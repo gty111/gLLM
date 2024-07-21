@@ -3,7 +3,6 @@ from typing import List
 
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
-from gllm.input_data import InputData
 
 
 class MemoryManager():
@@ -27,9 +26,9 @@ class MemoryManager():
         self.segments = [
             Segment(num_layers, page_num_segment, token_num_page, kv_head_num, kv_head_dim, torch.bfloat16)]
 
-    def store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, input_data: InputData):
+    def store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, seqs:List[Sequence]):
         cu_seqs_len = 0
-        for seq in input_data.seqs:
+        for seq in seqs:
             # prompt KV cache
             if len(seq.page_table) == 0:
                 for i in range(0, seq.prompt_len, self.token_num_page):
@@ -57,9 +56,9 @@ class MemoryManager():
                         v_cache[cu_seqs_len])
                 cu_seqs_len += 1
 
-    def pre_allocate_page(self, input_data: InputData):
-        for seq in input_data.seqs:
-            if not input_data.computed_prompt:
+    def pre_allocate_page(self, seqs:List[Sequence]):
+        for seq in seqs:
+            if not seqs[0].computed_prompt:
                 assert len(seq.page_table) == 0
                 num_page = (seq.prompt_len + self.token_num_page -
                             1) // self.token_num_page
