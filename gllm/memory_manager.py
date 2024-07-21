@@ -6,7 +6,7 @@ from gllm.sequence import Sequence
 
 
 class MemoryManager():
-    def __init__(self, num_layers: int, page_num_segment=1024, token_num_page=16, kv_head_num=8, kv_head_dim=128):
+    def __init__(self, num_layers: int, token_num_page=16, kv_head_num=8, kv_head_dim=128):
         '''
         num_layers: number of hidden layers
         page_num_segment: number of pages in a segment
@@ -14,25 +14,25 @@ class MemoryManager():
         kv_head_num: number of k/v heads
         kv_head_dim: dimension of k/v head
         '''
-        self.num_layers = num_layers
-        self.page_num_segment = page_num_segment
+        self.num_layers = num_layers        
         self.token_num_page = token_num_page
         self.kv_head_num = kv_head_num
         self.kv_head_dim = kv_head_dim
-        # free_mem_size, _ = torch.cuda.mem_get_info()
-        # num_max_pages = free_mem_size // (
-        #     token_num_page*kv_head_num*kv_head_dim*2*2*32)
-        # print(num_max_pages)
+        free_mem_size, _ = torch.cuda.mem_get_info()
+        num_max_pages = free_mem_size // (
+            2*num_layers*token_num_page*kv_head_num*kv_head_dim*2)
+        self.page_num_segment = int(num_max_pages * 0.9)
+        print(f'Allocate {self.page_num_segment} pages')
         self.segments = [
-            Segment(num_layers, page_num_segment, token_num_page, kv_head_num, kv_head_dim, torch.bfloat16)]
+            Segment(num_layers, self.page_num_segment, token_num_page, kv_head_num, kv_head_dim, torch.bfloat16)]
 
-    def store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, seqs:List[Sequence]):
+    def store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, seqs: List[Sequence], computed_prompt: bool):
         cu_seqs_len = 0
         for seq in seqs:
             # prompt KV cache
-            if len(seq.page_table) == 0:
+            if not computed_prompt:
                 for i in range(0, seq.prompt_len, self.token_num_page):
-                    page_num = i // self.token_num_page
+                    page_num = seq.page_table[i // self.token_num_page]
                     idx_right = min(seq.prompt_len, i+self.token_num_page)
                     self.segments[seq.segment_id].k_cache[layer_idx][page_num][0:idx_right-i].copy_(
                         k_cache[i+cu_seqs_len:idx_right+cu_seqs_len])
@@ -56,7 +56,7 @@ class MemoryManager():
                         v_cache[cu_seqs_len])
                 cu_seqs_len += 1
 
-    def pre_allocate_page(self, seqs:List[Sequence]):
+    def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
             if not seqs[0].computed_prompt:
                 assert len(seq.page_table) == 0
@@ -94,9 +94,6 @@ class Segment():
 
     def allocate(self):
         pagenum = self.allocatorID.allocate()
-        # if self.layer_id == 0:
-        #     print(
-        #         f'{self.layer_id}: #pages({self.k_cache.shape[0]}) #used_pages({self.allocatorID.get_num_used_ids()}))')
         return pagenum
 
     def free(self, page_num: int):

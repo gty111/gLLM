@@ -7,6 +7,7 @@ from gllm.memory_manager import MemoryManager
 
 class InputData():
     def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
+        memory_manager.pre_allocate_page(seqs)
         self.seqs = seqs
         self.memory_manager = memory_manager
         # we assume all seqs have the same computed_prompt and segment_id

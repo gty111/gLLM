@@ -21,7 +21,7 @@ class ModelRunner():
         if len(seqs) == 0:
             return
         with torch.no_grad():
-            input_data = InputData(seqs)
+            input_data = InputData(seqs, self.memory_manager)
             hidden_states = self.model(input_data)
             logits = self.model.compute_logits(input_data, hidden_states)
             next_tokens = self.model.sample(logits)

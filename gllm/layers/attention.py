@@ -18,7 +18,7 @@ class FlashAttention():
                 v: torch.Tensor,
                 input_data: InputData):
 
-        input_data.memory_manager.store(self.layer_id, k, v, input_data)
+        input_data.memory_manager.store(self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
         if not input_data.computed_prompt:
             out = flash_attn_varlen_func(q,
                                          k,
@@ -41,6 +41,3 @@ class FlashAttention():
                                           cache_seqlens=input_data.cache_seqs_len,
                                           causal=True)
             return out.squeeze(1)
-
-    def free(self, seq: Sequence):
-        self.memory_manager.free(seq)
