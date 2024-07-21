@@ -149,10 +149,6 @@ class LlamaForCausalLM(nn.Module):
         self.lm_head = nn.Linear(
             model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=torch.bfloat16, device='cuda')
 
-    def free_kv_cache(self, seq: Sequence):
-        for i in self.model.layers:
-            i.self_attn.attn.free(seq)
-
     def forward(self, input_data: InputData):
         return self.model(input_data)
 

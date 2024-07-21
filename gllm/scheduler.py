@@ -22,7 +22,7 @@ class Scheduler:
             if seq.token_ids[-1] in [128001, 128009]:
                 finish_lists_each.append(seq)
                 self.finish_lists[seq.seq_id] = seq
-                self.model_runner.model.free_kv_cache(seq)
+                self.model_runner.free_kv_cache(seq)
         for seq in finish_lists_each:
             self.decode_lists.remove(seq)
 
