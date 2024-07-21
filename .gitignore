@@ -1,0 +1,6 @@
+**/build
+**/.vscode
+**/*.egg-info
+**/guoty_scripts
+**/__pycache__
+**/*.so

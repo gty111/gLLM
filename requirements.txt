@@ -1,0 +1,9 @@
+cmake>=3.21
+ninja
+packaging
+setuptools>=49.4.0
+torch==2.3.1
+wheel
+tqdm
+transformers
+vllm-flash-attn==2.5.9.post1
