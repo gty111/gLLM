@@ -34,7 +34,7 @@ class ModelRunner():
     def free_kv_cache(self, seq: Sequence):
         self.memory_manager.free(seq)
 
-    def inference(self, seq: Sequence):
+    def stream_inference(self, seq: Sequence):
         output_tokens = []
         # -------prefill------
         prefill_start = time.time()

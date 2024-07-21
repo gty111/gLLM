@@ -19,7 +19,7 @@ class Scheduler:
         #     f'#prompt:{len(self.prompt_lists)} #decode:{len(self.decode_lists)}  #finish:{len(self.finish_lists)}')
         finish_lists_each = []
         for seq in self.decode_lists:
-            if seq.token_ids[-1] in [128001, 128009]:
+            if seq.token_ids[-1] in [128001, 128009] or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
                 finish_lists_each.append(seq)
                 self.finish_lists[seq.seq_id] = seq
                 self.model_runner.free_kv_cache(seq)

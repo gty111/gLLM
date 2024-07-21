@@ -11,17 +11,12 @@ from gllm.sequence import Sequence
 from gllm.input_data import InputData
 
 
-
 class LlamaMLP(nn.Module):
 
     def __init__(self, model_config: dict):
         super().__init__()
         self.hidden_size = model_config['hidden_size']
         self.intermediate_size = model_config['intermediate_size']
-        # self.gate_proj = nn.Linear(
-        #     self.hidden_size, self.intermediate_size, bias=False, dtype=torch.bfloat16, device='cuda')
-        # self.up_proj = nn.Linear(
-        #     self.hidden_size, self.intermediate_size, bias=False, dtype=torch.bfloat16, device='cuda')
         self.gate_up_proj = nn.Linear(
             self.hidden_size, self.intermediate_size*2, bias=False, dtype=torch.bfloat16, device='cuda')
         self.down_proj = nn.Linear(
@@ -29,9 +24,6 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor):
-        # y1 = self.gate_proj(x)
-        # y2 = self.up_proj(x)
-        # return self.down_proj(self.act_fn(torch.concat((y1,y2),dim=1)))
         return self.down_proj(self.act_fn(self.gate_up_proj(x)))
 
 
@@ -44,12 +36,6 @@ class LlamaAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.num_key_value_heads = model_config['num_key_value_heads']
 
-        # self.q_proj = nn.Linear(
-        #     self.hidden_size, self.num_heads*self.head_dim, bias=False, dtype=torch.bfloat16, device='cuda')
-        # self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads *
-        #                         self.head_dim, bias=False, dtype=torch.bfloat16, device='cuda')
-        # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads *
-        #                         self.head_dim, bias=False, dtype=torch.bfloat16, device='cuda')
         self.qkv_proj = nn.Linear(self.hidden_size, (self.num_heads+self.num_key_value_heads*2)
                                   * self.head_dim, bias=False, dtype=torch.bfloat16, device='cuda')
         self.o_proj = nn.Linear(self.num_heads*self.head_dim,
@@ -60,28 +46,17 @@ class LlamaAttention(nn.Module):
 
         self.scaling = self.head_dim**-0.5
 
-        self.attn = FlashAttention(layer_id, self.scaling)
+        self.attn = FlashAttention(
+            layer_id, self.scaling, self.num_heads, self.num_key_value_heads, self.head_dim, self.hidden_size)
 
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
-        # q = self.q_proj(hidden_states)
-        # k = self.k_proj(hidden_states)
-        # v = self.v_proj(hidden_states)
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=1)
-        q = qkv[:, :self.num_heads*self.head_dim]
-        k = qkv[:, self.num_heads *
-                self.head_dim:(self.num_heads+self.num_key_value_heads)*self.head_dim]
-        v = qkv[:, (self.num_heads+self.num_key_value_heads)*self.head_dim:]
         q, k = self.rotary_emb(input_data.positions, q, k)
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_key_value_heads, self.head_dim)
-        v = v.view(-1, self.num_key_value_heads, self.head_dim)
-
         attn_output = self.attn.forward(q, k, v, input_data)
-        attn_output = attn_output.view(-1, self.hidden_size)
         output = self.o_proj(attn_output)
         return output
 

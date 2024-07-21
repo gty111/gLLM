@@ -8,9 +8,19 @@ from gllm.input_data import InputData
 
 class FlashAttention():
 
-    def __init__(self, layer_id: int, scaling: float):
+    def __init__(self,
+                 layer_id: int,
+                 scaling: float,
+                 num_heads: int,
+                 num_key_value_heads: int,
+                 head_dim: int,
+                 hidden_size: int):
         self.scaling = scaling
         self.layer_id = layer_id
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
+        self.hidden_size = hidden_size
 
     def forward(self,
                 q: torch.Tensor,
@@ -18,7 +28,11 @@ class FlashAttention():
                 v: torch.Tensor,
                 input_data: InputData):
 
-        input_data.memory_manager.store(self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_key_value_heads, self.head_dim)
+        v = v.view(-1, self.num_key_value_heads, self.head_dim)
+        input_data.memory_manager.store(
+            self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
         if not input_data.computed_prompt:
             out = flash_attn_varlen_func(q,
                                          k,
@@ -29,7 +43,6 @@ class FlashAttention():
                                          max_seqlen_k=input_data.max_seqlen,
                                          softmax_scale=self.scaling,
                                          causal=True)
-            return out
         else:
             out = flash_attn_with_kvcache(q.unsqueeze(1),
                                           input_data.memory_manager.segments[
@@ -39,5 +52,5 @@ class FlashAttention():
                                           block_table=input_data.block_table,
                                           softmax_scale=self.scaling,
                                           cache_seqlens=input_data.cache_seqs_len,
-                                          causal=True)
-            return out.squeeze(1)
+                                          causal=True).squeeze(1)
+        return out.view(-1, self.hidden_size)

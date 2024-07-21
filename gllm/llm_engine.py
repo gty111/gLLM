@@ -13,8 +13,8 @@ class LLM():
         self.allocatorID = AllocatorID(1000, 9999)
         self.scheduler = Scheduler(self.model_runner)
 
-    def allocate_seq(self, token_ids: List[int]):
-        return Sequence(self.allocatorID.allocate(), token_ids)
+    def allocate_seq(self, token_ids: List[int], output_len=None):
+        return Sequence(self.allocatorID.allocate(), token_ids, output_len)
 
     def add_requests(self, requests: List[Sequence]):
         self.scheduler.add_requests(requests)
@@ -25,15 +25,29 @@ class LLM():
             self.allocatorID.free(seq.seq_id)
 
     def step(self):
-        self.model_runner.step_once(self.scheduler.schedule())
+        scheduled_seqs = self.scheduler.schedule()
+        self.model_runner.step_once(scheduled_seqs)
 
-    def generate(self, prompts: List[Sequence] = None):
+    def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None):
         requests: List[Sequence] = []
-        for prompt in prompts:
-            token_ids = self.model_runner.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}])
-            seq = self.allocate_seq(token_ids)
-            requests.append(seq)
+        if tokens is not None:
+            for idx, token_ids in enumerate(tokens):
+                if output_lens is not None:
+                    seq = self.allocate_seq(token_ids, output_lens[idx])
+                else:
+                    seq = self.allocate_seq(token_ids)
+                requests.append(seq)
+        elif prompts is not None:
+            for prompt in prompts:
+                token_ids = self.model_runner.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}])
+                if output_lens is not None:
+                    seq = self.allocate_seq(token_ids, output_lens[idx])
+                else:
+                    seq = self.allocate_seq(token_ids)
+                requests.append(seq)
+        else:
+            return None
         self.add_requests(requests)
 
         pbar = tqdm.tqdm(total=len(requests))
@@ -66,6 +80,6 @@ class LLM():
             history.append({"role": "user", "content": prompt})
             tokens = self.model_runner.tokenizer.apply_chat_template(history)
             seq = self.allocate_seq(tokens)
-            output_text = self.model_runner.inference(seq)
+            output_text = self.model_runner.stream_inference(seq)
             history.append({"role": "assistant", "content": output_text})
             # print(f'Answer: {output_text}')
