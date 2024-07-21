@@ -6,7 +6,7 @@ from typing import List
 from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
 from gllm.input_data import InputData
-
+from gllm.memory_manager import MemoryManager
 
 class ModelRunner():
     def __init__(self, model_path: str):
@@ -14,13 +14,14 @@ class ModelRunner():
 
         self.model = model_loader.load_model()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.memory_manager = MemoryManager(32)
 
     def step_once(self,
                   seqs: List[Sequence]):
         if len(seqs) == 0:
             return
         with torch.no_grad():
-            input_data = InputData(seqs)
+            input_data = InputData(seqs, self.memory_manager)
             hidden_states = self.model(input_data)
             logits = self.model.compute_logits(input_data, hidden_states)
             next_tokens = self.model.sample(logits)
@@ -29,6 +30,9 @@ class ModelRunner():
                 seqs[i].token_ids.append(next_tokens[i])
                 if not input_data.computed_prompt:
                     seqs[i].computed_prompt = True
+    
+    def free_kv_cache(self, seq: Sequence):
+        self.memory_manager.free(seq)
 
     def inference(self, seq: Sequence):
         output_tokens = []
@@ -50,7 +54,7 @@ class ModelRunner():
                 break
             self.step_once([seq])
         print('\n')
-        self.model.free_kv_cache(seq)
+        self.free_kv_cache(seq)
         decode_end = time.time()
         # ------decode end-------
         # ------metric---------

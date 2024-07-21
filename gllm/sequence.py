@@ -6,7 +6,7 @@ class Sequence():
         self.token_ids: List[int] = token_ids
         self.prompt_len = len(token_ids)
         self.segment_id = 0
-        self.page_table = [[] for _ in range(32)]
+        self.page_table = []
         self.computed_prompt = False
         self.prompt = ''
         self.output = ''
