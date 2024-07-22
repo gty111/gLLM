@@ -7,8 +7,8 @@ from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
-from gllm.sequence import Sequence
 from gllm.input_data import InputData
+from gllm.sampler import Sampler
 
 
 class LlamaMLP(nn.Module):
@@ -135,18 +135,6 @@ class LlamaForCausalLM(nn.Module):
             idx_list = input_data.cu_seqs_len - 1
             return self.lm_head(hidden_states[idx_list[1:]])
 
-    def sample(self, logits: torch.Tensor, temperature=0.6, top_p=0.9, top_k=5):
-        logits.div_(temperature)
-        probs = torch.softmax(logits, dim=1)
-        next_tokens = []
-        for i in range(probs.shape[0]):
-            accum_probs = 0
-            candi_tokens = []
-            for token in torch.argsort(probs[i], descending=True)[:top_k]:
-                candi_tokens.append(token.item())
-                accum_probs += probs[i, token]
-                if accum_probs >= top_p:
-                    break
-            next_token = random.sample(candi_tokens, 1)[0]
-            next_tokens.append(next_token)
-        return next_tokens
+    def sample(self, logits: torch.Tensor, temperature=0.6, top_p=0.9):
+        sampler = Sampler(logits, top_p, temperature)
+        return sampler.forward()
