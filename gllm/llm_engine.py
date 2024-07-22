@@ -38,7 +38,7 @@ class LLM():
                     seq = self.allocate_seq(token_ids)
                 requests.append(seq)
         elif prompts is not None:
-            for prompt in prompts:
+            for idx, prompt in enumerate(prompts):
                 token_ids = self.model_runner.tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt}])
                 if output_lens is not None:
