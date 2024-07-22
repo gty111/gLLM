@@ -2,7 +2,6 @@ from typing import List
 from vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 import torch
 
-from gllm.sequence import Sequence
 from gllm.input_data import InputData
 
 
@@ -31,8 +30,16 @@ class FlashAttention():
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
-        input_data.memory_manager.store(
-            self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
+        
+        # store performs better at small batch size
+        # batch store performs better at large batch size
+        # TODO: optimize thresholds to enable store or batch_store
+        if len(input_data.seqs) == 1:
+            input_data.memory_manager.store(
+                self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
+        else:
+            input_data.memory_manager.batch_store(
+                self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
         if not input_data.computed_prompt:
             out = flash_attn_varlen_func(q,
                                          k,
