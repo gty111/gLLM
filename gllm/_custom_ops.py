@@ -5,6 +5,15 @@ try:
 except ImportError as e:
     print(e)
 
+# cache ops
+def reshape_and_cache_flash(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    torch.ops._C.reshape_and_cache_flash(key, value, key_cache, value_cache, slot_mapping)
 
 # activation ops
 def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
@@ -43,4 +52,3 @@ def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
 def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
                        weight: torch.Tensor, epsilon: float) -> None:
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
-

@@ -27,34 +27,34 @@ class MemoryManager():
             Segment(num_layers, self.page_num_segment, token_num_page, kv_head_num, kv_head_dim, torch.bfloat16)]
 
     def store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, seqs: List[Sequence], computed_prompt: bool):
-        cu_seqs_len = 0
+        slot_mapping = []
         for seq in seqs:
             # prompt KV cache
             if not computed_prompt:
                 for i in range(0, seq.prompt_len, self.token_num_page):
                     page_num = seq.page_table[i // self.token_num_page]
                     idx_right = min(seq.prompt_len, i+self.token_num_page)
-                    self.segments[seq.segment_id].k_cache[layer_idx][page_num][0:idx_right-i].copy_(
-                        k_cache[i+cu_seqs_len:idx_right+cu_seqs_len])
-                    self.segments[seq.segment_id].v_cache[layer_idx][page_num][0:idx_right-i].copy_(
-                        v_cache[i+cu_seqs_len:idx_right+cu_seqs_len])
-                cu_seqs_len += seq.prompt_len
+                    slot_mapping.extend(list(
+                        range(page_num*self.token_num_page, page_num*self.token_num_page+idx_right-i)))
             # decode KV cache
             else:
                 if (len(seq.token_ids)-1) % self.token_num_page == 0:
                     page_num = seq.page_table[-1]
-                    self.segments[seq.segment_id].k_cache[layer_idx][page_num][0].copy_(
-                        k_cache[cu_seqs_len])
-                    self.segments[seq.segment_id].v_cache[layer_idx][page_num][0].copy_(
-                        v_cache[cu_seqs_len])
+                    slot_mapping.append(page_num*self.token_num_page)
                 else:
-                    offset = len(seq.token_ids) % self.token_num_page - 1
+                    offset = (len(seq.token_ids) - 1) % self.token_num_page
                     page_num = seq.page_table[-1]
-                    self.segments[seq.segment_id].k_cache[layer_idx][page_num][offset].copy_(
-                        k_cache[cu_seqs_len])
-                    self.segments[seq.segment_id].v_cache[layer_idx][page_num][offset].copy_(
-                        v_cache[cu_seqs_len])
-                cu_seqs_len += 1
+                    slot_mapping.append(page_num*self.token_num_page+offset)
+
+        slot_mapping_tensor = torch.tensor(
+            slot_mapping, dtype=torch.int64, device='cuda')
+
+        from gllm import _custom_ops as ops
+        ops.reshape_and_cache_flash(k_cache,
+                                    v_cache,
+                                    self.segments[0].k_cache[layer_idx],
+                                    self.segments[0].v_cache[layer_idx],
+                                    slot_mapping_tensor)
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:

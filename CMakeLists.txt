@@ -140,6 +140,7 @@ endif()
 #
 
 set(GLLM_EXT_SRC
+  "csrc/cache_kernels.cu"
   "csrc/pos_encoding_kernels.cu"
   "csrc/activation_kernels.cu"
   "csrc/layernorm_kernels.cu"

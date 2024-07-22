@@ -31,3 +31,8 @@ void gelu_new(torch::Tensor& out, torch::Tensor& input);
 void gelu_fast(torch::Tensor& out, torch::Tensor& input);
 
 void gelu_quick(torch::Tensor& out, torch::Tensor& input);
+
+void reshape_and_cache_flash(
+    torch::Tensor& key, torch::Tensor& value, 
+    torch::Tensor& key_cache, torch::Tensor& value_cache, 
+    torch::Tensor& slot_mapping);

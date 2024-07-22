@@ -74,6 +74,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops)
         "                         int rot_dim,"
         "                         Tensor cos_sin_cache_offsets) -> ()");
     ops.impl("batched_rotary_embedding", torch::kCUDA, &batched_rotary_embedding);
+
+    // Cache ops
+    ops.def(
+        "reshape_and_cache_flash(Tensor key, Tensor value,"
+        "            Tensor! key_cache, Tensor! value_cache,"
+        "            Tensor slot_mapping) -> ()");
+    ops.impl("reshape_and_cache_flash", torch::kCUDA, &reshape_and_cache_flash);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
