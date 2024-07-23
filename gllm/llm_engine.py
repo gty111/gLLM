@@ -27,6 +27,7 @@ class LLM():
     def step(self):
         scheduled_seqs = self.scheduler.schedule()
         self.model_runner.step_once(scheduled_seqs)
+        self.scheduler.update_finish_seqs()
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None):
         requests: List[Sequence] = []

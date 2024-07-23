@@ -15,20 +15,11 @@ class Scheduler:
         self.prompt_lists.extend(requests)
 
     def schedule(self):
-        # print(
-        #     f'#prompt:{len(self.prompt_lists)} #decode:{len(self.decode_lists)}  #finish:{len(self.finish_lists)}')
-        finish_lists_each = []
-        for seq in self.decode_lists:
-            if seq.token_ids[-1] in [128001, 128009] or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
-                finish_lists_each.append(seq)
-                self.finish_lists[seq.seq_id] = seq
-                self.model_runner.free_kv_cache(seq)
-        for seq in finish_lists_each:
-            self.decode_lists.remove(seq)
-
         schedule_lists: List[Sequence] = []
 
-        if len(self.prompt_lists) != 0:
+        # prompt
+        if len(self.prompt_lists) != 0 and (
+                self.model_runner.memory_manager.get_num_free_pages() > 1024 and len(self.decode_lists) < 512):
             cu_seqs_len = 0
             for seq in self.prompt_lists:
                 if cu_seqs_len + len(seq.token_ids) <= 4096:
@@ -37,8 +28,28 @@ class Scheduler:
                     schedule_lists.append(seq)
             for seq in schedule_lists:
                 self.prompt_lists.remove(seq)
-            return schedule_lists
 
-        for seq in self.decode_lists:
-            schedule_lists.append(seq)
+        # decode
+        if len(schedule_lists) == 0:
+            # set max batch size
+            for seq in self.decode_lists[:512]:
+                schedule_lists.append(seq)
+
+        # print(
+        #     f'#schedule:{len(schedule_lists)} '
+        #     f'#prompt:{len(self.prompt_lists)} '
+        #     f'#decode:{len(self.decode_lists)} '
+        #     f'#finish:{len(self.finish_lists)} '
+        #     f'memory_util:{self.model_runner.memory_manager.get_memory_util()} %')
         return schedule_lists
+
+    def update_finish_seqs(self):
+        # check finished seqs
+        finish_lists = []
+        for seq in self.decode_lists:
+            if seq.token_ids[-1] in [128001, 128009] or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
+                finish_lists.append(seq)
+                self.finish_lists[seq.seq_id] = seq
+                self.model_runner.free_kv_cache(seq)
+        for seq in finish_lists:
+            self.decode_lists.remove(seq)

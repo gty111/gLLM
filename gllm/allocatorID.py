@@ -3,7 +3,6 @@ import random
 
 class AllocatorID():
     def __init__(self, minnum=1, maxnum=1000):
-        self.max_id = maxnum
         self.ids = list(range(minnum, maxnum+1))
         self.used_ids = []
 
@@ -24,3 +23,9 @@ class AllocatorID():
 
     def get_num_used_ids(self):
         return len(self.used_ids)
+    
+    def get_num_free_ids(self):
+        return len(self.ids)
+    
+    def get_num_ids(self):
+        return len(self.ids) + len(self.used_ids)

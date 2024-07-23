@@ -14,7 +14,7 @@ class MemoryManager():
         kv_head_num: number of k/v heads
         kv_head_dim: dimension of k/v head
         '''
-        self.num_layers = num_layers        
+        self.num_layers = num_layers
         self.token_num_page = token_num_page
         self.kv_head_num = kv_head_num
         self.kv_head_dim = kv_head_dim
@@ -55,7 +55,7 @@ class MemoryManager():
                                     self.segments[0].k_cache[layer_idx],
                                     self.segments[0].v_cache[layer_idx],
                                     slot_mapping_tensor)
-        
+
     def store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, seqs: List[Sequence], computed_prompt: bool):
         cu_seqs_len = 0
         for seq in seqs:
@@ -105,6 +105,12 @@ class MemoryManager():
         for page_num in seq.page_table:
             self.segments[seq.segment_id].free(page_num)
 
+    def get_num_free_pages(self):
+        return self.segments[0].get_num_free_pages()
+
+    def get_memory_util(self):
+        return self.segments[0].get_memory_util()
+
 
 class Segment():
     def __init__(self,
@@ -128,3 +134,10 @@ class Segment():
 
     def free(self, page_num: int):
         self.allocatorID.free(page_num)
+
+    def get_num_free_pages(self):
+        return self.allocatorID.get_num_free_ids()
+
+    # return percent of used memory
+    def get_memory_util(self):
+        return round(100 * self.allocatorID.get_num_used_ids()/self.allocatorID.get_num_ids(), 2)
