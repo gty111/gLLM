@@ -1,0 +1,225 @@
+import torch
+import tqdm
+from torch import nn
+from copy import deepcopy
+
+from gllm.input_data import InputData
+from gllm.layers.rotary_embedding import RotaryEmbedding
+from gllm.layers.attention import FlashAttention
+from gllm.layers.activation import SiluAndMul
+from gllm.layers.layernorm import RMSNorm
+from gllm.sampler import Sampler
+
+
+class GLMAttention(nn.Module):
+    def __init__(self, layer_id: int, model_config: dict):
+        super().__init__()
+        self.hidden_size = model_config['hidden_size']
+        self.num_heads = model_config['num_attention_heads']
+        self.num_kv_heads = model_config['multi_query_group_num']
+        self.head_dim = self.hidden_size // self.num_heads
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+
+        self.rotary_emb = RotaryEmbedding(
+            self.head_dim, self.head_dim // 2, 8192, 10000.0, False, torch.float16)
+        self.attn = FlashAttention(
+            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
+
+        self.projection_size = model_config['kv_channels'] * self.num_heads
+        self.qkv_hidden_size = self.projection_size + 2 * \
+            self.head_dim * model_config['multi_query_group_num']
+        self.query_key_value = nn.Linear(self.hidden_size, self.qkv_hidden_size,
+                                         bias=model_config['add_bias_linear'] or model_config['add_qkv_bias'], dtype=torch.float16, device='cuda')
+        self.dense = nn.Linear(self.projection_size, self.hidden_size,
+                               bias=model_config['add_bias_linear'], dtype=torch.float16, device='cuda')
+
+    def forward(self, input_data: InputData, hidden_states: torch.Tensor):
+        qkv = self.query_key_value(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(input_data.positions, q, k)
+        attn_output = self.attn.forward(q, k, v, input_data)
+        output = self.dense(attn_output)
+        return output
+
+
+class GLMMLP(nn.Module):
+    def __init__(self, model_config):
+        super().__init__()
+        self.add_bias = model_config['add_bias_linear']
+        self.dense_h_to_4h = nn.Linear(
+            model_config['hidden_size'], model_config['ffn_hidden_size']*2, bias=self.add_bias, dtype=torch.float16, device='cuda')
+        self.activation_func = SiluAndMul()
+        self.dense_4h_to_h = nn.Linear(
+            model_config['ffn_hidden_size'], model_config['hidden_size'], bias=self.add_bias, dtype=torch.float16, device='cuda')
+
+    def forward(self, hidden_states):
+        # [s, b, 4hp]
+        intermediate_parallel = self.dense_h_to_4h(hidden_states)
+        intermediate_parallel = self.activation_func(intermediate_parallel)
+        # [s, b, h]
+        output = self.dense_4h_to_h(intermediate_parallel)
+        return output
+
+
+class GLMBlock(nn.Module):
+    def __init__(self, layer_id, model_config: dict):
+        super().__init__()
+        self.apply_residual_connection_post_layernorm = model_config[
+            'apply_residual_connection_post_layernorm']
+        self.fp32_residual_connection = model_config['fp32_residual_connection']
+
+        assert model_config['rmsnorm']
+        self.input_layernorm = RMSNorm(
+            model_config['hidden_size'], model_config['layernorm_epsilon'], torch.float16)
+
+        self.self_attention = GLMAttention(layer_id, model_config)
+        self.hidden_dropout = model_config['hidden_dropout']
+
+        self.post_attention_layernorm = RMSNorm(
+            model_config['hidden_size'], model_config['layernorm_epsilon'], torch.float16)
+
+        self.mlp = GLMMLP(model_config)
+
+    def forward(self, hidden_states: torch.Tensor, input_data: InputData):
+        # hidden_states: [num_tokens, h]
+        # Layer norm at the beginning of the transformer layer.
+        layernorm_output = self.input_layernorm(hidden_states)
+        # Self attention.
+        attention_output = self.self_attention(input_data, layernorm_output)
+
+        # Residual connection.
+        if self.apply_residual_connection_post_layernorm:
+            residual = layernorm_output
+        else:
+            residual = hidden_states
+
+        layernorm_input = residual + attention_output
+
+        # Layer norm post the self attention.
+        layernorm_output = self.post_attention_layernorm(layernorm_input)
+
+        # Second residual connection.
+        if self.apply_residual_connection_post_layernorm:
+            residual = layernorm_output
+        else:
+            residual = layernorm_input
+
+        output = self.mlp(layernorm_output) + residual
+
+        return output
+
+
+class GLMTransformer(nn.Module):
+    def __init__(self, model_config: dict):
+        super().__init__()
+        # assume post_layer_norm is true
+        self.post_layer_norm = True
+
+        self.num_layers = model_config['num_layers']
+
+        self.layers = nn.ModuleList(
+            [GLMBlock(i, model_config) for i in range(self.num_layers)])
+
+        if self.post_layer_norm:
+            assert model_config['rmsnorm']
+            layer_norm_func = RMSNorm
+            self.final_layernorm = layer_norm_func(
+                model_config['hidden_size'], model_config['layernorm_epsilon'], torch.float16)
+
+    def forward(self, hidden_states: torch.Tensor, input_data: InputData):
+        for i in range(self.num_layers):
+            layer = self.layers[i]
+            hidden_states = layer(hidden_states, input_data)
+        # Final layer norm.
+        if self.post_layer_norm:
+            hidden_states = self.final_layernorm(hidden_states)
+
+        return hidden_states
+
+
+class ChatGLMModel(nn.Module):
+    def __init__(self, model_config: dict):
+        super().__init__()
+
+        self.embedding = nn.Embedding(
+            model_config['padded_vocab_size'], model_config['hidden_size'], dtype=torch.float16, device='cuda')
+
+        self.num_layers = model_config['num_layers']
+        self.multi_query_group_num = model_config['multi_query_group_num']
+        self.kv_channels = model_config['kv_channels']
+
+        self.encoder = GLMTransformer(model_config)
+        self.output_layer = nn.Linear(
+            model_config['hidden_size'], model_config['padded_vocab_size'], bias=False, dtype=torch.float16, device='cuda')
+
+    def forward(self, input_data: InputData):
+        inputs_embeds = self.embedding(input_data.tokens)
+
+        # Run encoder.
+        hidden_states = self.encoder(inputs_embeds, input_data)
+        return hidden_states
+
+
+class ChatGLMForCausalLM(nn.Module):
+    def __init__(self, model_config: dict):
+        super().__init__()
+
+        self.model_config = model_config
+        self.num_layers = model_config['num_layers']
+        self.dtype = torch.float16
+        self.num_kv_heads = model_config['multi_query_group_num']
+        self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
+        self.finish_tokens = [model_config['eos_token_id']]
+
+        self.transformer = ChatGLMModel(model_config)
+        self.lm_head = self.transformer.output_layer
+
+    def forward(self, input_data: InputData):
+        return self.transformer(input_data)
+
+    def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
+        if input_data.computed_prompt:
+            return self.lm_head(hidden_states)
+        else:
+            # fetch hidden_states of last token in each seq
+            idx_list = input_data.cu_seqs_len - 1
+            return self.lm_head(hidden_states[idx_list[1:]])
+
+    def sample(self, logits: torch.Tensor, temperature=0.8, top_p=0.8):
+        sampler = Sampler(logits, top_p, temperature)
+        return sampler.forward()
+
+    def load_weights(self, weights):
+        parameters = dict(self.named_parameters())
+
+        for k, v in tqdm.tqdm(parameters.items()):
+            if 'embedding' in k:
+                k = k.replace('embedding', 'embedding.word_embeddings')
+            v.data.copy_(weights[k])
+
+    def process_response(self, output, history):
+        content = ""
+        history = deepcopy(history)
+        for response in output.split("<|assistant|>"):
+            if "\n" in response:
+                metadata, content = response.split("\n", maxsplit=1)
+            else:
+                metadata, content = "", response
+            if not metadata.strip():
+                content = content.strip()
+                history.append(
+                    {"role": "assistant", "metadata": metadata, "content": content})
+                content = content.replace("[[训练时间]]", "2023年")
+            else:
+                history.append(
+                    {"role": "assistant", "metadata": metadata, "content": content})
+                if history[0]["role"] == "system" and "tools" in history[0]:
+                    content = "\n".join(content.split("\n")[1:-1])
+                    parameters = eval(content)
+                    content = {"name": metadata.strip(),
+                               "parameters": parameters}
+                else:
+                    content = {"name": metadata.strip(), "content": content}
+        return content, history

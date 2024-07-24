@@ -8,13 +8,16 @@ from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager
 
+
 class ModelRunner():
     def __init__(self, model_path: str):
         model_loader = ModelLoader(model_path)
 
         self.model = model_loader.load_model()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.memory_manager = MemoryManager(32)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True)
+        self.memory_manager = MemoryManager(
+            self.model.num_layers, self.model.dtype, 16, self.model.num_kv_heads, self.model.head_dim)
 
     def step_once(self,
                   seqs: List[Sequence]):
@@ -30,7 +33,7 @@ class ModelRunner():
                 seqs[i].token_ids.append(next_tokens[i])
                 if not input_data.computed_prompt:
                     seqs[i].computed_prompt = True
-    
+
     def free_kv_cache(self, seq: Sequence):
         self.memory_manager.free(seq)
 
@@ -45,15 +48,18 @@ class ModelRunner():
 
         # ------decode-------
         decode_start = time.time()
+        current_length = 0
         while True:
             next_token = seq.token_ids[-1]
             output_tokens.append(next_token)
-            print(self.tokenizer.decode(
-                [next_token], True, True), end='', flush=True)
-            if next_token in [128001, 128009]:
+            if len(output_tokens) % 10 == 0 or next_token in self.model.finish_tokens:
+                response = self.tokenizer.decode(output_tokens, True, True)
+                print(response[current_length:], end='', flush=True)
+                current_length = len(response)
+            if next_token in self.model.finish_tokens:
                 break
             self.step_once([seq])
-        print('\n')
+        print("\n")
         self.free_kv_cache(seq)
         decode_end = time.time()
         # ------decode end-------

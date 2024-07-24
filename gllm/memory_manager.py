@@ -6,7 +6,7 @@ from gllm.sequence import Sequence
 
 
 class MemoryManager():
-    def __init__(self, num_layers: int, token_num_page=16, kv_head_num=8, kv_head_dim=128):
+    def __init__(self, num_layers: int, dtype: torch.dtype, token_num_page=16, kv_head_num=8, kv_head_dim=128):
         '''
         num_layers: number of hidden layers
         page_num_segment: number of pages in a segment
@@ -24,7 +24,7 @@ class MemoryManager():
         self.page_num_segment = int(num_max_pages * 0.9)
         print(f'Allocate {self.page_num_segment} pages')
         self.segments = [
-            Segment(num_layers, self.page_num_segment, token_num_page, kv_head_num, kv_head_dim, torch.bfloat16)]
+            Segment(num_layers, self.page_num_segment, token_num_page, kv_head_num, kv_head_dim, dtype)]
 
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, seqs: List[Sequence], computed_prompt: bool):
         slot_mapping = []

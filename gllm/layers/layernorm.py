@@ -7,16 +7,18 @@ class RMSNorm(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        eps: float = 1e-6,
+        eps: float,
+        dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size,dtype=torch.bfloat16,device='cuda'))
+        self.weight = nn.Parameter(torch.ones(
+            hidden_size, dtype=dtype, device='cuda'))
         self.variance_epsilon = eps
 
     def forward(
-        self, 
-        x, 
-        residual = None,
+        self,
+        x,
+        residual=None,
     ):
         from gllm import _custom_ops as ops
 

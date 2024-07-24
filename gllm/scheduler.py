@@ -47,7 +47,7 @@ class Scheduler:
         # check finished seqs
         finish_lists = []
         for seq in self.decode_lists:
-            if seq.token_ids[-1] in [128001, 128009] or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
+            if seq.token_ids[-1] in self.model_runner.model.finish_tokens or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
                 finish_lists.append(seq)
                 self.finish_lists[seq.seq_id] = seq
                 self.model_runner.free_kv_cache(seq)
