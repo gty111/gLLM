@@ -1,6 +1,6 @@
 import torch
-import random
-from typing import List, Optional
+import tqdm
+from typing import Optional
 from torch import nn
 
 from gllm.layers.activation import SiluAndMul
@@ -42,7 +42,7 @@ class LlamaAttention(nn.Module):
                                 self.hidden_size, bias=False, dtype=torch.bfloat16, device='cuda')
 
         self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim, model_config['max_position_embeddings'], model_config['rope_theta'])
+            self.head_dim, self.head_dim, model_config['max_position_embeddings'], model_config['rope_theta'], True, torch.bfloat16)
 
         self.scaling = self.head_dim**-0.5
 
@@ -66,10 +66,10 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, layer_id: int, model_config: dict):
         super().__init__()
         self.input_layernorm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'])
+            model_config['hidden_size'], model_config['rms_norm_eps'], torch.bfloat16)
         self.self_attn = LlamaAttention(layer_id, model_config)
         self.post_attention_layernorm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'])
+            model_config['hidden_size'], model_config['rms_norm_eps'], torch.bfloat16)
         self.mlp = LlamaMLP(model_config)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]):
@@ -103,7 +103,7 @@ class LlamaModel(nn.Module):
         self.embed_tokens = nn.Embedding(
             model_config['vocab_size'], model_config['hidden_size'], dtype=torch.bfloat16, device='cuda')
         self.norm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'])
+            model_config['hidden_size'], model_config['rms_norm_eps'], torch.bfloat16)
 
     def forward(self, input_data: InputData):
         hidden_states = self.embed_tokens(input_data.tokens)
@@ -119,6 +119,11 @@ class LlamaForCausalLM(nn.Module):
 
     def __init__(self, model_config: dict):
         super().__init__()
+        self.num_layers = model_config['num_hidden_layers']
+        self.dtype = torch.bfloat16
+        self.num_kv_heads = model_config['num_key_value_heads']
+        self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
+        self.finish_tokens = [128001, 128009]
         self.model = LlamaModel(model_config)
         self.model_config = model_config
         self.lm_head = nn.Linear(
@@ -138,3 +143,27 @@ class LlamaForCausalLM(nn.Module):
     def sample(self, logits: torch.Tensor, temperature=0.6, top_p=0.9):
         sampler = Sampler(logits, top_p, temperature)
         return sampler.forward()
+
+    def load_weights(self, weights):
+        parameters = dict(self.named_parameters())
+
+        # assert len(parameters) == len(weights)
+        num_attn_heads = self.model_config['num_attention_heads']
+        head_dim = self.model_config['hidden_size'] // num_attn_heads
+        num_kv_heads = self.model_config['num_key_value_heads']
+        intermediate_size = self.model_config['intermediate_size']
+        for k, v in tqdm.tqdm(parameters.items()):
+            if k.find('self_attn.qkv_proj') != -1:
+                v.data[:num_attn_heads*head_dim, :] = weights[k.replace(
+                    'qkv_proj', 'q_proj')]
+                v.data[num_attn_heads*head_dim:(num_attn_heads +
+                       num_kv_heads)*head_dim, :] = weights[k.replace('qkv_proj', 'k_proj')]
+                v.data[(num_attn_heads +
+                       num_kv_heads)*head_dim:, :] = weights[k.replace('qkv_proj', 'v_proj')]
+            elif k.find('gate_up_proj') != -1:
+                v.data[:intermediate_size, :] = weights[k.replace(
+                    'gate_up_proj', 'gate_proj')]
+                v.data[intermediate_size:, :] = weights[k.replace(
+                    'gate_up_proj', 'up_proj')]
+            else:
+                v.data.copy_(weights[k])

@@ -7,6 +7,7 @@ from gllm.allocatorID import AllocatorID
 from gllm.scheduler import Scheduler
 
 
+
 class LLM():
     def __init__(self, model_path):
         self.model_runner = ModelRunner(model_path)
@@ -67,6 +68,7 @@ class LLM():
         return requests
 
     def chat(self):
+        architecture = self.model_runner.model.model_config['architectures'][0]
         print("\nWelcome to the chatbot!\n"
               "Type '\exit' to exit the chatbot.\n"
               "Type '\clear' to clear the chatbot's history.\n")
@@ -78,9 +80,20 @@ class LLM():
                 continue
             elif prompt == '\exit':
                 break
-            history.append({"role": "user", "content": prompt})
-            tokens = self.model_runner.tokenizer.apply_chat_template(history)
+            
+            if architecture == 'LlamaForCausalLM':
+                history.append({"role": "user", "content": prompt})
+                tokens = self.model_runner.tokenizer.apply_chat_template(history)
+            elif architecture == 'ChatGLMModel':
+                tokens = self.model_runner.tokenizer.build_chat_input(prompt,history=history,role='user').get("input_ids").numpy().tolist()[0]
+            else:
+                assert 0
             seq = self.allocate_seq(tokens)
             output_text = self.model_runner.stream_inference(seq)
-            history.append({"role": "assistant", "content": output_text})
+            if architecture == 'LlamaForCausalLM':
+                history.append({"role": "assistant", "content": output_text})
+            elif architecture == 'ChatGLMModel':
+                _ , history = self.model_runner.model.process_response(output_text,history)
+            else:
+                assert 0
             # print(f'Answer: {output_text}')

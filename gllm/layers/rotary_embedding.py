@@ -7,20 +7,23 @@ class RotaryEmbedding(nn.Module):
 
     def __init__(
         self,
-        head_size,
-        rotary_dim,
-        max_position_embeddings,
-        base,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype,
     ) -> None:
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        self.is_neox_style = is_neox_style
 
         cache = self._compute_cos_sin_cache()
 
-        cache = cache.to(torch.bfloat16)
+        cache = cache.to(dtype)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base):
@@ -65,9 +68,9 @@ class RotaryEmbedding(nn.Module):
         if offsets is not None:
             ops.batched_rotary_embedding(positions, query, key, self.head_size,
                                          self.cos_sin_cache,
-                                         True, self.rotary_dim,
+                                         self.is_neox_style, self.rotary_dim,
                                          offsets)
         else:
             ops.rotary_embedding(positions, query, key, self.head_size,
-                                 self.cos_sin_cache, True)
+                                 self.cos_sin_cache, self.is_neox_style)
         return query, key
