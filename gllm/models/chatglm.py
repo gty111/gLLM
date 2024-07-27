@@ -167,6 +167,7 @@ class ChatGLMForCausalLM(nn.Module):
         super().__init__()
 
         self.model_config = model_config
+        self.max_model_len = model_config['seq_length']
         self.num_layers = model_config['num_layers']
         self.dtype = torch.float16
         self.num_kv_heads = model_config['multi_query_group_num']

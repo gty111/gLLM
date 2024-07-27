@@ -119,6 +119,7 @@ class LlamaForCausalLM(nn.Module):
 
     def __init__(self, model_config: dict):
         super().__init__()
+        self.max_model_len = model_config['max_position_embeddings']
         self.num_layers = model_config['num_hidden_layers']
         self.dtype = torch.bfloat16
         self.num_kv_heads = model_config['num_key_value_heads']

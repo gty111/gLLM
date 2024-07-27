@@ -10,6 +10,8 @@ class Scheduler:
         self.prompt_lists: List[Sequence] = []
         self.decode_lists: List[Sequence] = []
         self.finish_lists: Dict[int, Sequence] = {}
+        
+        self.max_decode_seqs = 256
 
     def add_requests(self, requests: List[Sequence]):
         self.prompt_lists.extend(requests)
@@ -19,10 +21,10 @@ class Scheduler:
 
         # prompt
         if len(self.prompt_lists) != 0 and (
-                self.model_runner.memory_manager.get_num_free_pages() > 1024 and len(self.decode_lists) < 512):
+                self.model_runner.memory_manager.get_num_free_pages() > 1024 and len(self.decode_lists) < self.max_decode_seqs):
             cu_seqs_len = 0
             for seq in self.prompt_lists:
-                if cu_seqs_len + len(seq.token_ids) <= 4096:
+                if cu_seqs_len + len(seq.token_ids) <= self.model_runner.model.max_model_len:
                     cu_seqs_len += len(seq.token_ids)
                     self.decode_lists.append(seq)
                     schedule_lists.append(seq)
@@ -32,7 +34,7 @@ class Scheduler:
         # decode
         if len(schedule_lists) == 0:
             # set max batch size
-            for seq in self.decode_lists[:512]:
+            for seq in self.decode_lists[:self.max_decode_seqs]:
                 schedule_lists.append(seq)
 
         # print(
