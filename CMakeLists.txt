@@ -19,21 +19,9 @@ set(PYTHON_SUPPORTED_VERSIONS "3.8" "3.9" "3.10" "3.11")
 # Supported NVIDIA architectures.
 set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
 
-# Supported AMD GPU architectures.
-set(HIP_SUPPORTED_ARCHS "gfx906;gfx908;gfx90a;gfx940;gfx941;gfx942;gfx1030;gfx1100")
 
-#
-# Supported/expected torch versions for CUDA/ROCm.
-#
-# Currently, having an incorrect pytorch version results in a warning
-# rather than an error.
-#
-# Note: the CUDA torch version is derived from pyproject.toml and various
-# requirements.txt files and should be kept consistent.  The ROCm torch
-# versions are derived from Dockerfile.rocm
-#
+# Supported/expected torch versions for CUDA.
 set(TORCH_SUPPORTED_VERSION_CUDA "2.3.1")
-set(TORCH_SUPPORTED_VERSION_ROCM "2.4.0")
 
 #
 # Try to find python package with an executable that exactly matches
@@ -69,13 +57,8 @@ find_package(Torch REQUIRED)
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
-if (NOT GLLM_TARGET_DEVICE STREQUAL "cuda" AND
-    NOT GLLM_TARGET_DEVICE STREQUAL "rocm")
-    if (GLLM_TARGET_DEVICE STREQUAL "cpu")
-        include(${CMAKE_CURRENT_LIST_DIR}/cmake/cpu_extension.cmake)
-    else()
-        message(FATAL_ERROR "Unsupported gLLM target device: ${GLLM_TARGET_DEVICE}")
-    endif()
+if (NOT GLLM_TARGET_DEVICE STREQUAL "cuda")
+    message(FATAL_ERROR "Unsupported gLLM target device: ${GLLM_TARGET_DEVICE}")
     return()
 endif()
 
@@ -83,29 +66,15 @@ endif()
 # Set up GPU language and check the torch version and warn if it isn't
 # what is expected.
 #
-if (NOT HIP_FOUND AND CUDA_FOUND)
+if (CUDA_FOUND)
   set(GLLM_GPU_LANG "CUDA")
 
   if (NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_CUDA})
     message(WARNING "Pytorch version ${TORCH_SUPPORTED_VERSION_CUDA} "
       "expected for CUDA build, saw ${Torch_VERSION} instead.")
   endif()
-elseif(HIP_FOUND)
-  set(GLLM_GPU_LANG "HIP")
-
-  # Importing torch recognizes and sets up some HIP/ROCm configuration but does
-  # not let cmake recognize .hip files. In order to get cmake to understand the
-  # .hip extension automatically, HIP must be enabled explicitly.
-  enable_language(HIP)
-
-  # ROCm 5.X and 6.X
-  if (ROCM_VERSION_DEV_MAJOR GREATER_EQUAL 5 AND
-      NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_ROCM})
-    message(WARNING "Pytorch version ${TORCH_SUPPORTED_VERSION_ROCM} "
-      "expected for ROCm build, saw ${Torch_VERSION} instead.")
-  endif()
 else()
-  message(FATAL_ERROR "Can't find CUDA or HIP installation.")
+  message(FATAL_ERROR "Can't find CUDA installation.")
 endif()
 
 #
