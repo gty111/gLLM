@@ -8,9 +8,10 @@ from gllm.scheduler import Scheduler
 
 
 class LLM():
-    def __init__(self, model_path):
-        self.model_runner = ModelRunner(model_path)
-        self.allocatorID = AllocatorID(1000, 9999)
+    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16):
+        self.model_runner = ModelRunner(
+            model_path, gpu_memory_utilization, page_size)
+        self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(self.model_runner)
 
     def allocate_seq(self, token_ids: List[int], output_len=None):
@@ -24,12 +25,12 @@ class LLM():
             del self.scheduler.finish_lists[seq.seq_id]
             self.allocatorID.free(seq.seq_id)
 
-    def step(self):
+    def step(self, temperature, top_p):
         scheduled_seqs = self.scheduler.schedule()
-        self.model_runner.step_once(scheduled_seqs)
+        self.model_runner.step_once(scheduled_seqs, temperature, top_p)
         self.scheduler.update_finish_seqs()
 
-    def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None):
+    def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None, temperature=0.6, top_p=0.9):
         requests: List[Sequence] = []
         if tokens is not None:
             for idx, token_ids in enumerate(tokens):
@@ -54,7 +55,7 @@ class LLM():
         pbar = tqdm.tqdm(total=len(requests))
         while len(self.scheduler.finish_lists) != len(requests):
             cur_finish_num = len(self.scheduler.finish_lists)
-            self.step()
+            self.step(temperature, top_p)
             pbar.update(len(self.scheduler.finish_lists)-cur_finish_num)
 
         for request in requests:

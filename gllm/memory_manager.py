@@ -6,45 +6,44 @@ from gllm.sequence import Sequence
 
 
 class MemoryManager():
-    def __init__(self, num_layers: int, dtype: torch.dtype, token_num_page=16, kv_head_num=8, kv_head_dim=128):
+    def __init__(self, gpu_memory_utilization: float, num_layers: int, dtype: torch.dtype, page_size: int, kv_head_num: int, kv_head_dim: int):
         '''
         num_layers: number of hidden layers
-        page_num_segment: number of pages in a segment
-        token_num_page: number of tokens in a page
+        page_size: number of tokens in a page
         kv_head_num: number of k/v heads
         kv_head_dim: dimension of k/v head
         '''
         self.num_layers = num_layers
-        self.token_num_page = token_num_page
+        self.page_size = page_size
         self.kv_head_num = kv_head_num
         self.kv_head_dim = kv_head_dim
         free_mem_size, _ = torch.cuda.mem_get_info()
         num_max_pages = free_mem_size // (
-            2*num_layers*token_num_page*kv_head_num*kv_head_dim*2)
-        self.page_num_segment = int(num_max_pages * 0.9)
+            2*num_layers*page_size*kv_head_num*kv_head_dim*2)
+        self.page_num_segment = int(num_max_pages * gpu_memory_utilization)
         print(f'Allocate {self.page_num_segment} pages')
         self.segments = [
-            Segment(num_layers, self.page_num_segment, token_num_page, kv_head_num, kv_head_dim, dtype)]
+            Segment(num_layers, self.page_num_segment, page_size, kv_head_num, kv_head_dim, dtype)]
 
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, seqs: List[Sequence], computed_prompt: bool):
         slot_mapping = []
         for seq in seqs:
             # prompt KV cache
             if not computed_prompt:
-                for i in range(0, seq.prompt_len, self.token_num_page):
-                    page_num = seq.page_table[i // self.token_num_page]
-                    idx_right = min(seq.prompt_len, i+self.token_num_page)
+                for i in range(0, seq.prompt_len, self.page_size):
+                    page_num = seq.page_table[i // self.page_size]
+                    idx_right = min(seq.prompt_len, i+self.page_size)
                     slot_mapping.extend(list(
-                        range(page_num*self.token_num_page, page_num*self.token_num_page+idx_right-i)))
+                        range(page_num*self.page_size, page_num*self.page_size+idx_right-i)))
             # decode KV cache
             else:
-                if (len(seq.token_ids)-1) % self.token_num_page == 0:
+                if (len(seq.token_ids)-1) % self.page_size == 0:
                     page_num = seq.page_table[-1]
-                    slot_mapping.append(page_num*self.token_num_page)
+                    slot_mapping.append(page_num*self.page_size)
                 else:
-                    offset = (len(seq.token_ids) - 1) % self.token_num_page
+                    offset = (len(seq.token_ids) - 1) % self.page_size
                     page_num = seq.page_table[-1]
-                    slot_mapping.append(page_num*self.token_num_page+offset)
+                    slot_mapping.append(page_num*self.page_size+offset)
 
         slot_mapping_tensor = torch.tensor(
             slot_mapping, dtype=torch.int64, device='cuda')
@@ -61,9 +60,9 @@ class MemoryManager():
         for seq in seqs:
             # prompt KV cache
             if not computed_prompt:
-                for i in range(0, seq.prompt_len, self.token_num_page):
-                    page_num = seq.page_table[i // self.token_num_page]
-                    idx_right = min(seq.prompt_len, i+self.token_num_page)
+                for i in range(0, seq.prompt_len, self.page_size):
+                    page_num = seq.page_table[i // self.page_size]
+                    idx_right = min(seq.prompt_len, i+self.page_size)
                     self.segments[seq.segment_id].k_cache[layer_idx][page_num][0:idx_right-i].copy_(
                         k_cache[i+cu_seqs_len:idx_right+cu_seqs_len])
                     self.segments[seq.segment_id].v_cache[layer_idx][page_num][0:idx_right-i].copy_(
@@ -71,14 +70,14 @@ class MemoryManager():
                 cu_seqs_len += seq.prompt_len
             # decode KV cache
             else:
-                if (len(seq.token_ids)-1) % self.token_num_page == 0:
+                if (len(seq.token_ids)-1) % self.page_size == 0:
                     page_num = seq.page_table[-1]
                     self.segments[seq.segment_id].k_cache[layer_idx][page_num][0].copy_(
                         k_cache[cu_seqs_len])
                     self.segments[seq.segment_id].v_cache[layer_idx][page_num][0].copy_(
                         v_cache[cu_seqs_len])
                 else:
-                    offset = len(seq.token_ids) % self.token_num_page - 1
+                    offset = len(seq.token_ids) % self.page_size - 1
                     page_num = seq.page_table[-1]
                     self.segments[seq.segment_id].k_cache[layer_idx][page_num][offset].copy_(
                         k_cache[cu_seqs_len])
@@ -90,14 +89,14 @@ class MemoryManager():
         for seq in seqs:
             if not seqs[0].computed_prompt:
                 assert len(seq.page_table) == 0
-                num_page = (seq.prompt_len + self.token_num_page -
-                            1) // self.token_num_page
+                num_page = (seq.prompt_len + self.page_size -
+                            1) // self.page_size
                 for _ in range(num_page):
                     seq.page_table.append(
                         self.segments[seq.segment_id].allocate())
             else:
                 assert len(seq.page_table) != 0
-                if (len(seq.token_ids)-1) % self.token_num_page == 0:
+                if (len(seq.token_ids)-1) % self.page_size == 0:
                     seq.page_table.append(
                         self.segments[seq.segment_id].allocate())
 

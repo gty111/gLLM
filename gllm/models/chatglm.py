@@ -192,7 +192,7 @@ class ChatGLMForCausalLM(nn.Module):
             idx_list = input_data.cu_seqs_len - 1
             return self.lm_head(hidden_states[idx_list[1:]])
 
-    def sample(self, logits: torch.Tensor, temperature=0.8, top_p=0.8):
+    def sample(self, logits: torch.Tensor, temperature, top_p):
         sampler = Sampler(logits, top_p, temperature)
         return sampler.forward()
 

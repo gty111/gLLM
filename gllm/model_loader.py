@@ -5,6 +5,7 @@ from safetensors import safe_open
 
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.chatglm import ChatGLMForCausalLM
+from gllm.models.qwen2 import Qwen2ForCausalLM
 
 
 class ModelLoader():
@@ -46,14 +47,15 @@ class ModelLoader():
         if architecture == 'LlamaForCausalLM':
             if 'rope_theta' not in model_config:
                 model_config['rope_theta'] = 10000
-            model = LlamaForCausalLM(model_config)
-            model.load_weights(weights)
-            return model
+            model = LlamaForCausalLM(model_config) 
         elif architecture == 'ChatGLMModel':
             if 'rope_theta' not in model_config:
                 model_config['rope_theta'] = 10000
             model = ChatGLMForCausalLM(model_config)
-            model.load_weights(weights)
-            return model
+        elif architecture == 'Qwen2ForCausalLM':
+            model = Qwen2ForCausalLM(model_config)
         else:
             assert 0
+            
+        model.load_weights(weights)
+        return model

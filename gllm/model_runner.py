@@ -10,24 +10,25 @@ from gllm.memory_manager import MemoryManager
 
 
 class ModelRunner():
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, gpu_memory_utilization, page_size):
         model_loader = ModelLoader(model_path)
 
         self.model = model_loader.load_model()
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True)
         self.memory_manager = MemoryManager(
-            self.model.num_layers, self.model.dtype, 16, self.model.num_kv_heads, self.model.head_dim)
+            gpu_memory_utilization, self.model.num_layers, self.model.dtype, page_size, self.model.num_kv_heads, self.model.head_dim)
 
     def step_once(self,
-                  seqs: List[Sequence]):
+                  seqs: List[Sequence], temperature, top_p):
         if len(seqs) == 0:
             return
         with torch.no_grad():
             input_data = InputData(seqs, self.memory_manager)
             hidden_states = self.model(input_data)
             logits = self.model.compute_logits(input_data, hidden_states)
-            next_tokens = self.model.sample(logits)
+            next_tokens = self.model.sample(
+                logits, temperature, top_p)
             assert len(next_tokens) == len(seqs)
             for i in range(len(next_tokens)):
                 seqs[i].token_ids.append(next_tokens[i])

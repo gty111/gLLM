@@ -11,9 +11,10 @@ if __name__ == '__main__':
     parser.add_argument('--share-gpt-path', type=str, required=True)
     parser.add_argument('--num-prompt', type=int, default=8)
     parser.add_argument('--print-output', action="store_true")
+    parser.add_argument('--gpu-memory-utilization', type=float, default=0.9)
     args = parser.parse_args()
 
-    llm = LLM(args.model_path)
+    llm = LLM(args.model_path, gpu_memory_utilization=args.gpu_memory_utilization)
     with open(args.share_gpt_path) as f:
         completions = json.load(f)
         tokens = []
@@ -27,7 +28,7 @@ if __name__ == '__main__':
             prompt = completion['conversations'][0]['value']
             answer = completion['conversations'][1]['value']
             tokens_each = llm.model_runner.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}])
+                [{"role": "user", "content": prompt}], add_generation_prompt=True)
             input_len = len(tokens_each)
             output_len = len(llm.model_runner.tokenizer.apply_chat_template(
                 [{"role": "assistant", "content": answer}]))

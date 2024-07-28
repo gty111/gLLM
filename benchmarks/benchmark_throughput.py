@@ -60,21 +60,24 @@ def sample_requests(
 
     return filtered_dataset
 
+
 def run_gllm(
     requests: List[Tuple[str, int, int]],
     model: str,
+    gpu_memory_utilization: float,
 ):
     from gllm import LLM
-    llm = LLM(model)
+    llm = LLM(model, gpu_memory_utilization)
     prompts = []
     output_lens = []
     for request in requests:
         prompts.append(request[0])
         output_lens.append(request[2])
     start = time.perf_counter()
-    llm.generate(prompts=prompts,output_lens=output_lens)
+    llm.generate(prompts=prompts, output_lens=output_lens)
     end = time.perf_counter()
     return end - start
+
 
 def run_vllm(
     requests: List[Tuple[str, int, int]],
@@ -259,7 +262,8 @@ def main(args: argparse.Namespace):
         elapsed_time = run_mii(requests, args.model, args.tensor_parallel_size,
                                args.output_len)
     elif args.backend == "gllm":
-        elapsed_time = run_gllm(requests,args.model)
+        elapsed_time = run_gllm(requests, args.model,
+                                args.gpu_memory_utilization)
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
     total_num_tokens = sum(prompt_len + output_len
@@ -284,7 +288,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark the throughput.")
     parser.add_argument("--backend",
                         type=str,
-                        choices=["vllm", "hf", "mii","gllm"],
+                        choices=["vllm", "hf", "mii", "gllm"],
                         default="vllm")
     parser.add_argument("--dataset",
                         type=str,
