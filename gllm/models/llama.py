@@ -18,9 +18,9 @@ class LlamaMLP(nn.Module):
         self.hidden_size = model_config['hidden_size']
         self.intermediate_size = model_config['intermediate_size']
         self.gate_up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size*2, bias=False, dtype=torch.bfloat16, device='cuda')
+            self.hidden_size, self.intermediate_size*2, bias=False, dtype=model_config['torch_dtype'], device='cuda')
         self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=False, dtype=torch.bfloat16, device='cuda')
+            self.intermediate_size, self.hidden_size, bias=False, dtype=model_config['torch_dtype'], device='cuda')
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor):
@@ -37,12 +37,12 @@ class LlamaAttention(nn.Module):
         self.num_key_value_heads = model_config['num_key_value_heads']
 
         self.qkv_proj = nn.Linear(self.hidden_size, (self.num_heads+self.num_key_value_heads*2)
-                                  * self.head_dim, bias=False, dtype=torch.bfloat16, device='cuda')
+                                  * self.head_dim, bias=False, dtype=model_config['torch_dtype'], device='cuda')
         self.o_proj = nn.Linear(self.num_heads*self.head_dim,
-                                self.hidden_size, bias=False, dtype=torch.bfloat16, device='cuda')
+                                self.hidden_size, bias=False, dtype=model_config['torch_dtype'], device='cuda')
 
         self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim, model_config['max_position_embeddings'], model_config['rope_theta'], True, torch.bfloat16)
+            self.head_dim, self.head_dim, model_config['max_position_embeddings'], model_config['rope_theta'], True, model_config['torch_dtype'])
 
         self.scaling = self.head_dim**-0.5
 
@@ -66,10 +66,10 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, layer_id: int, model_config: dict):
         super().__init__()
         self.input_layernorm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'], torch.bfloat16)
+            model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
         self.self_attn = LlamaAttention(layer_id, model_config)
         self.post_attention_layernorm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'], torch.bfloat16)
+            model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
         self.mlp = LlamaMLP(model_config)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]):
@@ -101,9 +101,9 @@ class LlamaModel(nn.Module):
         self.layers = nn.ModuleList([LlamaDecoderLayer(layer_id, model_config) for layer_id in range(
             model_config['num_hidden_layers'])])
         self.embed_tokens = nn.Embedding(
-            model_config['vocab_size'], model_config['hidden_size'], dtype=torch.bfloat16, device='cuda')
+            model_config['vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
         self.norm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'], torch.bfloat16)
+            model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
 
     def forward(self, input_data: InputData):
         hidden_states = self.embed_tokens(input_data.tokens)
@@ -121,14 +121,18 @@ class LlamaForCausalLM(nn.Module):
         super().__init__()
         self.max_model_len = model_config['max_position_embeddings']
         self.num_layers = model_config['num_hidden_layers']
-        self.dtype = torch.bfloat16
+        self.dtype = model_config['torch_dtype']
         self.num_kv_heads = model_config['num_key_value_heads']
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
-        self.finish_tokens = [128001, 128009]
+        if model_config['eos_token_id'] == 128001:
+            # Llama3-8b-chat
+            self.finish_tokens = [model_config['eos_token_id'],128009]
+        else:
+            self.finish_tokens = [model_config['eos_token_id']]
         self.model = LlamaModel(model_config)
         self.model_config = model_config
         self.lm_head = nn.Linear(
-            model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=torch.bfloat16, device='cuda')
+            model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
 
     def forward(self, input_data: InputData):
         return self.model(input_data)

@@ -1,5 +1,6 @@
 import json
 import glob
+import torch
 from safetensors import safe_open
 
 from gllm.models.llama import LlamaForCausalLM
@@ -9,6 +10,14 @@ from gllm.models.chatglm import ChatGLMForCausalLM
 class ModelLoader():
     def __init__(self, model_path):
         self.model_path = model_path
+
+    def get_dtype(self, dtype: str):
+        if dtype == 'float16':
+            return torch.float16
+        elif dtype == 'bfloat16':
+            return torch.bfloat16
+        else:
+            assert 0
 
     def load_weights(self):
         weights = {}
@@ -24,6 +33,8 @@ class ModelLoader():
         config_path = f"{self.model_path}/config.json"
         with open(config_path, 'r') as f:
             model_config = json.load(f)
+        model_config['torch_dtype'] = self.get_dtype(
+            model_config['torch_dtype'])
         return model_config
 
     def load_model(self):
@@ -33,10 +44,14 @@ class ModelLoader():
 
         architecture = model_config['architectures'][0]
         if architecture == 'LlamaForCausalLM':
+            if 'rope_theta' not in model_config:
+                model_config['rope_theta'] = 10000
             model = LlamaForCausalLM(model_config)
             model.load_weights(weights)
             return model
         elif architecture == 'ChatGLMModel':
+            if 'rope_theta' not in model_config:
+                model_config['rope_theta'] = 10000
             model = ChatGLMForCausalLM(model_config)
             model.load_weights(weights)
             return model

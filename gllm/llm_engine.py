@@ -7,7 +7,6 @@ from gllm.allocatorID import AllocatorID
 from gllm.scheduler import Scheduler
 
 
-
 class LLM():
     def __init__(self, model_path):
         self.model_runner = ModelRunner(model_path)
@@ -80,20 +79,19 @@ class LLM():
                 continue
             elif prompt == '\exit':
                 break
-            
-            if architecture == 'LlamaForCausalLM':
-                history.append({"role": "user", "content": prompt})
-                tokens = self.model_runner.tokenizer.apply_chat_template(history)
-            elif architecture == 'ChatGLMModel':
-                tokens = self.model_runner.tokenizer.build_chat_input(prompt,history=history,role='user').get("input_ids").numpy().tolist()[0]
+
+            if architecture == 'ChatGLMModel' and hasattr(self.model_runner.tokenizer, 'build_chat_input'):
+                tokens = self.model_runner.tokenizer.build_chat_input(
+                    prompt, history=history, role='user').get("input_ids").numpy().tolist()[0]
             else:
-                assert 0
+                history.append({"role": "user", "content": prompt})
+                tokens = self.model_runner.tokenizer.apply_chat_template(
+                    history, add_generation_prompt=True)
             seq = self.allocate_seq(tokens)
             output_text = self.model_runner.stream_inference(seq)
-            if architecture == 'LlamaForCausalLM':
-                history.append({"role": "assistant", "content": output_text})
-            elif architecture == 'ChatGLMModel':
-                _ , history = self.model_runner.model.process_response(output_text,history)
+
+            if architecture == 'ChatGLMModel' and hasattr(self.model_runner.tokenizer, 'build_chat_input'):
+                _, history = self.model_runner.model.process_response(
+                    output_text, history)
             else:
-                assert 0
-            # print(f'Answer: {output_text}')
+                history.append({"role": "assistant", "content": output_text})
