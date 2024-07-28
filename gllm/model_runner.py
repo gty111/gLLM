@@ -21,8 +21,6 @@ class ModelRunner():
 
     def step_once(self,
                   seqs: List[Sequence], temperature, top_p):
-        if len(seqs) == 0:
-            return
         with torch.no_grad():
             input_data = InputData(seqs, self.memory_manager)
             hidden_states = self.model(input_data)
@@ -38,11 +36,11 @@ class ModelRunner():
     def free_kv_cache(self, seq: Sequence):
         self.memory_manager.free(seq)
 
-    def stream_inference(self, seq: Sequence):
+    def stream_inference(self, seq: Sequence, temperature: float, top_p: float):
         output_tokens = []
         # -------prefill------
         prefill_start = time.time()
-        self.step_once([seq])
+        self.step_once([seq], temperature, top_p)
         seq.computed_prompt = True
         prefill_end = time.time()
         # ----prefill end-----
@@ -59,7 +57,7 @@ class ModelRunner():
                 current_length = len(response)
             if next_token in self.model.finish_tokens:
                 break
-            self.step_once([seq])
+            self.step_once([seq], temperature, top_p)
         print("\n")
         self.free_kv_cache(seq)
         decode_end = time.time()

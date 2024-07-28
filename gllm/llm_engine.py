@@ -8,11 +8,12 @@ from gllm.scheduler import Scheduler
 
 
 class LLM():
-    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16):
+    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256, num_threshold_free_pages=1024):
         self.model_runner = ModelRunner(
             model_path, gpu_memory_utilization, page_size)
         self.allocatorID = AllocatorID(0, 99999)
-        self.scheduler = Scheduler(self.model_runner)
+        self.scheduler = Scheduler(
+            self.model_runner, max_decode_seqs, num_threshold_free_pages)
 
     def allocate_seq(self, token_ids: List[int], output_len=None):
         return Sequence(self.allocatorID.allocate(), token_ids, output_len)
@@ -67,7 +68,7 @@ class LLM():
         self.free_requests(requests)
         return requests
 
-    def chat(self):
+    def chat(self, temperature=0.6, top_p=0.9):
         architecture = self.model_runner.model.model_config['architectures'][0]
         print("\nWelcome to the chatbot!\n"
               "Type '\exit' to exit the chatbot.\n"
@@ -89,7 +90,8 @@ class LLM():
                 tokens = self.model_runner.tokenizer.apply_chat_template(
                     history, add_generation_prompt=True)
             seq = self.allocate_seq(tokens)
-            output_text = self.model_runner.stream_inference(seq)
+            output_text = self.model_runner.stream_inference(
+                seq, temperature, top_p)
 
             if architecture == 'ChatGLMModel' and hasattr(self.model_runner.tokenizer, 'build_chat_input'):
                 _, history = self.model_runner.model.process_response(
