@@ -5,7 +5,7 @@ from gllm.model_runner import ModelRunner
 
 
 class Scheduler:
-    def __init__(self, model_runner: ModelRunner, max_decode_seqs: int, max_batch_tokens:int) -> None:
+    def __init__(self, model_runner: ModelRunner, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float) -> None:
         self.model_runner = model_runner
         self.prompt_lists: List[Sequence] = []
         self.decode_lists: List[Sequence] = []
@@ -13,7 +13,8 @@ class Scheduler:
 
         self.max_decode_seqs = max_decode_seqs
         self.max_batch_tokens = max_batch_tokens
-        self.num_threshold_free_pages = int(self.model_runner.memory_manager.get_num_free_pages()* 0.2)
+        self.num_threshold_free_pages = int(
+            self.model_runner.memory_manager.get_num_free_pages() * ratio_threshold_free_pages)
 
     def add_requests(self, requests: List[Sequence]):
         self.prompt_lists.extend(requests)
@@ -22,11 +23,15 @@ class Scheduler:
         schedule_lists: List[Sequence] = []
 
         # prompt
+        num_free_pages = self.model_runner.memory_manager.get_num_free_pages()
         if len(self.prompt_lists) != 0 and (
-                self.model_runner.memory_manager.get_num_free_pages() > self.num_threshold_free_pages and len(self.decode_lists) < self.max_decode_seqs):
+                num_free_pages > self.num_threshold_free_pages and len(self.decode_lists) < self.max_decode_seqs):
             cu_seqs_len = 0
             for seq in self.prompt_lists:
-                if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens:
+                if cu_seqs_len + len(
+                    seq.token_ids) <= self.max_batch_tokens and (
+                        cu_seqs_len + len(seq.token_ids)) < (
+                            num_free_pages - self.num_threshold_free_pages) * self.model_runner.memory_manager.page_size:
                     cu_seqs_len += len(seq.token_ids)
                     self.decode_lists.append(seq)
                     schedule_lists.append(seq)
@@ -35,9 +40,11 @@ class Scheduler:
 
         # decode
         if len(schedule_lists) == 0:
-            # set max batch size
-            for seq in self.decode_lists[:self.max_decode_seqs]:
-                schedule_lists.append(seq)
+            decode_batch_size = min(
+                self.max_decode_seqs, num_free_pages)
+            schedule_lists.extend(self.decode_lists[:decode_batch_size])
+
+        assert len(schedule_lists) != 0 and "Try to increase ratio_threshold_free_pages"
 
         # print(
         #     f'#schedule:{len(schedule_lists)} '
