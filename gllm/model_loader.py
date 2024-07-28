@@ -47,15 +47,17 @@ class ModelLoader():
         if architecture == 'LlamaForCausalLM':
             if 'rope_theta' not in model_config:
                 model_config['rope_theta'] = 10000
-            model = LlamaForCausalLM(model_config) 
+            model = LlamaForCausalLM(model_config)
         elif architecture == 'ChatGLMModel':
-            if 'rope_theta' not in model_config:
+            if 'rope_scaling' not in model_config:
                 model_config['rope_theta'] = 10000
+            else:
+                model_config['rope_theta'] = model_config['rope_scaling'] * 10000
             model = ChatGLMForCausalLM(model_config)
         elif architecture == 'Qwen2ForCausalLM':
             model = Qwen2ForCausalLM(model_config)
         else:
             assert 0
-            
+
         model.load_weights(weights)
         return model

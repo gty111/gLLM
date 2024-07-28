@@ -5,13 +5,14 @@ from gllm.model_runner import ModelRunner
 
 
 class Scheduler:
-    def __init__(self, model_runner: ModelRunner, max_decode_seqs: int) -> None:
+    def __init__(self, model_runner: ModelRunner, max_decode_seqs: int, max_batch_tokens:int) -> None:
         self.model_runner = model_runner
         self.prompt_lists: List[Sequence] = []
         self.decode_lists: List[Sequence] = []
         self.finish_lists: Dict[int, Sequence] = {}
 
         self.max_decode_seqs = max_decode_seqs
+        self.max_batch_tokens = max_batch_tokens
         self.num_threshold_free_pages = int(self.model_runner.memory_manager.get_num_free_pages()* 0.2)
 
     def add_requests(self, requests: List[Sequence]):
@@ -25,7 +26,7 @@ class Scheduler:
                 self.model_runner.memory_manager.get_num_free_pages() > self.num_threshold_free_pages and len(self.decode_lists) < self.max_decode_seqs):
             cu_seqs_len = 0
             for seq in self.prompt_lists:
-                if cu_seqs_len + len(seq.token_ids) <= self.model_runner.model.max_model_len:
+                if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens:
                     cu_seqs_len += len(seq.token_ids)
                     self.decode_lists.append(seq)
                     schedule_lists.append(seq)
