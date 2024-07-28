@@ -8,12 +8,12 @@ from gllm.scheduler import Scheduler
 
 
 class LLM():
-    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256, num_threshold_free_pages=1024):
+    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256):
         self.model_runner = ModelRunner(
             model_path, gpu_memory_utilization, page_size)
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
-            self.model_runner, max_decode_seqs, num_threshold_free_pages)
+            self.model_runner, max_decode_seqs)
 
     def allocate_seq(self, token_ids: List[int], output_len=None):
         return Sequence(self.allocatorID.allocate(), token_ids, output_len)
