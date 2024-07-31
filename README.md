@@ -25,15 +25,17 @@ python examples/chat.py --model-path $MODEL_PATH
 
 Offline batch inference
 ```
-python examples/batch_inference.py --model-path $MODEL
-    --share-gpt-path $SHARE_GPT_PATH --num-prompt $NUM_PROMPT
+python examples/batch_inference.py --model-path $MODEL \
+    --share-gpt-path $SHARE_GPT_PATH --num-prompt $NUM_PROMPT \
     --gpu-memory-utilization $GPU_MEMORY_UTILIZATION
 ```
 
 Benchmark with gllm/vllm
 ```
 # replace $BACKEND with gllm or vllm
-python benchmarks/benchmark_throughput.py --model $MODEL --dataset $DATASET --num-prompt $NUM_PROMPT --backend $BACKEND --trust-remote-code --gpu-memory-utilization $GPU_MEMORY_UTILIZATION
+python benchmarks/benchmark_throughput.py --model $MODEL \
+    --dataset $DATASET --num-prompt $NUM_PROMPT --backend $BACKEND \
+    --trust-remote-code --gpu-memory-utilization $GPU_MEMORY_UTILIZATION
 ```
 
 ## Supported Models
