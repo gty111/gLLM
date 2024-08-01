@@ -39,6 +39,7 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
 ```
 
 ## Supported Models
+> Note that gLLM only support load checkpoint from local memory
 
 - llama2-7b and llama3-8b
 - chatglm3-6b and glm4-9b
