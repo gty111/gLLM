@@ -9,15 +9,16 @@ Integreted with features like **continuous batching** and **paged attention**, g
 
 ### Offline performance (Test on llama3-8b)
 
-![](doc/pic/offline_throughput.svg)
+<img src=doc/pic/offline_throughput.svg width=500> 
 
-![](doc/pic/latency_breakdown.svg)
+<img src=doc/pic/latency_breakdown.svg width=500> 
+
 
 ### Online performance (Test on llama3-8b #prompts 2048)
 
-![](doc/pic/online_TTL.svg)
+<img src=doc/pic/online_TTL.svg height=240> 
+<img src=doc/pic/online_ITL.svg height=240>
 
-![](doc/pic/online_ITL.svg)
 
 ### Install gLLM
 ```
