@@ -8,21 +8,21 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from gllm.entrypoints.protocol import (ChatCompletionRequest, CompletionRequest, ModelList, ModelCard, ModelPermission, ChatCompletionStreamResponse,
                                        random_uuid, ChatCompletionResponseStreamChoice, DeltaMessage, CompletionStreamResponse, CompletionResponseStreamChoice)
-from gllm.llm_engine import LLM
+from gllm.async_llm_engine import AsyncLLM, AsyncStream
 
 router = APIRouter()
 
-llm = None
+llm: AsyncLLM = None
 
 
-async def chat_completion_stream_generator(request: ChatCompletionRequest):
+async def chat_completion_stream_generator(stream: AsyncStream, request: ChatCompletionRequest):
     request_id = f"cmpl-{random_uuid()}"
     created_time = int(time.time())
     chunk_object_type = "chat.completion.chunk"
-    for i in range(10):
+    async for text in stream:
         choice_data = ChatCompletionResponseStreamChoice(index=0,
                                                          delta=DeltaMessage(
-                                                             content='a'),
+                                                             content=text),
                                                          logprobs=None,
                                                          finish_reason=None)
         chunk = ChatCompletionStreamResponse(id=request_id,
@@ -34,12 +34,13 @@ async def chat_completion_stream_generator(request: ChatCompletionRequest):
         yield f'data: {data}\n\n'
     yield "data: [DONE]\n\n"
 
-async def completion_stream_generator(request: CompletionRequest):
+
+async def completion_stream_generator(stream: AsyncStream, request: CompletionRequest):
     request_id = f"cmpl-{random_uuid()}"
     created_time = int(time.time())
-    for i in range(10):
+    async for text in stream:
         choice_data = CompletionResponseStreamChoice(index=0,
-                                                     text='a',
+                                                     text=text,
                                                      logprobs=None,
                                                      finish_reason=None,
                                                      stop_reason=None)
@@ -50,6 +51,7 @@ async def completion_stream_generator(request: CompletionRequest):
         data = chunk.model_dump_json(exclude_unset=False)
         yield f'data: {data}\n\n'
     yield "data: [DONE]\n\n"
+
 
 @router.get("/v1/models")
 async def show_available_models():
@@ -63,7 +65,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # print(request.messages)
     # print(llm.model_runner.tokenizer.apply_chat_template(request.messages))
     if request.stream:
-        generator = chat_completion_stream_generator(request)
+        token_ids = llm.model_runner.tokenizer.apply_chat_template(
+            request.messages)
+        stream = await llm.add_requests_async(token_ids, request.max_tokens)
+        generator = chat_completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')
     else:
         return JSONResponse({})
@@ -72,7 +77,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
     if request.stream:
-        generator = completion_stream_generator(request)
+        token_ids = llm.model_runner.tokenizer.encode(request.prompt)
+        stream = await llm.add_requests_async(token_ids, request.max_tokens)
+        generator = completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')
     else:
         return JSONResponse({})
@@ -100,6 +107,6 @@ if __name__ == '__main__':
     parser.add_argument("--model-path", type=str, required=True)
     args = parser.parse_args()
 
-    llm = LLM(args.model_path)
+    llm = AsyncLLM(args.model_path)
 
     asyncio.run(run_server(args))

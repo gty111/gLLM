@@ -9,10 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # pydantic needs the TypedDict from typing_extensions
 from typing_extensions import Annotated, Required, TypedDict
 
-import uuid
-
-def random_uuid() -> str:
-    return str(uuid.uuid4().hex)
+from gllm.utils import random_uuid
 
 class CustomChatCompletionContentPartParam(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
@@ -177,10 +174,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
     add_generation_prompt: Optional[bool] = Field(
         default=True,
-        description=
-        ("If true, the generation prompt will be added to the chat template. "
-         "This is a parameter used by chat template in tokenizer config of the "
-         "model."),
+        description=("If true, the generation prompt will be added to the chat template. "
+                     "This is a parameter used by chat template in tokenizer config of the "
+                     "model."),
     )
     add_special_tokens: Optional[bool] = Field(
         default=False,
@@ -193,12 +189,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
     documents: Optional[List[Dict[str, str]]] = Field(
         default=None,
-        description=
-        ("A list of dicts representing documents that will be accessible to "
-         "the model if it is performing RAG (retrieval-augmented generation)."
-         " If the template does not support RAG, this argument will have no "
-         "effect. We recommend that each document should be a dict containing "
-         "\"title\" and \"text\" keys."),
+        description=("A list of dicts representing documents that will be accessible to "
+                     "the model if it is performing RAG (retrieval-augmented generation)."
+                     " If the template does not support RAG, this argument will have no "
+                     "effect. We recommend that each document should be a dict containing "
+                     "\"title\" and \"text\" keys."),
     )
     chat_template: Optional[str] = Field(
         default=None,
@@ -250,7 +245,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "for guided json decoding."))
 
     # doc: end-chat-completion-extra-params
-
 
     @model_validator(mode='before')
     @classmethod
@@ -354,10 +348,9 @@ class CompletionRequest(OpenAIBaseModel):
     )
     response_format: Optional[ResponseFormat] = Field(
         default=None,
-        description=
-        ("Similar to chat completion, this parameter specifies the format of "
-         "output. Only {'type': 'json_object'} or {'type': 'text' } is "
-         "supported."),
+        description=("Similar to chat completion, this parameter specifies the format of "
+                     "output. Only {'type': 'json_object'} or {'type': 'text' } is "
+                     "supported."),
     )
     guided_json: Optional[Union[str, dict, BaseModel]] = Field(
         default=None,
@@ -436,7 +429,6 @@ class EmbeddingRequest(BaseModel):
     additional_data: Optional[Any] = None
 
     # doc: end-embedding-pooling-params
-
 
 
 class CompletionLogProbs(OpenAIBaseModel):
