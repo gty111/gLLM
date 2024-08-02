@@ -37,7 +37,6 @@ class ModelRunner():
         self.memory_manager.free(seq)
 
     def stream_inference(self, seq: Sequence, temperature: float, top_p: float):
-        output_tokens = []
         # -------prefill------
         prefill_start = time.time()
         self.step_once([seq], temperature, top_p)
@@ -47,14 +46,9 @@ class ModelRunner():
 
         # ------decode-------
         decode_start = time.time()
-        current_length = 0
         while True:
             next_token = seq.token_ids[-1]
-            output_tokens.append(next_token)
-            if len(output_tokens) % 10 == 0 or next_token in self.model.finish_tokens:
-                response = self.tokenizer.decode(output_tokens, True, True)
-                print(response[current_length:], end='', flush=True)
-                current_length = len(response)
+            print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
             if next_token in self.model.finish_tokens:
                 break
             self.step_once([seq], temperature, top_p)
@@ -69,8 +63,8 @@ class ModelRunner():
         prefill_rate = round(
             seq.prompt_len / elapsed_prefill_time, 2)
         decode_rate = round(
-            len(output_tokens) / elapsed_decode_time, 2)
+            len(seq.token_ids[seq.prompt_len:]) / elapsed_decode_time, 2)
         print(
-            f"#input: {seq.prompt_len} #output: {len(output_tokens)} elapsed time: {elapsed_time} s rate(prefill/decode): {prefill_rate}/{decode_rate} toks/s")
+            f"#input: {seq.prompt_len} #output: {len(seq.token_ids[seq.prompt_len:])} elapsed time: {elapsed_time} s rate(prefill/decode): {prefill_rate}/{decode_rate} toks/s")
         # -----metric end--------
-        return self.tokenizer.decode(output_tokens, True, True)
+        return self.tokenizer.decode(seq.token_ids[seq.prompt_len:], True, True)

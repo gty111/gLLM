@@ -66,7 +66,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # print(llm.model_runner.tokenizer.apply_chat_template(request.messages))
     if request.stream:
         token_ids = llm.model_runner.tokenizer.apply_chat_template(
-            request.messages)
+            request.messages, add_generation_prompt=True)
         stream = await llm.add_requests_async(token_ids, request.max_tokens)
         generator = chat_completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')

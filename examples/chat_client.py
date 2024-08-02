@@ -27,7 +27,7 @@ chat_completion = client.chat.completions.create(
         "The Los Angeles Dodgers won the World Series in 2020."
     }, {
         "role": "user",
-        "content": "Where was it played?"
+        "content": "Can you tell a fairy tale?"
     }],
     model=model,
     stream=True
@@ -35,4 +35,5 @@ chat_completion = client.chat.completions.create(
 
 print("Chat completion results:")
 for i in chat_completion:
-    print(i)
+    print(i.choices[0].delta.content,end='',flush=True)
+print()

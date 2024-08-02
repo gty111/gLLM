@@ -1,6 +1,7 @@
 import json
 import glob
 import torch
+from logger import logger
 from safetensors import safe_open
 
 from gllm.models.llama import LlamaForCausalLM
@@ -58,6 +59,6 @@ class ModelLoader():
             model = Qwen2ForCausalLM(model_config)
         else:
             assert 0
-
+        logger.info("loading model...")
         model.load_weights(weights)
         return model
