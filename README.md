@@ -16,8 +16,7 @@ Integreted with features like **continuous batching** and **paged attention**, g
 
 ### Online performance (Test on llama3-8b #prompts 2048)
 
-<img src=doc/pic/online_TTL.svg height=240> 
-<img src=doc/pic/online_ITL.svg height=240>
+<img src=doc/pic/online_TTL.svg height=240> <img src=doc/pic/online_ITL.svg height=240>
 
 
 ### Install gLLM
