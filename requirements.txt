@@ -7,3 +7,7 @@ wheel
 tqdm
 transformers
 vllm-flash-attn==2.5.9.post1
+fastapi
+uvicorn
+openai
+logger

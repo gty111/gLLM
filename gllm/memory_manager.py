@@ -1,5 +1,6 @@
 import torch
 from typing import List
+from logger import logger
 
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
@@ -21,7 +22,7 @@ class MemoryManager():
         num_max_pages = free_mem_size // (
             2*num_layers*page_size*kv_head_num*kv_head_dim*2)
         self.page_num_segment = int(num_max_pages * gpu_memory_utilization)
-        print(f'Allocate {self.page_num_segment} pages')
+        logger.info(f'Allocate {self.page_num_segment} pages')
         self.segments = [
             Segment(num_layers, self.page_num_segment, page_size, kv_head_num, kv_head_dim, dtype)]
 

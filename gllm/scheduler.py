@@ -64,3 +64,6 @@ class Scheduler:
                 self.model_runner.free_kv_cache(seq)
         for seq in finish_lists:
             self.decode_lists.remove(seq)
+
+    def has_seqs(self):
+        return len(self.prompt_lists) + len(self.decode_lists) != 0
