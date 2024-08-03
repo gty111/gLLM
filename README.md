@@ -1,5 +1,11 @@
-# gLLM
+<p align="center">
+    <img src=doc/pic/gLLM.svg>
+</p>
+
+<h3 align="center">
 Lightweight, easy, fast and cheap LLM serving
+</h3>
+
 
 ---
 
