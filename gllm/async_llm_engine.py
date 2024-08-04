@@ -3,6 +3,7 @@ from logger import logger
 from typing import List, Dict
 
 from gllm.utils import make_async
+from gllm.sequence import Sequence
 from gllm.llm_engine import LLM
 
 
@@ -57,7 +58,12 @@ class AsyncLLM(LLM):
                          max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages)
 
         self.async_streams: Dict[int, AsyncStream] = {}
-        self.background_engine = None
+        self.schedule_engine = None
+        self.process_output_engine = None
+        self.gpu_engine = None
+        self.schedule_outputs: asyncio.Queue = asyncio.Queue(maxsize=2)
+        self.run_outputs: asyncio.Queue = asyncio.Queue()
+        
 
     async def add_requests_async(self, token_ids: List[int], output_len: int):
         seq = self.allocate_seq(token_ids, output_len)
@@ -81,16 +87,28 @@ class AsyncLLM(LLM):
             del self.async_streams[seq.seq_id]
             finished_seqs.append(seq)
         self.free_requests(finished_seqs)
+        
+        
+    async def run_schedule_engine(self):
+        while True:
+            scheduled_seqs = self.scheduler.schedule()
+            self.schedule_outputs.put(scheduled_seqs)
+        
+    async def run_gpu_engine(self):
+        while True:
+            scheduled_seqs = await self.schedule_outputs.get()
+            next_tokens = await make_async(self.model_runner.step_once)(seqs=scheduled_seqs, temperature=0.6, top_p=0.9)
+            self.run_outputs.put_nowait(next_tokens)
 
-    async def run_engine(self):
-        while self.scheduler.has_seqs():
-            await self.step_async(temperature=0.6, top_p=0.9)
-        self.background_engine = None
+    # async def run_engine(self):
+    #     while self.scheduler.has_seqs():
+    #         await self.step_async(temperature=0.6, top_p=0.9)
+    #     self.background_engine = None
 
-    def start_background_engine(self):
-        self._background_loop_unshielded = asyncio.get_event_loop(
-        ).create_task(self.run_engine())
-        self._background_loop_unshielded.add_done_callback(
-            _log_task_completion)
-        self.background_engine = asyncio.shield(
-            self._background_loop_unshielded)
+    # def start_background_engine(self):
+    #     self._background_loop_unshielded = asyncio.get_event_loop(
+    #     ).create_task(self.run_engine())
+    #     self._background_loop_unshielded.add_done_callback(
+    #         _log_task_completion)
+    #     self.background_engine = asyncio.shield(
+    #         self._background_loop_unshielded)
