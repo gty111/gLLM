@@ -74,11 +74,11 @@ python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
 ```
 
 ## Supported Models
-> Note that gLLM only support load model from local memory
+> Note that gLLM only support load model of safetensor format from local memory
 
-- llama2-7b and llama3-8b
-- chatglm3-6b and glm4-9b
-- qwen2-7b
+- Llama: llama2-7b, llama3-8b, llama3.1-8b
+- ChatGLM: chatglm3-6b and glm4-9b
+- Qwen2: qwen2-7b
 
 ## Limited functionality
 

@@ -128,7 +128,12 @@ class LlamaForCausalLM(nn.Module):
             # Llama3-8b-chat
             self.finish_tokens = [model_config['eos_token_id'],128009]
         else:
-            self.finish_tokens = [model_config['eos_token_id']]
+            if type(model_config['eos_token_id']) == int:
+                self.finish_tokens = [model_config['eos_token_id']]
+            elif type(model_config['eos_token_id']) == list:
+                self.finish_tokens = model_config['eos_token_id']
+            else:
+                assert 0
         self.model = LlamaModel(model_config)
         self.model_config = model_config
         self.lm_head = nn.Linear(
