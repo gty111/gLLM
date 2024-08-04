@@ -71,12 +71,12 @@ class AsyncLLM(LLM):
 
     async def step_async(self, temperature, top_p):
         scheduled_seqs = self.scheduler.schedule()
-        await make_async(self.model_runner.step_once)(seqs=scheduled_seqs, temperature=temperature, top_p=top_p)
+        next_tokens = await make_async(self.model_runner.step_once)(seqs=scheduled_seqs, temperature=temperature, top_p=top_p)
+        self.scheduler.update_seqs(scheduled_seqs, next_tokens)
         for seq in scheduled_seqs:
             self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
-        self.scheduler.update_finish_seqs()
         finished_seqs = []
-        for seq in self.scheduler.finish_lists.values():
+        for seq in self.scheduler.finish_lists:
             self.async_streams[seq.seq_id].finish()
             del self.async_streams[seq.seq_id]
             finished_seqs.append(seq)

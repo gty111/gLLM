@@ -28,10 +28,8 @@ class ModelRunner():
             next_tokens = self.model.sample(
                 logits, temperature, top_p)
             assert len(next_tokens) == len(seqs)
-            for i in range(len(next_tokens)):
-                seqs[i].token_ids.append(next_tokens[i])
-                if not input_data.computed_prompt:
-                    seqs[i].computed_prompt = True
+            return next_tokens
+            
 
     def free_kv_cache(self, seq: Sequence):
         self.memory_manager.free(seq)
@@ -39,7 +37,8 @@ class ModelRunner():
     def stream_inference(self, seq: Sequence, temperature: float, top_p: float):
         # -------prefill------
         prefill_start = time.time()
-        self.step_once([seq], temperature, top_p)
+        next_token = self.step_once([seq], temperature, top_p)[0]
+        seq.token_ids.append(next_token)
         seq.computed_prompt = True
         prefill_end = time.time()
         # ----prefill end-----
@@ -47,11 +46,11 @@ class ModelRunner():
         # ------decode-------
         decode_start = time.time()
         while True:
-            next_token = seq.token_ids[-1]
             print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
             if next_token in self.model.finish_tokens:
                 break
-            self.step_once([seq], temperature, top_p)
+            next_token = self.step_once([seq], temperature, top_p)[0]
+            seq.token_ids.append(next_token)
         print("\n")
         self.free_kv_cache(seq)
         decode_end = time.time()

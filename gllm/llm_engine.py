@@ -24,13 +24,13 @@ class LLM():
 
     def free_requests(self, requests: List[Sequence]):
         for seq in requests:
-            del self.scheduler.finish_lists[seq.seq_id]
+            self.scheduler.finish_lists.remove(seq)
             self.allocatorID.free(seq.seq_id)
 
     def step(self, temperature, top_p):
         scheduled_seqs = self.scheduler.schedule()
-        self.model_runner.step_once(scheduled_seqs, temperature, top_p)
-        self.scheduler.update_finish_seqs()
+        next_tokens = self.model_runner.step_once(scheduled_seqs, temperature, top_p)
+        self.scheduler.update_seqs(scheduled_seqs,next_tokens)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None, temperature=0.6, top_p=0.9):
         requests: List[Sequence] = []

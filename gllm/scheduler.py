@@ -9,7 +9,7 @@ class Scheduler:
         self.model_runner = model_runner
         self.prompt_lists: List[Sequence] = []
         self.decode_lists: List[Sequence] = []
-        self.finish_lists: Dict[int, Sequence] = {}
+        self.finish_lists: List[Sequence] = []
 
         self.max_decode_seqs = max_decode_seqs
         self.max_batch_tokens = max_batch_tokens
@@ -54,15 +54,20 @@ class Scheduler:
         #     f'memory_util:{self.model_runner.memory_manager.get_memory_util()} %')
         return schedule_lists
 
-    def update_finish_seqs(self):
+    def update_seqs(self,seqs:List[Sequence],next_tokens:List[int]):
+        # append next token to each seq
+        for i in range(len(next_tokens)):
+            seqs[i].token_ids.append(next_tokens[i])
+            if not seqs[i].computed_prompt:
+                seqs[i].computed_prompt = True
         # check finished seqs
-        finish_lists = []
+        finish_lists_each = []
         for seq in self.decode_lists:
             if seq.token_ids[-1] in self.model_runner.model.finish_tokens or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
-                finish_lists.append(seq)
-                self.finish_lists[seq.seq_id] = seq
+                finish_lists_each.append(seq)
+                self.finish_lists.append(seq)
                 self.model_runner.free_kv_cache(seq)
-        for seq in finish_lists:
+        for seq in finish_lists_each:
             self.decode_lists.remove(seq)
 
     def has_seqs(self):
