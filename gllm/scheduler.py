@@ -43,8 +43,6 @@ class Scheduler:
         if len(schedule_lists) == 0:
             decode_batch_size = min(
                 self.max_decode_seqs, num_free_pages)
-            if decode_batch_size > 256:
-                decode_batch_size = decode_batch_size // 2
             schedule_lists = self.decode_lists[:decode_batch_size]
             self.decode_lists = self.decode_lists[decode_batch_size:]
             
@@ -52,12 +50,12 @@ class Scheduler:
 
         assert len(schedule_lists) != 0 and "Try to increase ratio_threshold_free_pages"
 
-        print(
-            f'#schedule:{len(schedule_lists)} '
-            f'#prompt:{len(self.prompt_lists)} '
-            f'#decode:{len(self.decode_lists)} '
-            f'#finish:{len(self.finish_lists)} '
-            f'memory_util:{self.model_runner.memory_manager.get_memory_util()} %')
+        # print(
+        #     f'#schedule:{len(schedule_lists)} '
+        #     f'#prompt:{len(self.prompt_lists)} '
+        #     f'#decode:{len(self.decode_lists)} '
+        #     f'#finish:{len(self.finish_lists)} '
+        #     f'memory_util:{self.model_runner.memory_manager.get_memory_util()} %')
         return schedule_lists
 
     def update_seqs(self,seqs:List[Sequence],next_tokens:List[int]):

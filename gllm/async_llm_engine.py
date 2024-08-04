@@ -53,7 +53,7 @@ def _log_task_completion(task: asyncio.Task) -> None:
 
 class AsyncLLM(LLM):
 
-    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=512, max_batch_tokens=8192, ratio_threshold_free_pages=0.2):
+    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256, max_batch_tokens=8192, ratio_threshold_free_pages=0.2):
         super().__init__(model_path, gpu_memory_utilization, page_size,
                          max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages)
 
