@@ -68,7 +68,6 @@ class Scheduler:
         for seq in seqs:
             if seq.token_ids[-1] in self.model_runner.model.finish_tokens or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
                 self.finish_lists.append(seq)
-                self.model_runner.free_kv_cache(seq)
             else:
                 self.decode_lists.append(seq)
         self.num_schedule_running -= 1

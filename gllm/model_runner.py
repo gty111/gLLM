@@ -27,6 +27,9 @@ class ModelRunner():
             logits = self.model.compute_logits(input_data, hidden_states)
             next_tokens = self.model.sample(
                 logits, temperature, top_p)
+            for seq in seqs:
+                if seq.token_ids[-1] in self.model.finish_tokens or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
+                    self.free_kv_cache(seq)
             assert len(next_tokens) == len(seqs)
             return next_tokens
             

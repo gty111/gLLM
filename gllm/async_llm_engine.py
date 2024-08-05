@@ -1,11 +1,13 @@
 import asyncio
+import multiprocessing as mp
 from logger import logger
 from typing import List, Dict
+from multiprocessing import Queue,Process
 
 from gllm.utils import make_async
 from gllm.sequence import Sequence
 from gllm.llm_engine import LLM
-
+from gllm.model_runner import ModelRunner
 
 class AsyncStream:
 
@@ -61,9 +63,13 @@ class AsyncLLM(LLM):
         self.schedule_engine = None
         self.process_output_engine = None
         self.gpu_engine = None
-        self.schedule_outputs: asyncio.Queue = asyncio.Queue()
-        self.run_outputs: asyncio.Queue = asyncio.Queue()
+
+        self.ctx = mp.get_context('spawn')
+        self.schedule_outputs: Queue = self.ctx.Queue()
+        self.run_outputs: Queue = self.ctx.Queue()
         self.control_schedule : asyncio.Queue = asyncio.Queue()
+
+        self.start_gpu_engine()
         
 
     async def add_requests_async(self, token_ids: List[int], output_len: int):
@@ -74,26 +80,13 @@ class AsyncLLM(LLM):
         await make_async(self.add_requests)(requests=[seq])
         if self.schedule_engine is None:
             self.start_schedule_engine()
-        return stream
-
-    # async def step_async(self, temperature, top_p):
-    #     scheduled_seqs = self.scheduler.schedule()
-    #     next_tokens = await make_async(self.model_runner.step_once)(seqs=scheduled_seqs, temperature=temperature, top_p=top_p)
-    #     self.scheduler.update_seqs(scheduled_seqs, next_tokens)
-    #     for seq in scheduled_seqs:
-    #         self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
-    #     finished_seqs = []
-    #     for seq in self.scheduler.finish_lists:
-    #         self.async_streams[seq.seq_id].finish()
-    #         del self.async_streams[seq.seq_id]
-    #         finished_seqs.append(seq)
-    #     self.free_requests(finished_seqs)
-        
+        return stream       
         
     async def run_schedule_engine(self):
         # logger.info("Start schedule engine")
         while True:
             await self.control_schedule.get()
+            # print("SCHEDULE: start")
             # logger.info("schedule once")
             if not self.scheduler.has_seqs():
                 self.schedule_engine = None
@@ -103,23 +96,28 @@ class AsyncLLM(LLM):
             if not self.scheduler.has_seqs_cur():
                 continue
             scheduled_seqs = self.scheduler.schedule()
+            # print("SCHEDULE: end")
             self.schedule_outputs.put_nowait(scheduled_seqs)
         
-    async def run_gpu_engine(self):
-        # logger.info("Start gpu engine")
+    def run_gpu_engine(schedule_outputs:Queue,run_outputs:Queue,model_runner:ModelRunner):
+        print('start gpu engine process')
         while True:
-            scheduled_seqs = await self.schedule_outputs.get()
-            # logger.info("gpu once")
-            next_tokens = await make_async(self.model_runner.step_once)(seqs=scheduled_seqs, temperature=0.6, top_p=0.9)
-            self.run_outputs.put_nowait((scheduled_seqs,next_tokens))
+            # print("GPU: wait")
+            scheduled_seqs = schedule_outputs.get()
+            # print("GPU: start")
+            next_tokens = model_runner.step_once(seqs=scheduled_seqs, temperature=0.6, top_p=0.9)
+            # print("GPU: end")
+            run_outputs.put_nowait((scheduled_seqs,next_tokens))
             
     async def run_process_output_engine(self):
-        # logger.info("Start process output engine")
+        # print("start output process")
         self.control_schedule.put_nowait(0)
         while True:
             self.control_schedule.put_nowait(0)
-            outputs = await self.run_outputs.get()
-            # logger.info("process output once")
+            # print("OUTPUT: wait")
+            while self.run_outputs.empty():
+                await asyncio.sleep(0)
+            outputs = self.run_outputs.get()
             scheduled_seqs:List[Sequence] = outputs[0]
             next_tokens:List[int] = outputs[1]
             self.scheduler.update_seqs(scheduled_seqs, next_tokens)
@@ -131,10 +129,12 @@ class AsyncLLM(LLM):
                 del self.async_streams[seq.seq_id]
                 finished_seqs.append(seq)
             self.free_requests(finished_seqs)
-    
-    def start_background_engine(self):
-        self.start_gpu_engine()
-        self.start_process_output_engine()
+            # print("OUTPUT: end")
+
+
+    def start_gpu_engine(self):
+        self.gpu_engine = self.ctx.Process(target=AsyncLLM.run_gpu_engine,args=(self.schedule_outputs,self.run_outputs,self.model_runner))
+        self.gpu_engine.start()
     
     def start_schedule_engine(self):
         # launch schedule engine
@@ -145,18 +145,8 @@ class AsyncLLM(LLM):
         self.schedule_engine = asyncio.shield(
             self._schedule_task)
         
-        if self.gpu_engine is None and self.process_output_engine is None:
-            self.start_background_engine()
-    
-    
-    def start_gpu_engine(self):    
-        # launch gpu engine
-        self._gpu_task = asyncio.get_event_loop(
-        ).create_task(self.run_gpu_engine())
-        self._gpu_task.add_done_callback(
-            _log_task_completion)
-        self.gpu_engine = asyncio.shield(
-            self._gpu_task)
+        if self.process_output_engine is None:
+            self.start_process_output_engine()
 
     def start_process_output_engine(self):
         # launch process output engine
@@ -166,16 +156,3 @@ class AsyncLLM(LLM):
             _log_task_completion)
         self.process_output_engine = asyncio.shield(
             self._process_output_task)
-
-    # async def run_engine(self):
-    #     while self.scheduler.has_seqs():
-    #         await self.step_async(temperature=0.6, top_p=0.9)
-    #     self.background_engine = None
-
-    # def start_background_engine(self):
-    #     self._background_loop_unshielded = asyncio.get_event_loop(
-    #     ).create_task(self.run_engine())
-    #     self._background_loop_unshielded.add_done_callback(
-    #         _log_task_completion)
-    #     self.background_engine = asyncio.shield(
-    #         self._background_loop_unshielded)
