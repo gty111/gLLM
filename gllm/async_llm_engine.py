@@ -1,5 +1,6 @@
 import asyncio
 import multiprocessing as mp
+import time
 from logger import logger
 from typing import List, Dict
 from multiprocessing import Queue,Process
@@ -83,30 +84,28 @@ class AsyncLLM(LLM):
         return stream       
         
     async def run_schedule_engine(self):
-        # logger.info("Start schedule engine")
         while True:
             await self.control_schedule.get()
-            # print("SCHEDULE: start")
-            # logger.info("schedule once")
+            # print("SCHEDULE: start",time.time())
             if not self.scheduler.has_seqs():
                 self.schedule_engine = None
                 self.control_schedule.put_nowait(0)
-                # logger.info("Quit schedule engine")
                 return
             if not self.scheduler.has_seqs_cur():
                 continue
             scheduled_seqs = self.scheduler.schedule()
-            # print("SCHEDULE: end")
+            # time.sleep(0.01)
+            # print("SCHEDULE: end",time.time())
             self.schedule_outputs.put_nowait(scheduled_seqs)
         
     def run_gpu_engine(schedule_outputs:Queue,run_outputs:Queue,model_runner:ModelRunner):
         print('start gpu engine process')
         while True:
-            # print("GPU: wait")
+            # print("GPU: wait",time.time())
             scheduled_seqs = schedule_outputs.get()
-            # print("GPU: start")
+            # print("GPU: start",time.time())
             next_tokens = model_runner.step_once(seqs=scheduled_seqs, temperature=0.6, top_p=0.9)
-            # print("GPU: end")
+            # print("GPU: end",time.time())
             run_outputs.put_nowait((scheduled_seqs,next_tokens))
             
     async def run_process_output_engine(self):
@@ -114,10 +113,11 @@ class AsyncLLM(LLM):
         self.control_schedule.put_nowait(0)
         while True:
             self.control_schedule.put_nowait(0)
-            # print("OUTPUT: wait")
+            # print("OUTPUT: wait",time.time())
             while self.run_outputs.empty():
                 await asyncio.sleep(0)
             outputs = self.run_outputs.get()
+            # print("OUTPUT: start",time.time())
             scheduled_seqs:List[Sequence] = outputs[0]
             next_tokens:List[int] = outputs[1]
             self.scheduler.update_seqs(scheduled_seqs, next_tokens)
@@ -129,7 +129,8 @@ class AsyncLLM(LLM):
                 del self.async_streams[seq.seq_id]
                 finished_seqs.append(seq)
             self.free_requests(finished_seqs)
-            # print("OUTPUT: end")
+            # time.sleep(0.01)
+            # print("OUTPUT: end",time.time())
 
 
     def start_gpu_engine(self):
