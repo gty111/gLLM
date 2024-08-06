@@ -85,34 +85,37 @@ class AsyncLLM(LLM):
         
     async def run_schedule_engine(self):
         while True:
-            await self.control_schedule.get()
+            num_free_pages = await self.control_schedule.get()
             # print("SCHEDULE: start",time.time())
             if not self.scheduler.has_seqs():
                 self.schedule_engine = None
-                self.control_schedule.put_nowait(0)
+                self.control_schedule.put_nowait(num_free_pages)
                 return
-            if not self.scheduler.has_seqs_cur():
+            if not self.scheduler.has_seqs_cur() or self.scheduler.delay_schedule():
+                self.control_schedule.put_nowait(num_free_pages)
+                await asyncio.sleep(0)
                 continue
-            scheduled_seqs = self.scheduler.schedule()
-            # time.sleep(0.01)
+            scheduled_seqs = self.scheduler.schedule(num_free_pages)
+            # time.sleep(0.015)
             # print("SCHEDULE: end",time.time())
             self.schedule_outputs.put_nowait(scheduled_seqs)
         
     def run_gpu_engine(schedule_outputs:Queue,run_outputs:Queue,model_runner:ModelRunner):
-        print('start gpu engine process')
+        logger.info('start gpu engine process')
         while True:
             # print("GPU: wait",time.time())
             scheduled_seqs = schedule_outputs.get()
             # print("GPU: start",time.time())
             next_tokens = model_runner.step_once(seqs=scheduled_seqs, temperature=0.6, top_p=0.9)
             # print("GPU: end",time.time())
-            run_outputs.put_nowait((scheduled_seqs,next_tokens))
+            run_outputs.put_nowait((scheduled_seqs,next_tokens,model_runner.memory_manager.get_num_free_pages()))
             
     async def run_process_output_engine(self):
         # print("start output process")
-        self.control_schedule.put_nowait(0)
+        num_free_pages = self.model_runner.memory_manager.get_num_free_pages()
+        self.control_schedule.put_nowait(num_free_pages)
         while True:
-            self.control_schedule.put_nowait(0)
+            self.control_schedule.put_nowait(num_free_pages)
             # print("OUTPUT: wait",time.time())
             while self.run_outputs.empty():
                 await asyncio.sleep(0)
@@ -120,6 +123,7 @@ class AsyncLLM(LLM):
             # print("OUTPUT: start",time.time())
             scheduled_seqs:List[Sequence] = outputs[0]
             next_tokens:List[int] = outputs[1]
+            num_free_pages = outputs[2]
             self.scheduler.update_seqs(scheduled_seqs, next_tokens)
             for seq in scheduled_seqs:
                 self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
@@ -129,7 +133,7 @@ class AsyncLLM(LLM):
                 del self.async_streams[seq.seq_id]
                 finished_seqs.append(seq)
             self.free_requests(finished_seqs)
-            # time.sleep(0.01)
+            # time.sleep(0.015)
             # print("OUTPUT: end",time.time())
 
 
