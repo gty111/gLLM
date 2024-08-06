@@ -70,6 +70,7 @@ class BenchmarkMetrics:
     median_itl_ms: float
     std_itl_ms: float
     p99_itl_ms: float
+    avg_latency_ms: float
 
 
 def sample_sharegpt_requests(
@@ -242,6 +243,7 @@ def calculate_metrics(
     itls: List[float] = []
     tpots: List[float] = []
     ttfts: List[float] = []
+    latencys: List[float] = []
     for i in range(len(outputs)):
         if outputs[i].success:
             # We use the tokenizer to count the number of output tokens for all
@@ -258,6 +260,7 @@ def calculate_metrics(
                     (outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
+            latencys.append(outputs[i].latency)
             completed += 1
         else:
             actual_output_lens.append(0)
@@ -287,6 +290,7 @@ def calculate_metrics(
         median_itl_ms=np.median(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
+        avg_latency_ms=np.mean(latencys) * 1000,
     )
 
     return metrics, actual_output_lens
@@ -374,6 +378,7 @@ async def benchmark(
                                     metrics.input_throughput))
     print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
                                     metrics.output_throughput))
+    print("{:<40} {:<10.2f}".format("Avg latency (ms):", metrics.avg_latency_ms))
     print("{s:{c}^{n}}".format(s='Time to First Token', n=50, c='-'))
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):",
