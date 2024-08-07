@@ -57,7 +57,6 @@ class ModelRunner():
             next_token = self.step_once([seq], temperature, top_p)[0]
             seq.token_ids.append(next_token)
         print("\n")
-        self.free_kv_cache(seq)
         decode_end = time.time()
         # ------decode end-------
         # ------metric---------
