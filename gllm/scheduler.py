@@ -27,7 +27,7 @@ class Scheduler:
     def add_requests(self, requests: List[Sequence]):
         self.prompt_lists.extend(requests)
 
-    def schedule(self, num_free_pages:int):
+    def schedule(self, num_free_pages:int, iflog:bool=False):
         self.num_free_pages = num_free_pages
         schedule_lists: List[Sequence] = []
 
@@ -55,7 +55,7 @@ class Scheduler:
         assert len(schedule_lists) != 0 and "Try to increase ratio_threshold_free_pages"
 
         cur_time = time.time()
-        if cur_time - self.log_time > 2:
+        if iflog and cur_time - self.log_time > 2:
             self.log_time = cur_time
             print(
                 '#schedule: %4d #prompt: %4d #decode: %4d #finish: %4d memory_util: %2.2f %%' 

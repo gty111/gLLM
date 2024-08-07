@@ -95,7 +95,7 @@ class AsyncLLM(LLM):
                 self.control_schedule.put_nowait(num_free_pages)
                 await asyncio.sleep(0)
                 continue
-            scheduled_seqs = self.scheduler.schedule(num_free_pages)
+            scheduled_seqs = self.scheduler.schedule(num_free_pages, True)
             # time.sleep(0.015)
             # print("SCHEDULE: end",time.time())
             self.schedule_outputs.put_nowait(scheduled_seqs)
