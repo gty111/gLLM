@@ -11,7 +11,7 @@ Lightweight, easy, fast and cheap LLM serving
 
 ## What is gLLM?
 
-Integreted with features like **continuous batching** and **paged attention**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. Adopting part of codebase from vLLM, gLLM provides **faster** offline/online inference speed than vLLM with **lightweight** overhead and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
+Integreted with features like **continuous batching**, **paged attention** and **pipeline schedule**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. Adopting part of codebase from vLLM, gLLM provides **faster** offline/online inference speed than vLLM with **lightweight** overhead and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 ### Offline performance (Test on llama3-8b)
 
@@ -20,9 +20,9 @@ Integreted with features like **continuous batching** and **paged attention**, g
 <img src=doc/pic/latency_breakdown.svg width=500> 
 
 
-### Online performance (Test on llama3-8b #prompts 2048)
+### Online performance (Test on llama3.1-8b)
 
-<img src=doc/pic/online_TTL.svg height=240> <img src=doc/pic/online_ITL.svg height=240>
+<img src=doc/pic/online_avg_latency.svg height=240>
 
 
 ### Install gLLM
@@ -52,7 +52,10 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
 
 ### Launch online serving
 ```
+# w/o pipeline schedule
 python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH
+# w/ pipeline schedule
+python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH --pipe-schedule
 ```
 
 ### Client Completions
@@ -72,6 +75,14 @@ python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
         --num-prompts $NUM_PROMPTS --port $PORT --trust-remote-code \
         --request-rate $REQUEST_RATE
 ```
+
+## Pipeline Schedule
+
+### Comparison between baseline schedule and pipeline schedule
+<img src=doc/pic/pipeline_execution.svg height=240>
+
+### Architecture of pipeline schedule
+<img src=doc/pic/pipeline_architecture.svg height=240>
 
 ## Supported Models
 > Note that gLLM only support load model of safetensor format from local memory

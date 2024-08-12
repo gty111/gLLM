@@ -27,6 +27,11 @@ class ModelRunner():
             logits = self.model.compute_logits(input_data, hidden_states)
             next_tokens = self.model.sample(
                 logits, temperature, top_p)
+            for idx,seq in enumerate(seqs):
+                if next_tokens[idx] in self.model.finish_tokens or len(seq.token_ids) + 1 - seq.prompt_len >= seq.output_len:
+                    # print(f"free {seq.seq_id}")
+                    self.free_kv_cache(seq)
+            # print(f"memory_util:{self.memory_manager.get_memory_util()}")
             assert len(next_tokens) == len(seqs)
             return next_tokens
             
@@ -52,7 +57,6 @@ class ModelRunner():
             next_token = self.step_once([seq], temperature, top_p)[0]
             seq.token_ids.append(next_token)
         print("\n")
-        self.free_kv_cache(seq)
         decode_end = time.time()
         # ------decode end-------
         # ------metric---------

@@ -30,7 +30,8 @@ chat_completion = client.chat.completions.create(
         "content": "Can you tell a fairy tale?"
     }],
     model=model,
-    stream=True
+    stream=True,
+    max_tokens = 8
 )
 
 print("Chat completion results:")

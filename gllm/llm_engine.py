@@ -14,7 +14,9 @@ class LLM():
             model_path, gpu_memory_utilization, page_size)
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
-            self.model_runner, max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages)
+            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages,
+            self.model_runner.memory_manager.get_num_free_pages(),
+            self.model_runner.model.finish_tokens)
 
     def allocate_seq(self, token_ids: List[int], output_len=None):
         return Sequence(self.allocatorID.allocate(), token_ids, output_len)
@@ -28,7 +30,7 @@ class LLM():
             self.allocatorID.free(seq.seq_id)
 
     def step(self, temperature, top_p):
-        scheduled_seqs = self.scheduler.schedule()
+        scheduled_seqs = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages())
         next_tokens = self.model_runner.step_once(scheduled_seqs, temperature, top_p)
         self.scheduler.update_seqs(scheduled_seqs,next_tokens)
 
