@@ -53,8 +53,52 @@ def _log_task_completion(task: asyncio.Task) -> None:
     except Exception as e:
         logger.error("Engine background task failed", exc_info=e)
 
-
 class AsyncLLM(LLM):
+
+    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256, max_batch_tokens=8192, ratio_threshold_free_pages=0.2):
+        super().__init__(model_path, gpu_memory_utilization, page_size,
+                         max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages)
+
+        self.async_streams: Dict[int, AsyncStream] = {}
+        self.background_engine = None
+
+    async def add_requests_async(self, token_ids: List[int], output_len: int):
+        seq = self.allocate_seq(token_ids, output_len)
+        stream = AsyncStream()
+        assert seq.seq_id not in self.async_streams
+        self.async_streams[seq.seq_id] = stream
+        await make_async(self.add_requests)(requests=[seq])
+        if self.background_engine is None:
+            self.start_background_engine()
+        return stream
+
+    async def step_async(self, temperature, top_p):
+        scheduled_seqs = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages(), True)
+        next_tokens = await make_async(self.model_runner.step_once)(seqs=scheduled_seqs, temperature=temperature, top_p=top_p)
+        self.scheduler.update_seqs(scheduled_seqs, next_tokens)
+        for seq in scheduled_seqs:
+            self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
+        finished_seqs = []
+        for seq in self.scheduler.finish_lists:
+            self.async_streams[seq.seq_id].finish()
+            del self.async_streams[seq.seq_id]
+            finished_seqs.append(seq)
+        self.free_requests(finished_seqs)
+
+    async def run_engine(self):
+        while self.scheduler.has_seqs():
+            await self.step_async(temperature=0.6, top_p=0.9)
+        self.background_engine = None
+
+    def start_background_engine(self):
+        self._background_loop_unshielded = asyncio.get_event_loop(
+        ).create_task(self.run_engine())
+        self._background_loop_unshielded.add_done_callback(
+            _log_task_completion)
+        self.background_engine = asyncio.shield(
+            self._background_loop_unshielded)
+
+class PipeAsyncLLM(LLM):
 
     def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256, max_batch_tokens=8192, ratio_threshold_free_pages=0.2):
         super().__init__(model_path, gpu_memory_utilization, page_size,
@@ -71,6 +115,8 @@ class AsyncLLM(LLM):
         self.control_schedule : asyncio.Queue = asyncio.Queue()
 
         self.start_gpu_engine()
+        
+        logger.info('Enable pipeline schedule')
         
 
     async def add_requests_async(self, token_ids: List[int], output_len: int):
@@ -96,12 +142,10 @@ class AsyncLLM(LLM):
                 await asyncio.sleep(0)
                 continue
             scheduled_seqs = self.scheduler.schedule(num_free_pages, True)
-            # time.sleep(0.015)
             # print("SCHEDULE: end",time.time())
             self.schedule_outputs.put_nowait(scheduled_seqs)
         
     def run_gpu_engine(schedule_outputs:Queue,run_outputs:Queue,model_runner:ModelRunner):
-        logger.info('start gpu engine process')
         while True:
             # print("GPU: wait",time.time())
             scheduled_seqs = schedule_outputs.get()
@@ -111,7 +155,6 @@ class AsyncLLM(LLM):
             run_outputs.put_nowait((scheduled_seqs,next_tokens,model_runner.memory_manager.get_num_free_pages()))
             
     async def run_process_output_engine(self):
-        # print("start output process")
         num_free_pages = self.model_runner.memory_manager.get_num_free_pages()
         self.control_schedule.put_nowait(num_free_pages)
         while True:
@@ -133,12 +176,11 @@ class AsyncLLM(LLM):
                 del self.async_streams[seq.seq_id]
                 finished_seqs.append(seq)
             self.free_requests(finished_seqs)
-            # time.sleep(0.015)
             # print("OUTPUT: end",time.time())
 
 
     def start_gpu_engine(self):
-        self.gpu_engine = self.ctx.Process(target=AsyncLLM.run_gpu_engine,args=(self.schedule_outputs,self.run_outputs,self.model_runner))
+        self.gpu_engine = self.ctx.Process(target=PipeAsyncLLM.run_gpu_engine,args=(self.schedule_outputs,self.run_outputs,self.model_runner))
         self.gpu_engine.start()
     
     def start_schedule_engine(self):

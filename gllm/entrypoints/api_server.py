@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from gllm.entrypoints.protocol import (ChatCompletionRequest, CompletionRequest, ModelList, ModelCard, ModelPermission, ChatCompletionStreamResponse,
                                        random_uuid, ChatCompletionResponseStreamChoice, DeltaMessage, CompletionStreamResponse, CompletionResponseStreamChoice)
-from gllm.async_llm_engine import AsyncLLM, AsyncStream
+from gllm.async_llm_engine import AsyncLLM, PipeAsyncLLM, AsyncStream
 
 router = APIRouter()
 
@@ -105,8 +105,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Launch GLLM server')
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-path", type=str, required=True)
+    parser.add_argument("--pipe-schedule", action="store_true")
     args = parser.parse_args()
 
-    llm = AsyncLLM(args.model_path)
+    if args.pipe_schedule:
+        llm = PipeAsyncLLM(args.model_path)
+    else:
+        llm = AsyncLLM(args.model_path)
 
     asyncio.run(run_server(args))
