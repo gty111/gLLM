@@ -3,7 +3,7 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 
 class Sequence():
-    def __init__(self, seq_id, token_ids, output_len=None):
+    def __init__(self, seq_id, token_ids, finish_tokens, output_len=None, ignore_eos=False):
         self.seq_id = seq_id
         self.token_ids: List[int] = token_ids
         self.prompt_len = len(token_ids)
@@ -12,6 +12,8 @@ class Sequence():
         self.computed_prompt = False
         self.prompt = ''
         self.output = ''
+        self.ignore_eos = ignore_eos
+        self.finish_tokens: List[int] = finish_tokens
         # maximum output length
         if output_len is None:
             self.output_len = 4096
@@ -31,3 +33,10 @@ class Sequence():
             delta_text = added_space + delta_text
         self.cur_length = len(self.token_ids)
         return delta_text
+
+    def is_finish(self):
+        if (not self.ignore_eos and self.token_ids[-1] in self.finish_tokens
+            ) or len(self.token_ids) - self.prompt_len >= self.output_len:
+            return True
+        else:
+            return False

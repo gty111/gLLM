@@ -18,8 +18,9 @@ class LLM():
             self.model_runner.memory_manager.get_num_free_pages(),
             self.model_runner.model.finish_tokens)
 
-    def allocate_seq(self, token_ids: List[int], output_len=None):
-        return Sequence(self.allocatorID.allocate(), token_ids, output_len)
+    def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False):
+        return Sequence(self.allocatorID.allocate(), token_ids, 
+                        self.model_runner.model.finish_tokens, output_len, ignore_eos)
 
     def add_requests(self, requests: List[Sequence]):
         self.scheduler.add_requests(requests)
@@ -31,8 +32,8 @@ class LLM():
 
     def step(self, temperature, top_p):
         scheduled_seqs = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages())
-        next_tokens = self.model_runner.step_once(scheduled_seqs, temperature, top_p)
-        self.scheduler.update_seqs(scheduled_seqs,next_tokens)
+        self.model_runner.step_once(scheduled_seqs, temperature, top_p)
+        self.scheduler.update_seqs(scheduled_seqs)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None, temperature=0.6, top_p=0.9):
         requests: List[Sequence] = []

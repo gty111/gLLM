@@ -62,8 +62,8 @@ class AsyncLLM(LLM):
         self.async_streams: Dict[int, AsyncStream] = {}
         self.background_engine = None
 
-    async def add_requests_async(self, token_ids: List[int], output_len: int):
-        seq = self.allocate_seq(token_ids, output_len)
+    async def add_requests_async(self, token_ids: List[int], output_len: int, ignore_eos: bool):
+        seq = self.allocate_seq(token_ids, output_len, ignore_eos)
         stream = AsyncStream()
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
@@ -74,8 +74,8 @@ class AsyncLLM(LLM):
 
     async def step_async(self, temperature, top_p):
         scheduled_seqs = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages(), True)
-        next_tokens = await make_async(self.model_runner.step_once)(seqs=scheduled_seqs, temperature=temperature, top_p=top_p)
-        self.scheduler.update_seqs(scheduled_seqs, next_tokens)
+        await make_async(self.model_runner.step_once)(seqs=scheduled_seqs, temperature=temperature, top_p=top_p)
+        self.scheduler.update_seqs(scheduled_seqs)
         for seq in scheduled_seqs:
             self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
         for seq in self.scheduler.finish_lists:
@@ -117,8 +117,8 @@ class PipeAsyncLLM(LLM):
         logger.info('Enable pipeline schedule')
         
 
-    async def add_requests_async(self, token_ids: List[int], output_len: int):
-        seq = self.allocate_seq(token_ids, output_len)
+    async def add_requests_async(self, token_ids: List[int], output_len: int, ignore_eos:bool):
+        seq = self.allocate_seq(token_ids, output_len, ignore_eos)
         stream = AsyncStream()
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
@@ -148,9 +148,9 @@ class PipeAsyncLLM(LLM):
             # print("GPU: wait",time.time())
             scheduled_seqs = schedule_outputs.get()
             # print("GPU: start",time.time())
-            next_tokens = model_runner.step_once(seqs=scheduled_seqs, temperature=0.6, top_p=0.9)
+            model_runner.step_once(seqs=scheduled_seqs, temperature=0.6, top_p=0.9)
             # print("GPU: end",time.time())
-            run_outputs.put_nowait((scheduled_seqs,next_tokens,model_runner.memory_manager.get_num_free_pages()))
+            run_outputs.put_nowait((scheduled_seqs,model_runner.memory_manager.get_num_free_pages()))
             
     async def run_process_output_engine(self):
         num_free_pages = self.model_runner.memory_manager.get_num_free_pages()
@@ -163,9 +163,8 @@ class PipeAsyncLLM(LLM):
             outputs = self.run_outputs.get()
             # print("OUTPUT: start",time.time())
             scheduled_seqs:List[Sequence] = outputs[0]
-            next_tokens:List[int] = outputs[1]
-            num_free_pages = outputs[2]
-            self.scheduler.update_seqs(scheduled_seqs, next_tokens)
+            num_free_pages = outputs[1]
+            self.scheduler.update_seqs(scheduled_seqs)
             for seq in scheduled_seqs:
                 self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
             for seq in self.scheduler.finish_lists:

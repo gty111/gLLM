@@ -67,7 +67,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.stream:
         token_ids = llm.model_runner.tokenizer.apply_chat_template(
             request.messages, add_generation_prompt=True)
-        stream = await llm.add_requests_async(token_ids, request.max_tokens)
+        stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos)
         generator = chat_completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')
     else:
@@ -78,7 +78,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 async def create_completion(request: CompletionRequest, raw_request: Request):
     if request.stream:
         token_ids = llm.model_runner.tokenizer.encode(request.prompt)
-        stream = await llm.add_requests_async(token_ids, request.max_tokens)
+        stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos)
         generator = completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')
     else:

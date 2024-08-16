@@ -69,15 +69,9 @@ class Scheduler:
                    self.get_memory_util()))
         return schedule_lists
 
-    def update_seqs(self,seqs:List[Sequence],next_tokens:List[int]):
-        # append next token to each seq
-        for i in range(len(next_tokens)):
-            seqs[i].token_ids.append(next_tokens[i])
-            if not seqs[i].computed_prompt:
-                seqs[i].computed_prompt = True
-        # check finished seqs
+    def update_seqs(self,seqs:List[Sequence]):
         for seq in seqs:
-            if seq.token_ids[-1] in self.finish_tokens or len(seq.token_ids) - seq.prompt_len >= seq.output_len:
+            if seq.is_finish():
                 self.finish_lists.append(seq)
             else:
                 self.decode_lists.append(seq)

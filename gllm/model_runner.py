@@ -19,21 +19,21 @@ class ModelRunner():
         self.memory_manager = MemoryManager(
             gpu_memory_utilization, self.model.num_layers, self.model.dtype, page_size, self.model.num_kv_heads, self.model.head_dim)
 
+    @torch.inference_mode()
     def step_once(self,
                   seqs: List[Sequence], temperature, top_p):
-        with torch.no_grad():
-            input_data = InputData(seqs, self.memory_manager)
-            hidden_states = self.model(input_data)
-            logits = self.model.compute_logits(input_data, hidden_states)
-            next_tokens = self.model.sample(
-                logits, temperature, top_p)
-            for idx,seq in enumerate(seqs):
-                if next_tokens[idx] in self.model.finish_tokens or len(seq.token_ids) + 1 - seq.prompt_len >= seq.output_len:
-                    # print(f"free {seq.seq_id}")
-                    self.free_kv_cache(seq)
-            # print(f"memory_util:{self.memory_manager.get_memory_util()}")
-            assert len(next_tokens) == len(seqs)
-            return next_tokens
+        input_data = InputData(seqs, self.memory_manager)
+        hidden_states = self.model(input_data)
+        logits = self.model.compute_logits(input_data, hidden_states)
+        next_tokens = self.model.sample(
+            logits, temperature, top_p)
+        for idx,seq in enumerate(seqs):
+            if not seq.computed_prompt:
+                seq.computed_prompt = True
+            seq.token_ids.append(next_tokens[idx])
+            if seq.is_finish():
+                self.free_kv_cache(seq)
+        assert len(next_tokens) == len(seqs)
             
 
     def free_kv_cache(self, seq: Sequence):
@@ -42,9 +42,7 @@ class ModelRunner():
     def stream_inference(self, seq: Sequence, temperature: float, top_p: float):
         # -------prefill------
         prefill_start = time.time()
-        next_token = self.step_once([seq], temperature, top_p)[0]
-        seq.token_ids.append(next_token)
-        seq.computed_prompt = True
+        self.step_once([seq], temperature, top_p)
         prefill_end = time.time()
         # ----prefill end-----
 
@@ -52,10 +50,9 @@ class ModelRunner():
         decode_start = time.time()
         while True:
             print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
-            if next_token in self.model.finish_tokens:
+            if seq.is_finish():
                 break
-            next_token = self.step_once([seq], temperature, top_p)[0]
-            seq.token_ids.append(next_token)
+            self.step_once([seq], temperature, top_p)
         print("\n")
         decode_end = time.time()
         # ------decode end-------
