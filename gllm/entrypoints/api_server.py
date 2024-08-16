@@ -103,14 +103,29 @@ async def run_server(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Launch GLLM server')
-    parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--model-path", type=str, required=True)
-    parser.add_argument("--pipe-schedule", action="store_true")
+    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--model-path', type=str, required=True)
+    parser.add_argument('--pipe-schedule', action="store_true")
+    parser.add_argument('--gpu-memory-util',type=float,default=0.9)
+    parser.add_argument('--page-size',type=int,default=16)
+    parser.add_argument('--max-decode-seqs',type=int,default=256)
+    parser.add_argument('--max-batch-tokens',type=int,default=8192)
+    parser.add_argument('--ratio-free-pages',type=float,default=0.2)
     args = parser.parse_args()
 
     if args.pipe_schedule:
-        llm = PipeAsyncLLM(args.model_path)
+        llm = PipeAsyncLLM(model_path=args.model_path,
+                           gpu_memory_utilization=args.gpu_memory_util,
+                           page_size=args.page_size,
+                           max_decode_seqs=args.max_decode_seqs,
+                           max_batch_tokens=args.max_batch_tokens,
+                           ratio_threshold_free_pages=args.ratio_free_pages)
     else:
-        llm = AsyncLLM(args.model_path)
+        llm = AsyncLLM(model_path=args.model_path,
+                       gpu_memory_utilization=args.gpu_memory_util,
+                       page_size=args.page_size,
+                       max_decode_seqs=args.max_decode_seqs,
+                       max_batch_tokens=args.max_batch_tokens,
+                       ratio_threshold_free_pages=args.ratio_free_pages)
 
     asyncio.run(run_server(args))
