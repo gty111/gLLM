@@ -62,11 +62,10 @@ class Scheduler:
             else:
                 print('decode : ',end='')
             print(
-                '#schedule: %4d #prompt: %4d #decode: %4d #finish: %4d memory_util: %2.2f %%' 
+                '#schedule: %4d #prompt: %4d #decode: %4d memory_util: %2.2f %%' 
                 % (len(schedule_lists),
                    len(self.prompt_lists),
                    len(self.decode_lists),
-                   len(self.finish_lists),
                    self.get_memory_util()))
         return schedule_lists
 

@@ -24,10 +24,10 @@ class LLM():
     def add_requests(self, requests: List[Sequence]):
         self.scheduler.add_requests(requests)
 
-    def free_requests(self, requests: List[Sequence]):
-        for seq in requests:
-            self.scheduler.finish_lists.remove(seq)
+    def free_finish_requests(self):
+        for seq in self.scheduler.finish_lists:
             self.allocatorID.free(seq.seq_id)
+        self.scheduler.finish_lists = []
 
     def step(self, temperature, top_p):
         scheduled_seqs = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages())
@@ -68,7 +68,7 @@ class LLM():
             request.output = self.model_runner.tokenizer.decode(
                 request.token_ids[request.prompt_len:], True, True)
 
-        self.free_requests(requests)
+        self.free_finish_requests()
         return requests
 
     def chat(self, temperature=0.6, top_p=0.9):

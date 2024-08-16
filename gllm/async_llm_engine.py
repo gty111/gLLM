@@ -78,12 +78,10 @@ class AsyncLLM(LLM):
         self.scheduler.update_seqs(scheduled_seqs, next_tokens)
         for seq in scheduled_seqs:
             self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
-        finished_seqs = []
         for seq in self.scheduler.finish_lists:
             self.async_streams[seq.seq_id].finish()
             del self.async_streams[seq.seq_id]
-            finished_seqs.append(seq)
-        self.free_requests(finished_seqs)
+        self.free_finish_requests()
 
     async def run_engine(self):
         while self.scheduler.has_seqs():
@@ -170,12 +168,10 @@ class PipeAsyncLLM(LLM):
             self.scheduler.update_seqs(scheduled_seqs, next_tokens)
             for seq in scheduled_seqs:
                 self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
-            finished_seqs = []
             for seq in self.scheduler.finish_lists:
                 self.async_streams[seq.seq_id].finish()
                 del self.async_streams[seq.seq_id]
-                finished_seqs.append(seq)
-            self.free_requests(finished_seqs)
+            self.free_finish_requests()
             # print("OUTPUT: end",time.time())
 
 
