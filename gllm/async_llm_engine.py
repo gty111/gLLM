@@ -137,7 +137,7 @@ class PipeAsyncLLM(LLM):
                 self.schedule_engine = None
                 self.control_schedule.put_nowait(num_free_pages)
                 return
-            if not self.scheduler.has_seqs_cur() or self.scheduler.delay_schedule():
+            if not self.scheduler.has_scheduled_seqs() or self.scheduler.delay_schedule():
                 self.control_schedule.put_nowait(num_free_pages)
                 await asyncio.sleep(0)
                 continue

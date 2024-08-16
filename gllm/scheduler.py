@@ -18,7 +18,7 @@ class Scheduler:
         
         self.num_schedule_running = 0
         self.total_num_free_pages = total_num_free_pages
-        self.num_free_pages = None
+        self.num_free_pages = total_num_free_pages
 
         self.finish_tokens = finish_tokens
 
@@ -57,6 +57,10 @@ class Scheduler:
         cur_time = time.time()
         if iflog and cur_time - self.log_time > 2:
             self.log_time = cur_time
+            if not schedule_lists[0].computed_prompt:
+                print('prefill: ',end='')
+            else:
+                print('decode : ',end='')
             print(
                 '#schedule: %4d #prompt: %4d #decode: %4d #finish: %4d memory_util: %2.2f %%' 
                 % (len(schedule_lists),
@@ -86,13 +90,16 @@ class Scheduler:
         One schedule 128 seqs and the other schedule 8 seqs
         we can merge two schedule to one which contains 136 seqs
         '''
-        return self.num_schedule_running !=0 and len(self.prompt_lists) == 0 and len(self.decode_lists) < 32
+        return self.num_schedule_running !=0 and not self.can_schedule_prefill() and len(self.decode_lists) < 32
 
-    def has_seqs_cur(self):
-        return len(self.prompt_lists) + len(self.decode_lists) != 0 
+    def can_schedule_prefill(self):
+        return len(self.prompt_lists) != 0 and self.num_free_pages > self.num_threshold_free_pages
+
+    def has_scheduled_seqs(self):
+        return self.can_schedule_prefill() or len(self.decode_lists) != 0
 
     def has_seqs(self):
-        return self.has_seqs_cur() or self.num_schedule_running == 1
+        return len(self.prompt_lists) + len(self.decode_lists) != 0 or self.num_schedule_running != 0
     
     def get_memory_util(self):
         return round((self.total_num_free_pages - self.num_free_pages)*100 / self.total_num_free_pages,2)
