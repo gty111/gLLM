@@ -1,4 +1,9 @@
+import argparse
 from openai import OpenAI
+
+parser = argparse.ArgumentParser(description='Chat client')
+parser.add_argument("--stream",action="store_true")
+args = parser.parse_args()
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
 openai_api_key = "EMPTY"
@@ -30,11 +35,14 @@ chat_completion = client.chat.completions.create(
         "content": "Can you tell a fairy tale?"
     }],
     model=model,
-    stream=True,
-    max_tokens = 8
+    stream=args.stream,
+    max_tokens = 128
 )
 
-print("Chat completion results:")
-for i in chat_completion:
-    print(i.choices[0].delta.content,end='',flush=True)
-print()
+if args.stream:
+    print("Chat completion results:")
+    for i in chat_completion:
+        print(i.choices[0].delta.content,end='',flush=True)
+    print()
+else:
+    print(chat_completion)

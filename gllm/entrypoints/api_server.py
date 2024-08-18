@@ -2,55 +2,17 @@ import uvicorn
 import fastapi
 import asyncio
 import argparse
-import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from gllm.entrypoints.protocol import (ChatCompletionRequest, CompletionRequest, ModelList, ModelCard, ModelPermission, ChatCompletionStreamResponse,
-                                       random_uuid, ChatCompletionResponseStreamChoice, DeltaMessage, CompletionStreamResponse, CompletionResponseStreamChoice)
-from gllm.async_llm_engine import AsyncLLM, PipeAsyncLLM, AsyncStream
+from gllm.entrypoints.protocol import ChatCompletionRequest, CompletionRequest, ModelList, ModelCard, ModelPermission
+from gllm.async_llm_engine import AsyncLLM, PipeAsyncLLM
+from gllm.entrypoints.serving_chat import chat_completion_stream_generator, chat_completion_generator
+from gllm.entrypoints.serving_completions import completion_stream_generator, completion_generator
 
 router = APIRouter()
 
 llm: AsyncLLM = None
-
-
-async def chat_completion_stream_generator(stream: AsyncStream, request: ChatCompletionRequest):
-    request_id = f"cmpl-{random_uuid()}"
-    created_time = int(time.time())
-    chunk_object_type = "chat.completion.chunk"
-    async for text in stream:
-        choice_data = ChatCompletionResponseStreamChoice(index=0,
-                                                         delta=DeltaMessage(
-                                                             content=text),
-                                                         logprobs=None,
-                                                         finish_reason=None)
-        chunk = ChatCompletionStreamResponse(id=request_id,
-                                             object=chunk_object_type,
-                                             created=created_time,
-                                             choices=[choice_data],
-                                             model=request.model)
-        data = chunk.model_dump_json(exclude_unset=True)
-        yield f'data: {data}\n\n'
-    yield "data: [DONE]\n\n"
-
-
-async def completion_stream_generator(stream: AsyncStream, request: CompletionRequest):
-    request_id = f"cmpl-{random_uuid()}"
-    created_time = int(time.time())
-    async for text in stream:
-        choice_data = CompletionResponseStreamChoice(index=0,
-                                                     text=text,
-                                                     logprobs=None,
-                                                     finish_reason=None,
-                                                     stop_reason=None)
-        chunk = CompletionStreamResponse(id=request_id,
-                                         created=created_time,
-                                         choices=[choice_data],
-                                         model=request.model)
-        data = chunk.model_dump_json(exclude_unset=False)
-        yield f'data: {data}\n\n'
-    yield "data: [DONE]\n\n"
 
 
 @router.get("/v1/models")
@@ -62,27 +24,27 @@ async def show_available_models():
 
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
-    # print(request.messages)
-    # print(llm.model_runner.tokenizer.apply_chat_template(request.messages))
+    token_ids = llm.model_runner.tokenizer.apply_chat_template(
+        request.messages, add_generation_prompt=True)
+    stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos)
     if request.stream:
-        token_ids = llm.model_runner.tokenizer.apply_chat_template(
-            request.messages, add_generation_prompt=True)
-        stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos)
         generator = chat_completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')
     else:
-        return JSONResponse({})
+        generator = await chat_completion_generator(stream, request)
+        return JSONResponse(content=generator.model_dump())
 
 
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    token_ids = llm.model_runner.tokenizer.encode(request.prompt)
+    stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos)
     if request.stream:
-        token_ids = llm.model_runner.tokenizer.encode(request.prompt)
-        stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos)
         generator = completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')
     else:
-        return JSONResponse({})
+        generator = await completion_generator(stream, request)
+        return JSONResponse(content=generator.model_dump())
 
 
 async def run_server(args):
