@@ -33,7 +33,7 @@ class Scheduler:
 
         # prompt
         if len(self.prompt_lists) != 0 and (
-                self.num_free_pages > self.num_threshold_free_pages and len(schedule_lists) + len(self.decode_lists) < self.max_decode_seqs):
+                self.num_free_pages > self.num_threshold_free_pages):
             cu_seqs_len = 0
             for seq in self.prompt_lists:
                 if cu_seqs_len + len(
