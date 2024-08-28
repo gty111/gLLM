@@ -16,7 +16,7 @@ class LLM():
         self.scheduler = Scheduler(
             max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages,
             self.model_runner.memory_manager.get_num_free_pages(),
-            self.model_runner.model.finish_tokens)
+            self.model_runner.model.finish_tokens, page_size)
 
     def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False):
         return Sequence(self.allocatorID.allocate(), token_ids, 

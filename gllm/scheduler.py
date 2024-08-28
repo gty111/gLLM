@@ -7,7 +7,7 @@ from gllm.sequence import Sequence
 
 class Scheduler:
     def __init__(self, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float,
-                 total_num_free_pages:int, finish_tokens:List[int]) -> None:
+                 total_num_free_pages:int, finish_tokens:List[int], page_size: int) -> None:
         self.prompt_lists: List[Sequence] = [] # seqs to prefill
         self.decode_lists: List[Sequence] = [] # seqs to decode
         self.finish_lists: List[Sequence] = [] # seqs finished
@@ -19,6 +19,7 @@ class Scheduler:
         self.num_schedule_running = 0
         self.total_num_free_pages = total_num_free_pages
         self.num_free_pages = total_num_free_pages
+        self.page_size = page_size
 
         self.finish_tokens = finish_tokens
 
@@ -40,6 +41,7 @@ class Scheduler:
                     seq.token_ids) <= self.max_batch_tokens and self.num_free_pages > self.num_threshold_free_pages:
                     cu_seqs_len += len(seq.token_ids)
                     schedule_lists.append(seq)
+                    self.num_free_pages -= len(seq.token_ids) // self.page_size
             for seq in schedule_lists:
                 self.prompt_lists.remove(seq)
 
