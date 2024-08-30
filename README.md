@@ -85,9 +85,9 @@ python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
 <img src=doc/pic/pipeline_architecture.svg height=240>
 
 ## Supported Models
-> Note that gLLM only support load model of safetensor format from local memory
+> Note that gLLM only support loading model of .safetensor or .bin format from local disk
 
-- Llama: llama2-7b, llama3-8b, llama3.1-8b
+- Llama: llama2-7b, llama3-8b, llama3.1-8b and deepseek-coder
 - ChatGLM: chatglm3-6b and glm4-9b
 - Qwen2: qwen2-7b
 
