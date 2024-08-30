@@ -5,7 +5,7 @@ from torch import nn
 
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
-from gllm.layers.rotary_embedding import RotaryEmbedding
+from gllm.layers.rotary_embedding import RotaryEmbedding, LinearScalingRotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.input_data import InputData
 from gllm.sampler import Sampler
@@ -41,8 +41,18 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads*self.head_dim,
                                 self.hidden_size, bias=False, dtype=model_config['torch_dtype'], device='cuda')
 
-        self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim, model_config['max_position_embeddings'], model_config['rope_theta'], True, model_config['torch_dtype'])
+        if 'rope_scaling' in model_config:
+            rope_scaling = model_config['rope_scaling']
+            if rope_scaling['type'] == 'linear':
+                self.rotary_emb = LinearScalingRotaryEmbedding(
+                    self.head_dim, self.head_dim, model_config['max_position_embeddings'],
+                    model_config['rope_theta'], True, rope_scaling['factor'], model_config['torch_dtype'])
+            else:
+                assert 0
+        else:
+            self.rotary_emb = RotaryEmbedding(
+                self.head_dim, self.head_dim, model_config['max_position_embeddings'], 
+                model_config['rope_theta'], True, model_config['torch_dtype'])
 
         self.scaling = self.head_dim**-0.5
 
