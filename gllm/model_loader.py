@@ -23,13 +23,27 @@ class ModelLoader():
 
     def load_weights(self):
         weights = {}
+        
+        # load .safetensor
         weights_path = glob.glob(f"{self.model_path}/*.safetensors")
         for weight_path in weights_path:
             with safe_open(weight_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
+                    print(k,flush=True)
                     weights[k] = f.get_tensor(k)
+        
+        if len(weights) != 0:
+            return weights
+        
+        # load .bin
+        weights_path = glob.glob(f'{self.model_path}/*.bin')
+        for weight_path in weights_path:
+            weights.update(torch.load(weight_path,weights_only=True))
+        
+        if len(weights) != 0:
+            return weights
 
-        return weights
+        assert 0
 
     def load_config(self):
         config_path = f"{self.model_path}/config.json"
