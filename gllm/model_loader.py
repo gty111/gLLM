@@ -29,7 +29,6 @@ class ModelLoader():
         for weight_path in weights_path:
             with safe_open(weight_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
-                    print(k,flush=True)
                     weights[k] = f.get_tensor(k)
         
         if len(weights) != 0:
