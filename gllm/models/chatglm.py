@@ -180,6 +180,7 @@ class ChatGLMForCausalLM(nn.Module):
 
         self.transformer = ChatGLMModel(model_config)
         self.lm_head = self.transformer.output_layer
+        self.sampler = Sampler()
 
     def forward(self, input_data: InputData):
         return self.transformer(input_data)
@@ -192,9 +193,8 @@ class ChatGLMForCausalLM(nn.Module):
             idx_list = input_data.cu_seqs_len - 1
             return self.lm_head(hidden_states[idx_list[1:]])
 
-    def sample(self, logits: torch.Tensor, temperature, top_p):
-        sampler = Sampler(logits, top_p, temperature)
-        return sampler.forward()
+    def sample(self, input_data: InputData, logits: torch.Tensor):
+        return self.sampler.forward(logits, input_data)
 
     def load_weights(self, weights):
         parameters = dict(self.named_parameters())
