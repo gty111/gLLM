@@ -41,7 +41,7 @@ class LlamaAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads*self.head_dim,
                                 self.hidden_size, bias=False, dtype=model_config['torch_dtype'], device='cuda')
 
-        if 'rope_scaling' in model_config:
+        if model_config['rope_scaling'] is not None:
             rope_scaling = model_config['rope_scaling']
             if rope_scaling['type'] == 'linear':
                 self.rotary_emb = LinearScalingRotaryEmbedding(
@@ -148,7 +148,8 @@ class LlamaForCausalLM(nn.Module):
         self.model_config = model_config
         self.lm_head = nn.Linear(
             model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
-
+        self.sampler = Sampler()
+        
     def forward(self, input_data: InputData):
         return self.model(input_data)
 
@@ -160,9 +161,8 @@ class LlamaForCausalLM(nn.Module):
             idx_list = input_data.cu_seqs_len - 1
             return self.lm_head(hidden_states[idx_list[1:]])
 
-    def sample(self, logits: torch.Tensor, temperature, top_p):
-        sampler = Sampler(logits, top_p, temperature)
-        return sampler.forward()
+    def sample(self, input_data: InputData, logits: torch.Tensor):
+        return self.sampler.forward(logits, input_data)
 
     def load_weights(self, weights):
         parameters = dict(self.named_parameters())

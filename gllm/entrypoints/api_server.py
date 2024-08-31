@@ -26,7 +26,8 @@ async def show_available_models():
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     token_ids = llm.model_runner.tokenizer.apply_chat_template(
         request.messages, add_generation_prompt=True)
-    stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos)
+    stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos,
+                                          request.temperature, request.top_p, request.top_k)
     if request.stream:
         generator = chat_completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')
@@ -38,7 +39,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
     token_ids = llm.model_runner.tokenizer.encode(request.prompt)
-    stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos)
+    stream = await llm.add_requests_async(token_ids, request.max_tokens, request.ignore_eos,
+                                          request.temperature, request.top_p, request.top_k)
     if request.stream:
         generator = completion_stream_generator(stream, request)
         return StreamingResponse(content=generator, media_type='text/event-stream')

@@ -21,12 +21,11 @@ class ModelRunner():
 
     @torch.inference_mode()
     def step_once(self,
-                  seqs: List[Sequence], temperature, top_p):
+                  seqs: List[Sequence]):
         input_data = InputData(seqs, self.memory_manager)
         hidden_states = self.model(input_data)
         logits = self.model.compute_logits(input_data, hidden_states)
-        next_tokens = self.model.sample(
-            logits, temperature, top_p)
+        next_tokens = self.model.sample(input_data, logits)
         for idx,seq in enumerate(seqs):
             if not seq.computed_prompt:
                 seq.computed_prompt = True
@@ -39,10 +38,10 @@ class ModelRunner():
     def free_kv_cache(self, seq: Sequence):
         self.memory_manager.free(seq)
 
-    def stream_inference(self, seq: Sequence, temperature: float, top_p: float):
+    def stream_inference(self, seq: Sequence):
         # -------prefill------
         prefill_start = time.time()
-        self.step_once([seq], temperature, top_p)
+        self.step_once([seq])
         prefill_end = time.time()
         # ----prefill end-----
 
@@ -52,7 +51,7 @@ class ModelRunner():
             print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
             if seq.is_finish():
                 break
-            self.step_once([seq], temperature, top_p)
+            self.step_once([seq])
         print("\n")
         decode_end = time.time()
         # ------decode end-------
