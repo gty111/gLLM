@@ -5,7 +5,7 @@ from gllm.input_data import InputData
 class Sampler():
     
     def forward(self, logits: torch.Tensor, input_data: InputData):
-        temperature = torch.tensor([seq.temperature for seq in input_data.seqs], device='cuda')
+        temperature = torch.tensor([seq.temperature if seq.temperature > 1e-5 else 1 for seq in input_data.seqs], device='cuda')
         top_p = torch.tensor([seq.top_p for seq in input_data.seqs], device='cuda')
         top_k = torch.tensor([seq.top_k if seq.top_k != -1 else logits.shape[1] for seq in input_data.seqs], device='cuda')
         
