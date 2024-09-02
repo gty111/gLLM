@@ -1,9 +1,8 @@
 import asyncio
 import multiprocessing as mp
-import time
 from logger import logger
 from typing import List, Dict
-from multiprocessing import Queue,Process
+from multiprocessing import Queue, Value
 
 from gllm.utils import make_async
 from gllm.sequence import Sequence
@@ -112,6 +111,7 @@ class PipeAsyncLLM(LLM):
         self.schedule_outputs: Queue = self.ctx.Queue()
         self.run_outputs: Queue = self.ctx.Queue()
         self.control_schedule : asyncio.Queue = asyncio.Queue()
+        self.num_free_pages = self.ctx.Value('i', 0)
 
         self.start_gpu_engine()
         
@@ -131,41 +131,39 @@ class PipeAsyncLLM(LLM):
         
     async def run_schedule_engine(self):
         while True:
-            num_free_pages = await self.control_schedule.get()
+            await self.control_schedule.get()
             # print("SCHEDULE: start",time.time())
             if not self.scheduler.has_seqs():
                 self.schedule_engine = None
-                self.control_schedule.put_nowait(num_free_pages)
+                self.control_schedule.put_nowait(0)
                 return
             if not self.scheduler.has_scheduled_seqs() or self.scheduler.delay_schedule():
-                self.control_schedule.put_nowait(num_free_pages)
+                self.control_schedule.put_nowait(0)
                 await asyncio.sleep(0)
                 continue
-            scheduled_seqs = self.scheduler.schedule(num_free_pages, True)
+            scheduled_seqs = self.scheduler.schedule(self.num_free_pages.value, True)
             # print("SCHEDULE: end",time.time())
             self.schedule_outputs.put_nowait(scheduled_seqs)
         
-    def run_gpu_engine(schedule_outputs:Queue,run_outputs:Queue,model_runner:ModelRunner):
+    def run_gpu_engine(schedule_outputs:Queue, run_outputs:Queue, model_runner:ModelRunner, num_free_pages):
         while True:
+            num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
             # print("GPU: wait",time.time())
             scheduled_seqs = schedule_outputs.get()
             # print("GPU: start",time.time())
             model_runner.step_once(seqs=scheduled_seqs)
             # print("GPU: end",time.time())
-            run_outputs.put_nowait((scheduled_seqs,model_runner.memory_manager.get_num_free_pages()))
+            run_outputs.put_nowait(scheduled_seqs)
             
     async def run_process_output_engine(self):
-        num_free_pages = self.model_runner.memory_manager.get_num_free_pages()
-        self.control_schedule.put_nowait(num_free_pages)
+        self.control_schedule.put_nowait(0)
         while True:
-            self.control_schedule.put_nowait(num_free_pages)
+            self.control_schedule.put_nowait(0)
             # print("OUTPUT: wait",time.time())
             while self.run_outputs.empty():
                 await asyncio.sleep(0)
-            outputs = self.run_outputs.get()
+            scheduled_seqs:List[Sequence] = self.run_outputs.get()
             # print("OUTPUT: start",time.time())
-            scheduled_seqs:List[Sequence] = outputs[0]
-            num_free_pages = outputs[1]
             self.scheduler.update_seqs(scheduled_seqs)
             for seq in scheduled_seqs:
                 self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
@@ -177,7 +175,11 @@ class PipeAsyncLLM(LLM):
 
 
     def start_gpu_engine(self):
-        self.gpu_engine = self.ctx.Process(target=PipeAsyncLLM.run_gpu_engine,args=(self.schedule_outputs,self.run_outputs,self.model_runner))
+        self.gpu_engine = self.ctx.Process(
+            target=PipeAsyncLLM.run_gpu_engine,args=(self.schedule_outputs, 
+                                                     self.run_outputs, 
+                                                     self.model_runner,
+                                                     self.num_free_pages))
         self.gpu_engine.start()
     
     def start_schedule_engine(self):
