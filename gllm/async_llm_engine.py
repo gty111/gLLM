@@ -2,7 +2,8 @@ import asyncio
 import multiprocessing as mp
 from logger import logger
 from typing import List, Dict
-from multiprocessing import Queue, Value
+from multiprocessing import Queue
+from fastapi import Request
 
 from gllm.utils import make_async
 from gllm.sequence import Sequence
@@ -11,9 +12,10 @@ from gllm.model_runner import ModelRunner
 
 class AsyncStream:
 
-    def __init__(self):
+    def __init__(self, raw_request: Request):
         self._queue: asyncio.Queue = asyncio.Queue()
         self._finished = False
+        self._raw_request = raw_request
 
     def put(self, item: str):
         if self._finished:
@@ -61,19 +63,33 @@ class AsyncLLM(LLM):
         self.async_streams: Dict[int, AsyncStream] = {}
         self.background_engine = None
 
-    async def add_requests_async(self, token_ids: List[int], output_len: int, ignore_eos: bool,
+    async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float):
         seq = self.allocate_seq(token_ids, output_len, ignore_eos, temperature, top_p, top_k)
-        stream = AsyncStream()
+        stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
         await make_async(self.add_requests)(requests=[seq])
         if self.background_engine is None:
             self.start_background_engine()
         return stream
+    
+    async def check_abort_request(self, scheduled_seqs: List[Sequence]):
+        if not scheduled_seqs[0].computed_prompt:
+            abort_seqs = []
+            for seq in scheduled_seqs:
+                if await self.async_streams[seq.seq_id]._raw_request.is_disconnected():
+                    abort_seqs.append(seq)
+            for seq in abort_seqs:
+                scheduled_seqs.remove(seq)
+                self.scheduler.finish_lists.append(seq)  
 
     async def step_async(self):
         scheduled_seqs = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages(), True)
+        await self.check_abort_request(scheduled_seqs)
+        if len(scheduled_seqs) == 0:
+            self.scheduler.num_schedule_running -= 1
+            return
         await make_async(self.model_runner.step_once)(seqs=scheduled_seqs)
         self.scheduler.update_seqs(scheduled_seqs)
         for seq in scheduled_seqs:
@@ -118,16 +134,26 @@ class PipeAsyncLLM(LLM):
         logger.info('Enable pipeline schedule')
         
 
-    async def add_requests_async(self, token_ids: List[int], output_len: int, ignore_eos:bool,
+    async def add_requests_async(self, raw_request:Request, token_ids: List[int], output_len: int, ignore_eos:bool,
                                  temperature: float, top_p: float, top_k: float):
         seq = self.allocate_seq(token_ids, output_len, ignore_eos, temperature, top_p, top_k)
-        stream = AsyncStream()
+        stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
         await make_async(self.add_requests)(requests=[seq])
         if self.schedule_engine is None:
             self.start_schedule_engine()
-        return stream       
+        return stream      
+    
+    async def check_abort_request(self, scheduled_seqs: List[Sequence]):
+        if not scheduled_seqs[0].computed_prompt:
+            abort_seqs = []
+            for seq in scheduled_seqs:
+                if await self.async_streams[seq.seq_id]._raw_request.is_disconnected():
+                    abort_seqs.append(seq)
+            for seq in abort_seqs:
+                scheduled_seqs.remove(seq)
+                self.scheduler.finish_lists.append(seq)    
         
     async def run_schedule_engine(self):
         while True:
@@ -142,6 +168,12 @@ class PipeAsyncLLM(LLM):
                 await asyncio.sleep(0)
                 continue
             scheduled_seqs = self.scheduler.schedule(self.num_free_pages.value, True)
+            await self.check_abort_request(scheduled_seqs)
+            if len(scheduled_seqs) == 0:
+                self.scheduler.num_schedule_running -= 1
+                self.control_schedule.put_nowait(0)
+                await asyncio.sleep(0)
+                continue
             # print("SCHEDULE: end",time.time())
             self.schedule_outputs.put_nowait(scheduled_seqs)
         
