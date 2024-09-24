@@ -1,4 +1,5 @@
 import tqdm
+from logger import logger
 from typing import List
 
 from gllm.model_runner import ModelRunner
@@ -17,6 +18,14 @@ class LLM():
             max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages,
             self.model_runner.memory_manager.get_num_free_pages(),
             self.model_runner.model.finish_tokens, page_size)
+
+    def check_seq_length(self, token_ids: List[int], output_len:int):
+        max_seq_length = len(token_ids) + output_len if output_len is not None else len(token_ids)
+        if max_seq_length > self.model_runner.model.max_model_len:
+            logger.warning(f'Ignore seq due to the length({max_seq_length}) exceeds max model len({self.model_runner.model.max_model_len})')
+            return False
+        else:
+            return True
 
     def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False, 
                      temperature=0.6, top_p=0.9, top_k=10):
@@ -45,9 +54,10 @@ class LLM():
         for idx in range(num_seqs):
             token_ids = tokens[idx] if tokens is not None else self.model_runner.tokenizer.encode(prompts[idx])
             output_len_each = output_lens[idx] if output_lens is not None else None
-            seq = self.allocate_seq(token_ids, output_len_each, False, temperature,
-                                    top_p, top_k)
-            requests.append(seq)
+            if self.check_seq_length(token_ids, output_len_each):
+                seq = self.allocate_seq(token_ids, output_len_each, False, temperature,
+                                        top_p, top_k)
+                requests.append(seq)
         self.add_requests(requests)
 
         pbar = tqdm.tqdm(total=len(requests))
