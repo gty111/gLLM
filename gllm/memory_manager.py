@@ -1,5 +1,5 @@
 import torch
-from typing import List
+from typing import List, Set
 from logger import logger
 
 from gllm.allocatorID import AllocatorID
@@ -92,14 +92,19 @@ class MemoryManager():
                 assert len(seq.page_table) == 0
                 num_page = (seq.prompt_len + self.page_size -
                             1) // self.page_size
-                for _ in range(num_page):
-                    seq.page_table.append(
-                        self.segments[seq.segment_id].allocate())
+                computed_prefix = True
+                for i in range(num_page):
+                    if computed_prefix and (i+1)*self.page_size <= len(seq.token_ids):
+                        computed_prefix, page_num = self.segments[seq.segment_id].allocate((*seq.token_ids[:(i+1)*self.page_size],))
+                        seq.computed_page_num += int(computed_prefix)
+                    else:
+                        _, page_num = self.segments[seq.segment_id].allocate()
+                    seq.page_table.append(page_num)
             else:
                 assert len(seq.page_table) != 0
                 if (len(seq.token_ids)-1) % self.page_size == 0:
-                    seq.page_table.append(
-                        self.segments[seq.segment_id].allocate())
+                    _, page_num = self.segments[seq.segment_id].allocate()
+                    seq.page_table.append(page_num)
 
     def free(self, seq: Sequence):
         for page_num in seq.page_table:
@@ -116,24 +121,52 @@ class Segment():
     def __init__(self,
                  num_layers: int,
                  page_num_segment: int,
-                 token_num_page: int,
+                 page_size: int,
                  kv_head_num: int,
                  kv_head_dim: int,
                  dtype: torch.dtype):
         self.num_layers = num_layers
+        self.page_num_segment = page_num_segment
+        self.page_size = page_size
+        self.kv_head_num = kv_head_num
+        self.kv_head_dim = kv_head_dim
+        self.dtype = dtype
         # We don't need zero initialization here
         self.k_cache = [torch.ones(
-            (page_num_segment, token_num_page, kv_head_num, kv_head_dim), dtype=dtype, device='cuda') for _ in range(num_layers)]
+            (page_num_segment, page_size, kv_head_num, kv_head_dim), dtype=dtype, device='cuda') for _ in range(num_layers)]
         self.v_cache = [torch.ones(
-            (page_num_segment, token_num_page, kv_head_num, kv_head_dim), dtype=dtype, device='cuda') for _ in range(num_layers)]
+            (page_num_segment, page_size, kv_head_num, kv_head_dim), dtype=dtype, device='cuda') for _ in range(num_layers)]
         self.allocatorID = AllocatorID(0, page_num_segment-1)
+        # used for prefix cache
+        self.hash2page = {}
+        self.page_ref_num = [0 for _ in range(self.page_num_segment)]
+        self.page2hash = [0 for _ in range(self.page_num_segment)]
 
-    def allocate(self):
-        pagenum = self.allocatorID.allocate()
-        return pagenum
+    def allocate(self, token_ids:Set[int]=None):
+        page_hash = hash(token_ids) if token_ids is not None else None
+        if page_hash is not None and page_hash in self.hash2page:
+            page_num = self.hash2page[page_hash]
+            # print(f'reuse {page_num}')
+            self.allocatorID.allocate(page_num)
+            computed = True
+        else:
+            page_num = self.allocatorID.allocate()
+            # print(f'allocate {page_num}')
+            if self.page2hash[page_num] != 0 and self.page2hash[page_num] in self.hash2page:
+                del self.hash2page[self.page2hash[page_num]]
+            if page_hash is not None:
+                self.page2hash[page_num] = page_hash
+                self.hash2page[page_hash] = page_num
+            computed = False
+        self.page_ref_num[page_num] += 1
+        return computed, page_num
 
     def free(self, page_num: int):
-        self.allocatorID.free(page_num)
+        assert self.page_ref_num[page_num] > 0 
+        self.page_ref_num[page_num] -= 1
+        if self.page_ref_num[page_num] == 0:
+            # print(f'free {page_num}')
+            self.allocatorID.free(page_num)
 
     def get_num_free_pages(self):
         return self.allocatorID.get_num_free_ids()
