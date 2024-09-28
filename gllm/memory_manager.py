@@ -44,6 +44,8 @@ class MemoryManager():
                 else:
                     offset = (len(seq.token_ids) - 1) % self.page_size
                     page_num = seq.page_table[-1]
+                    if offset == self.page_size - 1:
+                        self.segments[seq.segment_id].update((*seq.token_ids[-self.page_size:],),page_num)
                     slot_mapping.append(page_num*self.page_size+offset)
 
         slot_mapping_tensor = torch.tensor(
@@ -81,6 +83,8 @@ class MemoryManager():
                 else:
                     offset = len(seq.token_ids) % self.page_size - 1
                     page_num = seq.page_table[-1]
+                    if offset == self.page_size - 1:
+                        self.segments[seq.segment_id].update((*seq.token_ids[-self.page_size:],),page_num)
                     self.segments[seq.segment_id].k_cache[layer_idx][page_num][offset].copy_(
                         k_cache[cu_seqs_len])
                     self.segments[seq.segment_id].v_cache[layer_idx][page_num][offset].copy_(
@@ -146,6 +150,15 @@ class Segment():
         self.hash2page = {}
         self.page_ref_num = [0 for _ in range(self.page_num_segment)]
         self.page2hash = [0 for _ in range(self.page_num_segment)]
+    
+    def update(self, token_ids: Set[int], page_num: int):
+        '''update page hash
+        '''
+        page_hash = hash(token_ids)
+        if page_hash not in self.hash2page:
+            self.page2hash[page_num] = page_hash
+            self.hash2page[page_hash] = page_num
+            
 
     def allocate(self, token_ids: Set[int] = None):
         page_hash = hash(token_ids) if token_ids is not None else None
