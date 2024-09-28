@@ -87,6 +87,7 @@ if __name__ == '__main__':
     parser.add_argument('--max-batch-tokens', type=int, default=8192)
     parser.add_argument('--ratio-free-pages', type=float, default=0.2)
     parser.add_argument('--enable-prefix-caching', action='store_true')
+    parser.add_argument('--num-multi-step', type=int, default=8)
     args = parser.parse_args()
 
     llm_cls = PipeAsyncLLM if args.pipe_schedule else AsyncLLM
@@ -96,6 +97,7 @@ if __name__ == '__main__':
                   max_decode_seqs=args.max_decode_seqs,
                   max_batch_tokens=args.max_batch_tokens,
                   ratio_threshold_free_pages=args.ratio_free_pages,
-                  enable_prefix_caching=args.enable_prefix_caching)
+                  enable_prefix_caching=args.enable_prefix_caching,
+                  decode_num_multi_steps=args.num_multi_step)
 
     asyncio.run(run_server(args))

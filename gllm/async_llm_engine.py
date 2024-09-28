@@ -57,6 +57,7 @@ def _log_task_completion(task: asyncio.Task) -> None:
 class AsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
+        kwargs.pop('decode_num_multi_steps')
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -114,6 +115,13 @@ class AsyncLLM(LLM):
 class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
+        logger.info('Enable pipeline schedule')
+        
+        self.decode_num_multi_steps = kwargs['decode_num_multi_steps']
+        kwargs.pop('decode_num_multi_steps')
+        if self.decode_num_multi_steps > 1:
+            logger.info(f'Enable multi step ({self.decode_num_multi_steps})')
+        
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -128,8 +136,6 @@ class PipeAsyncLLM(LLM):
         self.num_free_pages = self.ctx.Value('i', 0)
 
         self.start_gpu_engine()
-        
-        logger.info('Enable pipeline schedule')
         
 
     async def add_requests_async(self, raw_request:Request, token_ids: List[int], output_len: int, ignore_eos:bool,
@@ -175,14 +181,35 @@ class PipeAsyncLLM(LLM):
             # print("SCHEDULE: end",time.time())
             self.schedule_outputs.put_nowait(scheduled_seqs)
         
-    def run_gpu_engine(schedule_outputs:Queue, run_outputs:Queue, model_runner:ModelRunner, num_free_pages):
+    def run_gpu_engine(schedule_outputs:Queue, run_outputs:Queue, model_runner:ModelRunner, num_free_pages, decode_num_multi_step):
         while True:
             num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
-            # print("GPU: wait",time.time())
-            scheduled_seqs = schedule_outputs.get()
-            # print("GPU: start",time.time())
-            model_runner.step_once(seqs=scheduled_seqs)
-            # print("GPU: end",time.time())
+
+            scheduled_seqs:List[Sequence] = schedule_outputs.get()
+            
+            if not scheduled_seqs[0].computed_prompt:
+                num_multi_step = 1
+            else:
+                num_multi_step = decode_num_multi_step
+            
+            #multi-step
+            finish_seqs = []
+            for i in range(num_multi_step):
+                model_runner.step_once(seqs=scheduled_seqs)
+                if i == num_multi_step - 1:
+                    scheduled_seqs.extend(finish_seqs)
+                    break
+                next_scheduled_seqs = []
+                for seq in scheduled_seqs:
+                    if not seq.is_finish():
+                        next_scheduled_seqs.append(seq)
+                    else:
+                        finish_seqs.append(seq)
+                scheduled_seqs = next_scheduled_seqs
+                if len(scheduled_seqs) == 0:
+                    scheduled_seqs = finish_seqs
+                    break
+                
             run_outputs.put_nowait(scheduled_seqs)
             
     async def run_process_output_engine(self):
@@ -209,7 +236,8 @@ class PipeAsyncLLM(LLM):
             target=PipeAsyncLLM.run_gpu_engine,args=(self.schedule_outputs, 
                                                      self.run_outputs, 
                                                      self.model_runner,
-                                                     self.num_free_pages))
+                                                     self.num_free_pages,
+                                                     self.decode_num_multi_steps))
         self.gpu_engine.start()
     
     def start_schedule_engine(self):
