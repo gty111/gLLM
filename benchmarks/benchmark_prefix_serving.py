@@ -125,7 +125,6 @@ def sample_requests(
                                                 user_id,
                                                 epoch))
                 history.append({"role":"gpt","content":chat["value"]})
-        # print(f"{session_ID}:{epoch}")
         if flag_add:
             user_id += 1
         if user_id-1 == num_max_users:
@@ -240,7 +239,6 @@ async def benchmark(
     best_of: int,
     use_beam_search: bool,
     disable_tqdm: bool,
-    use_sessionID: bool,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS.get(backend)
@@ -390,7 +388,6 @@ def main(args: argparse.Namespace):
             best_of=args.best_of,
             use_beam_search=args.use_beam_search,
             disable_tqdm=args.disable_tqdm,
-            use_sessionID=args.use_sessionID
         ))
 
     # Save config and results to json
@@ -508,8 +505,5 @@ if __name__ == "__main__":
                         type=int,
                         default=None,
                         help="Specific length of the output")
-    parser.add_argument("--use-sessionID",
-                        action="store_true",
-                        help="Specify to use sessionID")
     args = parser.parse_args()
     main(args)

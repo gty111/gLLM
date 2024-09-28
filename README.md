@@ -11,7 +11,7 @@ Lightweight, easy, fast and cheap LLM serving
 
 ## What is gLLM?
 
-Integreted with features like **continuous batching**, **paged attention** and **pipeline schedule**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. Adopting part of codebase from vLLM, gLLM provides **faster** offline/online inference speed than vLLM with **lightweight** overhead and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
+Integreted with features like **continuous batching**, **paged attention**, **prefix caching** and **pipeline schedule**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. Adopting part of codebase from vLLM, gLLM provides **faster** offline/online inference speed than vLLM with **lightweight** overhead and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 ### Offline performance (Test on llama3-8b)
 
@@ -51,11 +51,11 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
 ```
 
 ### Launch online serving
+
 ```
-# w/o pipeline schedule
+# To enable pipeline schedule, add "--pipe-schedule"
+# To enable prefix caching, add "--enable-prefix-caching"
 python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH
-# w/ pipeline schedule
-python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH --pipe-schedule
 ```
 
 ### Client Completions
@@ -74,6 +74,17 @@ python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
         --dataset-name $DATASET_NAME --dataset-path $DATASET_PATH \
         --num-prompts $NUM_PROMPTS --port $PORT --trust-remote-code \
         --request-rate $REQUEST_RATE
+```
+
+### Online prefix benchmark with gllm or vllm
+```
+python benchmarks/benchmark_prefix_serving.py \
+        --trust-remote-code --backend $BACKEND --dataset $DATASET \
+        --model $MODEL --num-max-users $NUM_USERS \
+        --num-min-rounds $NUM_MIN_ROUNDS \
+        --num-max-rounds $NUM_MAX_ROUNDS \
+        --seed $NUM_USERS --port $PORT \
+        --input-len-min $INPUT_LEN_MIN --input-len-max $INPUT_LEN_MAX
 ```
 
 ## Pipeline Schedule
