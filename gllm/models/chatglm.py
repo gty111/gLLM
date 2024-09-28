@@ -8,7 +8,7 @@ from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
-from gllm.sampler import Sampler
+from gllm.layers.sampler import Sampler
 
 
 class GLMAttention(nn.Module):

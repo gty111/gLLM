@@ -8,7 +8,7 @@ from gllm.layers.layernorm import RMSNorm
 from gllm.layers.rotary_embedding import RotaryEmbedding, LinearScalingRotaryEmbedding, Llama3RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.input_data import InputData
-from gllm.sampler import Sampler
+from gllm.layers.sampler import Sampler
 
 
 class LlamaMLP(nn.Module):

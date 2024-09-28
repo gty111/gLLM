@@ -12,8 +12,10 @@ class Sampler():
         logits.div_(temperature.unsqueeze_(dim=1))
         logits = _apply_top_k_top_p(logits, top_p, top_k)
         probs = torch.softmax(logits, dim=1)
-        next_tokens = torch.multinomial(probs, 1).squeeze(1).cpu().numpy().tolist()
-        return next_tokens
+        # q = torch.empty_like(probs)
+        # q.exponential_()
+        # return probs.div_(q).argmax(dim=1).cpu().numpy().tolist()
+        return torch.multinomial(probs, 1).squeeze(1).cpu().numpy().tolist()
 
 
 def _apply_top_k_top_p(
