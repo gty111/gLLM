@@ -6,18 +6,23 @@ from typing import List
 from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
 from gllm.input_data import InputData
-from gllm.memory_manager import MemoryManager
+from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 
 class ModelRunner():
-    def __init__(self, model_path: str, gpu_memory_utilization, page_size):
+    def __init__(self, model_path: str, gpu_memory_utilization:float, page_size:int, 
+                 enable_prefix_caching:bool):
         model_loader = ModelLoader(model_path)
 
         self.model = model_loader.load_model()
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True)
-        self.memory_manager = MemoryManager(
-            gpu_memory_utilization, self.model.num_layers, self.model.dtype, page_size, self.model.num_kv_heads, self.model.head_dim)
+        
+        memory_manager_cls = PrefixMemoryManager if enable_prefix_caching else MemoryManager
+        self.memory_manager = memory_manager_cls(
+            gpu_memory_utilization=gpu_memory_utilization, num_layers=self.model.num_layers, 
+            dtype=self.model.dtype, page_size=page_size, kv_head_num=self.model.num_kv_heads, 
+            kv_head_dim=self.model.head_dim)
 
     @torch.inference_mode()
     def step_once(self,
