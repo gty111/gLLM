@@ -26,6 +26,8 @@ class Sequence():
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        # used for prefix cache
+        self.computed_page_num = 0
 
     def detokenize_inc(self, tokenizer: Optional[PreTrainedTokenizer | PreTrainedTokenizerFast]):
         added_space = ' ' if ' ' in tokenizer.decode(

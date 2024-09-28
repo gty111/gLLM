@@ -121,7 +121,7 @@ class Qwen2ForCausalLM(nn.Module):
             self.lm_head = nn.Linear(
                 model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
         self.sampler = Sampler()
-        
+
     def forward(self, input_data: InputData):
         return self.model(input_data)
 
@@ -130,7 +130,10 @@ class Qwen2ForCausalLM(nn.Module):
             return self.lm_head(hidden_states)
         else:
             # fetch hidden_states of last token in each seq
-            idx_list = input_data.cu_seqs_len - 1
+            if input_data.prefix_prefill:
+                idx_list = input_data.query_start_loc - 1
+            else:
+                idx_list = input_data.seq_start_loc - 1
             return self.lm_head(hidden_states[idx_list[1:]])
 
     def sample(self, input_data: InputData, logits: torch.Tensor):

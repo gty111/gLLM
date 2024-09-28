@@ -29,7 +29,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         request.messages, add_generation_prompt=True)
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
-                                            request.temperature, request.top_p, request.top_k)
+                                              request.temperature, request.top_p, request.top_k)
     else:
         return ErrorResponse(message="seq length exceeds max model length",
                              type="BadRequestError",
@@ -47,7 +47,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     token_ids = llm.model_runner.tokenizer.encode(request.prompt)
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
-                                            request.temperature, request.top_p, request.top_k)
+                                              request.temperature, request.top_p, request.top_k)
     else:
         return ErrorResponse(message="seq length exceeds max model length",
                              type="BadRequestError",
@@ -81,26 +81,21 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--model-path', type=str, required=True)
     parser.add_argument('--pipe-schedule', action="store_true")
-    parser.add_argument('--gpu-memory-util',type=float,default=0.9)
-    parser.add_argument('--page-size',type=int,default=16)
-    parser.add_argument('--max-decode-seqs',type=int,default=256)
-    parser.add_argument('--max-batch-tokens',type=int,default=8192)
-    parser.add_argument('--ratio-free-pages',type=float,default=0.2)
+    parser.add_argument('--gpu-memory-util', type=float, default=0.9)
+    parser.add_argument('--page-size', type=int, default=16)
+    parser.add_argument('--max-decode-seqs', type=int, default=256)
+    parser.add_argument('--max-batch-tokens', type=int, default=8192)
+    parser.add_argument('--ratio-free-pages', type=float, default=0.2)
+    parser.add_argument('--enable-prefix-caching', action='store_true')
     args = parser.parse_args()
 
-    if args.pipe_schedule:
-        llm = PipeAsyncLLM(model_path=args.model_path,
-                           gpu_memory_utilization=args.gpu_memory_util,
-                           page_size=args.page_size,
-                           max_decode_seqs=args.max_decode_seqs,
-                           max_batch_tokens=args.max_batch_tokens,
-                           ratio_threshold_free_pages=args.ratio_free_pages)
-    else:
-        llm = AsyncLLM(model_path=args.model_path,
-                       gpu_memory_utilization=args.gpu_memory_util,
-                       page_size=args.page_size,
-                       max_decode_seqs=args.max_decode_seqs,
-                       max_batch_tokens=args.max_batch_tokens,
-                       ratio_threshold_free_pages=args.ratio_free_pages)
+    llm_cls = PipeAsyncLLM if args.pipe_schedule else AsyncLLM
+    llm = llm_cls(model_path=args.model_path,
+                  gpu_memory_utilization=args.gpu_memory_util,
+                  page_size=args.page_size,
+                  max_decode_seqs=args.max_decode_seqs,
+                  max_batch_tokens=args.max_batch_tokens,
+                  ratio_threshold_free_pages=args.ratio_free_pages,
+                  enable_prefix_caching=args.enable_prefix_caching)
 
     asyncio.run(run_server(args))

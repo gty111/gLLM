@@ -3,11 +3,12 @@ from openai import OpenAI
 
 parser = argparse.ArgumentParser(description='Chat client')
 parser.add_argument("--stream",action="store_true")
+parser.add_argument("--port",type=int)
 args = parser.parse_args()
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
 openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:65532/v1"
+openai_api_base = f"http://localhost:{port}/v1"
 
 client = OpenAI(
     # defaults to os.environ.get("OPENAI_API_KEY")

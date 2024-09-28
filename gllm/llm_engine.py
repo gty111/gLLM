@@ -9,10 +9,11 @@ from gllm.scheduler import Scheduler
 
 
 class LLM():
-    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256, max_batch_tokens=8192, ratio_threshold_free_pages=0.2):
+    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256, 
+                 max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True):
         self.model_path = model_path
         self.model_runner = ModelRunner(
-            model_path, gpu_memory_utilization, page_size)
+            model_path, gpu_memory_utilization, page_size, enable_prefix_caching)
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
             max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages,
