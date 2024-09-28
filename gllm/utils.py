@@ -1,7 +1,8 @@
 import asyncio
 import uuid
+import torch
 from functools import partial
-from typing import Awaitable, Callable, ParamSpec, TypeVar
+from typing import Awaitable, Callable, ParamSpec, TypeVar, Union
 
 P = ParamSpec('P')
 K = TypeVar("K")
@@ -24,3 +25,13 @@ def make_async(func: Callable[P, T]) -> Callable[P, Awaitable[T]]:
 
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
+
+def async_tensor_h2d(
+    data: list,
+    dtype: torch.dtype,
+    target_device: Union[str, torch.device],
+    pin_memory: bool,
+) -> torch.Tensor:
+    """Asynchronously create a tensor and copy it from host to device."""
+    t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
+    return t.to(device=target_device, non_blocking=True)
