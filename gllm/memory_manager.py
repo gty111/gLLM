@@ -31,7 +31,7 @@ class MemoryManager():
         for seq in seqs:
             # prompt KV cache
             if not computed_prompt:
-                for i in range(0, seq.prompt_len, self.page_size):
+                for i in range(seq.computed_page_num*self.page_size, seq.prompt_len, self.page_size):
                     page_num = seq.page_table[i // self.page_size]
                     idx_right = min(seq.prompt_len, i+self.page_size)
                     slot_mapping.extend(list(
@@ -61,13 +61,14 @@ class MemoryManager():
         for seq in seqs:
             # prompt KV cache
             if not computed_prompt:
-                for i in range(0, seq.prompt_len, self.page_size):
+                seq_start_loc = seq.computed_page_num * self.page_size
+                for i in range(seq_start_loc, seq.prompt_len, self.page_size):
                     page_num = seq.page_table[i // self.page_size]
                     idx_right = min(seq.prompt_len, i+self.page_size)
                     self.segments[seq.segment_id].k_cache[layer_idx][page_num][0:idx_right-i].copy_(
-                        k_cache[i+cu_seqs_len:idx_right+cu_seqs_len])
+                        k_cache[i-seq_start_loc+cu_seqs_len:idx_right-seq_start_loc+cu_seqs_len])
                     self.segments[seq.segment_id].v_cache[layer_idx][page_num][0:idx_right-i].copy_(
-                        v_cache[i+cu_seqs_len:idx_right+cu_seqs_len])
+                        v_cache[i-seq_start_loc+cu_seqs_len:idx_right-seq_start_loc+cu_seqs_len])
                 cu_seqs_len += seq.prompt_len
             # decode KV cache
             else:
@@ -95,8 +96,12 @@ class MemoryManager():
                 computed_prefix = True
                 for i in range(num_page):
                     if computed_prefix and (i+1)*self.page_size <= len(seq.token_ids):
-                        computed_prefix, page_num = self.segments[seq.segment_id].allocate((*seq.token_ids[:(i+1)*self.page_size],))
+                        computed_prefix, page_num = self.segments[seq.segment_id].allocate(
+                            (*seq.token_ids[:(i+1)*self.page_size],))
                         seq.computed_page_num += int(computed_prefix)
+                    elif (i+1)*self.page_size <= len(seq.token_ids):
+                        _, page_num = self.segments[seq.segment_id].allocate(
+                            (*seq.token_ids[:(i+1)*self.page_size],))
                     else:
                         _, page_num = self.segments[seq.segment_id].allocate()
                     seq.page_table.append(page_num)
@@ -142,7 +147,7 @@ class Segment():
         self.page_ref_num = [0 for _ in range(self.page_num_segment)]
         self.page2hash = [0 for _ in range(self.page_num_segment)]
 
-    def allocate(self, token_ids:Set[int]=None):
+    def allocate(self, token_ids: Set[int] = None):
         page_hash = hash(token_ids) if token_ids is not None else None
         if page_hash is not None and page_hash in self.hash2page:
             page_num = self.hash2page[page_hash]
@@ -162,7 +167,7 @@ class Segment():
         return computed, page_num
 
     def free(self, page_num: int):
-        assert self.page_ref_num[page_num] > 0 
+        assert self.page_ref_num[page_num] > 0
         self.page_ref_num[page_num] -= 1
         if self.page_ref_num[page_num] == 0:
             # print(f'free {page_num}')

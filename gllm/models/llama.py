@@ -51,7 +51,7 @@ class LlamaAttention(nn.Module):
                     "original_max_position_embeddings"]
                 self.rotary_emb = Llama3RotaryEmbedding(
                     self.head_dim, self.head_dim, original_max_position,
-                    model_config['rope_theta'], True, model_config['torch_dtype'], 
+                    model_config['rope_theta'], True, model_config['torch_dtype'],
                     rope_scaling['factor'], low_freq_factor, high_freq_factor, original_max_position)
             elif rope_scaling['type'] == 'linear':
                 self.rotary_emb = LinearScalingRotaryEmbedding(
@@ -61,7 +61,7 @@ class LlamaAttention(nn.Module):
                 assert 0
         else:
             self.rotary_emb = RotaryEmbedding(
-                self.head_dim, self.head_dim, model_config['max_position_embeddings'], 
+                self.head_dim, self.head_dim, model_config['max_position_embeddings'],
                 model_config['rope_theta'], True, model_config['torch_dtype'])
 
         self.scaling = self.head_dim**-0.5
@@ -146,7 +146,7 @@ class LlamaForCausalLM(nn.Module):
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
         if model_config['eos_token_id'] == 128001:
             # Llama3-8b-chat
-            self.finish_tokens = [model_config['eos_token_id'],128009]
+            self.finish_tokens = [model_config['eos_token_id'], 128009]
         else:
             if type(model_config['eos_token_id']) == int:
                 self.finish_tokens = [model_config['eos_token_id']]
@@ -159,7 +159,7 @@ class LlamaForCausalLM(nn.Module):
         self.lm_head = nn.Linear(
             model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
         self.sampler = Sampler()
-        
+
     def forward(self, input_data: InputData):
         return self.model(input_data)
 
@@ -168,7 +168,10 @@ class LlamaForCausalLM(nn.Module):
             return self.lm_head(hidden_states)
         else:
             # fetch hidden_states of last token in each seq
-            idx_list = input_data.cu_seqs_len - 1
+            if input_data.prefix_prefill:
+                idx_list = input_data.query_start_loc - 1
+            else:
+                idx_list = input_data.seq_start_loc - 1
             return self.lm_head(hidden_states[idx_list[1:]])
 
     def sample(self, input_data: InputData, logits: torch.Tensor):
