@@ -68,8 +68,6 @@ def sample_requests(
     dataset_path: str,
     num_min_rounds: int,
     num_max_rounds: int,
-    input_len_min: int,
-    input_len_max: int,
     num_max_users: int,
     tokenizer: PreTrainedTokenizerBase,
     fixed_output_len: Optional[int],
@@ -81,16 +79,10 @@ def sample_requests(
     with open(dataset_path) as f:
         dataset = json.load(f)
     
-    # share_gpt_rounds need to double
-    num_min_rounds *= 2
-    num_max_rounds *= 2
-    
     assert num_min_rounds <= num_max_rounds
-    assert input_len_min < input_len_max
 
     dataset = [data for data in dataset if len(
-        data["conversations"]) >= num_min_rounds and len(
-            data["conversations"]) <= num_max_rounds]
+        data["conversations"]) >= num_min_rounds*2]
     dataset = [data for data in dataset if data[
         "conversations"][0]["from"] == "human"]
     
@@ -98,8 +90,7 @@ def sample_requests(
     user_id = 1
     for i in dataset:
         history = []
-        flag_add = False
-        epoch = 1
+        epoch = 0
         for chat in i["conversations"]:
             if chat["from"] == "human":
                 history.append({"role":"user","content":chat["value"]})
@@ -109,24 +100,23 @@ def sample_requests(
                     #     break
                     prompt_tokens = tokenizer.apply_chat_template(history,add_generation_prompt=True)
                     prompt = tokenizer.decode(prompt_tokens,True)
-                    if True or (len(prompt_tokens) > input_len_min and len(prompt_tokens) < input_len_max): 
-                        flag_add = True
-                        epoch += 1
-                        if fixed_output_len:
-                            filtered_dataset.append((prompt,
-                                                len(tokenizer(prompt).input_ids),
-                                                fixed_output_len,
-                                                user_id,
-                                                epoch))
-                        else:
-                            filtered_dataset.append((prompt,
-                                                len(tokenizer(prompt).input_ids),
-                                                len(tokenizer(chat['value']).input_ids),
-                                                user_id,
-                                                epoch))
+                    epoch += 1
+                    if fixed_output_len:
+                        filtered_dataset.append((prompt,
+                                            len(tokenizer(prompt).input_ids),
+                                            fixed_output_len,
+                                            user_id,
+                                            epoch))
+                    else:
+                        filtered_dataset.append((prompt,
+                                            len(tokenizer(prompt).input_ids),
+                                            len(tokenizer(chat['value']).input_ids),
+                                            user_id,
+                                            epoch))
                 history.append({"role":"gpt","content":chat["value"]})
-        if flag_add:
-            user_id += 1
+            if epoch == num_max_rounds:
+                break
+        user_id += 1
         if user_id-1 == num_max_users:
             break
     users = min(user_id,num_max_users)
@@ -371,8 +361,6 @@ def main(args: argparse.Namespace):
     input_requests = sample_requests(args.dataset, 
                                      args.num_min_rounds, 
                                      args.num_max_rounds, 
-                                     args.input_len_min,
-                                     args.input_len_max,
                                      args.num_max_users,
                                      tokenizer,
                                      args.output_len,
@@ -495,12 +483,6 @@ if __name__ == "__main__":
                         type=int,
                         default=50,
                         help="Min number of rounds at least in one conversation")
-    parser.add_argument("--input-len-max",
-                        type=int,
-                        default=2048)
-    parser.add_argument("--input-len-min",
-                        type=int,
-                        default=1536)
     parser.add_argument("--output-len",
                         type=int,
                         default=None,
