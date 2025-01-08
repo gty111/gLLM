@@ -31,10 +31,10 @@ class FlashAttention():
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
         
-        # store performs better at small batch size
+        # store performs better at small batch size (decode stage)
         # batch store performs better at large batch size
         # TODO: optimize thresholds to enable store or batch_store
-        if len(input_data.seqs) == 1:
+        if len(input_data.seqs) == 1 and input_data.computed_prompt:
             input_data.memory_manager.store(
                 self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
         else:

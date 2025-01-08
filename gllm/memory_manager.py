@@ -4,6 +4,7 @@ from logger import logger
 
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
+from gllm.utils import async_tensor_h2d
 
 
 class MemoryManager():
@@ -19,13 +20,13 @@ class MemoryManager():
         self.kv_head_num = kv_head_num
         self.kv_head_dim = kv_head_dim
         self.dtype = dtype
-        
+
         free_mem_size, _ = torch.cuda.mem_get_info()
         num_max_pages = free_mem_size // (
             2*num_layers*page_size*kv_head_num*kv_head_dim*2)
         self.num_pages = int(num_max_pages * gpu_memory_utilization)
         logger.info(f'Allocate {self.num_pages} pages')
-        
+
         self.segments = [
             Segment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)]
 
@@ -49,8 +50,8 @@ class MemoryManager():
                     page_num = seq.page_table[-1]
                     slot_mapping.append(page_num*self.page_size+offset)
 
-        slot_mapping_tensor = torch.tensor(
-            slot_mapping, dtype=torch.int64, device='cuda')
+        slot_mapping_tensor = async_tensor_h2d(
+            slot_mapping, torch.int64, 'cuda', True)
 
         from gllm import _custom_ops as ops
         ops.reshape_and_cache_flash(k_cache,
@@ -153,11 +154,11 @@ class Segment():
 class PrefixMemoryManager(MemoryManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
+
         del self.segments
         self.segments = [
             PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)]
-        
+
         logger.info('Enable prefix caching')
 
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor,
@@ -184,8 +185,8 @@ class PrefixMemoryManager(MemoryManager):
                             (*seq.token_ids[-self.page_size:],), page_num)
                     slot_mapping.append(page_num*self.page_size+offset)
 
-        slot_mapping_tensor = torch.tensor(
-            slot_mapping, dtype=torch.int64, device='cuda')
+        slot_mapping_tensor = async_tensor_h2d(
+            slot_mapping, torch.int64, 'cuda', True)
 
         from gllm import _custom_ops as ops
         ops.reshape_and_cache_flash(k_cache,
