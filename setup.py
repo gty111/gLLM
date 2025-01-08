@@ -4,6 +4,7 @@ import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
 from shutil import which
 from typing import Dict, List
 
@@ -69,7 +70,7 @@ class cmake_build_ext(build_ext):
     def compute_num_jobs(self):
         # `num_jobs` is either the value of the MAX_JOBS environment variable
         # (if defined) or the number of CPUs available.
-        num_jobs = os.getenv("MAX_JOBS", None)
+        num_jobs = None
         if num_jobs is not None:
             num_jobs = int(num_jobs)
             logger.info("Using MAX_JOBS=%d as the number of jobs.", num_jobs)
@@ -79,7 +80,7 @@ class cmake_build_ext(build_ext):
                 #  back to os.cpu_count() if we get an error here.
                 num_jobs = len(os.sched_getaffinity(0))
             except AttributeError:
-                num_jobs = os.cpu_count()
+                num_jobs = min(os.cpu_count(), 32)
 
         nvcc_threads = None
         if _is_cuda() and get_nvcc_cuda_version() >= Version("11.2"):
@@ -87,7 +88,7 @@ class cmake_build_ext(build_ext):
             # environment variable (if defined) or 1.
             # when it is set, we reduce `num_jobs` to avoid
             # overloading the system.
-            nvcc_threads = os.getenv("NVCC_THREADS", None)
+            nvcc_threads = None
             if nvcc_threads is not None:
                 nvcc_threads = int(nvcc_threads)
                 logger.info(
@@ -115,37 +116,40 @@ class cmake_build_ext(build_ext):
         default_cfg = "Debug" if self.debug else "RelWithDebInfo"
         cfg = os.getenv("CMAKE_BUILD_TYPE") or default_cfg
 
-        # where .so files will be written, should be the same for all extensions
-        # that use the same CMakeLists.txt.
-        outdir = os.path.abspath(
-            os.path.dirname(self.get_ext_fullpath(ext.name)))
-
         cmake_args = [
             '-DCMAKE_BUILD_TYPE={}'.format(cfg),
-            '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={}'.format(outdir),
-            '-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={}'.format(self.build_temp),
-            '-DGLLM_TARGET_DEVICE={}'.format(GLLM_TARGET_DEVICE),
         ]
-
-        verbose = bool(int(os.getenv('VERBOSE', '0')))
-        if verbose:
-            cmake_args += ['-DCMAKE_VERBOSE_MAKEFILE=ON']
 
         if is_sccache_available():
             cmake_args += [
+                '-DCMAKE_C_COMPILER_LAUNCHER=sccache',
                 '-DCMAKE_CXX_COMPILER_LAUNCHER=sccache',
                 '-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache',
-                '-DCMAKE_C_COMPILER_LAUNCHER=sccache',
+                '-DCMAKE_HIP_COMPILER_LAUNCHER=sccache',
             ]
         elif is_ccache_available():
             cmake_args += [
+                '-DCMAKE_C_COMPILER_LAUNCHER=ccache',
                 '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache',
                 '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache',
+                '-DCMAKE_HIP_COMPILER_LAUNCHER=ccache',
             ]
 
         # Pass the python executable to cmake so it can find an exact
         # match.
         cmake_args += ['-DGLLM_PYTHON_EXECUTABLE={}'.format(sys.executable)]
+
+        # Pass the python path to cmake so it can reuse the build dependencies
+        # on subsequent calls to python.
+        cmake_args += ['-DVLLM_PYTHON_PATH={}'.format(":".join(sys.path))]
+
+        # Override the base directory for FetchContent downloads to $ROOT/.deps
+        # This allows sharing dependencies between profiles,
+        # and plays more nicely with sccache.
+        # To override this, set the FETCHCONTENT_BASE_DIR environment variable.
+        fc_base_dir = os.path.join(ROOT_DIR, ".deps")
+        fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
+        cmake_args += ['-DFETCHCONTENT_BASE_DIR={}'.format(fc_base_dir)]
 
         #
         # Setup parallelism and build tool
@@ -180,10 +184,14 @@ class cmake_build_ext(build_ext):
             os.makedirs(self.build_temp)
 
         targets = []
+
+        def target_name(s: str) -> str:
+            return s.removeprefix("gllm.").removeprefix("vllm_flash_attn.")
+
         # Build all the extensions
         for ext in self.extensions:
             self.configure(ext)
-            targets.append(remove_prefix(ext.name, "gllm."))
+            targets.append(target_name(ext.name))
 
         num_jobs, _ = self.compute_num_jobs()
 
@@ -196,10 +204,49 @@ class cmake_build_ext(build_ext):
 
         subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
 
+        # Install the libraries
+        for ext in self.extensions:
+            # Install the extension into the proper location
+            outdir = Path(self.get_ext_fullpath(ext.name)).parent.absolute()
+
+            # Skip if the install directory is the same as the build directory
+            if outdir == self.build_temp:
+                continue
+
+            # CMake appends the extension prefix to the install path,
+            # and outdir already contains that prefix, so we need to remove it.
+            prefix = outdir
+            for i in range(ext.name.count('.')):
+                prefix = prefix.parent
+
+            # prefix here should actually be the same for all components
+            install_args = [
+                "cmake", "--install", ".", "--prefix", prefix, "--component",
+                target_name(ext.name)
+            ]
+
+            subprocess.check_call(install_args, cwd=self.build_temp)
+
+    def run(self):
+        # First, run the standard build_ext command to compile the extensions
+        super().run()
+
+        # copy vllm/vllm_flash_attn/*.py from self.build_lib to current
+        # directory so that they can be included in the editable build
+        import glob
+        files = glob.glob(
+            os.path.join(self.build_lib, "gllm", "vllm_flash_attn", "*.py"))
+        for file in files:
+            dst_file = os.path.join("gllm/vllm_flash_attn",
+                                    os.path.basename(file))
+            print(f"Copying {file} to {dst_file}")
+            self.copy_file(file, dst_file)
+
 
 def _is_cuda() -> bool:
     has_cuda = torch.version.cuda is not None
     return GLLM_TARGET_DEVICE == "cuda" and has_cuda
+
 
 def get_nvcc_cuda_version() -> Version:
     """Get the CUDA version from nvcc.
@@ -254,23 +301,15 @@ def get_requirements() -> List[str]:
         return resolved_requirements
 
     requirements = _read_requirements("requirements.txt")
-    cuda_major, cuda_minor = torch.version.cuda.split(".")
-    modified_requirements = []
-    for req in requirements:
-        if ("vllm-flash-attn" in req
-                and not (cuda_major == "12" and cuda_minor == "1")):
-            # vllm-flash-attn is built only for CUDA 12.1.
-            # Skip for other versions.
-            continue
-        modified_requirements.append(req)
-    requirements = modified_requirements
-    
+
     return requirements
 
 
 ext_modules = []
 
 ext_modules.append(CMakeExtension(name="gllm._C"))
+ext_modules.append(
+    CMakeExtension(name="gllm.vllm_flash_attn.vllm_flash_attn_c"))
 
 
 setup(
