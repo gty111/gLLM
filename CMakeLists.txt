@@ -21,7 +21,7 @@ set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
 
 
 # Supported/expected torch versions for CUDA.
-set(TORCH_SUPPORTED_VERSION_CUDA "2.3.1")
+set(TORCH_SUPPORTED_VERSION_CUDA "2.5.1")
 
 #
 # Try to find python package with an executable that exactly matches
@@ -67,37 +67,37 @@ endif()
 # what is expected.
 #
 if (CUDA_FOUND)
-  set(GLLM_GPU_LANG "CUDA")
+  set(VLLM_GPU_LANG "CUDA")
 
   if (NOT Torch_VERSION VERSION_EQUAL ${TORCH_SUPPORTED_VERSION_CUDA})
     message(WARNING "Pytorch version ${TORCH_SUPPORTED_VERSION_CUDA} "
       "expected for CUDA build, saw ${Torch_VERSION} instead.")
   endif()
+  clear_cuda_arches(CUDA_ARCH_FLAGS)
+  extract_unique_cuda_archs_ascending(CUDA_ARCHS "${CUDA_ARCH_FLAGS}")
+  message(STATUS "CUDA target architectures: ${CUDA_ARCHS}")
+  # Filter the target architectures by the supported supported archs
+  # since for some files we will build for all CUDA_ARCHS.
+  cuda_archs_loose_intersection(CUDA_ARCHS
+    "${CUDA_SUPPORTED_ARCHS}" "${CUDA_ARCHS}")
+  message(STATUS "CUDA supported target architectures: ${CUDA_ARCHS}")
 else()
   message(FATAL_ERROR "Can't find CUDA installation.")
 endif()
 
-#
-# Override the GPU architectures detected by cmake/torch and filter them by
-# the supported versions for the current language.
-# The final set of arches is stored in `GLLM_GPU_ARCHES`.
-#
-override_gpu_arches(GLLM_GPU_ARCHES
-  ${GLLM_GPU_LANG}
-  "${${GLLM_GPU_LANG}_SUPPORTED_ARCHS}")
 
 #
 # Query torch for additional GPU compilation flags for the given
-# `GLLM_GPU_LANG`.
-# The final set of arches is stored in `GLLM_GPU_FLAGS`.
+# `VLLM_GPU_LANG`.
+# The final set of arches is stored in `VLLM_GPU_FLAGS`.
 #
-get_torch_gpu_compiler_flags(GLLM_GPU_FLAGS ${GLLM_GPU_LANG})
+get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})
 
 #
 # Set nvcc parallelism.
 #
-if(NVCC_THREADS AND GLLM_GPU_LANG STREQUAL "CUDA")
-  list(APPEND GLLM_GPU_FLAGS "--threads=${NVCC_THREADS}")
+if(NVCC_THREADS AND VLLM_GPU_LANG STREQUAL "CUDA")
+  list(APPEND VLLM_GPU_FLAGS "--threads=${NVCC_THREADS}")
 endif()
 
 #
@@ -108,7 +108,7 @@ endif()
 # _C extension
 #
 
-set(GLLM_EXT_SRC
+set(VLLM_EXT_SRC
   "csrc/cache_kernels.cu"
   "csrc/pos_encoding_kernels.cu"
   "csrc/activation_kernels.cu"
@@ -119,32 +119,88 @@ set(GLLM_EXT_SRC
 define_gpu_extension_target(
   _C
   DESTINATION gllm
-  LANGUAGE ${GLLM_GPU_LANG}
-  SOURCES ${GLLM_EXT_SRC}
-  COMPILE_FLAGS ${GLLM_GPU_FLAGS}
-  ARCHITECTURES ${GLLM_GPU_ARCHES}
+  LANGUAGE ${VLLM_GPU_LANG}
+  SOURCES ${VLLM_EXT_SRC}
+  COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+  ARCHITECTURES ${VLLM_GPU_ARCHES}
   INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR};${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
   USE_SABI 3
   WITH_SOABI)
 
 
-#
-# Add the `default` target which detects which extensions should be
-# built based on platform/architecture.  This is the same logic that
-# setup.py uses to select which extensions should be built and should
-# be kept in sync.
-#
-# The `default` target makes direct use of cmake easier since knowledge
-# of which extensions are supported has been factored in, e.g.
-#
-# mkdir build && cd build
-# cmake -G Ninja -DGLLM_PYTHON_EXECUTABLE=`which python3` -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=../gllm ..
-# cmake --build . --target default
-#
-add_custom_target(default)
 
-if(GLLM_GPU_LANG STREQUAL "CUDA" OR GLLM_GPU_LANG STREQUAL "HIP")
-  message(STATUS "Enabling C extension.")
-  add_dependencies(default _C)
-
+# vLLM flash attention requires VLLM_GPU_ARCHES to contain the set of target
+# arches in the CMake syntax (75-real, 89-virtual, etc), since we clear the
+# arches in the CUDA case (and instead set the gencodes on a per file basis)
+# we need to manually set VLLM_GPU_ARCHES here.
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  foreach(_ARCH ${CUDA_ARCHS})
+    string(REPLACE "." "" _ARCH "${_ARCH}")
+    list(APPEND VLLM_GPU_ARCHES "${_ARCH}-real")
+  endforeach()
 endif()
+
+include(FetchContent)
+file(MAKE_DIRECTORY ${FETCHCONTENT_BASE_DIR}) # Ensure the directory exists
+message(STATUS "FetchContent base directory: ${FETCHCONTENT_BASE_DIR}")
+
+#
+# Build vLLM flash attention from source
+#
+# IMPORTANT: This has to be the last thing we do, because vllm-flash-attn uses the same macros/functions as vLLM.
+# Because functions all belong to the global scope, vllm-flash-attn's functions overwrite vLLMs.
+# They should be identical but if they aren't, this is a massive footgun.
+#
+# The vllm-flash-attn install rules are nested under vllm to make sure the library gets installed in the correct place.
+# To only install vllm-flash-attn, use --component vllm_flash_attn_c.
+# If no component is specified, vllm-flash-attn is still installed.
+
+# If VLLM_FLASH_ATTN_SRC_DIR is set, vllm-flash-attn is installed from that directory instead of downloading.
+# This is to enable local development of vllm-flash-attn within vLLM.
+# It can be set as an environment variable or passed as a cmake argument.
+# The environment variable takes precedence.
+if (DEFINED ENV{VLLM_FLASH_ATTN_SRC_DIR})
+  set(VLLM_FLASH_ATTN_SRC_DIR $ENV{VLLM_FLASH_ATTN_SRC_DIR})
+endif()
+
+if(VLLM_FLASH_ATTN_SRC_DIR)
+  FetchContent_Declare(vllm-flash-attn SOURCE_DIR ${VLLM_FLASH_ATTN_SRC_DIR})
+else()
+  FetchContent_Declare(
+          vllm-flash-attn
+          GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
+          GIT_TAG 96266b1111111f3d11aabefaf3bacbab6a89d03c
+          GIT_PROGRESS TRUE
+          # Don't share the vllm-flash-attn build between build types
+          BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
+  )
+endif()
+
+# Set the parent build flag so that the vllm-flash-attn library does not redo compile flag and arch initialization.
+set(VLLM_PARENT_BUILD ON)
+
+# Ensure the gllm/vllm_flash_attn directory exists before installation
+install(CODE "file(MAKE_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/gllm/vllm_flash_attn\")" COMPONENT vllm_flash_attn_c)
+
+# Make sure vllm-flash-attn install rules are nested under gllm/
+install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY FALSE)" COMPONENT vllm_flash_attn_c)
+install(CODE "set(OLD_CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}\")" COMPONENT vllm_flash_attn_c)
+install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/gllm/\")" COMPONENT vllm_flash_attn_c)
+
+# Fetch the vllm-flash-attn library
+FetchContent_MakeAvailable(vllm-flash-attn)
+message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
+
+# Restore the install prefix
+install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" COMPONENT vllm_flash_attn_c)
+install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" COMPONENT vllm_flash_attn_c)
+
+# Copy over the vllm-flash-attn python files
+install(
+        DIRECTORY ${vllm-flash-attn_SOURCE_DIR}/vllm_flash_attn/
+        DESTINATION gllm/vllm_flash_attn
+        COMPONENT vllm_flash_attn_c
+        FILES_MATCHING PATTERN "*.py"
+)
+
+# Nothing after vllm-flash-attn, see comment about macros above
