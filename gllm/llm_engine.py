@@ -43,9 +43,9 @@ class LLM():
         self.scheduler.finish_lists = []
 
     def step(self):
-        scheduled_seqs = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages())
-        self.model_runner.step_once(scheduled_seqs)
-        self.scheduler.update_seqs(scheduled_seqs)
+        scheduleOutput = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages())
+        self.model_runner.step_once(scheduleOutput)
+        self.scheduler.update_seqs(scheduleOutput)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None, 
                  temperature=0.6, top_p=0.9, top_k=10):
