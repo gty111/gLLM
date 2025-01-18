@@ -171,7 +171,7 @@ class PipeAsyncLLM(LLM):
         while True:
             if not self.run_outputs.empty():
                 schedulerOutput: SchedulerOutput = self.run_outputs.get()
-                print("OUTPUT START", flush=True)
+                # print("OUTPUT START", flush=True)
                 # print("OUTPUT: start",time.time())
                 self.scheduler.update_seqs(schedulerOutput)
                 for seq in schedulerOutput.schedule_lists:
@@ -181,8 +181,8 @@ class PipeAsyncLLM(LLM):
                     self.async_streams[seq.seq_id].finish()
                     del self.async_streams[seq.seq_id]
                 self.free_finish_requests()
-                print(
-                    f"OUTPUT END {len(self.scheduler.prompt_lists)} {len(self.scheduler.decode_lists)} {self.scheduler.num_schedule_decode} {self.scheduler.num_schedule_prefill}", flush=True)
+                # print(
+                #     f"OUTPUT END {len(self.scheduler.prompt_lists)} {len(self.scheduler.decode_lists)} {self.scheduler.num_schedule_decode} {self.scheduler.num_schedule_prefill}", flush=True)
             if self.scheduler.num_schedule_prefill + self.scheduler.num_schedule_decode < 2:
                 # print("SCHEDULE: start",time.time())
                 if not self.scheduler.has_seqs():
@@ -200,7 +200,7 @@ class PipeAsyncLLM(LLM):
                     continue
                 # print("SCHEDULE: end",time.time())
                 self.schedule_outputs.put_nowait(schedulerOutput)
-                print("SCHEDULE", flush=True)
+                # print("SCHEDULE", flush=True)
             await asyncio.sleep(0)
 
     def run_gpu_engine(schedule_outputs: Queue, run_outputs: Queue, model_runner: ModelRunner, num_free_pages, decode_num_multi_step):
@@ -208,7 +208,7 @@ class PipeAsyncLLM(LLM):
             num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
 
             schedulerOutput: SchedulerOutput = schedule_outputs.get()
-            print("GPU START", flush=True)
+            # print("GPU START", flush=True)
 
             if not schedulerOutput.computed_prompt:
                 num_multi_step = 1
@@ -234,7 +234,7 @@ class PipeAsyncLLM(LLM):
                     break
 
             run_outputs.put_nowait(schedulerOutput)
-            print("GPU END", flush=True)
+            # print("GPU END", flush=True)
 
     # async def run_process_output_engine(self):
     #     self.control_schedule.put_nowait(0)
