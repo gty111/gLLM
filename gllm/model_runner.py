@@ -7,6 +7,7 @@ from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
+from gllm.scheduler import SchedulerOutput
 
 
 class ModelRunner():
@@ -25,19 +26,18 @@ class ModelRunner():
             kv_head_dim=self.model.head_dim)
 
     @torch.inference_mode()
-    def step_once(self,
-                  seqs: List[Sequence]):
-        input_data = InputData(seqs, self.memory_manager)
+    def step_once(self, schedulerOutput: SchedulerOutput):
+        input_data = InputData(schedulerOutput.schedule_lists, self.memory_manager)
         hidden_states = self.model(input_data)
         logits = self.model.compute_logits(input_data, hidden_states)
         next_tokens = self.model.sample(input_data, logits)
-        for idx,seq in enumerate(seqs):
+        for idx,seq in enumerate(schedulerOutput.schedule_lists):
             if not seq.computed_prompt:
                 seq.computed_prompt = True
             seq.token_ids.append(next_tokens[idx])
             if seq.is_finish():
                 self.free_kv_cache(seq)
-        assert len(next_tokens) == len(seqs)
+        assert len(next_tokens) == len(schedulerOutput.schedule_lists)
             
 
     def free_kv_cache(self, seq: Sequence):
