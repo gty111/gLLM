@@ -80,10 +80,6 @@ class Scheduler:
                    len(self.prompt_lists),
                    len(self.decode_lists),
                    self.get_memory_util()))
-        # if not schedule_lists[0].computed_prompt:
-        #     print('prefill: ', end='')
-        # else:
-        #     print('decode : ', end='')
         return SchedulerOutput(schedule_lists)
 
     def update_seqs(self, scheduleOutput: SchedulerOutput):

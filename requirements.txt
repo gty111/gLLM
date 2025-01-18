@@ -1,3 +1,4 @@
+pydantic >= 2.9  # Required for fastapi >= 0.113.0
 numpy < 2.0.0
 cmake>=3.21
 ninja

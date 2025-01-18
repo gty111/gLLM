@@ -172,7 +172,6 @@ class PipeAsyncLLM(LLM):
             if not self.run_outputs.empty():
                 schedulerOutput: SchedulerOutput = self.run_outputs.get()
                 # print("OUTPUT START", flush=True)
-                # print("OUTPUT: start",time.time())
                 self.scheduler.update_seqs(schedulerOutput)
                 for seq in schedulerOutput.schedule_lists:
                     self.async_streams[seq.seq_id].put(
@@ -182,9 +181,9 @@ class PipeAsyncLLM(LLM):
                     del self.async_streams[seq.seq_id]
                 self.free_finish_requests()
                 # print(
-                #     f"OUTPUT END {len(self.scheduler.prompt_lists)} {len(self.scheduler.decode_lists)} {self.scheduler.num_schedule_decode} {self.scheduler.num_schedule_prefill}", flush=True)
+                #     f"OUTPUT END {len(self.scheduler.prompt_lists)} {len(self.scheduler.decode_lists)} "
+                #     f"{self.scheduler.num_schedule_decode} {self.scheduler.num_schedule_prefill}", flush=True)
             if self.scheduler.num_schedule_prefill + self.scheduler.num_schedule_decode < 2:
-                # print("SCHEDULE: start",time.time())
                 if not self.scheduler.has_seqs():
                     self.schedule_engine = None
                     return
@@ -198,7 +197,6 @@ class PipeAsyncLLM(LLM):
                     self.scheduler.num_schedule_prefill -= 1
                     await asyncio.sleep(0)
                     continue
-                # print("SCHEDULE: end",time.time())
                 self.schedule_outputs.put_nowait(schedulerOutput)
                 # print("SCHEDULE", flush=True)
             await asyncio.sleep(0)
@@ -236,34 +234,14 @@ class PipeAsyncLLM(LLM):
             run_outputs.put_nowait(schedulerOutput)
             # print("GPU END", flush=True)
 
-    # async def run_process_output_engine(self):
-    #     self.control_schedule.put_nowait(0)
-    #     while True:
-    #         self.control_schedule.put_nowait(0)
-    #         await asyncio.sleep(0)
-    #         # print("OUTPUT: wait",time.time())
-    #         while self.run_outputs.empty():
-    #             await asyncio.sleep(0)
-    #         scheduled_seqs:List[Sequence] = self.run_outputs.get()
-    #         print("OUTPUT START",flush=True)
-    #         # print("OUTPUT: start",time.time())
-    #         self.scheduler.update_seqs(scheduled_seqs)
-    #         for seq in scheduled_seqs:
-    #             self.async_streams[seq.seq_id].put(seq.detokenize_inc(self.model_runner.tokenizer))
-    #         for seq in self.scheduler.finish_lists:
-    #             self.async_streams[seq.seq_id].finish()
-    #             del self.async_streams[seq.seq_id]
-    #         self.free_finish_requests()
-    #         print("OUTPUT END",flush=True)
-    #         # print("OUTPUT: end",time.time())
-
     def start_gpu_engine(self):
         self.gpu_engine = self.ctx.Process(
-            target=PipeAsyncLLM.run_gpu_engine, args=(self.schedule_outputs,
-                                                      self.run_outputs,
-                                                      self.model_runner,
-                                                      self.num_free_pages,
-                                                      self.decode_num_multi_steps))
+            target=PipeAsyncLLM.run_gpu_engine,
+            args=(self.schedule_outputs,
+                  self.run_outputs,
+                  self.model_runner,
+                  self.num_free_pages,
+                  self.decode_num_multi_steps))
         self.gpu_engine.start()
 
     def start_schedule_engine(self):
@@ -274,15 +252,3 @@ class PipeAsyncLLM(LLM):
             _log_task_completion)
         self.schedule_engine = asyncio.shield(
             self._schedule_task)
-
-        # if self.process_output_engine is None:
-        #     self.start_process_output_engine()
-
-    # def start_process_output_engine(self):
-    #     # launch process output engine
-    #     self._process_output_task = asyncio.get_event_loop(
-    #     ).create_task(self.run_process_output_engine())
-    #     self._process_output_task.add_done_callback(
-    #         _log_task_completion)
-    #     self.process_output_engine = asyncio.shield(
-    #         self._process_output_task)
