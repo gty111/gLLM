@@ -161,6 +161,29 @@ class PipeAsyncLLM(LLM):
                 schedulerOutput.schedule_lists.remove(seq)
                 self.scheduler.finish_lists.append(seq)
 
+    async def run_schedule(self):
+        # P=0 D=0 or P=1 D=0 or D=1 schedule P
+        if self.scheduler.num_schedule_decode + self.scheduler.num_schedule_prefill == 0 or (
+            self.scheduler.num_schedule_prefill == 1 and self.scheduler.num_schedule_decode == 0) or (
+                self.scheduler.num_schedule_decode == 1 and self.scheduler.can_schedule_prefill()):
+            if not self.scheduler.has_seqs():
+                self.schedule_engine = None
+                return True
+            if not self.scheduler.has_scheduled_seqs():
+                await asyncio.sleep(0)
+                return False
+            schedulerOutput = self.scheduler.schedule(
+                self.num_free_pages.value, log=True, delta=True)
+            await self.check_abort_request(schedulerOutput)
+            if isinstance(schedulerOutput, SchedulerOutput) and len(schedulerOutput.schedule_lists) == 0:
+                self.scheduler.num_schedule_prefill -= 1
+                await asyncio.sleep(0)
+                return False
+            schedulerOutput.schedule_time = time.time()
+            self.schedule_outputs.put_nowait(schedulerOutput)
+            # print(f"SCHEDULE {time.time()%1000}", flush=True)
+            return False
+
     async def run_schedule_engine(self):
         while True:
             if not self.run_outputs.empty():
@@ -170,6 +193,8 @@ class PipeAsyncLLM(LLM):
                 # print(f"OUTPUT START {time.time()%1000}", flush=True)
                 self.scheduler.update_seqs(
                     schedulerOutput, next_tokens, delta=True)
+                # overlap gpu execution and output process
+                exit = await self.run_schedule()
                 act_schedule_list = None
                 if isinstance(schedulerOutput, SchedulerOutput):
                     act_schedule_list = schedulerOutput.schedule_lists
@@ -182,26 +207,11 @@ class PipeAsyncLLM(LLM):
                     self.async_streams[seq.seq_id].finish()
                     del self.async_streams[seq.seq_id]
                 self.free_finish_requests()
-            # P=0 D=0 or P=1 D=0 or D=1 schedule P
-            if self.scheduler.num_schedule_decode + self.scheduler.num_schedule_prefill == 0 or (
-                self.scheduler.num_schedule_prefill == 1 and self.scheduler.num_schedule_decode == 0) or (
-                    self.scheduler.num_schedule_decode == 1 and self.scheduler.can_schedule_prefill()):
-                if not self.scheduler.has_seqs():
-                    self.schedule_engine = None
+                # print(f"OUTPUT END {time.time()%1000}", flush=True)
+                if exit:
                     return
-                if not self.scheduler.has_scheduled_seqs():
-                    await asyncio.sleep(0)
-                    continue
-                schedulerOutput = self.scheduler.schedule(
-                    self.num_free_pages.value, log=True, delta=True)
-                await self.check_abort_request(schedulerOutput)
-                if isinstance(schedulerOutput, SchedulerOutput) and len(schedulerOutput.schedule_lists) == 0:
-                    self.scheduler.num_schedule_prefill -= 1
-                    await asyncio.sleep(0)
-                    continue
-                # schedulerOutput.schedule_time = time.time()
-                self.schedule_outputs.put_nowait(schedulerOutput)
-                # print(f"SCHEDULE {time.time()%1000}", flush=True)
+            if await self.run_schedule():
+                return
             await asyncio.sleep(0)
 
     def run_gpu_engine(schedule_outputs: Queue, run_outputs: Queue, model_runner: ModelRunner, num_free_pages):
