@@ -5,11 +5,11 @@ from typing import List
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 from gllm.allocatorID import AllocatorID
-from gllm.scheduler import Scheduler
+from gllm.scheduler import Scheduler, SchedulerOutput, DeltaSchedulerOutput
 
 
 class LLM():
-    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256, 
+    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256,
                  max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True):
         self.model_path = model_path
         self.model_runner = ModelRunner(
@@ -19,18 +19,21 @@ class LLM():
             max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages,
             self.model_runner.memory_manager.get_num_free_pages(),
             self.model_runner.model.finish_tokens, page_size)
+        self.decode_batch = SchedulerOutput([])
 
-    def check_seq_length(self, token_ids: List[int], output_len:int):
-        max_seq_length = len(token_ids) + output_len if output_len is not None else len(token_ids)
+    def check_seq_length(self, token_ids: List[int], output_len: int):
+        max_seq_length = len(
+            token_ids) + output_len if output_len is not None else len(token_ids)
         if max_seq_length > self.model_runner.model.max_model_len:
-            logger.warning(f'Ignore seq due to the length({max_seq_length}) exceeds max model len({self.model_runner.model.max_model_len})')
+            logger.warning(
+                f'Ignore seq due to the length({max_seq_length}) exceeds max model len({self.model_runner.model.max_model_len})')
             return False
         else:
             return True
 
-    def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False, 
+    def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False,
                      temperature=0.6, top_p=0.9, top_k=10):
-        return Sequence(self.allocatorID.allocate(), token_ids, 
+        return Sequence(self.allocatorID.allocate(), token_ids,
                         self.model_runner.model.finish_tokens, output_len, ignore_eos,
                         temperature, top_p, top_k)
 
@@ -47,13 +50,14 @@ class LLM():
         self.model_runner.step_once(scheduleOutput)
         self.scheduler.update_seqs(scheduleOutput)
 
-    def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None, 
+    def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None,
                  temperature=0.6, top_p=0.9, top_k=10):
         requests: List[Sequence] = []
         assert prompts is not None or tokens is not None
         num_seqs = len(prompts) if prompts is not None else len(tokens)
         for idx in range(num_seqs):
-            token_ids = tokens[idx] if tokens is not None else self.model_runner.tokenizer.encode(prompts[idx])
+            token_ids = tokens[idx] if tokens is not None else self.model_runner.tokenizer.encode(
+                prompts[idx])
             output_len_each = output_lens[idx] if output_lens is not None else None
             if self.check_seq_length(token_ids, output_len_each):
                 seq = self.allocate_seq(token_ids, output_len_each, False, temperature,
