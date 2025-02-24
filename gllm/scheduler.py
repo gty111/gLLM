@@ -16,9 +16,9 @@ class SchedulerOutput:
 # Only used for decode
 class DeltaSchedulerOutput:
     def __init__(self, free_indices: List[int], keep_indices: List[int], delta_schedule_list: List[int]):
-        self.free_indices = free_indices
-        self.keep_indices = keep_indices
-        self.delta_schedule_list = delta_schedule_list
+        self.free_indices = free_indices # gpu process => schedule process
+        self.keep_indices = keep_indices # gpu process => schedule process
+        self.delta_schedule_list = delta_schedule_list # schedule process => gpu process
 
 
 class Scheduler:
@@ -84,14 +84,14 @@ class Scheduler:
         self.num_schedule_decode += 1
         if not delta:
             decode_batch_size = min(
-                self.max_decode_seqs, self.num_free_pages, len(self.decode_lists))
+                self.max_decode_seqs, self.num_free_pages*self.page_size, len(self.decode_lists))
             schedule_lists = self.decode_lists[:decode_batch_size]
             self.decode_lists = self.decode_lists[decode_batch_size:]
             return SchedulerOutput(schedule_lists)
         else:
-            assert self.num_free_pages > len(self.decode_batch.schedule_lists)
+            assert self.num_free_pages*self.page_size > len(self.decode_batch.schedule_lists)
 
-            delta_batch_size = min(self.num_free_pages, self.max_decode_seqs -
+            delta_batch_size = min(self.num_free_pages*self.page_size, self.max_decode_seqs -
                                 len(self.decode_batch.schedule_lists), len(self.decode_lists))
             self.delta_scheduler_output.delta_schedule_list = self.decode_lists[:delta_batch_size]
             self.decode_batch.schedule_lists.extend(

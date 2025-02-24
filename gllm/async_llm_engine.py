@@ -61,7 +61,6 @@ def _log_task_completion(task: asyncio.Task) -> None:
 class AsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
-        kwargs.pop('decode_num_multi_steps')
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -125,12 +124,6 @@ class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         logger.info('Enable pipeline schedule')
-
-        self.decode_num_multi_steps = kwargs['decode_num_multi_steps']
-        kwargs.pop('decode_num_multi_steps')
-        if self.decode_num_multi_steps > 1:
-            logger.info(f'Enable multi step ({self.decode_num_multi_steps})')
-
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -189,7 +182,10 @@ class PipeAsyncLLM(LLM):
                     self.async_streams[seq.seq_id].finish()
                     del self.async_streams[seq.seq_id]
                 self.free_finish_requests()
-            if self.scheduler.num_schedule_decode == 0 or self.scheduler.can_schedule_prefill():
+            # P=0 D=0 or P=1 D=0 or D=1 schedule P
+            if self.scheduler.num_schedule_decode + self.scheduler.num_schedule_prefill == 0 or (
+                self.scheduler.num_schedule_prefill == 1 and self.scheduler.num_schedule_decode == 0) or (
+                    self.scheduler.num_schedule_decode == 1 and self.scheduler.can_schedule_prefill()):
                 if not self.scheduler.has_seqs():
                     self.schedule_engine = None
                     return
@@ -208,7 +204,7 @@ class PipeAsyncLLM(LLM):
                 # print(f"SCHEDULE {time.time()%1000}", flush=True)
             await asyncio.sleep(0)
 
-    def run_gpu_engine(schedule_outputs: Queue, run_outputs: Queue, model_runner: ModelRunner, num_free_pages, decode_num_multi_step):
+    def run_gpu_engine(schedule_outputs: Queue, run_outputs: Queue, model_runner: ModelRunner, num_free_pages):
         decode_batch = SchedulerOutput([])
         while True:
             num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
@@ -248,8 +244,7 @@ class PipeAsyncLLM(LLM):
             args=(self.schedule_outputs,
                   self.run_outputs,
                   self.model_runner,
-                  self.num_free_pages,
-                  self.decode_num_multi_steps))
+                  self.num_free_pages))
         self.gpu_engine.start()
 
     def start_schedule_engine(self):

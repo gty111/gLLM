@@ -83,11 +83,10 @@ if __name__ == '__main__':
     parser.add_argument('--pipe-schedule', action="store_true")
     parser.add_argument('--gpu-memory-util', type=float, default=0.9)
     parser.add_argument('--page-size', type=int, default=16)
-    parser.add_argument('--max-decode-seqs', type=int, default=256)
+    parser.add_argument('--max-decode-seqs', type=int, default=512)
     parser.add_argument('--max-batch-tokens', type=int, default=8192)
     parser.add_argument('--ratio-free-pages', type=float, default=0.2)
     parser.add_argument('--enable-prefix-caching', action='store_true')
-    parser.add_argument('--num-multi-step', type=int, default=8)
     args = parser.parse_args()
 
     llm_cls = PipeAsyncLLM if args.pipe_schedule else AsyncLLM
@@ -97,7 +96,6 @@ if __name__ == '__main__':
                   max_decode_seqs=args.max_decode_seqs,
                   max_batch_tokens=args.max_batch_tokens,
                   ratio_threshold_free_pages=args.ratio_free_pages,
-                  enable_prefix_caching=args.enable_prefix_caching,
-                  decode_num_multi_steps=args.num_multi_step)
+                  enable_prefix_caching=args.enable_prefix_caching)
 
     asyncio.run(run_server(args))
