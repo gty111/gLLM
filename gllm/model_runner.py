@@ -31,14 +31,13 @@ class ModelRunner():
         hidden_states = self.model(input_data)
         logits = self.model.compute_logits(input_data, hidden_states)
         next_tokens = self.model.sample(input_data, logits)
-        for idx,seq in enumerate(schedulerOutput.schedule_lists):
-            if not seq.computed_prompt:
-                seq.computed_prompt = True
-            seq.token_ids.append(next_tokens[idx])
-            if seq.is_finish():
-                self.free_kv_cache(seq)
         assert len(next_tokens) == len(schedulerOutput.schedule_lists)
-            
+        for idx,seq in enumerate(schedulerOutput.schedule_lists):
+            seq.token_ids.append(next_tokens[idx])
+            seq.computed_prompt = True
+            if seq.is_finish():
+                self.memory_manager.free(seq)
+        return next_tokens
 
     def free_kv_cache(self, seq: Sequence):
         self.memory_manager.free(seq)
@@ -46,7 +45,7 @@ class ModelRunner():
     def stream_inference(self, seq: Sequence):
         # -------prefill------
         prefill_start = time.time()
-        self.step_once([seq])
+        self.step_once(SchedulerOutput([seq]))
         prefill_end = time.time()
         # ----prefill end-----
 
@@ -56,7 +55,7 @@ class ModelRunner():
             print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
             if seq.is_finish():
                 break
-            self.step_once([seq])
+            self.step_once(SchedulerOutput([seq]))
         print("\n")
         decode_end = time.time()
         # ------decode end-------

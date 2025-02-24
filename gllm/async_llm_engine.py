@@ -1,5 +1,6 @@
 import asyncio
 import multiprocessing as mp
+import time
 from logger import logger
 from typing import List, Dict
 from multiprocessing import Queue
@@ -9,7 +10,7 @@ from gllm.utils import make_async
 from gllm.sequence import Sequence
 from gllm.llm_engine import LLM
 from gllm.model_runner import ModelRunner
-from gllm.scheduler import SchedulerOutput
+from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
 
 
 class AsyncStream:
@@ -91,7 +92,7 @@ class AsyncLLM(LLM):
 
     async def step_async(self):
         schedulerOutput = self.scheduler.schedule(
-            self.model_runner.memory_manager.get_num_free_pages(), True)
+            self.model_runner.memory_manager.get_num_free_pages(), log=True, delta=False)
         await self.check_abort_request(schedulerOutput)
         if len(schedulerOutput.schedule_lists) == 0:
             self.scheduler.num_schedule_prefill -= 1
@@ -156,9 +157,9 @@ class PipeAsyncLLM(LLM):
             self.start_schedule_engine()
         return stream
 
-    async def check_abort_request(self, schedulerOutput: SchedulerOutput):
+    async def check_abort_request(self, schedulerOutput):
         # we only check prefill requests
-        if not schedulerOutput.computed_prompt:
+        if isinstance(schedulerOutput, SchedulerOutput):
             abort_seqs = []
             for seq in schedulerOutput.schedule_lists:
                 if await self.async_streams[seq.seq_id]._raw_request.is_disconnected():
@@ -170,69 +171,76 @@ class PipeAsyncLLM(LLM):
     async def run_schedule_engine(self):
         while True:
             if not self.run_outputs.empty():
-                schedulerOutput: SchedulerOutput = self.run_outputs.get()
-                # print("OUTPUT START", flush=True)
-                self.scheduler.update_seqs(schedulerOutput)
-                for seq in schedulerOutput.schedule_lists:
+                schedulerOutput, next_tokens = self.run_outputs.get()
+                # print(
+                #     f"GPU=>output {(time.time()-schedulerOutput.gpu_time)*1000}", flush=True)
+                # print(f"OUTPUT START {time.time()%1000}", flush=True)
+                self.scheduler.update_seqs(
+                    schedulerOutput, next_tokens, delta=True)
+                act_schedule_list = None
+                if isinstance(schedulerOutput, SchedulerOutput):
+                    act_schedule_list = schedulerOutput.schedule_lists
+                elif isinstance(schedulerOutput, DeltaSchedulerOutput):
+                    act_schedule_list = self.scheduler.decode_batch.schedule_lists
+                for seq in act_schedule_list:
                     self.async_streams[seq.seq_id].put(
                         seq.detokenize_inc(self.model_runner.tokenizer))
                 for seq in self.scheduler.finish_lists:
                     self.async_streams[seq.seq_id].finish()
                     del self.async_streams[seq.seq_id]
                 self.free_finish_requests()
-                # print(
-                #     f"OUTPUT END {len(self.scheduler.prompt_lists)} {len(self.scheduler.decode_lists)} "
-                #     f"{self.scheduler.num_schedule_decode} {self.scheduler.num_schedule_prefill}", flush=True)
-            if self.scheduler.num_schedule_prefill + self.scheduler.num_schedule_decode < 2:
+            if self.scheduler.num_schedule_decode == 0 or self.scheduler.can_schedule_prefill():
                 if not self.scheduler.has_seqs():
                     self.schedule_engine = None
                     return
-                if not self.scheduler.has_scheduled_seqs() or self.scheduler.delay_schedule():
+                if not self.scheduler.has_scheduled_seqs():
                     await asyncio.sleep(0)
                     continue
                 schedulerOutput = self.scheduler.schedule(
-                    self.num_free_pages.value, True)
+                    self.num_free_pages.value, log=True, delta=True)
                 await self.check_abort_request(schedulerOutput)
-                if len(schedulerOutput.schedule_lists) == 0:
+                if isinstance(schedulerOutput, SchedulerOutput) and len(schedulerOutput.schedule_lists) == 0:
                     self.scheduler.num_schedule_prefill -= 1
                     await asyncio.sleep(0)
                     continue
+                # schedulerOutput.schedule_time = time.time()
                 self.schedule_outputs.put_nowait(schedulerOutput)
-                # print("SCHEDULE", flush=True)
+                # print(f"SCHEDULE {time.time()%1000}", flush=True)
             await asyncio.sleep(0)
 
     def run_gpu_engine(schedule_outputs: Queue, run_outputs: Queue, model_runner: ModelRunner, num_free_pages, decode_num_multi_step):
+        decode_batch = SchedulerOutput([])
         while True:
             num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
 
             schedulerOutput: SchedulerOutput = schedule_outputs.get()
-            # print("GPU START", flush=True)
+            # print(
+            #     f"Schedule=>GPU {(time.time()-schedulerOutput.schedule_time)*1000}", flush=True)
+            # print(f"GPU START {time.time()%1000}", flush=True)
 
-            if not schedulerOutput.computed_prompt:
-                num_multi_step = 1
-            else:
-                num_multi_step = decode_num_multi_step
-
-            # multi-step
-            finish_seqs = []
-            for i in range(num_multi_step):
-                model_runner.step_once(schedulerOutput)
-                if i == num_multi_step - 1:
-                    schedulerOutput.schedule_lists.extend(finish_seqs)
-                    break
-                next_scheduled_seqs = []
-                for seq in schedulerOutput.schedule_lists:
-                    if not seq.is_finish():
-                        next_scheduled_seqs.append(seq)
-                    else:
-                        finish_seqs.append(seq)
-                schedulerOutput.schedule_lists = next_scheduled_seqs
-                if len(schedulerOutput.schedule_lists) == 0:
-                    schedulerOutput.schedule_lists = finish_seqs
-                    break
-
-            run_outputs.put_nowait(schedulerOutput)
-            # print("GPU END", flush=True)
+            if isinstance(schedulerOutput, DeltaSchedulerOutput):
+                decode_batch.schedule_lists.extend(
+                    schedulerOutput.delta_schedule_list)
+                next_tokens = model_runner.step_once(decode_batch)
+                act_schedule_list = decode_batch.schedule_lists
+            elif isinstance(schedulerOutput, SchedulerOutput):
+                next_tokens = model_runner.step_once(schedulerOutput)
+                act_schedule_list = schedulerOutput.schedule_lists
+            keep_indices = []
+            free_indices = []
+            for idx, seq in enumerate(act_schedule_list):
+                if seq.is_finish():
+                    free_indices.append(idx)
+                else:
+                    keep_indices.append(idx)
+            schedulerOutput.keep_indices = keep_indices
+            schedulerOutput.free_indices = free_indices
+            if isinstance(schedulerOutput, DeltaSchedulerOutput):
+                decode_batch.schedule_lists = [
+                    decode_batch.schedule_lists[i] for i in keep_indices]
+            # schedulerOutput.gpu_time = time.time()
+            run_outputs.put_nowait((schedulerOutput, next_tokens))
+            # print(f"GPU END {time.time()%1000}", flush=True)
 
     def start_gpu_engine(self):
         self.gpu_engine = self.ctx.Process(
