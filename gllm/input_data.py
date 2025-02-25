@@ -1,8 +1,9 @@
 import torch
-import itertools
-from typing import List
-from gllm.utils import async_tensor_h2d
+import numpy as np
 
+from typing import List
+
+from gllm.utils import async_tensor_h2d
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager
 
@@ -22,12 +23,14 @@ class InputData():
                 tokens_list.extend(
                     seq.token_ids[seq.computed_page_num*self.memory_manager.page_size:])
                 self.prefix_prefill |= seq.computed_page_num != 0
-            self.tokens = async_tensor_h2d(tokens_list, torch.long, 'cuda', True)
+            self.tokens = async_tensor_h2d(
+                tokens_list, torch.long, 'cuda', True)
             positions_list = []
             for seq in seqs:
                 positions_list.extend(
                     list(range(seq.computed_page_num*self.memory_manager.page_size, seq.prompt_len)))
-            self.positions = async_tensor_h2d(positions_list, torch.long, 'cuda', True)
+            self.positions = async_tensor_h2d(
+                positions_list, torch.long, 'cuda', True)
             self.max_seq_len, self.seq_start_loc = self.get_seq_len_loc()
             if self.prefix_prefill:
                 self.block_table = self.get_block_table()
@@ -66,7 +69,12 @@ class InputData():
         return max_query_len, async_tensor_h2d(query_start_loc, torch.int32, 'cuda', True)
 
     def get_block_table(self):
-        max_num_block = max([len(seq.page_table) for seq in self.seqs])
-        block_tables = [seq.page_table + list(itertools.repeat(0, max_num_block-len(seq.page_table)))
-                        for seq in self.seqs]
-        return async_tensor_h2d(block_tables, torch.int32, 'cuda', True)
+        block_tables_list = [seq.page_table for seq in self.seqs]
+        max_num_block = max(map(len, block_tables_list))
+        block_tables = np.full(
+            (len(block_tables_list), max_num_block), 0, dtype=np.int32)
+        for idx,block_table in enumerate(block_tables_list):
+            block_tables[idx, :len(block_table)] = block_table
+        return torch.from_numpy(block_tables).to('cuda')
+    
+        
