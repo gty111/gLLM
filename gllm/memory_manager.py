@@ -148,7 +148,7 @@ class Segment():
 
     # return percent of used memory
     def get_memory_util(self):
-        return round(100 * self.allocatorID.get_num_used_ids()/self.allocatorID.get_num_ids(), 2)
+        return round(100 * self.allocatorID.get_num_used_ids()/self.allocatorID.size, 2)
 
 
 class PrefixMemoryManager(MemoryManager):
