@@ -25,6 +25,12 @@ class ModelRunner():
             dtype=self.model.dtype, page_size=page_size, kv_head_num=self.model.num_kv_heads, 
             kv_head_dim=self.model.head_dim)
 
+    def tokenize(self, content, chat:bool=False):
+        if chat:
+            return self.tokenizer.apply_chat_template(content, add_generation_prompt=True)
+        else:
+            return self.tokenizer.encode(content)
+
     @torch.inference_mode()
     def step_once(self, schedulerOutput: SchedulerOutput):
         input_data = InputData(schedulerOutput.schedule_lists, self.memory_manager)

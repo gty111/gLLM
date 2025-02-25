@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from http import HTTPStatus
 
+from gllm.utils import make_async
 from gllm.entrypoints.protocol import ChatCompletionRequest, CompletionRequest, ModelList, ModelCard, ModelPermission, ErrorResponse
 from gllm.async_llm_engine import AsyncLLM, PipeAsyncLLM
 from gllm.entrypoints.serving_chat import chat_completion_stream_generator, chat_completion_generator
@@ -25,8 +26,7 @@ async def show_available_models():
 
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
-    token_ids = llm.model_runner.tokenizer.apply_chat_template(
-        request.messages, add_generation_prompt=True)
+    token_ids = await make_async(llm.model_runner.tokenize)(request.messages, chat=True)
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
                                               request.temperature, request.top_p, request.top_k)
@@ -44,7 +44,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
-    token_ids = llm.model_runner.tokenizer.encode(request.prompt)
+    token_ids = await make_async(llm.model_runner.tokenize)(request.prompt)
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
                                               request.temperature, request.top_p, request.top_k)
