@@ -1,13 +1,14 @@
 import asyncio
 import multiprocessing as mp
 import time
+import zmq
+import pickle
+
 from logger import logger
 from typing import List, Dict
-from multiprocessing import Queue
 from fastapi import Request
 
-from gllm.utils import make_async
-from gllm.sequence import Sequence
+from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
 from gllm.model_runner import ModelRunner
 from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
@@ -132,9 +133,12 @@ class PipeAsyncLLM(LLM):
         self.gpu_engine = None
 
         self.ctx = mp.get_context('spawn')
-        self.schedule_outputs: Queue = self.ctx.Queue()
-        self.run_outputs: Queue = self.ctx.Queue()
+        # self.schedule_outputs: Queue = self.ctx.Queue()
+        # self.run_outputs: Queue = self.ctx.Queue()
         self.num_free_pages = self.ctx.Value('i', 0)
+        
+        self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
+        self.output_ipc_path = 'ipc:///tmp/gllm_output'
 
         self.start_gpu_engine()
 
@@ -161,7 +165,7 @@ class PipeAsyncLLM(LLM):
                 schedulerOutput.schedule_lists.remove(seq)
                 self.scheduler.finish_lists.append(seq)
 
-    async def run_schedule(self):
+    async def run_schedule(self, schedule_socket):
         # P=0 D=0 or P=1 D=0 or D=1 schedule P
         if self.scheduler.num_schedule_decode + self.scheduler.num_schedule_prefill == 0 or (
             self.scheduler.num_schedule_prefill == 1 and self.scheduler.num_schedule_decode == 0) or (
@@ -179,27 +183,37 @@ class PipeAsyncLLM(LLM):
                 self.scheduler.num_schedule_prefill -= 1
                 await asyncio.sleep(0)
                 return False
-            schedulerOutput.schedule_time = time.time()
-            self.schedule_outputs.put_nowait(schedulerOutput)
+            # schedulerOutput.schedule_time = time.time()
+            schedule_bytes = pickle.dumps(schedulerOutput)
+            schedule_socket.send(schedule_bytes, copy=False)
+            # self.schedule_outputs.put_nowait(schedulerOutput)
             # print(f"SCHEDULE {time.time()%1000}", flush=True)
             return False
 
     async def run_schedule_engine(self):
+        zmq_ctx = zmq.Context()
+        schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
+        output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PULL)
         while True:
-            if not self.run_outputs.empty():
-                schedulerOutput, next_tokens = self.run_outputs.get()
+            if output_socket.poll(timeout=0) != 0:
+                # print("start OUTPUT", flush=True)
+                # schedulerOutput, next_tokens = self.run_outputs.get()
+                recv_bytes = output_socket.recv(copy=False)
+                schedulerOutput, next_tokens = pickle.loads(recv_bytes)
                 # print(
                 #     f"GPU=>output {(time.time()-schedulerOutput.gpu_time)*1000}", flush=True)
                 # print(f"OUTPUT START {time.time()%1000}", flush=True)
                 self.scheduler.update_seqs(
                     schedulerOutput, next_tokens, delta=True)
                 # overlap gpu execution and output process
-                exit = await self.run_schedule()
+                exit = await self.run_schedule(schedule_socket)
                 act_schedule_list = None
                 if isinstance(schedulerOutput, SchedulerOutput):
                     act_schedule_list = schedulerOutput.schedule_lists
                 elif isinstance(schedulerOutput, DeltaSchedulerOutput):
                     act_schedule_list = self.scheduler.decode_batch.schedule_lists
+                else:
+                    assert 0
                 for seq in act_schedule_list:
                     self.async_streams[seq.seq_id].put(
                         seq.detokenize_inc(self.model_runner.tokenizer))
@@ -210,20 +224,26 @@ class PipeAsyncLLM(LLM):
                 # print(f"OUTPUT END {time.time()%1000}", flush=True)
                 if exit:
                     return
-            if await self.run_schedule():
+            if await self.run_schedule(schedule_socket):
                 return
             await asyncio.sleep(0)
 
-    def run_gpu_engine(schedule_outputs: Queue, run_outputs: Queue, model_runner: ModelRunner, num_free_pages):
+    def run_gpu_engine(model_runner: ModelRunner, num_free_pages, schedule_ipc_path, output_ipc_path):
+        zmq_ctx = zmq.Context()
+        schedule_socket = make_socket(zmq_ctx, schedule_ipc_path, zmq.PULL)
+        output_socket = make_socket(zmq_ctx,output_ipc_path, zmq.PUSH)
         decode_batch = SchedulerOutput([])
         while True:
             num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
 
-            schedulerOutput: SchedulerOutput = schedule_outputs.get()
+            # schedulerOutput: SchedulerOutput = schedule_outputs.get()
+            recv_bytes = schedule_socket.recv(copy=False)
+            schedulerOutput: SchedulerOutput = pickle.loads(recv_bytes)
             # print(
             #     f"Schedule=>GPU {(time.time()-schedulerOutput.schedule_time)*1000}", flush=True)
             # print(f"GPU START {time.time()%1000}", flush=True)
 
+            act_schedule_list = None
             if isinstance(schedulerOutput, DeltaSchedulerOutput):
                 decode_batch.schedule_lists.extend(
                     schedulerOutput.delta_schedule_list)
@@ -232,6 +252,8 @@ class PipeAsyncLLM(LLM):
             elif isinstance(schedulerOutput, SchedulerOutput):
                 next_tokens = model_runner.step_once(schedulerOutput)
                 act_schedule_list = schedulerOutput.schedule_lists
+            else:
+                assert 0
             keep_indices = []
             free_indices = []
             for idx, seq in enumerate(act_schedule_list):
@@ -245,16 +267,18 @@ class PipeAsyncLLM(LLM):
                 decode_batch.schedule_lists = [
                     decode_batch.schedule_lists[i] for i in keep_indices]
             # schedulerOutput.gpu_time = time.time()
-            run_outputs.put_nowait((schedulerOutput, next_tokens))
+            # run_outputs.put_nowait((schedulerOutput, next_tokens))
+            output_bytes = pickle.dumps((schedulerOutput, next_tokens))
+            output_socket.send(output_bytes, copy=False)
             # print(f"GPU END {time.time()%1000}", flush=True)
 
     def start_gpu_engine(self):
         self.gpu_engine = self.ctx.Process(
             target=PipeAsyncLLM.run_gpu_engine,
-            args=(self.schedule_outputs,
-                  self.run_outputs,
-                  self.model_runner,
-                  self.num_free_pages))
+            args=(self.model_runner,
+                  self.num_free_pages,
+                  self.schedule_ipc_path,
+                  self.output_ipc_path))
         self.gpu_engine.start()
 
     def start_schedule_engine(self):

@@ -1,6 +1,8 @@
 import asyncio
 import uuid
 import torch
+import zmq
+
 from functools import partial
 from typing import Awaitable, Callable, ParamSpec, TypeVar, Union
 
@@ -35,3 +37,20 @@ def async_tensor_h2d(
     """Asynchronously create a tensor and copy it from host to device."""
     t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
     return t.to(device=target_device, non_blocking=True)
+
+
+def make_socket(ctx, ipc_path: str, type):
+    if type == zmq.PUSH:
+        socket = ctx.socket(type)
+        socket.connect(ipc_path)
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, int(0.5 * 1024**3))
+        return socket
+    elif type == zmq.PULL:
+        socket = ctx.socket(type)
+        socket.bind(ipc_path)
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, int(0.5 * 1024**3))
+        return socket
+    else:
+        assert 0

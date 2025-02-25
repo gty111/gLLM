@@ -13,3 +13,4 @@ uvicorn[standard]
 openai >= 1.52.0
 logger
 torch==2.5.1
+zmq
