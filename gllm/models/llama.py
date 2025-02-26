@@ -1,5 +1,7 @@
 import torch
 import tqdm
+import torch.distributed as dist
+
 from typing import Optional
 from torch import nn
 
@@ -9,6 +11,7 @@ from gllm.layers.rotary_embedding import RotaryEmbedding, LinearScalingRotaryEmb
 from gllm.layers.attention import FlashAttention
 from gllm.input_data import InputData
 from gllm.layers.sampler import Sampler
+from gllm.dist_utils import get_pp_layers
 
 
 class LlamaMLP(nn.Module):
@@ -118,21 +121,31 @@ class LlamaModel(nn.Module):
 
     def __init__(self, model_config: dict):
         super().__init__()
-        self.layers = nn.ModuleList([LlamaDecoderLayer(layer_id, model_config) for layer_id in range(
-            model_config['num_hidden_layers'])])
-        self.embed_tokens = nn.Embedding(
-            model_config['vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
-        self.norm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
+        self.start_layer, self.end_layer = get_pp_layers(
+            model_config['num_hidden_layers'])
+        self.layers = nn.ModuleList([LlamaDecoderLayer(
+            layer_id-self.start_layer, model_config) for layer_id in range(self.start_layer, self.end_layer)])
+        if dist.get_rank() == 0:
+            self.embed_tokens = nn.Embedding(
+                model_config['vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
+        if dist.get_rank() == dist.get_world_size() - 1:
+            self.norm = RMSNorm(
+                model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
 
-    def forward(self, input_data: InputData):
-        hidden_states = self.embed_tokens(input_data.tokens)
-        residual = None
+    def forward(self, input_data: InputData, hidden_states=None, residual=None):
+        if dist.get_rank() == 0:
+            assert hidden_states is None
+            hidden_states = self.embed_tokens(input_data.tokens)
+        else:
+            assert hidden_states is not None
         for layer in self.layers:
             hidden_states, residual = layer(
                 input_data, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if dist.get_rank() == dist.get_world_size() - 1:
+            hidden_states, _ = self.norm(hidden_states, residual)
+            return hidden_states
+        else:
+            return hidden_states, residual
 
 
 class LlamaForCausalLM(nn.Module):
@@ -140,7 +153,7 @@ class LlamaForCausalLM(nn.Module):
     def __init__(self, model_config: dict):
         super().__init__()
         self.max_model_len = model_config['max_position_embeddings']
-        self.num_layers = model_config['num_hidden_layers']
+        self.num_layers = model_config['num_hidden_layers'] // dist.get_world_size()
         self.dtype = model_config['torch_dtype']
         self.num_kv_heads = model_config['num_key_value_heads']
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
@@ -156,8 +169,9 @@ class LlamaForCausalLM(nn.Module):
                 assert 0
         self.model = LlamaModel(model_config)
         self.model_config = model_config
-        self.lm_head = nn.Linear(
-            model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
+        if dist.get_rank() == dist.get_world_size() - 1:
+            self.lm_head = nn.Linear(
+                model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
         self.sampler = Sampler()
 
     def forward(self, input_data: InputData):
@@ -186,6 +200,11 @@ class LlamaForCausalLM(nn.Module):
         num_kv_heads = self.model_config['num_key_value_heads']
         intermediate_size = self.model_config['intermediate_size']
         for k, v in tqdm.tqdm(parameters.items()):
+            # resolve PP layer
+            if 'layers' in k:
+                k_list = k.split('.')
+                k_list[2] = str(int(k_list[2])+dist.get_rank()*self.num_layers)
+                k = '.'.join(k_list)
             if k.find('self_attn.qkv_proj') != -1:
                 v.data[:num_attn_heads*head_dim, :] = weights[k.replace(
                     'qkv_proj', 'q_proj')]

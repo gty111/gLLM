@@ -22,7 +22,7 @@ class DeltaSchedulerOutput:
 
 class Scheduler:
     def __init__(self, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float,
-                 total_num_free_pages: int, finish_tokens: List[int], page_size: int) -> None:
+                 page_size: int) -> None:
         self.prompt_lists: List[Sequence] = []  # seqs to prefill
         self.decode_lists: List[Sequence] = []  # seqs to decode
         self.finish_lists: List[Sequence] = []  # seqs finished
@@ -32,20 +32,23 @@ class Scheduler:
 
         self.max_decode_seqs = max_decode_seqs
         self.max_batch_tokens = max_batch_tokens
-        self.num_threshold_free_pages = int(
-            total_num_free_pages * ratio_threshold_free_pages)
+        self.ratio_threshold_free_pages = ratio_threshold_free_pages
+        self.num_threshold_free_pages = None
 
         # only used for delta
         self.num_schedule_prefill = 0
         self.schedule_decode = True
         
-        self.total_num_free_pages = total_num_free_pages
-        self.num_free_pages = total_num_free_pages
+        self.total_num_free_pages = None
+        self.num_free_pages = None
         self.page_size = page_size
 
-        self.finish_tokens = finish_tokens
-
         self.log_time = time.time()
+        
+    def set_total_num_free_pages(self, total_num_free_pages):
+        self.num_free_pages = total_num_free_pages
+        self.total_num_free_pages = total_num_free_pages
+        self.num_threshold_free_pages = int(total_num_free_pages * self.ratio_threshold_free_pages)
 
     def add_requests(self, requests: List[Sequence]):
         self.prompt_lists.extend(requests)

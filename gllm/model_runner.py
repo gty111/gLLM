@@ -1,5 +1,7 @@
 import torch
 import time
+import torch.distributed as dist
+
 from transformers import AutoTokenizer
 from typing import List
 
@@ -11,18 +13,28 @@ from gllm.scheduler import SchedulerOutput
 
 
 class ModelRunner():
-    def __init__(self, model_path: str, gpu_memory_utilization:float, page_size:int, 
+    def __init__(self, model_path: str, gpu_memory_util:float, page_size:int, 
                  enable_prefix_caching:bool):
-        model_loader = ModelLoader(model_path)
+        self.model_path = model_path
+        self.model_loader = ModelLoader(model_path)
+        self.enable_prefix_caching = enable_prefix_caching
+        self.gpu_memory_util = gpu_memory_util
+        self.page_size = page_size
 
-        self.model = model_loader.load_model()
+        # lazy init
+        self.model = None
+        self.tokenizer = None
+        self.memory_manager = None
+    
+    def init(self):
+        self.model = self.model_loader.load_model()
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True)
+            self.model_path, trust_remote_code=True)
         
-        memory_manager_cls = PrefixMemoryManager if enable_prefix_caching else MemoryManager
+        memory_manager_cls = PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         self.memory_manager = memory_manager_cls(
-            gpu_memory_utilization=gpu_memory_utilization, num_layers=self.model.num_layers, 
-            dtype=self.model.dtype, page_size=page_size, kv_head_num=self.model.num_kv_heads, 
+            gpu_memory_util=self.gpu_memory_util, num_layers=self.model.num_layers, 
+            dtype=self.model.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads, 
             kv_head_dim=self.model.head_dim)
 
     def tokenize(self, content, chat:bool=False):
@@ -32,8 +44,9 @@ class ModelRunner():
             return self.tokenizer.encode(content)
 
     @torch.inference_mode()
-    def step_once(self, schedulerOutput: SchedulerOutput):
-        input_data = InputData(schedulerOutput.schedule_lists, self.memory_manager)
+    def step_once(self, schedulerOutput: SchedulerOutput= None, hidden_states=None, residual=None):
+        if dist.get_rank() == 0:
+            input_data = InputData(schedulerOutput.schedule_lists, self.memory_manager)
         hidden_states = self.model(input_data)
         logits = self.model.compute_logits(input_data, hidden_states)
         next_tokens = self.model.sample(input_data, logits)

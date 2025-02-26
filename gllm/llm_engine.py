@@ -5,20 +5,22 @@ from typing import List
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 from gllm.allocatorID import AllocatorID
-from gllm.scheduler import Scheduler, SchedulerOutput, DeltaSchedulerOutput
-
+from gllm.scheduler import Scheduler, SchedulerOutput
+from gllm.dist_utils import init_dist
 
 class LLM():
-    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256,
-                 max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True):
+    def __init__(self, model_path, gpu_memory_util=0.9, page_size=16, max_decode_seqs=256,
+                 max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True, pp_size=1):
         self.model_path = model_path
         self.model_runner = ModelRunner(
-            model_path, gpu_memory_utilization, page_size, enable_prefix_caching)
+            model_path, gpu_memory_util, page_size, enable_prefix_caching)
+        self.pp_size = pp_size
+        if pp_size == 1:
+            init_dist(1,0,'127.0.0.1','45678')
+            self.model_runner.init()
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
-            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages,
-            self.model_runner.memory_manager.get_num_free_pages(),
-            self.model_runner.model.finish_tokens, page_size)
+            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size)
         self.decode_batch = SchedulerOutput([])
 
     def check_seq_length(self, token_ids: List[int], output_len: int):

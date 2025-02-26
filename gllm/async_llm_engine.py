@@ -1,6 +1,8 @@
 import asyncio
 import multiprocessing as mp
 import time
+import torch
+import torch.distributed as dist
 import zmq
 import pickle
 
@@ -8,6 +10,7 @@ from logger import logger
 from typing import List, Dict
 from fastapi import Request
 
+from gllm.dist_utils import init_dist
 from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
 from gllm.model_runner import ModelRunner
@@ -62,6 +65,7 @@ def _log_task_completion(task: asyncio.Task) -> None:
 class AsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
+        assert kwargs['pp_size'] == 1
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -130,7 +134,6 @@ class PipeAsyncLLM(LLM):
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
         self.process_output_engine = None
-        self.gpu_engine = None
 
         self.ctx = mp.get_context('spawn')
         self.num_free_pages = self.ctx.Value('i', 0)
@@ -138,7 +141,8 @@ class PipeAsyncLLM(LLM):
         self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
         self.output_ipc_path = 'ipc:///tmp/gllm_output'
 
-        self.start_gpu_engine()
+        for pp_rank in range(self.pp_size):
+            self.start_gpu_engine(pp_rank, self.pp_size)
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float):
@@ -196,6 +200,7 @@ class PipeAsyncLLM(LLM):
         zmq_ctx = zmq.Context()
         schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
         output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PULL)
+        self.scheduler.set_total_num_free_pages(self.num_free_pages.value)
         while True:
             if output_socket.poll(timeout=0) != 0:
 
@@ -227,37 +232,47 @@ class PipeAsyncLLM(LLM):
                 return
             await asyncio.sleep(0)
 
-    def run_gpu_engine(model_runner: ModelRunner, num_free_pages, schedule_ipc_path, output_ipc_path):
+    def run_gpu_engine(model_runner: ModelRunner, num_free_pages, schedule_ipc_path, output_ipc_path, pp_rank, pp_size):
+        init_dist(pp_size,pp_rank,'127.0.0.1','49083')
+        if not pp_size == 1:
+            model_runner.init()
         zmq_ctx = zmq.Context()
-        schedule_socket = make_socket(zmq_ctx, schedule_ipc_path, zmq.PULL)
-        output_socket = make_socket(zmq_ctx,output_ipc_path, zmq.PUSH)
-        decode_batch = SchedulerOutput([])
+        
+        schedule_socket = None
+        decode_batch = None
+        output_socket = None
+        if pp_rank == 0:
+            schedule_socket = make_socket(zmq_ctx, schedule_ipc_path, zmq.PULL)
+            decode_batch = SchedulerOutput([])
+        if pp_rank == pp_size - 1:
+            output_socket = make_socket(zmq_ctx,output_ipc_path, zmq.PUSH)
         while True:
-            num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
+            if pp_rank == 0:
+                num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
 
-            schedulerOutput: SchedulerOutput = None
-            act_schedule_list = None
-            next_tokens = None
-            if schedule_socket.poll(timeout=0) != 0:
-                recv_bytes = schedule_socket.recv(copy=False)
-                schedulerOutput = pickle.loads(recv_bytes)
-                
-                if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                    decode_batch.schedule_lists.extend(
-                        schedulerOutput.delta_schedule_list)
+                schedulerOutput: SchedulerOutput = None
+                act_schedule_list = None
+                next_tokens = None
+                if schedule_socket.poll(timeout=0) != 0:
+                    recv_bytes = schedule_socket.recv(copy=False)
+                    schedulerOutput = pickle.loads(recv_bytes)
+                    
+                    if isinstance(schedulerOutput, DeltaSchedulerOutput):
+                        decode_batch.schedule_lists.extend(
+                            schedulerOutput.delta_schedule_list)
+                        next_tokens = model_runner.step_once(decode_batch)
+                        act_schedule_list = decode_batch.schedule_lists
+                    elif isinstance(schedulerOutput, SchedulerOutput):
+                        next_tokens = model_runner.step_once(schedulerOutput)
+                        act_schedule_list = schedulerOutput.schedule_lists
+                    else:
+                        assert 0
+                elif len(decode_batch.schedule_lists) != 0:
+                    schedulerOutput = DeltaSchedulerOutput([],[])
                     next_tokens = model_runner.step_once(decode_batch)
                     act_schedule_list = decode_batch.schedule_lists
-                elif isinstance(schedulerOutput, SchedulerOutput):
-                    next_tokens = model_runner.step_once(schedulerOutput)
-                    act_schedule_list = schedulerOutput.schedule_lists
                 else:
-                    assert 0
-            elif len(decode_batch.schedule_lists) != 0:
-                schedulerOutput = DeltaSchedulerOutput([],[])
-                next_tokens = model_runner.step_once(decode_batch)
-                act_schedule_list = decode_batch.schedule_lists
-            else:
-                continue
+                    continue
             
             keep_indices = []
             free_indices = []
@@ -275,14 +290,15 @@ class PipeAsyncLLM(LLM):
             output_socket.send(output_bytes, copy=False)
 
 
-    def start_gpu_engine(self):
-        self.gpu_engine = self.ctx.Process(
+    def start_gpu_engine(self, pp_rank, pp_size):
+        self.ctx.Process(
             target=PipeAsyncLLM.run_gpu_engine,
             args=(self.model_runner,
                   self.num_free_pages,
                   self.schedule_ipc_path,
-                  self.output_ipc_path))
-        self.gpu_engine.start()
+                  self.output_ipc_path,
+                  pp_rank,
+                  pp_size)).start()
 
     def start_schedule_engine(self):
         # launch schedule engine
