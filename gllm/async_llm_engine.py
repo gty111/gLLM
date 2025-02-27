@@ -15,6 +15,7 @@ from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
 from gllm.model_runner import ModelRunner
 from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
+from gllm.input_data import InputData
 
 
 class AsyncStream:
@@ -260,22 +261,22 @@ class PipeAsyncLLM(LLM):
                     if isinstance(schedulerOutput, DeltaSchedulerOutput):
                         decode_batch.schedule_lists.extend(
                             schedulerOutput.delta_schedule_list)
-                        output = model_runner.step_once(decode_batch)
                         act_schedule_list = decode_batch.schedule_lists
                     elif isinstance(schedulerOutput, SchedulerOutput):
-                        output = model_runner.step_once(schedulerOutput)
                         act_schedule_list = schedulerOutput.schedule_lists
                     else:
                         assert 0
                 elif len(decode_batch.schedule_lists) != 0:
                     schedulerOutput = DeltaSchedulerOutput([],[])
-                    output = model_runner.step_once(decode_batch)
                     act_schedule_list = decode_batch.schedule_lists
                 else:
                     continue
                 
+                input_data = InputData(act_schedule_list, model_runner.memory_manager)
+                output = model_runner.step_once(input_data)
+                
                 if isinstance(output,tuple):
-                    send_pp_data(output, pp_rank+1)
+                    send_pp_data(input_data, output, pp_rank+1)
                     return
                 # keep_indices = []
                 # free_indices = []
@@ -289,7 +290,9 @@ class PipeAsyncLLM(LLM):
                 #     decode_batch.schedule_lists = [
                 #         decode_batch.schedule_lists[i] for i in keep_indices]
             if not pp_rank == 0:
-                hidden_states, residual = recv_pp_data(model_runner.model_loader.dtype, pp_rank-1)
+                input_data, hidden_states, residual = recv_pp_data(
+                    model_runner.model_loader.dtype, model_runner.memory_manager, pp_rank-1)
+                
                 
             return
                 

@@ -10,6 +10,8 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 class InputData():
     def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
+        if len(seqs) == 0:
+            return
         memory_manager.pre_allocate_page(seqs)
         self.seqs = seqs
         self.memory_manager = memory_manager
@@ -47,6 +49,33 @@ class InputData():
             self.block_table = self.get_block_table()
 
         assert self.tokens.shape == self.positions.shape
+        
+    def build_prefill(prefix_prefill, memory_manager, slot_mapping_tensor, positions, 
+                max_seq_len, seq_start_loc, block_table=None, 
+                max_query_len=None, query_start_loc=None):
+        input_data = InputData([],None)
+        input_data.computed_prompt = False
+        input_data.prefix_prefill = prefix_prefill
+        input_data.memory_manager = memory_manager
+        input_data.slot_mapping_tensor = slot_mapping_tensor
+        input_data.positions = positions
+        input_data.max_seq_len = max_seq_len
+        input_data.seq_start_loc = seq_start_loc
+        if prefix_prefill:
+            input_data.block_table = block_table
+            input_data.max_query_len = max_query_len
+            input_data.query_start_loc = query_start_loc
+        return input_data
+    
+    def build_decode(slot_mapping_tensor, memory_manager, positions, cache_seqs_len, block_table):
+        input_data = InputData([],None)
+        input_data.computed_prompt = True
+        input_data.slot_mapping_tensor = slot_mapping_tensor
+        input_data.memory_manager = memory_manager
+        input_data.positions = positions
+        input_data.cache_seqs_len = cache_seqs_len
+        input_data.block_table = block_table
+        return input_data
 
     def get_seq_len_loc(self):
         max_seqlen = 0

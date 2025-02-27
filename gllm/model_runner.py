@@ -43,9 +43,7 @@ class ModelRunner():
             return self.tokenizer.encode(content)
 
     @torch.inference_mode()
-    def step_once(self, schedulerOutput: SchedulerOutput= None, hidden_states=None, residual=None):
-        if dist.get_rank() == 0:
-            input_data = InputData(schedulerOutput.schedule_lists, self.memory_manager)
+    def step_once(self, input_data:InputData=None, hidden_states=None, residual=None):
         output = self.model(input_data, hidden_states, residual)
         if dist.get_rank() == dist.get_world_size() - 1:
             logits = self.model.compute_logits(input_data, output)
