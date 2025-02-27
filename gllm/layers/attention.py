@@ -31,15 +31,8 @@ class FlashAttention():
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
         
-        # store performs better at small batch size (decode stage)
-        # batch store performs better at large batch size
-        # TODO: optimize thresholds to enable store or batch_store
-        if len(input_data.seqs) == 1 and input_data.computed_prompt:
-            input_data.memory_manager.store(
-                self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
-        else:
-            input_data.memory_manager.batch_store(
-                self.layer_id, k, v, input_data.seqs, input_data.computed_prompt)
+        input_data.memory_manager.batch_store(
+            self.layer_id, k, v, input_data.slot_mapping_tensor)
 
         k_cache = input_data.memory_manager.segments[input_data.segment_id].k_cache[self.layer_id]
         v_cache = input_data.memory_manager.segments[input_data.segment_id].v_cache[self.layer_id]

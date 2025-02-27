@@ -5,7 +5,7 @@ from typing import List
 
 from gllm.utils import async_tensor_h2d
 from gllm.sequence import Sequence
-from gllm.memory_manager import MemoryManager
+from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 
 class InputData():
@@ -13,9 +13,11 @@ class InputData():
         memory_manager.pre_allocate_page(seqs)
         self.seqs = seqs
         self.memory_manager = memory_manager
+        self.page_size = memory_manager.page_size
         # we assume all seqs have the same computed_prompt and segment_id
         self.computed_prompt = seqs[0].computed_prompt
         self.segment_id = seqs[0].segment_id
+        self.slot_mapping_tensor = self.get_slot_mapping()
         if not self.computed_prompt:
             tokens_list = []
             self.prefix_prefill = False
@@ -76,5 +78,49 @@ class InputData():
         for idx,block_table in enumerate(block_tables_list):
             block_tables[idx, :len(block_table)] = block_table
         return torch.from_numpy(block_tables).to('cuda')
-    
+
+    def get_slot_mapping(self):
+        slot_mapping = []
+        if isinstance(self.memory_manager, PrefixMemoryManager):
+            for seq in self.seqs:
+                # prompt KV cache
+                if not self.computed_prompt:
+                    for i in range(seq.computed_page_num*self.page_size, seq.prompt_len, self.page_size):
+                        page_num = seq.page_table[i // self.page_size]
+                        idx_right = min(seq.prompt_len, i+self.page_size)
+                        slot_mapping.extend(list(
+                            range(page_num*self.page_size, page_num*self.page_size+idx_right-i)))
+                # decode KV cache
+                else:
+                    if (len(seq.token_ids)-1) % self.page_size == 0:
+                        page_num = seq.page_table[-1]
+                        slot_mapping.append(page_num*self.page_size)
+                    else:
+                        offset = (len(seq.token_ids) - 1) % self.page_size
+                        page_num = seq.page_table[-1]
+                        if offset == self.page_size - 1:
+                            self.memory_manager.segments[seq.segment_id].update(
+                                (*seq.token_ids[-self.page_size:],), page_num)
+                        slot_mapping.append(page_num*self.page_size+offset)
         
+        else:
+            for seq in self.seqs:
+                # prompt KV cache
+                if not self.computed_prompt:
+                    for i in range(0, seq.prompt_len, self.page_size):
+                        page_num = seq.page_table[i // self.page_size]
+                        idx_right = min(seq.prompt_len, i+self.page_size)
+                        slot_mapping.extend(list(
+                            range(page_num*self.page_size, page_num*self.page_size+idx_right-i)))
+                # decode KV cache
+                else:
+                    if (len(seq.token_ids)-1) % self.page_size == 0:
+                        page_num = seq.page_table[-1]
+                        slot_mapping.append(page_num*self.page_size)
+                    else:
+                        offset = (len(seq.token_ids) - 1) % self.page_size
+                        page_num = seq.page_table[-1]
+                        slot_mapping.append(page_num*self.page_size+offset)
+
+        return async_tensor_h2d(
+            slot_mapping, torch.int64, 'cuda', True)
