@@ -10,7 +10,7 @@ from logger import logger
 from typing import List, Dict
 from fastapi import Request
 
-from gllm.dist_utils import init_dist
+from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
 from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
 from gllm.model_runner import ModelRunner
@@ -247,12 +247,12 @@ class PipeAsyncLLM(LLM):
         if pp_rank == pp_size - 1:
             output_socket = make_socket(zmq_ctx,output_ipc_path, zmq.PUSH)
         while True:
+            output = None
             if pp_rank == 0:
                 num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
 
                 schedulerOutput: SchedulerOutput = None
                 act_schedule_list = None
-                next_tokens = None
                 if schedule_socket.poll(timeout=0) != 0:
                     recv_bytes = schedule_socket.recv(copy=False)
                     schedulerOutput = pickle.loads(recv_bytes)
@@ -260,33 +260,41 @@ class PipeAsyncLLM(LLM):
                     if isinstance(schedulerOutput, DeltaSchedulerOutput):
                         decode_batch.schedule_lists.extend(
                             schedulerOutput.delta_schedule_list)
-                        next_tokens = model_runner.step_once(decode_batch)
+                        output = model_runner.step_once(decode_batch)
                         act_schedule_list = decode_batch.schedule_lists
                     elif isinstance(schedulerOutput, SchedulerOutput):
-                        next_tokens = model_runner.step_once(schedulerOutput)
+                        output = model_runner.step_once(schedulerOutput)
                         act_schedule_list = schedulerOutput.schedule_lists
                     else:
                         assert 0
                 elif len(decode_batch.schedule_lists) != 0:
                     schedulerOutput = DeltaSchedulerOutput([],[])
-                    next_tokens = model_runner.step_once(decode_batch)
+                    output = model_runner.step_once(decode_batch)
                     act_schedule_list = decode_batch.schedule_lists
                 else:
                     continue
-            
-            keep_indices = []
-            free_indices = []
-            for idx, seq in enumerate(act_schedule_list):
-                if seq.is_finish():
-                    free_indices.append(idx)
-                else:
-                    keep_indices.append(idx)
-            schedulerOutput.free_indices = free_indices
-            if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                decode_batch.schedule_lists = [
-                    decode_batch.schedule_lists[i] for i in keep_indices]
+                
+                if isinstance(output,tuple):
+                    send_pp_data(output, pp_rank+1)
+                    return
+                # keep_indices = []
+                # free_indices = []
+                # for idx, seq in enumerate(act_schedule_list):
+                #     if seq.is_finish():
+                #         free_indices.append(idx)
+                #     else:
+                #         keep_indices.append(idx)
+                # schedulerOutput.free_indices = free_indices
+                # if isinstance(schedulerOutput, DeltaSchedulerOutput):
+                #     decode_batch.schedule_lists = [
+                #         decode_batch.schedule_lists[i] for i in keep_indices]
+            if not pp_rank == 0:
+                hidden_states, residual = recv_pp_data(model_runner.model_loader.dtype, pp_rank-1)
+                
+            return
+                
 
-            output_bytes = pickle.dumps((schedulerOutput, next_tokens))
+            output_bytes = pickle.dumps((schedulerOutput, output))
             output_socket.send(output_bytes, copy=False)
 
 

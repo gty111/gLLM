@@ -157,25 +157,30 @@ class LlamaForCausalLM(nn.Module):
         self.dtype = model_config['torch_dtype']
         self.num_kv_heads = model_config['num_key_value_heads']
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
-        if model_config['eos_token_id'] == 128001:
-            # Llama3-8b-chat
-            self.finish_tokens = [model_config['eos_token_id'], 128009]
-        else:
-            if type(model_config['eos_token_id']) == int:
-                self.finish_tokens = [model_config['eos_token_id']]
-            elif type(model_config['eos_token_id']) == list:
-                self.finish_tokens = model_config['eos_token_id']
-            else:
-                assert 0
+        self.finish_tokens = LlamaForCausalLM.get_finish_tokens(model_config)
         self.model = LlamaModel(model_config)
         self.model_config = model_config
         if dist.get_rank() == dist.get_world_size() - 1:
             self.lm_head = nn.Linear(
                 model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
         self.sampler = Sampler()
+        
+    def get_finish_tokens(model_config: dict):
+        finish_tokens = None
+        if model_config['eos_token_id'] == 128001:
+            # Llama3-8b-chat
+            finish_tokens = [model_config['eos_token_id'], 128009]
+        else:
+            if type(model_config['eos_token_id']) == int:
+                finish_tokens = [model_config['eos_token_id']]
+            elif type(model_config['eos_token_id']) == list:
+                finish_tokens = model_config['eos_token_id']
+            else:
+                assert 0
+        return finish_tokens
 
-    def forward(self, input_data: InputData):
-        return self.model(input_data)
+    def forward(self, input_data: InputData, hidden_states=None, residual=None):
+        return self.model(input_data, hidden_states, residual)
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
         if input_data.computed_prompt:

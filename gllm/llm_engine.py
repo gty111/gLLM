@@ -8,6 +8,7 @@ from gllm.allocatorID import AllocatorID
 from gllm.scheduler import Scheduler, SchedulerOutput
 from gllm.dist_utils import init_dist
 
+
 class LLM():
     def __init__(self, model_path, gpu_memory_util=0.9, page_size=16, max_decode_seqs=256,
                  max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True, pp_size=1):
@@ -16,17 +17,18 @@ class LLM():
             model_path, gpu_memory_util, page_size, enable_prefix_caching)
         self.pp_size = pp_size
         if pp_size == 1:
-            init_dist(1,0,'127.0.0.1','45678')
+            init_dist(1, 0, '127.0.0.1', '45678')
             self.model_runner.init()
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
             max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size)
-        self.decode_batch = SchedulerOutput([])
+        self.finish_tokens = self.model_runner.model_loader.get_finish_tokens()
+        self.model_max_length = self.model_runner.tokenizer.model_max_length
 
     def check_seq_length(self, token_ids: List[int], output_len: int):
         max_seq_length = len(
             token_ids) + output_len if output_len is not None else len(token_ids)
-        if max_seq_length > self.model_runner.model.max_model_len:
+        if max_seq_length > self.model_max_length:
             logger.warning(
                 f'Ignore seq due to the length({max_seq_length}) exceeds max model len({self.model_runner.model.max_model_len})')
             return False
@@ -36,7 +38,7 @@ class LLM():
     def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False,
                      temperature=0.6, top_p=0.9, top_k=10):
         return Sequence(self.allocatorID.allocate(), token_ids,
-                        self.model_runner.model.finish_tokens, output_len, ignore_eos,
+                        self.finish_tokens, output_len, ignore_eos,
                         temperature, top_p, top_k)
 
     def add_requests(self, requests: List[Sequence]):
@@ -48,7 +50,8 @@ class LLM():
         self.scheduler.finish_lists = []
 
     def step(self):
-        scheduleOutput = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages())
+        scheduleOutput = self.scheduler.schedule(
+            self.model_runner.memory_manager.get_num_free_pages())
         self.model_runner.step_once(scheduleOutput)
         self.scheduler.update_seqs(scheduleOutput)
 
