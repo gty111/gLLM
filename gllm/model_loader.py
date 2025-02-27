@@ -67,6 +67,7 @@ class ModelLoader():
             model_config['torch_dtype'])
         model_config['torch_dtype'] = self.dtype
         self.architecture = model_config['architectures'][0]
+        self.vocab_size = int(model_config['vocab_size'])
         return model_config
     
     def get_model_type(self):

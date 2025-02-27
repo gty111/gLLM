@@ -6,12 +6,11 @@ from logger import logger
 
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
-from gllm.utils import async_tensor_h2d
-from gllm.dist_utils import get_min_num_pages
 
 
 class MemoryManager():
-    def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype, page_size: int, kv_head_num: int, kv_head_dim: int):
+    def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype, 
+                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int):
         '''
         num_layers: number of hidden layers
         page_size: number of tokens in a page
@@ -23,13 +22,16 @@ class MemoryManager():
         self.kv_head_num = kv_head_num
         self.kv_head_dim = kv_head_dim
         self.dtype = dtype
+        self.vocab_size = vocab_size
 
         free_mem_size, _ = torch.cuda.mem_get_info()
         num_max_pages = free_mem_size // (
             2*num_layers*page_size*kv_head_num*kv_head_dim*2)
         num_pages = int(num_max_pages * gpu_memory_util)
         
-        self.num_pages = get_min_num_pages(num_pages)
+        num_pages_all = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(num_pages_all, num_pages)
+        self.num_pages = min(num_pages_all)
         
         logger.info(f'Allocate {self.num_pages} pages')
 

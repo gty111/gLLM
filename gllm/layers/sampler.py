@@ -6,12 +6,8 @@ from gllm.utils import async_tensor_h2d
 class Sampler():
     
     def forward(self, logits: torch.Tensor, input_data: InputData):
-        temperature = async_tensor_h2d([seq.temperature if seq.temperature > 1e-5 else 1 for seq in input_data.seqs], logits.dtype, 'cuda', True)
-        top_p = async_tensor_h2d([seq.top_p for seq in input_data.seqs], logits.dtype, 'cuda', True)
-        top_k = async_tensor_h2d([seq.top_k if seq.top_k != -1 else logits.shape[1] for seq in input_data.seqs], logits.dtype, 'cuda', True)
-        
-        logits.div_(temperature.unsqueeze_(dim=1))
-        logits = _apply_top_k_top_p(logits, top_p, top_k)
+        logits.div_(input_data.temperature.unsqueeze_(dim=1))
+        logits = _apply_top_k_top_p(logits, input_data.top_p, input_data.top_k)
         probs = torch.softmax(logits, dim=1)
         # q = torch.empty_like(probs)
         # q.exponential_()

@@ -292,8 +292,8 @@ class PipeAsyncLLM(LLM):
             if not pp_rank == 0:
                 input_data, hidden_states, residual = recv_pp_data(
                     model_runner.model_loader.dtype, model_runner.memory_manager, pp_rank-1)
-                
-                
+                output = model_runner.step_once(input_data,hidden_states, residual)
+                print(output)
             return
                 
 

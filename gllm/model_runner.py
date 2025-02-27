@@ -34,7 +34,7 @@ class ModelRunner():
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util, num_layers=self.model.num_layers, 
             dtype=self.model.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads, 
-            kv_head_dim=self.model.head_dim)
+            kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size)
 
     def tokenize(self, content, chat:bool=False):
         if chat:

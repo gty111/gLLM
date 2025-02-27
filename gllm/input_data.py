@@ -12,6 +12,9 @@ class InputData():
     def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
         if len(seqs) == 0:
             return
+        self.temperature = async_tensor_h2d([seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], memory_manager.dtype, 'cuda', True)
+        self.top_p = async_tensor_h2d([seq.top_p for seq in seqs], memory_manager.dtype, 'cuda', True)
+        self.top_k = async_tensor_h2d([seq.top_k if seq.top_k != -1 else memory_manager.vocab_size for seq in seqs], memory_manager.dtype, 'cuda', True)
         memory_manager.pre_allocate_page(seqs)
         self.seqs = seqs
         self.memory_manager = memory_manager
@@ -50,11 +53,16 @@ class InputData():
 
         assert self.tokens.shape == self.positions.shape
         
-    def build_prefill(prefix_prefill, memory_manager, slot_mapping_tensor, positions, 
+    def build_prefill(temperature, top_p, top_k, prefix_prefill, 
+                memory_manager, slot_mapping_tensor, positions, 
                 max_seq_len, seq_start_loc, block_table=None, 
                 max_query_len=None, query_start_loc=None):
         input_data = InputData([],None)
+        input_data.segment_id = 0
         input_data.computed_prompt = False
+        input_data.temperature = temperature
+        input_data.top_p = top_p
+        input_data.top_k = top_k
         input_data.prefix_prefill = prefix_prefill
         input_data.memory_manager = memory_manager
         input_data.slot_mapping_tensor = slot_mapping_tensor
@@ -67,9 +75,14 @@ class InputData():
             input_data.query_start_loc = query_start_loc
         return input_data
     
-    def build_decode(slot_mapping_tensor, memory_manager, positions, cache_seqs_len, block_table):
+    def build_decode(temperature, top_p, top_k,slot_mapping_tensor, 
+                     memory_manager, positions, cache_seqs_len, block_table):
         input_data = InputData([],None)
+        input_data.segment_id = 0
         input_data.computed_prompt = True
+        input_data.temperature = temperature
+        input_data.top_p = top_p
+        input_data.top_k = top_k
         input_data.slot_mapping_tensor = slot_mapping_tensor
         input_data.memory_manager = memory_manager
         input_data.positions = positions
