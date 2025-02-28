@@ -21,11 +21,11 @@ class InputData():
         self.page_size = memory_manager.page_size
         # we assume all seqs have the same computed_prompt and segment_id
         self.computed_prompt = seqs[0].computed_prompt
+        self.prefix_prefill = False
         self.segment_id = seqs[0].segment_id
         self.slot_mapping_tensor = self.get_slot_mapping()
         if not self.computed_prompt:
             tokens_list = []
-            self.prefix_prefill = False
             for seq in seqs:
                 tokens_list.extend(
                     seq.token_ids[seq.computed_page_num*self.memory_manager.page_size:])

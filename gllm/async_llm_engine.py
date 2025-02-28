@@ -1,14 +1,12 @@
 import asyncio
 import multiprocessing as mp
-import time
-import torch
-import torch.distributed as dist
 import zmq
 import pickle
 
 from logger import logger
 from typing import List, Dict
 from fastapi import Request
+from collections import deque
 
 from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
 from gllm.utils import make_async, make_socket
@@ -16,6 +14,7 @@ from gllm.llm_engine import LLM
 from gllm.model_runner import ModelRunner
 from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
 from gllm.input_data import InputData
+from gllm.sequence import Sequence
 
 
 class AsyncStream:
@@ -141,6 +140,7 @@ class PipeAsyncLLM(LLM):
         
         self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
         self.output_ipc_path = 'ipc:///tmp/gllm_output'
+        self.token_ipc_path = 'ipc:///tmp/gllm_token'
 
         for pp_rank in range(self.pp_size):
             self.start_gpu_engine(pp_rank, self.pp_size)
@@ -180,6 +180,9 @@ class PipeAsyncLLM(LLM):
         
         schedulerOutput = self.scheduler.schedule(
             self.num_free_pages.value, log=True, delta=True)
+        
+        if schedulerOutput is None:
+            return False
 
         # check abort requests
         await self.check_abort_request(schedulerOutput)
@@ -188,9 +191,11 @@ class PipeAsyncLLM(LLM):
             await asyncio.sleep(0)
             return False
         
-        if isinstance(schedulerOutput, DeltaSchedulerOutput) and len(schedulerOutput.delta_schedule_list) == 0:
-            await asyncio.sleep(0)
-            return False
+        # if isinstance(schedulerOutput, DeltaSchedulerOutput) and len(schedulerOutput.delta_schedule_list) == 0:
+        #     await asyncio.sleep(0)
+        #     return False
+        
+        print(schedulerOutput)
         
         schedule_bytes = pickle.dumps(schedulerOutput)
         schedule_socket.send(schedule_bytes, copy=False)
@@ -233,7 +238,7 @@ class PipeAsyncLLM(LLM):
                 return
             await asyncio.sleep(0)
 
-    def run_gpu_engine(model_runner: ModelRunner, num_free_pages, schedule_ipc_path, output_ipc_path, pp_rank, pp_size):
+    def run_gpu_engine(model_runner: ModelRunner, num_free_pages, schedule_ipc_path, output_ipc_path, token_ipc_path, pp_rank, pp_size):
         init_dist(pp_size,pp_rank,'127.0.0.1','49083')
         if not pp_size == 1:
             model_runner.init()
@@ -242,21 +247,27 @@ class PipeAsyncLLM(LLM):
         schedule_socket = None
         decode_batch = None
         output_socket = None
+        token_socket = None
+        schedule_queue:deque = None
         if pp_rank == 0:
             schedule_socket = make_socket(zmq_ctx, schedule_ipc_path, zmq.PULL)
             decode_batch = SchedulerOutput([])
-        if pp_rank == pp_size - 1:
-            output_socket = make_socket(zmq_ctx,output_ipc_path, zmq.PUSH)
+            output_socket = make_socket(zmq_ctx, output_ipc_path, zmq.PUSH)
+            if not pp_size == 1:
+                token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PULL)
+                schedule_queue = deque()
+        if pp_rank == pp_size - 1 and not pp_size == 1:
+            token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PUSH)
         while True:
             output = None
             if pp_rank == 0:
                 num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
 
-                schedulerOutput: SchedulerOutput = None
-                act_schedule_list = None
                 if schedule_socket.poll(timeout=0) != 0:
                     recv_bytes = schedule_socket.recv(copy=False)
                     schedulerOutput = pickle.loads(recv_bytes)
+                    
+                    act_schedule_list: List[Sequence] = None
                     
                     if isinstance(schedulerOutput, DeltaSchedulerOutput):
                         decode_batch.schedule_lists.extend(
@@ -266,39 +277,52 @@ class PipeAsyncLLM(LLM):
                         act_schedule_list = schedulerOutput.schedule_lists
                     else:
                         assert 0
-                elif len(decode_batch.schedule_lists) != 0:
-                    schedulerOutput = DeltaSchedulerOutput([],[])
-                    act_schedule_list = decode_batch.schedule_lists
-                else:
-                    continue
-                
-                input_data = InputData(act_schedule_list, model_runner.memory_manager)
-                output = model_runner.step_once(input_data)
-                
-                if isinstance(output,tuple):
-                    send_pp_data(input_data, output, pp_rank+1)
-                    return
-                # keep_indices = []
-                # free_indices = []
-                # for idx, seq in enumerate(act_schedule_list):
-                #     if seq.is_finish():
-                #         free_indices.append(idx)
-                #     else:
-                #         keep_indices.append(idx)
-                # schedulerOutput.free_indices = free_indices
-                # if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                #     decode_batch.schedule_lists = [
-                #         decode_batch.schedule_lists[i] for i in keep_indices]
+                    
+                    print(act_schedule_list[0].token_ids)
+
+                    input_data = InputData(act_schedule_list, model_runner.memory_manager)
+                    schedule_queue.append((schedulerOutput, act_schedule_list))
+                    output = model_runner.step_once(input_data)
+                    
+                    if isinstance(output,tuple):
+                        send_pp_data(input_data, output, pp_rank+1)
+                    
+                if token_socket.poll(timeout=0) != 0:
+                    recv_bytes = token_socket.recv(copy=False)
+                    next_tokens = pickle.loads(recv_bytes)
+                    
+                    schedulerOutput, act_schedule_list = schedule_queue.popleft()
+
+                    keep_indices = []
+                    free_indices = []
+                    for idx, seq in enumerate(act_schedule_list):
+                        seq.computed_prompt = True
+                        seq.token_ids.append(next_tokens[idx])
+                        if seq.is_finish():
+                            free_indices.append(idx)
+                        else:
+                            keep_indices.append(idx)
+                    schedulerOutput.free_indices = free_indices
+                    if isinstance(schedulerOutput, DeltaSchedulerOutput):
+                        decode_batch.schedule_lists = [
+                            decode_batch.schedule_lists[i] for i in keep_indices]
+                    output_bytes = pickle.dumps((schedulerOutput, next_tokens))
+                    output_socket.send(output_bytes, copy=False)
+                    
             if not pp_rank == 0:
                 input_data, hidden_states, residual = recv_pp_data(
                     model_runner.model_loader.dtype, model_runner.memory_manager, pp_rank-1)
                 output = model_runner.step_once(input_data,hidden_states, residual)
-                print(output)
-            return
+                if pp_rank == pp_size - 1:
+                    assert type(output) == list
+                    print(output)
+                    token_bytes = pickle.dumps(output)
+                    token_socket.send(token_bytes, copy=False)
+                else:
+                    send_pp_data(input_data, output, pp_rank+1)
                 
 
-            output_bytes = pickle.dumps((schedulerOutput, output))
-            output_socket.send(output_bytes, copy=False)
+            
 
 
     def start_gpu_engine(self, pp_rank, pp_size):
@@ -308,6 +332,7 @@ class PipeAsyncLLM(LLM):
                   self.num_free_pages,
                   self.schedule_ipc_path,
                   self.output_ipc_path,
+                  self.token_ipc_path,
                   pp_rank,
                   pp_size)).start()
 

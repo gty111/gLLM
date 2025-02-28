@@ -59,16 +59,11 @@ def send_pp_data(input_data:InputData, output, dst):
     
 def recv_pp_data(dtype, memory_manager, src):
     temperature = recv_tensor(dtype, src)
-    print('temperature',temperature)
     top_p = recv_tensor(dtype, src)
-    print('top_p',top_p)
     top_k = recv_tensor(dtype, src)
-    print('top_k',top_k)
     
     slot_mapping_tensor = recv_tensor(torch.int64, src)
-    print('slot_mapping_tensor',slot_mapping_tensor)
     positions = recv_tensor(torch.long, src)
-    print('positions',positions)
     
     # recv computed_prompt, prefix_prefill
     obj_list = [None, None]
@@ -77,10 +72,8 @@ def recv_pp_data(dtype, memory_manager, src):
     input_data = None
     
     computed_prompt, prefix_prefill = obj_list
-    print(computed_prompt, prefix_prefill)
     if not computed_prompt:
         seq_start_loc = recv_tensor(torch.int32, src)
-        print('seq_start_loc',seq_start_loc)
         if prefix_prefill:
             obj_list = [None, None]
             dist.recv_object_list(obj_list,src)
@@ -110,9 +103,7 @@ def recv_pp_data(dtype, memory_manager, src):
     
     # recv hidden_states, residual
     hidden_states = recv_tensor(dtype, src)
-    print('hidden_states', hidden_states)
     residual = recv_tensor(dtype, src)
-    print('residual', residual)
     return input_data, hidden_states, residual
 
 def init_dist(pp_size, pp_rank, master_addr, master_port):
