@@ -204,7 +204,7 @@ class LlamaForCausalLM(nn.Module):
         head_dim = self.model_config['hidden_size'] // num_attn_heads
         num_kv_heads = self.model_config['num_key_value_heads']
         intermediate_size = self.model_config['intermediate_size']
-        for k, v in tqdm.tqdm(parameters.items()):
+        for k, v in parameters.items():
             # resolve PP layer
             if 'layers' in k:
                 k_list = k.split('.')

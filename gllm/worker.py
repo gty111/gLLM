@@ -121,7 +121,7 @@ class Worker:
  
 def run_worker(worker: Worker):
     worker.init()
-    logger.info(f'GPU process {worker.rank} init')
+    logger.info(f'worker {worker.rank} init')
     while True:
         if worker.rank == 0:
             worker.set_num_free_pages()

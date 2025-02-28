@@ -1,6 +1,8 @@
 import json
 import glob
 import torch
+import torch.distributed as dist
+
 from logger import logger
 from safetensors import safe_open
 
@@ -87,6 +89,6 @@ class ModelLoader():
         model_type = self.get_model_type()
         model = model_type(self.model_config)
         
-        logger.info("loading model...")
+        logger.info(f"worker {dist.get_rank()} loading model ...")
         model.load_weights(weights)
         return model

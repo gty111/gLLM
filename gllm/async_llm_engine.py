@@ -2,6 +2,7 @@ import asyncio
 import multiprocessing as mp
 import zmq
 import pickle
+import time
 
 from logger import logger
 from typing import List, Dict
@@ -137,8 +138,15 @@ class PipeAsyncLLM(LLM):
         self.output_ipc_path = 'ipc:///tmp/gllm_output'
         self.token_ipc_path = 'ipc:///tmp/gllm_token'
 
+        logger.info(f"Launching {self.pp_size} worker(s) ...")
         for pp_rank in range(self.pp_size):
-            self.start_gpu_engine(pp_rank, self.pp_size)
+            self.start_worker(pp_rank, self.pp_size)
+        
+        # wait gpu engine start
+        while True:
+            if self.num_free_pages.value != 0:
+                break
+            time.sleep(1)
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float):
@@ -229,7 +237,7 @@ class PipeAsyncLLM(LLM):
             await asyncio.sleep(0)
             
 
-    def start_gpu_engine(self, pp_rank, pp_size):
+    def start_worker(self, pp_rank, pp_size):
         worker = Worker(self.model_runner,
                         self.num_free_pages,
                         pp_rank,

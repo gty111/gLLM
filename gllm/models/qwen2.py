@@ -147,7 +147,7 @@ class Qwen2ForCausalLM(nn.Module):
         head_dim = self.model_config['hidden_size'] // num_attn_heads
         num_kv_heads = self.model_config['num_key_value_heads']
         intermediate_size = self.model_config['intermediate_size']
-        for k, v in tqdm.tqdm(parameters.items()):
+        for k, v in parameters.items():
             if k.find('self_attn.qkv_proj.weight') != -1:
                 v.data[:num_attn_heads*head_dim, :] = weights[k.replace(
                     'qkv_proj', 'q_proj')]

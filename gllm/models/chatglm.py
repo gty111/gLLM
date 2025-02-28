@@ -202,7 +202,7 @@ class ChatGLMForCausalLM(nn.Module):
     def load_weights(self, weights):
         parameters = dict(self.named_parameters())
 
-        for k, v in tqdm.tqdm(parameters.items()):
+        for k, v in parameters.items():
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')
             v.data.copy_(weights[k])
