@@ -1,3 +1,4 @@
+import torch
 import torch.distributed as dist
 import zmq
 import pickle
@@ -24,19 +25,23 @@ class Worker:
         self.world_size = pp_size
         self.master_addr = master_addr
         self.master_port = master_port
-        zmq_ctx = zmq.Context()
-        if dist.get_rank() == 0:
-            self.schedule_socket = make_socket(zmq_ctx, schedule_ipc_path, zmq.PULL)
-            self.output_socket = make_socket(zmq_ctx, output_ipc_path, zmq.PUSH)
-            self.to_schedule_list = []
-            self.already_schedule_queue = deque()
-            if dist.get_world_size() != 1:
-                token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PULL)
-        if dist.get_rank() == dist.get_world_size() - 1 and dist.get_world_size() != 1:
-            token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PUSH)
-            
+        self.schedule_ipc_path = schedule_ipc_path
+        self.output_ipc_path = output_ipc_path
+        self.token_ipc_path = token_ipc_path
+        
     def init(self):
         init_dist(self.world_size, self.rank, self.master_addr, self.master_port)
+        torch.cuda.set_device(f'cuda:{self.rank}')
+        zmq_ctx = zmq.Context()
+        if self.rank == 0:
+            self.schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PULL)
+            self.output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PUSH)
+            self.to_schedule_list = []
+            self.already_schedule_queue = deque()
+            if self.world_size != 1:
+                self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PULL)
+        if self.rank == self.world_size - 1 and self.world_size != 1:
+            self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
         self.model_runner.init()
         
     def set_num_free_pages(self):
@@ -56,23 +61,25 @@ class Worker:
     def schedule_run(self):
         output = None
         act_schedule_list: List[Sequence] = None
+        schedulerOutput = None
 
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput = pickle.loads(recv_bytes)
             
             if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                to_schedule_list.extend(
+                self.to_schedule_list.extend(
                     schedulerOutput.delta_schedule_list)
-                act_schedule_list = to_schedule_list
-                to_schedule_list = []
+                act_schedule_list = self.to_schedule_list
+                self.to_schedule_list = []
             elif isinstance(schedulerOutput, SchedulerOutput):
                 act_schedule_list = schedulerOutput.schedule_lists
             else:
                 assert 0
-        elif len(to_schedule_list) != 0:
-            act_schedule_list = to_schedule_list
-            to_schedule_list = []
+        elif len(self.to_schedule_list) != 0:
+            schedulerOutput = DeltaSchedulerOutput([],[])
+            act_schedule_list = self.to_schedule_list
+            self.to_schedule_list = []
         
         if act_schedule_list is not None:
             input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
@@ -80,16 +87,16 @@ class Worker:
             output = self.model_runner.step_once(input_data)
             
             if isinstance(output,tuple):
-                send_pp_data(input_data, output, dist.get_rank()+1)
+                send_pp_data(input_data, output, self.rank+1)
         
         return output
         
 
     def process_output(self, output):
             next_tokens = None
-            if isinstance(self.output,list) :
+            if isinstance(output,list) :
                 next_tokens = output
-            elif dist.get_world_size() != 1 and self.token_socket.poll(timeout=0) != 0:
+            elif self.world_size != 1 and self.token_socket.poll(timeout=0) != 0:
                 recv_bytes = self.token_socket.recv(copy=False)
                 next_tokens = pickle.loads(recv_bytes)
             

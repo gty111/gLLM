@@ -2,7 +2,8 @@ import argparse
 from openai import OpenAI
 
 parser = argparse.ArgumentParser(description='Chat client')
-parser.add_argument("--stream",action="store_true")
+parser.add_argument("--no-stream", action="store_true")
+parser.add_argument("--num-tokens", type=int, default=512)
 parser.add_argument("--port",type=int)
 args = parser.parse_args()
 
@@ -36,11 +37,11 @@ chat_completion = client.chat.completions.create(
         "content": "Can you tell a fairy tale?"
     }],
     model=model,
-    stream=args.stream,
-    max_tokens = 128
+    stream=not args.no_stream,
+    max_tokens = args.num_tokens
 )
 
-if args.stream:
+if not args.no_stream:
     print("Chat completion results:")
     for i in chat_completion:
         print(i.choices[0].delta.content,end='',flush=True)

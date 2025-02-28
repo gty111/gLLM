@@ -58,7 +58,7 @@ class Scheduler:
         cur_time = time.time()
         if log and cur_time - self.log_time > 1:
             self.log_time = cur_time
-            print(
+            logger.info(
                 '#prompt: %4d #decode: %4d memory_util: %2.2f %%'
                 % (len(self.prompt_lists),
                    len(self.decode_lists) + len(self.decode_batch.schedule_lists),

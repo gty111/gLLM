@@ -110,7 +110,6 @@ def init_dist(pp_size, pp_rank, master_addr, master_port):
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = master_port
     dist.init_process_group(backend='nccl', world_size=pp_size, rank=pp_rank)
-    torch.cuda.set_device(f'cuda:{pp_rank}')
 
 def get_pp_layers(num_layers):
     assert num_layers % dist.get_world_size() == 0
