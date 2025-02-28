@@ -89,6 +89,6 @@ class ModelLoader():
         model_type = self.get_model_type()
         model = model_type(self.model_config)
         
-        logger.info(f"worker {dist.get_rank()} loading model ...")
+        logger.info(f"Worker {dist.get_rank()} loading model ...")
         model.load_weights(weights)
         return model

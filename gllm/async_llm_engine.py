@@ -140,7 +140,7 @@ class PipeAsyncLLM(LLM):
 
         logger.info(f"Launching {self.pp_size} worker(s) ...")
         for pp_rank in range(self.pp_size):
-            self.start_worker(pp_rank, self.pp_size)
+            self.start_worker(pp_rank)
         
         # wait gpu engine start
         while True:
@@ -237,11 +237,11 @@ class PipeAsyncLLM(LLM):
             await asyncio.sleep(0)
             
 
-    def start_worker(self, pp_rank, pp_size):
+    def start_worker(self, pp_rank):
         worker = Worker(self.model_runner,
                         self.num_free_pages,
                         pp_rank,
-                        pp_size,
+                        self.pp_size,
                         self.master_addr,
                         self.master_port,
                         self.schedule_ipc_path,

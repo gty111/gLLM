@@ -58,9 +58,30 @@ class Worker:
         else:
             send_pp_data(input_data, output, self.rank+1)
     
+    # PP schedule
+    def schedule(self):
+        # to_schedule_list => schedule_list (ref already_schedule_queue)
+        num_total_seqs = len(self.to_schedule_list)
+        for schedulerOutput,schedule_list in self.already_schedule_queue:
+            num_total_seqs += len(schedule_list)
+        
+        if num_total_seqs <= self.world_size or self.world_size == 1:
+            cur_schedule_list = self.to_schedule_list
+            self.to_schedule_list = []
+            return cur_schedule_list    
+        
+        num_schedule_seqs = num_total_seqs // self.world_size
+        if len(self.already_schedule_queue) > self.world_size:
+            return []
+        if num_schedule_seqs > len(self.to_schedule_list):
+            return []
+        cur_schedule_list = self.to_schedule_list[:num_schedule_seqs]
+        self.to_schedule_list = self.to_schedule_list[num_schedule_seqs:]
+        return cur_schedule_list
+    
     def schedule_run(self):
         output = None
-        act_schedule_list: List[Sequence] = None
+        act_schedule_list: List[Sequence] = []
         schedulerOutput = None
 
         if self.schedule_socket.poll(timeout=0) != 0:
@@ -70,18 +91,16 @@ class Worker:
             if isinstance(schedulerOutput, DeltaSchedulerOutput):
                 self.to_schedule_list.extend(
                     schedulerOutput.delta_schedule_list)
-                act_schedule_list = self.to_schedule_list
-                self.to_schedule_list = []
+                act_schedule_list = self.schedule()
             elif isinstance(schedulerOutput, SchedulerOutput):
                 act_schedule_list = schedulerOutput.schedule_lists
             else:
                 assert 0
         elif len(self.to_schedule_list) != 0:
             schedulerOutput = DeltaSchedulerOutput([],[])
-            act_schedule_list = self.to_schedule_list
-            self.to_schedule_list = []
+            act_schedule_list = self.schedule()
         
-        if act_schedule_list is not None:
+        if len(act_schedule_list) != 0:
             input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
             self.already_schedule_queue.append((schedulerOutput, act_schedule_list))
             output = self.model_runner.step_once(input_data)
@@ -121,7 +140,7 @@ class Worker:
  
 def run_worker(worker: Worker):
     worker.init()
-    logger.info(f'worker {worker.rank} init')
+    logger.info(f'Worker {worker.rank} init')
     while True:
         if worker.rank == 0:
             worker.set_num_free_pages()
