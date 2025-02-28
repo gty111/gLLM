@@ -6,16 +6,11 @@ import pickle
 from logger import logger
 from typing import List, Dict
 from fastapi import Request
-from collections import deque
 
-from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
 from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
-from gllm.model_runner import ModelRunner
 from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
-from gllm.input_data import InputData
-from gllm.sequence import Sequence
-
+from gllm.worker import Worker, run_worker
 
 class AsyncStream:
 
@@ -232,111 +227,21 @@ class PipeAsyncLLM(LLM):
             if await self.run_schedule(schedule_socket):
                 return
             await asyncio.sleep(0)
-
-    def run_gpu_engine(model_runner: ModelRunner, num_free_pages, schedule_ipc_path, output_ipc_path, token_ipc_path, pp_rank, pp_size, master_addr, master_port):
-        init_dist(pp_size,pp_rank, master_addr, master_port)
-        model_runner.init()
-        zmq_ctx = zmq.Context()
-        
-        schedule_socket = None
-        output_socket = None
-        token_socket = None
-        already_schedule_queue:deque = None
-        to_schedule_list: List[Sequence] = None
-        if pp_rank == 0:
-            schedule_socket = make_socket(zmq_ctx, schedule_ipc_path, zmq.PULL)
-            output_socket = make_socket(zmq_ctx, output_ipc_path, zmq.PUSH)
-            to_schedule_list = []
-            already_schedule_queue = deque()
-            if pp_size != 1:
-                token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PULL)
-        if pp_rank == pp_size - 1 and pp_size != 1:
-            token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PUSH)
-        
-        logger.info(f'GPU process {pp_rank} complete initialization')
-        while True:
-            output = None
-            if pp_rank == 0:
-                num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
-
-                act_schedule_list: List[Sequence] = None
-                
-                if schedule_socket.poll(timeout=0) != 0:
-                    recv_bytes = schedule_socket.recv(copy=False)
-                    schedulerOutput = pickle.loads(recv_bytes)
-                    
-                    if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                        to_schedule_list.extend(
-                            schedulerOutput.delta_schedule_list)
-                        act_schedule_list = to_schedule_list
-                        to_schedule_list = []
-                    elif isinstance(schedulerOutput, SchedulerOutput):
-                        act_schedule_list = schedulerOutput.schedule_lists
-                    else:
-                        assert 0
-                elif len(to_schedule_list) != 0:
-                    act_schedule_list = to_schedule_list
-                    to_schedule_list = []
-                
-                if act_schedule_list is not None:
-                    input_data = InputData(act_schedule_list, model_runner.memory_manager)
-                    already_schedule_queue.append((schedulerOutput, act_schedule_list))
-                    output = model_runner.step_once(input_data)
-                    
-                    if isinstance(output,tuple):
-                        send_pp_data(input_data, output, pp_rank+1)
-                
-                next_tokens = None
-                if isinstance(output,list) :
-                    next_tokens = output
-                elif pp_size != 1 and token_socket.poll(timeout=0) != 0:
-                    recv_bytes = token_socket.recv(copy=False)
-                    next_tokens = pickle.loads(recv_bytes)
-                
-                if next_tokens is not None:
-                    schedulerOutput, act_schedule_list = already_schedule_queue.popleft()
-
-                    keep_indices = []
-                    free_indices = []
-                    for idx, seq in enumerate(act_schedule_list):
-                        seq.computed_prompt = True
-                        seq.token_ids.append(next_tokens[idx])
-                        if seq.is_finish():
-                            free_indices.append(idx)
-                            model_runner.memory_manager.free(seq)
-                        else:
-                            keep_indices.append(idx)
-                    schedulerOutput.free_indices = free_indices
-                    if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                        to_schedule_list.extend([act_schedule_list[i] for i in keep_indices])
-                    output_bytes = pickle.dumps((schedulerOutput, next_tokens))
-                    output_socket.send(output_bytes, copy=False)
-                    
-            if not pp_rank == 0:
-                input_data, hidden_states, residual = recv_pp_data(
-                    model_runner.model_loader.dtype, model_runner.memory_manager, pp_rank-1)
-                output = model_runner.step_once(input_data,hidden_states, residual)
-                if pp_rank == pp_size - 1:
-                    assert type(output) == list
-                    token_bytes = pickle.dumps(output)
-                    token_socket.send(token_bytes, copy=False)
-                else:
-                    send_pp_data(input_data, output, pp_rank+1)
             
 
-
     def start_gpu_engine(self, pp_rank, pp_size):
+        worker = Worker(self.model_runner,
+                        self.num_free_pages,
+                        pp_rank,
+                        pp_size,
+                        self.master_addr,
+                        self.master_port,
+                        self.schedule_ipc_path,
+                        self.output_ipc_path,
+                        self.token_ipc_path)
         self.ctx.Process(
-            target=PipeAsyncLLM.run_gpu_engine,
-            args=(self.model_runner,
-                  self.num_free_pages,
-                  self.schedule_ipc_path,
-                  self.output_ipc_path,
-                  self.token_ipc_path,
-                  pp_rank,
-                  pp_size,
-                  self.master_addr,
-                  self.master_port),
+            target=run_worker,
+            args=(worker,),
             daemon=True).start()
 
     def start_schedule_engine(self):
