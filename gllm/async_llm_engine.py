@@ -12,6 +12,7 @@ from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
 from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
 from gllm.worker import Worker, run_worker
+from gllm.input_data import InputData
 
 class AsyncStream:
 
@@ -61,11 +62,13 @@ def _log_task_completion(task: asyncio.Task) -> None:
 class AsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
-        assert kwargs['pp_size'] == 1
+        assert kwargs['pp_size'] == 1 and "AsyncLLM doesn't support degree of PP > 1"
         super().__init__(*args, **kwargs)
+        super().init()
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.background_engine = None
+        
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float):
@@ -97,12 +100,14 @@ class AsyncLLM(LLM):
         if len(schedulerOutput.schedule_lists) == 0:
             self.scheduler.num_schedule_prefill -= 1
             return
-        await make_async(self.model_runner.step_once)(schedulerOutput)
-        self.scheduler.update_seqs(schedulerOutput)
+        next_tokens = await make_async(self.model_runner.step_once)(
+            InputData(schedulerOutput.schedule_lists,self.model_runner.memory_manager))
+        self.scheduler.update_seqs(schedulerOutput, next_tokens)
         for seq in schedulerOutput.schedule_lists:
             self.async_streams[seq.seq_id].put(
                 seq.detokenize_inc(self.model_runner.tokenizer))
         for seq in self.scheduler.finish_lists:
+            self.model_runner.free_kv_cache(seq)
             self.async_streams[seq.seq_id].finish()
             del self.async_streams[seq.seq_id]
         self.free_finish_requests()
