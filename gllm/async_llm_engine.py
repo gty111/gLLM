@@ -252,7 +252,8 @@ class PipeAsyncLLM(LLM):
                 token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PULL)
         if pp_rank == pp_size - 1 and pp_size != 1:
             token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PUSH)
-            
+        
+        logger.info(f'GPU process {pp_rank} complete initialization')
         while True:
             output = None
             if pp_rank == 0:
@@ -302,6 +303,7 @@ class PipeAsyncLLM(LLM):
                         seq.token_ids.append(next_tokens[idx])
                         if seq.is_finish():
                             free_indices.append(idx)
+                            model_runner.memory_manager.free(seq)
                         else:
                             keep_indices.append(idx)
                     schedulerOutput.free_indices = free_indices
