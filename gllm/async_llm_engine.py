@@ -336,7 +336,8 @@ class PipeAsyncLLM(LLM):
                   pp_rank,
                   pp_size,
                   self.master_addr,
-                  self.master_port)).start()
+                  self.master_port),
+            daemon=True).start()
 
     def start_schedule_engine(self):
         # launch schedule engine
