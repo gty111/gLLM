@@ -11,10 +11,11 @@ if __name__ == '__main__':
     parser.add_argument('--share-gpt-path', type=str, required=True)
     parser.add_argument('--num-prompt', type=int, default=8)
     parser.add_argument('--print-output', action="store_true")
-    parser.add_argument('--gpu-memory-utilization', type=float, default=0.9)
+    parser.add_argument('--gpu-memory-util', type=float, default=0.9)
     args = parser.parse_args()
 
-    llm = LLM(args.model_path, gpu_memory_utilization=args.gpu_memory_utilization)
+    llm = LLM(args.model_path, gpu_memory_util=args.gpu_memory_util)
+    llm.init()
     with open(args.share_gpt_path) as f:
         completions = json.load(f)
         tokens = []

@@ -6,6 +6,8 @@ from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 from gllm.allocatorID import AllocatorID
 from gllm.scheduler import Scheduler
+from gllm.dist_utils import init_dist
+from gllm.input_data import InputData
 
 
 class LLM():
@@ -47,11 +49,18 @@ class LLM():
             self.allocatorID.free(seq.seq_id)
         self.scheduler.finish_lists = []
 
+    def init(self):
+        init_dist(1, 0, self.master_addr, self.master_port)
+        self.model_runner.init()
+        self.scheduler.set_total_num_free_pages(self.model_runner.memory_manager.get_num_free_pages())
+
     def step(self):
+        if self.model_runner.model is None:
+            self.init()
         scheduleOutput = self.scheduler.schedule(
             self.model_runner.memory_manager.get_num_free_pages())
-        self.model_runner.step_once(scheduleOutput)
-        self.scheduler.update_seqs(scheduleOutput)
+        next_tokens = self.model_runner.step_once(InputData(scheduleOutput.schedule_lists, self.model_runner.memory_manager))
+        self.scheduler.update_seqs(scheduleOutput, next_tokens)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None,
                  temperature=0.6, top_p=0.9, top_k=10):
@@ -84,7 +93,9 @@ class LLM():
         return requests
 
     def chat(self):
-        architecture = self.model_runner.model.model_config['architectures'][0]
+        init_dist(1, 0, self.master_addr, self.master_port)
+        self.model_runner.init()
+        architecture = self.model_runner.model_loader.architecture
         print("\nWelcome to the chatbot!\n"
               "Type '\exit' to exit the chatbot.\n"
               "Type '\clear' to clear the chatbot's history.\n")

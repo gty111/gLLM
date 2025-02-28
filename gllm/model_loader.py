@@ -69,7 +69,12 @@ class ModelLoader():
             model_config['torch_dtype'])
         model_config['torch_dtype'] = self.dtype
         self.architecture = model_config['architectures'][0]
-        self.vocab_size = int(model_config['vocab_size'])
+        if 'vocab_size' in model_config:
+            self.vocab_size = int(model_config['vocab_size'])
+        elif 'padded_vocab_size' in model_config:
+            self.vocab_size = int(model_config['padded_vocab_size'])
+        else:
+            assert 0
         return model_config
     
     def get_model_type(self):

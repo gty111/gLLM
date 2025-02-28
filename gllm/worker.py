@@ -48,9 +48,14 @@ class Worker:
         self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
 
     def run(self):
-        input_data, hidden_states, residual = recv_pp_data(
+        data = recv_pp_data(
             self.model_runner.model_loader.dtype, self.model_runner.memory_manager, self.rank-1)
-        output = self.model_runner.step_once(input_data,hidden_states, residual)
+        if len(data) == 3:
+            input_data, hidden_states, residual = data
+            output = self.model_runner.step_once(input_data,hidden_states, residual)
+        elif len(data) == 2:
+            input_data, hidden_states = data
+            output = self.model_runner.step_once(input_data,hidden_states)
         if self.rank == self.world_size - 1:
             assert type(output) == list
             token_bytes = pickle.dumps(output)
@@ -105,7 +110,7 @@ class Worker:
             self.already_schedule_queue.append((schedulerOutput, act_schedule_list))
             output = self.model_runner.step_once(input_data)
             
-            if isinstance(output,tuple):
+            if type(output) != list:
                 send_pp_data(input_data, output, self.rank+1)
         
         return output

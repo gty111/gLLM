@@ -64,7 +64,9 @@ class ModelRunner():
     def stream_inference(self, seq: Sequence):
         # -------prefill------
         prefill_start = time.time()
-        self.step_once(SchedulerOutput([seq]))
+        next_token = self.step_once(InputData([seq],self.memory_manager))[0]
+        seq.token_ids.append(next_token)
+        seq.computed_prompt = True
         prefill_end = time.time()
         # ----prefill end-----
 
@@ -74,7 +76,8 @@ class ModelRunner():
             print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
             if seq.is_finish():
                 break
-            self.step_once(SchedulerOutput([seq]))
+            next_token = self.step_once(InputData([seq], self.memory_manager))[0]
+            seq.token_ids.append(next_token)
         print("\n")
         decode_end = time.time()
         # ------decode end-------

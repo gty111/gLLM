@@ -134,10 +134,7 @@ class LlamaModel(nn.Module):
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         if dist.get_rank() == 0:
-            assert hidden_states is None
             hidden_states = self.embed_tokens(input_data.tokens)
-        else:
-            assert hidden_states is not None
         for layer in self.layers:
             hidden_states, residual = layer(
                 input_data, hidden_states, residual)

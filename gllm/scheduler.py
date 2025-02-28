@@ -59,7 +59,7 @@ class Scheduler:
         if log and cur_time - self.log_time > 1:
             self.log_time = cur_time
             logger.info(
-                '#prompt: %4d #decode: %4d memory_util: %2.2f %%'
+                '#wait: %4d #decode: %4d memory_util: %2.2f %%'
                 % (len(self.prompt_lists),
                    len(self.decode_lists) + len(self.decode_batch.schedule_lists),
                    self.get_memory_util()))
@@ -112,12 +112,14 @@ class Scheduler:
     def update_seqs(self, schedulerOutput:SchedulerOutput, next_tokens: List[int]=None, delta=False):
         if not delta:
             for idx,seq in enumerate(schedulerOutput.schedule_lists):
+                seq.token_ids.append(next_tokens[idx])
+                if not seq.computed_prompt:
+                    seq.computed_prompt = True
                 if seq.is_finish():
                     self.finish_lists.append(seq)
                 else:
                     self.decode_lists.append(seq)
         else:
-            
             if isinstance(schedulerOutput, SchedulerOutput):  # prefill
                 for idx in schedulerOutput.free_indices:
                     self.finish_lists.append(schedulerOutput.schedule_lists[idx])
