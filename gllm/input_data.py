@@ -78,6 +78,7 @@ class InputData():
     def build_decode(temperature, top_p, top_k,slot_mapping_tensor, 
                      memory_manager, positions, cache_seqs_len, block_table):
         input_data = InputData([],None)
+        input_data.prefix_prefill = False
         input_data.segment_id = 0
         input_data.computed_prompt = True
         input_data.temperature = temperature

@@ -91,7 +91,7 @@ class Scheduler:
             return SchedulerOutput(schedule_lists)
         else:
             if not self.schedule_decode:
-                return None
+                return DeltaSchedulerOutput([],[])
             assert self.num_free_pages*self.page_size > len(self.decode_batch.schedule_lists)
 
             delta_batch_size = min(self.num_free_pages*self.page_size, self.max_decode_seqs -

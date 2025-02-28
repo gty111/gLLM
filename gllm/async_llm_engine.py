@@ -180,9 +180,6 @@ class PipeAsyncLLM(LLM):
         
         schedulerOutput = self.scheduler.schedule(
             self.num_free_pages.value, log=True, delta=True)
-        
-        if schedulerOutput is None:
-            return False
 
         # check abort requests
         await self.check_abort_request(schedulerOutput)
@@ -191,11 +188,9 @@ class PipeAsyncLLM(LLM):
             await asyncio.sleep(0)
             return False
         
-        # if isinstance(schedulerOutput, DeltaSchedulerOutput) and len(schedulerOutput.delta_schedule_list) == 0:
-        #     await asyncio.sleep(0)
-        #     return False
-        
-        print(schedulerOutput)
+        if isinstance(schedulerOutput, DeltaSchedulerOutput) and len(schedulerOutput.delta_schedule_list) == 0:
+            await asyncio.sleep(0)
+            return False
         
         schedule_bytes = pickle.dumps(schedulerOutput)
         schedule_socket.send(schedule_bytes, copy=False)
@@ -245,43 +240,47 @@ class PipeAsyncLLM(LLM):
         zmq_ctx = zmq.Context()
         
         schedule_socket = None
-        decode_batch = None
         output_socket = None
         token_socket = None
-        schedule_queue:deque = None
+        already_schedule_queue:deque = None
+        to_schedule_list: List[Sequence] = None
         if pp_rank == 0:
             schedule_socket = make_socket(zmq_ctx, schedule_ipc_path, zmq.PULL)
-            decode_batch = SchedulerOutput([])
             output_socket = make_socket(zmq_ctx, output_ipc_path, zmq.PUSH)
+            to_schedule_list = []
             if not pp_size == 1:
                 token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PULL)
-                schedule_queue = deque()
+                already_schedule_queue = deque()
         if pp_rank == pp_size - 1 and not pp_size == 1:
             token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PUSH)
+            
         while True:
             output = None
             if pp_rank == 0:
                 num_free_pages.value = model_runner.memory_manager.get_num_free_pages()
 
+                act_schedule_list: List[Sequence] = None
+                
                 if schedule_socket.poll(timeout=0) != 0:
                     recv_bytes = schedule_socket.recv(copy=False)
                     schedulerOutput = pickle.loads(recv_bytes)
                     
-                    act_schedule_list: List[Sequence] = None
-                    
                     if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                        decode_batch.schedule_lists.extend(
+                        to_schedule_list.extend(
                             schedulerOutput.delta_schedule_list)
-                        act_schedule_list = decode_batch.schedule_lists
+                        act_schedule_list = to_schedule_list
+                        to_schedule_list = []
                     elif isinstance(schedulerOutput, SchedulerOutput):
                         act_schedule_list = schedulerOutput.schedule_lists
                     else:
                         assert 0
-                    
-                    print(act_schedule_list[0].token_ids)
-
+                elif not len(to_schedule_list) == 0:
+                    act_schedule_list = to_schedule_list
+                    to_schedule_list = []
+                
+                if act_schedule_list is not None:
                     input_data = InputData(act_schedule_list, model_runner.memory_manager)
-                    schedule_queue.append((schedulerOutput, act_schedule_list))
+                    already_schedule_queue.append((schedulerOutput, act_schedule_list))
                     output = model_runner.step_once(input_data)
                     
                     if isinstance(output,tuple):
@@ -291,7 +290,7 @@ class PipeAsyncLLM(LLM):
                     recv_bytes = token_socket.recv(copy=False)
                     next_tokens = pickle.loads(recv_bytes)
                     
-                    schedulerOutput, act_schedule_list = schedule_queue.popleft()
+                    schedulerOutput, act_schedule_list = already_schedule_queue.popleft()
 
                     keep_indices = []
                     free_indices = []
@@ -304,8 +303,7 @@ class PipeAsyncLLM(LLM):
                             keep_indices.append(idx)
                     schedulerOutput.free_indices = free_indices
                     if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                        decode_batch.schedule_lists = [
-                            decode_batch.schedule_lists[i] for i in keep_indices]
+                        to_schedule_list.extend([act_schedule_list[i] for i in keep_indices])
                     output_bytes = pickle.dumps((schedulerOutput, next_tokens))
                     output_socket.send(output_bytes, copy=False)
                     
@@ -315,13 +313,10 @@ class PipeAsyncLLM(LLM):
                 output = model_runner.step_once(input_data,hidden_states, residual)
                 if pp_rank == pp_size - 1:
                     assert type(output) == list
-                    print(output)
                     token_bytes = pickle.dumps(output)
                     token_socket.send(token_bytes, copy=False)
                 else:
                     send_pp_data(input_data, output, pp_rank+1)
-                
-
             
 
 
