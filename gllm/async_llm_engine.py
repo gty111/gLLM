@@ -233,10 +233,9 @@ class PipeAsyncLLM(LLM):
                 return
             await asyncio.sleep(0)
 
-    def run_gpu_engine(model_runner: ModelRunner, num_free_pages, schedule_ipc_path, output_ipc_path, token_ipc_path, pp_rank, pp_size):
-        init_dist(pp_size,pp_rank,'127.0.0.1','49083')
-        if not pp_size == 1:
-            model_runner.init()
+    def run_gpu_engine(model_runner: ModelRunner, num_free_pages, schedule_ipc_path, output_ipc_path, token_ipc_path, pp_rank, pp_size, master_addr, master_port):
+        init_dist(pp_size,pp_rank, master_addr, master_port)
+        model_runner.init()
         zmq_ctx = zmq.Context()
         
         schedule_socket = None
@@ -248,10 +247,10 @@ class PipeAsyncLLM(LLM):
             schedule_socket = make_socket(zmq_ctx, schedule_ipc_path, zmq.PULL)
             output_socket = make_socket(zmq_ctx, output_ipc_path, zmq.PUSH)
             to_schedule_list = []
-            if not pp_size == 1:
+            already_schedule_queue = deque()
+            if pp_size != 1:
                 token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PULL)
-                already_schedule_queue = deque()
-        if pp_rank == pp_size - 1 and not pp_size == 1:
+        if pp_rank == pp_size - 1 and pp_size != 1:
             token_socket = make_socket(zmq_ctx, token_ipc_path, zmq.PUSH)
             
         while True:
@@ -274,7 +273,7 @@ class PipeAsyncLLM(LLM):
                         act_schedule_list = schedulerOutput.schedule_lists
                     else:
                         assert 0
-                elif not len(to_schedule_list) == 0:
+                elif len(to_schedule_list) != 0:
                     act_schedule_list = to_schedule_list
                     to_schedule_list = []
                 
@@ -285,11 +284,15 @@ class PipeAsyncLLM(LLM):
                     
                     if isinstance(output,tuple):
                         send_pp_data(input_data, output, pp_rank+1)
-                    
-                if token_socket.poll(timeout=0) != 0:
+                
+                next_tokens = None
+                if isinstance(output,list) :
+                    next_tokens = output
+                elif pp_size != 1 and token_socket.poll(timeout=0) != 0:
                     recv_bytes = token_socket.recv(copy=False)
                     next_tokens = pickle.loads(recv_bytes)
-                    
+                
+                if next_tokens is not None:
                     schedulerOutput, act_schedule_list = already_schedule_queue.popleft()
 
                     keep_indices = []
@@ -329,7 +332,9 @@ class PipeAsyncLLM(LLM):
                   self.output_ipc_path,
                   self.token_ipc_path,
                   pp_rank,
-                  pp_size)).start()
+                  pp_size,
+                  self.master_addr,
+                  self.master_port)).start()
 
     def start_schedule_engine(self):
         # launch schedule engine

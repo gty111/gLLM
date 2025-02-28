@@ -16,9 +16,8 @@ class LLM():
         self.model_runner = ModelRunner(
             model_path, gpu_memory_util, page_size, enable_prefix_caching)
         self.pp_size = pp_size
-        if pp_size == 1:
-            init_dist(1, 0, '127.0.0.1', '45678')
-            self.model_runner.init()
+        self.master_addr = '127.0.0.1'
+        self.master_port = '49082'
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
             max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size)

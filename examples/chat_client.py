@@ -37,7 +37,7 @@ chat_completion = client.chat.completions.create(
     }],
     model=model,
     stream=args.stream,
-    max_tokens = 128
+    max_tokens = 1024
 )
 
 if args.stream:
