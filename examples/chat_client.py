@@ -2,9 +2,8 @@ import argparse
 from openai import OpenAI
 
 parser = argparse.ArgumentParser(description='Chat client')
-parser.add_argument("--no-stream", action="store_true")
 parser.add_argument("--num-tokens", type=int, default=512)
-parser.add_argument("--port",type=int)
+parser.add_argument("--port", type=int)
 args = parser.parse_args()
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
@@ -20,31 +19,30 @@ client = OpenAI(
 models = client.models.list()
 model = models.data[0].id
 
-chat_completion = client.chat.completions.create(
-    messages=[{
-        "role": "system",
-        "content": "You are a helpful assistant."
-    }, {
-        "role": "user",
-        "content": "Who won the world series in 2020?"
-    }, {
-        "role":
-        "assistant",
-        "content":
-        "The Los Angeles Dodgers won the World Series in 2020."
-    }, {
-        "role": "user",
-        "content": "Can you tell a fairy tale?"
-    }],
-    model=model,
-    stream=not args.no_stream,
-    max_tokens = args.num_tokens
-)
+messages = []
 
-if not args.no_stream:
-    print("Chat completion results:")
-    for i in chat_completion:
-        print(i.choices[0].delta.content,end='',flush=True)
+print("\nWelcome to the chatbot!\n"
+      "Type '\exit' to exit the chatbot.\n"
+      "Type '\clear' to clear the chatbot's history.\n")
+
+while True:
+    prompt = input('>>> ')
+    if prompt == '\exit':
+        break
+    elif prompt == '\clear':
+        messages = []
+    messages.append({'role': 'user', 'content': prompt})
+    chat_completion = client.chat.completions.create(
+        messages=messages,
+        model=model,
+        stream=True,
+        max_tokens=args.num_tokens,
+    )
+    reply = ''
     print()
-else:
-    print(chat_completion)
+    for i in chat_completion:
+        reply += i.choices[0].delta.content
+        print(i.choices[0].delta.content, end='', flush=True)
+    print()
+    print()
+    messages.append({'role': 'assistant', 'content': reply})

@@ -117,31 +117,31 @@ class Worker:
         
 
     def process_output(self, output):
-            next_tokens = None
-            if isinstance(output,list) :
-                next_tokens = output
-            elif self.world_size != 1 and self.token_socket.poll(timeout=0) != 0:
-                recv_bytes = self.token_socket.recv(copy=False)
-                next_tokens = pickle.loads(recv_bytes)
-            
-            if next_tokens is not None:
-                schedulerOutput, act_schedule_list = self.already_schedule_queue.popleft()
+        next_tokens = None
+        if isinstance(output,list) :
+            next_tokens = output
+        elif self.world_size != 1 and self.token_socket.poll(timeout=0) != 0:
+            recv_bytes = self.token_socket.recv(copy=False)
+            next_tokens = pickle.loads(recv_bytes)
+        
+        if next_tokens is not None:
+            schedulerOutput, act_schedule_list = self.already_schedule_queue.popleft()
 
-                keep_indices = []
-                free_indices = []
-                for idx, seq in enumerate(act_schedule_list):
-                    seq.computed_prompt = True
-                    seq.token_ids.append(next_tokens[idx])
-                    if seq.is_finish():
-                        free_indices.append(idx)
-                        self.model_runner.memory_manager.free(seq)
-                    else:
-                        keep_indices.append(idx)
-                schedulerOutput.free_indices = free_indices
-                if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                    self.to_schedule_list.extend([act_schedule_list[i] for i in keep_indices])
-                output_bytes = pickle.dumps((schedulerOutput, next_tokens))
-                self.output_socket.send(output_bytes, copy=False)
+            keep_indices = []
+            free_indices = []
+            for idx, seq in enumerate(act_schedule_list):
+                seq.computed_prompt = True
+                seq.token_ids.append(next_tokens[idx])
+                if seq.is_finish():
+                    free_indices.append(idx)
+                    self.model_runner.memory_manager.free(seq)
+                else:
+                    keep_indices.append(idx)
+            schedulerOutput.free_indices = free_indices
+            if isinstance(schedulerOutput, DeltaSchedulerOutput):
+                self.to_schedule_list.extend([act_schedule_list[i] for i in keep_indices])
+            output_bytes = pickle.dumps((schedulerOutput, next_tokens))
+            self.output_socket.send(output_bytes, copy=False)
  
 def run_worker(worker: Worker):
     worker.init()
