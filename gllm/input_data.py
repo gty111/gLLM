@@ -10,17 +10,22 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 class InputData():
     def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
+        if len(seqs) == 0:
+            return
+        self.temperature = async_tensor_h2d([seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], memory_manager.dtype, 'cuda', True)
+        self.top_p = async_tensor_h2d([seq.top_p for seq in seqs], memory_manager.dtype, 'cuda', True)
+        self.top_k = async_tensor_h2d([seq.top_k if seq.top_k != -1 else memory_manager.vocab_size for seq in seqs], memory_manager.dtype, 'cuda', True)
         memory_manager.pre_allocate_page(seqs)
         self.seqs = seqs
         self.memory_manager = memory_manager
         self.page_size = memory_manager.page_size
         # we assume all seqs have the same computed_prompt and segment_id
         self.computed_prompt = seqs[0].computed_prompt
+        self.prefix_prefill = False
         self.segment_id = seqs[0].segment_id
         self.slot_mapping_tensor = self.get_slot_mapping()
         if not self.computed_prompt:
             tokens_list = []
-            self.prefix_prefill = False
             for seq in seqs:
                 tokens_list.extend(
                     seq.token_ids[seq.computed_page_num*self.memory_manager.page_size:])
@@ -47,6 +52,44 @@ class InputData():
             self.block_table = self.get_block_table()
 
         assert self.tokens.shape == self.positions.shape
+        
+    def build_prefill(temperature, top_p, top_k, prefix_prefill, 
+                memory_manager, slot_mapping_tensor, positions, 
+                max_seq_len, seq_start_loc, block_table=None, 
+                max_query_len=None, query_start_loc=None):
+        input_data = InputData([],None)
+        input_data.segment_id = 0
+        input_data.computed_prompt = False
+        input_data.temperature = temperature
+        input_data.top_p = top_p
+        input_data.top_k = top_k
+        input_data.prefix_prefill = prefix_prefill
+        input_data.memory_manager = memory_manager
+        input_data.slot_mapping_tensor = slot_mapping_tensor
+        input_data.positions = positions
+        input_data.max_seq_len = max_seq_len
+        input_data.seq_start_loc = seq_start_loc
+        if prefix_prefill:
+            input_data.block_table = block_table
+            input_data.max_query_len = max_query_len
+            input_data.query_start_loc = query_start_loc
+        return input_data
+    
+    def build_decode(temperature, top_p, top_k,slot_mapping_tensor, 
+                     memory_manager, positions, cache_seqs_len, block_table):
+        input_data = InputData([],None)
+        input_data.prefix_prefill = False
+        input_data.segment_id = 0
+        input_data.computed_prompt = True
+        input_data.temperature = temperature
+        input_data.top_p = top_p
+        input_data.top_k = top_k
+        input_data.slot_mapping_tensor = slot_mapping_tensor
+        input_data.memory_manager = memory_manager
+        input_data.positions = positions
+        input_data.cache_seqs_len = cache_seqs_len
+        input_data.block_table = block_table
+        return input_data
 
     def get_seq_len_loc(self):
         max_seqlen = 0

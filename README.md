@@ -13,16 +13,9 @@ Lightweight, easy, fast and cheap LLM serving
 
 Integreted with features like **continuous batching**, **paged attention**, **prefix caching** and **pipeline schedule**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. Adopting part of codebase from vLLM, gLLM provides **faster** offline/online inference speed than vLLM with **lightweight** overhead and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
-### Offline performance (Test on llama3-8b)
-
-<img src=doc/pic/offline_throughput.svg width=500> 
-
-<img src=doc/pic/latency_breakdown.svg width=500> 
-
-
-### Online performance (Test on llama3.1-8b)
-
-<img src=doc/pic/online_avg_latency.svg height=240>
+*Latest News* :fire:
+- [2025/03/01]: Pipeline parallelism has been integrated. You can run any size of model you want :laughing: .
+- [2025/02/27]: We apply numerous optimizations which lowers CPU overhead a lot :clap: ! 
 
 
 ### Install gLLM
@@ -55,6 +48,7 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
 ```
 # To enable pipeline schedule, add "--pipe-schedule"
 # To enable prefix caching, add "--enable-prefix-caching"
+# To enable pipeline parallelism, add "--pp $PP_DEGREE"
 python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH
 ```
 
@@ -98,11 +92,11 @@ python benchmarks/benchmark_prefix_serving.py \
 ## Supported Models
 > Note that gLLM only support loading model of .safetensor or .bin format from local disk
 
-- Llama: llama2-7b, llama3-8b, llama3.1-8b and deepseek-coder
-- ChatGLM: chatglm3-6b and glm4-9b
-- Qwen2: qwen2-7b
+- Llama: Llama2, Llama3, Llama3.1 and deepseek-coder
+- ChatGLM: Chatglm3 and glm4
+- Qwen2: Qwen2, Qwen2.5
 
 ## Limited functionality
 
-- Do NOT support TP or PP
+- Do NOT support TP
 - Limited number of supported models

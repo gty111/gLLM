@@ -5,26 +5,30 @@ from typing import List
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 from gllm.allocatorID import AllocatorID
-from gllm.scheduler import Scheduler, SchedulerOutput, DeltaSchedulerOutput
+from gllm.scheduler import Scheduler
+from gllm.dist_utils import init_dist
+from gllm.input_data import InputData
 
 
 class LLM():
-    def __init__(self, model_path, gpu_memory_utilization=0.9, page_size=16, max_decode_seqs=256,
-                 max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True):
+    def __init__(self, model_path, gpu_memory_util=0.9, page_size=16, max_decode_seqs=256,
+                 max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True, pp_size=1):
         self.model_path = model_path
         self.model_runner = ModelRunner(
-            model_path, gpu_memory_utilization, page_size, enable_prefix_caching)
+            model_path, gpu_memory_util, page_size, enable_prefix_caching)
+        self.pp_size = pp_size
+        self.master_addr = '127.0.0.1'
+        self.master_port = '49082'
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
-            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages,
-            self.model_runner.memory_manager.get_num_free_pages(),
-            self.model_runner.model.finish_tokens, page_size)
-        self.decode_batch = SchedulerOutput([])
+            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size)
+        self.finish_tokens = self.model_runner.model_loader.get_finish_tokens()
+        self.model_max_length = self.model_runner.tokenizer.model_max_length
 
     def check_seq_length(self, token_ids: List[int], output_len: int):
         max_seq_length = len(
             token_ids) + output_len if output_len is not None else len(token_ids)
-        if max_seq_length > self.model_runner.model.max_model_len:
+        if max_seq_length > self.model_max_length:
             logger.warning(
                 f'Ignore seq due to the length({max_seq_length}) exceeds max model len({self.model_runner.model.max_model_len})')
             return False
@@ -34,7 +38,7 @@ class LLM():
     def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False,
                      temperature=0.6, top_p=0.9, top_k=10):
         return Sequence(self.allocatorID.allocate(), token_ids,
-                        self.model_runner.model.finish_tokens, output_len, ignore_eos,
+                        self.finish_tokens, output_len, ignore_eos,
                         temperature, top_p, top_k)
 
     def add_requests(self, requests: List[Sequence]):
@@ -45,10 +49,18 @@ class LLM():
             self.allocatorID.free(seq.seq_id)
         self.scheduler.finish_lists = []
 
+    def init(self):
+        init_dist(1, 0, self.master_addr, self.master_port)
+        self.model_runner.init()
+        self.scheduler.set_total_num_free_pages(self.model_runner.memory_manager.get_num_free_pages())
+
     def step(self):
-        scheduleOutput = self.scheduler.schedule(self.model_runner.memory_manager.get_num_free_pages())
-        self.model_runner.step_once(scheduleOutput)
-        self.scheduler.update_seqs(scheduleOutput)
+        if self.model_runner.model is None:
+            self.init()
+        scheduleOutput = self.scheduler.schedule(
+            self.model_runner.memory_manager.get_num_free_pages())
+        next_tokens = self.model_runner.step_once(InputData(scheduleOutput.schedule_lists, self.model_runner.memory_manager))
+        self.scheduler.update_seqs(scheduleOutput, next_tokens)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None,
                  temperature=0.6, top_p=0.9, top_k=10):
@@ -81,7 +93,9 @@ class LLM():
         return requests
 
     def chat(self):
-        architecture = self.model_runner.model.model_config['architectures'][0]
+        init_dist(1, 0, self.master_addr, self.master_port)
+        self.model_runner.init()
+        architecture = self.model_runner.model_loader.architecture
         print("\nWelcome to the chatbot!\n"
               "Type '\exit' to exit the chatbot.\n"
               "Type '\clear' to clear the chatbot's history.\n")

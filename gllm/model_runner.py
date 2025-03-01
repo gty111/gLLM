@@ -1,5 +1,7 @@
 import torch
 import time
+import torch.distributed as dist
+
 from transformers import AutoTokenizer
 from typing import List
 
@@ -11,19 +13,28 @@ from gllm.scheduler import SchedulerOutput
 
 
 class ModelRunner():
-    def __init__(self, model_path: str, gpu_memory_utilization:float, page_size:int, 
+    def __init__(self, model_path: str, gpu_memory_util:float, page_size:int, 
                  enable_prefix_caching:bool):
-        model_loader = ModelLoader(model_path)
-
-        self.model = model_loader.load_model()
+        self.model_path = model_path
+        self.model_loader = ModelLoader(model_path)
+        self.enable_prefix_caching = enable_prefix_caching
+        self.gpu_memory_util = gpu_memory_util
+        self.page_size = page_size
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True)
+            self.model_path, trust_remote_code=True)
         
-        memory_manager_cls = PrefixMemoryManager if enable_prefix_caching else MemoryManager
+        # lazy init
+        self.model = None
+        self.memory_manager = None
+    
+    def init(self):
+        self.model = self.model_loader.load_model()
+        
+        memory_manager_cls = PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         self.memory_manager = memory_manager_cls(
-            gpu_memory_utilization=gpu_memory_utilization, num_layers=self.model.num_layers, 
-            dtype=self.model.dtype, page_size=page_size, kv_head_num=self.model.num_kv_heads, 
-            kv_head_dim=self.model.head_dim)
+            gpu_memory_util=self.gpu_memory_util, num_layers=self.model.num_layers, 
+            dtype=self.model.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads, 
+            kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size)
 
     def tokenize(self, content, chat:bool=False):
         if chat:
@@ -32,18 +43,20 @@ class ModelRunner():
             return self.tokenizer.encode(content)
 
     @torch.inference_mode()
-    def step_once(self, schedulerOutput: SchedulerOutput):
-        input_data = InputData(schedulerOutput.schedule_lists, self.memory_manager)
-        hidden_states = self.model(input_data)
-        logits = self.model.compute_logits(input_data, hidden_states)
-        next_tokens = self.model.sample(input_data, logits)
-        assert len(next_tokens) == len(schedulerOutput.schedule_lists)
-        for idx,seq in enumerate(schedulerOutput.schedule_lists):
-            seq.token_ids.append(next_tokens[idx])
-            seq.computed_prompt = True
-            if seq.is_finish():
-                self.memory_manager.free(seq)
-        return next_tokens
+    def step_once(self, input_data:InputData=None, hidden_states=None, residual=None):
+        output = self.model(input_data, hidden_states, residual)
+        if dist.get_rank() == dist.get_world_size() - 1:
+            logits = self.model.compute_logits(input_data, output)
+            next_tokens = self.model.sample(input_data, logits)
+            # assert len(next_tokens) == len(schedulerOutput.schedule_lists)
+            # for idx,seq in enumerate(schedulerOutput.schedule_lists):
+            #     seq.token_ids.append(next_tokens[idx])
+            #     seq.computed_prompt = True
+            #     if seq.is_finish():
+            #         self.memory_manager.free(seq)
+            return next_tokens
+        else:
+            return output
 
     def free_kv_cache(self, seq: Sequence):
         self.memory_manager.free(seq)
@@ -51,7 +64,9 @@ class ModelRunner():
     def stream_inference(self, seq: Sequence):
         # -------prefill------
         prefill_start = time.time()
-        self.step_once(SchedulerOutput([seq]))
+        next_token = self.step_once(InputData([seq],self.memory_manager))[0]
+        seq.token_ids.append(next_token)
+        seq.computed_prompt = True
         prefill_end = time.time()
         # ----prefill end-----
 
@@ -61,7 +76,8 @@ class ModelRunner():
             print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
             if seq.is_finish():
                 break
-            self.step_once(SchedulerOutput([seq]))
+            next_token = self.step_once(InputData([seq], self.memory_manager))[0]
+            seq.token_ids.append(next_token)
         print("\n")
         decode_end = time.time()
         # ------decode end-------

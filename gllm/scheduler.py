@@ -22,7 +22,7 @@ class DeltaSchedulerOutput:
 
 class Scheduler:
     def __init__(self, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float,
-                 total_num_free_pages: int, finish_tokens: List[int], page_size: int) -> None:
+                 page_size: int) -> None:
         self.prompt_lists: List[Sequence] = []  # seqs to prefill
         self.decode_lists: List[Sequence] = []  # seqs to decode
         self.finish_lists: List[Sequence] = []  # seqs finished
@@ -32,20 +32,23 @@ class Scheduler:
 
         self.max_decode_seqs = max_decode_seqs
         self.max_batch_tokens = max_batch_tokens
-        self.num_threshold_free_pages = int(
-            total_num_free_pages * ratio_threshold_free_pages)
+        self.ratio_threshold_free_pages = ratio_threshold_free_pages
+        self.num_threshold_free_pages = None
 
         # only used for delta
         self.num_schedule_prefill = 0
         self.schedule_decode = True
         
-        self.total_num_free_pages = total_num_free_pages
-        self.num_free_pages = total_num_free_pages
+        self.total_num_free_pages = None
+        self.num_free_pages = None
         self.page_size = page_size
 
-        self.finish_tokens = finish_tokens
-
         self.log_time = time.time()
+        
+    def set_total_num_free_pages(self, total_num_free_pages):
+        self.num_free_pages = total_num_free_pages
+        self.total_num_free_pages = total_num_free_pages
+        self.num_threshold_free_pages = int(total_num_free_pages * self.ratio_threshold_free_pages)
 
     def add_requests(self, requests: List[Sequence]):
         self.prompt_lists.extend(requests)
@@ -55,8 +58,8 @@ class Scheduler:
         cur_time = time.time()
         if log and cur_time - self.log_time > 1:
             self.log_time = cur_time
-            print(
-                '#prompt: %4d #decode: %4d memory_util: %2.2f %%'
+            logger.info(
+                '#wait: %4d #decode: %4d memory_util: %2.2f %%'
                 % (len(self.prompt_lists),
                    len(self.decode_lists) + len(self.decode_batch.schedule_lists),
                    self.get_memory_util()))
@@ -109,12 +112,14 @@ class Scheduler:
     def update_seqs(self, schedulerOutput:SchedulerOutput, next_tokens: List[int]=None, delta=False):
         if not delta:
             for idx,seq in enumerate(schedulerOutput.schedule_lists):
+                seq.token_ids.append(next_tokens[idx])
+                if not seq.computed_prompt:
+                    seq.computed_prompt = True
                 if seq.is_finish():
                     self.finish_lists.append(seq)
                 else:
                     self.decode_lists.append(seq)
         else:
-            
             if isinstance(schedulerOutput, SchedulerOutput):  # prefill
                 for idx in schedulerOutput.free_indices:
                     self.finish_lists.append(schedulerOutput.schedule_lists[idx])

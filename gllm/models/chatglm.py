@@ -1,5 +1,6 @@
 import torch
-import tqdm
+import torch.distributed as dist
+
 from torch import nn
 from copy import deepcopy
 
@@ -9,6 +10,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
+from gllm.dist_utils import get_pp_layers
 
 
 class GLMAttention(nn.Module):
@@ -117,24 +119,26 @@ class GLMTransformer(nn.Module):
         # assume post_layer_norm is true
         self.post_layer_norm = True
 
-        self.num_layers = model_config['num_layers']
-
+        self.num_layers = model_config['num_layers'] // dist.get_world_size()
+        self.start_layer, self.end_layer = get_pp_layers(model_config['num_layers'])
         self.layers = nn.ModuleList(
-            [GLMBlock(i, model_config) for i in range(self.num_layers)])
+            [GLMBlock(i-self.start_layer, model_config) for i in range(self.start_layer, self.end_layer)])
 
-        if self.post_layer_norm:
-            assert model_config['rmsnorm']
-            layer_norm_func = RMSNorm
-            self.final_layernorm = layer_norm_func(
-                model_config['hidden_size'], model_config['layernorm_epsilon'], model_config['torch_dtype'])
+        if dist.get_rank() == dist.get_world_size() - 1:
+            if self.post_layer_norm:
+                assert model_config['rmsnorm']
+                layer_norm_func = RMSNorm
+                self.final_layernorm = layer_norm_func(
+                    model_config['hidden_size'], model_config['layernorm_epsilon'], model_config['torch_dtype'])
 
-    def forward(self, hidden_states: torch.Tensor, input_data: InputData):
+    def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         for i in range(self.num_layers):
             layer = self.layers[i]
             hidden_states = layer(hidden_states, input_data)
         # Final layer norm.
-        if self.post_layer_norm:
-            hidden_states = self.final_layernorm(hidden_states)
+        if dist.get_rank() == dist.get_world_size() - 1:
+            if self.post_layer_norm:
+                hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states
 
@@ -146,7 +150,7 @@ class ChatGLMModel(nn.Module):
         self.embedding = nn.Embedding(
             model_config['padded_vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
 
-        self.num_layers = model_config['num_layers']
+        self.num_layers = model_config['num_layers'] // dist.get_world_size()
         self.multi_query_group_num = model_config['multi_query_group_num']
         self.kv_channels = model_config['kv_channels']
 
@@ -154,11 +158,12 @@ class ChatGLMModel(nn.Module):
         self.output_layer = nn.Linear(
             model_config['hidden_size'], model_config['padded_vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
 
-    def forward(self, input_data: InputData):
-        inputs_embeds = self.embedding(input_data.tokens)
+    def forward(self, input_data: InputData, hidden_states=None):
+        if dist.get_rank() == 0:
+            hidden_states = self.embedding(input_data.tokens)
 
         # Run encoder.
-        hidden_states = self.encoder(inputs_embeds, input_data)
+        hidden_states = self.encoder(input_data, hidden_states)
         return hidden_states
 
 
@@ -168,22 +173,25 @@ class ChatGLMForCausalLM(nn.Module):
 
         self.model_config = model_config
         self.max_model_len = model_config['seq_length']
-        self.num_layers = model_config['num_layers']
+        self.num_layers = model_config['num_layers'] // dist.get_world_size()
         self.dtype = model_config['torch_dtype']
         self.num_kv_heads = model_config['multi_query_group_num']
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
+        self.finish_tokens = ChatGLMForCausalLM.get_finish_tokens(model_config)
+        self.transformer = ChatGLMModel(model_config)
+        if dist.get_rank() == dist.get_world_size() - 1:
+            self.lm_head = self.transformer.output_layer
+        self.sampler = Sampler()
+        
+    def get_finish_tokens(model_config):
         if type(model_config['eos_token_id']) == list:
             # glm4-9b-chat
-            self.finish_tokens = model_config['eos_token_id']
+            return model_config['eos_token_id']
         else:
-            self.finish_tokens = [model_config['eos_token_id']]
+            return [model_config['eos_token_id']]
 
-        self.transformer = ChatGLMModel(model_config)
-        self.lm_head = self.transformer.output_layer
-        self.sampler = Sampler()
-
-    def forward(self, input_data: InputData):
-        return self.transformer(input_data)
+    def forward(self, input_data: InputData, hidden_states=None, residual=None):
+        return self.transformer(input_data, hidden_states)
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
         if input_data.computed_prompt:
@@ -202,7 +210,12 @@ class ChatGLMForCausalLM(nn.Module):
     def load_weights(self, weights):
         parameters = dict(self.named_parameters())
 
-        for k, v in tqdm.tqdm(parameters.items()):
+        for k, v in parameters.items():
+            # resolve PP layer
+            if 'layers' in k:
+                k_list = k.split('.')
+                k_list[3] = str(int(k_list[3])+dist.get_rank()*self.num_layers)
+                k = '.'.join(k_list)
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')
             v.data.copy_(weights[k])

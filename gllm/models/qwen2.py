@@ -1,5 +1,6 @@
 import torch
-import tqdm
+import torch.distributed as dist
+
 from typing import Optional
 from torch import nn
 
@@ -9,6 +10,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
 from gllm.input_data import InputData
+from gllm.dist_utils import get_pp_layers
 
 
 class Qwen2MLP(nn.Module):
@@ -84,24 +86,31 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     def __init__(self, model_config: dict):
         super().__init__()
-        self.embed_tokens = nn.Embedding(
-            model_config['vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
+        if dist.get_rank() == 0:
+            self.embed_tokens = nn.Embedding(
+                model_config['vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
+        self.start_layer, self.end_layer = get_pp_layers(
+            model_config['num_hidden_layers'])
         self.layers = nn.ModuleList([
-            Qwen2DecoderLayer(i, model_config)
-            for i in range(model_config['num_hidden_layers'])
+            Qwen2DecoderLayer(i-self.start_layer, model_config)
+            for i in range(self.start_layer, self.end_layer)
         ])
-        self.norm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
+        if dist.get_rank() == dist.get_world_size() - 1:
+            self.norm = RMSNorm(
+                model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
 
-    def forward(self, input_data: InputData):
-        hidden_states = self.embed_tokens(input_data.tokens)
-        residual = None
+    def forward(self, input_data: InputData, hidden_states=None, residual=None):
+        if dist.get_rank() == 0:
+            hidden_states = self.embed_tokens(input_data.tokens)
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 input_data, hidden_states, residual)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if dist.get_rank() == dist.get_world_size() - 1:
+            hidden_states, _ = self.norm(hidden_states, residual)
+            return hidden_states
+        else:
+            return hidden_states, residual
 
 
 class Qwen2ForCausalLM(nn.Module):
@@ -109,21 +118,26 @@ class Qwen2ForCausalLM(nn.Module):
         super().__init__()
         self.model_config = model_config
         self.max_model_len = model_config['max_position_embeddings']
-        self.num_layers = model_config['num_hidden_layers']
+        self.num_layers = model_config['num_hidden_layers'] // dist.get_world_size()
         self.dtype = model_config['torch_dtype']
         self.num_kv_heads = model_config['num_key_value_heads']
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
-        self.finish_tokens = [model_config['eos_token_id']]
+        self.finish_tokens = Qwen2ForCausalLM.get_finish_tokens(model_config)
         self.model = Qwen2Model(model_config)
-        if model_config['tie_word_embeddings']:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = nn.Linear(
-                model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
+        if dist.get_rank() == dist.get_world_size() - 1:
+            if model_config['tie_word_embeddings']:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = nn.Linear(
+                    model_config['hidden_size'], model_config['vocab_size'], 
+                    bias=False, dtype=model_config['torch_dtype'], device='cuda')
         self.sampler = Sampler()
 
-    def forward(self, input_data: InputData):
-        return self.model(input_data)
+    def get_finish_tokens(model_config):
+        return [model_config['eos_token_id']]
+    
+    def forward(self, input_data: InputData, hidden_states=None, residual=None):
+        return self.model(input_data, hidden_states, residual)
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
         if input_data.computed_prompt:
@@ -147,7 +161,12 @@ class Qwen2ForCausalLM(nn.Module):
         head_dim = self.model_config['hidden_size'] // num_attn_heads
         num_kv_heads = self.model_config['num_key_value_heads']
         intermediate_size = self.model_config['intermediate_size']
-        for k, v in tqdm.tqdm(parameters.items()):
+        for k, v in parameters.items():
+            # resolve PP layer
+            if 'layers' in k:
+                k_list = k.split('.')
+                k_list[2] = str(int(k_list[2])+dist.get_rank()*self.num_layers)
+                k = '.'.join(k_list)
             if k.find('self_attn.qkv_proj.weight') != -1:
                 v.data[:num_attn_heads*head_dim, :] = weights[k.replace(
                     'qkv_proj', 'q_proj')]
