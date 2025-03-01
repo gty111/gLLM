@@ -3,13 +3,11 @@ import time
 import torch.distributed as dist
 
 from transformers import AutoTokenizer
-from typing import List
 
 from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.scheduler import SchedulerOutput
 
 
 class ModelRunner():

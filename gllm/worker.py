@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 import zmq
 import pickle
 
@@ -14,7 +13,7 @@ from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
 from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
 from gllm.utils import make_socket
 
-
+# Used with PipeAsyncLLM
 class Worker:
     
     def __init__(self, model_runner:ModelRunner, num_free_pages, pp_rank, pp_size, 

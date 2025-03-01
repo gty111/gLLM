@@ -3,7 +3,7 @@
 </p>
 
 <h3 align="center">
-Lightweight, easy, fast and cheap LLM serving
+Lightweight, easy, fast and cheap LLM serving playground
 </h3>
 
 
@@ -11,7 +11,7 @@ Lightweight, easy, fast and cheap LLM serving
 
 ## What is gLLM?
 
-Integreted with features like **continuous batching**, **paged attention**, **prefix caching** and **pipeline schedule**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. Adopting part of codebase from vLLM, gLLM provides **faster** offline/online inference speed than vLLM with **lightweight** overhead and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
+Integreted with features like **continuous batching**, **paged attention**, **prefix caching**, **pipeline parallelism** and **pipeline schedule**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
 - [2025/03/01]: Pipeline parallelism has been integrated. You can run any size of model you want :laughing: .
