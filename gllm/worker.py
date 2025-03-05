@@ -33,56 +33,82 @@ class Worker:
         torch.cuda.set_device(f'cuda:{self.rank}')
         zmq_ctx = zmq.Context()
         if self.rank == 0:
-            self.schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PULL)
+            # main process => GPU rank 0
+            self.schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PULL) 
+            # GPU rank 0 => main process
             self.output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PUSH)
-            self.to_schedule_list = []
-            self.already_schedule_queue = deque()
+            # seqs to schedule
+            self.seqs_to_schedule = []
+            # running batch 
+            self.batch_running = deque()
+            # GPU rank 0 => other GPU ranks : batched seqs
+            self.gpu_schedule_socket = []
+            for i in range(1,self.world_size):
+                self.gpu_schedule_socket.append(make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{i}',zmq.PUSH))
             if self.world_size != 1:
+                # GPU last rank => GPU rank 0 : next tokens
                 self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PULL)
+        else:
+            # GPU rank 0 => other GPU ranks : batched seqs
+            self.gpu_schedule_socket = make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{self.rank}', zmq.PULL)
+            # Input data for each GPU rank except rank 0 
+            self.schedule_queue = deque()
         if self.rank == self.world_size - 1 and self.world_size != 1:
+            # GPU last rank => GPU rank 0 : next tokens
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
         self.model_runner.init()
+        self.dtype = self.model_runner.memory_manager.dtype
         
     def set_num_free_pages(self):
         self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
 
+    # GPU process except rank 0 
     def run(self):
-        data = recv_pp_data(
-            self.model_runner.model_loader.dtype, self.model_runner.memory_manager, self.rank-1)
-        if len(data) == 3:
-            input_data, hidden_states, residual = data
-            output = self.model_runner.step_once(input_data,hidden_states, residual)
-        elif len(data) == 2:
-            input_data, hidden_states = data
-            output = self.model_runner.step_once(input_data,hidden_states)
+        if self.gpu_schedule_socket.poll(timeout=0) != 0:
+            recv_bytes = self.gpu_schedule_socket.recv(copy=False)
+            seqs = pickle.loads(recv_bytes)
+            self.schedule_queue.append(InputData(seqs,self.model_runner.memory_manager))
+        if len(self.schedule_queue) == 0:
+            return
+        data = recv_pp_data(self.rank-1, self.dtype, self.model_runner.model.ret_residual)
+        hidden_states = None
+        residual = None
+        if len(data) == 2:
+            hidden_states, residual = data
+        else:
+            hidden_states = data
+            residual = None
+        input_data = self.schedule_queue.popleft()
+        output = self.model_runner.step_once(input_data,hidden_states,residual)
         if self.rank == self.world_size - 1:
             assert type(output) == list
             token_bytes = pickle.dumps(output)
             self.token_socket.send(token_bytes, copy=False)
         else:
-            send_pp_data(input_data, output, self.rank+1)
+            send_pp_data(output, self.rank+1)
     
     # PP schedule
     def schedule(self):
         # to_schedule_list => schedule_list (ref already_schedule_queue)
-        num_total_seqs = len(self.to_schedule_list)
-        for schedulerOutput,schedule_list in self.already_schedule_queue:
+        num_total_seqs = len(self.seqs_to_schedule)
+        for schedulerOutput,schedule_list in self.batch_running:
             num_total_seqs += len(schedule_list)
         
         if num_total_seqs <= self.world_size or self.world_size == 1:
-            cur_schedule_list = self.to_schedule_list
-            self.to_schedule_list = []
+            cur_schedule_list = self.seqs_to_schedule
+            self.seqs_to_schedule = []
             return cur_schedule_list    
         
         num_schedule_seqs = num_total_seqs // self.world_size
-        if len(self.already_schedule_queue) > self.world_size:
+        if len(self.batch_running) > self.world_size:
             return []
-        if num_schedule_seqs > len(self.to_schedule_list):
+        if num_schedule_seqs > len(self.seqs_to_schedule):
             return []
-        cur_schedule_list = self.to_schedule_list[:num_schedule_seqs]
-        self.to_schedule_list = self.to_schedule_list[num_schedule_seqs:]
+        cur_schedule_list = self.seqs_to_schedule[:num_schedule_seqs]
+        self.seqs_to_schedule = self.seqs_to_schedule[num_schedule_seqs:]
         return cur_schedule_list
     
+    # rank 0 process
     def schedule_run(self):
         output = None
         act_schedule_list: List[Sequence] = []
@@ -93,38 +119,41 @@ class Worker:
             schedulerOutput = pickle.loads(recv_bytes)
             
             if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                self.to_schedule_list.extend(
+                self.seqs_to_schedule.extend(
                     schedulerOutput.delta_schedule_list)
                 act_schedule_list = self.schedule()
             elif isinstance(schedulerOutput, SchedulerOutput):
                 act_schedule_list = schedulerOutput.schedule_lists
             else:
                 assert 0
-        elif len(self.to_schedule_list) != 0:
+        elif len(self.seqs_to_schedule) != 0:
             schedulerOutput = DeltaSchedulerOutput([],[])
             act_schedule_list = self.schedule()
         
         if len(act_schedule_list) != 0:
             input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
-            self.already_schedule_queue.append((schedulerOutput, act_schedule_list))
+            seqs_bytes = pickle.dumps(act_schedule_list)
+            for i in range(1,self.world_size):
+                self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
+            self.batch_running.append((schedulerOutput, act_schedule_list))
             output = self.model_runner.step_once(input_data)
             
             if type(output) != list:
-                send_pp_data(input_data, output, self.rank+1)
+                send_pp_data(output, self.rank+1)
         
         return output
         
-
+    # rank 0 process
     def process_output(self, output):
         next_tokens = None
-        if isinstance(output,list) :
+        if isinstance(output,list) : # word_size == 1
             next_tokens = output
-        elif self.world_size != 1 and self.token_socket.poll(timeout=0) != 0:
+        elif self.world_size != 1 and self.token_socket.poll(timeout=0) != 0: # recv tokens from last rank
             recv_bytes = self.token_socket.recv(copy=False)
             next_tokens = pickle.loads(recv_bytes)
         
         if next_tokens is not None:
-            schedulerOutput, act_schedule_list = self.already_schedule_queue.popleft()
+            schedulerOutput, act_schedule_list = self.batch_running.popleft()
 
             keep_indices = []
             free_indices = []
@@ -138,7 +167,7 @@ class Worker:
                     keep_indices.append(idx)
             schedulerOutput.free_indices = free_indices
             if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                self.to_schedule_list.extend([act_schedule_list[i] for i in keep_indices])
+                self.seqs_to_schedule.extend([act_schedule_list[i] for i in keep_indices])
             output_bytes = pickle.dumps((schedulerOutput, next_tokens))
             self.output_socket.send(output_bytes, copy=False)
  

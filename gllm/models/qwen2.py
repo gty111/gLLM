@@ -124,6 +124,7 @@ class Qwen2ForCausalLM(nn.Module):
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
         self.finish_tokens = Qwen2ForCausalLM.get_finish_tokens(model_config)
         self.model = Qwen2Model(model_config)
+        self.ret_residual = True
         if dist.get_rank() == dist.get_world_size() - 1:
             if model_config['tie_word_embeddings']:
                 self.lm_head = self.model.embed_tokens

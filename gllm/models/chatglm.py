@@ -179,6 +179,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
         self.finish_tokens = ChatGLMForCausalLM.get_finish_tokens(model_config)
         self.transformer = ChatGLMModel(model_config)
+        self.ret_residual = False
         if dist.get_rank() == dist.get_world_size() - 1:
             self.lm_head = self.transformer.output_layer
         self.sampler = Sampler()
