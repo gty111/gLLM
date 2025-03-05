@@ -37,8 +37,14 @@ class Worker:
             self.output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PUSH)
             self.to_schedule_list = []
             self.already_schedule_queue = deque()
+            self.schedule_process_socket = []
+            for i in range(1,self.world_size):
+                self.schedule_process_socket.append(make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{i}',zmq.PUSH))
             if self.world_size != 1:
                 self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PULL)
+        else:
+            self.schedule_process_socket = make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{self.rank}', zmq.PULL)
+            self.schedule_queue = deque()
         if self.rank == self.world_size - 1 and self.world_size != 1:
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
         self.model_runner.init()
@@ -47,13 +53,23 @@ class Worker:
         self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
 
     def run(self):
+        if self.schedule_process_socket.poll(timeout=0) != 0:
+            recv_bytes = self.schedule_process_socket.recv(copy=False)
+            seqs = pickle.loads(recv_bytes)
+            self.schedule_queue.append(seqs)
+        if len(self.schedule_queue) == 0:
+            return
         data = recv_pp_data(
             self.model_runner.model_loader.dtype, self.model_runner.memory_manager, self.rank-1)
-        if len(data) == 3:
-            input_data, hidden_states, residual = data
+        if len(data) == 2:
+            hidden_states, residual = data
+            seqs = self.schedule_queue.popleft()
+            input_data = InputData(seqs,self.model_runner.memory_manager)
             output = self.model_runner.step_once(input_data,hidden_states, residual)
-        elif len(data) == 2:
-            input_data, hidden_states = data
+        elif len(data) == 1:
+            hidden_states = data
+            seqs = self.schedule_queue.popleft()
+            input_data = InputData(seqs,self.model_runner.memory_manager)
             output = self.model_runner.step_once(input_data,hidden_states)
         if self.rank == self.world_size - 1:
             assert type(output) == list
@@ -83,6 +99,7 @@ class Worker:
         self.to_schedule_list = self.to_schedule_list[num_schedule_seqs:]
         return cur_schedule_list
     
+    # rank 0 process
     def schedule_run(self):
         output = None
         act_schedule_list: List[Sequence] = []
@@ -105,6 +122,9 @@ class Worker:
             act_schedule_list = self.schedule()
         
         if len(act_schedule_list) != 0:
+            seqs_bytes = pickle.dumps(act_schedule_list)
+            for i in range(1,self.world_size):
+                self.schedule_process_socket[i-1].send(seqs_bytes,copy=False)
             input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
             self.already_schedule_queue.append((schedulerOutput, act_schedule_list))
             output = self.model_runner.step_once(input_data)
@@ -124,6 +144,7 @@ class Worker:
             next_tokens = pickle.loads(recv_bytes)
         
         if next_tokens is not None:
+            print(next_tokens)
             schedulerOutput, act_schedule_list = self.already_schedule_queue.popleft()
 
             keep_indices = []
