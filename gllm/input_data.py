@@ -1,3 +1,4 @@
+import torch.distributed as dist
 import torch
 import numpy as np
 
@@ -12,10 +13,12 @@ class InputData():
     def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
         if len(seqs) == 0:
             return
-        self.temperature = async_tensor_h2d([seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], memory_manager.dtype, 'cuda', True)
-        self.top_p = async_tensor_h2d([seq.top_p for seq in seqs], memory_manager.dtype, 'cuda', True)
-        self.top_k = async_tensor_h2d([seq.top_k if seq.top_k != -1 else memory_manager.vocab_size for seq in seqs], memory_manager.dtype, 'cuda', True)
-        memory_manager.pre_allocate_page(seqs)
+        if dist.get_rank() == dist.get_world_size() - 1:
+            self.temperature = async_tensor_h2d([seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], memory_manager.dtype, 'cuda', True)
+            self.top_p = async_tensor_h2d([seq.top_p for seq in seqs], memory_manager.dtype, 'cuda', True)
+            self.top_k = async_tensor_h2d([seq.top_k if seq.top_k != -1 else memory_manager.vocab_size for seq in seqs], memory_manager.dtype, 'cuda', True)
+        if dist.get_rank() == 0:
+            memory_manager.pre_allocate_page(seqs)
         self.seqs = seqs
         self.memory_manager = memory_manager
         self.page_size = memory_manager.page_size

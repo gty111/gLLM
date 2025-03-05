@@ -122,10 +122,10 @@ class Worker:
             act_schedule_list = self.schedule()
         
         if len(act_schedule_list) != 0:
+            input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
             seqs_bytes = pickle.dumps(act_schedule_list)
             for i in range(1,self.world_size):
                 self.schedule_process_socket[i-1].send(seqs_bytes,copy=False)
-            input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
             self.already_schedule_queue.append((schedulerOutput, act_schedule_list))
             output = self.model_runner.step_once(input_data)
             
@@ -144,7 +144,6 @@ class Worker:
             next_tokens = pickle.loads(recv_bytes)
         
         if next_tokens is not None:
-            print(next_tokens)
             schedulerOutput, act_schedule_list = self.already_schedule_queue.popleft()
 
             keep_indices = []
