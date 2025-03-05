@@ -55,44 +55,6 @@ class InputData():
             self.block_table = self.get_block_table()
 
         assert self.tokens.shape == self.positions.shape
-        
-    def build_prefill(temperature, top_p, top_k, prefix_prefill, 
-                memory_manager, slot_mapping_tensor, positions, 
-                max_seq_len, seq_start_loc, block_table=None, 
-                max_query_len=None, query_start_loc=None):
-        input_data = InputData([],None)
-        input_data.segment_id = 0
-        input_data.computed_prompt = False
-        input_data.temperature = temperature
-        input_data.top_p = top_p
-        input_data.top_k = top_k
-        input_data.prefix_prefill = prefix_prefill
-        input_data.memory_manager = memory_manager
-        input_data.slot_mapping_tensor = slot_mapping_tensor
-        input_data.positions = positions
-        input_data.max_seq_len = max_seq_len
-        input_data.seq_start_loc = seq_start_loc
-        if prefix_prefill:
-            input_data.block_table = block_table
-            input_data.max_query_len = max_query_len
-            input_data.query_start_loc = query_start_loc
-        return input_data
-    
-    def build_decode(temperature, top_p, top_k,slot_mapping_tensor, 
-                     memory_manager, positions, cache_seqs_len, block_table):
-        input_data = InputData([],None)
-        input_data.prefix_prefill = False
-        input_data.segment_id = 0
-        input_data.computed_prompt = True
-        input_data.temperature = temperature
-        input_data.top_p = top_p
-        input_data.top_k = top_k
-        input_data.slot_mapping_tensor = slot_mapping_tensor
-        input_data.memory_manager = memory_manager
-        input_data.positions = positions
-        input_data.cache_seqs_len = cache_seqs_len
-        input_data.block_table = block_table
-        return input_data
 
     def get_seq_len_loc(self):
         max_seqlen = 0

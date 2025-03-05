@@ -157,6 +157,7 @@ class LlamaForCausalLM(nn.Module):
         self.finish_tokens = LlamaForCausalLM.get_finish_tokens(model_config)
         self.model = LlamaModel(model_config)
         self.model_config = model_config
+        self.ret_residual = True
         if dist.get_rank() == dist.get_world_size() - 1:
             self.lm_head = nn.Linear(
                 model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
