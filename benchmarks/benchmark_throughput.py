@@ -64,10 +64,10 @@ def sample_requests(
 def run_gllm(
     requests: List[Tuple[str, int, int]],
     model: str,
-    gpu_memory_utilization: float,
+    gpu_memory_util: float,
 ):
     from gllm import LLM
-    llm = LLM(model, gpu_memory_utilization)
+    llm = LLM(model, gpu_memory_util=gpu_memory_util)
     prompts = []
     output_lens = []
     for request in requests:
