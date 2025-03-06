@@ -23,7 +23,7 @@ class DeltaSchedulerOutput:
 
 class Scheduler:
     def __init__(self, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float,
-                 page_size: int) -> None:
+                 page_size: int, pp_size:int) -> None:
         self.prompt_lists: List[Sequence] = []  # seqs to prefill
         self.decode_lists: List[Sequence] = []  # seqs to decode
         self.finish_lists: List[Sequence] = []  # seqs finished
@@ -45,6 +45,8 @@ class Scheduler:
         self.page_size = page_size
 
         self.log_time = time.time()
+        
+        self.pp_size = pp_size
         
     def set_total_num_free_pages(self, total_num_free_pages):
         self.num_free_pages = total_num_free_pages
@@ -69,7 +71,7 @@ class Scheduler:
 
         # prompt
         if len(self.prompt_lists) != 0 and (
-                self.num_free_pages > self.num_threshold_free_pages) and (not delta or delta and self.num_schedule_prefill <= 1):
+                self.num_free_pages > self.num_threshold_free_pages) and (not delta or delta and self.num_schedule_prefill <= self.pp_size):
             prefill_schedule_lists: List[Sequence] = []
             cu_seqs_len = 0
             for seq in self.prompt_lists:

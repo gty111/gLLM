@@ -35,12 +35,12 @@ def recv_pp_data(src, dtype, shape, has_residual):
     hidden_states = torch.zeros(torch.Size(shape),dtype=dtype,device=f'cuda:{dist.get_rank()}')
     if has_residual:
         residual = hidden_states.clone().detach()
-        dist.irecv(hidden_states,src).wait()
-        dist.irecv(residual,src).wait()
-        return hidden_states, residual
+        hidden_states_future = dist.irecv(hidden_states,src)
+        residual_future = dist.irecv(residual,src)
+        return hidden_states_future, residual_future, hidden_states, residual
     else:
-        dist.irecv(hidden_states,src).wait()
-        return hidden_states
+        hidden_states_future = dist.irecv(hidden_states,src)
+        return hidden_states_future, hidden_states
     
 def init_dist(pp_size, pp_rank, master_addr, master_port):
     os.environ['MASTER_ADDR'] = master_addr

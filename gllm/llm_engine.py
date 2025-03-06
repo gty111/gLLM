@@ -22,7 +22,7 @@ class LLM():
         self.master_port = '49082'
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
-            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size)
+            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size, pp_size)
         self.finish_tokens = self.model_runner.model_loader.get_finish_tokens()
         self.model_max_length = self.model_runner.tokenizer.model_max_length
 

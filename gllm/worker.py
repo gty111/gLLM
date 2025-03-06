@@ -53,6 +53,8 @@ class Worker:
             self.gpu_schedule_socket = make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{self.rank}', zmq.PULL)
             # Input data for each GPU rank except rank 0 
             self.schedule_queue = deque()
+            # Input data and intermediate data for each GPU rank except rank 0
+            self.run_queue = deque()
         if self.rank == self.world_size - 1 and self.world_size != 1:
             # GPU last rank => GPU rank 0 : next tokens
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
@@ -66,29 +68,46 @@ class Worker:
 
     # GPU process except rank 0 
     def run(self):
+        # model forward
+        if len(self.run_queue) != 0:
+            hidden_states = None
+            residual = None
+            input_data,intermediate_data = self.run_queue.popleft()
+            if len(intermediate_data) == 4:
+                if not (intermediate_data[0].is_completed() and intermediate_data[1].is_completed()):
+                    self.run_queue.appendleft((input_data,intermediate_data))
+                    return
+                else:
+                    hidden_states, residual = intermediate_data[2], intermediate_data[3]
+            elif len(intermediate_data) == 2:
+                if not intermediate_data[0].is_completed():
+                    self.run_queue.appendleft((input_data,intermediate_data))
+                    return
+                else:
+                    hidden_states = intermediate_data[1]
+            else:
+                assert 0
+
+            output = self.model_runner.step_once(input_data,hidden_states,residual)
+            if self.rank == self.world_size - 1:
+                assert type(output) == list
+                token_bytes = pickle.dumps(output)
+                self.token_socket.send(token_bytes, copy=False)
+            else:
+                send_pp_data(output, self.rank+1)
+        
+        # recv schedule seqs
         if self.gpu_schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.gpu_schedule_socket.recv(copy=False)
             seqs = pickle.loads(recv_bytes)
             self.schedule_queue.append(InputData(seqs,self.model_runner.memory_manager))
-        if len(self.schedule_queue) == 0:
-            return
-        input_data = self.schedule_queue.popleft()
-        data = recv_pp_data(
-            self.rank-1, self.dtype, [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
-        hidden_states = None
-        residual = None
-        if len(data) == 2:
-            hidden_states, residual = data
-        else:
-            hidden_states = data
-            residual = None
-        output = self.model_runner.step_once(input_data,hidden_states,residual)
-        if self.rank == self.world_size - 1:
-            assert type(output) == list
-            token_bytes = pickle.dumps(output)
-            self.token_socket.send(token_bytes, copy=False)
-        else:
-            send_pp_data(output, self.rank+1)
+        if len(self.schedule_queue) != 0:
+            # recv intermediate data
+            input_data = self.schedule_queue.popleft()
+            intermediate_data = recv_pp_data(
+                self.rank-1, self.dtype, [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
+            self.run_queue.append((input_data,intermediate_data))
+        
     
     # PP schedule
     def schedule(self):
