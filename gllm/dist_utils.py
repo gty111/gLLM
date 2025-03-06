@@ -26,15 +26,17 @@ def recv_tensor(dtype, src):
 def send_pp_data(output, dst):
     if type(output) == tuple:
         assert len(output) == 2
-        send_tensor(output[0],dst)
-        send_tensor(output[1],dst)
+        dist.send(output[0],dst)
+        dist.send(output[1],dst)
     else:
-        send_tensor(output,dst)
+        dist.send(output,dst)
 
-def recv_pp_data(src, dtype, has_residual):
+def recv_pp_data(src, dtype, shape, has_residual):
     if has_residual:
-        hidden_states = recv_tensor(dtype, src)
-        residual = recv_tensor(dtype, src)
+        hidden_states = torch.zeros(torch.Size(shape),dtype=dtype,device=f'cuda:{dist.get_rank()}')
+        residual = hidden_states.clone().detach()
+        dist.recv(hidden_states,src)
+        dist.recv(residual,src)
         return hidden_states, residual
     else:
         return recv_tensor(dtype, src)

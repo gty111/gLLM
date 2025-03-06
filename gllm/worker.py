@@ -58,6 +58,8 @@ class Worker:
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
         self.model_runner.init()
         self.dtype = self.model_runner.memory_manager.dtype
+        self.hidden_size = self.model_runner.model_loader.hidden_size
+        self.ret_residual = self.model_runner.model.ret_residual
         
     def set_num_free_pages(self):
         self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
@@ -70,7 +72,9 @@ class Worker:
             self.schedule_queue.append(InputData(seqs,self.model_runner.memory_manager))
         if len(self.schedule_queue) == 0:
             return
-        data = recv_pp_data(self.rank-1, self.dtype, self.model_runner.model.ret_residual)
+        input_data = self.schedule_queue.popleft()
+        data = recv_pp_data(
+            self.rank-1, self.dtype, [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
         hidden_states = None
         residual = None
         if len(data) == 2:
@@ -78,7 +82,6 @@ class Worker:
         else:
             hidden_states = data
             residual = None
-        input_data = self.schedule_queue.popleft()
         output = self.model_runner.step_once(input_data,hidden_states,residual)
         if self.rank == self.world_size - 1:
             assert type(output) == list
