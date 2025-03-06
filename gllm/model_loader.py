@@ -75,6 +75,7 @@ class ModelLoader():
             self.vocab_size = int(model_config['padded_vocab_size'])
         else:
             assert 0
+        self.hidden_size = int(model_config['hidden_size'])
         return model_config
     
     def get_model_type(self):

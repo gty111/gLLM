@@ -26,18 +26,21 @@ def recv_tensor(dtype, src):
 def send_pp_data(output, dst):
     if type(output) == tuple:
         assert len(output) == 2
-        send_tensor(output[0],dst)
-        send_tensor(output[1],dst)
+        dist.isend(output[0],dst)
+        dist.isend(output[1],dst)
     else:
-        send_tensor(output,dst)
+        dist.isend(output,dst)
 
-def recv_pp_data(src, dtype, has_residual):
+def recv_pp_data(src, dtype, shape, has_residual):
+    hidden_states = torch.zeros(torch.Size(shape),dtype=dtype,device=f'cuda:{dist.get_rank()}')
     if has_residual:
-        hidden_states = recv_tensor(dtype, src)
-        residual = recv_tensor(dtype, src)
-        return hidden_states, residual
+        residual = hidden_states.clone().detach()
+        hidden_states_future = dist.irecv(hidden_states,src)
+        residual_future = dist.irecv(residual,src)
+        return hidden_states_future, residual_future, hidden_states, residual
     else:
-        return recv_tensor(dtype, src)
+        hidden_states_future = dist.irecv(hidden_states,src)
+        return hidden_states_future, hidden_states
     
 def init_dist(pp_size, pp_rank, master_addr, master_port):
     os.environ['MASTER_ADDR'] = master_addr
