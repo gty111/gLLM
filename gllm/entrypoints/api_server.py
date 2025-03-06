@@ -88,10 +88,12 @@ if __name__ == '__main__':
     parser.add_argument('--ratio-free-pages', type=float, default=0.2)
     parser.add_argument('--enable-prefix-caching', action='store_true')
     parser.add_argument('--pp', type=int, default=1)
+    parser.add_argument('--load-format', type=str, choices=['auto','dummy'],default='auto')
     args = parser.parse_args()
 
     llm_cls = PipeAsyncLLM if args.pipe_schedule else AsyncLLM
-    llm = llm_cls(model_path=args.model_path,
+    llm = llm_cls(load_format=args.load_format,
+                  model_path=args.model_path,
                   gpu_memory_util=args.gpu_memory_util,
                   page_size=args.page_size,
                   max_decode_seqs=args.max_decode_seqs,

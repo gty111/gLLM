@@ -11,10 +11,10 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 
 class ModelRunner():
-    def __init__(self, model_path: str, gpu_memory_util:float, page_size:int, 
+    def __init__(self, load_format:str, model_path: str, gpu_memory_util:float, page_size:int, 
                  enable_prefix_caching:bool):
         self.model_path = model_path
-        self.model_loader = ModelLoader(model_path)
+        self.model_loader = ModelLoader(load_format, model_path)
         self.enable_prefix_caching = enable_prefix_caching
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size

@@ -12,10 +12,11 @@ from gllm.models.qwen2 import Qwen2ForCausalLM
 
 
 class ModelLoader():
-    def __init__(self, model_path):
+    def __init__(self, load_format, model_path):
         self.model_path = model_path
         self.model_config = self.load_config()
         self.post_process_config()
+        self.load_format = load_format
         
     def get_dtype(self, dtype: str):
         if dtype == 'float16':
@@ -91,10 +92,13 @@ class ModelLoader():
         return model_type
 
     def load_model(self):
-        weights = self.load_weights()
         model_type = self.get_model_type()
         model = model_type(self.model_config)
         
-        logger.info(f"Worker {dist.get_rank()} loading model ...")
-        model.load_weights(weights)
+        if self.load_format == 'auto':
+            weights = self.load_weights()
+            logger.info(f"Worker {dist.get_rank()} loading model ...")
+            model.load_weights(weights)
+        else:
+            assert self.load_format == 'dummy'
         return model

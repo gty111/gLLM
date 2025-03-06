@@ -12,11 +12,11 @@ from gllm.input_data import InputData
 
 
 class LLM():
-    def __init__(self, model_path, gpu_memory_util=0.9, page_size=16, max_decode_seqs=256,
+    def __init__(self, load_format, model_path, gpu_memory_util=0.9, page_size=16, max_decode_seqs=256,
                  max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True, pp_size=1):
         self.model_path = model_path
         self.model_runner = ModelRunner(
-            model_path, gpu_memory_util, page_size, enable_prefix_caching)
+            load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching)
         self.pp_size = pp_size
         self.master_addr = '127.0.0.1'
         self.master_port = '49082'
