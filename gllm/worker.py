@@ -1,3 +1,4 @@
+import torch.multiprocessing as mp
 import torch
 import zmq
 import pickle
@@ -16,11 +17,12 @@ from gllm.utils import make_socket
 # Used with PipeAsyncLLM
 class Worker:
     
-    def __init__(self, model_runner:ModelRunner, mp_share_nums, num_free_pages, pp_rank, pp_size, 
+    def __init__(self, model_runner:ModelRunner, mp_share_nums, mp_queue, num_free_pages, pp_rank, pp_size, 
                  master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path,
                  interleaved_pp):
         self.model_runner = model_runner
         self.mp_share_nums = mp_share_nums
+        self.mp_queue: mp.Queue = mp_queue
         self.num_free_pages = num_free_pages
         self.pp_rank = pp_rank # pp rank
         self.pp_size = pp_size # pp size
@@ -62,6 +64,9 @@ class Worker:
             if self.pp_size != 1:
                 # GPU last pp rank => GPU pp rank 0 : next tokens
                 self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PULL)
+            if self.interleaved_pp:
+                # Intermediate data for comm between NCCL groups
+                self.run_queue = deque()
         else:
             # GPU pp rank 0 => other GPU pp ranks : batched seqs
             self.gpu_schedule_socket = make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{self.pp_rank}', zmq.PULL)
@@ -101,14 +106,20 @@ class Worker:
                     hidden_states = intermediate_data[1]
             else:
                 assert 0
-
             output = self.model_runner.step_once(input_data,hidden_states,residual)
             if self.pp_rank == self.pp_size - 1:
                 assert type(output) == list
                 token_bytes = pickle.dumps(output)
                 self.token_socket.send(token_bytes, copy=False)
             else:
-                send_pp_data(output, self.get_pp_next_rank())
+                if not self.interleaved_pp or self.pp_rank != self.pp_size//2 - 1:
+                    send_pp_data(output, self.get_pp_next_rank())
+                else:
+                    if len(output) == 2:
+                        output = (output[0].to('cuda:0'),output[1].to('cuda:0')) 
+                    else:
+                        output = output.to('cuda:0')
+                    self.mp_queue.put(output)
         
         # recv schedule seqs
         if self.gpu_schedule_socket.poll(timeout=0) != 0:
@@ -117,12 +128,25 @@ class Worker:
             self.schedule_queue.append(InputData(seqs,self.model_runner.memory_manager))
         if len(self.schedule_queue) != 0:
             # recv intermediate data
-            input_data = self.schedule_queue.popleft()
-            intermediate_data = recv_pp_data(
-                self.get_pp_last_rank(), self.dtype, 
-                [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
-            self.run_queue.append((input_data,intermediate_data))
-        
+            if not self.interleaved_pp or self.device_rank != 0:
+                input_data = self.schedule_queue.popleft()
+                intermediate_data = recv_pp_data(
+                    self.get_pp_last_rank(), self.dtype, 
+                    [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
+                self.run_queue.append((input_data,intermediate_data))
+            else: # comm from mp queue
+                if not self.mp_queue.empty():
+                    input_data = self.schedule_queue.popleft()
+                    intermediate_data = self.mp_queue.get() 
+                    hidden_states = None
+                    residual = None
+                    if len(intermediate_data) == 2:
+                        hidden_states, residual = intermediate_data
+                    else:
+                        hidden_states = intermediate_data
+                    output = self.model_runner.step_once(input_data,hidden_states,residual)
+                    send_pp_data(output, self.get_pp_next_rank())
+                    
     
     # PP schedule
     def schedule(self):

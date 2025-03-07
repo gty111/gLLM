@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 
 from torch import nn
 from copy import deepcopy
@@ -10,7 +9,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
-from gllm.dist_utils import get_pp_layers
+from gllm.dist_utils import get_pp_layers, get_pp_rank, get_pp_size
 
 
 class GLMAttention(nn.Module):
@@ -119,12 +118,12 @@ class GLMTransformer(nn.Module):
         # assume post_layer_norm is true
         self.post_layer_norm = True
 
-        self.num_layers = model_config['num_layers'] // dist.get_world_size()
+        self.num_layers = model_config['num_layers'] // get_pp_size()
         self.start_layer, self.end_layer = get_pp_layers(model_config['num_layers'])
         self.layers = nn.ModuleList(
             [GLMBlock(i-self.start_layer, model_config) for i in range(self.start_layer, self.end_layer)])
 
-        if dist.get_rank() == dist.get_world_size() - 1:
+        if get_pp_rank() == get_pp_size() - 1:
             if self.post_layer_norm:
                 assert model_config['rmsnorm']
                 layer_norm_func = RMSNorm
@@ -136,7 +135,7 @@ class GLMTransformer(nn.Module):
             layer = self.layers[i]
             hidden_states = layer(hidden_states, input_data)
         # Final layer norm.
-        if dist.get_rank() == dist.get_world_size() - 1:
+        if get_pp_rank() == get_pp_size() - 1:
             if self.post_layer_norm:
                 hidden_states = self.final_layernorm(hidden_states)
 
@@ -150,7 +149,7 @@ class ChatGLMModel(nn.Module):
         self.embedding = nn.Embedding(
             model_config['padded_vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
 
-        self.num_layers = model_config['num_layers'] // dist.get_world_size()
+        self.num_layers = model_config['num_layers'] // get_pp_size()
         self.multi_query_group_num = model_config['multi_query_group_num']
         self.kv_channels = model_config['kv_channels']
 
@@ -159,7 +158,7 @@ class ChatGLMModel(nn.Module):
             model_config['hidden_size'], model_config['padded_vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
 
     def forward(self, input_data: InputData, hidden_states=None):
-        if dist.get_rank() == 0:
+        if get_pp_rank() == 0:
             hidden_states = self.embedding(input_data.tokens)
 
         # Run encoder.
@@ -173,14 +172,14 @@ class ChatGLMForCausalLM(nn.Module):
 
         self.model_config = model_config
         self.max_model_len = model_config['seq_length']
-        self.num_layers = model_config['num_layers'] // dist.get_world_size()
+        self.num_layers = model_config['num_layers'] // get_pp_size()
         self.dtype = model_config['torch_dtype']
         self.num_kv_heads = model_config['multi_query_group_num']
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
         self.finish_tokens = ChatGLMForCausalLM.get_finish_tokens(model_config)
         self.transformer = ChatGLMModel(model_config)
         self.ret_residual = False
-        if dist.get_rank() == dist.get_world_size() - 1:
+        if get_pp_rank() == get_pp_size() - 1:
             self.lm_head = self.transformer.output_layer
         self.sampler = Sampler()
         
@@ -215,7 +214,7 @@ class ChatGLMForCausalLM(nn.Module):
             # resolve PP layer
             if 'layers' in k:
                 k_list = k.split('.')
-                k_list[3] = str(int(k_list[3])+dist.get_rank()*self.num_layers)
+                k_list[3] = str(int(k_list[3])+get_pp_rank()*self.num_layers)
                 k = '.'.join(k_list)
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')

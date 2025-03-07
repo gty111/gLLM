@@ -1,5 +1,4 @@
 import torch
-import torch.distributed as dist
 
 from typing import Optional
 from torch import nn

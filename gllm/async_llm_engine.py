@@ -147,6 +147,7 @@ class PipeAsyncLLM(LLM):
         self.ctx = mp.get_context('spawn')
         self.num_free_pages = self.ctx.Value('i', 0)
         self.mp_share_nums = self.ctx.Array('i', [0]*self.pp_size)
+        self.mp_queue = self.ctx.Queue()
         
         self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
         self.output_ipc_path = 'ipc:///tmp/gllm_output'
@@ -257,6 +258,7 @@ class PipeAsyncLLM(LLM):
             master_port = str(int(master_port)+1)
         worker = Worker(self.model_runner,
                         self.mp_share_nums,
+                        self.mp_queue,
                         self.num_free_pages,
                         pp_rank,
                         self.pp_size,
