@@ -10,7 +10,8 @@ from gllm.sequence import Sequence
 
 class MemoryManager():
     def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype, 
-                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int):
+                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int,
+                 interleaved_pp:bool):
         '''
         num_layers: number of hidden layers
         page_size: number of tokens in a page
@@ -32,6 +33,9 @@ class MemoryManager():
         num_pages_all = [None for _ in range(dist.get_world_size())]
         dist.all_gather_object(num_pages_all, num_pages)
         self.num_pages = min(num_pages_all)
+        
+        if interleaved_pp:
+            self.num_pages = self.num_pages // 2
         
         if dist.get_rank() == 0:
             logger.info(f'Allocate {self.num_pages} pages')

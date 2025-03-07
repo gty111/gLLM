@@ -1,5 +1,5 @@
 import asyncio
-import multiprocessing as mp
+import torch.multiprocessing as mp
 import zmq
 import pickle
 import time
@@ -130,6 +130,13 @@ class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         logger.info('Enable pipeline schedule')
+        
+        self.interleaved_pp = kwargs['interleaved_pp']
+        kwargs.pop('interleaved_pp')
+        
+        if self.interleaved_pp:
+            kwargs['pp_size'] *= 2
+            
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -243,6 +250,9 @@ class PipeAsyncLLM(LLM):
             
 
     def start_worker(self, pp_rank):
+        master_port = self.master_port
+        if self.interleaved_pp and pp_rank >= (self.pp_size//2):
+            master_port += 1
         worker = Worker(self.model_runner,
                         self.num_free_pages,
                         pp_rank,
@@ -251,7 +261,8 @@ class PipeAsyncLLM(LLM):
                         self.master_port,
                         self.schedule_ipc_path,
                         self.output_ipc_path,
-                        self.token_ipc_path)
+                        self.token_ipc_path,
+                        self.interleaved_pp)
         self.ctx.Process(
             target=run_worker,
             args=(worker,),

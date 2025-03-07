@@ -89,6 +89,7 @@ if __name__ == '__main__':
     parser.add_argument('--enable-prefix-caching', action='store_true')
     parser.add_argument('--pp', type=int, default=1)
     parser.add_argument('--load-format', type=str, choices=['auto','dummy'],default='auto')
+    parser.add_argument('--interleaved-pp', action='store_true')
     args = parser.parse_args()
 
     llm_cls = PipeAsyncLLM if args.pipe_schedule else AsyncLLM
@@ -100,6 +101,7 @@ if __name__ == '__main__':
                   max_batch_tokens=args.max_batch_tokens,
                   ratio_threshold_free_pages=args.ratio_free_pages,
                   enable_prefix_caching=args.enable_prefix_caching,
-                  pp_size=args.pp)
+                  pp_size=args.pp,
+                  interleaved_pp=args.interleaved_pp)
 
     asyncio.run(run_server(args))

@@ -25,14 +25,15 @@ class ModelRunner():
         self.model = None
         self.memory_manager = None
     
-    def init(self):
+    def init(self, inteleaved_pp=False):
         self.model = self.model_loader.load_model()
         
         memory_manager_cls = PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util, num_layers=self.model.num_layers, 
             dtype=self.model.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads, 
-            kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size)
+            kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size,
+            interleaved_pp=inteleaved_pp)
 
     def tokenize(self, content, chat:bool=False):
         if chat:

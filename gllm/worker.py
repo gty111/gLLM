@@ -17,48 +17,61 @@ from gllm.utils import make_socket
 class Worker:
     
     def __init__(self, model_runner:ModelRunner, num_free_pages, pp_rank, pp_size, 
-                 master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path):
+                 master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path,
+                 interleaved_pp):
         self.model_runner = model_runner
         self.num_free_pages = num_free_pages
-        self.rank = pp_rank
-        self.world_size = pp_size
+        self.pp_rank = pp_rank # pp rank
+        self.pp_size = pp_size # pp size
         self.master_addr = master_addr
         self.master_port = master_port
         self.schedule_ipc_path = schedule_ipc_path
         self.output_ipc_path = output_ipc_path
         self.token_ipc_path = token_ipc_path
         
+        self.interleaved_pp = interleaved_pp
+        self.device_size = self.pp_size if not interleaved_pp else self.pp_size//2
+        self.device_rank = self.pp_rank if not interleaved_pp else self.pp_rank % self.device_size
+    
+    def get_pp_next_rank(self):
+        # return device_rank of next pp_rank
+        return (self.device_rank + 1) % self.device_size
+        
+    def get_pp_last_rank(self):
+        # return device_rank of last pp_rank
+        return (self.device_rank - 1 + self.device_size) % self.device_size
+    
     def init(self):
-        init_dist(self.world_size, self.rank, self.master_addr, self.master_port)
-        torch.cuda.set_device(f'cuda:{self.rank}')
+        init_dist(self.pp_size, self.pp_rank, self.device_size, self.device_rank, self.master_addr, self.master_port)
+        torch.cuda.set_device(f'cuda:{self.device_rank}')
         zmq_ctx = zmq.Context()
-        if self.rank == 0:
-            # main process => GPU rank 0
+        if self.pp_rank == 0:
+            # main process => GPU pp rank 0
             self.schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PULL) 
-            # GPU rank 0 => main process
+            # GPU pp rank 0 => main process
             self.output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PUSH)
             # seqs to schedule
             self.seqs_to_schedule = []
             # running batch 
             self.batch_running = deque()
-            # GPU rank 0 => other GPU ranks : batched seqs
+            # GPU pp rank 0 => other GPU ranks : batched seqs
             self.gpu_schedule_socket = []
-            for i in range(1,self.world_size):
+            for i in range(1,self.pp_size):
                 self.gpu_schedule_socket.append(make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{i}',zmq.PUSH))
-            if self.world_size != 1:
-                # GPU last rank => GPU rank 0 : next tokens
+            if self.pp_size != 1:
+                # GPU last pp rank => GPU pp rank 0 : next tokens
                 self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PULL)
         else:
-            # GPU rank 0 => other GPU ranks : batched seqs
-            self.gpu_schedule_socket = make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{self.rank}', zmq.PULL)
-            # Input data for each GPU rank except rank 0 
+            # GPU pp rank 0 => other GPU pp ranks : batched seqs
+            self.gpu_schedule_socket = make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{self.pp_rank}', zmq.PULL)
+            # Input data for each GPU pp rank except pp rank 0 
             self.schedule_queue = deque()
-            # Input data and intermediate data for each GPU rank except rank 0
+            # Input data and intermediate data for each GPU pp rank except pp rank 0
             self.run_queue = deque()
-        if self.rank == self.world_size - 1 and self.world_size != 1:
-            # GPU last rank => GPU rank 0 : next tokens
+        if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
+            # GPU last pp rank => GPU pp rank 0 : next tokens
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
-        self.model_runner.init()
+        self.model_runner.init(self.interleaved_pp)
         self.dtype = self.model_runner.memory_manager.dtype
         self.hidden_size = self.model_runner.model_loader.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual
@@ -66,7 +79,7 @@ class Worker:
     def set_num_free_pages(self):
         self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
 
-    # GPU process except rank 0 
+    # GPU process except pp rank 0 
     def run(self):
         # model forward
         if len(self.run_queue) != 0:
@@ -89,12 +102,12 @@ class Worker:
                 assert 0
 
             output = self.model_runner.step_once(input_data,hidden_states,residual)
-            if self.rank == self.world_size - 1:
+            if self.pp_rank == self.pp_size - 1:
                 assert type(output) == list
                 token_bytes = pickle.dumps(output)
                 self.token_socket.send(token_bytes, copy=False)
             else:
-                send_pp_data(output, self.rank+1)
+                send_pp_data(output, self.get_pp_next_rank())
         
         # recv schedule seqs
         if self.gpu_schedule_socket.poll(timeout=0) != 0:
@@ -105,7 +118,8 @@ class Worker:
             # recv intermediate data
             input_data = self.schedule_queue.popleft()
             intermediate_data = recv_pp_data(
-                self.rank-1, self.dtype, [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
+                self.get_pp_last_rank(), self.dtype, 
+                [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
             self.run_queue.append((input_data,intermediate_data))
         
     
@@ -116,13 +130,13 @@ class Worker:
         for schedulerOutput,schedule_list in self.batch_running:
             num_total_seqs += len(schedule_list)
         
-        if num_total_seqs <= self.world_size or self.world_size == 1:
+        if num_total_seqs <= self.pp_size or self.pp_size == 1:
             cur_schedule_list = self.seqs_to_schedule
             self.seqs_to_schedule = []
             return cur_schedule_list    
         
-        num_schedule_seqs = num_total_seqs // self.world_size
-        if len(self.batch_running) > self.world_size:
+        num_schedule_seqs = num_total_seqs // self.pp_size
+        if len(self.batch_running) > self.pp_size:
             return []
         if num_schedule_seqs > len(self.seqs_to_schedule):
             return []
@@ -130,7 +144,7 @@ class Worker:
         self.seqs_to_schedule = self.seqs_to_schedule[num_schedule_seqs:]
         return cur_schedule_list
     
-    # rank 0 process
+    # pp rank 0 process
     def schedule_run(self):
         output = None
         act_schedule_list: List[Sequence] = []
@@ -155,22 +169,22 @@ class Worker:
         if len(act_schedule_list) != 0:
             input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
             seqs_bytes = pickle.dumps(act_schedule_list)
-            for i in range(1,self.world_size):
+            for i in range(1,self.pp_size):
                 self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
             self.batch_running.append((schedulerOutput, act_schedule_list))
             output = self.model_runner.step_once(input_data)
             
             if type(output) != list:
-                send_pp_data(output, self.rank+1)
+                send_pp_data(output, self.get_pp_next_rank())
         
         return output
         
-    # rank 0 process
+    # pp rank 0 process
     def process_output(self, output):
         next_tokens = None
         if isinstance(output,list) : # word_size == 1
             next_tokens = output
-        elif self.world_size != 1 and self.token_socket.poll(timeout=0) != 0: # recv tokens from last rank
+        elif self.pp_size != 1 and self.token_socket.poll(timeout=0) != 0: # recv tokens from last rank
             recv_bytes = self.token_socket.recv(copy=False)
             next_tokens = pickle.loads(recv_bytes)
         
@@ -195,9 +209,9 @@ class Worker:
  
 def run_worker(worker: Worker):
     worker.init()
-    logger.info(f'Worker {worker.rank} init')
+    logger.info(f'Worker {worker.pp_rank} init')
     while True:
-        if worker.rank == 0:
+        if worker.pp_rank == 0:
             worker.set_num_free_pages()
             output = worker.schedule_run()
             worker.process_output(output)   

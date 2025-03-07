@@ -41,13 +41,27 @@ def recv_pp_data(src, dtype, shape, has_residual):
     else:
         hidden_states_future = dist.irecv(hidden_states,src)
         return hidden_states_future, hidden_states
-    
-def init_dist(pp_size, pp_rank, master_addr, master_port):
+
+_PP_RANK=None
+_PP_SIZE=None
+
+def get_pp_rank():
+    assert _PP_RANK is not None
+    return _PP_RANK
+
+def get_pp_size():
+    assert _PP_SIZE is not None
+    return _PP_SIZE
+
+def init_dist(pp_size, pp_rank, device_size, device_rank, master_addr, master_port):
+    global _PP_RANK, _PP_SIZE
+    _PP_RANK = pp_rank
+    _PP_SIZE = pp_size
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = master_port
-    dist.init_process_group(backend='nccl', world_size=pp_size, rank=pp_rank)
+    dist.init_process_group(backend='nccl', world_size=device_size, rank=device_rank)
 
 def get_pp_layers(num_layers):
-    assert num_layers % dist.get_world_size() == 0
-    num_layers_pp = num_layers // dist.get_world_size()
-    return num_layers_pp * dist.get_rank(), num_layers_pp * (dist.get_rank()+1)
+    assert num_layers % get_pp_size() == 0
+    num_layers_pp = num_layers // get_pp_size()
+    return num_layers_pp * get_pp_rank(), num_layers_pp * (get_pp_rank()+1)
