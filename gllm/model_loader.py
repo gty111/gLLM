@@ -1,7 +1,6 @@
 import json
 import glob
 import torch
-import torch.distributed as dist
 
 from logger import logger
 from safetensors import safe_open
@@ -9,6 +8,7 @@ from safetensors import safe_open
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.qwen2 import Qwen2ForCausalLM
+from gllm.dist_utils import get_pp_rank
 
 
 class ModelLoader():
@@ -50,7 +50,7 @@ class ModelLoader():
         if len(weights) != 0:
             return weights
 
-        assert 0
+        return None
         
     def post_process_config(self):
         if self.architecture == 'ChatGLMModel':
@@ -97,7 +97,7 @@ class ModelLoader():
         
         if self.load_format == 'auto':
             weights = self.load_weights()
-            logger.info(f"Worker {dist.get_rank()} loading model ...")
+            logger.info(f"Worker {get_pp_rank()} loading model ...")
             model.load_weights(weights)
         else:
             assert self.load_format == 'dummy'

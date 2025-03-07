@@ -16,10 +16,11 @@ from gllm.utils import make_socket
 # Used with PipeAsyncLLM
 class Worker:
     
-    def __init__(self, model_runner:ModelRunner, num_free_pages, pp_rank, pp_size, 
+    def __init__(self, model_runner:ModelRunner, mp_share_nums, num_free_pages, pp_rank, pp_size, 
                  master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path,
                  interleaved_pp):
         self.model_runner = model_runner
+        self.mp_shape_nums = mp_share_nums
         self.num_free_pages = num_free_pages
         self.pp_rank = pp_rank # pp rank
         self.pp_size = pp_size # pp size
@@ -71,7 +72,7 @@ class Worker:
         if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
             # GPU last pp rank => GPU pp rank 0 : next tokens
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
-        self.model_runner.init(self.interleaved_pp)
+        self.model_runner.init(self.mp_share_nums, self.interleaved_pp)
         self.dtype = self.model_runner.memory_manager.dtype
         self.hidden_size = self.model_runner.model_loader.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual

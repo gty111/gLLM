@@ -1,9 +1,9 @@
-import torch.distributed as dist
 import torch
 import numpy as np
 
 from typing import List
 
+from gllm.dist_utils import get_pp_size, get_pp_rank
 from gllm.utils import async_tensor_h2d
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
@@ -13,11 +13,11 @@ class InputData():
     def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
         if len(seqs) == 0:
             return
-        if dist.get_rank() == dist.get_world_size() - 1:
+        if get_pp_rank() == get_pp_size() - 1:
             self.temperature = async_tensor_h2d([seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], memory_manager.dtype, 'cuda', True)
             self.top_p = async_tensor_h2d([seq.top_p for seq in seqs], memory_manager.dtype, 'cuda', True)
             self.top_k = async_tensor_h2d([seq.top_k if seq.top_k != -1 else memory_manager.vocab_size for seq in seqs], memory_manager.dtype, 'cuda', True)
-        if dist.get_rank() == 0:
+        if get_pp_rank() == 0:
             memory_manager.pre_allocate_page(seqs)
         self.seqs = seqs
         self.memory_manager = memory_manager
