@@ -20,7 +20,7 @@ class Worker:
                  master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path,
                  interleaved_pp):
         self.model_runner = model_runner
-        self.mp_shape_nums = mp_share_nums
+        self.mp_share_nums = mp_share_nums
         self.num_free_pages = num_free_pages
         self.pp_rank = pp_rank # pp rank
         self.pp_size = pp_size # pp size
@@ -72,7 +72,7 @@ class Worker:
         if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
             # GPU last pp rank => GPU pp rank 0 : next tokens
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
-        self.model_runner.init(self.mp_share_nums, self.interleaved_pp)
+        self.model_runner.init(self.mp_share_nums,self.interleaved_pp)
         self.dtype = self.model_runner.memory_manager.dtype
         self.hidden_size = self.model_runner.model_loader.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual

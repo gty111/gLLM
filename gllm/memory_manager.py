@@ -8,6 +8,7 @@ from logger import logger
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
 from gllm.dist_utils import get_pp_size, get_pp_rank
+from gllm.utils import mp_sync
 
 
 class MemoryManager():
@@ -27,28 +28,30 @@ class MemoryManager():
         self.dtype = dtype
         self.vocab_size = vocab_size
 
-        free_mem_size, _ = torch.cuda.mem_get_info()
-        num_max_pages = free_mem_size // (
-            2*num_layers*page_size*kv_head_num*kv_head_dim*2)
-        num_pages = int(num_max_pages * gpu_memory_util)
-        
-        if mp_share_nums is None:
+        if mp_share_nums is None or not interleaved_pp:
+            free_mem_size, _ = torch.cuda.mem_get_info()
+            num_max_pages = free_mem_size // (
+                2*num_layers*page_size*kv_head_num*kv_head_dim*2)
+            num_pages = int(num_max_pages * gpu_memory_util)
             num_pages_all = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(num_pages_all, num_pages)
             self.num_pages = min(num_pages_all)
         else:
+            '''
+            when using interleaved PP, two distinct NCCL groups init, so we 
+            need mp_share_nums to swap num_pages and sync
+            '''
+            mp_share_nums[get_pp_rank()] = -1
+            mp_sync(mp_share_nums,0)
+
+            free_mem_size, _ = torch.cuda.mem_get_info()
+            num_max_pages = free_mem_size // (
+                2*num_layers*page_size*kv_head_num*kv_head_dim*2)
+            num_pages = int(num_max_pages * gpu_memory_util)
             mp_share_nums[get_pp_rank()] = num_pages
-            while True:
-                # wait for other process
-                wait = False
-                for i in mp_share_nums:
-                    if i == 0:
-                        wait = True
-                        break
-                if wait:
-                    time.sleep(1)
-                self.num_pages = min(num_pages) // 2
-                break
+            mp_sync(mp_share_nums,-1)
+            
+            self.num_pages = min(mp_share_nums)//2
             
         if get_pp_rank() == 0:
             logger.info(f'Allocate {self.num_pages} pages')
