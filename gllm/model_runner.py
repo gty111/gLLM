@@ -1,6 +1,5 @@
 import torch
 import time
-import torch.distributed as dist
 
 from transformers import AutoTokenizer
 

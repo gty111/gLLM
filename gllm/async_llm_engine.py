@@ -230,16 +230,20 @@ class PipeAsyncLLM(LLM):
                     schedulerOutput, next_tokens, delta=True)
                 # overlap gpu execution and output process
                 exit = await self.run_schedule(schedule_socket)
-                act_schedule_list = None
                 if isinstance(schedulerOutput, SchedulerOutput):
-                    act_schedule_list = schedulerOutput.schedule_lists
+                    for seq in schedulerOutput.schedule_lists:
+                        self.async_streams[seq.seq_id].put(
+                            seq.detokenize_inc(self.model_runner.tokenizer))
                 elif isinstance(schedulerOutput, DeltaSchedulerOutput):
-                    act_schedule_list = self.scheduler.decode_batch.schedule_lists
+                    for id in schedulerOutput.act_schedule_ids:
+                        if id not in self.scheduler.decode_batch:
+                            continue
+                        seq = self.scheduler.decode_batch[id]
+                        self.async_streams[id].put(
+                            seq.detokenize_inc(self.model_runner.tokenizer))
                 else:
                     assert 0
-                for seq in act_schedule_list:
-                    self.async_streams[seq.seq_id].put(
-                        seq.detokenize_inc(self.model_runner.tokenizer))
+                
                 for seq in self.scheduler.finish_lists:
                     self.async_streams[seq.seq_id].finish()
                     del self.async_streams[seq.seq_id]

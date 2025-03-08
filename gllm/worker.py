@@ -116,9 +116,9 @@ class Worker:
                     send_pp_data(output, self.get_pp_next_rank())
                 else:
                     if len(output) == 2:
-                        output = (output[0].to('cuda:0'),output[1].to('cuda:0')) 
+                        output = (output[0].to('cuda:0').share_memory_(),output[1].to('cuda:0').share_memory_()) 
                     else:
-                        output = output.to('cuda:0')
+                        output = output.to('cuda:0').share_memory_()
                     self.mp_queue.put(output)
         
         # recv schedule seqs
@@ -215,20 +215,21 @@ class Worker:
         
         if next_tokens is not None:
             schedulerOutput, act_schedule_list = self.batch_running.popleft()
-
+            assert len(next_tokens) == len(act_schedule_list)
             keep_indices = []
-            free_indices = []
+            free_ids = []
             for idx, seq in enumerate(act_schedule_list):
                 seq.computed_prompt = True
                 seq.token_ids.append(next_tokens[idx])
                 if seq.is_finish():
-                    free_indices.append(idx)
+                    free_ids.append(seq.seq_id)
                     self.model_runner.memory_manager.free(seq)
                 else:
                     keep_indices.append(idx)
-            schedulerOutput.free_indices = free_indices
+            schedulerOutput.free_ids = free_ids
             if isinstance(schedulerOutput, DeltaSchedulerOutput):
                 self.seqs_to_schedule.extend([act_schedule_list[i] for i in keep_indices])
+                schedulerOutput.act_schedule_ids = [seq.seq_id for seq in act_schedule_list]
             output_bytes = pickle.dumps((schedulerOutput, next_tokens))
             self.output_socket.send(output_bytes, copy=False)
  
