@@ -27,8 +27,13 @@ class MemoryManager():
         self.kv_head_dim = kv_head_dim
         self.dtype = dtype
         self.vocab_size = vocab_size
-
-        if mp_share_nums is None or not interleaved_pp:
+        
+        if not dist.is_initialized():
+            free_mem_size, _ = torch.cuda.mem_get_info()
+            num_max_pages = free_mem_size // (
+                2*num_layers*page_size*kv_head_num*kv_head_dim*2)
+            self.num_pages = int(num_max_pages * gpu_memory_util)
+        elif mp_share_nums is None or not interleaved_pp:
             free_mem_size, _ = torch.cuda.mem_get_info()
             num_max_pages = free_mem_size // (
                 2*num_layers*page_size*kv_head_num*kv_head_dim*2)

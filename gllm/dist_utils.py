@@ -42,15 +42,13 @@ def recv_pp_data(src, dtype, shape, has_residual):
         hidden_states_future = dist.irecv(hidden_states,src)
         return hidden_states_future, hidden_states
 
-_PP_RANK=None
-_PP_SIZE=None
+_PP_RANK=0
+_PP_SIZE=1
 
 def get_pp_rank():
-    assert _PP_RANK is not None
     return _PP_RANK
 
 def get_pp_size():
-    assert _PP_SIZE is not None
     return _PP_SIZE
 
 def init_dist(pp_size, pp_rank, device_size, device_rank, master_addr, master_port):

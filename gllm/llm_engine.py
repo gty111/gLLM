@@ -51,7 +51,6 @@ class LLM():
         self.scheduler.finish_lists = []
 
     def init(self):
-        init_dist(1, 0, self.master_addr, self.master_port)
         self.model_runner.init()
         self.scheduler.set_total_num_free_pages(self.model_runner.memory_manager.get_num_free_pages())
 
@@ -94,7 +93,6 @@ class LLM():
         return requests
 
     def chat(self):
-        init_dist(1, 0, self.master_addr, self.master_port)
         self.model_runner.init()
         architecture = self.model_runner.model_loader.architecture
         print("\nWelcome to the chatbot!\n"
