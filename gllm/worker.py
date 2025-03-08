@@ -17,12 +17,11 @@ from gllm.utils import make_socket
 # Used with PipeAsyncLLM
 class Worker:
     
-    def __init__(self, model_runner:ModelRunner, mp_share_nums, mp_queue, num_free_pages, pp_rank, pp_size, 
+    def __init__(self, model_runner:ModelRunner, mp_share_nums, num_free_pages, pp_rank, pp_size, 
                  master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path,
                  interleaved_pp):
         self.model_runner = model_runner
         self.mp_share_nums = mp_share_nums
-        self.mp_queue: mp.Queue = mp_queue
         self.num_free_pages = num_free_pages
         self.pp_rank = pp_rank # pp rank
         self.pp_size = pp_size # pp size
@@ -77,6 +76,11 @@ class Worker:
         if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
             # GPU last pp rank => GPU pp rank 0 : next tokens
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
+        if self.interleaved_pp:
+            if self.pp_rank == self.pp_size // 2 - 1:
+                self.pp_socket = make_socket(zmq_ctx, 'ipc:///tmp/gllm_pp', zmq.PUSH)
+            elif self.pp_rank == self.pp_size // 2:
+                self.pp_socket = make_socket(zmq_ctx, 'ipc:///tmp/gllm_pp', zmq.PULL)
         self.model_runner.init(self.mp_share_nums,self.interleaved_pp)
         self.dtype = self.model_runner.memory_manager.dtype
         self.hidden_size = self.model_runner.model_loader.hidden_size
@@ -115,11 +119,8 @@ class Worker:
                 if not self.interleaved_pp or self.pp_rank != self.pp_size//2 - 1:
                     send_pp_data(output, self.get_pp_next_rank())
                 else:
-                    if len(output) == 2:
-                        output = (output[0].to('cuda:0').share_memory_(),output[1].to('cuda:0').share_memory_()) 
-                    else:
-                        output = output.to('cuda:0').share_memory_()
-                    self.mp_queue.put(output)
+                    tensor_bytes = pickle.dumps(output)
+                    self.pp_socket.send(tensor_bytes, copy=False)
         
         # recv schedule seqs
         if self.gpu_schedule_socket.poll(timeout=0) != 0:
@@ -134,16 +135,20 @@ class Worker:
                     self.get_pp_last_rank(), self.dtype, 
                     [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
                 self.run_queue.append((input_data,intermediate_data))
-            else: # comm from mp queue
-                if not self.mp_queue.empty():
+            else: # comm from socket
+                if self.pp_socket.poll(timeout=0) != 0:
                     input_data = self.schedule_queue.popleft()
-                    intermediate_data = self.mp_queue.get() 
+                    recv_bytes = self.pp_socket.recv(copy=False)
+                    intermediate_data = pickle.loads(recv_bytes)
                     hidden_states = None
                     residual = None
                     if len(intermediate_data) == 2:
                         hidden_states, residual = intermediate_data
+                        hidden_states = hidden_states.to(f'cuda:{self.device_rank}')
+                        residual = residual.to(f'cuda:{self.device_rank}')
                     else:
                         hidden_states = intermediate_data
+                        hidden_states = hidden_states.to(f'cuda:{self.device_rank}')
                     output = self.model_runner.step_once(input_data,hidden_states,residual)
                     send_pp_data(output, self.get_pp_next_rank())
                     
