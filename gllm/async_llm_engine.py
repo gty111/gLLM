@@ -205,12 +205,9 @@ class PipeAsyncLLM(LLM):
             await asyncio.sleep(0)
             return False
         
-        if isinstance(schedulerOutput, DeltaSchedulerOutput) and len(schedulerOutput.delta_schedule_list) == 0:
-            await asyncio.sleep(0)
-            return False
-        
-        schedule_bytes = pickle.dumps(schedulerOutput)
-        schedule_socket.send(schedule_bytes, copy=False)
+        if isinstance(schedulerOutput, SchedulerOutput):
+            schedule_bytes = pickle.dumps(schedulerOutput)
+            schedule_socket.send(schedule_bytes, copy=False)
 
         return False
 

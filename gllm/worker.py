@@ -184,11 +184,7 @@ class Worker:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput = pickle.loads(recv_bytes)
             
-            if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                self.seqs_to_schedule.extend(
-                    schedulerOutput.delta_schedule_list)
-                act_schedule_list = self.schedule()
-            elif isinstance(schedulerOutput, SchedulerOutput):
+            if isinstance(schedulerOutput, SchedulerOutput):
                 act_schedule_list = schedulerOutput.schedule_lists
             else:
                 assert 0
@@ -231,10 +227,14 @@ class Worker:
                     self.model_runner.memory_manager.free(seq)
                 else:
                     keep_indices.append(idx)
+                    
+            self.seqs_to_schedule.extend([act_schedule_list[i] for i in keep_indices])
+            
             schedulerOutput.free_ids = free_ids
-            if isinstance(schedulerOutput, DeltaSchedulerOutput):
-                self.seqs_to_schedule.extend([act_schedule_list[i] for i in keep_indices])
-                schedulerOutput.act_schedule_ids = [seq.seq_id for seq in act_schedule_list]
+            schedulerOutput.act_schedule_ids = [seq.seq_id for seq in act_schedule_list]
+            if isinstance(schedulerOutput, SchedulerOutput):
+                # avoid send abundant info
+                schedulerOutput.schedule_lists = []
             output_bytes = pickle.dumps((schedulerOutput, next_tokens))
             self.output_socket.send(output_bytes, copy=False)
  
