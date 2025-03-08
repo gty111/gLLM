@@ -9,7 +9,7 @@ from gllm.layers.rotary_embedding import RotaryEmbedding, LinearScalingRotaryEmb
 from gllm.layers.attention import FlashAttention
 from gllm.input_data import InputData
 from gllm.layers.sampler import Sampler
-from gllm.dist_utils import get_pp_layers, get_pp_rank, get_pp_size
+from gllm.dist_utils import get_pp_num_layers, get_pp_layers, get_pp_rank, get_pp_size
 
 
 class LlamaMLP(nn.Module):
@@ -148,7 +148,7 @@ class LlamaForCausalLM(nn.Module):
     def __init__(self, model_config: dict):
         super().__init__()
         self.max_model_len = model_config['max_position_embeddings']
-        self.num_layers = model_config['num_hidden_layers'] // get_pp_size()
+        self.num_layers = get_pp_num_layers(model_config['num_hidden_layers'])
         self.dtype = model_config['torch_dtype']
         self.num_kv_heads = model_config['num_key_value_heads']
         self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
@@ -204,7 +204,7 @@ class LlamaForCausalLM(nn.Module):
             # resolve PP layer
             if 'layers' in k:
                 k_list = k.split('.')
-                k_list[2] = str(int(k_list[2])+get_pp_rank()*self.num_layers)
+                k_list[2] = str(int(k_list[2])+self.model.start_layer)
                 k = '.'.join(k_list)
             if k.find('self_attn.qkv_proj') != -1:
                 v.data[:num_attn_heads*head_dim, :] = weights[k.replace(

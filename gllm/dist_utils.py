@@ -63,5 +63,18 @@ def init_dist(pp_size, pp_rank, device_size, device_rank, master_addr, master_po
 
 def get_pp_layers(num_layers):
     assert num_layers % get_pp_size() == 0
-    num_layers_pp = num_layers // get_pp_size()
-    return num_layers_pp * get_pp_rank(), num_layers_pp * (get_pp_rank()+1)
+    # elapsed time for last stage ususally longer, so we add 1 
+    num_layers_pp = num_layers // get_pp_size() + 1
+    if get_pp_rank() != get_pp_size() - 1:
+        return num_layers_pp * get_pp_rank(), num_layers_pp * (get_pp_rank()+1)
+    else:
+        return num_layers_pp * get_pp_rank(), num_layers
+
+def get_pp_num_layers(num_layers):
+    assert num_layers % get_pp_size() == 0
+    # elapsed time for last stage ususally longer, so we add 1
+    num_layers_pp = num_layers // get_pp_size() + 1
+    if get_pp_rank() != get_pp_size() - 1:
+        return num_layers_pp
+    else:
+        return num_layers_pp - get_pp_size()
