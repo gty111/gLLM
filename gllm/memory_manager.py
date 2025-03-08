@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.distributed as dist
 
@@ -6,11 +7,14 @@ from logger import logger
 
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
+from gllm.dist_utils import get_pp_size, get_pp_rank
+from gllm.utils import mp_sync
 
 
 class MemoryManager():
     def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype, 
-                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int):
+                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int,
+                 interleaved_pp:bool, mp_share_nums):
         '''
         num_layers: number of hidden layers
         page_size: number of tokens in a page
@@ -24,16 +28,32 @@ class MemoryManager():
         self.dtype = dtype
         self.vocab_size = vocab_size
 
-        free_mem_size, _ = torch.cuda.mem_get_info()
-        num_max_pages = free_mem_size // (
-            2*num_layers*page_size*kv_head_num*kv_head_dim*2)
-        num_pages = int(num_max_pages * gpu_memory_util)
-        
-        num_pages_all = [None for _ in range(dist.get_world_size())]
-        dist.all_gather_object(num_pages_all, num_pages)
-        self.num_pages = min(num_pages_all)
-        
-        if dist.get_rank() == 0:
+        if mp_share_nums is None or not interleaved_pp:
+            free_mem_size, _ = torch.cuda.mem_get_info()
+            num_max_pages = free_mem_size // (
+                2*num_layers*page_size*kv_head_num*kv_head_dim*2)
+            num_pages = int(num_max_pages * gpu_memory_util)
+            num_pages_all = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(num_pages_all, num_pages)
+            self.num_pages = min(num_pages_all)
+        else:
+            '''
+            when using interleaved PP, two distinct NCCL groups init, so we 
+            need mp_share_nums to swap num_pages and sync
+            '''
+            mp_share_nums[get_pp_rank()] = -1
+            mp_sync(mp_share_nums,0)
+
+            free_mem_size, _ = torch.cuda.mem_get_info()
+            num_max_pages = free_mem_size // (
+                2*num_layers*page_size*kv_head_num*kv_head_dim*2)
+            num_pages = int(num_max_pages * gpu_memory_util)
+            mp_share_nums[get_pp_rank()] = num_pages
+            mp_sync(mp_share_nums,-1)
+            
+            self.num_pages = min(mp_share_nums)//2
+            
+        if get_pp_rank() == 0:
             logger.info(f'Allocate {self.num_pages} pages')
 
         self.segments = [

@@ -1,6 +1,5 @@
 import torch
 import time
-import torch.distributed as dist
 
 from transformers import AutoTokenizer
 
@@ -8,6 +7,7 @@ from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
+from gllm.dist_utils import get_pp_rank, get_pp_size
 
 
 class ModelRunner():
@@ -25,14 +25,14 @@ class ModelRunner():
         self.model = None
         self.memory_manager = None
     
-    def init(self):
+    def init(self, mp_share_nums=None, interleaved_pp=False):
         self.model = self.model_loader.load_model()
-        
         memory_manager_cls = PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util, num_layers=self.model.num_layers, 
             dtype=self.model.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads, 
-            kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size)
+            kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size,
+            interleaved_pp=interleaved_pp, mp_share_nums=mp_share_nums)
 
     def tokenize(self, content, chat:bool=False):
         if chat:
@@ -43,15 +43,9 @@ class ModelRunner():
     @torch.inference_mode()
     def step_once(self, input_data:InputData=None, hidden_states=None, residual=None):
         output = self.model(input_data, hidden_states, residual)
-        if dist.get_rank() == dist.get_world_size() - 1:
+        if get_pp_rank() == get_pp_size() - 1:
             logits = self.model.compute_logits(input_data, output)
             next_tokens = self.model.sample(input_data, logits)
-            # assert len(next_tokens) == len(schedulerOutput.schedule_lists)
-            # for idx,seq in enumerate(schedulerOutput.schedule_lists):
-            #     seq.token_ids.append(next_tokens[idx])
-            #     seq.computed_prompt = True
-            #     if seq.is_finish():
-            #         self.memory_manager.free(seq)
             return next_tokens
         else:
             return output

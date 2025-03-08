@@ -12,14 +12,15 @@ class SchedulerOutput:
             self.computed_prompt = schedule_lists[0].computed_prompt
         else:
             self.computed_prompt = True
-        self.schedule_lists = schedule_lists
+        self.schedule_lists = schedule_lists # schedule process => gpu process
+        self.free_ids = [] # gpu process => schedule process
 
 # Only used for decode
 class DeltaSchedulerOutput:
-    def __init__(self, free_indices: List[int], delta_schedule_list: List[int]):
-        self.free_indices = free_indices # gpu process => schedule process
+    def __init__(self, free_ids: List[int], delta_schedule_list: List[int]):
+        self.free_ids = free_ids # gpu process => schedule process
         self.delta_schedule_list = delta_schedule_list # schedule process => gpu process
-
+        self.act_schedule_ids = [] # gpu process => schedule process
 
 class Scheduler:
     def __init__(self, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float,
@@ -28,7 +29,7 @@ class Scheduler:
         self.decode_lists: List[Sequence] = []  # seqs to decode
         self.finish_lists: List[Sequence] = []  # seqs finished
 
-        self.decode_batch = SchedulerOutput([])
+        self.decode_batch = dict() # seqs under decoding (seq_id => seq)
         self.delta_scheduler_output = DeltaSchedulerOutput([], [])
 
         self.max_decode_seqs = max_decode_seqs
@@ -64,7 +65,7 @@ class Scheduler:
             logger.info(
                 '#wait: %4d #decode: %4d memory_util: %2.2f %%'
                 % (len(self.prompt_lists),
-                   len(self.decode_lists) + len(self.decode_batch.schedule_lists),
+                   len(self.decode_lists) + len(self.decode_batch),
                    self.get_memory_util()))
 
         self.num_free_pages = num_free_pages
@@ -95,16 +96,16 @@ class Scheduler:
         else:
             if not self.schedule_decode:
                 return DeltaSchedulerOutput([],[])
-            assert self.num_free_pages*self.page_size > len(self.decode_batch.schedule_lists)
+            assert self.num_free_pages*self.page_size > len(self.decode_batch)
 
             delta_batch_size = min(self.num_free_pages*self.page_size, self.max_decode_seqs -
-                                len(self.decode_batch.schedule_lists), len(self.decode_lists))
+                                len(self.decode_batch), len(self.decode_lists))
             self.delta_scheduler_output.delta_schedule_list = self.decode_lists[:delta_batch_size]
-            self.decode_batch.schedule_lists.extend(
-                self.delta_scheduler_output.delta_schedule_list)
+            for seq in self.delta_scheduler_output.delta_schedule_list:
+                self.decode_batch[seq.seq_id] = seq
             self.decode_lists = self.decode_lists[delta_batch_size:]
 
-            assert (len(self.decode_batch.schedule_lists) +
+            assert (len(self.decode_batch) +
                     delta_batch_size != 0 or self.num_schedule_prefill) and "Try to increase ratio_threshold_free_pages"
             # we only schedule decode when GPU has stepped once on last decode batch
             if not len(self.delta_scheduler_output.delta_schedule_list) == 0:
@@ -124,31 +125,30 @@ class Scheduler:
                     self.decode_lists.append(seq)
         else:
             if isinstance(schedulerOutput, SchedulerOutput):  # prefill
-                for idx in schedulerOutput.free_indices:
-                    self.finish_lists.append(schedulerOutput.schedule_lists[idx])
-                keep_indices = list(set(range(len(schedulerOutput.schedule_lists)))-set(schedulerOutput.free_indices))
-                for idx in keep_indices:
-                    self.decode_lists.append(schedulerOutput.schedule_lists[idx])
+                for seq in schedulerOutput.schedule_lists:
+                    if seq.seq_id in schedulerOutput.free_ids:
+                        self.finish_lists.append(seq)
+                    else:
+                        self.decode_lists.append(seq)
                 self.num_schedule_prefill -= 1
             elif isinstance(schedulerOutput, DeltaSchedulerOutput):  # decode
                 self.schedule_decode = True
-                for i in schedulerOutput.free_indices:
-                    self.finish_lists.append(self.decode_batch.schedule_lists[i])
-                keep_indices = list(set(range(len(self.decode_batch.schedule_lists)))-set(schedulerOutput.free_indices))
-                self.decode_batch.schedule_lists = [
-                    self.decode_batch.schedule_lists[i] for i in keep_indices]
-                keep_indices_token = list(set(range(len(next_tokens)))-set(schedulerOutput.free_indices))
-                for i,idx in enumerate(keep_indices_token):
-                    self.decode_batch.schedule_lists[i].token_ids.append(next_tokens[idx])
+                for i in schedulerOutput.free_ids:
+                    self.finish_lists.append(self.decode_batch.pop(i))
+                for idx,i in enumerate(schedulerOutput.act_schedule_ids):
+                    if i in self.decode_batch:
+                        self.decode_batch[i].token_ids.append(next_tokens[idx])
+            else:
+                assert 0
 
     def can_schedule_prefill(self):
         return len(self.prompt_lists) != 0 and self.num_free_pages > self.num_threshold_free_pages
 
     def has_scheduled_seqs(self):
-        return self.can_schedule_prefill() or len(self.decode_lists) + len(self.decode_batch.schedule_lists) != 0
+        return self.can_schedule_prefill() or len(self.decode_lists) + len(self.decode_batch) != 0
 
     def has_seqs(self):
-        return len(self.prompt_lists) + len(self.decode_lists) + len(self.decode_batch.schedule_lists) != 0 or self.num_schedule_prefill != 0
+        return len(self.prompt_lists) + len(self.decode_lists) + len(self.decode_batch) != 0 or self.num_schedule_prefill != 0
 
     def get_memory_util(self):
         return round((self.total_num_free_pages - self.num_free_pages)*100 / self.total_num_free_pages, 2)

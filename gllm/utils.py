@@ -2,6 +2,7 @@ import asyncio
 import uuid
 import torch
 import zmq
+import time
 
 from functools import partial
 from typing import Awaitable, Callable, ParamSpec, TypeVar, Union
@@ -54,3 +55,15 @@ def make_socket(ctx, ipc_path: str, type):
         return socket
     else:
         assert 0
+
+def mp_sync(mp_share_obj,init_num):
+    while True:
+        wait = False
+        for i in mp_share_obj:
+            if i==init_num:
+                wait = True
+                break
+        if wait:
+            time.sleep(1)
+        else:
+            break
