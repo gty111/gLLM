@@ -50,7 +50,7 @@ class ModelLoader():
         if len(weights) != 0:
             return weights
 
-        return None
+        assert 0
         
     def post_process_config(self):
         if self.architecture == 'ChatGLMModel':
