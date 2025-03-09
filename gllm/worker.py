@@ -56,6 +56,7 @@ class Worker:
             self.seqs_to_schedule = []
             # running batch 
             self.batch_running = deque()
+            self.num_running_seqs = 0
             # GPU pp rank 0 => other GPU ranks : batched seqs
             self.gpu_schedule_socket = []
             for i in range(1,self.pp_size):
@@ -156,9 +157,7 @@ class Worker:
     # PP schedule
     def schedule(self):
         # to_schedule_list => schedule_list (ref already_schedule_queue)
-        num_total_seqs = len(self.seqs_to_schedule)
-        for schedulerOutput,schedule_list in self.batch_running:
-            num_total_seqs += len(schedule_list)
+        num_total_seqs = len(self.seqs_to_schedule) + self.num_running_seqs
         
         if num_total_seqs <= self.pp_size or self.pp_size == 1:
             cur_schedule_list = self.seqs_to_schedule
@@ -197,6 +196,7 @@ class Worker:
             seqs_bytes = pickle.dumps(act_schedule_list)
             for i in range(1,self.pp_size):
                 self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
+            self.num_running_seqs += len(act_schedule_list)
             self.batch_running.append((schedulerOutput, act_schedule_list))
             output = self.model_runner.step_once(input_data)
             
@@ -216,8 +216,8 @@ class Worker:
         
         if next_tokens is not None:
             schedulerOutput, act_schedule_list = self.batch_running.popleft()
+            self.num_running_seqs -= len(act_schedule_list)
             assert len(next_tokens) == len(act_schedule_list)
-            keep_indices = []
             free_ids = []
             for idx, seq in enumerate(act_schedule_list):
                 seq.computed_prompt = True
@@ -226,9 +226,7 @@ class Worker:
                     free_ids.append(seq.seq_id)
                     self.model_runner.memory_manager.free(seq)
                 else:
-                    keep_indices.append(idx)
-                    
-            self.seqs_to_schedule.extend([act_schedule_list[i] for i in keep_indices])
+                    self.seqs_to_schedule.append(seq)
             
             schedulerOutput.free_ids = free_ids
             schedulerOutput.act_schedule_ids = [seq.seq_id for seq in act_schedule_list]
