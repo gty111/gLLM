@@ -72,7 +72,8 @@ class Scheduler:
 
         # prompt
         if len(self.prompt_lists) != 0 and (
-                self.num_free_pages > self.num_threshold_free_pages) and (not delta or delta and self.num_schedule_prefill <= self.pp_size):
+                self.num_free_pages > self.num_threshold_free_pages) and (
+                    not delta or delta and self.num_schedule_prefill <= self.pp_size + 1): # plus 1 can overlap schedule and execution
             prefill_schedule_lists: List[Sequence] = []
             cu_seqs_len = 0
             for seq in self.prompt_lists:
