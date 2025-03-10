@@ -14,7 +14,7 @@ class SchedulerOutput:
 
 # Only used for decode
 class DeltaSchedulerOutput:
-    def __init__(self, free_ids: List[int], delta_schedule_list: List[int]):
+    def __init__(self, free_ids: List[int]):
         self.free_ids = free_ids # gpu process => schedule process
         self.act_schedule_ids = [] # gpu process => schedule process
 
@@ -35,7 +35,6 @@ class Scheduler:
 
         # only used for delta
         self.num_schedule_prefill = 0
-        self.schedule_decode = True
         
         self.total_num_free_pages = None
         self.num_free_pages = None
@@ -92,7 +91,7 @@ class Scheduler:
             self.decode_lists = self.decode_lists[decode_batch_size:]
             return SchedulerOutput(schedule_lists)
         else:
-            return DeltaSchedulerOutput([], [])
+            return DeltaSchedulerOutput([])
 
 
     def update_seqs(self, schedulerOutput:SchedulerOutput, next_tokens: List[int]=None, delta=False):
@@ -111,20 +110,18 @@ class Scheduler:
                     seq:Sequence = self.prefill_batch.pop(id)
                     seq.token_ids.append(next_tokens[idx])
                     seq.computed_prompt = True
-                    if id in schedulerOutput.free_ids:
-                        self.finish_lists.append(seq)
-                    else:
+                    if id not in schedulerOutput.free_ids:
                         self.decode_batch[id] = seq
                 self.num_schedule_prefill -= 1
             elif isinstance(schedulerOutput, DeltaSchedulerOutput):  # decode
-                self.schedule_decode = True
                 for i in schedulerOutput.free_ids:
-                    self.finish_lists.append(self.decode_batch.pop(i))
+                    self.decode_batch.pop(i)
                 for idx,i in enumerate(schedulerOutput.act_schedule_ids):
                     if i in self.decode_batch:
                         self.decode_batch[i].token_ids.append(next_tokens[idx])
             else:
                 assert 0
+            self.finish_lists.extend(schedulerOutput.free_ids)
 
     def can_schedule_prefill(self):
         return len(self.prompt_lists) != 0 and self.num_free_pages > self.num_threshold_free_pages

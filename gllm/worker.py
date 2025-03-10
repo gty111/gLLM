@@ -153,7 +153,7 @@ class Worker:
             else:
                 assert 0
         elif len(self.seqs_to_schedule) != 0:
-            schedulerOutput = DeltaSchedulerOutput([],[])
+            schedulerOutput = DeltaSchedulerOutput([])
             act_schedule_list = self.schedule()
         
         if len(act_schedule_list) != 0:
