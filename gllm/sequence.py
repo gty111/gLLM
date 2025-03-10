@@ -8,7 +8,6 @@ class Sequence():
         self.seq_id = seq_id
         self.token_ids: List[int] = token_ids
         self.prompt_len = len(token_ids)
-        self.segment_id = 0
         self.page_table = []
         self.computed_prompt = False
         self.prompt = ''
@@ -26,8 +25,9 @@ class Sequence():
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
-        # used for prefix cache
-        self.computed_page_num = 0
+        # used for prefix cache and chunked prefill
+        self.computed_token_num = 0
+        self.to_compute_token_num = 0
 
     def detokenize_inc(self, tokenizer: Optional[PreTrainedTokenizer | PreTrainedTokenizerFast]):
         added_space = ' ' if ' ' in tokenizer.decode(
@@ -43,7 +43,7 @@ class Sequence():
 
     def is_finish(self):
         if (not self.ignore_eos and self.token_ids[-1] in self.finish_tokens
-            ) or len(self.token_ids) - self.prompt_len >= self.output_len:
+                ) or len(self.token_ids) - self.prompt_len >= self.output_len:
             return True
         else:
             return False

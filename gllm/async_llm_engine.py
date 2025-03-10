@@ -10,9 +10,10 @@ from fastapi import Request
 
 from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
-from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
+from gllm.scheduler import SchedulerOutput
 from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
+
 
 class AsyncStream:
 
@@ -68,7 +69,6 @@ class AsyncLLM(LLM):
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.background_engine = None
-        
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float):
@@ -82,26 +82,11 @@ class AsyncLLM(LLM):
             self.start_background_engine()
         return stream
 
-    async def check_abort_request(self, schedulerOutput: SchedulerOutput):
-        # we only check prefill requests
-        if not schedulerOutput.computed_prompt:
-            abort_seqs = []
-            for seq in schedulerOutput.schedule_lists:
-                if await self.async_streams[seq.seq_id]._raw_request.is_disconnected():
-                    abort_seqs.append(seq)
-            for seq in abort_seqs:
-                schedulerOutput.schedule_lists.remove(seq)
-                self.scheduler.finish_lists.append(seq)
-
     async def step_async(self):
         schedulerOutput = self.scheduler.schedule(
             self.model_runner.memory_manager.get_num_free_pages(), log=True, delta=False)
-        await self.check_abort_request(schedulerOutput)
-        if len(schedulerOutput.schedule_lists) == 0:
-            self.scheduler.num_schedule_prefill -= 1
-            return
         next_tokens = await make_async(self.model_runner.step_once)(
-            InputData(schedulerOutput.schedule_lists,self.model_runner.memory_manager))
+            InputData(schedulerOutput.schedule_lists, self.model_runner.memory_manager))
         self.scheduler.update_seqs(schedulerOutput, next_tokens)
         for seq in schedulerOutput.schedule_lists:
             self.async_streams[seq.seq_id].put(
@@ -130,14 +115,7 @@ class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         logger.info('Enable pipeline schedule')
-        
-        self.interleaved_pp = kwargs['interleaved_pp']
-        kwargs.pop('interleaved_pp')
-        
-        if self.interleaved_pp:
-            logger.info('Enable interleaved PP')
-            kwargs['pp_size'] *= 2
-            
+
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -146,8 +124,7 @@ class PipeAsyncLLM(LLM):
 
         self.ctx = mp.get_context('spawn')
         self.num_free_pages = self.ctx.Value('i', 0)
-        self.mp_share_nums = self.ctx.Array('i', [0]*self.pp_size)
-        
+
         self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
         self.output_ipc_path = 'ipc:///tmp/gllm_output'
         self.token_ipc_path = 'ipc:///tmp/gllm_token'
@@ -155,7 +132,7 @@ class PipeAsyncLLM(LLM):
         logger.info(f"Launching {self.pp_size} worker(s) ...")
         for pp_rank in range(self.pp_size):
             self.start_worker(pp_rank)
-        
+
         # wait gpu engine start
         while True:
             if self.num_free_pages.value != 0:
@@ -174,38 +151,20 @@ class PipeAsyncLLM(LLM):
             self.start_schedule_engine()
         return stream
 
-    async def check_abort_request(self, schedulerOutput):
-        # we only check prefill requests
-        if isinstance(schedulerOutput, SchedulerOutput):
-            abort_seqs = []
-            for seq in schedulerOutput.schedule_lists:
-                if await self.async_streams[seq.seq_id]._raw_request.is_disconnected():
-                    abort_seqs.append(seq)
-            for seq in abort_seqs:
-                schedulerOutput.schedule_lists.remove(seq)
-                self.scheduler.finish_lists.append(seq)
-
     async def run_schedule(self, schedule_socket):
-        
+
         if not self.scheduler.has_seqs():
             self.schedule_engine = None
             return True
-        
+
         if not self.scheduler.has_scheduled_seqs():
             await asyncio.sleep(0)
             return False
-        
+
         schedulerOutput = self.scheduler.schedule(
             self.num_free_pages.value, log=True, delta=True)
 
-        # check abort requests
-        await self.check_abort_request(schedulerOutput)
-        if isinstance(schedulerOutput, SchedulerOutput) and len(schedulerOutput.schedule_lists) == 0:
-            self.scheduler.num_schedule_prefill -= 1
-            await asyncio.sleep(0)
-            return False
-        
-        if isinstance(schedulerOutput, SchedulerOutput):
+        if len(schedulerOutput.schedule_lists) != 0:
             schedule_bytes = pickle.dumps(schedulerOutput)
             schedule_socket.send(schedule_bytes, copy=False)
 
@@ -213,7 +172,8 @@ class PipeAsyncLLM(LLM):
 
     async def run_schedule_engine(self):
         zmq_ctx = zmq.Context()
-        schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
+        schedule_socket = make_socket(
+            zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
         output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PULL)
         self.scheduler.set_total_num_free_pages(self.num_free_pages.value)
         while True:
@@ -226,23 +186,15 @@ class PipeAsyncLLM(LLM):
                     schedulerOutput, next_tokens, delta=True)
                 # overlap gpu execution and output process
                 exit = await self.run_schedule(schedule_socket)
-                if isinstance(schedulerOutput, SchedulerOutput):
-                    for seq in schedulerOutput.schedule_lists:
-                        self.async_streams[seq.seq_id].put(
-                            seq.detokenize_inc(self.model_runner.tokenizer))
-                elif isinstance(schedulerOutput, DeltaSchedulerOutput):
-                    for id in schedulerOutput.act_schedule_ids:
-                        if id not in self.scheduler.decode_batch:
-                            continue
-                        seq = self.scheduler.decode_batch[id]
-                        self.async_streams[id].put(
-                            seq.detokenize_inc(self.model_runner.tokenizer))
-                else:
-                    assert 0
-                
-                for seq in self.scheduler.finish_lists:
-                    self.async_streams[seq.seq_id].finish()
-                    del self.async_streams[seq.seq_id]
+                for id in schedulerOutput.act_schedule_ids:
+                    if id in schedulerOutput.free_ids:
+                        continue
+                    seq = self.scheduler.run_batch[id]
+                    self.async_streams[id].put(
+                        seq.detokenize_inc(self.model_runner.tokenizer))
+                for id in schedulerOutput.free_ids:
+                    self.async_streams[id].finish()
+                    del self.async_streams[id]
                 self.free_finish_requests()
 
                 if exit:
@@ -250,23 +202,17 @@ class PipeAsyncLLM(LLM):
             if await self.run_schedule(schedule_socket):
                 return
             await asyncio.sleep(0)
-            
 
     def start_worker(self, pp_rank):
-        master_port = self.master_port
-        if self.interleaved_pp and pp_rank >= (self.pp_size//2):
-            master_port = str(int(master_port)+1)
         worker = Worker(self.model_runner,
-                        self.mp_share_nums,
                         self.num_free_pages,
                         pp_rank,
                         self.pp_size,
                         self.master_addr,
-                        master_port,
+                        self.master_port,
                         self.schedule_ipc_path,
                         self.output_ipc_path,
-                        self.token_ipc_path,
-                        self.interleaved_pp)
+                        self.token_ipc_path)
         self.ctx.Process(
             target=run_worker,
             args=(worker,),

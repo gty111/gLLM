@@ -46,8 +46,8 @@ class LLM():
         self.scheduler.add_requests(requests)
 
     def free_finish_requests(self):
-        for seq in self.scheduler.finish_lists:
-            self.allocatorID.free(seq.seq_id)
+        for id in self.scheduler.finish_lists:
+            self.allocatorID.free(id)
         self.scheduler.finish_lists = []
 
     def init(self):

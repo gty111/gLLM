@@ -1,4 +1,3 @@
-import time
 import torch
 import torch.distributed as dist
 
@@ -7,14 +6,13 @@ from logger import logger
 
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
-from gllm.dist_utils import get_pp_size, get_pp_rank
+from gllm.dist_utils import get_pp_rank
 from gllm.utils import mp_sync
 
 
 class MemoryManager():
-    def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype, 
-                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int,
-                 interleaved_pp:bool, mp_share_nums):
+    def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype,
+                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int):
         '''
         num_layers: number of hidden layers
         page_size: number of tokens in a page
@@ -27,13 +25,13 @@ class MemoryManager():
         self.kv_head_dim = kv_head_dim
         self.dtype = dtype
         self.vocab_size = vocab_size
-        
+
         if not dist.is_initialized():
             free_mem_size, _ = torch.cuda.mem_get_info()
             num_max_pages = free_mem_size // (
                 2*num_layers*page_size*kv_head_num*kv_head_dim*2)
             self.num_pages = int(num_max_pages * gpu_memory_util)
-        elif mp_share_nums is None or not interleaved_pp:
+        else:
             free_mem_size, _ = torch.cuda.mem_get_info()
             num_max_pages = free_mem_size // (
                 2*num_layers*page_size*kv_head_num*kv_head_dim*2)
@@ -41,61 +39,45 @@ class MemoryManager():
             num_pages_all = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(num_pages_all, num_pages)
             self.num_pages = min(num_pages_all)
-        else:
-            '''
-            when using interleaved PP, two distinct NCCL groups init, so we 
-            need mp_share_nums to swap num_pages and sync
-            '''
-            mp_share_nums[get_pp_rank()] = -1
-            mp_sync(mp_share_nums,0)
 
-            free_mem_size, _ = torch.cuda.mem_get_info()
-            num_max_pages = free_mem_size // (
-                2*num_layers*page_size*kv_head_num*kv_head_dim*2)
-            num_pages = int(num_max_pages * gpu_memory_util)
-            mp_share_nums[get_pp_rank()] = num_pages
-            mp_sync(mp_share_nums,-1)
-            
-            self.num_pages = min(mp_share_nums)//2
-            
         if get_pp_rank() == 0:
             logger.info(f'Allocate {self.num_pages} pages')
 
-        self.segments = [
-            Segment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)]
+        self.segment = Segment(self.num_layers, self.num_pages,
+                               self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)
 
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping_tensor: torch.Tensor):
         from gllm import _custom_ops as ops
         ops.reshape_and_cache_flash(k_cache,
                                     v_cache,
-                                    self.segments[0].k_cache[layer_idx],
-                                    self.segments[0].v_cache[layer_idx],
+                                    self.segment.k_cache[layer_idx],
+                                    self.segment.v_cache[layer_idx],
                                     slot_mapping_tensor)
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
-            if not seqs[0].computed_prompt:
+            if not seq.computed_prompt:
                 assert len(seq.page_table) == 0
                 num_page = (seq.prompt_len + self.page_size -
                             1) // self.page_size
                 for _ in range(num_page):
                     seq.page_table.append(
-                        self.segments[seq.segment_id].allocate())
+                        self.segment.allocate())
             else:
                 assert len(seq.page_table) != 0
                 if (len(seq.token_ids)-1) % self.page_size == 0:
                     seq.page_table.append(
-                        self.segments[seq.segment_id].allocate())
+                        self.segment.allocate())
 
     def free(self, seq: Sequence):
         for page_num in seq.page_table:
-            self.segments[seq.segment_id].free(page_num)
+            self.segment.free(page_num)
 
     def get_num_free_pages(self):
-        return self.segments[0].get_num_free_pages()
+        return self.segment.get_num_free_pages()
 
     def get_memory_util(self):
-        return self.segments[0].get_memory_util()
+        return self.segment.get_memory_util()
 
 
 class Segment():
@@ -137,43 +119,42 @@ class PrefixMemoryManager(MemoryManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        del self.segments
-        self.segments = [
-            PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)]
-
-        logger.info('Enable prefix caching')
+        del self.segment
+        self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)
 
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping_tensor: torch.Tensor):
         from gllm import _custom_ops as ops
         ops.reshape_and_cache_flash(k_cache,
                                     v_cache,
-                                    self.segments[0].k_cache[layer_idx],
-                                    self.segments[0].v_cache[layer_idx],
+                                    self.segment.k_cache[layer_idx],
+                                    self.segment.v_cache[layer_idx],
                                     slot_mapping_tensor)
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
-            if not seqs[0].computed_prompt:
+            if not seq.computed_prompt:
                 assert len(seq.page_table) == 0
                 num_page = (seq.prompt_len + self.page_size -
                             1) // self.page_size
                 computed_prefix = True
                 for i in range(num_page):
                     if computed_prefix and (i+1)*self.page_size <= len(seq.token_ids):
-                        computed_prefix, page_num = self.segments[seq.segment_id].allocate(
+                        computed_prefix, page_num = self.segment.allocate(
                             (*seq.token_ids[:(i+1)*self.page_size],))
-                        seq.computed_page_num += int(computed_prefix)
+                        seq.computed_token_num += int(
+                            computed_prefix) * self.page_size
                     elif (i+1)*self.page_size <= len(seq.token_ids):
-                        _, page_num = self.segments[seq.segment_id].allocate(
+                        _, page_num = self.segment.allocate(
                             (*seq.token_ids[:(i+1)*self.page_size],))
                     else:
-                        _, page_num = self.segments[seq.segment_id].allocate()
+                        _, page_num = self.segment.allocate()
                     seq.page_table.append(page_num)
             else:
                 assert len(seq.page_table) != 0
                 if (len(seq.token_ids)-1) % self.page_size == 0:
-                    _, page_num = self.segments[seq.segment_id].allocate()
+                    _, page_num = self.segment.allocate()
                     seq.page_table.append(page_num)
+
 
 class PrefixSegment(Segment):
     def __init__(self, *args, **kwargs):
