@@ -34,8 +34,8 @@ class FlashAttention():
         input_data.memory_manager.batch_store(
             self.layer_id, k, v, input_data.slot_mapping_tensor)
 
-        k_cache = input_data.memory_manager.segments[input_data.segment_id].k_cache[self.layer_id]
-        v_cache = input_data.memory_manager.segments[input_data.segment_id].v_cache[self.layer_id]
+        k_cache = input_data.memory_manager.segment.k_cache[self.layer_id]
+        v_cache = input_data.memory_manager.segment.v_cache[self.layer_id]
 
         out = flash_attn_varlen_func(q,
                                      k_cache,

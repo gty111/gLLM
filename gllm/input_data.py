@@ -32,19 +32,12 @@ class InputData():
         self.seqs = seqs
         self.memory_manager = memory_manager
         self.page_size = memory_manager.page_size
-        self.segment_id = seqs[0].segment_id
         self.slot_mapping_tensor = self.get_slot_mapping()
-        # print(self.slot_mapping_tensor)
         self.tokens = self.get_tokens()
-        # print(self.tokens)
         self.positions = self.get_position()
-        # print(self.positions)
         self.max_seq_len, self.seq_start_loc = self.get_seq_len_loc()
-        # print(self.max_seq_len, self.seq_start_loc)
         self.block_table = self.get_block_table()
-        # print(self.block_table)
         self.max_query_len, self.query_start_loc = self.get_query_len_loc()
-        # print(self.max_query_len, self.query_start_loc)
 
         assert self.tokens.shape == self.positions.shape
 
