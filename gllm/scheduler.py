@@ -8,10 +8,6 @@ from gllm.sequence import Sequence
 
 class SchedulerOutput:
     def __init__(self, schedule_lists: List[Sequence]):
-        if not len(schedule_lists) == 0:
-            self.computed_prompt = schedule_lists[0].computed_prompt
-        else:
-            self.computed_prompt = True
         self.schedule_lists = schedule_lists # schedule process => gpu process
         self.free_ids = [] # gpu process => schedule process
         self.act_schedule_ids = [] # gpu process => schedule process

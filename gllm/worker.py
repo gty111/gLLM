@@ -221,6 +221,8 @@ class Worker:
             free_ids = []
             for idx, seq in enumerate(act_schedule_list):
                 seq.computed_prompt = True
+                seq.computed_token_num += seq.to_compute_token_num
+                seq.to_compute_token_num = 1
                 seq.token_ids.append(next_tokens[idx])
                 if seq.is_finish():
                     free_ids.append(seq.seq_id)

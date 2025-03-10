@@ -179,15 +179,9 @@ class LlamaForCausalLM(nn.Module):
         return self.model(input_data, hidden_states, residual)
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
-        if input_data.computed_prompt:
-            return self.lm_head(hidden_states)
-        else:
-            # fetch hidden_states of last token in each seq
-            if input_data.prefix_prefill:
-                idx_list = input_data.query_start_loc - 1
-            else:
-                idx_list = input_data.seq_start_loc - 1
-            return self.lm_head(hidden_states[idx_list[1:]])
+        # fetch hidden_states of last token in each seq
+        idx_list = input_data.query_start_loc - 1
+        return self.lm_head(hidden_states[idx_list[1:]])
 
     def sample(self, input_data: InputData, logits: torch.Tensor):
         return self.sampler.forward(logits, input_data)

@@ -82,24 +82,9 @@ class AsyncLLM(LLM):
             self.start_background_engine()
         return stream
 
-    async def check_abort_request(self, schedulerOutput: SchedulerOutput):
-        # we only check prefill requests
-        if not schedulerOutput.computed_prompt:
-            abort_seqs = []
-            for seq in schedulerOutput.schedule_lists:
-                if await self.async_streams[seq.seq_id]._raw_request.is_disconnected():
-                    abort_seqs.append(seq)
-            for seq in abort_seqs:
-                schedulerOutput.schedule_lists.remove(seq)
-                self.scheduler.finish_lists.append(seq)
-
     async def step_async(self):
         schedulerOutput = self.scheduler.schedule(
             self.model_runner.memory_manager.get_num_free_pages(), log=True, delta=False)
-        await self.check_abort_request(schedulerOutput)
-        if len(schedulerOutput.schedule_lists) == 0:
-            self.scheduler.num_schedule_prefill -= 1
-            return
         next_tokens = await make_async(self.model_runner.step_once)(
             InputData(schedulerOutput.schedule_lists,self.model_runner.memory_manager))
         self.scheduler.update_seqs(schedulerOutput, next_tokens)
@@ -174,17 +159,6 @@ class PipeAsyncLLM(LLM):
             self.start_schedule_engine()
         return stream
 
-    async def check_abort_request(self, schedulerOutput):
-        # we only check prefill requests
-        if isinstance(schedulerOutput, SchedulerOutput):
-            abort_seqs = []
-            for seq in schedulerOutput.schedule_lists:
-                if await self.async_streams[seq.seq_id]._raw_request.is_disconnected():
-                    abort_seqs.append(seq)
-            for seq in abort_seqs:
-                schedulerOutput.schedule_lists.remove(seq)
-                self.scheduler.finish_lists.append(seq)
-
     async def run_schedule(self, schedule_socket):
         
         if not self.scheduler.has_seqs():
@@ -197,13 +171,6 @@ class PipeAsyncLLM(LLM):
         
         schedulerOutput = self.scheduler.schedule(
             self.num_free_pages.value, log=True, delta=True)
-
-        # check abort requests
-        await self.check_abort_request(schedulerOutput)
-        if isinstance(schedulerOutput, SchedulerOutput) and len(schedulerOutput.schedule_lists) == 0:
-            self.scheduler.num_schedule_prefill -= 1
-            await asyncio.sleep(0)
-            return False
         
         if isinstance(schedulerOutput, SchedulerOutput):
             schedule_bytes = pickle.dumps(schedulerOutput)

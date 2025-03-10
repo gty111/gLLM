@@ -1,5 +1,6 @@
 import torch
 import time
+from logger import logger
 
 from transformers import AutoTokenizer
 
@@ -16,6 +17,8 @@ class ModelRunner():
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
         self.enable_prefix_caching = enable_prefix_caching
+        if self.enable_prefix_caching:
+            logger.info('Enable prefix caching')
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size
         self.tokenizer = AutoTokenizer.from_pretrained(
