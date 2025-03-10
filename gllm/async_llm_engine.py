@@ -10,9 +10,10 @@ from fastapi import Request
 
 from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
-from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
+from gllm.scheduler import SchedulerOutput
 from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
+
 
 class AsyncStream:
 
@@ -68,7 +69,6 @@ class AsyncLLM(LLM):
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.background_engine = None
-        
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float):
@@ -86,7 +86,7 @@ class AsyncLLM(LLM):
         schedulerOutput = self.scheduler.schedule(
             self.model_runner.memory_manager.get_num_free_pages(), log=True, delta=False)
         next_tokens = await make_async(self.model_runner.step_once)(
-            InputData(schedulerOutput.schedule_lists,self.model_runner.memory_manager))
+            InputData(schedulerOutput.schedule_lists, self.model_runner.memory_manager))
         self.scheduler.update_seqs(schedulerOutput, next_tokens)
         for seq in schedulerOutput.schedule_lists:
             self.async_streams[seq.seq_id].put(
@@ -115,7 +115,7 @@ class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         logger.info('Enable pipeline schedule')
-            
+
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -124,7 +124,7 @@ class PipeAsyncLLM(LLM):
 
         self.ctx = mp.get_context('spawn')
         self.num_free_pages = self.ctx.Value('i', 0)
-        
+
         self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
         self.output_ipc_path = 'ipc:///tmp/gllm_output'
         self.token_ipc_path = 'ipc:///tmp/gllm_token'
@@ -132,7 +132,7 @@ class PipeAsyncLLM(LLM):
         logger.info(f"Launching {self.pp_size} worker(s) ...")
         for pp_rank in range(self.pp_size):
             self.start_worker(pp_rank)
-        
+
         # wait gpu engine start
         while True:
             if self.num_free_pages.value != 0:
@@ -152,19 +152,19 @@ class PipeAsyncLLM(LLM):
         return stream
 
     async def run_schedule(self, schedule_socket):
-        
+
         if not self.scheduler.has_seqs():
             self.schedule_engine = None
             return True
-        
+
         if not self.scheduler.has_scheduled_seqs():
             await asyncio.sleep(0)
             return False
-        
+
         schedulerOutput = self.scheduler.schedule(
             self.num_free_pages.value, log=True, delta=True)
-        
-        if isinstance(schedulerOutput, SchedulerOutput):
+
+        if len(schedulerOutput.schedule_lists) != 0:
             schedule_bytes = pickle.dumps(schedulerOutput)
             schedule_socket.send(schedule_bytes, copy=False)
 
@@ -172,7 +172,8 @@ class PipeAsyncLLM(LLM):
 
     async def run_schedule_engine(self):
         zmq_ctx = zmq.Context()
-        schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
+        schedule_socket = make_socket(
+            zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
         output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PULL)
         self.scheduler.set_total_num_free_pages(self.num_free_pages.value)
         while True:
@@ -188,7 +189,7 @@ class PipeAsyncLLM(LLM):
                 for id in schedulerOutput.act_schedule_ids:
                     if id in schedulerOutput.free_ids:
                         continue
-                    seq = self.scheduler.decode_batch[id]
+                    seq = self.scheduler.run_batch[id]
                     self.async_streams[id].put(
                         seq.detokenize_inc(self.model_runner.tokenizer))
                 for id in schedulerOutput.free_ids:
@@ -201,7 +202,6 @@ class PipeAsyncLLM(LLM):
             if await self.run_schedule(schedule_socket):
                 return
             await asyncio.sleep(0)
-            
 
     def start_worker(self, pp_rank):
         worker = Worker(self.model_runner,

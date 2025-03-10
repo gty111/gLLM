@@ -11,7 +11,7 @@ from gllm.input_data import InputData
 from gllm.sequence import Sequence
 from gllm.model_runner import ModelRunner
 from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
-from gllm.scheduler import SchedulerOutput, DeltaSchedulerOutput
+from gllm.scheduler import SchedulerOutput
 from gllm.utils import make_socket
 
 # Used with PipeAsyncLLM
@@ -147,13 +147,9 @@ class Worker:
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput = pickle.loads(recv_bytes)
-            
-            if isinstance(schedulerOutput, SchedulerOutput):
-                act_schedule_list = schedulerOutput.schedule_lists
-            else:
-                assert 0
+            act_schedule_list = schedulerOutput.schedule_lists
         elif len(self.seqs_to_schedule) != 0:
-            schedulerOutput = DeltaSchedulerOutput([])
+            schedulerOutput = SchedulerOutput([])
             act_schedule_list = self.schedule()
         
         if len(act_schedule_list) != 0:
@@ -197,9 +193,8 @@ class Worker:
             
             schedulerOutput.free_ids = free_ids
             schedulerOutput.act_schedule_ids = [seq.seq_id for seq in act_schedule_list]
-            if isinstance(schedulerOutput, SchedulerOutput):
-                # avoid send abundant info
-                schedulerOutput.schedule_lists = []
+            # avoid send abundant info
+            schedulerOutput.schedule_lists = []
             output_bytes = pickle.dumps((schedulerOutput, next_tokens))
             self.output_socket.send(output_bytes, copy=False)
  
