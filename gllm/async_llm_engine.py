@@ -115,13 +115,6 @@ class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         logger.info('Enable pipeline schedule')
-        
-        self.interleaved_pp = kwargs['interleaved_pp']
-        kwargs.pop('interleaved_pp')
-        
-        if self.interleaved_pp:
-            logger.info('Enable interleaved PP')
-            kwargs['pp_size'] *= 2
             
         super().__init__(*args, **kwargs)
 
@@ -131,7 +124,6 @@ class PipeAsyncLLM(LLM):
 
         self.ctx = mp.get_context('spawn')
         self.num_free_pages = self.ctx.Value('i', 0)
-        self.mp_share_nums = self.ctx.Array('i', [0]*self.pp_size)
         
         self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
         self.output_ipc_path = 'ipc:///tmp/gllm_output'
@@ -220,20 +212,15 @@ class PipeAsyncLLM(LLM):
             
 
     def start_worker(self, pp_rank):
-        master_port = self.master_port
-        if self.interleaved_pp and pp_rank >= (self.pp_size//2):
-            master_port = str(int(master_port)+1)
         worker = Worker(self.model_runner,
-                        self.mp_share_nums,
                         self.num_free_pages,
                         pp_rank,
                         self.pp_size,
                         self.master_addr,
-                        master_port,
+                        self.master_port,
                         self.schedule_ipc_path,
                         self.output_ipc_path,
-                        self.token_ipc_path,
-                        self.interleaved_pp)
+                        self.token_ipc_path)
         self.ctx.Process(
             target=run_worker,
             args=(worker,),

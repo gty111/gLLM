@@ -108,11 +108,11 @@ class Scheduler:
         else:
             if isinstance(schedulerOutput, SchedulerOutput):  # prefill
                 for idx, id in enumerate(schedulerOutput.act_schedule_ids):
-                    seq:Sequence = self.prefill_batch[id]
+                    seq:Sequence = self.prefill_batch.pop(id)
                     seq.token_ids.append(next_tokens[idx])
                     seq.computed_prompt = True
                     if id in schedulerOutput.free_ids:
-                        self.finish_lists.append(self.prefill_batch.pop(id))
+                        self.finish_lists.append(seq)
                     else:
                         self.decode_batch[id] = seq
                 self.num_schedule_prefill -= 1
