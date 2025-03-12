@@ -26,7 +26,7 @@ class RotaryEmbedding(nn.Module):
 
         cache = self._compute_cos_sin_cache()
 
-        cache = cache.to(dtype)
+        cache = cache.to(dtype=dtype,device='cuda')
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base):
@@ -64,8 +64,6 @@ class RotaryEmbedding(nn.Module):
     ):
         from gllm import _custom_ops as ops
 
-        self.cos_sin_cache = self.cos_sin_cache.to(positions.device,
-                                                   dtype=query.dtype)
         # ops.rotary_embedding()/batched_rotary_embedding()
         # are in-place operations that update the query and key tensors.
         if offsets is not None:

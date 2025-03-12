@@ -154,9 +154,10 @@ class Worker:
         
         if len(act_schedule_list) != 0:
             input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
-            seqs_bytes = pickle.dumps(act_schedule_list)
-            for i in range(1,self.pp_size):
-                self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
+            if self.pp_size > 1:
+                seqs_bytes = pickle.dumps(act_schedule_list)
+                for i in range(1,self.pp_size):
+                    self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
             self.num_running_seqs += len(act_schedule_list)
             self.batch_running.append((schedulerOutput, act_schedule_list))
             output = self.model_runner.step_once(input_data)
