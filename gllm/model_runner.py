@@ -60,6 +60,8 @@ class ModelRunner():
         prefill_start = time.time()
         next_token = self.step_once(InputData([seq],self.memory_manager))[0]
         seq.token_ids.append(next_token)
+        seq.computed_token_num += seq.to_compute_token_num
+        seq.to_compute_token_num = 1
         prefill_end = time.time()
         # ----prefill end-----
 
@@ -70,6 +72,7 @@ class ModelRunner():
             if seq.is_finish():
                 break
             next_token = self.step_once(InputData([seq], self.memory_manager))[0]
+            seq.computed_token_num += seq.to_compute_token_num
             seq.token_ids.append(next_token)
         print("\n")
         decode_end = time.time()

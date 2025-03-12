@@ -71,10 +71,14 @@ class Scheduler:
                     cu_seqs_len += len(seq.token_ids)
                     prefill_schedule_lists.append(seq)
                     self.num_free_pages -= len(seq.token_ids) // self.page_size
-            for seq in prefill_schedule_lists:
-                self.prompt_lists.remove(seq)
-                self.run_batch[seq.seq_id] = seq
-            self.num_schedule += 1
+            if delta:
+                for seq in prefill_schedule_lists:
+                    self.prompt_lists.remove(seq)
+                    self.run_batch[seq.seq_id] = seq
+                self.num_schedule += 1
+            else:
+                for seq in prefill_schedule_lists:
+                    self.prompt_lists.remove(seq)
             return SchedulerOutput(prefill_schedule_lists, True)
 
         # decode
@@ -91,8 +95,10 @@ class Scheduler:
         if not delta:
             for idx, seq in enumerate(schedulerOutput.schedule_lists):
                 seq.token_ids.append(next_tokens[idx])
+                seq.computed_token_num += seq.to_compute_token_num
+                seq.to_compute_token_num = 1
                 if seq.is_finish():
-                    self.finish_lists.append(seq)
+                    self.finish_lists.append(seq.seq_id)
                 else:
                     self.decode_lists.append(seq)
         else:

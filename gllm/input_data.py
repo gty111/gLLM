@@ -11,8 +11,7 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 class InputData():
     def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
-        if len(seqs) == 0:
-            return
+        assert len(seqs) != 0
         if get_pp_rank() == get_pp_size() - 1:
             self.temperature = async_tensor_h2d(
                 [seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], memory_manager.dtype, 'cuda', True)
