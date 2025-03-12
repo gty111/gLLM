@@ -212,7 +212,6 @@ async def user_request(request_func,
             prompt_len=request[1],
             output_len=request[2],
             best_of=best_of,
-            use_beam_search=use_beam_search,
         )
         cur_task = asyncio.create_task(
             request_func(request_func_input=request_func_input,

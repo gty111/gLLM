@@ -33,6 +33,10 @@ class LLM():
             logger.warning(
                 f'Ignore seq due to the length({max_seq_length}) exceeds max model len({self.model_runner.model.max_model_len})')
             return False
+        elif len(token_ids) > self.scheduler.max_batch_tokens:
+            logger.warning(
+                f'Ignore seq due to the prompt length({len(token_ids)}) exceeds max batch tokens({self.scheduler.max_batch_tokens})')
+            return False
         else:
             return True
 

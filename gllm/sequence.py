@@ -9,7 +9,6 @@ class Sequence():
         self.token_ids: List[int] = token_ids
         self.prompt_len = len(token_ids)
         self.page_table = []
-        self.computed_prompt = False
         self.prompt = ''
         self.output = ''
         self.ignore_eos = ignore_eos

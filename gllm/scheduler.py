@@ -7,7 +7,8 @@ from gllm.sequence import Sequence
 
 
 class SchedulerOutput:
-    def __init__(self, schedule_lists: List[Sequence]):
+    def __init__(self, schedule_lists: List[Sequence],from_main_process=False):
+        self.from_main_process = from_main_process
         self.schedule_lists = schedule_lists  # schedule process => gpu process
         self.free_ids = []  # gpu process => schedule process
         self.act_schedule_ids = []  # gpu process => schedule process
@@ -26,8 +27,7 @@ class Scheduler:
         self.ratio_threshold_free_pages = ratio_threshold_free_pages
         self.num_threshold_free_pages = None
 
-        # only used for delta
-        self.num_schedule_prefill = 0
+        self.num_schedule = 0
 
         self.total_num_free_pages = None
         self.num_free_pages = None
@@ -62,7 +62,7 @@ class Scheduler:
         # prompt
         if len(self.prompt_lists) != 0 and (
                 self.num_free_pages > self.num_threshold_free_pages) and (
-                    not delta or delta and self.num_schedule_prefill <= self.pp_size + 1):  # plus 1 can overlap schedule and execution
+                    not delta or delta and self.num_schedule <= self.pp_size + 1):  # plus 1 can overlap schedule and execution
             prefill_schedule_lists: List[Sequence] = []
             cu_seqs_len = 0
             for seq in self.prompt_lists:
@@ -74,8 +74,8 @@ class Scheduler:
             for seq in prefill_schedule_lists:
                 self.prompt_lists.remove(seq)
                 self.run_batch[seq.seq_id] = seq
-            self.num_schedule_prefill += 1
-            return SchedulerOutput(prefill_schedule_lists)
+            self.num_schedule += 1
+            return SchedulerOutput(prefill_schedule_lists, True)
 
         # decode
         if not delta:
@@ -91,19 +91,15 @@ class Scheduler:
         if not delta:
             for idx, seq in enumerate(schedulerOutput.schedule_lists):
                 seq.token_ids.append(next_tokens[idx])
-                if not seq.computed_prompt:
-                    seq.computed_prompt = True
                 if seq.is_finish():
                     self.finish_lists.append(seq)
                 else:
                     self.decode_lists.append(seq)
         else:
-            # workaround for checking prefill or decode 
-            if not self.run_batch[schedulerOutput.act_schedule_ids[0]].computed_prompt: 
-                self.num_schedule_prefill -= 1
+            if schedulerOutput.from_main_process:
+                self.num_schedule -= 1
             for idx, id in enumerate(schedulerOutput.act_schedule_ids):
                 seq: Sequence = self.run_batch[id]
-                seq.computed_prompt = True
                 if id in schedulerOutput.free_ids:
                     self.run_batch.pop(id)
                 else:
@@ -117,7 +113,7 @@ class Scheduler:
         return self.can_schedule_prefill() or len(self.decode_lists) + len(self.run_batch) != 0
 
     def has_seqs(self):
-        return len(self.prompt_lists) + len(self.decode_lists) + len(self.run_batch) != 0 or self.num_schedule_prefill != 0
+        return len(self.prompt_lists) + len(self.decode_lists) + len(self.run_batch) != 0 or self.num_schedule != 0
 
     def get_memory_util(self):
         return round((self.total_num_free_pages - self.num_free_pages)*100 / self.total_num_free_pages, 2)

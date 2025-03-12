@@ -60,7 +60,6 @@ class ModelRunner():
         prefill_start = time.time()
         next_token = self.step_once(InputData([seq],self.memory_manager))[0]
         seq.token_ids.append(next_token)
-        seq.computed_prompt = True
         prefill_end = time.time()
         # ----prefill end-----
 

@@ -95,6 +95,9 @@ class InputData():
                 page_idx = i // self.page_size
                 slot_idx = i % self.page_size
                 slot_mapping.append(seq.page_table[page_idx]*self.page_size+slot_idx)
+                # for now we only update decode page
+                if isinstance(self.memory_manager, PrefixMemoryManager) and seq.to_compute_token_num == 1 and slot_idx==self.page_size-1:
+                    self.memory_manager.segment.update((*seq.token_ids[-self.page_size:],),seq.page_table[page_idx])
 
         return async_tensor_h2d(
             slot_mapping, torch.int64, 'cuda', True)

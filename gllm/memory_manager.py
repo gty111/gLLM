@@ -56,18 +56,10 @@ class MemoryManager():
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
-            if not seq.computed_prompt:
-                assert len(seq.page_table) == 0
-                num_page = (seq.prompt_len + self.page_size -
-                            1) // self.page_size
-                for _ in range(num_page):
-                    seq.page_table.append(
-                        self.segment.allocate())
-            else:
-                assert len(seq.page_table) != 0
-                if (len(seq.token_ids)-1) % self.page_size == 0:
-                    seq.page_table.append(
-                        self.segment.allocate())
+            num_page = (len(seq.token_ids) + self.page_size - 1) // self.page_size - len(seq.page_table)
+            for _ in range(num_page):
+                seq.page_table.append(
+                    self.segment.allocate())
 
     def free(self, seq: Sequence):
         for page_num in seq.page_table:
@@ -132,28 +124,20 @@ class PrefixMemoryManager(MemoryManager):
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
-            if not seq.computed_prompt:
-                assert len(seq.page_table) == 0
-                num_page = (seq.prompt_len + self.page_size -
-                            1) // self.page_size
-                computed_prefix = True
-                for i in range(num_page):
-                    if computed_prefix and (i+1)*self.page_size <= len(seq.token_ids):
-                        computed_prefix, page_num = self.segment.allocate(
+            len_page_table = len(seq.page_table)
+            num_page = (len(seq.token_ids) + self.page_size - 1) // self.page_size - len_page_table
+            computed_prefix = True
+            for i in range(len_page_table,len_page_table+num_page):
+                if computed_prefix and (i+1)*self.page_size <= len(seq.token_ids):
+                    computed_prefix, page_num = self.segment.allocate(
                             (*seq.token_ids[:(i+1)*self.page_size],))
-                        seq.computed_token_num += int(
-                            computed_prefix) * self.page_size
-                    elif (i+1)*self.page_size <= len(seq.token_ids):
-                        _, page_num = self.segment.allocate(
+                    seq.computed_token_num += int(computed_prefix) * self.page_size
+                elif (i+1)*self.page_size <= len(seq.token_ids):
+                    _, page_num = self.segment.allocate(
                             (*seq.token_ids[:(i+1)*self.page_size],))
-                    else:
-                        _, page_num = self.segment.allocate()
-                    seq.page_table.append(page_num)
-            else:
-                assert len(seq.page_table) != 0
-                if (len(seq.token_ids)-1) % self.page_size == 0:
+                else:
                     _, page_num = self.segment.allocate()
-                    seq.page_table.append(page_num)
+                seq.page_table.append(page_num)
 
 
 class PrefixSegment(Segment):
