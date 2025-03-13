@@ -217,10 +217,16 @@ class Worker:
 def run_worker(worker: Worker):
     worker.init()
     logger.info(f'Worker {worker.pp_rank} init')
-    while True:
-        if worker.pp_rank == 0:
-            worker.set_num_free_pages()
-            output = worker.schedule_run()
-            worker.process_output(output)   
-        else:
-            worker.run()
+    try:
+        while True:
+            if worker.pp_rank == 0:
+                worker.set_num_free_pages()
+                output = worker.schedule_run()
+                worker.process_output(output)   
+            else:
+                worker.run()
+    except KeyboardInterrupt as e:
+        logger.info(f'Worker {worker.pp_rank} exit')
+    
+    except Exception as e:
+        logger.error(f'Worker {worker.pp_rank} \n{e}')

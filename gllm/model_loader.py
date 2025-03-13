@@ -1,6 +1,7 @@
 import json
 import glob
 import torch
+import sys
 
 from logger import logger
 from safetensors import safe_open
@@ -50,7 +51,9 @@ class ModelLoader():
         if len(weights) != 0:
             return weights
 
-        assert 0
+        if get_pp_rank() == 0:
+            logger.error('No weights(.bin/.safetensor) found in the directory!')
+        sys.exit(0)
         
     def post_process_config(self):
         if self.architecture == 'ChatGLMModel':
