@@ -89,18 +89,18 @@ class Scheduler:
                 else:
                     break
             
-            if delta:
-                for seq in prefill_schedule_lists:
-                    self.prompt_lists.remove(seq)
-                    self.run_batch[seq.seq_id] = seq
-                if len(prefill_schedule_lists) != 0:
+            if len(prefill_schedule_lists) != 0:
+                if delta:
+                    for seq in prefill_schedule_lists:
+                        self.prompt_lists.remove(seq)
+                        self.run_batch[seq.seq_id] = seq
                     self.prefill_budget.append(cur_prefill_budget)
                     self.total_prefill_budget += cur_prefill_budget
                     self.num_schedule += 1
-            else:
-                for seq in prefill_schedule_lists:
-                    self.prompt_lists.remove(seq)
-            return SchedulerOutput(prefill_schedule_lists, True)
+                else:
+                    for seq in prefill_schedule_lists:
+                        self.prompt_lists.remove(seq)
+                return SchedulerOutput(prefill_schedule_lists, True)
 
         # decode
         if not delta:
