@@ -80,7 +80,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Launch GLLM server')
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--model-path', type=str, required=True)
-    parser.add_argument('--pipe-schedule', action="store_true")
+    parser.add_argument('--disable-pipe-schedule', action="store_true")
     parser.add_argument('--gpu-memory-util', type=float, default=0.9)
     parser.add_argument('--page-size', type=int, default=16)
     parser.add_argument('--max-decode-seqs', type=int, default=512)
@@ -91,7 +91,7 @@ if __name__ == '__main__':
     parser.add_argument('--load-format', type=str, choices=['auto','dummy'],default='auto')
     args = parser.parse_args()
 
-    llm_cls = PipeAsyncLLM if args.pipe_schedule else AsyncLLM
+    llm_cls = PipeAsyncLLM if not args.disable_pipe_schedule else AsyncLLM
     llm = llm_cls(load_format=args.load_format,
                   model_path=args.model_path,
                   gpu_memory_util=args.gpu_memory_util,

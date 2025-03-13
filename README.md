@@ -11,7 +11,7 @@ Lightweight, easy, fast and cheap LLM serving playground
 
 ## What is gLLM?
 
-Integreted with features like **continuous batching**, **paged attention**, **prefix caching**, **pipeline parallelism** and **pipeline schedule**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
+Integreted with features like **continuous batching**, **paged attention**, **prefix caching** and **pipeline parallelism**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
 - [2025/03/01]: Pipeline parallelism has been integrated. You can run any size of model you want :laughing: .
@@ -46,7 +46,6 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
 ### Launch online serving
 
 ```
-# To enable pipeline schedule, add "--pipe-schedule"
 # To enable prefix caching, add "--enable-prefix-caching"
 # To enable pipeline parallelism, add "--pp $PP_DEGREE"
 python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH
@@ -80,14 +79,6 @@ python benchmarks/benchmark_prefix_serving.py \
         --seed $NUM_USERS --port $PORT \
         --input-len-min $INPUT_LEN_MIN --input-len-max $INPUT_LEN_MAX
 ```
-
-## Pipeline Schedule
-
-### Comparison between baseline schedule and pipeline schedule
-<img src=doc/pic/pipeline_execution.svg height=240>
-
-### Architecture of pipeline schedule
-<img src=doc/pic/pipeline_architecture.svg height=240>
 
 ## Supported Models
 > Note that gLLM only support loading model of .safetensor or .bin format from local disk
