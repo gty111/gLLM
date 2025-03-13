@@ -85,7 +85,7 @@ class InputData():
             (len(block_tables_list), max_num_block), 0, dtype=np.int32)
         for idx, block_table in enumerate(block_tables_list):
             block_tables[idx, :len(block_table)] = block_table
-        return torch.from_numpy(block_tables).to('cuda')
+        return torch.from_numpy(block_tables).to(device='cuda',non_blocking=True)
 
     def get_slot_mapping(self):
         slot_mapping = []
