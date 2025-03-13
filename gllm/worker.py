@@ -11,7 +11,7 @@ from gllm.input_data import InputData
 from gllm.sequence import Sequence
 from gllm.model_runner import ModelRunner
 from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
-from gllm.scheduler import SchedulerOutput
+from gllm.scheduler import SchedulerOutput, PreemptOutput
 from gllm.utils import make_socket
 
 # Used with PipeAsyncLLM
@@ -47,7 +47,7 @@ class Worker:
             # GPU pp rank 0 => main process
             self.output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PUSH)
             # seqs to schedule
-            self.seqs_to_schedule = []
+            self.seqs_to_schedule: List[Sequence] = []
             # running batch 
             self.batch_running = deque()
             self.num_running_seqs = 0
@@ -72,6 +72,8 @@ class Worker:
         self.dtype = self.model_runner.memory_manager.dtype
         self.hidden_size = self.model_runner.model_loader.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual
+        self.max_decode_seqs = self.model_runner.max_decode_seqs
+        self.max_batch_tokens = self.model_runner.max_batch_tokens
         
     def set_num_free_pages(self):
         self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
@@ -118,18 +120,29 @@ class Worker:
                 [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
             self.run_queue.append((input_data,intermediate_data))
                     
+    # PP rank 0 check if preempt seqs 
+    def check_preempt(self):
+        preempt_ids = []
+        while self.model_runner.memory_manager.get_num_free_slots() < self.max_batch_tokens:
+            seq_to_preempt = self.seqs_to_schedule.pop()
+            preempt_ids.append(seq_to_preempt.seq_id)
+            self.model_runner.memory_manager.free(seq_to_preempt)
+        if len(preempt_ids):
+            preemptOutput = PreemptOutput(preempt_ids)
+            send_bytes = pickle.dumps((preemptOutput,[]))
+            self.output_socket.send(send_bytes,copy=False)
     
-    # PP schedule
+    # PP rank 0 schedule 
     def schedule(self):
         # to_schedule_list => schedule_list (ref already_schedule_queue)
         num_total_seqs = len(self.seqs_to_schedule) + self.num_running_seqs
         
         if num_total_seqs <= self.pp_size or self.pp_size == 1:
-            cur_schedule_list = self.seqs_to_schedule
-            self.seqs_to_schedule = []
+            cur_schedule_list = self.seqs_to_schedule[:self.max_decode_seqs]
+            self.seqs_to_schedule = self.seqs_to_schedule[self.max_decode_seqs:]
             return cur_schedule_list    
         
-        num_schedule_seqs = num_total_seqs // self.pp_size
+        num_schedule_seqs = min(num_total_seqs // self.pp_size, self.max_decode_seqs)
         if len(self.batch_running) > self.pp_size:
             return []
         if num_schedule_seqs > len(self.seqs_to_schedule):
@@ -144,6 +157,7 @@ class Worker:
         act_schedule_list: List[Sequence] = []
         schedulerOutput = None
 
+        self.check_preempt()
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput = pickle.loads(recv_bytes)
@@ -181,6 +195,7 @@ class Worker:
             self.num_running_seqs -= len(act_schedule_list)
             assert len(next_tokens) == len(act_schedule_list)
             free_ids = []
+            run_seqs = []
             for idx, seq in enumerate(act_schedule_list):
                 seq.computed_prompt = True
                 seq.computed_token_num += seq.to_compute_token_num
@@ -190,8 +205,8 @@ class Worker:
                     free_ids.append(seq.seq_id)
                     self.model_runner.memory_manager.free(seq)
                 else:
-                    self.seqs_to_schedule.append(seq)
-            
+                    run_seqs.append(seq)
+            self.seqs_to_schedule = run_seqs + self.seqs_to_schedule
             schedulerOutput.free_ids = free_ids
             schedulerOutput.act_schedule_ids = [seq.seq_id for seq in act_schedule_list]
             # avoid send abundant info

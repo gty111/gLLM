@@ -16,7 +16,7 @@ class LLM():
                  max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True, pp_size=1):
         self.model_path = model_path
         self.model_runner = ModelRunner(
-            load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching)
+            load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, max_batch_tokens, max_decode_seqs)
         self.pp_size = pp_size
         self.master_addr = '127.0.0.1'
         self.master_port = '49082'

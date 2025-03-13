@@ -41,7 +41,7 @@ class MemoryManager():
             self.num_pages = min(num_pages_all)
 
         if get_pp_rank() == 0:
-            logger.info(f'Allocate {self.num_pages} pages')
+            logger.info(f'Allocate {self.num_pages} pages ({self.page_size} tokens/page)')
 
         self.segment = Segment(self.num_layers, self.num_pages,
                                self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)
@@ -67,6 +67,9 @@ class MemoryManager():
 
     def get_num_free_pages(self):
         return self.segment.get_num_free_pages()
+    
+    def get_num_free_slots(self):
+        return self.segment.get_num_free_pages() * self.page_size
 
     def get_memory_util(self):
         return self.segment.get_memory_util()

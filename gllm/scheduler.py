@@ -1,7 +1,8 @@
 import time
 
 from logger import logger
-from typing import List
+from typing import List, Dict
+from collections import deque
 
 from gllm.sequence import Sequence
 
@@ -12,6 +13,10 @@ class SchedulerOutput:
         self.schedule_lists = schedule_lists  # schedule process => gpu process
         self.free_ids = []  # gpu process => schedule process
         self.act_schedule_ids = []  # gpu process => schedule process
+        
+class PreemptOutput:
+    def __init__(self, preempt_ids:List[int]):
+        self.preempt_ids = preempt_ids
 
 class Scheduler:
     def __init__(self, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float,
@@ -20,8 +25,8 @@ class Scheduler:
         self.decode_lists: List[Sequence] = []  # seqs to decode
         self.finish_lists: List[Sequence] = []  # seqs finished
 
-        self.run_batch = dict()  # seqs under running (seq_id => seq)
-
+        self.run_batch:Dict[int,Sequence] = dict()  # seqs under running (seq_id => seq)
+        
         self.max_decode_seqs = max_decode_seqs
         self.max_batch_tokens = max_batch_tokens
         self.ratio_threshold_free_pages = ratio_threshold_free_pages
@@ -36,6 +41,14 @@ class Scheduler:
         self.log_time = time.time()
 
         self.pp_size = pp_size
+        
+        # Since we run multiple prefill schedule, worker may not allocate pages 
+        # Use budget to track number of pages for prefill schedule on the fly
+        self.total_prefill_budget = 0
+        self.prefill_budget = deque()
+        
+        self.preempt_num_seqs = 0
+        self.log_preempt_num_seqs = 0
 
     def set_total_num_free_pages(self, total_num_free_pages):
         self.num_free_pages = total_num_free_pages
@@ -59,23 +72,31 @@ class Scheduler:
 
         self.num_free_pages = num_free_pages
 
+        cur_prefill_budget = 0
         # prompt
         if len(self.prompt_lists) != 0 and (
                 self.num_free_pages > self.num_threshold_free_pages) and (
-                    not delta or delta and self.num_schedule <= self.pp_size + 1):  # plus 1 can overlap schedule and execution
+                    not delta or delta and self.num_schedule <= self.pp_size):
             prefill_schedule_lists: List[Sequence] = []
             cu_seqs_len = 0
             for seq in self.prompt_lists:
-                if cu_seqs_len + len(
-                        seq.token_ids) <= self.max_batch_tokens and self.num_free_pages > self.num_threshold_free_pages:
+                num_page = (len(seq.token_ids)+self.page_size-1) // self.page_size
+                if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens and (
+                    self.num_free_pages - num_page - cur_prefill_budget - self.total_prefill_budget > self.num_threshold_free_pages):
                     cu_seqs_len += len(seq.token_ids)
                     prefill_schedule_lists.append(seq)
-                    self.num_free_pages -= len(seq.token_ids) // self.page_size
+                    cur_prefill_budget += num_page
+                else:
+                    break
+            
             if delta:
                 for seq in prefill_schedule_lists:
                     self.prompt_lists.remove(seq)
                     self.run_batch[seq.seq_id] = seq
-                self.num_schedule += 1
+                if len(prefill_schedule_lists) != 0:
+                    self.prefill_budget.append(cur_prefill_budget)
+                    self.total_prefill_budget += cur_prefill_budget
+                    self.num_schedule += 1
             else:
                 for seq in prefill_schedule_lists:
                     self.prompt_lists.remove(seq)
@@ -104,6 +125,7 @@ class Scheduler:
         else:
             if schedulerOutput.from_main_process:
                 self.num_schedule -= 1
+                self.total_prefill_budget -= self.prefill_budget.popleft()
             for idx, id in enumerate(schedulerOutput.act_schedule_ids):
                 seq: Sequence = self.run_batch[id]
                 if id in schedulerOutput.free_ids:
@@ -111,6 +133,19 @@ class Scheduler:
                 else:
                     seq.token_ids.append(next_tokens[idx])
             self.finish_lists.extend(schedulerOutput.free_ids)
+
+    def process_preempt_ids(self, preempt_ids:List[int]):
+        preempt_list = []
+        for id in preempt_ids:
+            seq = self.run_batch.pop(id)
+            seq.computed_token_num = 0
+            preempt_list.append(seq)
+        self.prompt_lists = preempt_list + self.prompt_lists
+        self.preempt_num_seqs += len(preempt_list)
+        if self.preempt_num_seqs - self.log_preempt_num_seqs > 100:
+            logger.warning(f'#Preempted seqs: {self.preempt_num_seqs}')
+            logger.warning('Try increase --ratio-free-pages or the performance is poor!')
+            self.log_preempt_num_seqs = self.preempt_num_seqs
 
     def can_schedule_prefill(self):
         return len(self.prompt_lists) != 0 and self.num_free_pages > self.num_threshold_free_pages

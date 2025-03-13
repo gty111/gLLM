@@ -10,7 +10,7 @@ from fastapi import Request
 
 from gllm.utils import make_async, make_socket
 from gllm.llm_engine import LLM
-from gllm.scheduler import SchedulerOutput
+from gllm.scheduler import PreemptOutput
 from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
 
@@ -64,6 +64,7 @@ class AsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         assert kwargs['pp_size'] == 1 and "AsyncLLM doesn't support degree of PP > 1"
+        logger.info('Using AsyncLLM backend')
         super().__init__(*args, **kwargs)
         super().init()
 
@@ -114,7 +115,7 @@ class AsyncLLM(LLM):
 class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
-        logger.info('Enable pipeline schedule')
+        logger.info('Using PipeAsyncLLM backend')
 
         super().__init__(*args, **kwargs)
 
@@ -178,10 +179,13 @@ class PipeAsyncLLM(LLM):
         self.scheduler.set_total_num_free_pages(self.num_free_pages.value)
         while True:
             if output_socket.poll(timeout=0) != 0:
-
                 recv_bytes = output_socket.recv(copy=False)
-                schedulerOutput, next_tokens = pickle.loads(recv_bytes)
-
+                recv_data = pickle.loads(recv_bytes)
+                
+                schedulerOutput, next_tokens = recv_data
+                if isinstance(schedulerOutput, PreemptOutput):
+                    self.scheduler.process_preempt_ids(schedulerOutput.preempt_ids)
+                    continue
                 self.scheduler.update_seqs(
                     schedulerOutput, next_tokens, delta=True)
                 # overlap gpu execution and output process
@@ -196,7 +200,6 @@ class PipeAsyncLLM(LLM):
                     self.async_streams[id].finish()
                     del self.async_streams[id]
                 self.free_finish_requests()
-
                 if exit:
                     return
             if await self.run_schedule(schedule_socket):
