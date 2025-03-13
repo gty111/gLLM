@@ -2,13 +2,12 @@ import asyncio
 import torch.multiprocessing as mp
 import zmq
 import pickle
-import time
 
 from logger import logger
 from typing import List, Dict
 from fastapi import Request
 
-from gllm.utils import make_async, make_socket
+from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive
 from gllm.llm_engine import LLM
 from gllm.scheduler import PreemptOutput
 from gllm.worker import Worker, run_worker
@@ -125,6 +124,7 @@ class PipeAsyncLLM(LLM):
 
         self.ctx = mp.get_context('spawn')
         self.num_free_pages = self.ctx.Value('i', 0)
+        self.mp_alive = self.ctx.Array('i',[0 for i in range(self.pp_size)])
 
         self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
         self.output_ipc_path = 'ipc:///tmp/gllm_output'
@@ -134,11 +134,8 @@ class PipeAsyncLLM(LLM):
         for pp_rank in range(self.pp_size):
             self.start_worker(pp_rank)
 
-        # wait gpu engine start
-        while True:
-            if self.num_free_pages.value != 0:
-                break
-            time.sleep(1)
+        # wait worker start
+        wait_worker(self.mp_alive, self.pp_size)
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float):
@@ -178,6 +175,7 @@ class PipeAsyncLLM(LLM):
         output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PULL)
         self.scheduler.set_total_num_free_pages(self.num_free_pages.value)
         while True:
+            check_worker_alive(self.mp_alive)
             if output_socket.poll(timeout=0) != 0:
                 recv_bytes = output_socket.recv(copy=False)
                 recv_data = pickle.loads(recv_bytes)
@@ -215,7 +213,8 @@ class PipeAsyncLLM(LLM):
                         self.master_port,
                         self.schedule_ipc_path,
                         self.output_ipc_path,
-                        self.token_ipc_path)
+                        self.token_ipc_path,
+                        self.mp_alive)
         self.ctx.Process(
             target=run_worker,
             args=(worker,),

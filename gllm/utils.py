@@ -3,6 +3,7 @@ import uuid
 import torch
 import zmq
 import time
+import sys
 
 from functools import partial
 from typing import Awaitable, Callable, ParamSpec, TypeVar, Union
@@ -56,14 +57,18 @@ def make_socket(ctx, ipc_path: str, type):
     else:
         assert 0
 
-def mp_sync(mp_share_obj,init_num):
+def wait_worker(mp_alive,num_worker):
     while True:
-        wait = False
-        for i in mp_share_obj:
-            if i==init_num:
-                wait = True
-                break
-        if wait:
-            time.sleep(1)
-        else:
+        num_worker_start = 0
+        for i in mp_alive:
+            if i==-1:
+                sys.exit()
+            num_worker_start += i
+        if num_worker_start == num_worker:
             break
+        time.sleep(1)
+        
+def check_worker_alive(mp_alive):
+    for i in mp_alive:
+        if i==-1:
+            sys.exit()

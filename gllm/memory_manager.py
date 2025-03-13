@@ -7,7 +7,6 @@ from logger import logger
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
 from gllm.dist_utils import get_pp_rank
-from gllm.utils import mp_sync
 
 
 class MemoryManager():

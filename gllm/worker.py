@@ -2,6 +2,7 @@ import torch.multiprocessing as mp
 import torch
 import zmq
 import pickle
+import torch.distributed as dist
 
 from collections import deque
 from logger import logger
@@ -18,7 +19,7 @@ from gllm.utils import make_socket
 class Worker:
     
     def __init__(self, model_runner:ModelRunner, num_free_pages, pp_rank, pp_size, 
-                 master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path):
+                 master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path,mp_alive):
         self.model_runner = model_runner
         self.num_free_pages = num_free_pages
         self.pp_rank = pp_rank # pp rank
@@ -28,6 +29,7 @@ class Worker:
         self.schedule_ipc_path = schedule_ipc_path
         self.output_ipc_path = output_ipc_path
         self.token_ipc_path = token_ipc_path
+        self.mp_alive = mp_alive
     
     def get_pp_next_rank(self):
         # return device_rank of next pp_rank
@@ -74,6 +76,7 @@ class Worker:
         self.ret_residual = self.model_runner.model.ret_residual
         self.max_decode_seqs = self.model_runner.max_decode_seqs
         self.max_batch_tokens = self.model_runner.max_batch_tokens
+        self.mp_alive[self.pp_rank] = 1
         
     def set_num_free_pages(self):
         self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
@@ -215,9 +218,9 @@ class Worker:
             self.output_socket.send(output_bytes, copy=False)
  
 def run_worker(worker: Worker):
-    worker.init()
-    logger.info(f'Worker {worker.pp_rank} init')
     try:
+        worker.init()
+        logger.info(f'Worker {worker.pp_rank} init')
         while True:
             if worker.pp_rank == 0:
                 worker.set_num_free_pages()
@@ -227,6 +230,9 @@ def run_worker(worker: Worker):
                 worker.run()
     except KeyboardInterrupt as e:
         logger.info(f'Worker {worker.pp_rank} exit')
-    
+        dist.destroy_process_group()
+        worker.mp_alive[worker.pp_rank] = -1
     except Exception as e:
         logger.error(f'Worker {worker.pp_rank} \n{e}')
+        dist.destroy_process_group()
+        worker.mp_alive[worker.pp_rank] = -1
