@@ -5,6 +5,7 @@ from typing import List, Dict
 from collections import deque
 
 from gllm.sequence import Sequence
+from gllm.memory_manager import MemoryManager
 
 
 class SchedulerOutput:
@@ -112,13 +113,16 @@ class Scheduler:
         else:
             return SchedulerOutput([])
 
-    def update_seqs(self, schedulerOutput: SchedulerOutput, next_tokens: List[int] = None, delta=False):
+    def update_seqs(self, schedulerOutput: SchedulerOutput, next_tokens: List[int] = None, 
+                    delta=False, memory_manager: MemoryManager=None):
         if not delta:
+            assert memory_manager is not None
             for idx, seq in enumerate(schedulerOutput.schedule_lists):
                 seq.token_ids.append(next_tokens[idx])
                 seq.computed_token_num += seq.to_compute_token_num
                 seq.to_compute_token_num = 1
                 if seq.is_finish():
+                    memory_manager.free(seq)
                     self.finish_lists.append(seq.seq_id)
                 else:
                     self.decode_lists.append(seq)
@@ -134,15 +138,20 @@ class Scheduler:
                     seq.token_ids.append(next_tokens[idx])
             self.finish_lists.extend(schedulerOutput.free_ids)
 
-    def process_preempt_ids(self, preempt_ids:List[int]):
-        preempt_list = []
-        for id in preempt_ids:
-            seq = self.run_batch.pop(id)
-            seq.computed_token_num = 0
-            preempt_list.append(seq)
-        self.prompt_lists = preempt_list + self.prompt_lists
-        self.preempt_num_seqs += len(preempt_list)
-        if self.preempt_num_seqs - self.log_preempt_num_seqs > 100:
+    def process_preempt(self, preempt_ids:List[int]=None, preempt_seqs:List[Sequence]=None):
+        _preempt_seqs = []
+        if preempt_ids is not None:
+            for id in preempt_ids:
+                seq = self.run_batch.pop(id)
+                _preempt_seqs.append(seq)
+        else:
+            assert preempt_seqs is not None
+            _preempt_seqs = preempt_seqs
+        for seq in _preempt_seqs:
+            seq.preempt()
+        self.prompt_lists = _preempt_seqs + self.prompt_lists
+        self.preempt_num_seqs += len(_preempt_seqs)
+        if self.preempt_num_seqs - self.log_preempt_num_seqs > 10:
             logger.warning(f'#Preempted seqs: {self.preempt_num_seqs}')
             logger.warning('Try increase --ratio-free-pages or the performance is poor!')
             self.log_preempt_num_seqs = self.preempt_num_seqs

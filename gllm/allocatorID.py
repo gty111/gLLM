@@ -16,6 +16,7 @@ class AllocatorID():
         return id
 
     def free(self, id: int):
+        # assert id not in self.free_ids
         self.free_ids.appendleft(id)
 
     def is_empty(self):

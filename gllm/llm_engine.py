@@ -13,7 +13,7 @@ from gllm.input_data import InputData
 
 class LLM():
     def __init__(self, model_path, load_format='auto', gpu_memory_util=0.9, page_size=16, max_decode_seqs=256,
-                 max_batch_tokens=8192, ratio_threshold_free_pages=0.2, enable_prefix_caching=True, pp_size=1):
+                 max_batch_tokens=8192, ratio_threshold_free_pages=0.05, enable_prefix_caching=False, pp_size=1):
         self.model_path = model_path
         self.model_runner = ModelRunner(
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, max_batch_tokens, max_decode_seqs)
@@ -58,13 +58,22 @@ class LLM():
         self.model_runner.init()
         self.scheduler.set_total_num_free_pages(self.model_runner.memory_manager.get_num_free_pages())
 
+    def check_preempt_seqs(self):
+        preempt_seqs = []
+        while self.model_runner.memory_manager.get_num_free_slots() < self.scheduler.max_batch_tokens:
+            seq = self.scheduler.decode_lists.pop()
+            self.model_runner.memory_manager.free(seq)
+            preempt_seqs.append(seq)
+        self.scheduler.process_preempt(preempt_seqs=preempt_seqs)
+
     def step(self):
         if self.model_runner.model is None:
             self.init()
+        self.check_preempt_seqs()
         scheduleOutput = self.scheduler.schedule(
             self.model_runner.memory_manager.get_num_free_pages())
         next_tokens = self.model_runner.step_once(InputData(scheduleOutput.schedule_lists, self.model_runner.memory_manager))
-        self.scheduler.update_seqs(scheduleOutput, next_tokens)
+        self.scheduler.update_seqs(scheduleOutput, next_tokens,memory_manager=self.model_runner.memory_manager)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None,
                  temperature=0.6, top_p=0.9, top_k=10):

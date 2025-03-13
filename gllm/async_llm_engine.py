@@ -83,18 +83,18 @@ class AsyncLLM(LLM):
         return stream
 
     async def step_async(self):
+        self.check_preempt_seqs()
         schedulerOutput = self.scheduler.schedule(
             self.model_runner.memory_manager.get_num_free_pages(), log=True, delta=False)
         next_tokens = await make_async(self.model_runner.step_once)(
             InputData(schedulerOutput.schedule_lists, self.model_runner.memory_manager))
-        self.scheduler.update_seqs(schedulerOutput, next_tokens)
+        self.scheduler.update_seqs(schedulerOutput, next_tokens,memory_manager=self.model_runner.memory_manager)
         for seq in schedulerOutput.schedule_lists:
             self.async_streams[seq.seq_id].put(
                 seq.detokenize_inc(self.model_runner.tokenizer))
-        for seq in self.scheduler.finish_lists:
-            self.model_runner.free_kv_cache(seq)
-            self.async_streams[seq.seq_id].finish()
-            del self.async_streams[seq.seq_id]
+        for seq_id in self.scheduler.finish_lists:
+            self.async_streams[seq_id].finish()
+            del self.async_streams[seq_id]
         self.free_finish_requests()
 
     async def run_engine(self):
@@ -182,7 +182,7 @@ class PipeAsyncLLM(LLM):
                 
                 schedulerOutput, next_tokens = recv_data
                 if isinstance(schedulerOutput, PreemptOutput):
-                    self.scheduler.process_preempt_ids(schedulerOutput.preempt_ids)
+                    self.scheduler.process_preempt(preempt_ids=schedulerOutput.preempt_ids)
                     continue
                 self.scheduler.update_seqs(
                     schedulerOutput, next_tokens, delta=True)

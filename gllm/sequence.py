@@ -46,3 +46,7 @@ class Sequence():
             return True
         else:
             return False
+        
+    def preempt(self):
+        self.computed_token_num = 0
+        self.page_table = []
