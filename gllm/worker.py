@@ -1,9 +1,9 @@
-import torch.multiprocessing as mp
 import torch
 import zmq
 import pickle
 import torch.distributed as dist
 import traceback
+import time
 
 from collections import deque
 from logger import logger
@@ -55,6 +55,7 @@ class Worker:
             # running batch 
             self.batch_running = deque()
             self.num_running_decode_seqs = 0
+            self.log_time = 0
             # rank 0 => other ranks : batched seqs
             self.gpu_schedule_socket = []
             for i in range(1,self.pp_size):
@@ -154,7 +155,7 @@ class Worker:
         
         # prefill
         prefill_token_budget = min(
-            int(self.model_runner.memory_manager.get_memory_free() * self.max_batch_tokens), 
+            round(self.model_runner.memory_manager.get_memory_free() * self.max_batch_tokens), 
             max(self.get_num_free_pages()-self.num_threshold_free_pages,0))
         prefill_batched_token_nums = 0
         for seq in self.seqs_to_prefill:
@@ -188,13 +189,15 @@ class Worker:
         for seq in schedule_decode_seqs:
             seq.to_compute_token_num = 1
 
-        logger.info(
-                '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %2.2f %%'
-                % (len(self.seqs_to_prefill),
-                   num_total_decode_seqs,
-                   prefill_batched_token_nums,
-                   len(schedule_decode_seqs),
-                   self.model_runner.memory_manager.get_memory_util()))
+        if time.time()-self.log_time > 1:
+            self.log_time = time.time()
+            logger.info(
+                    '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %2.2f %%'
+                    % (len(self.seqs_to_prefill),
+                    num_total_decode_seqs,
+                    prefill_batched_token_nums,
+                    len(schedule_decode_seqs),
+                    self.model_runner.memory_manager.get_memory_util()))
         return schedule_prefill_seqs + schedule_decode_seqs
     
     # rank 0
