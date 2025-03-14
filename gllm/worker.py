@@ -167,11 +167,13 @@ class Worker:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput = pickle.loads(recv_bytes)
             act_schedule_list = schedulerOutput.schedule_lists
-            num_prefill_tokens = schedulerOutput.num_batched_tokens
-            num_decode_tokens = min(self.max_batch_tokens - num_prefill_tokens, len(self.seqs_to_schedule))
-            act_schedule_list.extend(self.seqs_to_schedule[:num_decode_tokens])
-            self.seqs_to_schedule = self.seqs_to_schedule[num_decode_tokens:]
-            # print(f'Prefill {num_prefill_tokens} Decode {num_decode_tokens}')
+            if self.pp_size > 1:
+                # batch prefill and decode together
+                num_prefill_tokens = schedulerOutput.num_batched_tokens
+                num_decode_tokens = min(self.max_batch_tokens - num_prefill_tokens, len(self.seqs_to_schedule))
+                act_schedule_list.extend(self.seqs_to_schedule[:num_decode_tokens])
+                self.seqs_to_schedule = self.seqs_to_schedule[num_decode_tokens:]
+                # print(f'Prefill {num_prefill_tokens} Decode {num_decode_tokens}')
         elif len(self.seqs_to_schedule) != 0:
             schedulerOutput = SchedulerOutput([])
             act_schedule_list = self.schedule()
