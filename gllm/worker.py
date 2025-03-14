@@ -160,16 +160,23 @@ class Worker:
     def schedule_run(self):
         output = None
         act_schedule_list: List[Sequence] = []
-        schedulerOutput = None
+        schedulerOutput:SchedulerOutput = None
 
         self.check_preempt()
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput = pickle.loads(recv_bytes)
             act_schedule_list = schedulerOutput.schedule_lists
+            num_prefill_tokens = schedulerOutput.num_batched_tokens
+            num_decode_tokens = min(self.max_batch_tokens - num_prefill_tokens, len(self.seqs_to_schedule))
+            act_schedule_list.extend(self.seqs_to_schedule[:num_decode_tokens])
+            self.seqs_to_schedule = self.seqs_to_schedule[num_decode_tokens:]
+            # print(f'Prefill {num_prefill_tokens} Decode {num_decode_tokens}')
         elif len(self.seqs_to_schedule) != 0:
             schedulerOutput = SchedulerOutput([])
             act_schedule_list = self.schedule()
+            # if len(act_schedule_list) != 0:
+            #     print(f'Decode {len(act_schedule_list)}')
         
         if len(act_schedule_list) != 0:
             input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
