@@ -78,7 +78,7 @@ class Scheduler:
         # prompt
         if delta:
             if len(self.prompt_lists) != 0 and (
-                self.num_free_pages > self.num_threshold_free_pages) and self.num_schedule <= self.pp_size + 1:
+                self.num_free_pages - self.total_prefill_budget > self.num_threshold_free_pages) and self.num_schedule <= self.pp_size + 1:
                 prefill_schedule_lists: List[Sequence] = []
                 cu_seqs_len = 0
                 for seq in self.prompt_lists:
@@ -90,6 +90,10 @@ class Scheduler:
                         prefill_schedule_lists.append(seq)
                         cur_prefill_budget += num_page
                     else:
+                        if len(prefill_schedule_lists) == 0:
+                            cu_seqs_len += len(seq.token_ids)
+                            prefill_schedule_lists.append(seq)
+                            cur_prefill_budget += num_page
                         break
             
                 if len(prefill_schedule_lists) != 0:
