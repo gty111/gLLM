@@ -3,6 +3,7 @@ import torch
 import zmq
 import pickle
 import torch.distributed as dist
+import traceback
 
 from collections import deque
 from logger import logger
@@ -127,7 +128,7 @@ class Worker:
     # rank 0: check if preempt seqs 
     def check_preempt(self):
         preempt_ids = []
-        while self.model_runner.memory_manager.get_num_free_slots() < self.max_batch_tokens:
+        while self.model_runner.memory_manager.get_num_free_slots() < self.max_batch_tokens and len(self.seqs_to_schedule) != 0:
             seq_to_preempt = self.seqs_to_schedule.pop()
             preempt_ids.append(seq_to_preempt.seq_id)
             self.model_runner.memory_manager.free(seq_to_preempt)
@@ -235,5 +236,6 @@ def run_worker(worker: Worker):
         worker.mp_alive[worker.pp_rank] = -1
     except Exception as e:
         logger.error(f'Worker {worker.pp_rank} \n{e}')
+        traceback.print_exc()
         dist.destroy_process_group()
         worker.mp_alive[worker.pp_rank] = -1
