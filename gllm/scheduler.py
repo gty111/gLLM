@@ -9,16 +9,10 @@ from gllm.memory_manager import MemoryManager
 
 
 class SchedulerOutput:
-    def __init__(self, schedule_lists: List[Sequence],from_main_process=False, num_batched_tokens=None):
-        self.num_batched_tokens = num_batched_tokens
-        self.from_main_process = from_main_process
+    def __init__(self, schedule_lists: List[Sequence]):
         self.schedule_lists = schedule_lists  # schedule process => gpu process
         self.free_ids = []  # gpu process => schedule process
         self.act_schedule_ids = []  # gpu process => schedule process
-        
-class PreemptOutput:
-    def __init__(self, preempt_ids:List[int]):
-        self.preempt_ids = preempt_ids
 
 class Scheduler:
     def __init__(self, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float,
@@ -34,8 +28,6 @@ class Scheduler:
         self.ratio_threshold_free_pages = ratio_threshold_free_pages
         self.num_threshold_free_pages = None
 
-        self.num_schedule = 0
-
         self.total_num_free_pages = None
         self.num_free_pages = None
         self.page_size = page_size
@@ -43,11 +35,6 @@ class Scheduler:
         self.log_time = time.time()
 
         self.pp_size = pp_size
-        
-        # Since we run multiple prefill schedule, worker may not allocate pages 
-        # Use budget to track number of pages for prefill schedule on the fly
-        self.total_prefill_budget = 0
-        self.prefill_budget = deque()
         
         self.preempt_num_seqs = 0
         self.log_preempt_num_seqs = 0
@@ -77,33 +64,12 @@ class Scheduler:
         cur_prefill_budget = 0
         # prompt
         if delta:
-            if len(self.prompt_lists) != 0 and (
-                self.num_free_pages - self.total_prefill_budget > self.num_threshold_free_pages) and self.num_schedule <= self.pp_size + 1:
-                prefill_schedule_lists: List[Sequence] = []
-                cu_seqs_len = 0
-                for seq in self.prompt_lists:
-                    num_page = (len(seq.token_ids)+self.page_size-1) // self.page_size
-                    # dynamic adjust prefill batch tokens number according to memory utilization
-                    if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens*self.get_memory_free() and (
-                        self.num_free_pages - num_page - cur_prefill_budget - self.total_prefill_budget > self.num_threshold_free_pages):
-                        cu_seqs_len += len(seq.token_ids)
-                        prefill_schedule_lists.append(seq)
-                        cur_prefill_budget += num_page
-                    else:
-                        if len(prefill_schedule_lists) == 0:
-                            cu_seqs_len += len(seq.token_ids)
-                            prefill_schedule_lists.append(seq)
-                            cur_prefill_budget += num_page
-                        break
-            
-                if len(prefill_schedule_lists) != 0:
-                    for seq in prefill_schedule_lists:
-                        self.prompt_lists.remove(seq)
-                        self.run_batch[seq.seq_id] = seq
-                    self.prefill_budget.append(cur_prefill_budget)
-                    self.total_prefill_budget += cur_prefill_budget
-                    self.num_schedule += 1
-                    return SchedulerOutput(prefill_schedule_lists, True, cu_seqs_len)
+            # we just forward seqs to the worker
+            for seq in self.prompt_lists:
+                self.run_batch[seq.seq_id] = seq
+            prefill_schedule_lists = self.prompt_lists
+            self.prompt_lists = []
+            return SchedulerOutput(prefill_schedule_lists)
         else:
             if len(self.prompt_lists) != 0 and (
                 self.num_free_pages > self.num_threshold_free_pages):
@@ -150,9 +116,6 @@ class Scheduler:
                 else:
                     self.decode_lists.append(seq)
         else:
-            if schedulerOutput.from_main_process:
-                self.num_schedule -= 1
-                self.total_prefill_budget -= self.prefill_budget.popleft()
             for idx, id in enumerate(schedulerOutput.act_schedule_ids):
                 seq: Sequence = self.run_batch[id]
                 if id in schedulerOutput.free_ids:
@@ -186,10 +149,7 @@ class Scheduler:
         return self.can_schedule_prefill() or len(self.decode_lists) + len(self.run_batch) != 0
 
     def has_seqs(self):
-        return len(self.prompt_lists) + len(self.decode_lists) + len(self.run_batch) != 0 or self.num_schedule != 0
+        return len(self.prompt_lists) + len(self.decode_lists) + len(self.run_batch) != 0
 
     def get_memory_util(self):
         return round((self.total_num_free_pages - self.num_free_pages)*100 / self.total_num_free_pages, 2)
-
-    def get_memory_free(self):
-        return self.num_free_pages / self.total_num_free_pages

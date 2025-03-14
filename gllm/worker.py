@@ -1,9 +1,9 @@
-import torch.multiprocessing as mp
 import torch
 import zmq
 import pickle
 import torch.distributed as dist
 import traceback
+import time
 
 from collections import deque
 from logger import logger
@@ -13,7 +13,7 @@ from gllm.input_data import InputData
 from gllm.sequence import Sequence
 from gllm.model_runner import ModelRunner
 from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
-from gllm.scheduler import SchedulerOutput, PreemptOutput
+from gllm.scheduler import SchedulerOutput
 from gllm.utils import make_socket
 
 # Used with PipeAsyncLLM
@@ -50,10 +50,12 @@ class Worker:
             # rank 0 => main process
             self.output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PUSH)
             # seqs to schedule
-            self.seqs_to_schedule: List[Sequence] = []
+            self.seqs_to_prefill: List[Sequence] = []
+            self.seqs_to_decode: List[Sequence] = []
             # running batch 
             self.batch_running = deque()
-            self.num_running_seqs = 0
+            self.num_running_decode_seqs = 0
+            self.log_time = 0
             # rank 0 => other ranks : batched seqs
             self.gpu_schedule_socket = []
             for i in range(1,self.pp_size):
@@ -77,9 +79,16 @@ class Worker:
         self.ret_residual = self.model_runner.model.ret_residual
         self.max_decode_seqs = self.model_runner.max_decode_seqs
         self.max_batch_tokens = self.model_runner.max_batch_tokens
+        self.num_threshold_free_pages = int(
+            self.model_runner.ratio_threshold_free_pages * self.model_runner.memory_manager.get_num_free_pages())
+        self.page_size = self.model_runner.page_size
+        
         self.mp_alive[self.pp_rank] = 1
         self.set_num_free_pages()
-        
+    
+    def get_num_free_pages(self):
+        return self.model_runner.memory_manager.get_num_free_pages()
+    
     def set_num_free_pages(self):
         self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
 
@@ -128,74 +137,92 @@ class Worker:
     # rank 0: check if preempt seqs 
     def check_preempt(self):
         preempt_ids = []
-        while self.model_runner.memory_manager.get_num_free_slots() < self.max_batch_tokens and len(self.seqs_to_schedule) != 0:
-            seq_to_preempt = self.seqs_to_schedule.pop()
+        while self.model_runner.memory_manager.get_num_free_slots() < self.max_batch_tokens and len(self.seqs_to_decode) != 0:
+            seq_to_preempt = self.seqs_to_decode.pop()
             preempt_ids.append(seq_to_preempt.seq_id)
             self.model_runner.memory_manager.free(seq_to_preempt)
-        if len(preempt_ids):
-            preemptOutput = PreemptOutput(preempt_ids)
-            send_bytes = pickle.dumps((preemptOutput,[]))
-            self.output_socket.send(send_bytes,copy=False)
+        self.seqs_to_prefill = preempt_ids + self.seqs_to_prefill
     
     # rank 0: PP schedule 
-    def schedule(self, max_decode_tokens=None):
-        # to_schedule_list => schedule_list (ref already_schedule_queue)
-        num_total_seqs = len(self.seqs_to_schedule) + self.num_running_seqs
+    def schedule(self):
+        if len(self.batch_running) >= self.pp_size:
+            return []
         
-        if num_total_seqs <= self.pp_size or self.pp_size == 1:
-            cur_schedule_list = self.seqs_to_schedule[:self.max_decode_seqs]
-            self.seqs_to_schedule = self.seqs_to_schedule[self.max_decode_seqs:]
-            return cur_schedule_list    
+        self.check_preempt()
         
-        num_schedule_seqs = min(num_total_seqs // self.pp_size, self.max_decode_seqs)
-        if max_decode_tokens:
-            num_schedule_seqs = min(max_decode_tokens,num_schedule_seqs)
+        schedule_prefill_seqs = []
+        schedule_decode_seqs = []
+        
+        # prefill
+        prefill_token_budget = min(
+            round(self.model_runner.memory_manager.get_memory_free() * self.max_batch_tokens), 
+            max(self.get_num_free_pages()-self.num_threshold_free_pages,0))
+        prefill_batched_token_nums = 0
+        for seq in self.seqs_to_prefill:
+            if prefill_token_budget == 0:
+                break
+            self.model_runner.memory_manager.pre_allocate_page([seq])
+            if len(seq.token_ids)-seq.computed_token_num <= prefill_token_budget:
+                seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
+                prefill_batched_token_nums += seq.to_compute_token_num
+                prefill_token_budget -= seq.to_compute_token_num
+            else:
+                prefill_batched_token_nums += prefill_token_budget
+                seq.to_compute_token_num = prefill_token_budget
+                prefill_token_budget = 0
+                
+            schedule_prefill_seqs.append(seq)
+        for seq in schedule_prefill_seqs:
+            self.seqs_to_prefill.remove(seq)
+        
+        # decode
+        num_total_decode_seqs = len(self.seqs_to_decode) + self.num_running_decode_seqs
+        if num_total_decode_seqs < self.pp_size:
+            decode_token_budget = num_total_decode_seqs
         else:
-            if len(self.batch_running) > self.pp_size:
-                return []
-            if num_schedule_seqs > len(self.seqs_to_schedule):
-                return []
-        cur_schedule_list = self.seqs_to_schedule[:num_schedule_seqs]
-        self.seqs_to_schedule = self.seqs_to_schedule[num_schedule_seqs:]
-        return cur_schedule_list
+            decode_token_budget = num_total_decode_seqs // self.pp_size
+        schedule_decode_seqs = self.seqs_to_decode[:decode_token_budget]
+        self.seqs_to_decode = self.seqs_to_decode[decode_token_budget:]
+        self.num_running_decode_seqs += len(schedule_decode_seqs)
+        
+        self.model_runner.memory_manager.pre_allocate_page(schedule_decode_seqs)
+        for seq in schedule_decode_seqs:
+            seq.to_compute_token_num = 1
+
+        if time.time()-self.log_time > 1:
+            self.log_time = time.time()
+            logger.info(
+                    '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %2.2f %%'
+                    % (len(self.seqs_to_prefill),
+                    num_total_decode_seqs,
+                    prefill_batched_token_nums,
+                    len(schedule_decode_seqs),
+                    self.model_runner.memory_manager.get_memory_util()))
+        return schedule_prefill_seqs + schedule_decode_seqs
     
     # rank 0
     def schedule_run(self):
         output = None
-        act_schedule_list: List[Sequence] = []
-        schedulerOutput:SchedulerOutput = None
 
-        self.check_preempt()
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput = pickle.loads(recv_bytes)
-            act_schedule_list = schedulerOutput.schedule_lists
-            if self.pp_size > 1:
-                # batch prefill and decode together
-                num_prefill_tokens = schedulerOutput.num_batched_tokens
-                max_decode_tokens = self.max_batch_tokens - num_prefill_tokens
-                decode_schedule_list = self.schedule(max_decode_tokens)
-                act_schedule_list.extend(decode_schedule_list)
-                # print(f'Prefill {num_prefill_tokens} Decode {len(decode_schedule_list)} #batch {len(self.batch_running)}')
-        elif len(self.seqs_to_schedule) != 0:
-            schedulerOutput = SchedulerOutput([])
-            act_schedule_list = self.schedule()
-            # if len(act_schedule_list) != 0:
-            #     print(f'Decode {len(act_schedule_list)} #batch {len(self.batch_running)}')
+            self.seqs_to_prefill.extend(schedulerOutput.schedule_lists)
         
-        if len(act_schedule_list) != 0:
-            input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
-            self.set_num_free_pages()
-            if self.pp_size > 1:
-                seqs_bytes = pickle.dumps(act_schedule_list)
-                for i in range(1,self.pp_size):
-                    self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
-            self.num_running_seqs += len(act_schedule_list)
-            self.batch_running.append((schedulerOutput, act_schedule_list))
-            output = self.model_runner.step_once(input_data)
-            
-            if type(output) != list:
-                send_pp_data(output, self.get_pp_next_rank())
+        if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0:
+            schedule_seqs = self.schedule()
+            if len(schedule_seqs) != 0:
+                input_data = InputData(schedule_seqs, self.model_runner.memory_manager)
+                self.set_num_free_pages()
+                if self.pp_size > 1:
+                    seqs_bytes = pickle.dumps(schedule_seqs)
+                    for i in range(1,self.pp_size):
+                        self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
+                self.batch_running.append(schedule_seqs)
+                output = self.model_runner.step_once(input_data)
+                
+                if type(output) != list:
+                    send_pp_data(output, self.get_pp_next_rank())
         
         return output
         
@@ -209,27 +236,34 @@ class Worker:
             next_tokens = pickle.loads(recv_bytes)
         
         if next_tokens is not None:
-            schedulerOutput, act_schedule_list = self.batch_running.popleft()
-            self.num_running_seqs -= len(act_schedule_list)
-            assert len(next_tokens) == len(act_schedule_list)
+            schedule_seqs:List[Sequence] = self.batch_running.popleft()
+            assert len(next_tokens) == len(schedule_seqs)
             free_ids = []
-            run_seqs = []
-            for idx, seq in enumerate(act_schedule_list):
-                seq.computed_prompt = True
+            decode_seqs = []
+            prefill_seqs = []
+            
+            send_indices = []
+            for idx, seq in enumerate(schedule_seqs):
+                if seq.computed_prompt():
+                    self.num_running_decode_seqs -= 1
                 seq.computed_token_num += seq.to_compute_token_num
-                seq.to_compute_token_num = 1
-                seq.token_ids.append(next_tokens[idx])
+                if seq.computed_prompt():
+                    send_indices.append(idx)
+                    seq.token_ids.append(next_tokens[idx])
                 if seq.is_finish():
                     free_ids.append(seq.seq_id)
                     self.model_runner.memory_manager.free(seq)
+                elif seq.computed_prompt():
+                    decode_seqs.append(seq)
                 else:
-                    run_seqs.append(seq)
-            self.seqs_to_schedule = run_seqs + self.seqs_to_schedule
+                    prefill_seqs.append(seq)
+            self.seqs_to_decode = decode_seqs + self.seqs_to_decode
+            self.seqs_to_prefill = prefill_seqs + self.seqs_to_prefill
+            
+            schedulerOutput = SchedulerOutput([])
             schedulerOutput.free_ids = free_ids
-            schedulerOutput.act_schedule_ids = [seq.seq_id for seq in act_schedule_list]
-            # avoid send abundant info
-            schedulerOutput.schedule_lists = []
-            output_bytes = pickle.dumps((schedulerOutput, next_tokens))
+            schedulerOutput.act_schedule_ids = [schedule_seqs[i].seq_id for i in send_indices]
+            output_bytes = pickle.dumps((schedulerOutput, [next_tokens[i] for i in send_indices]))
             self.output_socket.send(output_bytes, copy=False)
  
 def run_worker(worker: Worker):

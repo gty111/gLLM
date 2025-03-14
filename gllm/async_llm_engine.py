@@ -9,7 +9,6 @@ from fastapi import Request
 
 from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive
 from gllm.llm_engine import LLM
-from gllm.scheduler import PreemptOutput
 from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
 
@@ -160,7 +159,7 @@ class PipeAsyncLLM(LLM):
             return False
 
         schedulerOutput = self.scheduler.schedule(
-            self.num_free_pages.value, log=True, delta=True)
+            self.num_free_pages.value, delta=True)
 
         if len(schedulerOutput.schedule_lists) != 0:
             schedule_bytes = pickle.dumps(schedulerOutput)
@@ -181,9 +180,6 @@ class PipeAsyncLLM(LLM):
                 recv_data = pickle.loads(recv_bytes)
                 
                 schedulerOutput, next_tokens = recv_data
-                if isinstance(schedulerOutput, PreemptOutput):
-                    self.scheduler.process_preempt(preempt_ids=schedulerOutput.preempt_ids)
-                    continue
                 self.scheduler.update_seqs(
                     schedulerOutput, next_tokens, delta=True)
                 # overlap gpu execution and output process

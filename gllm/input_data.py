@@ -19,14 +19,6 @@ class InputData():
                 [seq.top_p for seq in seqs], memory_manager.dtype, 'cuda', True)
             self.top_k = async_tensor_h2d(
                 [seq.top_k if seq.top_k != -1 else memory_manager.vocab_size for seq in seqs], memory_manager.dtype, 'cuda', True)
-        if get_pp_rank() == 0:
-            memory_manager.pre_allocate_page(seqs)
-        
-        # workaround for setting to_compute_token_num in prefill stage
-        # considering prefix caching
-        for seq in seqs:
-            if seq.to_compute_token_num == 0:
-                seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
         
         self.seqs = seqs
         self.memory_manager = memory_manager
