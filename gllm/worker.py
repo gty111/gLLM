@@ -138,7 +138,7 @@ class Worker:
             self.output_socket.send(send_bytes,copy=False)
     
     # rank 0: PP schedule 
-    def schedule(self):
+    def schedule(self, max_decode_tokens=None):
         # to_schedule_list => schedule_list (ref already_schedule_queue)
         num_total_seqs = len(self.seqs_to_schedule) + self.num_running_seqs
         
@@ -148,10 +148,13 @@ class Worker:
             return cur_schedule_list    
         
         num_schedule_seqs = min(num_total_seqs // self.pp_size, self.max_decode_seqs)
-        if len(self.batch_running) > self.pp_size:
-            return []
-        if num_schedule_seqs > len(self.seqs_to_schedule):
-            return []
+        if max_decode_tokens:
+            num_schedule_seqs = min(max_decode_tokens,num_schedule_seqs)
+        else:
+            if len(self.batch_running) > self.pp_size:
+                return []
+            if num_schedule_seqs > len(self.seqs_to_schedule):
+                return []
         cur_schedule_list = self.seqs_to_schedule[:num_schedule_seqs]
         self.seqs_to_schedule = self.seqs_to_schedule[num_schedule_seqs:]
         return cur_schedule_list
@@ -170,15 +173,15 @@ class Worker:
             if self.pp_size > 1:
                 # batch prefill and decode together
                 num_prefill_tokens = schedulerOutput.num_batched_tokens
-                num_decode_tokens = min(self.max_batch_tokens - num_prefill_tokens, len(self.seqs_to_schedule))
-                act_schedule_list.extend(self.seqs_to_schedule[:num_decode_tokens])
-                self.seqs_to_schedule = self.seqs_to_schedule[num_decode_tokens:]
-                # print(f'Prefill {num_prefill_tokens} Decode {num_decode_tokens}')
+                max_decode_tokens = self.max_batch_tokens - num_prefill_tokens
+                decode_schedule_list = self.schedule(max_decode_tokens)
+                act_schedule_list.extend(decode_schedule_list)
+                # print(f'Prefill {num_prefill_tokens} Decode {len(decode_schedule_list)} #batch {len(self.batch_running)}')
         elif len(self.seqs_to_schedule) != 0:
             schedulerOutput = SchedulerOutput([])
             act_schedule_list = self.schedule()
             # if len(act_schedule_list) != 0:
-            #     print(f'Decode {len(act_schedule_list)}')
+            #     print(f'Decode {len(act_schedule_list)} #batch {len(self.batch_running)}')
         
         if len(act_schedule_list) != 0:
             input_data = InputData(act_schedule_list, self.model_runner.memory_manager)
