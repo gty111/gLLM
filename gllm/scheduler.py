@@ -9,8 +9,9 @@ from gllm.memory_manager import MemoryManager
 
 
 class SchedulerOutput:
-    def __init__(self, schedule_lists: List[Sequence],from_main_process=False):
+    def __init__(self, schedule_lists: List[Sequence],from_main_process=False, num_batched_tokens=0):
         self.from_main_process = from_main_process
+        self.num_batched_tokens = num_batched_tokens
         self.schedule_lists = schedule_lists  # schedule process => gpu process
         self.free_ids = []  # gpu process => schedule process
         self.act_schedule_ids = []  # gpu process => schedule process
@@ -101,7 +102,7 @@ class Scheduler:
                 else:
                     for seq in prefill_schedule_lists:
                         self.prompt_lists.remove(seq)
-                return SchedulerOutput(prefill_schedule_lists, True)
+                return SchedulerOutput(prefill_schedule_lists, True, cu_seqs_len)
 
         # decode
         if not delta:
