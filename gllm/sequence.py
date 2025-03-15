@@ -50,3 +50,6 @@ class Sequence():
     def preempt(self):
         self.computed_token_num = 0
         self.page_table = []
+
+    def computed_prompt(self):
+        return self.computed_token_num >= self.prompt_len

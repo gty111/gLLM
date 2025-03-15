@@ -72,6 +72,9 @@ class MemoryManager():
 
     def get_memory_util(self):
         return self.segment.get_memory_util()
+    
+    def get_memory_free(self):
+        return self.get_num_free_pages() / self.num_pages
 
 
 class Segment():

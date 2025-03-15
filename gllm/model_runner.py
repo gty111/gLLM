@@ -13,7 +13,7 @@ from gllm.dist_utils import get_pp_rank, get_pp_size
 
 class ModelRunner():
     def __init__(self, load_format:str, model_path: str, gpu_memory_util:float, page_size:int, 
-                 enable_prefix_caching:bool, max_batch_tokens, max_decode_seqs):
+                 enable_prefix_caching:bool, max_batch_tokens, max_decode_seqs, ratio_threshold_free_pages):
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
         self.enable_prefix_caching = enable_prefix_caching
@@ -25,6 +25,7 @@ class ModelRunner():
             self.model_path, trust_remote_code=True)
         self.max_batch_tokens = max_batch_tokens
         self.max_decode_seqs = max_decode_seqs
+        self.ratio_threshold_free_pages = ratio_threshold_free_pages
         
         # lazy init
         self.model = None
