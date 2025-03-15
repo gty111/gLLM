@@ -118,6 +118,10 @@ class PrefixMemoryManager(MemoryManager):
 
         del self.segment
         self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)
+        
+        # for prefill stage
+        self.num_allocated_pages = 0
+        self.num_hit_pages = 0
 
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping_tensor: torch.Tensor):
         from gllm import _custom_ops as ops
@@ -131,18 +135,25 @@ class PrefixMemoryManager(MemoryManager):
         for seq in seqs:
             len_page_table = len(seq.page_table)
             num_page = (len(seq.token_ids) + self.page_size - 1) // self.page_size - len_page_table
+            if not seq.computed_prompt():
+                self.num_allocated_pages += num_page
             computed_prefix = True
             for i in range(len_page_table,len_page_table+num_page):
                 if computed_prefix and (i+1)*self.page_size <= len(seq.token_ids):
                     computed_prefix, page_num = self.segment.allocate(
                             (*seq.token_ids[:(i+1)*self.page_size],))
                     seq.computed_token_num += int(computed_prefix) * self.page_size
+                    if not seq.computed_prompt():
+                        self.num_hit_pages += int(computed_prefix)
                 elif (i+1)*self.page_size <= len(seq.token_ids):
                     _, page_num = self.segment.allocate(
                             (*seq.token_ids[:(i+1)*self.page_size],))
                 else:
                     _, page_num = self.segment.allocate()
                 seq.page_table.append(page_num)
+    
+    def get_cache_hit_rate(self):
+        return round(100 * self.num_hit_pages/self.num_allocated_pages, 2)
 
 
 class PrefixSegment(Segment):

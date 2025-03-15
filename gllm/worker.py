@@ -15,6 +15,7 @@ from gllm.model_runner import ModelRunner
 from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
 from gllm.scheduler import SchedulerOutput
 from gllm.utils import make_socket
+from gllm.memory_manager import PrefixMemoryManager
 
 # Used with PipeAsyncLLM
 class Worker:
@@ -191,13 +192,17 @@ class Worker:
 
         if time.time()-self.log_time > 1:
             self.log_time = time.time()
-            logger.info(
-                    '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %2.2f %%'
-                    % (len(self.seqs_to_prefill),
-                    num_total_decode_seqs,
-                    prefill_batched_token_nums,
-                    len(schedule_decode_seqs),
-                    self.model_runner.memory_manager.get_memory_util()))
+            log_info = '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
+                            len(self.seqs_to_prefill),
+                            num_total_decode_seqs,
+                            prefill_batched_token_nums,
+                            len(schedule_decode_seqs),
+                            '%.2f' % self.model_runner.memory_manager.get_memory_util())
+            if isinstance(self.model_runner.memory_manager, PrefixMemoryManager):
+                log_info += ' cache_hit_rate: %5s %%' % ('%.2f' % self.model_runner.memory_manager.get_cache_hit_rate())
+                logger.info(log_info)
+            else:
+                logger.info(log_info)
         return schedule_prefill_seqs + schedule_decode_seqs
     
     # rank 0
