@@ -1,7 +1,6 @@
 import torch
 
 from gllm.input_data import InputData
-from gllm.utils import async_tensor_h2d
 
 class Sampler():
     

@@ -82,11 +82,10 @@ python benchmarks/benchmark_prefix_serving.py \
 ```
 
 ## Supported Models
-> Note that gLLM only support loading model of .safetensor or .bin format from local disk
 
-- Llama: Llama2, Llama3, Llama3.1 and deepseek-coder
-- ChatGLM: Chatglm3 and glm4
-- Qwen2: Qwen2, Qwen2.5
+- Llama Series: Llama2, Llama3, Llama3.1 and deepseek-coder
+- ChatGLM Series: Chatglm3 and glm4
+- Qwen2 Series: Qwen2, Qwen2.5
 
 ## Limited functionality
 

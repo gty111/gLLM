@@ -85,7 +85,7 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
-        if get_pp_rank() == 0:
+        if get_pp_rank() == 0 or config.tie_word_embeddings and get_pp_rank() == get_pp_size() - 1:
             self.embed_tokens = nn.Embedding(
                 config.vocab_size, config.hidden_size, dtype=config.torch_dtype, device='cuda')
         self.start_layer, self.end_layer = get_pp_layers(
@@ -126,7 +126,9 @@ class Qwen2ForCausalLM(nn.Module):
         self.ret_residual = True
         if get_pp_rank() == get_pp_size() - 1:
             if config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
+                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, 
+                                         dtype=config.torch_dtype, device='cuda', bias=False)
+                self.lm_head.weight = self.model.embed_tokens.weight
             else:
                 self.lm_head = nn.Linear(
                     config.hidden_size, config.vocab_size, 

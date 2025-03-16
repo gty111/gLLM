@@ -4,9 +4,14 @@ import torch
 import zmq
 import time
 import sys
+import os
+import hashlib
+import filelock
+import tempfile
 
 from functools import partial
-from typing import Awaitable, Callable, ParamSpec, TypeVar, Union
+from typing import Awaitable, Callable, ParamSpec, TypeVar, Union, Optional
+from pathlib import Path
 
 P = ParamSpec('P')
 K = TypeVar("K")
@@ -72,3 +77,20 @@ def check_worker_alive(mp_alive):
     for i in mp_alive:
         if i==-1:
             sys.exit()
+            
+
+temp_dir = tempfile.gettempdir()
+
+def get_lock(model_name_or_path: Union[str, Path],
+             cache_dir: Optional[str] = None):
+    lock_dir = cache_dir or temp_dir
+    model_name_or_path = str(model_name_or_path)
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    model_name = model_name_or_path.replace("/", "-")
+    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
+    # add hash to avoid conflict with old users' lock files
+    lock_file_name = hash_name + model_name + ".lock"
+    # mode 0o666 is required for the filelock to be shared across users
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name),
+                             mode=0o666)
+    return lock

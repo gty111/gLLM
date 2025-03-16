@@ -1,5 +1,4 @@
-from typing import List
-from gllm.vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from gllm.vllm_flash_attn import flash_attn_varlen_func
 import torch
 
 from gllm.input_data import InputData

@@ -4,11 +4,13 @@ import torch
 from logger import logger
 from safetensors import safe_open
 from transformers import AutoConfig
+from huggingface_hub import snapshot_download
 
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.qwen2 import Qwen2ForCausalLM
 from gllm.dist_utils import get_pp_rank
+from gllm.utils import get_lock
 
 
 class ModelLoader():
@@ -27,29 +29,51 @@ class ModelLoader():
 
     def get_finish_tokens(self):
         return self.get_model_type().get_finish_tokens(self.config)
-
-    def load_weights(self):
-        weights = {}
-        
+    
+    def load_safetensors(self, path):
         # load .safetensor
-        weights_path = glob.glob(f"{self.model_path}/*.safetensors")
+        weights_path = glob.glob(f"{path}/*.safetensors")
         for weight_path in weights_path:
             with safe_open(weight_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
-                    weights[k] = f.get_tensor(k)
-        
-        if len(weights) != 0:
-            return weights
-        
-        # load .bin
-        weights_path = glob.glob(f'{self.model_path}/*.bin')
+                    self.weights[k] = f.get_tensor(k)
+        return len(self.weights) != 0
+                    
+    def load_bin(self, path):
+        weights_path = glob.glob(f'{path}/*.bin')
         for weight_path in weights_path:
-            weights.update(torch.load(weight_path,weights_only=True))
+            self.weights.update(torch.load(weight_path,weights_only=True))
+        return len(self.weights) != 0
+            
+    def load_weights_from_local(self,path):
+        if self.load_safetensors(path):
+            return True
         
-        if len(weights) != 0:
-            return weights
+        if self.load_bin(path):
+            return True
+        
+        return False
+        
+    def load_weights_from_huggingface(self, path):
+        try:
+            with get_lock(path, None):
+                cached_path = snapshot_download(path, 
+                                                allow_patterns=["*.safetensors", "*.bin"],
+                                                ignore_patterns=["original/**/*"])
+                return self.load_weights_from_local(cached_path)
+        except Exception:
+            return False
 
-        raise Exception('No weights(.bin/.safetensor) found in the directory!')
+    def load_weights(self):
+        self.weights = {}
+        
+        if self.load_weights_from_local(self.model_path):
+            return
+        
+        if self.load_weights_from_huggingface(self.model_path):
+            return
+
+        raise Exception(f'Failed to load {self.model_path}!')
 
     def load_config(self):
         config = AutoConfig.from_pretrained(self.model_path,trust_remote_code=True)
@@ -73,12 +97,14 @@ class ModelLoader():
 
     def load_model(self):
         model_type = self.get_model_type()
-        model = model_type(self.config)
         
         if self.load_format == 'auto':
-            weights = self.load_weights()
+            self.load_weights()
             logger.info(f"Worker {get_pp_rank()} loading model ...")
-            model.load_weights(weights)
+            model = model_type(self.config)
+            model.load_weights(self.weights)
+            return model
         else:
             assert self.load_format == 'dummy'
-        return model
+            model = model_type(self.config)
+            return model
