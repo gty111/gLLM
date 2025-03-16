@@ -14,14 +14,14 @@ from gllm.dist_utils import get_pp_num_layers, get_pp_layers, get_pp_rank, get_p
 
 class LlamaMLP(nn.Module):
 
-    def __init__(self, model_config: dict):
+    def __init__(self, config: dict):
         super().__init__()
-        self.hidden_size = model_config['hidden_size']
-        self.intermediate_size = model_config['intermediate_size']
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
         self.gate_up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size*2, bias=False, dtype=model_config['torch_dtype'], device='cuda')
+            self.hidden_size, self.intermediate_size*2, bias=False, dtype=config.torch_dtype, device='cuda')
         self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=False, dtype=model_config['torch_dtype'], device='cuda')
+            self.intermediate_size, self.hidden_size, bias=False, dtype=config.torch_dtype, device='cuda')
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor):
@@ -30,19 +30,21 @@ class LlamaMLP(nn.Module):
 
 class LlamaAttention(nn.Module):
 
-    def __init__(self, layer_id: int, model_config: dict):
+    def __init__(self, layer_id: int, config: dict):
         super().__init__()
-        self.hidden_size = model_config['hidden_size']
-        self.num_heads = model_config['num_attention_heads']
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = model_config['num_key_value_heads']
+        self.num_key_value_heads = config.num_key_value_heads
 
         self.qkv_proj = nn.Linear(self.hidden_size, (self.num_heads+self.num_key_value_heads*2)
-                                  * self.head_dim, bias=False, dtype=model_config['torch_dtype'], device='cuda')
+                                  * self.head_dim, bias=False, dtype=config.torch_dtype, device='cuda')
         self.o_proj = nn.Linear(self.num_heads*self.head_dim,
-                                self.hidden_size, bias=False, dtype=model_config['torch_dtype'], device='cuda')
-
-        rope_scaling = model_config['rope_scaling']
+                                self.hidden_size, bias=False, dtype=config.torch_dtype, device='cuda')
+        
+        self.rope_theta = getattr(config,'rope_theta',10000)
+        
+        rope_scaling = config.rope_scaling
         if rope_scaling is not None:
             scaling_type = rope_scaling['type'] if 'type' in rope_scaling else rope_scaling['rope_type']
             if scaling_type == 'llama3':
@@ -52,18 +54,18 @@ class LlamaAttention(nn.Module):
                     "original_max_position_embeddings"]
                 self.rotary_emb = Llama3RotaryEmbedding(
                     self.head_dim, self.head_dim, original_max_position,
-                    model_config['rope_theta'], True, model_config['torch_dtype'],
+                    self.rope_theta, True, config.torch_dtype,
                     rope_scaling['factor'], low_freq_factor, high_freq_factor, original_max_position)
             elif rope_scaling['type'] == 'linear':
                 self.rotary_emb = LinearScalingRotaryEmbedding(
-                    self.head_dim, self.head_dim, model_config['max_position_embeddings'],
-                    model_config['rope_theta'], True, rope_scaling['factor'], model_config['torch_dtype'])
+                    self.head_dim, self.head_dim, config.max_position_embeddings,
+                    self.rope_theta, True, rope_scaling['factor'], config.torch_dtype)
             else:
                 assert 0
         else:
             self.rotary_emb = RotaryEmbedding(
-                self.head_dim, self.head_dim, model_config['max_position_embeddings'],
-                model_config['rope_theta'], True, model_config['torch_dtype'])
+                self.head_dim, self.head_dim, config.max_position_embeddings,
+                self.rope_theta, True, config.torch_dtype)
 
         self.scaling = self.head_dim**-0.5
 
@@ -84,14 +86,14 @@ class LlamaAttention(nn.Module):
 
 class LlamaDecoderLayer(nn.Module):
 
-    def __init__(self, layer_id: int, model_config: dict):
+    def __init__(self, layer_id: int, config: dict):
         super().__init__()
         self.input_layernorm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
-        self.self_attn = LlamaAttention(layer_id, model_config)
+            config.hidden_size, config.rms_norm_eps, config.torch_dtype)
+        self.self_attn = LlamaAttention(layer_id, config)
         self.post_attention_layernorm = RMSNorm(
-            model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
-        self.mlp = LlamaMLP(model_config)
+            config.hidden_size, config.rms_norm_eps, config.torch_dtype)
+        self.mlp = LlamaMLP(config)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]):
         # residual connection and input layernorm
@@ -117,18 +119,18 @@ class LlamaDecoderLayer(nn.Module):
 
 class LlamaModel(nn.Module):
 
-    def __init__(self, model_config: dict):
+    def __init__(self, config: dict):
         super().__init__()
         self.start_layer, self.end_layer = get_pp_layers(
-            model_config['num_hidden_layers'])
+            config.num_hidden_layers)
         self.layers = nn.ModuleList([LlamaDecoderLayer(
-            layer_id-self.start_layer, model_config) for layer_id in range(self.start_layer, self.end_layer)])
+            layer_id-self.start_layer, config) for layer_id in range(self.start_layer, self.end_layer)])
         if get_pp_rank() == 0:
             self.embed_tokens = nn.Embedding(
-                model_config['vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
+                config.vocab_size, config.hidden_size, dtype=config.torch_dtype, device='cuda')
         if get_pp_rank() == get_pp_size() - 1:
             self.norm = RMSNorm(
-                model_config['hidden_size'], model_config['rms_norm_eps'], model_config['torch_dtype'])
+                config.hidden_size, config.rms_norm_eps, config.torch_dtype)
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         if get_pp_rank() == 0:
@@ -145,32 +147,32 @@ class LlamaModel(nn.Module):
 
 class LlamaForCausalLM(nn.Module):
 
-    def __init__(self, model_config: dict):
+    def __init__(self, config: dict):
         super().__init__()
-        self.max_model_len = model_config['max_position_embeddings']
-        self.num_layers = get_pp_num_layers(model_config['num_hidden_layers'])
-        self.dtype = model_config['torch_dtype']
-        self.num_kv_heads = model_config['num_key_value_heads']
-        self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
-        self.finish_tokens = LlamaForCausalLM.get_finish_tokens(model_config)
-        self.model = LlamaModel(model_config)
-        self.model_config = model_config
+        self.max_model_len = config.max_position_embeddings
+        self.num_layers = get_pp_num_layers(config.num_hidden_layers)
+        self.dtype = config.torch_dtype
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.finish_tokens = LlamaForCausalLM.get_finish_tokens(config)
+        self.model = LlamaModel(config)
+        self.config = config
         self.ret_residual = True
         if get_pp_rank() == get_pp_size() - 1:
             self.lm_head = nn.Linear(
-                model_config['hidden_size'], model_config['vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
+                config.hidden_size, config.vocab_size, bias=False, dtype=config.torch_dtype, device='cuda')
         self.sampler = Sampler()
         
-    def get_finish_tokens(model_config: dict):
+    def get_finish_tokens(config: dict):
         finish_tokens = None
-        if model_config['eos_token_id'] == 128001:
+        if config.eos_token_id == 128001:
             # Llama3-8b-chat
-            finish_tokens = [model_config['eos_token_id'], 128009]
+            finish_tokens = [config.eos_token_id, 128009]
         else:
-            if type(model_config['eos_token_id']) == int:
-                finish_tokens = [model_config['eos_token_id']]
-            elif type(model_config['eos_token_id']) == list:
-                finish_tokens = model_config['eos_token_id']
+            if type(config.eos_token_id) == int:
+                finish_tokens = [config.eos_token_id]
+            elif type(config.eos_token_id) == list:
+                finish_tokens = config.eos_token_id
             else:
                 assert 0
         return finish_tokens
@@ -190,10 +192,10 @@ class LlamaForCausalLM(nn.Module):
         parameters = dict(self.named_parameters())
 
         # assert len(parameters) == len(weights)
-        num_attn_heads = self.model_config['num_attention_heads']
-        head_dim = self.model_config['hidden_size'] // num_attn_heads
-        num_kv_heads = self.model_config['num_key_value_heads']
-        intermediate_size = self.model_config['intermediate_size']
+        num_attn_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_attn_heads
+        num_kv_heads = self.config.num_key_value_heads
+        intermediate_size = self.config.intermediate_size
         for k, v in parameters.items():
             # resolve PP layer
             if 'layers' in k:

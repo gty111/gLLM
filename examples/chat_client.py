@@ -2,7 +2,7 @@ import argparse
 from openai import OpenAI
 
 parser = argparse.ArgumentParser(description='Chat client')
-parser.add_argument("--num-tokens", type=int, default=512)
+parser.add_argument("--num-tokens", type=int, default=2048)
 parser.add_argument("--port", type=int)
 args = parser.parse_args()
 

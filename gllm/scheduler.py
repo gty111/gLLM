@@ -2,7 +2,6 @@ import time
 
 from logger import logger
 from typing import List, Dict
-from collections import deque
 
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager

@@ -1,9 +1,9 @@
-import json
 import glob
 import torch
 
 from logger import logger
 from safetensors import safe_open
+from transformers import AutoConfig
 
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.chatglm import ChatGLMForCausalLM
@@ -14,8 +14,7 @@ from gllm.dist_utils import get_pp_rank
 class ModelLoader():
     def __init__(self, load_format, model_path):
         self.model_path = model_path
-        self.model_config = self.load_config()
-        self.post_process_config()
+        self.config = self.load_config()
         self.load_format = load_format
         
     def get_dtype(self, dtype: str):
@@ -27,7 +26,7 @@ class ModelLoader():
             assert 0
 
     def get_finish_tokens(self):
-        return self.get_model_type().get_finish_tokens(self.model_config)
+        return self.get_model_type().get_finish_tokens(self.config)
 
     def load_weights(self):
         weights = {}
@@ -51,33 +50,14 @@ class ModelLoader():
             return weights
 
         raise Exception('No weights(.bin/.safetensor) found in the directory!')
-        
-    def post_process_config(self):
-        if self.architecture == 'ChatGLMModel':
-            if 'rope_scaling' not in self.model_config:
-                self.model_config['rope_theta'] = 10000
-            else:
-                self.model_config['rope_theta'] = self.model_config['rope_scaling'] * 10000
-        elif self.architecture == 'LlamaForCausalLM':
-            if 'rope_theta' not in self.model_config:
-                self.model_config['rope_theta'] = 10000
 
     def load_config(self):
-        config_path = f"{self.model_path}/config.json"
-        with open(config_path, 'r') as f:
-            model_config = json.load(f)
-        self.dtype = self.get_dtype(
-            model_config['torch_dtype'])
-        model_config['torch_dtype'] = self.dtype
-        self.architecture = model_config['architectures'][0]
-        if 'vocab_size' in model_config:
-            self.vocab_size = int(model_config['vocab_size'])
-        elif 'padded_vocab_size' in model_config:
-            self.vocab_size = int(model_config['padded_vocab_size'])
-        else:
-            assert 0
-        self.hidden_size = int(model_config['hidden_size'])
-        return model_config
+        config = AutoConfig.from_pretrained(self.model_path,trust_remote_code=True)
+        self.dtype = config.torch_dtype
+        self.architecture = config.architectures[0]
+        self.vocab_size = config.vocab_size
+        self.hidden_size = config.hidden_size
+        return config
     
     def get_model_type(self):
         model_type = None
@@ -93,7 +73,7 @@ class ModelLoader():
 
     def load_model(self):
         model_type = self.get_model_type()
-        model = model_type(self.model_config)
+        model = model_type(self.config)
         
         if self.load_format == 'auto':
             weights = self.load_weights()

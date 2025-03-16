@@ -13,28 +13,28 @@ from gllm.dist_utils import get_pp_num_layers, get_pp_layers, get_pp_rank, get_p
 
 
 class GLMAttention(nn.Module):
-    def __init__(self, layer_id: int, model_config: dict):
+    def __init__(self, layer_id: int, config: dict):
         super().__init__()
-        self.hidden_size = model_config['hidden_size']
-        self.num_heads = model_config['num_attention_heads']
-        self.num_kv_heads = model_config['multi_query_group_num']
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.multi_query_group_num
         self.head_dim = self.hidden_size // self.num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
 
         self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim // 2, model_config['seq_length'], model_config['rope_theta'], False, model_config['torch_dtype'])
+            self.head_dim, self.head_dim // 2, config.seq_length, getattr(config,'rope_theta',10000), False, config.torch_dtype)
         self.attn = FlashAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
 
-        self.projection_size = model_config['kv_channels'] * self.num_heads
+        self.projection_size = config.kv_channels * self.num_heads
         self.qkv_hidden_size = self.projection_size + 2 * \
-            self.head_dim * model_config['multi_query_group_num']
+            self.head_dim * config.multi_query_group_num
         self.query_key_value = nn.Linear(self.hidden_size, self.qkv_hidden_size,
-                                         bias=model_config['add_bias_linear'] or model_config['add_qkv_bias'], dtype=model_config['torch_dtype'], device='cuda')
+                                         bias=config.add_bias_linear or config.add_qkv_bias, dtype=config.torch_dtype, device='cuda')
         self.dense = nn.Linear(self.projection_size, self.hidden_size,
-                               bias=model_config['add_bias_linear'], dtype=model_config['torch_dtype'], device='cuda')
+                               bias=config.add_bias_linear, dtype=config.torch_dtype, device='cuda')
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.query_key_value(hidden_states)
@@ -46,14 +46,14 @@ class GLMAttention(nn.Module):
 
 
 class GLMMLP(nn.Module):
-    def __init__(self, model_config):
+    def __init__(self, config):
         super().__init__()
-        self.add_bias = model_config['add_bias_linear']
+        self.add_bias = config.add_bias_linear
         self.dense_h_to_4h = nn.Linear(
-            model_config['hidden_size'], model_config['ffn_hidden_size']*2, bias=self.add_bias, dtype=model_config['torch_dtype'], device='cuda')
+            config.hidden_size, config.ffn_hidden_size*2, bias=self.add_bias, dtype=config.torch_dtype, device='cuda')
         self.activation_func = SiluAndMul()
         self.dense_4h_to_h = nn.Linear(
-            model_config['ffn_hidden_size'], model_config['hidden_size'], bias=self.add_bias, dtype=model_config['torch_dtype'], device='cuda')
+            config.ffn_hidden_size, config.hidden_size, bias=self.add_bias, dtype=config.torch_dtype, device='cuda')
 
     def forward(self, hidden_states):
         # [s, b, 4hp]
@@ -65,23 +65,22 @@ class GLMMLP(nn.Module):
 
 
 class GLMBlock(nn.Module):
-    def __init__(self, layer_id, model_config: dict):
+    def __init__(self, layer_id, config: dict):
         super().__init__()
-        self.apply_residual_connection_post_layernorm = model_config[
-            'apply_residual_connection_post_layernorm']
-        self.fp32_residual_connection = model_config['fp32_residual_connection']
+        self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
+        self.fp32_residual_connection = config.fp32_residual_connection
 
-        assert model_config['rmsnorm']
+        assert config.rmsnorm
         self.input_layernorm = RMSNorm(
-            model_config['hidden_size'], model_config['layernorm_epsilon'], model_config['torch_dtype'])
+            config.hidden_size, config.layernorm_epsilon, config.torch_dtype)
 
-        self.self_attention = GLMAttention(layer_id, model_config)
-        self.hidden_dropout = model_config['hidden_dropout']
+        self.self_attention = GLMAttention(layer_id, config)
+        self.hidden_dropout = config.hidden_dropout
 
         self.post_attention_layernorm = RMSNorm(
-            model_config['hidden_size'], model_config['layernorm_epsilon'], model_config['torch_dtype'])
+            config.hidden_size, config.layernorm_epsilon, config.torch_dtype)
 
-        self.mlp = GLMMLP(model_config)
+        self.mlp = GLMMLP(config)
 
     def forward(self, hidden_states: torch.Tensor, input_data: InputData):
         # hidden_states: [num_tokens, h]
@@ -113,21 +112,21 @@ class GLMBlock(nn.Module):
 
 
 class GLMTransformer(nn.Module):
-    def __init__(self, model_config: dict):
+    def __init__(self, config: dict):
         super().__init__()
         # assume post_layer_norm is true
         self.post_layer_norm = True
 
-        self.start_layer, self.end_layer = get_pp_layers(model_config['num_layers'])
+        self.start_layer, self.end_layer = get_pp_layers(config.num_layers)
         self.layers = nn.ModuleList(
-            [GLMBlock(i-self.start_layer, model_config) for i in range(self.start_layer, self.end_layer)])
+            [GLMBlock(i-self.start_layer, config) for i in range(self.start_layer, self.end_layer)])
 
         if get_pp_rank() == get_pp_size() - 1:
             if self.post_layer_norm:
-                assert model_config['rmsnorm']
+                assert config.rmsnorm
                 layer_norm_func = RMSNorm
                 self.final_layernorm = layer_norm_func(
-                    model_config['hidden_size'], model_config['layernorm_epsilon'], model_config['torch_dtype'])
+                    config.hidden_size, config.layernorm_epsilon, config.torch_dtype)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         for layer in self.layers:
@@ -141,18 +140,18 @@ class GLMTransformer(nn.Module):
 
 
 class ChatGLMModel(nn.Module):
-    def __init__(self, model_config: dict):
+    def __init__(self, config: dict):
         super().__init__()
 
         self.embedding = nn.Embedding(
-            model_config['padded_vocab_size'], model_config['hidden_size'], dtype=model_config['torch_dtype'], device='cuda')
+            config.padded_vocab_size, config.hidden_size, dtype=config.torch_dtype, device='cuda')
 
-        self.multi_query_group_num = model_config['multi_query_group_num']
-        self.kv_channels = model_config['kv_channels']
+        self.multi_query_group_num = config.multi_query_group_num
+        self.kv_channels = config.kv_channels
 
-        self.encoder = GLMTransformer(model_config)
+        self.encoder = GLMTransformer(config)
         self.output_layer = nn.Linear(
-            model_config['hidden_size'], model_config['padded_vocab_size'], bias=False, dtype=model_config['torch_dtype'], device='cuda')
+            config.hidden_size, config.padded_vocab_size, bias=False, dtype=config.torch_dtype, device='cuda')
 
     def forward(self, input_data: InputData, hidden_states=None):
         if get_pp_rank() == 0:
@@ -164,28 +163,28 @@ class ChatGLMModel(nn.Module):
 
 
 class ChatGLMForCausalLM(nn.Module):
-    def __init__(self, model_config: dict):
+    def __init__(self, config: dict):
         super().__init__()
 
-        self.model_config = model_config
-        self.max_model_len = model_config['seq_length']
-        self.num_layers = get_pp_num_layers(model_config['num_layers'])
-        self.dtype = model_config['torch_dtype']
-        self.num_kv_heads = model_config['multi_query_group_num']
-        self.head_dim = model_config['hidden_size'] // model_config['num_attention_heads']
-        self.finish_tokens = ChatGLMForCausalLM.get_finish_tokens(model_config)
-        self.transformer = ChatGLMModel(model_config)
+        self.config = config
+        self.max_model_len = config.seq_length
+        self.num_layers = get_pp_num_layers(config.num_layers)
+        self.dtype = config.torch_dtype
+        self.num_kv_heads = config.multi_query_group_num
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.finish_tokens = ChatGLMForCausalLM.get_finish_tokens(config)
+        self.transformer = ChatGLMModel(config)
         self.ret_residual = False
         if get_pp_rank() == get_pp_size() - 1:
             self.lm_head = self.transformer.output_layer
         self.sampler = Sampler()
         
-    def get_finish_tokens(model_config):
-        if type(model_config['eos_token_id']) == list:
+    def get_finish_tokens(config):
+        if type(config.eos_token_id) == list:
             # glm4-9b-chat
-            return model_config['eos_token_id']
+            return config.eos_token_id
         else:
-            return [model_config['eos_token_id']]
+            return [config.eos_token_id]
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.transformer(input_data, hidden_states)

@@ -7,7 +7,6 @@ from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 from gllm.allocatorID import AllocatorID
 from gllm.scheduler import Scheduler
-from gllm.dist_utils import init_dist
 from gllm.input_data import InputData
 
 
