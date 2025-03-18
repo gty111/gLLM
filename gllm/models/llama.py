@@ -14,7 +14,7 @@ from gllm.dist_utils import get_pp_num_layers, get_pp_layers, get_pp_rank, get_p
 
 class LlamaMLP(nn.Module):
 
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -30,7 +30,7 @@ class LlamaMLP(nn.Module):
 
 class LlamaAttention(nn.Module):
 
-    def __init__(self, layer_id: int, config: dict):
+    def __init__(self, layer_id: int, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -86,7 +86,7 @@ class LlamaAttention(nn.Module):
 
 class LlamaDecoderLayer(nn.Module):
 
-    def __init__(self, layer_id: int, config: dict):
+    def __init__(self, layer_id: int, config):
         super().__init__()
         self.input_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps, config.torch_dtype)
@@ -119,7 +119,7 @@ class LlamaDecoderLayer(nn.Module):
 
 class LlamaModel(nn.Module):
 
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
         self.start_layer, self.end_layer = get_pp_layers(
             config.num_hidden_layers)
@@ -147,7 +147,7 @@ class LlamaModel(nn.Module):
 
 class LlamaForCausalLM(nn.Module):
 
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
         self.max_model_len = config.max_position_embeddings
         self.num_layers = get_pp_num_layers(config.num_hidden_layers)
@@ -163,7 +163,7 @@ class LlamaForCausalLM(nn.Module):
                 config.hidden_size, config.vocab_size, bias=False, dtype=config.torch_dtype, device='cuda')
         self.sampler = Sampler()
         
-    def get_finish_tokens(config: dict):
+    def get_finish_tokens(config):
         finish_tokens = None
         if config.eos_token_id == 128001:
             # Llama3-8b-chat

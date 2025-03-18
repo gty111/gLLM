@@ -14,7 +14,7 @@ from gllm.dist_utils import get_pp_num_layers, get_pp_layers, get_pp_size, get_p
 
 class Qwen2MLP(nn.Module):
 
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
         self.gate_up_proj = nn.Linear(config.hidden_size, config.intermediate_size
                                       * 2, bias=False, dtype=config.torch_dtype, device='cuda')
@@ -27,7 +27,7 @@ class Qwen2MLP(nn.Module):
 
 
 class Qwen2Attention(nn.Module):
-    def __init__(self, layer_id: int, config: dict):
+    def __init__(self, layer_id: int, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -57,7 +57,7 @@ class Qwen2Attention(nn.Module):
 
 
 class Qwen2DecoderLayer(nn.Module):
-    def __init__(self, layer_id: int, config: dict):
+    def __init__(self, layer_id: int, config):
         super().__init__()
         self.self_attn = Qwen2Attention(layer_id, config)
         self.mlp = Qwen2MLP(config)
@@ -83,7 +83,7 @@ class Qwen2DecoderLayer(nn.Module):
 
 
 class Qwen2Model(nn.Module):
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
         if get_pp_rank() == 0 or config.tie_word_embeddings and get_pp_rank() == get_pp_size() - 1:
             self.embed_tokens = nn.Embedding(
@@ -113,7 +113,7 @@ class Qwen2Model(nn.Module):
 
 
 class Qwen2ForCausalLM(nn.Module):
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.max_model_len = config.max_position_embeddings

@@ -13,7 +13,7 @@ from gllm.dist_utils import get_pp_num_layers, get_pp_layers, get_pp_rank, get_p
 
 
 class GLMAttention(nn.Module):
-    def __init__(self, layer_id: int, config: dict):
+    def __init__(self, layer_id: int, config):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -65,7 +65,7 @@ class GLMMLP(nn.Module):
 
 
 class GLMBlock(nn.Module):
-    def __init__(self, layer_id, config: dict):
+    def __init__(self, layer_id, config):
         super().__init__()
         self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
         self.fp32_residual_connection = config.fp32_residual_connection
@@ -112,7 +112,7 @@ class GLMBlock(nn.Module):
 
 
 class GLMTransformer(nn.Module):
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
         # assume post_layer_norm is true
         self.post_layer_norm = True
@@ -140,7 +140,7 @@ class GLMTransformer(nn.Module):
 
 
 class ChatGLMModel(nn.Module):
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
 
         self.embedding = nn.Embedding(
@@ -163,7 +163,7 @@ class ChatGLMModel(nn.Module):
 
 
 class ChatGLMForCausalLM(nn.Module):
-    def __init__(self, config: dict):
+    def __init__(self, config):
         super().__init__()
 
         self.config = config
