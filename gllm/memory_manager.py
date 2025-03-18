@@ -66,9 +66,6 @@ class MemoryManager():
 
     def get_num_free_pages(self):
         return self.segment.get_num_free_pages()
-    
-    def get_num_free_slots(self):
-        return self.segment.get_num_free_pages() * self.page_size
 
     def get_memory_util(self):
         return self.segment.get_memory_util()

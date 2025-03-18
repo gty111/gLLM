@@ -54,20 +54,10 @@ class LLM():
         self.model_runner.init()
         self.scheduler.set_total_num_free_pages(self.model_runner.memory_manager.get_num_free_pages())
 
-    def check_preempt_seqs(self):
-        preempt_seqs = []
-        while self.model_runner.memory_manager.get_num_free_slots() < self.scheduler.max_batch_tokens:
-            seq = self.scheduler.decode_lists.pop()
-            self.model_runner.memory_manager.free(seq)
-            preempt_seqs.append(seq)
-        self.scheduler.process_preempt(preempt_seqs=preempt_seqs)
-
     def step(self):
         if self.model_runner.model is None:
             self.init()
-        self.check_preempt_seqs()
-        scheduleOutput = self.scheduler.schedule(
-            self.model_runner.memory_manager.get_num_free_pages())
+        scheduleOutput = self.scheduler.schedule(self.model_runner.memory_manager)
         next_tokens = self.model_runner.step_once(InputData(scheduleOutput.schedule_lists, self.model_runner.memory_manager))
         self.scheduler.update_seqs(scheduleOutput, next_tokens,memory_manager=self.model_runner.memory_manager)
 

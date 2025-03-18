@@ -83,8 +83,7 @@ class AsyncLLM(LLM):
 
     async def step_async(self):
         self.check_preempt_seqs()
-        schedulerOutput = self.scheduler.schedule(
-            self.model_runner.memory_manager.get_num_free_pages(), log=True, delta=False)
+        schedulerOutput = self.scheduler.schedule(self.model_runner.memory_manager, log=True, delta=False)
         next_tokens = await make_async(self.model_runner.step_once)(
             InputData(schedulerOutput.schedule_lists, self.model_runner.memory_manager))
         self.scheduler.update_seqs(schedulerOutput, next_tokens,memory_manager=self.model_runner.memory_manager)
@@ -122,7 +121,6 @@ class PipeAsyncLLM(LLM):
         self.process_output_engine = None
 
         self.ctx = mp.get_context('spawn')
-        self.num_free_pages = self.ctx.Value('i', 0)
         self.mp_alive = self.ctx.Array('i',[0 for i in range(self.pp_size)])
 
         self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
@@ -149,21 +147,17 @@ class PipeAsyncLLM(LLM):
         return stream
 
     async def run_schedule(self, schedule_socket):
-
         if not self.scheduler.has_seqs():
             self.schedule_engine = None
             return True
 
-        if not self.scheduler.has_scheduled_seqs():
-            await asyncio.sleep(0)
-            return False
-
-        schedulerOutput = self.scheduler.schedule(
-            self.num_free_pages.value, delta=True)
+        schedulerOutput = self.scheduler.schedule(delta=True)
 
         if len(schedulerOutput.schedule_lists) != 0:
             schedule_bytes = pickle.dumps(schedulerOutput)
             schedule_socket.send(schedule_bytes, copy=False)
+
+        await asyncio.sleep(0)
 
         return False
 
@@ -172,7 +166,6 @@ class PipeAsyncLLM(LLM):
         schedule_socket = make_socket(
             zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
         output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PULL)
-        self.scheduler.set_total_num_free_pages(self.num_free_pages.value)
         while True:
             check_worker_alive(self.mp_alive)
             if output_socket.poll(timeout=0) != 0:
@@ -202,7 +195,6 @@ class PipeAsyncLLM(LLM):
 
     def start_worker(self, pp_rank):
         worker = Worker(self.model_runner,
-                        self.num_free_pages,
                         pp_rank,
                         self.pp_size,
                         self.master_addr,

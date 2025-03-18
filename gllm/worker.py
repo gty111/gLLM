@@ -20,10 +20,9 @@ from gllm.memory_manager import PrefixMemoryManager
 # Used with PipeAsyncLLM
 class Worker:
     
-    def __init__(self, model_runner:ModelRunner, num_free_pages, pp_rank, pp_size, 
+    def __init__(self, model_runner:ModelRunner, pp_rank, pp_size, 
                  master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path,mp_alive):
         self.model_runner = model_runner
-        self.num_free_pages = num_free_pages
         self.pp_rank = pp_rank # pp rank
         self.pp_size = pp_size # pp size
         self.master_addr = master_addr
@@ -57,6 +56,9 @@ class Worker:
             self.batch_running = deque()
             self.num_running_decode_seqs = 0
             self.log_time = 0
+            # preempt seqs
+            self.num_preempt_seqs = 0
+            self.log_num_preempt_seqs = 0
             # rank 0 => other ranks : batched seqs
             self.gpu_schedule_socket = []
             for i in range(1,self.pp_size):
@@ -80,18 +82,14 @@ class Worker:
         self.ret_residual = self.model_runner.model.ret_residual
         self.max_decode_seqs = self.model_runner.max_decode_seqs
         self.max_batch_tokens = self.model_runner.max_batch_tokens
+        self.page_size = self.model_runner.page_size
         self.num_threshold_free_pages = int(
             self.model_runner.ratio_threshold_free_pages * self.model_runner.memory_manager.get_num_free_pages())
-        self.page_size = self.model_runner.page_size
         
         self.mp_alive[self.pp_rank] = 1
-        self.set_num_free_pages()
     
     def get_num_free_pages(self):
         return self.model_runner.memory_manager.get_num_free_pages()
-    
-    def set_num_free_pages(self):
-        self.num_free_pages.value = self.model_runner.memory_manager.get_num_free_pages()
 
     # rank except 0 
     def run(self):
@@ -137,19 +135,25 @@ class Worker:
                     
     # rank 0: check if preempt seqs 
     def check_preempt(self):
-        preempt_ids = []
-        while self.model_runner.memory_manager.get_num_free_slots() < self.max_batch_tokens and len(self.seqs_to_decode) != 0:
+        preempt_seqs = []
+        while self.model_runner.memory_manager.get_num_free_pages() < (
+            self.num_running_decode_seqs + len(self.seqs_to_decode)) and len(self.seqs_to_decode) != 0:
             seq_to_preempt = self.seqs_to_decode.pop()
-            preempt_ids.append(seq_to_preempt.seq_id)
             self.model_runner.memory_manager.free(seq_to_preempt)
-        self.seqs_to_prefill = preempt_ids + self.seqs_to_prefill
+            seq_to_preempt.preempt()
+            preempt_seqs.append(seq_to_preempt)
+        self.seqs_to_prefill = preempt_seqs + self.seqs_to_prefill
+        
+        self.num_preempt_seqs += len(preempt_seqs)
+        if self.num_preempt_seqs - self.log_num_preempt_seqs > 10:
+            self.log_num_preempt_seqs = self.num_preempt_seqs
+            logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}')
+            logger.warning('Try increase --ratio-free-pages or the performance is poor!')
     
     # rank 0: PP schedule 
     def schedule(self):
         if len(self.batch_running) >= self.pp_size:
             return []
-        
-        self.check_preempt()
         
         schedule_prefill_seqs = []
         schedule_decode_seqs = []
@@ -179,6 +183,8 @@ class Worker:
             schedule_prefill_seqs.append(seq)
         for seq in schedule_prefill_seqs:
             self.seqs_to_prefill.remove(seq)
+        
+        self.check_preempt()
         
         # decode
         num_total_decode_seqs = len(self.seqs_to_decode) + self.num_running_decode_seqs
@@ -222,7 +228,6 @@ class Worker:
             schedule_seqs = self.schedule()
             if len(schedule_seqs) != 0:
                 input_data = InputData(schedule_seqs, self.model_runner.memory_manager)
-                self.set_num_free_pages()
                 if self.pp_size > 1:
                     seqs_bytes = pickle.dumps(schedule_seqs)
                     for i in range(1,self.pp_size):

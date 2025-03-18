@@ -47,7 +47,11 @@ class Scheduler:
     def add_requests(self, requests: List[Sequence]):
         self.prompt_lists.extend(requests)
 
-    def schedule(self, num_free_pages: int, log: bool = False, delta: bool = False):
+    def schedule(self, memory_manager:MemoryManager = None, log: bool = False, delta: bool = False):
+        if memory_manager:
+            num_free_pages = memory_manager.get_num_free_pages()
+            self.num_free_pages = num_free_pages
+            
         # log
         cur_time = time.time()
         if log and cur_time - self.log_time > 1:
@@ -58,9 +62,6 @@ class Scheduler:
                    len(self.decode_lists) + len(self.run_batch),
                    self.get_memory_util()))
 
-        self.num_free_pages = num_free_pages
-
-        cur_prefill_budget = 0
         # prompt
         if delta:
             # we just forward seqs to the worker
@@ -70,8 +71,8 @@ class Scheduler:
             self.prompt_lists = []
             return SchedulerOutput(prefill_schedule_lists)
         else:
-            if len(self.prompt_lists) != 0 and (
-                self.num_free_pages > self.num_threshold_free_pages):
+            cur_prefill_budget = 0
+            if self.num_free_pages > self.num_threshold_free_pages:
                 prefill_schedule_lists: List[Sequence] = []
                 cu_seqs_len = 0
                 for seq in self.prompt_lists:
@@ -79,6 +80,8 @@ class Scheduler:
                     if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens and (
                         self.num_free_pages - num_page - cur_prefill_budget > self.num_threshold_free_pages):
                         cu_seqs_len += len(seq.token_ids)
+                        memory_manager.pre_allocate_page([seq])
+                        seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
                         prefill_schedule_lists.append(seq)
                         cur_prefill_budget += num_page
                     else:
@@ -95,11 +98,15 @@ class Scheduler:
             # since worker can schedule by self
             return SchedulerOutput([])
         else:
+            self.check_preempt_seqs(memory_manager)
             decode_batch_size = min(
                 self.max_decode_seqs, self.num_free_pages*self.page_size, len(self.decode_lists))
-            schedule_lists = self.decode_lists[:decode_batch_size]
+            decode_schedule_lists = self.decode_lists[:decode_batch_size]
             self.decode_lists = self.decode_lists[decode_batch_size:]
-            return SchedulerOutput(schedule_lists)
+            memory_manager.pre_allocate_page(decode_schedule_lists)
+            for seq in decode_schedule_lists:
+                seq.to_compute_token_num = 1
+            return SchedulerOutput(decode_schedule_lists)
 
     def update_seqs(self, schedulerOutput: SchedulerOutput, next_tokens: List[int] = None, 
                     delta=False, memory_manager: MemoryManager=None):
@@ -108,7 +115,6 @@ class Scheduler:
             for idx, seq in enumerate(schedulerOutput.schedule_lists):
                 seq.token_ids.append(next_tokens[idx])
                 seq.computed_token_num += seq.to_compute_token_num
-                seq.to_compute_token_num = 1
                 if seq.is_finish():
                     memory_manager.free(seq)
                     self.finish_lists.append(seq.seq_id)
@@ -123,29 +129,23 @@ class Scheduler:
                     seq.token_ids.append(next_tokens[idx])
             self.finish_lists.extend(schedulerOutput.free_ids)
 
-    def process_preempt(self, preempt_ids:List[int]=None, preempt_seqs:List[Sequence]=None):
-        _preempt_seqs = []
-        if preempt_ids is not None:
-            for id in preempt_ids:
-                seq = self.run_batch.pop(id)
-                _preempt_seqs.append(seq)
-        else:
-            assert preempt_seqs is not None
-            _preempt_seqs = preempt_seqs
-        for seq in _preempt_seqs:
+    def check_preempt_seqs(self, memory_manager:MemoryManager):
+        preempt_seqs = []
+        while memory_manager.get_num_free_pages() < len(self.decode_lists):
+            seq = self.decode_lists.pop()
+            memory_manager.free(seq)
+            preempt_seqs.append(seq)
+        self.process_preempt(preempt_seqs)
+    
+    def process_preempt(self, preempt_seqs:List[Sequence]=None):
+        for seq in preempt_seqs:
             seq.preempt()
-        self.prompt_lists = _preempt_seqs + self.prompt_lists
-        self.preempt_num_seqs += len(_preempt_seqs)
+        self.prompt_lists = preempt_seqs + self.prompt_lists
+        self.preempt_num_seqs += len(preempt_seqs)
         if self.preempt_num_seqs - self.log_preempt_num_seqs > 10:
             logger.warning(f'#Preempted seqs: {self.preempt_num_seqs}')
             logger.warning('Try increase --ratio-free-pages or the performance is poor!')
             self.log_preempt_num_seqs = self.preempt_num_seqs
-
-    def can_schedule_prefill(self):
-        return len(self.prompt_lists) != 0 and self.num_free_pages > self.num_threshold_free_pages
-
-    def has_scheduled_seqs(self):
-        return self.can_schedule_prefill() or len(self.decode_lists) + len(self.run_batch) != 0
 
     def has_seqs(self):
         return len(self.prompt_lists) + len(self.decode_lists) + len(self.run_batch) != 0

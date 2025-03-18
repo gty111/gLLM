@@ -65,9 +65,10 @@ def run_gllm(
     requests: List[Tuple[str, int, int]],
     model: str,
     gpu_memory_util: float,
+    ratio_threshold_free_pages: float,
 ):
     from gllm import LLM
-    llm = LLM(model, gpu_memory_util=gpu_memory_util)
+    llm = LLM(model, gpu_memory_util=gpu_memory_util, ratio_threshold_free_pages=ratio_threshold_free_pages)
     prompts = []
     output_lens = []
     for request in requests:
@@ -262,7 +263,8 @@ def main(args: argparse.Namespace):
                                args.output_len)
     elif args.backend == "gllm":
         elapsed_time = run_gllm(requests, args.model,
-                                args.gpu_memory_utilization)
+                                args.gpu_memory_utilization,
+                                args.ratio_free_pages)
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
     total_num_tokens = sum(prompt_len + output_len
@@ -347,6 +349,7 @@ if __name__ == "__main__":
                         help='the fraction of GPU memory to be used for '
                         'the model executor, which can range from 0 to 1.'
                         'If unspecified, will use the default value of 0.9.')
+    parser.add_argument("--ratio-free-pages", type=float, default=0.05)
     parser.add_argument("--enforce-eager",
                         action="store_true",
                         help="enforce eager execution")

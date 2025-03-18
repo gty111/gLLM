@@ -61,6 +61,8 @@ class ModelRunner():
     def stream_inference(self, seq: Sequence):
         # -------prefill------
         prefill_start = time.time()
+        self.memory_manager.pre_allocate_page([seq])
+        seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
         next_token = self.step_once(InputData([seq],self.memory_manager))[0]
         seq.token_ids.append(next_token)
         seq.computed_token_num += seq.to_compute_token_num
@@ -74,6 +76,7 @@ class ModelRunner():
             print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
             if seq.is_finish():
                 break
+            self.memory_manager.pre_allocate_page([seq])
             next_token = self.step_once(InputData([seq], self.memory_manager))[0]
             seq.computed_token_num += seq.to_compute_token_num
             seq.token_ids.append(next_token)
