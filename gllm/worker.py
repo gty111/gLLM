@@ -155,12 +155,13 @@ class Worker:
         schedule_decode_seqs = []
         
         # prefill
-        prefill_token_budget = max(self.get_num_free_pages()-self.num_threshold_free_pages,0)
+        prefill_token_budget = self.page_size * max(self.get_num_free_pages()-self.num_threshold_free_pages,0)
         if self.pp_size > 1:
             prefill_token_budget = min(
                 round(self.model_runner.memory_manager.get_memory_free() * self.max_batch_tokens),
                 prefill_token_budget)
-        
+        else:
+            prefill_token_budget = min(self.max_batch_tokens, prefill_token_budget)
         prefill_batched_token_nums = 0
         for seq in self.seqs_to_prefill:
             if prefill_token_budget == 0:
