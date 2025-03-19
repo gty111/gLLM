@@ -150,6 +150,62 @@ class Worker:
             logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}')
             logger.warning('Try increase --ratio-free-pages or the performance is poor!')
     
+    def schedule_naive(self):
+        if len(self.batch_running) >= self.pp_size:
+            return []
+        
+        schedule_prefill_seqs = []
+        schedule_decode_seqs = []
+        
+        self.check_preempt()
+        
+        num_tokens_budget = self.max_batch_tokens
+        
+        # decode
+        schedule_decode_seqs = self.seqs_to_decode[:num_tokens_budget]
+        self.seqs_to_decode = self.seqs_to_decode[num_tokens_budget:]
+        self.num_running_decode_seqs += len(schedule_decode_seqs)
+        
+        self.model_runner.memory_manager.pre_allocate_page(schedule_decode_seqs)
+        for seq in schedule_decode_seqs:
+            seq.to_compute_token_num = 1
+        
+        num_tokens_budget -= len(schedule_decode_seqs)
+        
+        # prefill
+        prefill_batched_token_nums = 0
+        for seq in self.seqs_to_prefill:
+            if num_tokens_budget == 0:
+                break
+            self.model_runner.memory_manager.pre_allocate_page([seq])
+            if len(seq.token_ids)-seq.computed_token_num <= num_tokens_budget:
+                seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
+                prefill_batched_token_nums += seq.to_compute_token_num
+                num_tokens_budget -= seq.to_compute_token_num
+            else:
+                prefill_batched_token_nums += num_tokens_budget
+                seq.to_compute_token_num = num_tokens_budget
+                num_tokens_budget = 0
+            schedule_prefill_seqs.append(seq)
+            
+        for seq in schedule_prefill_seqs:
+            self.seqs_to_prefill.remove(seq)
+
+        if time.time()-self.log_time > 1:
+            self.log_time = time.time()
+            log_info = '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
+                            len(self.seqs_to_prefill),
+                            self.num_running_decode_seqs,
+                            prefill_batched_token_nums,
+                            len(schedule_decode_seqs),
+                            '%.2f' % self.model_runner.memory_manager.get_memory_util())
+            if isinstance(self.model_runner.memory_manager, PrefixMemoryManager):
+                log_info += ' cache_hit_rate: %5s %%' % ('%.2f' % self.model_runner.memory_manager.get_cache_hit_rate())
+                logger.info(log_info)
+            else:
+                logger.info(log_info)
+        return schedule_prefill_seqs + schedule_decode_seqs
+    
     # rank 0: PP schedule 
     def schedule(self):
         if len(self.batch_running) >= self.pp_size:
@@ -225,7 +281,7 @@ class Worker:
             self.seqs_to_prefill.extend(schedulerOutput.schedule_lists)
         
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0:
-            schedule_seqs = self.schedule()
+            schedule_seqs = self.schedule_naive()
             if len(schedule_seqs) != 0:
                 input_data = InputData(schedule_seqs, self.model_runner.memory_manager)
                 if self.pp_size > 1:
