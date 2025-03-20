@@ -17,7 +17,9 @@ class AllocatorID():
 
     def free(self, id: int):
         # assert id not in self.free_ids
-        self.free_ids.appendleft(id)
+        
+        # append instead of appendleft to improve prefix cache hit rate
+        self.free_ids.append(id)
 
     def is_empty(self):
         return len(self.free_ids) == self.size

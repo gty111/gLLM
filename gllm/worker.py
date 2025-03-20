@@ -59,6 +59,8 @@ class Worker:
             # preempt seqs
             self.num_preempt_seqs = 0
             self.log_num_preempt_seqs = 0
+            # num wait tokens
+            self.num_wait_tokens = 0
             # rank 0 => other ranks : batched seqs
             self.gpu_schedule_socket = []
             for i in range(1,self.pp_size):
@@ -220,13 +222,13 @@ class Worker:
             prefill_token_budget = min(
                 round(self.model_runner.memory_manager.get_memory_free() * self.max_batch_tokens),
                 prefill_token_budget)
+            prefill_token_budget = min(max(self.num_wait_tokens//8,32),prefill_token_budget)
         else:
             prefill_token_budget = min(self.max_batch_tokens, prefill_token_budget)
         prefill_batched_token_nums = 0
         for seq in self.seqs_to_prefill:
             if prefill_token_budget == 0:
                 break
-            self.model_runner.memory_manager.pre_allocate_page([seq])
             if len(seq.token_ids)-seq.computed_token_num <= prefill_token_budget:
                 seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
                 prefill_batched_token_nums += seq.to_compute_token_num
@@ -235,10 +237,12 @@ class Worker:
                 prefill_batched_token_nums += prefill_token_budget
                 seq.to_compute_token_num = prefill_token_budget
                 prefill_token_budget = 0
-                
             schedule_prefill_seqs.append(seq)
+        
+        self.num_wait_tokens -= prefill_batched_token_nums
         for seq in schedule_prefill_seqs:
             self.seqs_to_prefill.remove(seq)
+        self.model_runner.memory_manager.pre_allocate_page(schedule_prefill_seqs)
         
         self.check_preempt()
         
@@ -277,8 +281,12 @@ class Worker:
 
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
-            schedulerOutput = pickle.loads(recv_bytes)
+            schedulerOutput: SchedulerOutput = pickle.loads(recv_bytes)
+            if isinstance(self.model_runner.memory_manager, PrefixMemoryManager):
+                self.model_runner.memory_manager.pre_allocate_computed_page(schedulerOutput.schedule_lists)
             self.seqs_to_prefill.extend(schedulerOutput.schedule_lists)
+            for seq in schedulerOutput.schedule_lists:
+                self.num_wait_tokens += len(seq.token_ids) - seq.computed_token_num
         
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0:
             schedule_seqs = self.schedule()

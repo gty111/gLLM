@@ -128,25 +128,34 @@ class PrefixMemoryManager(MemoryManager):
                                     self.segment.v_cache[layer_idx],
                                     slot_mapping_tensor)
 
+    def pre_allocate_computed_page(self, seqs: List[Sequence]):
+        for seq in seqs:
+            assert len(seq.page_table) == 0
+            num_page = (len(seq.token_ids) + self.page_size - 1) // self.page_size 
+            if not seq.computed_prompt():
+                self.num_allocated_pages += num_page
+            for i in range(num_page):
+                if (i+1)*self.page_size <= len(seq.token_ids):
+                    page_num = self.segment.has_computed((*seq.token_ids[:(i+1)*self.page_size],))
+                    if page_num is not None:
+                        seq.page_table.append(page_num)
+                        seq.computed_token_num += self.page_size
+                        self.num_hit_pages += 1
+                    else:
+                        break
+                else:
+                    break
+
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
             len_page_table = len(seq.page_table)
             num_page = (len(seq.token_ids) + self.page_size - 1) // self.page_size - len_page_table
-            if not seq.computed_prompt():
-                self.num_allocated_pages += num_page
-            computed_prefix = True
             for i in range(len_page_table,len_page_table+num_page):
-                if computed_prefix and (i+1)*self.page_size <= len(seq.token_ids):
-                    computed_prefix, page_num = self.segment.allocate(
-                            (*seq.token_ids[:(i+1)*self.page_size],))
-                    seq.computed_token_num += int(computed_prefix) * self.page_size
-                    if not seq.computed_prompt():
-                        self.num_hit_pages += int(computed_prefix)
-                elif (i+1)*self.page_size <= len(seq.token_ids):
-                    _, page_num = self.segment.allocate(
+                if (i+1)*self.page_size <= len(seq.token_ids):
+                    page_num = self.segment.allocate(
                             (*seq.token_ids[:(i+1)*self.page_size],))
                 else:
-                    _, page_num = self.segment.allocate()
+                    page_num = self.segment.allocate()
                 seq.page_table.append(page_num)
     
     def get_cache_hit_rate(self):
@@ -167,25 +176,29 @@ class PrefixSegment(Segment):
         if page_hash not in self.hash2page:
             self.page2hash[page_num] = page_hash
             self.hash2page[page_hash] = page_num
+            
+    def has_computed(self, token_ids):
+        page_hash = hash(token_ids)
+        if page_hash in self.hash2page:
+            page_num = self.hash2page[page_hash]
+            self.allocatorID.allocate(page_num)
+            # print(f'reuse {page_num}')
+            self.page_ref_num[page_num] += 1
+            return page_num
+        else:
+            return None
 
     def allocate(self, token_ids: Set[int] = None):
         page_hash = hash(token_ids) if token_ids is not None else None
-        if page_hash is not None and page_hash in self.hash2page:
-            page_num = self.hash2page[page_hash]
-            # print(f'reuse {page_num}')
-            self.allocatorID.allocate(page_num)
-            computed = True
-        else:
-            page_num = self.allocatorID.allocate()
-            # print(f'allocate {page_num}')
-            if self.page2hash[page_num] != 0 and self.page2hash[page_num] in self.hash2page:
-                del self.hash2page[self.page2hash[page_num]]
-            if page_hash is not None:
-                self.page2hash[page_num] = page_hash
-                self.hash2page[page_hash] = page_num
-            computed = False
+        page_num = self.allocatorID.allocate()
+        # print(f'allocate {page_num}')
+        if self.page2hash[page_num] != 0 and self.page2hash[page_num] in self.hash2page:
+            del self.hash2page[self.page2hash[page_num]]
+        if page_hash is not None:
+            self.page2hash[page_num] = page_hash
+            self.hash2page[page_hash] = page_num
         self.page_ref_num[page_num] += 1
-        return computed, page_num
+        return page_num
 
     def free(self, page_num: int):
         assert self.page_ref_num[page_num] > 0
