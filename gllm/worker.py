@@ -281,7 +281,7 @@ class Worker:
             self.seqs_to_prefill.extend(schedulerOutput.schedule_lists)
         
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0:
-            schedule_seqs = self.schedule_naive()
+            schedule_seqs = self.schedule()
             if len(schedule_seqs) != 0:
                 input_data = InputData(schedule_seqs, self.model_runner.memory_manager)
                 if self.pp_size > 1:
