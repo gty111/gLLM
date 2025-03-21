@@ -50,8 +50,8 @@ class Worker:
             # rank 0 => main process
             self.output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PUSH)
             # seqs to schedule
-            self.seqs_to_prefill: List[Sequence] = []
-            self.seqs_to_decode: List[Sequence] = []
+            self.seqs_to_prefill: deque[Sequence] = deque()
+            self.seqs_to_decode: deque[Sequence] = deque()
             # running batch 
             self.batch_running = deque()
             self.num_running_decode_seqs = 0
@@ -144,7 +144,7 @@ class Worker:
             self.model_runner.memory_manager.free(seq_to_preempt)
             seq_to_preempt.preempt()
             preempt_seqs.append(seq_to_preempt)
-        self.seqs_to_prefill = preempt_seqs + self.seqs_to_prefill
+        self.seqs_to_prefill.extendleft(preempt_seqs)
         
         self.num_preempt_seqs += len(preempt_seqs)
         if self.num_preempt_seqs - self.log_num_preempt_seqs > 10:
@@ -164,21 +164,22 @@ class Worker:
         num_tokens_budget = self.max_batch_tokens
         
         # decode
-        schedule_decode_seqs = self.seqs_to_decode[:num_tokens_budget]
-        self.seqs_to_decode = self.seqs_to_decode[num_tokens_budget:]
-        self.num_running_decode_seqs += len(schedule_decode_seqs)
-        
-        self.model_runner.memory_manager.pre_allocate_page(schedule_decode_seqs)
-        for seq in schedule_decode_seqs:
+        for _ in range(num_tokens_budget):
+            if len(self.seqs_to_decode) == 0:
+                break
+            seq = self.seqs_to_decode.pop()
             seq.to_compute_token_num = 1
+            schedule_decode_seqs.append(seq)
+            
+        self.num_running_decode_seqs += len(schedule_decode_seqs)
+        self.model_runner.memory_manager.pre_allocate_page(schedule_decode_seqs)
         
         num_tokens_budget -= len(schedule_decode_seqs)
         
         # prefill
         prefill_batched_token_nums = 0
-        for seq in self.seqs_to_prefill:
-            if num_tokens_budget == 0:
-                break
+        while len(self.seqs_to_prefill) != 0 and num_tokens_budget != 0:
+            seq = self.seqs_to_prefill.popleft()
             self.model_runner.memory_manager.pre_allocate_page([seq])
             if len(seq.token_ids)-seq.computed_token_num <= num_tokens_budget:
                 seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
@@ -189,9 +190,6 @@ class Worker:
                 seq.to_compute_token_num = num_tokens_budget
                 num_tokens_budget = 0
             schedule_prefill_seqs.append(seq)
-            
-        for seq in schedule_prefill_seqs:
-            self.seqs_to_prefill.remove(seq)
 
         if time.time()-self.log_time > 1:
             self.log_time = time.time()
@@ -226,9 +224,8 @@ class Worker:
         else:
             prefill_token_budget = min(self.max_batch_tokens, prefill_token_budget)
         prefill_batched_token_nums = 0
-        for seq in self.seqs_to_prefill:
-            if prefill_token_budget == 0:
-                break
+        while len(self.seqs_to_prefill) != 0 and prefill_token_budget != 0:
+            seq = self.seqs_to_prefill.popleft()
             if len(seq.token_ids)-seq.computed_token_num <= prefill_token_budget:
                 seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
                 prefill_batched_token_nums += seq.to_compute_token_num
@@ -240,8 +237,6 @@ class Worker:
             schedule_prefill_seqs.append(seq)
         
         self.num_wait_tokens -= prefill_batched_token_nums
-        for seq in schedule_prefill_seqs:
-            self.seqs_to_prefill.remove(seq)
         self.model_runner.memory_manager.pre_allocate_page(schedule_prefill_seqs)
         
         self.check_preempt()
@@ -252,13 +247,15 @@ class Worker:
             decode_token_budget = num_total_decode_seqs
         else:
             decode_token_budget = num_total_decode_seqs // self.pp_size
-        schedule_decode_seqs = self.seqs_to_decode[:decode_token_budget]
-        self.seqs_to_decode = self.seqs_to_decode[decode_token_budget:]
+        for _ in range(decode_token_budget):
+            if len(self.seqs_to_decode) == 0:
+                break
+            seq = self.seqs_to_decode.popleft()
+            seq.to_compute_token_num = 1
+            schedule_decode_seqs.append(seq)
         self.num_running_decode_seqs += len(schedule_decode_seqs)
         
         self.model_runner.memory_manager.pre_allocate_page(schedule_decode_seqs)
-        for seq in schedule_decode_seqs:
-            seq.to_compute_token_num = 1
 
         if time.time()-self.log_time > 1:
             self.log_time = time.time()
@@ -316,32 +313,27 @@ class Worker:
         if next_tokens is not None:
             schedule_seqs:List[Sequence] = self.batch_running.popleft()
             assert len(next_tokens) == len(schedule_seqs)
-            free_ids = []
-            decode_seqs = []
-            prefill_seqs = []
+
+            send_tokens = []
+            schedulerOutput = SchedulerOutput([])
             
-            send_indices = []
             for idx, seq in enumerate(schedule_seqs):
                 if seq.computed_prompt():
                     self.num_running_decode_seqs -= 1
                 seq.computed_token_num += seq.to_compute_token_num
                 if seq.computed_prompt():
-                    send_indices.append(idx)
+                    schedulerOutput.act_schedule_ids.append(seq.seq_id)
+                    send_tokens.append(next_tokens[idx])
                     seq.token_ids.append(next_tokens[idx])
                 if seq.is_finish():
-                    free_ids.append(seq.seq_id)
+                    schedulerOutput.free_ids.append(seq.seq_id)
                     self.model_runner.memory_manager.free(seq)
                 elif seq.computed_prompt():
-                    decode_seqs.append(seq)
+                    self.seqs_to_decode.appendleft(seq)
                 else:
-                    prefill_seqs.append(seq)
-            self.seqs_to_decode = decode_seqs + self.seqs_to_decode
-            self.seqs_to_prefill = prefill_seqs + self.seqs_to_prefill
+                    self.seqs_to_prefill.appendleft(seq)
             
-            schedulerOutput = SchedulerOutput([])
-            schedulerOutput.free_ids = free_ids
-            schedulerOutput.act_schedule_ids = [schedule_seqs[i].seq_id for i in send_indices]
-            output_bytes = pickle.dumps((schedulerOutput, [next_tokens[i] for i in send_indices]))
+            output_bytes = pickle.dumps((schedulerOutput, send_tokens))
             self.output_socket.send(output_bytes, copy=False)
  
 def run_worker(worker: Worker):
