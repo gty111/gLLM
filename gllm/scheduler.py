@@ -109,7 +109,7 @@ class Scheduler:
             return SchedulerOutput(decode_schedule_lists)
 
     def update_seqs(self, schedulerOutput: SchedulerOutput, next_tokens: List[int] = None, 
-                    delta=False, memory_manager: MemoryManager=None):
+                    delta=False, memory_manager: MemoryManager=None, async_streams=None, tokenizer=None):
         if not delta:
             assert memory_manager is not None
             for idx, seq in enumerate(schedulerOutput.schedule_lists):
@@ -123,10 +123,12 @@ class Scheduler:
         else:
             for idx, id in enumerate(schedulerOutput.act_schedule_ids):
                 seq: Sequence = self.run_batch[id]
+                seq.token_ids.append(next_tokens[idx])
+                async_streams[id].put(seq.detokenize_inc(tokenizer))
                 if id in schedulerOutput.free_ids:
                     self.run_batch.pop(id)
-                else:
-                    seq.token_ids.append(next_tokens[idx])
+                    async_streams[id].finish()
+                    del async_streams[id]
             self.finish_lists.extend(schedulerOutput.free_ids)
 
     def check_preempt_seqs(self, memory_manager:MemoryManager):

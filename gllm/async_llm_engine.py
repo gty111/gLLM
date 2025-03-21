@@ -157,8 +157,6 @@ class PipeAsyncLLM(LLM):
             schedule_bytes = pickle.dumps(schedulerOutput)
             schedule_socket.send(schedule_bytes, copy=False)
 
-        await asyncio.sleep(0)
-
         return False
 
     async def run_schedule_engine(self):
@@ -171,24 +169,11 @@ class PipeAsyncLLM(LLM):
             if output_socket.poll(timeout=0) != 0:
                 recv_bytes = output_socket.recv(copy=False)
                 recv_data = pickle.loads(recv_bytes)
-                
                 schedulerOutput, next_tokens = recv_data
                 self.scheduler.update_seqs(
-                    schedulerOutput, next_tokens, delta=True)
-                # overlap gpu execution and output process
-                exit = await self.run_schedule(schedule_socket)
-                for id in schedulerOutput.act_schedule_ids:
-                    if id in schedulerOutput.free_ids:
-                        continue
-                    seq = self.scheduler.run_batch[id]
-                    self.async_streams[id].put(
-                        seq.detokenize_inc(self.model_runner.tokenizer))
-                for id in schedulerOutput.free_ids:
-                    self.async_streams[id].finish()
-                    del self.async_streams[id]
+                    schedulerOutput, next_tokens, delta=True, 
+                    async_streams=self.async_streams, tokenizer=self.model_runner.tokenizer)
                 self.free_finish_requests()
-                if exit:
-                    return
             if await self.run_schedule(schedule_socket):
                 return
             await asyncio.sleep(0)
