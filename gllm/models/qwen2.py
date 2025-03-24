@@ -134,9 +134,6 @@ class Qwen2ForCausalLM(nn.Module):
                     config.hidden_size, config.vocab_size, 
                     bias=False, dtype=config.torch_dtype, device='cuda')
         self.sampler = Sampler()
-
-    def get_finish_tokens(config):
-        return [config.eos_token_id]
     
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.model(input_data, hidden_states, residual)

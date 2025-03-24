@@ -1,7 +1,8 @@
 import time
 
 from logger import logger
-from typing import List, Dict
+from typing import List, Dict, Union
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager
@@ -109,7 +110,8 @@ class Scheduler:
             return SchedulerOutput(decode_schedule_lists)
 
     def update_seqs(self, schedulerOutput: SchedulerOutput, next_tokens: List[int] = None, 
-                    delta=False, memory_manager: MemoryManager=None, async_streams=None, tokenizer=None):
+                    delta=False, memory_manager: MemoryManager=None, async_streams=None, 
+                    tokenizer: Union[PreTrainedTokenizer,PreTrainedTokenizerFast]=None):
         if not delta:
             assert memory_manager is not None
             for idx, seq in enumerate(schedulerOutput.schedule_lists):

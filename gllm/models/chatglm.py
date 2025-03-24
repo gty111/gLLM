@@ -178,13 +178,6 @@ class ChatGLMForCausalLM(nn.Module):
         if get_pp_rank() == get_pp_size() - 1:
             self.lm_head = self.transformer.output_layer
         self.sampler = Sampler()
-        
-    def get_finish_tokens(config):
-        if type(config.eos_token_id) == list:
-            # glm4-9b-chat
-            return config.eos_token_id
-        else:
-            return [config.eos_token_id]
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.transformer(input_data, hidden_states)

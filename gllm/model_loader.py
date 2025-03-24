@@ -3,7 +3,7 @@ import torch
 
 from logger import logger
 from safetensors import safe_open
-from transformers import AutoConfig
+from transformers import AutoConfig, GenerationConfig
 from huggingface_hub import snapshot_download
 
 from gllm.models.llama import LlamaForCausalLM
@@ -16,7 +16,7 @@ from gllm.utils import get_lock
 class ModelLoader():
     def __init__(self, load_format, model_path):
         self.model_path = model_path
-        self.config = self.load_config()
+        self.load_config()
         self.load_format = load_format
         
     def get_dtype(self, dtype: str):
@@ -76,12 +76,12 @@ class ModelLoader():
         raise Exception(f'Failed to load {self.model_path}!')
 
     def load_config(self):
-        config = AutoConfig.from_pretrained(self.model_path,trust_remote_code=True)
-        self.dtype = config.torch_dtype
-        self.architecture = config.architectures[0]
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
-        return config
+        self.config = AutoConfig.from_pretrained(self.model_path,trust_remote_code=True)
+        self.generation_config = GenerationConfig.from_pretrained(self.model_path)
+        self.dtype = self.config.torch_dtype
+        self.architecture = self.config.architectures[0]
+        self.vocab_size = self.config.vocab_size
+        self.hidden_size = self.config.hidden_size
     
     def get_model_type(self):
         model_type = None

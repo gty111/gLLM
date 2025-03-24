@@ -162,20 +162,6 @@ class LlamaForCausalLM(nn.Module):
             self.lm_head = nn.Linear(
                 config.hidden_size, config.vocab_size, bias=False, dtype=config.torch_dtype, device='cuda')
         self.sampler = Sampler()
-        
-    def get_finish_tokens(config):
-        finish_tokens = None
-        if config.eos_token_id == 128001:
-            # Llama3-8b-chat
-            finish_tokens = [config.eos_token_id, 128009]
-        else:
-            if type(config.eos_token_id) == int:
-                finish_tokens = [config.eos_token_id]
-            elif type(config.eos_token_id) == list:
-                finish_tokens = config.eos_token_id
-            else:
-                assert 0
-        return finish_tokens
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.model(input_data, hidden_states, residual)
