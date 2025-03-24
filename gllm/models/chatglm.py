@@ -172,7 +172,6 @@ class ChatGLMForCausalLM(nn.Module):
         self.dtype = config.torch_dtype
         self.num_kv_heads = config.multi_query_group_num
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.finish_tokens = ChatGLMForCausalLM.get_finish_tokens(config)
         self.transformer = ChatGLMModel(config)
         self.ret_residual = False
         if get_pp_rank() == get_pp_size() - 1:

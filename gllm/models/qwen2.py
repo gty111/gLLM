@@ -121,7 +121,6 @@ class Qwen2ForCausalLM(nn.Module):
         self.dtype = config.torch_dtype
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
-        self.finish_tokens = Qwen2ForCausalLM.get_finish_tokens(config)
         self.model = Qwen2Model(config)
         self.ret_residual = True
         if get_pp_rank() == get_pp_size() - 1:
