@@ -3,6 +3,7 @@
 import os
 import json
 import re
+import sys
 import random
 from tqdm import tqdm
 import time
@@ -103,7 +104,7 @@ def single_request(api_url, single_question, cot_examples_dict, pbar):
     request_func_input = RequestFuncInput(prompt=prompt,
                                           api_url=api_url,
                                           prompt_len=len(prompt),
-                                          output_len=4000,
+                                          output_len=args.output_len,
                                           model=args.model,
                                           )
     return async_request_openai_chat_completions(request_func_input=request_func_input, pbar=pbar)
@@ -135,8 +136,8 @@ def update_result(output_res_path):
                             category_record[category]["wrong"] += 1
             success = True
         except Exception as e:
-            # print("Error", e, "sleep 2 seconds")
-            time.sleep(2)
+            print("Error", e, "sleep 2 seconds")
+            sys.exit(-1)
     return res, category_record
 
 
@@ -166,12 +167,15 @@ async def evaluate(subjects):
         res, category_record = update_result(output_res_path)
         category = subject
 
+        print(f"running {subject} requests ...")
         pbar = tqdm(total=len(test_data))
         tasks = []
         for each in test_data:
             tasks.append(single_request(api_url, each, dev_df, pbar))
         completions = await asyncio.gather(*tasks)
-        for idx, each in enumerate(test_data):
+        pbar.close()
+        print(f"processing {subject} completions ...")
+        for idx, each in tqdm(enumerate(test_data),total=len(test_data)):
             label = each["answer"]
             response = completions[idx].generated_text
             response = response.replace('**', '')
@@ -195,6 +199,7 @@ async def evaluate(subjects):
                 res, category_record = update_result(output_res_path)
         save_res(res, output_res_path)
         save_summary(category_record, output_summary_path)
+        print(category_record)
 
 
 def save_res(res, output_res_path):
@@ -237,6 +242,7 @@ if __name__ == "__main__":
                         help="business, law, psychology, biology, chemistry, history, other, health, "
                              "economics, math, physics, computer science, philosophy, engineering")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--output-len", type=int, default=1024)
     assigned_subjects = []
     args = parser.parse_args()
 
