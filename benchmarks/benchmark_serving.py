@@ -557,10 +557,7 @@ async def benchmark(
         api_url=api_url,
         prompt_len=test_prompt_len,
         output_len=test_output_len,
-        logprobs=logprobs,
         best_of=best_of,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
     )
     test_output = await request_func(request_func_input=test_input)
     if not test_output.success:
@@ -577,10 +574,7 @@ async def benchmark(
                                          api_url=base_url + "/start_profile",
                                          prompt_len=test_prompt_len,
                                          output_len=test_output_len,
-                                         logprobs=logprobs,
-                                         best_of=best_of,
-                                         multi_modal_content=test_mm_content,
-                                         ignore_eos=ignore_eos)
+                                         best_of=best_of)
         profile_output = await request_func(request_func_input=profile_input)
         if profile_output.success:
             print("Profiler started")
@@ -620,10 +614,7 @@ async def benchmark(
                                               api_url=api_url,
                                               prompt_len=prompt_len,
                                               output_len=output_len,
-                                              logprobs=logprobs,
-                                              best_of=best_of,
-                                              multi_modal_content=mm_content,
-                                              ignore_eos=ignore_eos)
+                                              best_of=best_of)
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -638,7 +629,6 @@ async def benchmark(
             api_url=base_url + "/stop_profile",
             prompt_len=test_prompt_len,
             output_len=test_output_len,
-            logprobs=logprobs,
             best_of=best_of,
         )
         profile_output = await request_func(request_func_input=profile_input)
@@ -791,7 +781,6 @@ def main(args: argparse.Namespace):
         base_url = f"http://{args.host}:{args.port}"
 
     tokenizer = get_tokenizer(tokenizer_id,
-                              tokenizer_mode=tokenizer_mode,
                               trust_remote_code=args.trust_remote_code)
 
     if args.dataset is not None:
