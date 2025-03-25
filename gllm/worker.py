@@ -142,6 +142,11 @@ class Worker:
         num_decode_seqs = len(self.seqs_to_decode) + reduce(lambda x,y: x+len(y),self.batch_running,0)
         return num_decode_seqs
     
+    # rank 0
+    def update_num_wait_tokens(self):
+        self.num_wait_tokens = reduce(
+            lambda x,y: x + len(y.token_ids) - y.computed_token_num,self.seqs_to_prefill,0)
+    
     # rank 0: check if preempt seqs 
     def check_preempt(self,num_decode_tokens):
         preempt_seqs = []
@@ -150,7 +155,7 @@ class Worker:
             self.model_runner.memory_manager.free(seq_to_preempt)
             seq_to_preempt.preempt()
             preempt_seqs.append(seq_to_preempt)
-            self.num_wait_tokens += len(seq_to_preempt.token_ids)
+            
         self.seqs_to_prefill.extendleft(preempt_seqs)
         
         self.num_preempt_seqs += len(preempt_seqs)
@@ -211,6 +216,8 @@ class Worker:
     
     # rank 0: PP schedule 
     def schedule(self):
+        self.update_num_wait_tokens()
+        
         schedule_prefill_seqs = []
         schedule_decode_seqs = []
         
@@ -233,7 +240,6 @@ class Worker:
             seq = self.seqs_to_prefill.popleft()
             if isinstance(self.model_runner.memory_manager, PrefixMemoryManager) and seq.computed_token_num == 0:
                 self.model_runner.memory_manager.pre_allocate_computed_page([seq])
-                self.num_wait_tokens -= seq.computed_token_num
             if len(seq.token_ids)-seq.computed_token_num <= prefill_token_budget:
                 seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
                 prefill_batched_token_nums += seq.to_compute_token_num
@@ -245,7 +251,6 @@ class Worker:
             schedule_prefill_seqs.append(seq)
 
         self.model_runner.memory_manager.pre_allocate_page(schedule_prefill_seqs)
-        self.num_wait_tokens -= prefill_batched_token_nums
         
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
@@ -291,8 +296,6 @@ class Worker:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput: SchedulerOutput = pickle.loads(recv_bytes)
             self.seqs_to_prefill.extend(schedulerOutput.schedule_lists)
-            for seq in schedulerOutput.schedule_lists:
-                self.num_wait_tokens += len(seq.token_ids)
         
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
             schedule_seqs = self.schedule()
