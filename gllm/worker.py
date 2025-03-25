@@ -246,7 +246,10 @@ class Worker:
         if num_total_decode_seqs < self.pp_size:
             decode_token_budget = num_total_decode_seqs
         else:
-            decode_token_budget = num_total_decode_seqs // self.pp_size
+            # here we add num_total_decode_seqs to self.pp_rank
+            # because we want to solve the situation when #seqs=5 pp_size=4
+            # then assign rank0: 1 seq | rank1: 1 seq | rank2: 1 seq | rank3: 2 seqs
+            decode_token_budget = (num_total_decode_seqs + self.pp_rank) // self.pp_size
         for _ in range(decode_token_budget):
             if len(self.seqs_to_decode) == 0:
                 break
@@ -259,8 +262,9 @@ class Worker:
 
         if time.time()-self.log_time > 1:
             self.log_time = time.time()
-            log_info = '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
+            log_info = '#wait: %4d/%8d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
                             len(self.seqs_to_prefill),
+                            self.num_wait_tokens,
                             num_total_decode_seqs,
                             prefill_batched_token_nums,
                             len(schedule_decode_seqs),
