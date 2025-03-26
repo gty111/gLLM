@@ -216,7 +216,6 @@ class Worker:
     
     # rank 0: PP schedule 
     def schedule(self):
-        self.update_num_wait_tokens()
         
         schedule_prefill_seqs = []
         schedule_decode_seqs = []
@@ -224,6 +223,7 @@ class Worker:
         # prefill
         prefill_token_budget = self.page_size * max(self.get_num_free_pages()-self.num_threshold_free_pages,0)
         if self.pp_size > 1 and prefill_token_budget != 0:
+            self.update_num_wait_tokens()
             free_ratio = self.model_runner.memory_manager.get_memory_free()
             # a = ratio_threshold_free_pages
             # free_ratio in [1,a] | prefill_ratio in [1,0]
