@@ -24,6 +24,8 @@ class LLM():
         self.scheduler = Scheduler(
             max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size, pp_size)
         self.finish_tokens = self.model_runner.model_loader.generation_config.eos_token_id
+        if type(self.finish_tokens) == int:
+            self.finish_tokens = [self.finish_tokens]
         self.model_max_length = self.model_runner.tokenizer.model_max_length
 
     def check_seq_length(self, token_ids: List[int], output_len: int):
