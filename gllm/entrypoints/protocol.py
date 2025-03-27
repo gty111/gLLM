@@ -143,8 +143,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
@@ -153,7 +153,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
     use_beam_search: Optional[bool] = False
-    top_k: Optional[int] = -1
+    top_k: Optional[int] = None
     min_p: Optional[float] = 0.0
     repetition_penalty: Optional[float] = 1.0
     length_penalty: Optional[float] = 1.0
@@ -320,13 +320,13 @@ class CompletionRequest(OpenAIBaseModel):
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     user: Optional[str] = None
 
     # doc: begin-completion-sampling-params
     use_beam_search: Optional[bool] = False
-    top_k: Optional[int] = -1
+    top_k: Optional[int] = None
     min_p: Optional[float] = 0.0
     repetition_penalty: Optional[float] = 1.0
     length_penalty: Optional[float] = 1.0

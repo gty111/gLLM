@@ -27,6 +27,7 @@ class LLM():
         if type(self.finish_tokens) == int:
             self.finish_tokens = [self.finish_tokens]
         self.model_max_length = self.model_runner.tokenizer.model_max_length
+        self.generation_config = self.model_runner.model_loader.generation_config
 
     def check_seq_length(self, token_ids: List[int], output_len: int):
         max_seq_length = len(
@@ -39,7 +40,10 @@ class LLM():
             return True
 
     def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False,
-                     temperature=0.6, top_p=0.9, top_k=10):
+                     temperature=None, top_p=None, top_k=None):
+        temperature = self.generation_config.temperature if temperature is None else temperature
+        top_p = self.generation_config.top_p if top_p is None else top_p
+        top_k = self.generation_config.top_k if top_k is None else top_k
         return Sequence(self.allocatorID.allocate(), token_ids,
                         self.finish_tokens, output_len, ignore_eos,
                         temperature, top_p, top_k)
@@ -64,7 +68,7 @@ class LLM():
         self.scheduler.update_seqs(scheduleOutput, next_tokens,memory_manager=self.model_runner.memory_manager)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None,
-                 temperature=0.6, top_p=0.9, top_k=10):
+                 temperature=None, top_p=None, top_k=None):
         requests: List[Sequence] = []
         assert prompts is not None or tokens is not None
         num_seqs = len(prompts) if prompts is not None else len(tokens)
