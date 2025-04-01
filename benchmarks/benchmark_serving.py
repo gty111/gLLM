@@ -86,6 +86,55 @@ class BenchmarkMetrics:
     percentiles_e2el_ms: List[Tuple[float, float]]
 
 
+def find_closest_key(dictionary, target):
+    return min(dictionary.keys(), key=lambda k: abs(k - target))
+
+def sample_splitwise_requests(
+    splitwise_path: str,
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+) -> List[Tuple[str, int, int, None]]:
+    # Load the dataset.
+    with open(dataset_path, encoding='utf-8') as f:
+        dataset = json.load(f)
+    # Filter out the conversations with less than 2 turns.
+    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
+    # Only keep the first two turns of each conversation.
+    dataset = [(data["conversations"][0]["value"],
+                data["conversations"][1]["value"]) for data in dataset]
+
+    # Shuffle the dataset.
+    random.shuffle(dataset)
+
+    # filtered_dataset: List[Tuple[str, int, int]] = []
+    filtered_dataset = dict()
+    for i in range(len(dataset)):
+        if len(filtered_dataset) == num_requests*2:
+            break
+
+        prompt = dataset[i][0]
+        prompt_token_ids = tokenizer(prompt).input_ids
+        prompt_len = len(prompt_token_ids)
+        filtered_dataset[prompt_len] = prompt
+
+    ret_dataset = []
+    with open(splitwise_path,'r') as f:
+        lines = f.readlines()[1:]
+        for line in lines:
+            if len(ret_dataset) == num_requests:
+                break
+            data_each = line.split(',')
+            prompt_len = int(data_each[-2])
+            output_len = int(data_each[-1])
+            k = find_closest_key(filtered_dataset,prompt_len)
+            ret_dataset.append((filtered_dataset[k],k,output_len,None))
+            # print(k,prompt_len)
+            # print(filtered_dataset[k])
+
+    return ret_dataset
+
 def sample_sharegpt_requests(
     dataset_path: str,
     num_requests: int,
@@ -803,6 +852,14 @@ def main(args: argparse.Namespace):
             tokenizer=tokenizer,
             fixed_output_len=args.sharegpt_output_len,
         )
+    elif args.dataset_name == "splitwise":
+        input_requests = sample_splitwise_requests(
+            splitwise_path=args.splitwise_path,
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.sharegpt_output_len,
+        )
 
     elif args.dataset_name == "sonnet":
         # Do not format the prompt, pass to message directly
@@ -963,7 +1020,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "sonnet", "random", "hf"],
+        choices=["sharegpt", "sonnet", "random", "hf","splitwise"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -971,6 +1028,9 @@ if __name__ == "__main__":
                         default=None,
                         help="Path to the sharegpt/sonnet dataset. "
                         "Or the huggingface dataset ID if using HF dataset.")
+    parser.add_argument("--splitwise-path",
+                        type=str,
+                        default=None)
     parser.add_argument(
         "--max-concurrency",
         type=int,

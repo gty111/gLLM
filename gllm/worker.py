@@ -286,6 +286,8 @@ class Worker:
                 logger.info(log_info)
             else:
                 logger.info(log_info)
+        # with open('log','a') as f:
+        #     f.write(f'{prefill_batched_token_nums} {len(schedule_decode_seqs)}\n')
         return schedule_prefill_seqs + schedule_decode_seqs
     
     # rank 0
