@@ -127,8 +127,6 @@ class PipeAsyncLLM(LLM):
         self.schedule_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
         self.output_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
         self.token_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
-        
-        print(self.schedule_ipc_path)
 
         logger.info(f"Launching {self.pp_size} worker(s) ...")
         for pp_rank in range(self.pp_size):
