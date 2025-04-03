@@ -65,13 +65,13 @@ class Worker:
             # rank 0 => other ranks : batched seqs
             self.gpu_schedule_socket = []
             for i in range(1,self.pp_size):
-                self.gpu_schedule_socket.append(make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{i}',zmq.PUSH))
+                self.gpu_schedule_socket.append(make_socket(zmq_ctx, f'{self.schedule_ipc_path}_{i}',zmq.PUSH))
             if self.pp_size != 1:
                 # last rank => rank 0 : next tokens
                 self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PULL)
         else:
             # rank 0 => other ranks : batched seqs
-            self.gpu_schedule_socket = make_socket(zmq_ctx, f'ipc:///tmp/gllm_schedule_{self.pp_rank}', zmq.PULL)
+            self.gpu_schedule_socket = make_socket(zmq_ctx, f'{self.schedule_ipc_path}_{self.pp_rank}', zmq.PULL)
             # Input data for each rank except 0 
             self.schedule_queue = deque()
             # Input data and intermediate data for rank except 0

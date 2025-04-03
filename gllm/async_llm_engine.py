@@ -7,7 +7,7 @@ from logger import logger
 from typing import List, Dict
 from fastapi import Request
 
-from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive
+from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive, random_uuid
 from gllm.llm_engine import LLM
 from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
@@ -123,9 +123,12 @@ class PipeAsyncLLM(LLM):
         self.ctx = mp.get_context('spawn')
         self.mp_alive = self.ctx.Array('i',[0 for i in range(self.pp_size)])
 
-        self.schedule_ipc_path = 'ipc:///tmp/gllm_schedule'
-        self.output_ipc_path = 'ipc:///tmp/gllm_output'
-        self.token_ipc_path = 'ipc:///tmp/gllm_token'
+        ipc_path_prefix = random_uuid()
+        self.schedule_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
+        self.output_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
+        self.token_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
+        
+        print(self.schedule_ipc_path)
 
         logger.info(f"Launching {self.pp_size} worker(s) ...")
         for pp_rank in range(self.pp_size):
