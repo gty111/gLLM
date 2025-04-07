@@ -55,7 +55,7 @@ class MemoryManager():
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
-            num_page = (len(seq.token_ids) + self.page_size - 1) // self.page_size - len(seq.page_table)
+            num_page = (seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1) // self.page_size - len(seq.page_table)
             for _ in range(num_page):
                 seq.page_table.append(
                     self.segment.allocate())
@@ -149,7 +149,7 @@ class PrefixMemoryManager(MemoryManager):
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
             len_page_table = len(seq.page_table)
-            num_page = (len(seq.token_ids) + self.page_size - 1) // self.page_size - len_page_table
+            num_page = (seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1) // self.page_size - len_page_table
             for i in range(len_page_table,len_page_table+num_page):
                 if (i+1)*self.page_size <= len(seq.token_ids):
                     page_num = self.segment.allocate(
