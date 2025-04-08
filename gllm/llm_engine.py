@@ -40,13 +40,14 @@ class LLM():
             return True
 
     def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False,
-                     temperature=None, top_p=None, top_k=None):
+                     temperature=None, top_p=None, top_k=None, repetition_penalty=None):
         temperature = self.generation_config.temperature if temperature is None else temperature
         top_p = self.generation_config.top_p if top_p is None else top_p
         top_k = self.generation_config.top_k if top_k is None else top_k
+        repetition_penalty = self.generation_config.repetition_penalty if repetition_penalty is None else repetition_penalty
         return Sequence(self.allocatorID.allocate(), token_ids,
                         self.finish_tokens, output_len, ignore_eos,
-                        temperature, top_p, top_k)
+                        temperature, top_p, top_k, repetition_penalty)
 
     def add_requests(self, requests: List[Sequence]):
         self.scheduler.add_requests(requests)

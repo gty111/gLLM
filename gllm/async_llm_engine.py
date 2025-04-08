@@ -70,9 +70,9 @@ class AsyncLLM(LLM):
         self.background_engine = None
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
-                                 temperature: float, top_p: float, top_k: float):
-        seq = self.allocate_seq(token_ids, output_len,
-                                ignore_eos, temperature, top_p, top_k)
+                                 temperature: float, top_p: float, top_k: float, repetition_penalty: float):
+        seq = self.allocate_seq(token_ids, output_len, ignore_eos, 
+                                temperature, top_p, top_k, repetition_penalty)
         stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream

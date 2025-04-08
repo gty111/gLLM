@@ -5,7 +5,12 @@ from gllm.input_data import InputData
 class Sampler():
     
     def forward(self, logits: torch.Tensor, input_data: InputData):
+        # repetition_penalty
+        logits /= torch.where(logits>0, input_data.repetition_penalty, 1.0)
+        logits *= torch.where(logits<=0, 1.0, input_data.repetition_penalty)
+        # temperature
         logits.div_(input_data.temperature.unsqueeze_(dim=1))
+        # top_p top_k
         logits = _apply_top_k_top_p(logits, input_data.top_p, input_data.top_k)
         probs = torch.softmax(logits, dim=1)
         # q = torch.empty_like(probs)

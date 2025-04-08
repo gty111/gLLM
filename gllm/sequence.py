@@ -4,7 +4,7 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 class Sequence():
     def __init__(self, seq_id, token_ids, finish_tokens, output_len=None, ignore_eos=False,
-                 temperature=0.6, top_p=0.9, top_k=10):
+                 temperature=0.6, top_p=0.9, top_k=10, repetition_penalty=1.0):
         self.seq_id = seq_id
         self.token_ids: List[int] = token_ids
         self.prompt_len = len(token_ids)
@@ -24,6 +24,7 @@ class Sequence():
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        self.repetition_penalty = repetition_penalty
         # used for prefix cache and chunked prefill
         self.computed_token_num = 0
         self.to_compute_token_num = 0

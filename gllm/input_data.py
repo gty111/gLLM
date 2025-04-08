@@ -19,6 +19,9 @@ class InputData():
                 [seq.top_p for seq in seqs], memory_manager.dtype, 'cuda', True)
             self.top_k = async_tensor_h2d(
                 [seq.top_k if seq.top_k != -1 else memory_manager.vocab_size for seq in seqs], memory_manager.dtype, 'cuda', True)
+            self.repetition_penalty = async_tensor_h2d(
+                [seq.repetition_penalty for seq in seqs], memory_manager.dtype, 'cuda', True)
+            self.repetition_penalty = self.repetition_penalty.unsqueeze(dim=1).repeat(1,memory_manager.vocab_size)
         
         self.seqs = seqs
         self.memory_manager = memory_manager

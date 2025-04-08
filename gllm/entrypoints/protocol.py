@@ -155,7 +155,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     use_beam_search: Optional[bool] = False
     top_k: Optional[int] = None
     min_p: Optional[float] = 0.0
-    repetition_penalty: Optional[float] = 1.0
+    repetition_penalty: Optional[float] = None
     length_penalty: Optional[float] = 1.0
     early_stopping: Optional[bool] = False
     ignore_eos: Optional[bool] = False
