@@ -115,48 +115,49 @@ async def evaluate(subjects):
         subjects = list(test_df.keys())
     print("assigned subjects", subjects)
     category_record = {'total':{'#correct':0,'#wrong':0}}
+    
+    print(f"Sending requests ...")
+    pbar = tqdm()
+    tasks = []
+    test_data_total = []
     for subject in subjects:
         test_data = test_df[subject][:args.num_per_sub]
-        category = subject
-
-        print(f"running {subject} requests ...")
-        pbar = tqdm(total=len(test_data))
-        tasks = []
+        test_data_total.extend(test_data)
         for each in test_data:
             tasks.append(single_request(api_url, each, dev_df, pbar))
-        completions = await asyncio.gather(*tasks)
-        pbar.close()
-        print(f"processing {subject} completions ...")
-        for idx, each in tqdm(enumerate(test_data),total=len(test_data)):
-            label = each["answer"]
-            response = completions[idx].generated_text
-            response = response.replace('**', '')
-            pred = extract_answer(response)
-            if response is not None:
-                if category not in category_record:
-                    category_record[category] = {"#correct": 0, "#wrong": 0}
-                each["pred"] = pred
-                each["model_outputs"] = response
-                if pred is not None:
-                    if pred == label:
-                        category_record[category]["#correct"] += 1
-                        category_record['total']['#correct'] += 1
-                    else:
-                        category_record[category]["#wrong"] += 1
-                        category_record['total']['#wrong'] += 1
+    pbar.total = len(tasks)
+    completions = await asyncio.gather(*tasks)
+    pbar.close()
+    print(f"Processing completions ...")
+    for idx, each in tqdm(enumerate(test_data_total),total=len(tasks)):
+        label = each["answer"]
+        response = completions[idx].generated_text
+        response = response.replace('**', '')
+        pred = extract_answer(response)
+        category = each["category"]
+        if response is not None:
+            if category not in category_record:
+                category_record[category] = {"#correct": 0, "#wrong": 0}
+            each["pred"] = pred
+            each["model_outputs"] = response
+            if pred is not None:
+                if pred == label:
+                    category_record[category]["#correct"] += 1
+                    category_record['total']['#correct'] += 1
                 else:
                     category_record[category]["#wrong"] += 1
                     category_record['total']['#wrong'] += 1
-        category_record['total']['score'] = round(
-            100*category_record['total']['#correct'] / (
-                category_record['total']['#correct'] + category_record['total']['#wrong']),2)
-        print(category_record)
+            else:
+                category_record[category]["#wrong"] += 1
+                category_record['total']['#wrong'] += 1
+    category_record['total']['score'] = round(
+        100*category_record['total']['#correct'] / (
+            category_record['total']['#correct'] + category_record['total']['#wrong']),2)
+    print(category_record)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output_dir", "-o", type=str,
-                        default=".eval_results/")
     parser.add_argument("--model", "-m", type=str, required=True)
     parser.add_argument("--assigned_subjects", "-a", type=str, default="all",
                         help="business, law, psychology, biology, chemistry, history, other, health, "
@@ -171,5 +172,4 @@ if __name__ == "__main__":
         assigned_subjects = []
     else:
         assigned_subjects = args.assigned_subjects.split(",")
-    os.makedirs(args.output_dir, exist_ok=True)
     asyncio.run(evaluate(assigned_subjects))
