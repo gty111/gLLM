@@ -1,12 +1,9 @@
 # adopt from https://github.com/TIGER-AI-Lab/MMLU-Pro/blob/main/evaluate_from_api.py
 
 import os
-import json
 import re
-import sys
 import random
 from tqdm import tqdm
-import time
 from datasets import load_dataset
 import argparse
 from benchmarks.backend_request_func import async_request_openai_chat_completions, RequestFuncInput
@@ -110,47 +107,6 @@ def single_request(api_url, single_question, cot_examples_dict, pbar):
     return async_request_openai_chat_completions(request_func_input=request_func_input, pbar=pbar)
 
 
-def update_result(output_res_path):
-    category_record = {}
-    res = []
-    success = False
-    while not success:
-        try:
-            if os.path.exists(output_res_path):
-                with open(output_res_path, "r") as fi:
-                    res = json.load(fi)
-                    for each in res:
-                        category = each["category"]
-                        if category not in category_record:
-                            category_record[category] = {
-                                "corr": 0.0, "wrong": 0.0}
-                        if not each["pred"]:
-                            x = random.randint(0, len(each["options"]) - 1)
-                            if x == each["answer_index"]:
-                                category_record[category]["corr"] += 1
-                            else:
-                                category_record[category]["wrong"] += 1
-                        elif each["pred"] == each["answer"]:
-                            category_record[category]["corr"] += 1
-                        else:
-                            category_record[category]["wrong"] += 1
-            success = True
-        except Exception as e:
-            print("Error", e, "sleep 2 seconds")
-            sys.exit(-1)
-    return res, category_record
-
-
-def merge_result(res, curr):
-    merged = False
-    for i, single in enumerate(res):
-        if single["question_id"] == curr["question_id"] and single["question"] == curr["question"]:
-            res[i] = curr
-            merged = True
-    if not merged:
-        res.append(curr)
-    return res
-
 
 async def evaluate(subjects):
     api_url = f"http://localhost:{args.port}/v1/chat/completions"
@@ -158,13 +114,9 @@ async def evaluate(subjects):
     if not subjects:
         subjects = list(test_df.keys())
     print("assigned subjects", subjects)
+    category_record = {'total':{'#correct':0,'#wrong':0}}
     for subject in subjects:
-        test_data = test_df[subject]
-        output_res_path = os.path.join(
-            args.output_dir, subject + "_result.json")
-        output_summary_path = os.path.join(
-            args.output_dir, subject + "_summary.json")
-        res, category_record = update_result(output_res_path)
+        test_data = test_df[subject][:args.num_per_sub]
         category = subject
 
         print(f"running {subject} requests ...")
@@ -181,56 +133,24 @@ async def evaluate(subjects):
             response = response.replace('**', '')
             pred = extract_answer(response)
             if response is not None:
-                res, category_record = update_result(output_res_path)
                 if category not in category_record:
-                    category_record[category] = {"corr": 0.0, "wrong": 0.0}
+                    category_record[category] = {"#correct": 0, "#wrong": 0}
                 each["pred"] = pred
                 each["model_outputs"] = response
-                merge_result(res, each)
                 if pred is not None:
                     if pred == label:
-                        category_record[category]["corr"] += 1
+                        category_record[category]["#correct"] += 1
+                        category_record['total']['#correct'] += 1
                     else:
-                        category_record[category]["wrong"] += 1
+                        category_record[category]["#wrong"] += 1
+                        category_record['total']['#wrong'] += 1
                 else:
-                    category_record[category]["wrong"] += 1
-                save_res(res, output_res_path)
-                save_summary(category_record, output_summary_path)
-                res, category_record = update_result(output_res_path)
-        save_res(res, output_res_path)
-        save_summary(category_record, output_summary_path)
+                    category_record[category]["#wrong"] += 1
+                    category_record['total']['#wrong'] += 1
+        category_record['total']['score'] = round(
+            100*category_record['total']['#correct'] / (
+                category_record['total']['#correct'] + category_record['total']['#wrong']),2)
         print(category_record)
-
-
-def save_res(res, output_res_path):
-    temp = []
-    exist_q_id = []
-    for each in res:
-        if each["question_id"] not in exist_q_id:
-            exist_q_id.append(each["question_id"])
-            temp.append(each)
-        else:
-            continue
-    res = temp
-    with open(output_res_path, "w") as fo:
-        fo.write(json.dumps(res))
-
-
-def save_summary(category_record, output_summary_path):
-    total_corr = 0.0
-    total_wrong = 0.0
-    for k, v in category_record.items():
-        if k == "total":
-            continue
-        cat_acc = v["corr"] / (v["corr"] + v["wrong"])
-        category_record[k]["acc"] = cat_acc
-        total_corr += v["corr"]
-        total_wrong += v["wrong"]
-    acc = total_corr / (total_corr + total_wrong)
-    category_record["total"] = {
-        "corr": total_corr, "wrong": total_wrong, "acc": acc}
-    with open(output_summary_path, "w") as fo:
-        fo.write(json.dumps(category_record))
 
 
 if __name__ == "__main__":
@@ -243,6 +163,7 @@ if __name__ == "__main__":
                              "economics, math, physics, computer science, philosophy, engineering")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--output-len", type=int, default=1024)
+    parser.add_argument("--num-per-sub", type=int, default=100)
     assigned_subjects = []
     args = parser.parse_args()
 

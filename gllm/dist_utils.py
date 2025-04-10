@@ -2,6 +2,8 @@ import os
 import torch.distributed as dist
 import torch
 
+from logger import logger
+
 def send_tensor(tensor:torch.Tensor, dst):
     tensor_shape = list(tensor.shape)
     # send dim
@@ -60,19 +62,35 @@ def init_dist(pp_size, pp_rank, device_size, device_rank, master_addr, master_po
     dist.init_process_group(backend='nccl', world_size=device_size, rank=device_rank)
 
 def get_pp_layers(num_layers):
-    assert num_layers % get_pp_size() == 0
-    # elapsed time for last stage ususally longer, so we add 1 
-    num_layers_pp = num_layers // get_pp_size() + 1
+    num_layers_pp = num_layers // get_pp_size()
+    
+    if get_pp_size() <= 4 or num_layers % get_pp_size() != 0:
+        num_layers_pp += 1
+
     if get_pp_rank() != get_pp_size() - 1:
-        return num_layers_pp * get_pp_rank(), num_layers_pp * (get_pp_rank()+1)
+        assigned_layers = num_layers_pp * get_pp_rank(), num_layers_pp * (get_pp_rank()+1)
     else:
-        return num_layers_pp * get_pp_rank(), num_layers
+        assigned_layers = num_layers_pp * get_pp_rank(), num_layers
+    
+    logger.info('Worker %d assigned layers: (%3d,%3d) #total: %2d'%
+                (
+                    get_pp_rank(),
+                    assigned_layers[0],
+                    assigned_layers[1]-1,
+                    assigned_layers[1]-assigned_layers[0]
+                ))
+    
+    return assigned_layers
 
 def get_pp_num_layers(num_layers):
-    assert num_layers % get_pp_size() == 0
-    # elapsed time for last stage ususally longer, so we add 1
-    num_layers_pp = num_layers // get_pp_size() + 1
+    num_layers_pp = num_layers // get_pp_size()
+    
+    if get_pp_size() <= 4 or num_layers % get_pp_size() != 0:
+        num_layers_pp += 1
+    
     if get_pp_rank() != get_pp_size() - 1:
-        return num_layers_pp
+        num_assigned_layers = num_layers_pp
     else:
-        return num_layers_pp - get_pp_size()
+        num_assigned_layers = num_layers - num_layers_pp * (get_pp_size() - 1)
+    
+    return num_assigned_layers
