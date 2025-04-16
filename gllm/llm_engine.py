@@ -22,7 +22,7 @@ class LLM():
         self.master_port = '49082'
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
-            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size, pp_size)
+            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size)
         self.finish_tokens = self.model_runner.model_loader.generation_config.eos_token_id
         if type(self.finish_tokens) == int:
             self.finish_tokens = [self.finish_tokens]
@@ -52,10 +52,9 @@ class LLM():
     def add_requests(self, requests: List[Sequence]):
         self.scheduler.add_requests(requests)
 
-    def free_finish_requests(self):
-        for id in self.scheduler.finish_lists:
+    def free_finish_ids(self, finish_ids:List[int]):
+        for id in finish_ids:
             self.allocatorID.free(id)
-        self.scheduler.finish_lists = []
 
     def init(self):
         self.model_runner.init()
@@ -66,7 +65,7 @@ class LLM():
             self.init()
         scheduleOutput = self.scheduler.schedule(self.model_runner.memory_manager)
         next_tokens = self.model_runner.step_once(InputData(scheduleOutput.schedule_lists, self.model_runner.memory_manager))
-        self.scheduler.update_seqs(scheduleOutput, next_tokens,memory_manager=self.model_runner.memory_manager)
+        self.scheduler.update_seqs(scheduleOutput, next_tokens, self.model_runner.memory_manager)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None,
                  temperature=None, top_p=None, top_k=None):
@@ -84,10 +83,10 @@ class LLM():
         self.add_requests(requests)
 
         pbar = tqdm.tqdm(total=len(requests))
-        while len(self.scheduler.finish_lists) != len(requests):
-            cur_finish_num = len(self.scheduler.finish_lists)
+        while len(self.scheduler.finish_ids) != len(requests):
+            cur_finish_num = len(self.scheduler.finish_ids)
             self.step()
-            pbar.update(len(self.scheduler.finish_lists)-cur_finish_num)
+            pbar.update(len(self.scheduler.finish_ids)-cur_finish_num)
 
         for request in requests:
             request.prompt = self.model_runner.tokenizer.decode(
@@ -95,7 +94,7 @@ class LLM():
             request.output = self.model_runner.tokenizer.decode(
                 request.token_ids[request.prompt_len:], True, True)
 
-        self.free_finish_requests()
+        self.free_finish_ids(self.scheduler.get_finish_ids())
         return requests
 
     def chat(self):

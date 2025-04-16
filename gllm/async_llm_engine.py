@@ -11,6 +11,8 @@ from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive,
 from gllm.llm_engine import LLM
 from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
+from gllm.sequence import Sequence
+from gllm.scheduler import SchedulerOutput
 
 
 class AsyncStream:
@@ -82,18 +84,17 @@ class AsyncLLM(LLM):
         return stream
 
     async def step_async(self):
-        self.check_preempt_seqs()
-        schedulerOutput = self.scheduler.schedule(self.model_runner.memory_manager, log=True, delta=False)
+        schedulerOutput = self.scheduler.schedule(self.model_runner.memory_manager, log=True)
         next_tokens = await make_async(self.model_runner.step_once)(
             InputData(schedulerOutput.schedule_lists, self.model_runner.memory_manager))
-        self.scheduler.update_seqs(schedulerOutput, next_tokens,memory_manager=self.model_runner.memory_manager)
+        self.scheduler.update_seqs(schedulerOutput, next_tokens, self.model_runner.memory_manager)
         for seq in schedulerOutput.schedule_lists:
             self.async_streams[seq.seq_id].put(
                 seq.detokenize_inc(self.model_runner.tokenizer))
-        for seq_id in self.scheduler.finish_lists:
+        for seq_id in self.scheduler.finish_ids:
             self.async_streams[seq_id].finish()
             del self.async_streams[seq_id]
-        self.free_finish_requests()
+        self.free_finish_ids(self.scheduler.get_finish_ids())
 
     async def run_engine(self):
         while self.scheduler.has_seqs():
@@ -119,6 +120,9 @@ class PipeAsyncLLM(LLM):
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
         self.process_output_engine = None
+        
+        self.wait_lists: List[Sequence] = []
+        self.running_maps: Dict[int,Sequence] = dict()
 
         self.ctx = mp.get_context('spawn')
         self.mp_alive = self.ctx.Array('i',[0 for i in range(self.pp_size)])
@@ -134,11 +138,14 @@ class PipeAsyncLLM(LLM):
 
         # wait worker start
         wait_worker(self.mp_alive, self.pp_size)
+        
+    def add_requests(self, requests: List[Sequence]):
+        self.wait_lists.extend(requests)
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
-                                 temperature: float, top_p: float, top_k: float):
-        seq = self.allocate_seq(token_ids, output_len,
-                                ignore_eos, temperature, top_p, top_k)
+                                 temperature: float, top_p: float, top_k: float, repetition_penalty: float):
+        seq = self.allocate_seq(token_ids, output_len, ignore_eos, 
+                                temperature, top_p, top_k, repetition_penalty)
         stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
@@ -146,19 +153,6 @@ class PipeAsyncLLM(LLM):
         if self.schedule_engine is None:
             self.start_schedule_engine()
         return stream
-
-    async def run_schedule(self, schedule_socket):
-        if not self.scheduler.has_seqs():
-            self.schedule_engine = None
-            return True
-
-        schedulerOutput = self.scheduler.schedule(delta=True)
-
-        if len(schedulerOutput.schedule_lists) != 0:
-            schedule_bytes = pickle.dumps(schedulerOutput)
-            schedule_socket.send(schedule_bytes, copy=False)
-
-        return False
 
     async def run_schedule_engine(self):
         zmq_ctx = zmq.Context()
@@ -171,12 +165,22 @@ class PipeAsyncLLM(LLM):
                 recv_bytes = output_socket.recv(copy=False)
                 recv_data = pickle.loads(recv_bytes)
                 schedulerOutput, next_tokens = recv_data
-                self.scheduler.update_seqs(
-                    schedulerOutput, next_tokens, delta=True, 
-                    async_streams=self.async_streams, tokenizer=self.model_runner.tokenizer)
-                self.free_finish_requests()
-            if await self.run_schedule(schedule_socket):
-                return
+                for idx, id in enumerate(schedulerOutput.act_schedule_ids):
+                    seq: Sequence = self.running_maps[id]
+                    seq.token_ids.append(next_tokens[idx])
+                    self.async_streams[id].put(seq.detokenize_inc(self.model_runner.tokenizer))
+                    if id in schedulerOutput.free_ids:
+                        self.running_maps.pop(id)
+                        self.async_streams[id].finish()
+                        del self.async_streams[id]
+                self.free_finish_ids(schedulerOutput.free_ids)
+            if len(self.wait_lists) != 0:
+                for seq in self.wait_lists:
+                    self.running_maps[seq.seq_id] = seq
+                schedulerOutput = SchedulerOutput(self.wait_lists)
+                self.wait_lists = []
+                schedule_bytes = pickle.dumps(schedulerOutput)
+                schedule_socket.send(schedule_bytes, copy=False)
             await asyncio.sleep(0)
 
     def start_worker(self, pp_rank):

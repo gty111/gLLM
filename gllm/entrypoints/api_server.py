@@ -5,6 +5,7 @@ import argparse
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from http import HTTPStatus
+from typing import Union
 
 from gllm.utils import make_async
 from gllm.entrypoints.protocol import ChatCompletionRequest, CompletionRequest, ModelList, ModelCard, ModelPermission, ErrorResponse
@@ -14,7 +15,7 @@ from gllm.entrypoints.serving_completions import completion_stream_generator, co
 
 router = APIRouter()
 
-llm: AsyncLLM = None
+llm: Union[AsyncLLM|PipeAsyncLLM] = None
 
 
 @router.get("/v1/models")
@@ -29,7 +30,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     token_ids = await make_async(llm.model_runner.tokenize)(request.messages, chat=True)
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
-                                              request.temperature, request.top_p, request.top_k)
+                                              request.temperature, request.top_p, request.top_k, request.repetition_penalty)
     else:
         return ErrorResponse(message="seq length exceeds max model length",
                              type="BadRequestError",
@@ -47,7 +48,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     token_ids = await make_async(llm.model_runner.tokenize)(request.prompt)
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
-                                              request.temperature, request.top_p, request.top_k)
+                                              request.temperature, request.top_p, request.top_k, request.repetition_penalty)
     else:
         return ErrorResponse(message="seq length exceeds max model length",
                              type="BadRequestError",
