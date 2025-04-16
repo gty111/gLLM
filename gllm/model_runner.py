@@ -31,8 +31,8 @@ class ModelRunner():
         self.model = None
         self.memory_manager = None
     
-    def init(self):
-        self.model = self.model_loader.load_model()
+    def init(self, mp_load_progress):
+        self.model = self.model_loader.load_model(mp_load_progress)
         memory_manager_cls = PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util, num_layers=self.model.num_layers, 

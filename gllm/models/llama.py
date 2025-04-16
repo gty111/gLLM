@@ -173,8 +173,10 @@ class LlamaForCausalLM(nn.Module):
     def sample(self, input_data: InputData, logits: torch.Tensor):
         return self.sampler.forward(logits, input_data)
 
-    def load_weights(self, weights):
+    def load_weights(self, weights, mp_load_progress):
         parameters = dict(self.named_parameters())
+        mp_load_progress[get_pp_rank()*2] = len(parameters)
+        mp_load_progress[get_pp_rank()*2+1] = 0
 
         # assert len(parameters) == len(weights)
         num_attn_heads = self.config.num_attention_heads
@@ -201,3 +203,4 @@ class LlamaForCausalLM(nn.Module):
                     'gate_up_proj', 'up_proj')]
             else:
                 v.data.copy_(weights[k])
+            mp_load_progress[get_pp_rank()*2+1] += 1

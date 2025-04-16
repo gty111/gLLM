@@ -6,6 +6,7 @@ import pickle
 from logger import logger
 from typing import List, Dict
 from fastapi import Request
+from tqdm import tqdm
 
 from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive, random_uuid
 from gllm.llm_engine import LLM
@@ -126,6 +127,7 @@ class PipeAsyncLLM(LLM):
 
         self.ctx = mp.get_context('spawn')
         self.mp_alive = self.ctx.Array('i',[0 for i in range(self.pp_size)])
+        self.mp_load_progress = self.ctx.Array('i',[0 for i in range(self.pp_size*2)])
 
         ipc_path_prefix = random_uuid()
         self.schedule_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
@@ -136,8 +138,34 @@ class PipeAsyncLLM(LLM):
         for pp_rank in range(self.pp_size):
             self.start_worker(pp_rank)
 
+        if kwargs['load_format'] == 'auto':
+            self.load_progress()
+        
         # wait worker start
         wait_worker(self.mp_alive, self.pp_size)
+    
+    def load_progress(self):
+        total_weights = 0
+        while True:
+            ready = True
+            total_weights = 0
+            for i in range(self.pp_size):
+                if self.mp_load_progress[i*2] == 0:
+                    ready = False
+                    continue
+                total_weights += self.mp_load_progress[i*2]
+            if ready:
+                break
+        pbar = tqdm(total=total_weights)
+        last_total_weights = 0
+        while True:
+            cur_total_weights = 0
+            for i in range(self.pp_size):
+                cur_total_weights += self.mp_load_progress[i*2+1]
+            pbar.update(cur_total_weights-last_total_weights)
+            last_total_weights = cur_total_weights
+            if cur_total_weights == total_weights:
+                break
         
     def add_requests(self, requests: List[Sequence]):
         self.wait_lists.extend(requests)
@@ -192,7 +220,8 @@ class PipeAsyncLLM(LLM):
                         self.schedule_ipc_path,
                         self.output_ipc_path,
                         self.token_ipc_path,
-                        self.mp_alive)
+                        self.mp_alive,
+                        self.mp_load_progress)
         self.ctx.Process(
             target=run_worker,
             args=(worker,),

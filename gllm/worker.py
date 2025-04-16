@@ -23,7 +23,8 @@ from gllm.memory_manager import PrefixMemoryManager
 class Worker:
     
     def __init__(self, model_runner:ModelRunner, pp_rank, pp_size, 
-                 master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path,mp_alive):
+                 master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path, mp_alive,
+                 mp_load_progress):
         self.model_runner = model_runner
         self.pp_rank = pp_rank # pp rank
         self.pp_size = pp_size # pp size
@@ -33,6 +34,7 @@ class Worker:
         self.output_ipc_path = output_ipc_path
         self.token_ipc_path = token_ipc_path
         self.mp_alive = mp_alive
+        self.mp_load_progress = mp_load_progress
     
     def get_pp_next_rank(self):
         # return device_rank of next pp_rank
@@ -79,7 +81,7 @@ class Worker:
         if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
             # last rank => rank 0 : next tokens
             self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
-        self.model_runner.init()
+        self.model_runner.init(self.mp_load_progress)
         self.dtype = self.model_runner.memory_manager.dtype
         self.hidden_size = self.model_runner.model_loader.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual

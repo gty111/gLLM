@@ -95,14 +95,13 @@ class ModelLoader():
             assert 0
         return model_type
 
-    def load_model(self):
+    def load_model(self, mp_load_progress):
         model_type = self.get_model_type()
         
         if self.load_format == 'auto':
             self.load_weights()
-            logger.info(f"Worker {get_pp_rank()} loading model ...")
             model = model_type(self.config)
-            model.load_weights(self.weights)
+            model.load_weights(self.weights,mp_load_progress)
             return model
         else:
             assert self.load_format == 'dummy'
