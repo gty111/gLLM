@@ -5,7 +5,7 @@ from typing import List, Dict, Union
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from gllm.sequence import Sequence
-from gllm.memory_manager import MemoryManager
+from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 
 class SchedulerOutput:
@@ -81,8 +81,10 @@ class Scheduler:
                     if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens and (
                         self.num_free_pages - num_page - cur_prefill_budget > self.num_threshold_free_pages):
                         cu_seqs_len += len(seq.token_ids)
-                        memory_manager.pre_allocate_page([seq])
+                        if isinstance(memory_manager, PrefixMemoryManager):
+                            memory_manager.pre_allocate_computed_page([seq])
                         seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
+                        memory_manager.pre_allocate_page([seq])
                         prefill_schedule_lists.append(seq)
                         cur_prefill_budget += num_page
                     else:
@@ -104,9 +106,9 @@ class Scheduler:
                 self.max_decode_seqs, self.num_free_pages*self.page_size, len(self.decode_lists))
             decode_schedule_lists = self.decode_lists[:decode_batch_size]
             self.decode_lists = self.decode_lists[decode_batch_size:]
-            memory_manager.pre_allocate_page(decode_schedule_lists)
             for seq in decode_schedule_lists:
                 seq.to_compute_token_num = 1
+            memory_manager.pre_allocate_page(decode_schedule_lists)
             return SchedulerOutput(decode_schedule_lists)
 
     def update_seqs(self, schedulerOutput: SchedulerOutput, next_tokens: List[int] = None, 

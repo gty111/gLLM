@@ -61,8 +61,10 @@ class ModelRunner():
     def stream_inference(self, seq: Sequence):
         # -------prefill------
         prefill_start = time.time()
-        self.memory_manager.pre_allocate_page([seq])
+        if isinstance(self.memory_manager, PrefixMemoryManager):
+            self.memory_manager.pre_allocate_computed_page([seq])
         seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
+        self.memory_manager.pre_allocate_page([seq])
         next_token = self.step_once(InputData([seq],self.memory_manager))[0]
         seq.token_ids.append(next_token)
         seq.computed_token_num += seq.to_compute_token_num
