@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive, random_uuid
 from gllm.llm_engine import LLM
-from gllm.worker import Worker, run_worker
+from gllm.async_worker import AsyncWorker, run_worker
 from gllm.input_data import InputData
 from gllm.sequence import Sequence
 from gllm.scheduler import SchedulerOutput
@@ -44,10 +44,6 @@ class AsyncStream:
         if isinstance(result, Exception):
             raise result
         return result
-
-
-class AsyncEngineDeadError(RuntimeError):
-    pass
 
 
 def _log_task_completion(task: asyncio.Task) -> None:
@@ -212,7 +208,7 @@ class PipeAsyncLLM(LLM):
             await asyncio.sleep(0)
 
     def start_worker(self, pp_rank):
-        worker = Worker(self.model_runner,
+        worker = AsyncWorker(self.model_runner,
                         pp_rank,
                         self.pp_size,
                         self.master_addr,
