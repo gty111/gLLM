@@ -5,6 +5,7 @@ import torch.distributed as dist
 import traceback
 import time
 import random
+import logging
 
 from collections import deque
 from logger import logger
@@ -45,6 +46,7 @@ class Worker:
         return (self.pp_rank - 1 + self.pp_size) % self.pp_size
     
     def init(self):
+        self.init_logger()
         init_dist(self.pp_size, self.pp_rank, self.pp_size, self.pp_rank, self.master_addr, self.master_port)
         torch.cuda.set_device(f'cuda:{self.pp_rank}')
         zmq_ctx = zmq.Context()
@@ -93,6 +95,11 @@ class Worker:
             self.model_runner.ratio_threshold_free_pages * self.model_runner.memory_manager.get_num_free_pages())
         
         self.mp_alive[self.pp_rank] = 1
+    
+    def init_logger(self):
+        formater = logging.Formatter(f"[%(asctime)s %(filename)s:%(lineno)d Worker {self.pp_rank}] %(levelname)s - %(message)s")
+        for handler in logger.handlers:
+            handler.setFormatter(formater)
     
     def get_num_free_pages(self):
         return self.model_runner.memory_manager.get_num_free_pages()
@@ -353,7 +360,7 @@ class Worker:
 def run_worker(worker: Worker):
     try:
         worker.init()
-        logger.info(f'Worker {worker.pp_rank} init')
+        logger.info(f'Init')
         while True:
             if worker.pp_rank == 0:
                 output = worker.schedule_run()
@@ -361,11 +368,11 @@ def run_worker(worker: Worker):
             else:
                 worker.run()
     except KeyboardInterrupt as e:
-        logger.info(f'Worker {worker.pp_rank} exit')
+        logger.info(f'Exit')
         dist.destroy_process_group()
         worker.mp_alive[worker.pp_rank] = -1
     except Exception as e:
-        logger.error(f'Worker {worker.pp_rank} \n{e}')
+        logger.error(e)
         traceback.print_exc()
         dist.destroy_process_group()
         worker.mp_alive[worker.pp_rank] = -1

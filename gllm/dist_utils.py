@@ -72,9 +72,8 @@ def get_pp_layers(num_layers):
     else:
         assigned_layers = num_layers_pp * get_pp_rank(), num_layers
     
-    logger.info('Worker %d assigned layers: (%3d,%3d) #total: %2d'%
+    logger.info('Assigned layers: (%3d,%3d) #total: %2d'%
                 (
-                    get_pp_rank(),
                     assigned_layers[0],
                     assigned_layers[1]-1,
                     assigned_layers[1]-assigned_layers[0]
