@@ -141,11 +141,16 @@ class AsyncWorker:
             hidden_states = None
             residual = None
             
-            packed_data = self.run_queue.popleft()
             if self.ret_residual:
-                input_data, (hidden_states, residual) = packed_data
+                input_data, (hidden_states_future, residual_future, hidden_states, residual) = self.run_queue[0]
+                if not hidden_states_future.is_completed() or not residual_future.is_completed():
+                    return
             else:
-                input_data, hidden_states = packed_data
+                input_data, (hidden_states_future, hidden_states) = self.run_queue[0]
+                if not hidden_states_future.is_completed():
+                    return
+            
+            self.run_queue.popleft()
                 
             output = self.model_runner.step_once(input_data,hidden_states,residual)
             if self.pp_rank == self.pp_size - 1:
@@ -153,7 +158,7 @@ class AsyncWorker:
                 token_bytes = pickle.dumps(output)
                 self.token_socket.send(token_bytes, copy=False)
             else:
-                await make_async(send_pp_data)(output, self.get_pp_next_rank())
+                send_pp_data(output, self.get_pp_next_rank())
     
     # rank 0
     def get_num_decode_seqs(self):
@@ -333,7 +338,7 @@ class AsyncWorker:
                 output = self.model_runner.step_once(input_data)
                 
                 if type(output) != list:
-                    await make_async(send_pp_data)(output, self.get_pp_next_rank())
+                    send_pp_data(output, self.get_pp_next_rank())
                 else:
                     self.next_tokens_queue.append(output)
     
