@@ -15,7 +15,7 @@ class SchedulerOutput:
         self.act_schedule_ids = []  # gpu process => schedule process
 
 class Scheduler:
-    def __init__(self, max_decode_seqs: int, max_batch_tokens: int, ratio_threshold_free_pages: float,
+    def __init__(self, maxd: int, maxp: int, kvthresh: float,
                  page_size: int) -> None:
         self.prompt_lists: List[Sequence] = []  # seqs to prefill
         self.decode_lists: List[Sequence] = []  # seqs to decode
@@ -23,10 +23,10 @@ class Scheduler:
 
         self.run_batch:Dict[int,Sequence] = dict()  # seqs under running (seq_id => seq)
         
-        self.max_decode_seqs = max_decode_seqs
-        self.max_batch_tokens = max_batch_tokens
-        self.ratio_threshold_free_pages = ratio_threshold_free_pages
-        self.num_threshold_free_pages = None
+        self.max_decode_seqs = maxd
+        self.max_batch_tokens = maxp
+        self.kvthresh = kvthresh
+        self.num_kvthresh_pages = None
 
         self.total_num_free_pages = None
         self.num_free_pages = None
@@ -40,8 +40,8 @@ class Scheduler:
     def set_total_num_free_pages(self, total_num_free_pages):
         self.num_free_pages = total_num_free_pages
         self.total_num_free_pages = total_num_free_pages
-        self.num_threshold_free_pages = int(
-            total_num_free_pages * self.ratio_threshold_free_pages)
+        self.num_kvthresh_pages = int(
+            total_num_free_pages * self.kvthresh)
 
     def add_requests(self, requests: List[Sequence]):
         self.prompt_lists.extend(requests)
@@ -65,12 +65,12 @@ class Scheduler:
         
         # prompt
         cur_prefill_budget = len(decode_schedule_lists)
-        if self.num_free_pages > self.num_threshold_free_pages:
+        if self.num_free_pages > self.num_kvthresh_pages:
             cu_seqs_len = 0
             for seq in self.prompt_lists:
                 num_page = (len(seq.token_ids)+self.page_size-1) // self.page_size
                 if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens and (
-                    self.num_free_pages - num_page - cur_prefill_budget > self.num_threshold_free_pages):
+                    self.num_free_pages - num_page - cur_prefill_budget > self.num_kvthresh_pages):
                     cu_seqs_len += len(seq.token_ids)
                     if isinstance(memory_manager, PrefixMemoryManager):
                         memory_manager.pre_allocate_computed_page([seq])

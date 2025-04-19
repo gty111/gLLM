@@ -111,7 +111,8 @@ class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         logger.info('Using PipeAsyncLLM backend')
-
+        
+        self.assigned_layers = kwargs.pop('assigned_layers')
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -152,7 +153,7 @@ class PipeAsyncLLM(LLM):
                 total_weights += self.mp_load_progress[i*2]
             if ready:
                 break
-        pbar = tqdm(total=total_weights)
+        pbar = tqdm(total=total_weights, bar_format='Loading model weights ... {l_bar}{bar}{r_bar}')
         last_total_weights = 0
         while True:
             cur_total_weights = 0
@@ -217,7 +218,8 @@ class PipeAsyncLLM(LLM):
                         self.output_ipc_path,
                         self.token_ipc_path,
                         self.mp_alive,
-                        self.mp_load_progress)
+                        self.mp_load_progress,
+                        self.assigned_layers)
         self.ctx.Process(
             target=run_worker,
             args=(worker,),

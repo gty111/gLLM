@@ -11,18 +11,18 @@ from gllm.input_data import InputData
 
 
 class LLM():
-    def __init__(self, model_path, load_format='auto', gpu_memory_util=0.9, page_size=16, max_decode_seqs=256,
-                 max_batch_tokens=8192, ratio_threshold_free_pages=0.05, enable_prefix_caching=True, pp_size=1):
+    def __init__(self, model_path, load_format='auto', gpu_memory_util=0.9, page_size=16, maxd=256,
+                 maxp=2048, minp=32, iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1):
         self.model_path = model_path
         self.model_runner = ModelRunner(
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, 
-            max_batch_tokens, max_decode_seqs, ratio_threshold_free_pages)
+            maxp, maxd, kvthresh, minp, iterp)
         self.pp_size = pp_size
         self.master_addr = '127.0.0.1'
         self.master_port = '49082'
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
-            max_decode_seqs, max_batch_tokens, ratio_threshold_free_pages, page_size)
+            maxd, maxp, kvthresh, page_size)
         self.finish_tokens = self.model_runner.model_loader.generation_config.eos_token_id
         if type(self.finish_tokens) == int:
             self.finish_tokens = [self.finish_tokens]
