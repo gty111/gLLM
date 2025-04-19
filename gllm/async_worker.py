@@ -36,7 +36,7 @@ class AsyncWorker:
 
     def __init__(self, model_runner: ModelRunner, pp_rank, pp_size,
                  master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path, mp_alive,
-                 mp_load_progress, assigned_layers):
+                 mp_load_progress, assigned_layers, use_naive_schedule):
         self.model_runner = model_runner
         self.pp_rank = pp_rank  # pp rank
         self.pp_size = pp_size  # pp size
@@ -48,6 +48,7 @@ class AsyncWorker:
         self.mp_alive = mp_alive
         self.mp_load_progress = mp_load_progress
         self.assigned_layers = assigned_layers
+        self.use_naive_schedule = use_naive_schedule
 
     def get_pp_next_rank(self):
         # return device_rank of next pp_rank
@@ -203,7 +204,7 @@ class AsyncWorker:
             self.log_num_preempt_seqs = self.num_preempt_seqs
             logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}')
             logger.warning(
-                'Try increase --ratio-free-pages or the performance is poor!')
+                'Try increase --kvthresh or the performance is poor!')
 
     # rank 0: PP schedule
     def schedule_naive(self):
@@ -230,7 +231,8 @@ class AsyncWorker:
         prefill_batched_token_nums = 0
         while len(self.seqs_to_prefill) != 0 and num_tokens_budget != 0:
             seq = self.seqs_to_prefill.popleft()
-            self.model_runner.memory_manager.pre_allocate_page([seq])
+            if isinstance(self.model_runner.memory_manager, PrefixMemoryManager) and seq.computed_token_num == 0:
+                self.model_runner.memory_manager.pre_allocate_computed_page([seq])
             if len(seq.token_ids)-seq.computed_token_num <= num_tokens_budget:
                 seq.to_compute_token_num = len(
                     seq.token_ids) - seq.computed_token_num
@@ -241,6 +243,7 @@ class AsyncWorker:
                 seq.to_compute_token_num = num_tokens_budget
                 num_tokens_budget = 0
             schedule_prefill_seqs.append(seq)
+        self.model_runner.memory_manager.pre_allocate_page(schedule_prefill_seqs)
 
         if time.time()-self.log_time > 1:
             self.log_time = time.time()
@@ -265,15 +268,13 @@ class AsyncWorker:
         schedule_decode_seqs = []
 
         # prefill
-        prefill_token_budget = self.page_size * \
-            max(self.get_num_free_pages()-self.num_kvthresh_pages, 0)
+        prefill_token_budget = self.page_size * max(self.get_num_free_pages()-self.num_kvthresh_pages, 0)
         if self.pp_size > 1 and prefill_token_budget != 0:
             self.update_num_wait_tokens()
             free_ratio = self.model_runner.memory_manager.get_memory_free()
             # a = ratio_threshold_free_pages
             # free_ratio in [1,a] | prefill_ratio in [1,0]
-            prefill_ratio = (free_ratio - self.kvthresh) / \
-                (1-self.kvthresh)
+            prefill_ratio = (free_ratio - self.kvthresh) / (1-self.kvthresh)
             prefill_ratio = max(prefill_ratio, 0)
             prefill_token_budget = min(
                 round(prefill_ratio * self.maxp),
@@ -287,8 +288,7 @@ class AsyncWorker:
         while len(self.seqs_to_prefill) != 0 and prefill_token_budget != 0:
             seq = self.seqs_to_prefill.popleft()
             if isinstance(self.model_runner.memory_manager, PrefixMemoryManager) and seq.computed_token_num == 0:
-                self.model_runner.memory_manager.pre_allocate_computed_page([
-                                                                            seq])
+                self.model_runner.memory_manager.pre_allocate_computed_page([seq])
             if len(seq.token_ids)-seq.computed_token_num <= prefill_token_budget:
                 seq.to_compute_token_num = len(
                     seq.token_ids) - seq.computed_token_num
@@ -357,7 +357,7 @@ class AsyncWorker:
     @async_wrapper
     async def schedule_run(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
-            schedule_seqs = self.schedule()
+            schedule_seqs = self.schedule() if not self.use_naive_schedule else self.schedule_naive()
             if len(schedule_seqs) != 0:
                 input_data = InputData(
                     schedule_seqs, self.model_runner.memory_manager)

@@ -91,6 +91,7 @@ if __name__ == '__main__':
     parser.add_argument('--minp', type=int, help='Minimum token count in prefill, used in PipeAsyncLLM', default=32)
     parser.add_argument('--iterp', type=int, help='Number of iterations to process waiting prefill tokens, used in PipeAsyncLLM', default=8)
     parser.add_argument('--kvthresh', type=float, help='KV cache threshold for prefill operations', default=0.05)
+    parser.add_argument('--use-naive-schedule', help='Use scheduling policy in Sarathi-Serve', action='store_true')
     parser.add_argument('--enable-prefix-caching', help='Enable KV cache reuse across requests', action='store_true')
     parser.add_argument('--pp', type=int, help='Number of pipeline stages', default=1)
     parser.add_argument('--load-format', type=str, choices=['auto','dummy'], help='auto: actually load model weights; dummy: initialize the model with random values', default='auto')
@@ -109,6 +110,7 @@ if __name__ == '__main__':
                   kvthresh=args.kvthresh,
                   enable_prefix_caching=args.enable_prefix_caching,
                   pp_size=args.pp,
-                  assigned_layers=args.assigned_layers)
+                  assigned_layers=args.assigned_layers,
+                  use_naive_schedule=args.use_naive_schedule)
 
     asyncio.run(run_server(args))

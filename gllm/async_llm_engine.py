@@ -61,6 +61,7 @@ class AsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         kwargs.pop('assigned_layers')
+        kwargs.pop('use_naive_schedule')
         assert kwargs['pp_size'] == 1 and "AsyncLLM doesn't support degree of PP > 1"
         logger.info('Using AsyncLLM backend')
         super().__init__(*args, **kwargs)
@@ -114,6 +115,8 @@ class PipeAsyncLLM(LLM):
         logger.info('Using PipeAsyncLLM backend')
         
         self.assigned_layers = kwargs.pop('assigned_layers')
+        self.use_naive_schedule = kwargs.pop('use_naive_schedule')
+        
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
@@ -220,7 +223,8 @@ class PipeAsyncLLM(LLM):
                         self.token_ipc_path,
                         self.mp_alive,
                         self.mp_load_progress,
-                        self.assigned_layers)
+                        self.assigned_layers,
+                        self.use_naive_schedule)
         self.ctx.Process(
             target=run_worker,
             args=(worker,),

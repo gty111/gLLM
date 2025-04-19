@@ -121,7 +121,7 @@ class Scheduler:
         self.preempt_num_seqs += len(preempt_seqs)
         if self.preempt_num_seqs - self.log_preempt_num_seqs > 10:
             logger.warning(f'#Preempted seqs: {self.preempt_num_seqs}')
-            logger.warning('Try increase --ratio-free-pages or the performance is poor!')
+            logger.warning('Try increase --kvthresh or the performance is poor!')
             self.log_preempt_num_seqs = self.preempt_num_seqs
 
     def get_finish_ids(self):
