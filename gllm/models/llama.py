@@ -175,8 +175,9 @@ class LlamaForCausalLM(nn.Module):
 
     def load_weights(self, weights, mp_load_progress):
         parameters = dict(self.named_parameters())
-        mp_load_progress[get_pp_rank()*2] = len(parameters)
-        mp_load_progress[get_pp_rank()*2+1] = 0
+        if mp_load_progress is not None:
+            mp_load_progress[get_pp_rank()*2] = len(parameters)
+            mp_load_progress[get_pp_rank()*2+1] = 0
 
         # assert len(parameters) == len(weights)
         num_attn_heads = self.config.num_attention_heads
@@ -203,4 +204,5 @@ class LlamaForCausalLM(nn.Module):
                     'gate_up_proj', 'up_proj')]
             else:
                 v.data.copy_(weights[k])
-            mp_load_progress[get_pp_rank()*2+1] += 1
+            if mp_load_progress is not None:
+                mp_load_progress[get_pp_rank()*2+1] += 1

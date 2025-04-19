@@ -82,11 +82,12 @@ def get_pp_layers(num_layers):
         assert len(total_assigned_layers) == get_pp_size() and sum(total_assigned_layers) == num_layers
         assigned_layers = [sum(total_assigned_layers[:get_pp_rank()]), sum(total_assigned_layers[:get_pp_rank()+1])]
     
-    logger.info('Assigned layers: (%3d,%3d) #total: %2d'%
-                (
-                    assigned_layers[0],
-                    assigned_layers[1]-1,
-                    assigned_layers[1]-assigned_layers[0]
-                ))
+    if get_pp_size() > 1:
+        logger.info('Assigned layers: (%3d,%3d) #total: %2d'%
+                    (
+                        assigned_layers[0],
+                        assigned_layers[1]-1,
+                        assigned_layers[1]-assigned_layers[0]
+                    ))
     
     return assigned_layers

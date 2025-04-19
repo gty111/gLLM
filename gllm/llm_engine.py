@@ -106,6 +106,7 @@ class LLM():
         history = []
         while True:
             prompt = input(">>> ")
+            print()
             if prompt == '\clear':
                 history = []
                 continue
