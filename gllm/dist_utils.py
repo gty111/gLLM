@@ -46,6 +46,7 @@ def recv_pp_data(src, dtype, shape, has_residual):
 
 _PP_RANK=0
 _PP_SIZE=1
+_ASSIGNED_LAYERS=None
 
 def get_pp_rank():
     return _PP_RANK
@@ -53,43 +54,40 @@ def get_pp_rank():
 def get_pp_size():
     return _PP_SIZE
 
-def init_dist(pp_size, pp_rank, device_size, device_rank, master_addr, master_port):
-    global _PP_RANK, _PP_SIZE
+def get_assigned_layers():
+    return _ASSIGNED_LAYERS
+
+def init_dist(pp_size, pp_rank, device_size, device_rank, master_addr, master_port, assigned_layers):
+    global _PP_RANK, _PP_SIZE, _ASSIGNED_LAYERS
     _PP_RANK = pp_rank
     _PP_SIZE = pp_size
+    _ASSIGNED_LAYERS = assigned_layers
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = master_port
     dist.init_process_group(backend='nccl', world_size=device_size, rank=device_rank)
 
 def get_pp_layers(num_layers):
-    num_layers_pp = num_layers // get_pp_size()
-    
-    if get_pp_size() <= 4 or num_layers % get_pp_size() != 0:
-        num_layers_pp += 1
+    if _ASSIGNED_LAYERS is None:
+        num_layers_pp = num_layers // get_pp_size()
+        
+        if get_pp_size() <= 4 or num_layers % get_pp_size() != 0:
+            num_layers_pp += 1
 
-    if get_pp_rank() != get_pp_size() - 1:
-        assigned_layers = num_layers_pp * get_pp_rank(), num_layers_pp * (get_pp_rank()+1)
+        if get_pp_rank() != get_pp_size() - 1:
+            assigned_layers = num_layers_pp * get_pp_rank(), num_layers_pp * (get_pp_rank()+1)
+        else:
+            assigned_layers = num_layers_pp * get_pp_rank(), num_layers
     else:
-        assigned_layers = num_layers_pp * get_pp_rank(), num_layers
+        total_assigned_layers = [int(i) for i in _ASSIGNED_LAYERS.split(',')]
+        assert len(total_assigned_layers) == get_pp_size() and sum(total_assigned_layers) == num_layers
+        assigned_layers = [sum(total_assigned_layers[:get_pp_rank()]), sum(total_assigned_layers[:get_pp_rank()+1])]
     
-    logger.info('Assigned layers: (%3d,%3d) #total: %2d'%
-                (
-                    assigned_layers[0],
-                    assigned_layers[1]-1,
-                    assigned_layers[1]-assigned_layers[0]
-                ))
+    if get_pp_size() > 1:
+        logger.info('Assigned layers: (%3d,%3d) #total: %2d'%
+                    (
+                        assigned_layers[0],
+                        assigned_layers[1]-1,
+                        assigned_layers[1]-assigned_layers[0]
+                    ))
     
     return assigned_layers
-
-def get_pp_num_layers(num_layers):
-    num_layers_pp = num_layers // get_pp_size()
-    
-    if get_pp_size() <= 4 or num_layers % get_pp_size() != 0:
-        num_layers_pp += 1
-    
-    if get_pp_rank() != get_pp_size() - 1:
-        num_assigned_layers = num_layers_pp
-    else:
-        num_assigned_layers = num_layers - num_layers_pp * (get_pp_size() - 1)
-    
-    return num_assigned_layers

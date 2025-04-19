@@ -95,7 +95,7 @@ class ModelLoader():
             assert 0
         return model_type
 
-    def load_model(self, mp_load_progress):
+    def load_model(self, mp_load_progress=None):
         model_type = self.get_model_type()
         
         if self.load_format == 'auto':

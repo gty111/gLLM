@@ -9,7 +9,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
 from gllm.input_data import InputData
-from gllm.dist_utils import get_pp_num_layers, get_pp_layers, get_pp_size, get_pp_rank
+from gllm.dist_utils import get_pp_layers, get_pp_size, get_pp_rank
 
 
 class Qwen2MLP(nn.Module):
@@ -117,11 +117,11 @@ class Qwen2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.max_model_len = config.max_position_embeddings
-        self.num_layers = get_pp_num_layers(config.num_hidden_layers)
         self.dtype = config.torch_dtype
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.model = Qwen2Model(config)
+        self.num_layers = len(self.model.layers)
         self.ret_residual = True
         if get_pp_rank() == get_pp_size() - 1:
             if config.tie_word_embeddings:
@@ -145,10 +145,11 @@ class Qwen2ForCausalLM(nn.Module):
     def sample(self, input_data: InputData, logits: torch.Tensor):
         return self.sampler.forward(logits, input_data)
 
-    def load_weights(self, weights, mp_load_progress):
+    def load_weights(self, weights, mp_load_progress=None):
         parameters = dict(self.named_parameters())
-        mp_load_progress[get_pp_rank()*2] = len(parameters)
-        mp_load_progress[get_pp_rank()*2+1] = 0
+        if mp_load_progress is not None:
+            mp_load_progress[get_pp_rank()*2] = len(parameters)
+            mp_load_progress[get_pp_rank()*2+1] = 0
 
         # assert len(parameters) == len(weights)
         num_attn_heads = self.config.num_attention_heads
@@ -182,4 +183,5 @@ class Qwen2ForCausalLM(nn.Module):
                     'gate_up_proj', 'up_proj')]
             else:
                 v.data.copy_(weights[k])
-            mp_load_progress[get_pp_rank()*2+1] += 1
+            if mp_load_progress is not None:
+                mp_load_progress[get_pp_rank()*2+1] += 1

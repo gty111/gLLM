@@ -9,7 +9,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
-from gllm.dist_utils import get_pp_num_layers, get_pp_layers, get_pp_rank, get_pp_size
+from gllm.dist_utils import get_pp_layers, get_pp_rank, get_pp_size
 
 
 class GLMAttention(nn.Module):
@@ -168,11 +168,11 @@ class ChatGLMForCausalLM(nn.Module):
 
         self.config = config
         self.max_model_len = config.seq_length
-        self.num_layers = get_pp_num_layers(config.num_layers)
         self.dtype = config.torch_dtype
         self.num_kv_heads = config.multi_query_group_num
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.transformer = ChatGLMModel(config)
+        self.num_layers = len(self.transformer.encoder.layers)
         self.ret_residual = False
         if get_pp_rank() == get_pp_size() - 1:
             self.lm_head = self.transformer.output_layer
@@ -191,8 +191,9 @@ class ChatGLMForCausalLM(nn.Module):
 
     def load_weights(self, weights, mp_load_progress):
         parameters = dict(self.named_parameters())
-        mp_load_progress[get_pp_rank()*2] = len(parameters)
-        mp_load_progress[get_pp_rank()*2+1] = 0
+        if mp_load_progress is not None:
+            mp_load_progress[get_pp_rank()*2] = len(parameters)
+            mp_load_progress[get_pp_rank()*2+1] = 0
 
         for k, v in parameters.items():
             # resolve PP layer
@@ -203,7 +204,8 @@ class ChatGLMForCausalLM(nn.Module):
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')
             v.data.copy_(weights[k])
-            mp_load_progress[get_pp_rank()*2+1] += 1
+            if mp_load_progress is not None:
+                mp_load_progress[get_pp_rank()*2+1] += 1
 
     def process_response(self, output, history):
         content = ""
