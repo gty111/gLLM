@@ -60,6 +60,7 @@ def _log_task_completion(task: asyncio.Task) -> None:
 class AsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
+        kwargs.pop('assigned_layers')
         assert kwargs['pp_size'] == 1 and "AsyncLLM doesn't support degree of PP > 1"
         logger.info('Using AsyncLLM backend')
         super().__init__(*args, **kwargs)

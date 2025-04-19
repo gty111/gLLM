@@ -33,7 +33,7 @@ class ModelRunner():
         self.model = None
         self.memory_manager = None
 
-    def init(self, mp_load_progress):
+    def init(self, mp_load_progress=None):
         self.model = self.model_loader.load_model(mp_load_progress)
         memory_manager_cls = PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         self.memory_manager = memory_manager_cls(
