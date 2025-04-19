@@ -154,7 +154,7 @@ class PipeAsyncLLM(LLM):
                 total_weights += self.mp_load_progress[i*2]
             if ready:
                 break
-        pbar = tqdm(total=total_weights, bar_format='Loading model weights ... {l_bar}{bar}{r_bar}')
+        pbar = tqdm(total=total_weights, bar_format='Loading model weights ... {l_bar}{bar}{r_bar}', ncols=100)
         last_total_weights = 0
         while True:
             cur_total_weights = 0
