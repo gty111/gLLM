@@ -198,7 +198,6 @@ async def user_request(request_func,
                        requests,):
     cur_task = None
     outputs = []
-    api_urls = [f"http://localhost:{port}/v1/completions" for port in [12345,12346]]
     for request in requests:
         if cur_task is not None:
             # wait for the last request finished
@@ -422,7 +421,7 @@ if __name__ == "__main__":
         default=None,
         help="Server or API base url if not using http host and port.",
     )
-    parser.add_argument("--host", type=str, default="localhost")
+    parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--endpoint",

@@ -1,5 +1,6 @@
 import glob
 import torch
+import sys
 
 from logger import logger
 from safetensors import safe_open
@@ -9,7 +10,6 @@ from huggingface_hub import snapshot_download
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.qwen2 import Qwen2ForCausalLM
-from gllm.dist_utils import get_pp_rank
 from gllm.utils import get_lock
 
 
@@ -92,7 +92,8 @@ class ModelLoader():
         elif self.architecture == 'Qwen2ForCausalLM':
             model_type = Qwen2ForCausalLM
         else:
-            assert 0
+            logger.error(f'Unsupported model: {self.architecture}')
+            sys.exit(0)
         return model_type
 
     def load_model(self, mp_load_progress=None):
