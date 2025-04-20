@@ -148,6 +148,7 @@ class PipeAsyncLLM(LLM):
     def load_progress(self):
         total_weights = 0
         while True:
+            check_worker_alive(self.mp_alive)
             ready = True
             total_weights = 0
             for i in range(self.pp_size):
@@ -160,6 +161,7 @@ class PipeAsyncLLM(LLM):
         pbar = tqdm(total=total_weights, bar_format='Loading model weights ... {l_bar}{bar}{r_bar}', ncols=100)
         last_total_weights = 0
         while True:
+            check_worker_alive(self.mp_alive)
             cur_total_weights = 0
             for i in range(self.pp_size):
                 cur_total_weights += self.mp_load_progress[i*2+1]

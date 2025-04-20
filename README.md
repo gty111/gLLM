@@ -21,6 +21,7 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 
 ### Install gLLM
 ```
+pip install torch==2.5.1
 pip install --verbose -e .
 ```
 
@@ -46,9 +47,8 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
 ### Launch online serving
 
 ```
-# To enable prefix caching, add "--enable-prefix-caching"
-# To enable pipeline parallelism, add "--pp $PP_DEGREE"
-python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH
+python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
+    --enable-prefix-caching --pp $PP_STAGES
 ```
 
 ### Client Completions
