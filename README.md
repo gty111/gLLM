@@ -66,7 +66,7 @@ python examples/client.py --port $PORT
 python examples/chat_client.py --port $PORT
 ```
 
-### Online benchmark
+### Online Benchmark
 ```
 # Launch online server first
 python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
