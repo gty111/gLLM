@@ -95,7 +95,7 @@ if __name__ == '__main__':
     parser.add_argument('--enable-prefix-caching', help='Enable KV cache reuse across requests', action='store_true')
     parser.add_argument('--pp', type=int, help='Number of pipeline stages', default=1)
     parser.add_argument('--load-format', type=str, choices=['auto','dummy'], help='auto: actually load model weights; dummy: initialize the model with random values', default='auto')
-    parser.add_argument('--assigned-layers', type=str, help='If we have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
+    parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
     args = parser.parse_args()
 
     llm_cls = PipeAsyncLLM if not args.disable_pipe_schedule else AsyncLLM

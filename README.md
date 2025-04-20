@@ -46,7 +46,7 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
     --gpu-memory-util $GPU_MEMORY_UTIL
 ```
 
-### Launch Online Server
+### Launch OpenAI-Compatible Server
 
 ```
 # To see the description of args, run 'python -m gllm.entrypoints.api_server -h'
@@ -56,19 +56,19 @@ python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
 
 ### Client Completions
 ```
-# Launch online server first
+# Launch server first
 python examples/client.py --port $PORT
 ```
 
 ### Interactive Online Chat
 ```
-# Launch online server first
+# Launch server first
 python examples/chat_client.py --port $PORT
 ```
 
 ### Online Benchmark
 ```
-# Launch online server first
+# Launch server first
 python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
         --dataset-name $DATASET_NAME --dataset-path $DATASET_PATH \
         --num-prompts $NUM_PROMPTS --port $PORT --trust-remote-code \
@@ -77,7 +77,7 @@ python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
 
 ### Online Prefix Benchmark
 ```
-# Launch online server first
+# Launch server first
 python benchmarks/benchmark_prefix_serving.py \
         --trust-remote-code --backend $BACKEND --dataset $SHAREGPT_PATH \
         --model $MODEL --num-max-users $NUM_USERS \
@@ -88,7 +88,7 @@ python benchmarks/benchmark_prefix_serving.py \
 
 ### Evaluate Output Quality
 ```
-# Launch online server first
+# Launch server first
 python evaluations/evaluate_MMLU_pro.py --model $MODEL --port $PORT
 ```
 
