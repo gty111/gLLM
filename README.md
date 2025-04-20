@@ -33,15 +33,14 @@ python examples/chat.py --model-path $MODEL_PATH
 ```
 python examples/batch_inference.py --model-path $MODEL \
     --share-gpt-path $SHARE_GPT_PATH --num-prompt $NUM_PROMPT \
-    --gpu-memory-utilization $GPU_MEMORY_UTILIZATION
+    --gpu-memory-util $GPU_MEMORY_UTILIZATION
 ```
 
-### Offline benchmark with gllm/vllm
+### Offline benchmark
 ```
-# replace $BACKEND with gllm or vllm
 python benchmarks/benchmark_throughput.py --model $MODEL \
-    --dataset $DATASET --num-prompt $NUM_PROMPT --backend $BACKEND \
-    --trust-remote-code --gpu-memory-utilization $GPU_MEMORY_UTILIZATION
+    --dataset $DATASET --num-prompt $NUM_PROMPT --backend gllm \
+    --gpu-memory-util $GPU_MEMORY_UTILIZATION
 ```
 
 ### Launch online serving
