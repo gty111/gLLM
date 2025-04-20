@@ -3,7 +3,7 @@
 </p>
 
 <h3 align="center">
-Lightweight, easy, fast and cheap LLM serving playground
+Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Token Throttling
 </h3>
 
 
@@ -11,7 +11,7 @@ Lightweight, easy, fast and cheap LLM serving playground
 
 ## What is gLLM?
 
-Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching** and **pipeline parallelism**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
+Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching** and **pipeline parallelism**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
 - [2025/03/15]: Chunked prefill has been integrated. You can input any length of text you want :hugs:
@@ -19,65 +19,77 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 - [2025/02/27]: We apply numerous optimizations which lowers CPU overhead a lot :clap: 
 
 
-### Install gLLM
+## Install gLLM
 ```
 pip install torch==2.5.1
-pip install --verbose -e .
+pip install -v -e .
 ```
 
-### Chat mode
+## Quickstart
+
+### Interactive Offline Chat
 ```
 python examples/chat.py --model-path $MODEL_PATH
 ```
 
-### Offline batch inference
+### Offline Batch Inference
 ```
 python examples/batch_inference.py --model-path $MODEL \
     --share-gpt-path $SHARE_GPT_PATH --num-prompt $NUM_PROMPT \
-    --gpu-memory-util $GPU_MEMORY_UTILIZATION
+    --gpu-memory-util $GPU_MEMORY_UTIL
 ```
 
-### Offline benchmark
+### Offline Benchmark
 ```
 python benchmarks/benchmark_throughput.py --model $MODEL \
-    --dataset $DATASET --num-prompt $NUM_PROMPT --backend gllm \
-    --gpu-memory-util $GPU_MEMORY_UTILIZATION
+    --dataset $SHAREGPT_PATH --num-prompt $NUM_PROMPT --backend gllm \
+    --gpu-memory-util $GPU_MEMORY_UTIL
 ```
 
-### Launch online serving
+### Launch Online Server
 
 ```
+# To see the description of args, run 'python -m gllm.entrypoints.api_server -h'
 python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
     --enable-prefix-caching --pp $PP_STAGES
 ```
 
 ### Client Completions
 ```
-python examples/client.py
+# Launch online server first
+python examples/client.py --port $PORT
 ```
 
-### Client Chat Completions
+### Interactive Online Chat
 ```
-python examples/chat_client.py
+# Launch online server first
+python examples/chat_client.py --port $PORT
 ```
 
-### Online benchmark with gllm or vllm
+### Online benchmark
 ```
+# Launch online server first
 python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
         --dataset-name $DATASET_NAME --dataset-path $DATASET_PATH \
         --num-prompts $NUM_PROMPTS --port $PORT --trust-remote-code \
         --request-rate $REQUEST_RATE
 ```
 
-### Online prefix benchmark with gllm or vllm
+### Online Prefix Benchmark
 ```
+# Launch online server first
 python benchmarks/benchmark_prefix_serving.py \
-        --trust-remote-code --backend $BACKEND --dataset $DATASET \
+        --trust-remote-code --backend $BACKEND --dataset $SHAREGPT_PATH \
         --model $MODEL --num-max-users $NUM_USERS \
         --num-min-rounds $NUM_MIN_ROUNDS \
         --num-max-rounds $NUM_MAX_ROUNDS \
-        --seed $NUM_USERS --port $PORT \
-        --input-len-min $INPUT_LEN_MIN --input-len-max $INPUT_LEN_MAX
+        --port $PORT 
+```
+
+### Evaluate Output Quality
+```
+# Launch online server first
+python evaluations/evaluate_MMLU_pro.py --model $MODEL --port $PORT
 ```
 
 ## Supported Models
@@ -86,7 +98,8 @@ python benchmarks/benchmark_prefix_serving.py \
 - ChatGLM Series: Chatglm3 and glm4
 - Qwen2 Series: Qwen2, Qwen2.5
 
-## Limited functionality
+## Roadmap
 
-- Do NOT support TP
-- Limited number of supported models
+- [ ] Support TP
+- [ ] Support mult-node deployment
+- [ ] Support as many models as possible
