@@ -2,9 +2,9 @@
     <img src=doc/pic/gLLM.svg height=240>
 </p>
 
-<h3 align="center">
+<h4 align="center">
 Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Token Throttling
-</h3>
+</h4>
 
 
 ---
