@@ -10,6 +10,7 @@ from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
 from gllm.input_data import InputData
 from gllm.dist_utils import get_pp_layers, get_pp_size, get_pp_rank
+from gllm.utils import get_model_load_pbar
 
 
 class Qwen2MLP(nn.Module):
@@ -150,6 +151,8 @@ class Qwen2ForCausalLM(nn.Module):
         if mp_load_progress is not None:
             mp_load_progress[get_pp_rank()*2] = len(parameters)
             mp_load_progress[get_pp_rank()*2+1] = 0
+        else:
+            pbar = get_model_load_pbar(len(parameters))
 
         # assert len(parameters) == len(weights)
         num_attn_heads = self.config.num_attention_heads
@@ -185,3 +188,5 @@ class Qwen2ForCausalLM(nn.Module):
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
                 mp_load_progress[get_pp_rank()*2+1] += 1
+            else:
+                pbar.update(1)
