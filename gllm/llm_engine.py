@@ -84,7 +84,7 @@ class LLM():
                 requests.append(seq)
         self.add_requests(requests)
 
-        pbar = tqdm.tqdm(total=len(requests))
+        pbar = tqdm.tqdm(total=len(requests),ncols=100)
         while len(self.scheduler.finish_ids) != len(requests):
             cur_finish_num = len(self.scheduler.finish_ids)
             self.step()

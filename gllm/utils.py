@@ -9,6 +9,7 @@ import hashlib
 import filelock
 import tempfile
 import logging
+import tqdm
 
 from logger import logger
 from functools import partial
@@ -101,3 +102,7 @@ def get_lock(model_name_or_path: Union[str, Path],
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name),
                              mode=0o666)
     return lock
+
+def get_model_load_pbar(num_totals):
+    return tqdm.tqdm(total=num_totals,ncols=100,
+                    bar_format='Loading model weights ... {l_bar}{bar}{r_bar}')

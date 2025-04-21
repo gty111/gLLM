@@ -6,9 +6,9 @@ import pickle
 from logger import logger
 from typing import List, Dict
 from fastapi import Request
-from tqdm import tqdm
 
-from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive, random_uuid
+from gllm.utils import (make_async, make_socket, wait_worker, 
+                        check_worker_alive, random_uuid, get_model_load_pbar)
 from gllm.llm_engine import LLM
 from gllm.async_worker import AsyncWorker, run_worker_async
 from gllm.worker import Worker, run_worker
@@ -126,7 +126,6 @@ class PipeAsyncLLM(LLM):
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
-        self.process_output_engine = None
 
         self.wait_lists: List[Sequence] = []
         self.running_maps: Dict[int, Sequence] = dict()
@@ -166,8 +165,7 @@ class PipeAsyncLLM(LLM):
                 total_weights += self.mp_load_progress[i*2]
             if ready:
                 break
-        pbar = tqdm(total=total_weights,
-                    bar_format='Loading model weights ... {l_bar}{bar}{r_bar}', ncols=100)
+        pbar = get_model_load_pbar(total_weights)
         last_total_weights = 0
         while True:
             check_worker_alive(self.mp_alive)

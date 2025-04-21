@@ -1,8 +1,7 @@
 import time
 
 from logger import logger
-from typing import List, Dict, Union
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+from typing import List, Dict
 
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
@@ -10,9 +9,11 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 class SchedulerOutput:
     def __init__(self, schedule_lists: List[Sequence]):
-        self.schedule_lists = schedule_lists  # schedule process => gpu process
-        self.free_ids = []  # gpu process => schedule process
-        self.act_schedule_ids = []  # gpu process => schedule process
+        # front-end => worker
+        self.schedule_lists = schedule_lists  
+        # worker => front-end
+        self.free_ids = []  
+        self.act_schedule_ids = []
 
 class Scheduler:
     def __init__(self, maxd: int, maxp: int, kvthresh: float,
