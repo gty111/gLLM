@@ -14,15 +14,15 @@ from logger import logger
 from functools import partial
 from typing import Awaitable, Callable, ParamSpec, TypeVar, Union, Optional
 from pathlib import Path
-from gllm.dist_utils import get_pp_rank
 
 P = ParamSpec('P')
 K = TypeVar("K")
 T = TypeVar("T")
 
-formater = logging.Formatter(f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s")
-for handler in logger.handlers:
-    handler.setFormatter(formater)
+def init_logger():
+    formater = logging.Formatter(f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s")
+    for handler in logger.handlers:
+        handler.setFormatter(formater)
 
 def make_async(func: Callable[P, T]) -> Callable[P, Awaitable[T]]:
     """Take a blocking function, and run it on in an executor thread.

@@ -10,7 +10,8 @@ from tqdm import tqdm
 
 from gllm.utils import make_async, make_socket, wait_worker, check_worker_alive, random_uuid
 from gllm.llm_engine import LLM
-from gllm.async_worker import AsyncWorker, run_worker
+from gllm.async_worker import AsyncWorker, run_worker_async
+from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
 from gllm.sequence import Sequence
 from gllm.scheduler import SchedulerOutput
@@ -62,6 +63,7 @@ class AsyncLLM(LLM):
     def __init__(self, *args, **kwargs):
         kwargs.pop('assigned_layers')
         kwargs.pop('use_naive_schedule')
+        kwargs.pop('use_async_worker')
         assert kwargs['pp_size'] == 1 and "AsyncLLM doesn't support degree of PP > 1"
         logger.info('Using AsyncLLM backend')
         super().__init__(*args, **kwargs)
@@ -72,7 +74,7 @@ class AsyncLLM(LLM):
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float, repetition_penalty: float):
-        seq = self.allocate_seq(token_ids, output_len, ignore_eos, 
+        seq = self.allocate_seq(token_ids, output_len, ignore_eos,
                                 temperature, top_p, top_k, repetition_penalty)
         stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams
@@ -83,10 +85,12 @@ class AsyncLLM(LLM):
         return stream
 
     async def step_async(self):
-        schedulerOutput = self.scheduler.schedule(self.model_runner.memory_manager, log=True)
+        schedulerOutput = self.scheduler.schedule(
+            self.model_runner.memory_manager, log=True)
         next_tokens = await make_async(self.model_runner.step_once)(
             InputData(schedulerOutput.schedule_lists, self.model_runner.memory_manager))
-        self.scheduler.update_seqs(schedulerOutput, next_tokens, self.model_runner.memory_manager)
+        self.scheduler.update_seqs(
+            schedulerOutput, next_tokens, self.model_runner.memory_manager)
         for seq in schedulerOutput.schedule_lists:
             self.async_streams[seq.seq_id].put(
                 seq.detokenize_inc(self.model_runner.tokenizer))
@@ -113,38 +117,42 @@ class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
         logger.info('Using PipeAsyncLLM backend')
-        
+
         self.assigned_layers = kwargs.pop('assigned_layers')
         self.use_naive_schedule = kwargs.pop('use_naive_schedule')
-        
+        self.use_async_worker = kwargs.pop('use_async_worker')
+
         super().__init__(*args, **kwargs)
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
         self.process_output_engine = None
-        
+
         self.wait_lists: List[Sequence] = []
-        self.running_maps: Dict[int,Sequence] = dict()
+        self.running_maps: Dict[int, Sequence] = dict()
 
         self.ctx = mp.get_context('spawn')
-        self.mp_alive = self.ctx.Array('i',[0 for i in range(self.pp_size)])
-        self.mp_load_progress = self.ctx.Array('i',[0 for i in range(self.pp_size*2)])
+        self.mp_alive = self.ctx.Array('i', [0 for i in range(self.pp_size)])
+        self.mp_load_progress = self.ctx.Array(
+            'i', [0 for i in range(self.pp_size*2)])
 
         ipc_path_prefix = random_uuid()
         self.schedule_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
         self.output_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
         self.token_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
 
-        logger.info(f"Launching {self.pp_size} worker(s) ...")
+        logger.info(f'Launching {self.pp_size} worker(s) ...')
+        if self.use_async_worker:
+            logger.warning(f'AsyncWorker is an experimental feature')
         for pp_rank in range(self.pp_size):
             self.start_worker(pp_rank)
 
         if kwargs['load_format'] == 'auto':
             self.load_progress()
-        
+
         # wait worker start
         wait_worker(self.mp_alive, self.pp_size)
-    
+
     def load_progress(self):
         total_weights = 0
         while True:
@@ -158,7 +166,8 @@ class PipeAsyncLLM(LLM):
                 total_weights += self.mp_load_progress[i*2]
             if ready:
                 break
-        pbar = tqdm(total=total_weights, bar_format='Loading model weights ... {l_bar}{bar}{r_bar}', ncols=100)
+        pbar = tqdm(total=total_weights,
+                    bar_format='Loading model weights ... {l_bar}{bar}{r_bar}', ncols=100)
         last_total_weights = 0
         while True:
             check_worker_alive(self.mp_alive)
@@ -169,13 +178,13 @@ class PipeAsyncLLM(LLM):
             last_total_weights = cur_total_weights
             if cur_total_weights == total_weights:
                 break
-        
+
     def add_requests(self, requests: List[Sequence]):
         self.wait_lists.extend(requests)
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
                                  temperature: float, top_p: float, top_k: float, repetition_penalty: float):
-        seq = self.allocate_seq(token_ids, output_len, ignore_eos, 
+        seq = self.allocate_seq(token_ids, output_len, ignore_eos,
                                 temperature, top_p, top_k, repetition_penalty)
         stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams
@@ -199,7 +208,8 @@ class PipeAsyncLLM(LLM):
                 for idx, id in enumerate(schedulerOutput.act_schedule_ids):
                     seq: Sequence = self.running_maps[id]
                     seq.token_ids.append(next_tokens[idx])
-                    self.async_streams[id].put(seq.detokenize_inc(self.model_runner.tokenizer))
+                    self.async_streams[id].put(
+                        seq.detokenize_inc(self.model_runner.tokenizer))
                     if id in schedulerOutput.free_ids:
                         self.running_maps.pop(id)
                         self.async_streams[id].finish()
@@ -215,20 +225,21 @@ class PipeAsyncLLM(LLM):
             await asyncio.sleep(0)
 
     def start_worker(self, pp_rank):
-        worker = AsyncWorker(self.model_runner,
-                        pp_rank,
-                        self.pp_size,
-                        self.master_addr,
-                        self.master_port,
-                        self.schedule_ipc_path,
-                        self.output_ipc_path,
-                        self.token_ipc_path,
-                        self.mp_alive,
-                        self.mp_load_progress,
-                        self.assigned_layers,
-                        self.use_naive_schedule)
+        worker_cls = Worker if not self.use_async_worker else AsyncWorker
+        worker = worker_cls(self.model_runner,
+                            pp_rank,
+                            self.pp_size,
+                            self.master_addr,
+                            self.master_port,
+                            self.schedule_ipc_path,
+                            self.output_ipc_path,
+                            self.token_ipc_path,
+                            self.mp_alive,
+                            self.mp_load_progress,
+                            self.assigned_layers,
+                            self.use_naive_schedule)
         self.ctx.Process(
-            target=run_worker,
+            target=run_worker if not self.use_async_worker else run_worker_async,
             args=(worker,),
             daemon=True).start()
 
