@@ -5,6 +5,7 @@ import torch.distributed as dist
 import traceback
 import time
 import random
+import logging
 
 from collections import deque
 from logger import logger
@@ -26,8 +27,8 @@ class Worker:
                  master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path, mp_alive,
                  mp_load_progress, assigned_layers, use_naive_schedule):
         self.model_runner = model_runner
-        self.pp_rank = pp_rank # pp rank
-        self.pp_size = pp_size # pp size
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
         self.master_addr = master_addr
         self.master_port = master_port
         self.schedule_ipc_path = schedule_ipc_path
@@ -39,14 +40,30 @@ class Worker:
         self.use_naive_schedule = use_naive_schedule
     
     def get_pp_next_rank(self):
-        # return device_rank of next pp_rank
         return (self.pp_rank + 1) % self.pp_size
         
     def get_pp_last_rank(self):
-        # return device_rank of last pp_rank
         return (self.pp_rank - 1 + self.pp_size) % self.pp_size
     
+    def get_num_free_pages(self):
+        return self.model_runner.memory_manager.get_num_free_pages()
+    
+    def get_num_decode_seqs(self):
+        num_decode_seqs = len(self.seqs_to_decode) + reduce(lambda x,y: x+len(y),self.batch_running,0)
+        return num_decode_seqs
+    
+    def update_num_wait_tokens(self):
+        self.num_wait_tokens = reduce(
+            lambda x,y: x + len(y.token_ids) - y.computed_token_num,self.seqs_to_prefill,0)
+    
+    def init_logger(self):
+        formater = logging.Formatter(
+            f"[%(asctime)s %(filename)s:%(lineno)d Worker {self.pp_rank}] %(levelname)s - %(message)s")
+        for handler in logger.handlers:
+            handler.setFormatter(formater)
+    
     def init(self):
+        self.init_logger()
         init_dist(self.pp_size, self.pp_rank, self.pp_size, self.pp_rank, self.master_addr, self.master_port, self.assigned_layers)
         torch.cuda.set_device(f'cuda:{self.pp_rank}')
         zmq_ctx = zmq.Context()
@@ -60,6 +77,8 @@ class Worker:
             self.seqs_to_decode: deque[Sequence] = deque()
             # running batch 
             self.batch_running = deque()
+            # next tokens
+            self.next_tokens_queue = deque()
             self.log_time = 0
             # preempt seqs
             self.num_preempt_seqs = 0
@@ -96,13 +115,24 @@ class Worker:
             self.model_runner.kvthresh * self.model_runner.memory_manager.get_num_free_pages())
         
         self.mp_alive[self.pp_rank] = 1
-    
-    def get_num_free_pages(self):
-        return self.model_runner.memory_manager.get_num_free_pages()
+        
+        logger.info(f'Init')
 
-    # rank except 0 
-    def run(self):
-        # model forward
+    def recv_schedule_seqs(self):
+        if self.gpu_schedule_socket.poll(timeout=0) != 0:
+            recv_bytes = self.gpu_schedule_socket.recv(copy=False)
+            seqs = pickle.loads(recv_bytes)
+            self.schedule_queue.append(InputData(seqs,self.model_runner.memory_manager))
+            
+    def recv_intermediate_data(self):
+        if len(self.schedule_queue) != 0:
+            input_data = self.schedule_queue.popleft()
+            intermediate_data = recv_pp_data(
+                self.get_pp_last_rank(), self.dtype, 
+                [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
+            self.run_queue.append((input_data,intermediate_data))
+    
+    def forward(self):
         if len(self.run_queue) != 0:
             hidden_states = None
             residual = None
@@ -123,32 +153,7 @@ class Worker:
                 self.token_socket.send(token_bytes, copy=False)
             else:
                 send_pp_data(output, self.get_pp_next_rank())
-        
-        # recv schedule seqs
-        if self.gpu_schedule_socket.poll(timeout=0) != 0:
-            recv_bytes = self.gpu_schedule_socket.recv(copy=False)
-            seqs = pickle.loads(recv_bytes)
-            self.schedule_queue.append(InputData(seqs,self.model_runner.memory_manager))
-
-        # recv intermediate data 
-        if len(self.schedule_queue) != 0:
-            input_data = self.schedule_queue.popleft()
-            intermediate_data = recv_pp_data(
-                self.get_pp_last_rank(), self.dtype, 
-                [input_data.tokens.shape[0],self.hidden_size], self.ret_residual)
-            self.run_queue.append((input_data,intermediate_data))
     
-    # rank 0
-    def get_num_decode_seqs(self):
-        num_decode_seqs = len(self.seqs_to_decode) + reduce(lambda x,y: x+len(y),self.batch_running,0)
-        return num_decode_seqs
-    
-    # rank 0
-    def update_num_wait_tokens(self):
-        self.num_wait_tokens = reduce(
-            lambda x,y: x + len(y.token_ids) - y.computed_token_num,self.seqs_to_prefill,0)
-    
-    # rank 0: check if preempt seqs 
     def check_preempt(self,num_decode_tokens):
         preempt_seqs = []
         while self.model_runner.memory_manager.get_num_free_pages() < num_decode_tokens and len(self.seqs_to_decode) != 0:
@@ -215,7 +220,6 @@ class Worker:
                 logger.info(log_info)
         return schedule_prefill_seqs + schedule_decode_seqs
     
-    # rank 0: PP schedule 
     def schedule(self):
         
         schedule_prefill_seqs = []
@@ -291,51 +295,29 @@ class Worker:
         #     f.write(f'{prefill_batched_token_nums} {len(schedule_decode_seqs)}\n')
         return schedule_prefill_seqs + schedule_decode_seqs
     
-    # rank 0
     def recv_requests(self):
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
             schedulerOutput: SchedulerOutput = pickle.loads(recv_bytes)
             self.seqs_to_prefill.extend(schedulerOutput.schedule_lists)
-            
-    # rank 0
-    def schedule_run(self):
-        output = None
-
-        self.recv_requests()
-        
-        if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
-            schedule_seqs = self.schedule() if not self.use_naive_schedule else self.schedule_naive()
-            if len(schedule_seqs) != 0:
-                input_data = InputData(schedule_seqs, self.model_runner.memory_manager)
-                if self.pp_size > 1:
-                    seqs_bytes = pickle.dumps(schedule_seqs)
-                    for i in range(1,self.pp_size):
-                        self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
-                self.batch_running.append(schedule_seqs)
-                output = self.model_runner.step_once(input_data)
-                
-                if type(output) != list:
-                    send_pp_data(output, self.get_pp_next_rank())
-        
-        return output
-        
-    # rank 0
-    def process_output(self, output):
-        next_tokens = None
-        if isinstance(output,list) : # word_size == 1
-            next_tokens = output
-        elif self.pp_size != 1 and self.token_socket.poll(timeout=0) != 0: # recv tokens from last rank
+            logger.debug(f'receive {len(schedulerOutput.schedule_lists)} seqs')
+    
+    def recv_next_tokens(self):
+        if self.pp_size != 1 and self.token_socket.poll(timeout=0) != 0 :  # recv tokens from last rank
             recv_bytes = self.token_socket.recv(copy=False)
             next_tokens = pickle.loads(recv_bytes)
-        
-        if next_tokens is not None:
-            schedule_seqs:List[Sequence] = self.batch_running.popleft()
+            self.next_tokens_queue.append(next_tokens)
+    
+    def process_output(self):
+        if len(self.next_tokens_queue) != 0:
+            next_tokens = self.next_tokens_queue.popleft()
+
+            schedule_seqs: List[Sequence] = self.batch_running.popleft()
             assert len(next_tokens) == len(schedule_seqs)
 
             send_tokens = []
             schedulerOutput = SchedulerOutput([])
-            
+
             for idx, seq in enumerate(schedule_seqs):
                 seq.computed_token_num += seq.to_compute_token_num
                 if seq.computed_prompt():
@@ -349,9 +331,37 @@ class Worker:
                     self.seqs_to_decode.appendleft(seq)
                 else:
                     self.seqs_to_prefill.appendleft(seq)
-            
+
             output_bytes = pickle.dumps((schedulerOutput, send_tokens))
             self.output_socket.send(output_bytes, copy=False)
+    
+    def schedule_forward(self):
+        if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
+            schedule_seqs = self.schedule() if not self.use_naive_schedule else self.schedule_naive()
+            if len(schedule_seqs) != 0:
+                input_data = InputData(schedule_seqs, self.model_runner.memory_manager)
+                if self.pp_size > 1:
+                    seqs_bytes = pickle.dumps(schedule_seqs)
+                    for i in range(1,self.pp_size):
+                        self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
+                self.batch_running.append(schedule_seqs)
+                output = self.model_runner.step_once(input_data)
+                
+                if type(output) != list:
+                    send_pp_data(output, self.get_pp_next_rank())
+                else:
+                    self.next_tokens_queue.append(output)
+                    
+    def run_driver(self):
+        self.recv_requests()
+        self.recv_next_tokens()
+        self.schedule_forward()
+        self.process_output()
+        
+    def run_other(self):
+        self.recv_schedule_seqs()
+        self.recv_intermediate_data()
+        self.forward()
             
     def handle_keyboardInterrupt(self):
         logger.info(f'Exit')
@@ -367,13 +377,11 @@ class Worker:
 def run_worker(worker: Worker):
     try:
         worker.init()
-        logger.info(f'init')
         while True:
             if worker.pp_rank == 0:
-                output = worker.schedule_run()
-                worker.process_output(output)   
+                worker.run_driver()  
             else:
-                worker.run()
+                worker.run_other()
     except KeyboardInterrupt as e:
         worker.handle_keyboardInterrupt()
     except Exception as e:

@@ -8,11 +8,13 @@ from gllm.sequence import Sequence
 from gllm.allocatorID import AllocatorID
 from gllm.scheduler import Scheduler
 from gllm.input_data import InputData
+from gllm.utils import init_logger
 
 
 class LLM():
     def __init__(self, model_path, load_format='auto', gpu_memory_util=0.9, page_size=16, maxd=256,
                  maxp=2048, minp=32, iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1):
+        init_logger()
         self.model_path = model_path
         self.model_runner = ModelRunner(
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, 
