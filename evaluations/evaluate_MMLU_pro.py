@@ -109,7 +109,7 @@ def single_request(api_url, single_question, cot_examples_dict, pbar):
 
 
 async def evaluate(subjects):
-    api_url = f"http://localhost:{args.port}/v1/chat/completions"
+    api_url = f"http://{args.host}:{args.port}/v1/chat/completions"
     test_df, dev_df = load_mmlu_pro()
     if not subjects:
         subjects = list(test_df.keys())
@@ -162,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--assigned_subjects", "-a", type=str, default="all",
                         help="business, law, psychology, biology, chemistry, history, other, health, "
                              "economics, math, physics, computer science, philosophy, engineering")
+    parser.add_argument("--host", type=str, default='0.0.0.0')
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--output-len", type=int, default=1024)
     parser.add_argument("--num-per-sub", type=int, default=100)
