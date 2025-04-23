@@ -587,6 +587,8 @@ async def benchmark(
     ignore_eos: bool,
     gootput_config_dict: Dict[str, float],
     max_concurrency: Optional[int],
+    arrival_stage: int,
+    stage_interval: int,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -636,6 +638,8 @@ async def benchmark(
     print(f"Traffic request rate: {request_rate}")
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
+    print(f"Arrival stage(s): {arrival_stage}")
+    print(f"Stage interval: {stage_interval}")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -656,18 +660,25 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
-    async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len, mm_content = request
-        request_func_input = RequestFuncInput(model=model_id,
-                                              prompt=prompt,
-                                              api_url=api_url,
-                                              prompt_len=prompt_len,
-                                              output_len=output_len,
-                                              best_of=best_of)
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_func_input=request_func_input,
-                                     pbar=pbar)))
+    
+    num_requests_stage = len(input_requests) // arrival_stage
+    input_requests_stage = [input_requests[i*num_requests_stage:(i+1)*num_requests_stage] \
+                            if i!=arrival_stage-1 else input_requests[i*num_requests_stage:] for i in range(arrival_stage)]
+    for i in range(arrival_stage):
+        async for request in get_request(input_requests_stage[i], request_rate, burstiness):
+            prompt, prompt_len, output_len, mm_content = request
+            request_func_input = RequestFuncInput(model=model_id,
+                                                prompt=prompt,
+                                                api_url=api_url,
+                                                prompt_len=prompt_len,
+                                                output_len=output_len,
+                                                best_of=best_of)
+            tasks.append(
+                asyncio.create_task(
+                    limited_request_func(request_func_input=request_func_input,
+                                        pbar=pbar)))
+        if arrival_stage != 1:
+            await asyncio.sleep(stage_interval)
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
@@ -730,8 +741,10 @@ async def benchmark(
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
-        "generated_texts": [output.generated_text for output in outputs],
-        "errors": [output.error for output in outputs],
+        # "generated_texts": [output.generated_text for output in outputs],
+        # "errors": [output.error for output in outputs],
+        "tpots": [(output.latency - output.ttft)/(
+            actual_output_lens[idx]-1) if actual_output_lens[idx] != 1 else 0 for idx,output in enumerate(outputs)]
     }
 
     def process_one_metric(
@@ -938,6 +951,8 @@ def main(args: argparse.Namespace):
             ignore_eos=args.ignore_eos,
             gootput_config_dict=gootput_config_dict,
             max_concurrency=args.max_concurrency,
+            arrival_stage=args.arrival_stage,
+            stage_interval=args.stage_interval,
         ))
 
     # Save config and results to json
@@ -984,6 +999,7 @@ def main(args: argparse.Namespace):
             file_name = os.path.join(args.result_dir, file_name)
         with open(file_name, "w", encoding='utf-8') as outfile:
             json.dump(result_json, outfile)
+        print(f"results saved to {file_name}")
 
 
 if __name__ == "__main__":
@@ -1031,6 +1047,15 @@ if __name__ == "__main__":
     parser.add_argument("--splitwise-path",
                         type=str,
                         default=None)
+    parser.add_argument("--arrival-stage",
+                        type=int,
+                        default=1,
+                        help="The number of stages to send the request to the server")
+    parser.add_argument("--stage-interval",
+                        type=int,
+                        default=15,
+                        help="The interval (seconds) between stages (used with --arrival-stage)")
+    
     parser.add_argument(
         "--max-concurrency",
         type=int,
