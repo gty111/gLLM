@@ -20,20 +20,87 @@ from gllm.scheduler import SchedulerOutput
 from gllm.utils import make_socket
 from gllm.memory_manager import PrefixMemoryManager
 
+class zmqComm:
+    def __init__(self, pp_rank, pp_size, schedule_path, output_path, token_path):
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
+        self.schedule_path = schedule_path
+        self.output_path = output_path
+        self.token_path = token_path
+    
+    def init(self):
+        self.ctx = zmq.Context()
+        if self.pp_rank == 0:
+            # front-end => rank 0
+            self.request_socket = make_socket(self.ctx, self.schedule_path, zmq.PULL) 
+            # rank 0 => front-end
+            self.output_socket = make_socket(self.ctx, self.output_path, zmq.PUSH)
+            if self.pp_size != 1:
+                # rank 0 => other ranks : batched seqs
+                self.schedule_sockets = []
+                for i in range(1, self.pp_size):
+                    self.schedule_sockets.append(make_socket(self.ctx, f'{self.schedule_path}_{i}',zmq.PUSH))
+                # last rank => rank 0 : next tokens
+                self.token_socket = make_socket(self.ctx, self.token_path, zmq.PULL)
+        else:
+            # rank 0 => other ranks : batched seqs
+            self.schedule_socket = make_socket(self.ctx, f'{self.schedule_path}_{self.pp_rank}', zmq.PULL)
+        
+        if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
+            # last rank => rank 0 : next tokens
+            self.token_socket = make_socket(self.ctx, self.token_path, zmq.PUSH)
+            
+    def send_token(self, tokens):
+        assert type(tokens) == list
+        tokens_bytes = pickle.dumps(tokens)
+        self.token_socket.send(tokens_bytes, copy=False)
+        
+    def send_output(self, output):
+        output_bytes = pickle.dumps(output)
+        self.output_socket.send(output_bytes, copy=False)
+        
+    def send_schedule(self, seqs):
+        seqs_bytes = pickle.dumps(seqs)
+        for socket in self.schedule_sockets:
+            socket.send(seqs_bytes,copy=False)
+    
+    def poll_schedule(self):
+        return self.schedule_socket.poll(timeout=0) != 0
+    
+    def recv_schedule(self):
+        recv_bytes = self.schedule_socket.recv(copy=False)
+        seqs = pickle.loads(recv_bytes)
+        return seqs
+    
+    def poll_requests(self):
+        return self.request_socket.poll(timeout=0) != 0
+    
+    def recv_requests(self):
+        recv_bytes = self.request_socket.recv(copy=False)
+        schedulerOutput = pickle.loads(recv_bytes)
+        return schedulerOutput
+    
+    def poll_tokens(self):
+        return self.token_socket.poll(timeout=0) != 0
+    
+    def recv_tokens(self):
+        recv_bytes = self.token_socket.recv(copy=False)
+        next_tokens = pickle.loads(recv_bytes)
+        return next_tokens
+    
+    
 # Used with PipeAsyncLLM
 class Worker:
     
     def __init__(self, model_runner:ModelRunner, pp_rank, pp_size, 
-                 master_addr, master_port, schedule_ipc_path, output_ipc_path, token_ipc_path, mp_alive,
+                 master_addr, master_port, comm: zmqComm, mp_alive,
                  mp_load_progress, assigned_layers, use_naive_schedule):
         self.model_runner = model_runner
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.master_addr = master_addr
         self.master_port = master_port
-        self.schedule_ipc_path = schedule_ipc_path
-        self.output_ipc_path = output_ipc_path
-        self.token_ipc_path = token_ipc_path
+        self.comm = comm
         self.mp_alive = mp_alive
         self.mp_load_progress = mp_load_progress
         self.assigned_layers = assigned_layers
@@ -64,14 +131,10 @@ class Worker:
     
     def init(self):
         self.init_logger()
+        self.comm.init()
         init_dist(self.pp_size, self.pp_rank, self.pp_size, self.pp_rank, self.master_addr, self.master_port, self.assigned_layers)
         torch.cuda.set_device(f'cuda:{self.pp_rank}')
-        zmq_ctx = zmq.Context()
         if self.pp_rank == 0:
-            # main process => rank 0
-            self.schedule_socket = make_socket(zmq_ctx, self.schedule_ipc_path, zmq.PULL) 
-            # rank 0 => main process
-            self.output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PUSH)
             # seqs to schedule
             self.seqs_to_prefill: deque[Sequence] = deque()
             self.seqs_to_decode: deque[Sequence] = deque()
@@ -85,23 +148,11 @@ class Worker:
             self.log_num_preempt_seqs = 0
             # num wait tokens
             self.num_wait_tokens = 0
-            # rank 0 => other ranks : batched seqs
-            self.gpu_schedule_socket = []
-            for i in range(1,self.pp_size):
-                self.gpu_schedule_socket.append(make_socket(zmq_ctx, f'{self.schedule_ipc_path}_{i}',zmq.PUSH))
-            if self.pp_size != 1:
-                # last rank => rank 0 : next tokens
-                self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PULL)
         else:
-            # rank 0 => other ranks : batched seqs
-            self.gpu_schedule_socket = make_socket(zmq_ctx, f'{self.schedule_ipc_path}_{self.pp_rank}', zmq.PULL)
             # Input data for each rank except 0 
             self.schedule_queue = deque()
             # Input data and intermediate data for rank except 0
             self.run_queue = deque()
-        if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
-            # last rank => rank 0 : next tokens
-            self.token_socket = make_socket(zmq_ctx, self.token_ipc_path, zmq.PUSH)
         self.model_runner.init(self.mp_load_progress)
         self.dtype = self.model_runner.memory_manager.dtype
         self.hidden_size = self.model_runner.model_loader.hidden_size
@@ -119,9 +170,8 @@ class Worker:
         logger.info(f'Init')
 
     def recv_schedule_seqs(self):
-        if self.gpu_schedule_socket.poll(timeout=0) != 0:
-            recv_bytes = self.gpu_schedule_socket.recv(copy=False)
-            seqs = pickle.loads(recv_bytes)
+        if self.comm.poll_schedule():
+            seqs = self.comm.recv_schedule()
             self.schedule_queue.append(InputData(seqs,self.model_runner.memory_manager))
             
     def recv_intermediate_data(self):
@@ -148,9 +198,7 @@ class Worker:
             self.run_queue.popleft()
             output = self.model_runner.step_once(input_data,hidden_states,residual)
             if self.pp_rank == self.pp_size - 1:
-                assert type(output) == list
-                token_bytes = pickle.dumps(output)
-                self.token_socket.send(token_bytes, copy=False)
+                self.comm.send_token(output)
             else:
                 send_pp_data(output, self.get_pp_next_rank())
     
@@ -296,16 +344,13 @@ class Worker:
         return schedule_prefill_seqs + schedule_decode_seqs
     
     def recv_requests(self):
-        if self.schedule_socket.poll(timeout=0) != 0:
-            recv_bytes = self.schedule_socket.recv(copy=False)
-            schedulerOutput: SchedulerOutput = pickle.loads(recv_bytes)
+        if self.comm.poll_requests():
+            schedulerOutput = self.comm.recv_requests()
             self.seqs_to_prefill.extend(schedulerOutput.schedule_lists)
-            logger.debug(f'receive {len(schedulerOutput.schedule_lists)} seqs')
     
     def recv_next_tokens(self):
-        if self.pp_size != 1 and self.token_socket.poll(timeout=0) != 0 :  # recv tokens from last rank
-            recv_bytes = self.token_socket.recv(copy=False)
-            next_tokens = pickle.loads(recv_bytes)
+        if self.pp_size != 1 and self.comm.poll_tokens() :  # recv tokens from last rank
+            next_tokens = self.comm.recv_tokens()
             self.next_tokens_queue.append(next_tokens)
     
     def process_output(self):
@@ -332,8 +377,7 @@ class Worker:
                 else:
                     self.seqs_to_prefill.appendleft(seq)
 
-            output_bytes = pickle.dumps((schedulerOutput, send_tokens))
-            self.output_socket.send(output_bytes, copy=False)
+            self.comm.send_output((schedulerOutput, send_tokens))
     
     def schedule_forward(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
@@ -341,9 +385,7 @@ class Worker:
             if len(schedule_seqs) != 0:
                 input_data = InputData(schedule_seqs, self.model_runner.memory_manager)
                 if self.pp_size > 1:
-                    seqs_bytes = pickle.dumps(schedule_seqs)
-                    for i in range(1,self.pp_size):
-                        self.gpu_schedule_socket[i-1].send(seqs_bytes,copy=False)
+                    self.comm.send_schedule(schedule_seqs)
                 self.batch_running.append(schedule_seqs)
                 output = self.model_runner.step_once(input_data)
                 

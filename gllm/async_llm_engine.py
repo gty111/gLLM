@@ -11,7 +11,7 @@ from gllm.utils import (make_async, make_socket, wait_worker,
                         check_worker_alive, random_uuid, get_model_load_pbar)
 from gllm.llm_engine import LLM
 from gllm.async_worker import AsyncWorker, run_worker_async
-from gllm.worker import Worker, run_worker
+from gllm.worker import Worker, run_worker, zmqComm
 from gllm.input_data import InputData
 from gllm.sequence import Sequence
 from gllm.scheduler import SchedulerOutput
@@ -136,9 +136,9 @@ class PipeAsyncLLM(LLM):
             'i', [0 for i in range(self.pp_size*2)])
 
         ipc_path_prefix = random_uuid()
-        self.schedule_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
-        self.output_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
-        self.token_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
+        self.schedule_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
+        self.output_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
+        self.token_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
 
         logger.info(f'Launching {self.pp_size} worker(s) ...')
         if self.use_async_worker:
@@ -194,9 +194,8 @@ class PipeAsyncLLM(LLM):
 
     async def run_schedule_engine(self):
         zmq_ctx = zmq.Context()
-        schedule_socket = make_socket(
-            zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
-        output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PULL)
+        schedule_socket = make_socket(zmq_ctx, self.schedule_path, zmq.PUSH)
+        output_socket = make_socket(zmq_ctx, self.output_path, zmq.PULL)
         while True:
             check_worker_alive(self.mp_alive)
             if output_socket.poll(timeout=0) != 0:
@@ -224,14 +223,17 @@ class PipeAsyncLLM(LLM):
 
     def start_worker(self, pp_rank):
         worker_cls = Worker if not self.use_async_worker else AsyncWorker
+        comm = zmqComm(pp_rank, 
+                       self.pp_size, 
+                       self.schedule_path, 
+                       self.output_path,
+                       self.token_path)
         worker = worker_cls(self.model_runner,
                             pp_rank,
                             self.pp_size,
                             self.master_addr,
                             self.master_port,
-                            self.schedule_ipc_path,
-                            self.output_ipc_path,
-                            self.token_ipc_path,
+                            comm,
                             self.mp_alive,
                             self.mp_load_progress,
                             self.assigned_layers,
