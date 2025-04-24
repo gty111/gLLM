@@ -21,8 +21,6 @@ class Scheduler:
         self.prompt_lists: List[Sequence] = []  # seqs to prefill
         self.decode_lists: List[Sequence] = []  # seqs to decode
         self.finish_ids: List[Sequence] = []  # ids of finished seq
-
-        self.run_batch:Dict[int,Sequence] = dict()  # seqs under running (seq_id => seq)
         
         self.max_decode_seqs = maxd
         self.max_batch_tokens = maxp
@@ -58,7 +56,7 @@ class Scheduler:
             logger.info(
                 '#wait: %4d #run: %4d memory_util: %2.2f %%'
                 % (len(self.prompt_lists),
-                   len(self.decode_lists) + len(self.run_batch),
+                   len(self.decode_lists),
                    self.get_memory_util()))
         
         prefill_schedule_lists: List[Sequence] = []
@@ -131,7 +129,7 @@ class Scheduler:
         return finish_ids
     
     def has_seqs(self):
-        return len(self.prompt_lists) + len(self.decode_lists) + len(self.run_batch) != 0
+        return len(self.prompt_lists) + len(self.decode_lists) != 0
 
     def get_memory_util(self):
         return round((self.total_num_free_pages - self.num_free_pages)*100 / self.total_num_free_pages, 2)
