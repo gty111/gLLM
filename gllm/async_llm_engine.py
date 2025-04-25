@@ -1,20 +1,18 @@
 import asyncio
 import torch.multiprocessing as mp
-import zmq
-import pickle
 
 from logger import logger
 from typing import List, Dict
 from fastapi import Request
 
-from gllm.utils import (make_async, make_socket, wait_worker, 
+from gllm.utils import (make_async, wait_worker,
                         check_worker_alive, random_uuid, get_model_load_pbar)
 from gllm.llm_engine import LLM
 from gllm.async_worker import AsyncWorker, run_worker_async
-from gllm.worker import Worker, run_worker
+from gllm.worker import Worker, run_worker, zmqComm
 from gllm.input_data import InputData
 from gllm.sequence import Sequence
-from gllm.scheduler import SchedulerOutput
+from gllm.scheduler import IPCPackage
 
 
 class AsyncStream:
@@ -65,9 +63,10 @@ class AsyncLLM(LLM):
         kwargs.pop('use_naive_schedule')
         kwargs.pop('use_async_worker')
         assert kwargs['pp_size'] == 1 and "AsyncLLM doesn't support degree of PP > 1"
-        logger.info('Using AsyncLLM backend')
         super().__init__(*args, **kwargs)
         super().init()
+
+        logger.info('Using AsyncLLM backend')
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.background_engine = None
@@ -85,13 +84,13 @@ class AsyncLLM(LLM):
         return stream
 
     async def step_async(self):
-        schedulerOutput = self.scheduler.schedule(
+        ipc_package = self.scheduler.schedule(
             self.model_runner.memory_manager, log=True)
         next_tokens = await make_async(self.model_runner.step_once)(
-            InputData(schedulerOutput.schedule_lists, self.model_runner.memory_manager))
+            InputData(ipc_package.schedule_lists, self.model_runner.memory_manager))
         self.scheduler.update_seqs(
-            schedulerOutput, next_tokens, self.model_runner.memory_manager)
-        for seq in schedulerOutput.schedule_lists:
+            ipc_package, next_tokens, self.model_runner.memory_manager)
+        for seq in ipc_package.schedule_lists:
             self.async_streams[seq.seq_id].put(
                 seq.detokenize_inc(self.model_runner.tokenizer))
         for seq_id in self.scheduler.finish_ids:
@@ -116,13 +115,13 @@ class AsyncLLM(LLM):
 class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
-        logger.info('Using PipeAsyncLLM backend')
-
         self.assigned_layers = kwargs.pop('assigned_layers')
         self.use_naive_schedule = kwargs.pop('use_naive_schedule')
         self.use_async_worker = kwargs.pop('use_async_worker')
 
         super().__init__(*args, **kwargs)
+
+        logger.info('Using PipeAsyncLLM backend')
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
@@ -136,9 +135,13 @@ class PipeAsyncLLM(LLM):
             'i', [0 for i in range(self.pp_size*2)])
 
         ipc_path_prefix = random_uuid()
-        self.schedule_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
-        self.output_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
-        self.token_ipc_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
+        self.schedule_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
+        self.output_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
+        self.token_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
+
+        self.comm = zmqComm(0, 0, self.schedule_path,
+                            self.output_path, self.token_path)
+        self.comm.init()
 
         logger.info(f'Launching {self.pp_size} worker(s) ...')
         if self.use_async_worker:
@@ -193,45 +196,42 @@ class PipeAsyncLLM(LLM):
         return stream
 
     async def run_schedule_engine(self):
-        zmq_ctx = zmq.Context()
-        schedule_socket = make_socket(
-            zmq_ctx, self.schedule_ipc_path, zmq.PUSH)
-        output_socket = make_socket(zmq_ctx, self.output_ipc_path, zmq.PULL)
         while True:
             check_worker_alive(self.mp_alive)
-            if output_socket.poll(timeout=0) != 0:
-                recv_bytes = output_socket.recv(copy=False)
-                recv_data = pickle.loads(recv_bytes)
-                schedulerOutput, next_tokens = recv_data
-                for idx, id in enumerate(schedulerOutput.act_schedule_ids):
+            output = self.comm.recv_output()
+            if output is not None:
+                ipc_package, next_tokens = output
+                for idx, id in enumerate(ipc_package.act_schedule_ids):
                     seq: Sequence = self.running_maps[id]
                     seq.token_ids.append(next_tokens[idx])
                     self.async_streams[id].put(
                         seq.detokenize_inc(self.model_runner.tokenizer))
-                    if id in schedulerOutput.free_ids:
+                    if id in ipc_package.free_ids:
                         self.running_maps.pop(id)
                         self.async_streams[id].finish()
                         del self.async_streams[id]
-                self.free_finish_ids(schedulerOutput.free_ids)
+                self.free_finish_ids(ipc_package.free_ids)
             if len(self.wait_lists) != 0:
                 for seq in self.wait_lists:
                     self.running_maps[seq.seq_id] = seq
-                schedulerOutput = SchedulerOutput(self.wait_lists)
+                ipc_package = IPCPackage(self.wait_lists)
                 self.wait_lists = []
-                schedule_bytes = pickle.dumps(schedulerOutput)
-                schedule_socket.send(schedule_bytes, copy=False)
+                self.comm.send_requests(ipc_package)
             await asyncio.sleep(0)
 
     def start_worker(self, pp_rank):
         worker_cls = Worker if not self.use_async_worker else AsyncWorker
+        comm = zmqComm(pp_rank,
+                       self.pp_size,
+                       self.schedule_path,
+                       self.output_path,
+                       self.token_path)
         worker = worker_cls(self.model_runner,
                             pp_rank,
                             self.pp_size,
                             self.master_addr,
                             self.master_port,
-                            self.schedule_ipc_path,
-                            self.output_ipc_path,
-                            self.token_ipc_path,
+                            comm,
                             self.mp_alive,
                             self.mp_load_progress,
                             self.assigned_layers,
