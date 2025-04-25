@@ -9,10 +9,11 @@ from gllm.utils import (make_async, wait_worker,
                         check_worker_alive, random_uuid, get_model_load_pbar)
 from gllm.llm_engine import LLM
 from gllm.async_worker import AsyncWorker, run_worker_async
-from gllm.worker import Worker, run_worker, zmqComm
+from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
 from gllm.sequence import Sequence
 from gllm.scheduler import IPCPackage
+from gllm.zmq_comm import zmqComm
 
 
 class AsyncStream:
