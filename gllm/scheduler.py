@@ -1,18 +1,18 @@
 import time
 
 from logger import logger
-from typing import List, Dict
+from typing import List
 
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 
-class SchedulerOutput:
+class IPCPackage:
     def __init__(self, schedule_lists: List[Sequence]):
         # front-end => worker
-        self.schedule_lists = schedule_lists  
+        self.schedule_lists = schedule_lists
         # worker => front-end
-        self.free_ids = []  
+        self.free_ids = []
         self.act_schedule_ids = []
 
 class Scheduler:
@@ -21,7 +21,7 @@ class Scheduler:
         self.prompt_lists: List[Sequence] = []  # seqs to prefill
         self.decode_lists: List[Sequence] = []  # seqs to decode
         self.finish_ids: List[Sequence] = []  # ids of finished seq
-        
+
         self.max_decode_seqs = maxd
         self.max_batch_tokens = maxp
         self.kvthresh = kvthresh
@@ -32,7 +32,7 @@ class Scheduler:
         self.page_size = page_size
 
         self.log_time = time.time()
-        
+
         self.preempt_num_seqs = 0
         self.log_preempt_num_seqs = 0
 
@@ -45,10 +45,10 @@ class Scheduler:
     def add_requests(self, requests: List[Sequence]):
         self.prompt_lists.extend(requests)
 
-    def schedule(self, memory_manager:MemoryManager, log: bool = False):
+    def schedule(self, memory_manager: MemoryManager, log: bool = False):
         num_free_pages = memory_manager.get_num_free_pages()
         self.num_free_pages = num_free_pages
-            
+
         # log
         cur_time = time.time()
         if log and cur_time - self.log_time > 1:
@@ -58,22 +58,24 @@ class Scheduler:
                 % (len(self.prompt_lists),
                    len(self.decode_lists),
                    self.get_memory_util()))
-        
+
         prefill_schedule_lists: List[Sequence] = []
         decode_schedule_lists: List[Sequence] = []
-        
+
         # prompt
         cur_prefill_budget = len(decode_schedule_lists)
         if self.num_free_pages > self.num_kvthresh_pages:
             cu_seqs_len = 0
             for seq in self.prompt_lists:
-                num_page = (len(seq.token_ids)+self.page_size-1) // self.page_size
+                num_page = (len(seq.token_ids) +
+                            self.page_size-1) // self.page_size
                 if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens and (
-                    self.num_free_pages - num_page - cur_prefill_budget > self.num_kvthresh_pages):
+                        self.num_free_pages - num_page - cur_prefill_budget > self.num_kvthresh_pages):
                     cu_seqs_len += len(seq.token_ids)
                     if isinstance(memory_manager, PrefixMemoryManager):
                         memory_manager.pre_allocate_computed_page([seq])
-                    seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
+                    seq.to_compute_token_num = len(
+                        seq.token_ids) - seq.computed_token_num
                     memory_manager.pre_allocate_page([seq])
                     prefill_schedule_lists.append(seq)
                     cur_prefill_budget += num_page
@@ -81,7 +83,7 @@ class Scheduler:
                     break
             for seq in prefill_schedule_lists:
                 self.prompt_lists.remove(seq)
-                
+
         # decode
         if len(prefill_schedule_lists) == 0:
             self.check_preempt_seqs(memory_manager)
@@ -93,10 +95,10 @@ class Scheduler:
                 seq.to_compute_token_num = 1
             memory_manager.pre_allocate_page(decode_schedule_lists)
 
-        return SchedulerOutput(prefill_schedule_lists+decode_schedule_lists)
+        return IPCPackage(prefill_schedule_lists+decode_schedule_lists)
 
-    def update_seqs(self, schedulerOutput: SchedulerOutput, next_tokens: List[int], memory_manager: MemoryManager):
-        for idx, seq in enumerate(schedulerOutput.schedule_lists):
+    def update_seqs(self, ipc_package: IPCPackage, next_tokens: List[int], memory_manager: MemoryManager):
+        for idx, seq in enumerate(ipc_package.schedule_lists):
             seq.token_ids.append(next_tokens[idx])
             seq.computed_token_num += seq.to_compute_token_num
             if seq.is_finish():
@@ -105,29 +107,30 @@ class Scheduler:
             else:
                 self.decode_lists.append(seq)
 
-    def check_preempt_seqs(self, memory_manager:MemoryManager):
+    def check_preempt_seqs(self, memory_manager: MemoryManager):
         preempt_seqs = []
         while memory_manager.get_num_free_pages() < len(self.decode_lists):
             seq = self.decode_lists.pop()
             memory_manager.free(seq)
             preempt_seqs.append(seq)
         self.process_preempt(preempt_seqs)
-    
-    def process_preempt(self, preempt_seqs:List[Sequence]=None):
+
+    def process_preempt(self, preempt_seqs: List[Sequence] = None):
         for seq in preempt_seqs:
             seq.preempt()
         self.prompt_lists = preempt_seqs + self.prompt_lists
         self.preempt_num_seqs += len(preempt_seqs)
         if self.preempt_num_seqs - self.log_preempt_num_seqs > 10:
             logger.warning(f'#Preempted seqs: {self.preempt_num_seqs}')
-            logger.warning('Try increase --kvthresh or the performance is poor!')
+            logger.warning(
+                'Try increase --kvthresh or the performance is poor!')
             self.log_preempt_num_seqs = self.preempt_num_seqs
 
     def get_finish_ids(self):
         finish_ids = self.finish_ids
         self.finish_ids = []
         return finish_ids
-    
+
     def has_seqs(self):
         return len(self.prompt_lists) + len(self.decode_lists) != 0
 
