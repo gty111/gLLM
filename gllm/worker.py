@@ -80,7 +80,7 @@ class zmqComm:
         output_bytes = pickle.dumps(output)
         self.output_socket.send(output_bytes, copy=False)
 
-    def recv_output(self, output):
+    def recv_output(self):
         if self.output_socket.poll(timeout=0) != 0:
             recv_bytes = self.output_socket.recv(copy=False)
             output = pickle.loads(recv_bytes)
@@ -102,8 +102,8 @@ class zmqComm:
             return None
 
     def send_requests(self, ipc_package):
-        schedule_bytes = pickle.dumps(ipc_package)
-        self.request_socket.send(schedule_bytes, copy=False)
+        ipc_bytes = pickle.dumps(ipc_package)
+        self.request_socket.send(ipc_bytes, copy=False)
 
     def recv_requests(self):
         if self.request_socket.poll(timeout=0) != 0:
