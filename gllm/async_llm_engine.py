@@ -147,6 +147,8 @@ class PipeAsyncLLM(LLM):
         logger.info(f'Launching {self.pp_size} worker(s) ...')
         if self.use_async_worker:
             logger.warning(f'AsyncWorker is an experimental feature')
+            
+        self.process = []
         for pp_rank in range(self.pp_size):
             self.start_worker(pp_rank)
 
@@ -236,10 +238,12 @@ class PipeAsyncLLM(LLM):
                             self.mp_load_progress,
                             self.assigned_layers,
                             self.use_naive_schedule)
-        self.ctx.Process(
-            target=run_worker if not self.use_async_worker else run_worker_async,
-            args=(worker,),
-            daemon=True).start()
+        process = self.ctx.Process(
+                    target=run_worker if not self.use_async_worker else run_worker_async,
+                    args=(worker,),
+                    daemon=True)
+        self.process.append(process)
+        process.start()
 
     def start_schedule_engine(self):
         # launch schedule engine

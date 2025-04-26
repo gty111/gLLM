@@ -56,13 +56,13 @@ def get_pp_size():
 def get_assigned_layers():
     return _ASSIGNED_LAYERS
 
-def init_dist(pp_size, pp_rank, device_size, device_rank, master_addr, master_port, assigned_layers):
+def init_dist(pp_size, pp_rank, master_addr, master_port, assigned_layers):
     global _PP_RANK, _PP_SIZE, _ASSIGNED_LAYERS
     _PP_RANK = pp_rank
     _PP_SIZE = pp_size
     _ASSIGNED_LAYERS = assigned_layers
     dist.init_process_group(init_method=f'tcp://{master_addr}:{master_port}', 
-                        backend='nccl', world_size=device_size, rank=device_rank)
+                        backend='nccl', world_size=pp_size, rank=pp_rank)
 
 def get_pp_layers(num_layers):
     if _ASSIGNED_LAYERS is None:
