@@ -199,12 +199,11 @@ class PipeAsyncLLM(LLM):
     async def run_schedule_engine(self):
         while True:
             check_worker_alive(self.mp_alive)
-            output = self.comm.recv_output()
-            if output is not None:
-                ipc_package, next_tokens = output
+            ipc_package = self.comm.recv_output()
+            if ipc_package is not None:
                 for idx, id in enumerate(ipc_package.act_schedule_ids):
                     seq: Sequence = self.running_maps[id]
-                    seq.token_ids.append(next_tokens[idx])
+                    seq.token_ids.append(ipc_package.next_tokens[idx])
                     self.async_streams[id].put(
                         seq.detokenize_inc(self.model_runner.tokenizer))
                     if id in ipc_package.free_ids:
