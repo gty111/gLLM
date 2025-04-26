@@ -42,6 +42,12 @@ def recv_pp_data(src, dtype, shape, has_residual):
     else:
         hidden_states_future = dist.irecv(hidden_states,src)
         return hidden_states_future, hidden_states
+    
+def send_obj_list(obj_list, dst):
+    dist.send_object_list(obj_list, dst=dst)
+    
+def recv_obj_list(obj_list, src):
+    dist.recv_object_list(obj_list, src=src)
 
 _PP_RANK=0
 _LOCAL_RANK=0

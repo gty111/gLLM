@@ -45,11 +45,11 @@ class Worker:
     def init(self):
         self.init_logger()
         
-        self.comm.init()
-        
         init_dist(self.pp_size, self.local_rank, self.pp_rank, self.master_addr, 
                   self.master_port, self.assigned_layers)
         torch.cuda.set_device(f'cuda:{self.pp_rank}')
+        
+        self.comm.init()
         
         self.model_runner.init(self.mp_load_progress)
         self.dtype = self.model_runner.memory_manager.dtype

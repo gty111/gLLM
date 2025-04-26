@@ -142,12 +142,12 @@ class PipeAsyncLLM(LLM):
         self.mp_load_progress = self.ctx.Array(
             'i', [0 for i in range(self.num_workers*2)])
 
-        ipc_path_prefix = 'test_multi_node' # random_uuid()
+        ipc_path_prefix = random_uuid()
         self.schedule_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
         self.output_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
         self.token_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
 
-        self.comm = zmqComm(0, 0, self.schedule_path,
+        self.comm = zmqComm(self.zmq_port_base, self.launch_mode, self.master_addr, 0, 0, self.schedule_path,
                             self.output_path, self.token_path)
         self.comm.init()
 
@@ -230,7 +230,10 @@ class PipeAsyncLLM(LLM):
 
     def start_worker(self, local_rank, pp_rank):
         worker_cls = Worker if not self.use_async_worker else AsyncWorker
-        comm = zmqComm(pp_rank,
+        comm = zmqComm(self.zmq_port_base,
+                       self.launch_mode,
+                       self.master_addr,
+                       pp_rank,
                        self.pp_size,
                        self.schedule_path,
                        self.output_path,

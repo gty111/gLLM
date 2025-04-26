@@ -2,6 +2,9 @@ import uvicorn
 import fastapi
 import asyncio
 import argparse
+from logger import logger
+import traceback
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from http import HTTPStatus
@@ -83,6 +86,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, help='Uvicorn port', default=8000)
     parser.add_argument('--nccl-port', type=str, help='NCCL port', default='8001')
+    parser.add_argument('--zmq-port-base', type=int, help='ZeroMQ port', default=8002)
     parser.add_argument('--model-path', help='Path to the model, either from local disk or from huggingface', type=str, required=True)
     parser.add_argument('--disable-pipe-schedule', help='Use AsyncLLM backend (used for performance comparsion)', action="store_true")
     parser.add_argument('--gpu-memory-util', type=float, help='GPU memory utilization for KV cache (excluding model weights)', default=0.9)
@@ -105,6 +109,7 @@ if __name__ == '__main__':
     llm_cls = PipeAsyncLLM if not args.disable_pipe_schedule else AsyncLLM
     llm = llm_cls(host=args.host,
                   nccl_port=args.nccl_port,
+                  zmq_port_base=args.zmq_port_base,
                   launch_mode=args.launch_mode,
                   worker_ranks=args.worker_ranks,
                   load_format=args.load_format,
@@ -125,5 +130,11 @@ if __name__ == '__main__':
     if args.launch_mode != 'slave':
         asyncio.run(run_server(args))
     else:
-        for process in llm.process_list:
-            process.join()
+        try:
+            for process in llm.process_list:
+                process.join()
+        except KeyboardInterrupt as e:
+            pass
+        except Exception as e:
+            logger.error(e)
+            traceback.print_exc()

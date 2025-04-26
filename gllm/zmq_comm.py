@@ -2,9 +2,13 @@ import zmq
 import pickle
 
 from gllm.utils import make_socket
+from gllm.dist_utils import send_obj_list, recv_obj_list
 
 class zmqComm:
-    def __init__(self, pp_rank, pp_size, schedule_path, output_path, token_path):
+    def __init__(self, port_base, launch_mode, master_addr, pp_rank, pp_size, schedule_path, output_path, token_path):
+        self.port_base = port_base
+        self.master_addr = master_addr
+        self.launch_mode = launch_mode
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.schedule_path = schedule_path
@@ -27,24 +31,51 @@ class zmqComm:
                 # rank 0 => front-end
                 self.output_socket = make_socket(
                     self.ctx, self.output_path, zmq.PUSH)
+                
                 if self.pp_size != 1:
-                    # rank 0 => other ranks : batched seqs
-                    self.schedule_sockets = []
-                    for i in range(1, self.pp_size):
-                        self.schedule_sockets.append(make_socket(
-                            self.ctx, f'{self.schedule_path}_{i}', zmq.PUSH))
-                    # last rank => rank 0 : next tokens
-                    self.token_socket = make_socket(
-                        self.ctx, self.token_path, zmq.PULL)
+                    if self.launch_mode == 'normal':
+                        # rank 0 => other ranks : batched seqs
+                        self.schedule_sockets = []
+                        for i in range(1, self.pp_size):
+                            self.schedule_sockets.append(make_socket(
+                                self.ctx, f'{self.schedule_path}_{i}', zmq.PUSH))
+                        # last rank => rank 0 : next tokens
+                        self.token_socket = make_socket(
+                            self.ctx, self.token_path, zmq.PULL)
+                    else:
+                        # rank 0 => other ranks : batched seqs
+                        self.schedule_sockets = []
+                        for i in range(1, self.pp_size):
+                            port_each = self.port_base+i
+                            self.schedule_sockets.append(make_socket(
+                                self.ctx, f'tcp://{self.master_addr}:{port_each}', zmq.PUSH))
+                            send_obj_list([port_each],i)
+                        # last rank => rank 0 : next tokens
+                        port_token = self.port_base+self.pp_size
+                        self.token_socket = make_socket(
+                            self.ctx, f'tcp://{self.master_addr}:{port_token}', zmq.PULL)
+                        send_obj_list([port_token], self.pp_size-1)
             else:
                 # rank 0 => other ranks : batched seqs
-                self.schedule_socket = make_socket(
-                    self.ctx, f'{self.schedule_path}_{self.pp_rank}', zmq.PULL)
+                if self.launch_mode == 'normal':
+                    self.schedule_socket = make_socket(
+                        self.ctx, f'{self.schedule_path}_{self.pp_rank}', zmq.PULL)
+                else:
+                    port_schedule = [None]
+                    recv_obj_list(port_schedule, 0)
+                    self.schedule_socket = make_socket(
+                        self.ctx, f'tcp://{self.master_addr}:{port_schedule[0]}', zmq.PULL)
 
             if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
                 # last rank => rank 0 : next tokens
-                self.token_socket = make_socket(
-                    self.ctx, self.token_path, zmq.PUSH)
+                if self.launch_mode == 'normal':
+                    self.token_socket = make_socket(
+                        self.ctx, self.token_path, zmq.PUSH)
+                else:
+                    port_token = [None]
+                    recv_obj_list(port_token, 0)
+                    self.token_socket = make_socket(
+                        self.ctx, f'tcp://{self.master_addr}:{port_token[0]}', zmq.PUSH)
 
         
 
