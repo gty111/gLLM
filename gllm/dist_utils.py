@@ -1,4 +1,3 @@
-import os
 import torch.distributed as dist
 import torch
 
@@ -62,9 +61,8 @@ def init_dist(pp_size, pp_rank, device_size, device_rank, master_addr, master_po
     _PP_RANK = pp_rank
     _PP_SIZE = pp_size
     _ASSIGNED_LAYERS = assigned_layers
-    os.environ['MASTER_ADDR'] = master_addr
-    os.environ['MASTER_PORT'] = master_port
-    dist.init_process_group(backend='nccl', world_size=device_size, rank=device_rank)
+    dist.init_process_group(init_method=f'tcp://{master_addr}:{master_port}', 
+                        backend='nccl', world_size=device_size, rank=device_rank)
 
 def get_pp_layers(num_layers):
     if _ASSIGNED_LAYERS is None:
