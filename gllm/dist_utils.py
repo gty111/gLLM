@@ -44,11 +44,15 @@ def recv_pp_data(src, dtype, shape, has_residual):
         return hidden_states_future, hidden_states
 
 _PP_RANK=0
+_LOCAL_RANK=0
 _PP_SIZE=1
 _ASSIGNED_LAYERS=None
 
 def get_pp_rank():
     return _PP_RANK
+
+def get_local_rank():
+    return _LOCAL_RANK
 
 def get_pp_size():
     return _PP_SIZE
@@ -56,9 +60,10 @@ def get_pp_size():
 def get_assigned_layers():
     return _ASSIGNED_LAYERS
 
-def init_dist(pp_size, pp_rank, master_addr, master_port, assigned_layers):
-    global _PP_RANK, _PP_SIZE, _ASSIGNED_LAYERS
+def init_dist(pp_size, local_rank, pp_rank, master_addr, master_port, assigned_layers):
+    global _PP_RANK, _PP_SIZE, _ASSIGNED_LAYERS, _LOCAL_RANK
     _PP_RANK = pp_rank
+    _LOCAL_RANK = local_rank
     _PP_SIZE = pp_size
     _ASSIGNED_LAYERS = assigned_layers
     dist.init_process_group(init_method=f'tcp://{master_addr}:{master_port}', 
