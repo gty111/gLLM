@@ -14,6 +14,7 @@ class IPCPackage:
         # worker => front-end
         self.free_ids = []
         self.act_schedule_ids = []
+        self.next_tokens = []
 
 class Scheduler:
     def __init__(self, maxd: int, maxp: int, kvthresh: float,
