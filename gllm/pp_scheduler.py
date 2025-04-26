@@ -46,7 +46,7 @@ class PPScheduler():
         return num_decode_seqs
 
     def update_num_wait_tokens(self):
-        return reduce(
+        self.num_wait_tokens = reduce(
             lambda x, y: x + len(y.token_ids) - y.computed_token_num, self.seqs_to_prefill, 0)
         
     def add_new_requests(self, seqs):
@@ -91,7 +91,7 @@ class PPScheduler():
         self.seqs_to_prefill.extendleft(preempt_seqs)
 
         self.num_preempt_seqs += len(preempt_seqs)
-        if self.num_preempt_seqs - self.log_num_preempt_seqs >= 1:
+        if self.num_preempt_seqs - self.log_num_preempt_seqs >= 10:
             self.log_num_preempt_seqs = self.num_preempt_seqs
             logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}')
             logger.warning(
