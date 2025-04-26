@@ -13,37 +13,40 @@ class zmqComm:
 
     def init(self):
         self.ctx = zmq.Context()
-        if self.pp_rank == 0:
-            # front-end => rank 0
-            self.request_socket = make_socket(
-                self.ctx, self.schedule_path, zmq.PULL)
-            # rank 0 => front-end
-            self.output_socket = make_socket(
-                self.ctx, self.output_path, zmq.PUSH)
-            if self.pp_size != 1:
-                # rank 0 => other ranks : batched seqs
-                self.schedule_sockets = []
-                for i in range(1, self.pp_size):
-                    self.schedule_sockets.append(make_socket(
-                        self.ctx, f'{self.schedule_path}_{i}', zmq.PUSH))
-                # last rank => rank 0 : next tokens
-                self.token_socket = make_socket(
-                    self.ctx, self.token_path, zmq.PULL)
-        else:
-            # rank 0 => other ranks : batched seqs
-            self.schedule_socket = make_socket(
-                self.ctx, f'{self.schedule_path}_{self.pp_rank}', zmq.PULL)
-
-        if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
-            # last rank => rank 0 : next tokens
-            self.token_socket = make_socket(
-                self.ctx, self.token_path, zmq.PUSH)
-
+        
         if self.pp_size == 0:  # front-end process
             self.request_socket = make_socket(
                 self.ctx, self.schedule_path, zmq.PUSH)
             self.output_socket = make_socket(
                 self.ctx, self.output_path, zmq.PULL)
+        else: # worker process
+            if self.pp_rank == 0:
+                # front-end => rank 0
+                self.request_socket = make_socket(
+                    self.ctx, self.schedule_path, zmq.PULL)
+                # rank 0 => front-end
+                self.output_socket = make_socket(
+                    self.ctx, self.output_path, zmq.PUSH)
+                if self.pp_size != 1:
+                    # rank 0 => other ranks : batched seqs
+                    self.schedule_sockets = []
+                    for i in range(1, self.pp_size):
+                        self.schedule_sockets.append(make_socket(
+                            self.ctx, f'{self.schedule_path}_{i}', zmq.PUSH))
+                    # last rank => rank 0 : next tokens
+                    self.token_socket = make_socket(
+                        self.ctx, self.token_path, zmq.PULL)
+            else:
+                # rank 0 => other ranks : batched seqs
+                self.schedule_socket = make_socket(
+                    self.ctx, f'{self.schedule_path}_{self.pp_rank}', zmq.PULL)
+
+            if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
+                # last rank => rank 0 : next tokens
+                self.token_socket = make_socket(
+                    self.ctx, self.token_path, zmq.PUSH)
+
+        
 
     def send_tokens(self, tokens):
         assert type(tokens) == list
