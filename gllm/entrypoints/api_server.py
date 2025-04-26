@@ -79,9 +79,10 @@ async def run_server(args):
         await server.shutdown()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Launch GLLM server')
+    parser = argparse.ArgumentParser(description='Launch gLLM server')
     parser.add_argument('--host', type=str, default='0.0.0.0')
-    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--port', type=int, help='Uvicorn port', default=8000)
+    parser.add_argument('--nccl-port', type=str, help='NCCL port', default='8001')
     parser.add_argument('--model-path', help='Path to the model, either from local disk or from huggingface', type=str, required=True)
     parser.add_argument('--disable-pipe-schedule', help='Use AsyncLLM backend (used for performance comparsion)', action="store_true")
     parser.add_argument('--gpu-memory-util', type=float, help='GPU memory utilization for KV cache (excluding model weights)', default=0.9)
@@ -100,7 +101,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     llm_cls = PipeAsyncLLM if not args.disable_pipe_schedule else AsyncLLM
-    llm = llm_cls(load_format=args.load_format,
+    llm = llm_cls(host=args.host,
+                  nccl_port=args.nccl_port,
+                  load_format=args.load_format,
                   model_path=args.model_path,
                   gpu_memory_util=args.gpu_memory_util,
                   page_size=args.page_size,

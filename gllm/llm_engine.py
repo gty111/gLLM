@@ -12,7 +12,7 @@ from gllm.utils import init_logger
 
 
 class LLM():
-    def __init__(self, model_path, load_format='auto', gpu_memory_util=0.9, page_size=16, maxd=256,
+    def __init__(self, model_path, host, nccl_port, load_format='auto', gpu_memory_util=0.9, page_size=16, maxd=256,
                  maxp=2048, minp=32, iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1):
         init_logger()
         self.model_path = model_path
@@ -20,8 +20,8 @@ class LLM():
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, 
             maxp, maxd, kvthresh, minp, iterp)
         self.pp_size = pp_size
-        self.master_addr = '127.0.0.1'
-        self.master_port = '49082'
+        self.master_addr = host
+        self.master_port = nccl_port
         self.allocatorID = AllocatorID(0, 99999)
         self.scheduler = Scheduler(
             maxd, maxp, kvthresh, page_size)
