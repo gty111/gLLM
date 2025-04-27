@@ -15,10 +15,11 @@ from gllm.pp_scheduler import PPScheduler
 # Used with PipeAsyncLLM
 class Worker:
 
-    def __init__(self, model_runner: ModelRunner, pp_rank, pp_size,
+    def __init__(self, model_runner: ModelRunner, local_rank, pp_rank, pp_size,
                  master_addr, master_port, comm: zmqComm, mp_alive,
                  mp_load_progress, assigned_layers, use_naive_schedule):
         self.model_runner = model_runner
+        self.local_rank = local_rank
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.master_addr = master_addr
@@ -44,11 +45,11 @@ class Worker:
     def init(self):
         self.init_logger()
         
-        self.comm.init()
-        
-        init_dist(self.pp_size, self.pp_rank, self.master_addr, 
+        init_dist(self.pp_size, self.local_rank, self.pp_rank, self.master_addr, 
                   self.master_port, self.assigned_layers)
         torch.cuda.set_device(f'cuda:{self.pp_rank}')
+        
+        self.comm.init()
         
         self.model_runner.init(self.mp_load_progress)
         self.dtype = self.model_runner.memory_manager.dtype
@@ -70,7 +71,7 @@ class Worker:
             # Input data and intermediate data for rank except 0
             self.run_queue = deque()
 
-        self.mp_alive[self.pp_rank] = 1
+        self.mp_alive[self.local_rank] = 1
 
         logger.info(f'Init')
 
@@ -156,13 +157,13 @@ class Worker:
     def handle_keyboardInterrupt(self):
         logger.info(f'Exit')
         dist.destroy_process_group()
-        self.mp_alive[self.pp_rank] = -1
+        self.mp_alive[self.local_rank] = -1
 
     def handle_exception(self, e):
         logger.error(e)
         traceback.print_exc()
         dist.destroy_process_group()
-        self.mp_alive[self.pp_rank] = -1
+        self.mp_alive[self.local_rank] = -1
 
 
 def run_worker(worker: Worker):

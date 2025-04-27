@@ -9,7 +9,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
 from gllm.input_data import InputData
-from gllm.dist_utils import get_pp_layers, get_pp_size, get_pp_rank
+from gllm.dist_utils import get_pp_layers, get_pp_size, get_pp_rank, get_local_rank
 from gllm.utils import get_model_load_pbar
 
 
@@ -149,8 +149,8 @@ class Qwen2ForCausalLM(nn.Module):
     def load_weights(self, weights, mp_load_progress=None):
         parameters = dict(self.named_parameters())
         if mp_load_progress is not None:
-            mp_load_progress[get_pp_rank()*2] = len(parameters)
-            mp_load_progress[get_pp_rank()*2+1] = 0
+            mp_load_progress[get_local_rank()*2] = len(parameters)
+            mp_load_progress[get_local_rank()*2+1] = 0
         else:
             pbar = get_model_load_pbar(len(parameters))
 
@@ -187,6 +187,6 @@ class Qwen2ForCausalLM(nn.Module):
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
-                mp_load_progress[get_pp_rank()*2+1] += 1
+                mp_load_progress[get_local_rank()*2+1] += 1
             else:
                 pbar.update(1)

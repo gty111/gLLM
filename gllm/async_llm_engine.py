@@ -129,34 +129,41 @@ class PipeAsyncLLM(LLM):
 
         self.wait_lists: List[Sequence] = []
         self.running_maps: Dict[int, Sequence] = dict()
+        
+        if self.launch_mode != 'normal':
+            self.act_worker_ranks = [int(i) for i in self.worker_ranks.split(',')]
+            assert len(self.act_worker_ranks) != 0
+        else:
+            self.act_worker_ranks = list(range(self.pp_size))
+        self.num_workers = len(self.act_worker_ranks)
 
         self.ctx = mp.get_context('spawn')
-        self.mp_alive = self.ctx.Array('i', [0 for i in range(self.pp_size)])
+        self.mp_alive = self.ctx.Array('i', [0 for i in range(self.num_workers)])
         self.mp_load_progress = self.ctx.Array(
-            'i', [0 for i in range(self.pp_size*2)])
+            'i', [0 for i in range(self.num_workers*2)])
 
         ipc_path_prefix = random_uuid()
         self.schedule_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
         self.output_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
         self.token_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
 
-        self.comm = zmqComm(0, 0, self.schedule_path,
-                            self.output_path, self.token_path)
+        self.comm = zmqComm(self.host, self.zmq_port_base, self.launch_mode, self.master_addr, 
+                            0, 0, self.schedule_path, self.output_path, self.token_path)
         self.comm.init()
 
-        logger.info(f'Launching {self.pp_size} worker(s) ...')
+        logger.info(f'Launching worker {self.act_worker_ranks} ...')
         if self.use_async_worker:
             logger.warning(f'AsyncWorker is an experimental feature')
             
-        self.process = []
-        for pp_rank in range(self.pp_size):
-            self.start_worker(pp_rank)
+        self.process_list = []
+        for local_rank, pp_rank in enumerate(self.act_worker_ranks):
+            self.start_worker(local_rank, pp_rank)
 
         if kwargs['load_format'] == 'auto':
             self.load_progress()
 
         # wait worker start
-        wait_worker(self.mp_alive, self.pp_size)
+        wait_worker(self.mp_alive, self.num_workers)
 
     def load_progress(self):
         total_weights = 0
@@ -164,7 +171,7 @@ class PipeAsyncLLM(LLM):
             check_worker_alive(self.mp_alive)
             ready = True
             total_weights = 0
-            for i in range(self.pp_size):
+            for i in range(self.num_workers):
                 if self.mp_load_progress[i*2] == 0:
                     ready = False
                     continue
@@ -176,7 +183,7 @@ class PipeAsyncLLM(LLM):
         while True:
             check_worker_alive(self.mp_alive)
             cur_total_weights = 0
-            for i in range(self.pp_size):
+            for i in range(self.num_workers):
                 cur_total_weights += self.mp_load_progress[i*2+1]
             pbar.update(cur_total_weights-last_total_weights)
             last_total_weights = cur_total_weights
@@ -221,14 +228,19 @@ class PipeAsyncLLM(LLM):
                 self.comm.send_requests(ipc_package)
             await asyncio.sleep(0)
 
-    def start_worker(self, pp_rank):
+    def start_worker(self, local_rank, pp_rank):
         worker_cls = Worker if not self.use_async_worker else AsyncWorker
-        comm = zmqComm(pp_rank,
+        comm = zmqComm(self.host,
+                       self.zmq_port_base,
+                       self.launch_mode,
+                       self.master_addr,
+                       pp_rank,
                        self.pp_size,
                        self.schedule_path,
                        self.output_path,
                        self.token_path)
         worker = worker_cls(self.model_runner,
+                            local_rank,
                             pp_rank,
                             self.pp_size,
                             self.master_addr,
@@ -242,7 +254,7 @@ class PipeAsyncLLM(LLM):
                     target=run_worker if not self.use_async_worker else run_worker_async,
                     args=(worker,),
                     daemon=True)
-        self.process.append(process)
+        self.process_list.append(process)
         process.start()
 
     def start_schedule_engine(self):

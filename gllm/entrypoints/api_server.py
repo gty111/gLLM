@@ -2,6 +2,9 @@ import uvicorn
 import fastapi
 import asyncio
 import argparse
+from logger import logger
+import traceback
+
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from http import HTTPStatus
@@ -80,9 +83,11 @@ async def run_server(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Launch gLLM server')
-    parser.add_argument('--host', type=str, default='0.0.0.0')
+    parser.add_argument('--host', type=str, help='Host addr', default='0.0.0.0')
     parser.add_argument('--port', type=int, help='Uvicorn port', default=8000)
-    parser.add_argument('--nccl-port', type=str, help='NCCL port', default='8001')
+    parser.add_argument('--master-addr', type=str, help='NCCL addr', default='0.0.0.0')
+    parser.add_argument('--master-port', type=str, help='NCCL port', default='8001')
+    parser.add_argument('--zmq-port-base', type=int, help='ZeroMQ port', default=8002)
     parser.add_argument('--model-path', help='Path to the model, either from local disk or from huggingface', type=str, required=True)
     parser.add_argument('--disable-pipe-schedule', help='Use AsyncLLM backend (used for performance comparsion)', action="store_true")
     parser.add_argument('--gpu-memory-util', type=float, help='GPU memory utilization for KV cache (excluding model weights)', default=0.9)
@@ -98,11 +103,17 @@ if __name__ == '__main__':
     parser.add_argument('--load-format', type=str, choices=['auto','dummy'], help='auto: actually load model weights; dummy: initialize the model with random values', default='auto')
     parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
     parser.add_argument('--use-async-worker', help='Experimental feature for worker implemented by async', action='store_true')
+    parser.add_argument('--launch-mode', type=str, choices=['normal', 'master', 'slave'], default='normal')
+    parser.add_argument('--worker-ranks',type=str,help='Specify the rank of workers like 0,1',default=None)
     args = parser.parse_args()
 
     llm_cls = PipeAsyncLLM if not args.disable_pipe_schedule else AsyncLLM
     llm = llm_cls(host=args.host,
-                  nccl_port=args.nccl_port,
+                  master_addr=args.master_addr,
+                  master_port=args.master_port,
+                  zmq_port_base=args.zmq_port_base,
+                  launch_mode=args.launch_mode,
+                  worker_ranks=args.worker_ranks,
                   load_format=args.load_format,
                   model_path=args.model_path,
                   gpu_memory_util=args.gpu_memory_util,
@@ -117,5 +128,15 @@ if __name__ == '__main__':
                   assigned_layers=args.assigned_layers,
                   use_naive_schedule=args.use_naive_schedule,
                   use_async_worker=args.use_async_worker)
-
-    asyncio.run(run_server(args))
+    
+    if args.launch_mode != 'slave':
+        asyncio.run(run_server(args))
+    else:
+        try:
+            for process in llm.process_list:
+                process.join()
+        except KeyboardInterrupt as e:
+            pass
+        except Exception as e:
+            logger.error(e)
+            traceback.print_exc()
