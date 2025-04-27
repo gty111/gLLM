@@ -147,8 +147,8 @@ class PipeAsyncLLM(LLM):
         self.output_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
         self.token_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
 
-        self.comm = zmqComm(self.zmq_port_base, self.launch_mode, self.master_addr, 0, 0, self.schedule_path,
-                            self.output_path, self.token_path)
+        self.comm = zmqComm(self.host, self.zmq_port_base, self.launch_mode, self.master_addr, 
+                            0, 0, self.schedule_path, self.output_path, self.token_path)
         self.comm.init()
 
         logger.info(f'Launching worker {self.act_worker_ranks} ...')
@@ -230,7 +230,8 @@ class PipeAsyncLLM(LLM):
 
     def start_worker(self, local_rank, pp_rank):
         worker_cls = Worker if not self.use_async_worker else AsyncWorker
-        comm = zmqComm(self.zmq_port_base,
+        comm = zmqComm(self.host,
+                       self.zmq_port_base,
                        self.launch_mode,
                        self.master_addr,
                        pp_rank,

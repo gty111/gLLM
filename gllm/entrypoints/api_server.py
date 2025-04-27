@@ -83,9 +83,10 @@ async def run_server(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Launch gLLM server')
-    parser.add_argument('--host', type=str, default='0.0.0.0')
+    parser.add_argument('--host', type=str, help='Host addr', default='0.0.0.0')
     parser.add_argument('--port', type=int, help='Uvicorn port', default=8000)
-    parser.add_argument('--nccl-port', type=str, help='NCCL port', default='8001')
+    parser.add_argument('--master-addr', type=str, help='NCCL addr', default='0.0.0.0')
+    parser.add_argument('--master-port', type=str, help='NCCL port', default='8001')
     parser.add_argument('--zmq-port-base', type=int, help='ZeroMQ port', default=8002)
     parser.add_argument('--model-path', help='Path to the model, either from local disk or from huggingface', type=str, required=True)
     parser.add_argument('--disable-pipe-schedule', help='Use AsyncLLM backend (used for performance comparsion)', action="store_true")
@@ -108,7 +109,8 @@ if __name__ == '__main__':
 
     llm_cls = PipeAsyncLLM if not args.disable_pipe_schedule else AsyncLLM
     llm = llm_cls(host=args.host,
-                  nccl_port=args.nccl_port,
+                  master_addr=args.master_addr,
+                  master_port=args.master_port,
                   zmq_port_base=args.zmq_port_base,
                   launch_mode=args.launch_mode,
                   worker_ranks=args.worker_ranks,

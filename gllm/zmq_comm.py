@@ -5,7 +5,8 @@ from gllm.utils import make_socket
 from gllm.dist_utils import send_obj_list, recv_obj_list
 
 class zmqComm:
-    def __init__(self, port_base, launch_mode, master_addr, pp_rank, pp_size, schedule_path, output_path, token_path):
+    def __init__(self, host_addr, port_base, launch_mode, master_addr, pp_rank, pp_size, schedule_path, output_path, token_path):
+        self.host_addr = host_addr
         self.port_base = port_base
         self.master_addr = master_addr
         self.launch_mode = launch_mode
@@ -47,9 +48,11 @@ class zmqComm:
                         self.schedule_sockets = []
                         for i in range(1, self.pp_size):
                             port_each = self.port_base+i
-                            self.schedule_sockets.append(make_socket(
-                                self.ctx, f'tcp://{self.master_addr}:{port_each}', zmq.PUSH))
                             send_obj_list([port_each],i)
+                            addr_each = [None]
+                            recv_obj_list(addr_each,i)
+                            self.schedule_sockets.append(make_socket(
+                                self.ctx, f'tcp://{addr_each[0]}:{port_each}', zmq.PUSH))
                         # last rank => rank 0 : next tokens
                         port_token = self.port_base+self.pp_size
                         self.token_socket = make_socket(
@@ -63,8 +66,9 @@ class zmqComm:
                 else:
                     port_schedule = [None]
                     recv_obj_list(port_schedule, 0)
+                    send_obj_list([self.host_addr],0)
                     self.schedule_socket = make_socket(
-                        self.ctx, f'tcp://{self.master_addr}:{port_schedule[0]}', zmq.PULL)
+                        self.ctx, f'tcp://{self.host_addr}:{port_schedule[0]}', zmq.PULL)
 
             if self.pp_rank == self.pp_size - 1 and self.pp_size != 1:
                 # last rank => rank 0 : next tokens
