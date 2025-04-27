@@ -15,7 +15,7 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 
 *Latest News* :fire:
 - [2025/04/27]: We support multi-node deployments. You can serve your model across different machines :blush:
-- [2025/04/21]: We release our paper on [arXiv:2504.14775](https://arxiv.org/abs/2504.14775)
+- [2025/04/21]: We release our paper on [arXiv:2504.14775](https://arxiv.org/abs/2504.14775) :partying_face:
 - [2025/03/15]: Chunked prefill has been integrated. You can input any length of text you want :hugs:
 - [2025/03/01]: Pipeline parallelism has been integrated. You can run any size of model you want :laughing: 
 - [2025/02/27]: We apply numerous optimizations which lowers CPU overhead a lot :clap: 
