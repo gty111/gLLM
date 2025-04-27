@@ -76,7 +76,7 @@ class ModelCard(OpenAIBaseModel):
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "vllm"
+    owned_by: str = "gllm"
     root: Optional[str] = None
     parent: Optional[str] = None
     max_model_len: Optional[int] = None
