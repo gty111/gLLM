@@ -11,13 +11,32 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 
 ## What is gLLM?
 
-Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching** and **pipeline parallelism**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
+<p align="center">
+<img src=doc/pic/overview.svg width=500>
+</p>
+
+Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **token throttling** and **pipeline parallelism**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
+- [2025/04/27]: We support multi-node deployments. You can serve your model across different machines :blush:
+- [2025/04/21]: We release our paper on [arXiv:2504.14775](https://arxiv.org/abs/2504.14775) :partying_face:
 - [2025/03/15]: Chunked prefill has been integrated. You can input any length of text you want :hugs:
 - [2025/03/01]: Pipeline parallelism has been integrated. You can run any size of model you want :laughing: 
 - [2025/02/27]: We apply numerous optimizations which lowers CPU overhead a lot :clap: 
 
+## Token Throttling
+
+### Prefill Token Throttling
+<p align="center">
+<img src=doc/pic/prefill_throttling.svg >
+</p>
+
+---
+
+### Decode Token Throttling
+<p align="center">
+<img src=doc/pic/decode_throttling.svg >
+</p>
 
 ## Install gLLM
 ```
@@ -46,13 +65,38 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
     --gpu-memory-util $GPU_MEMORY_UTIL
 ```
 
-### Launch OpenAI-Compatible Server
+### Launch OpenAI-Compatible Server (Intra-node)
 
 ```
 # To see the description of args, run 'python -m gllm.entrypoints.api_server -h'
 python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
-    --enable-prefix-caching --pp $PP_STAGES
+    --enable-prefix-caching --pp $PP
 ```
+
+### Launch OpenAI-Compatible Server (Multi-node)
+
+> Experimental feature
+
+gLLM can be launched in three modes: (1) `normal`, used for single-node multiple GPUs (2) `master`, used for multi-node deployment (3) `slave`, used for multi-node deployment.
+
+To launch master gLLM instance
+```
+python -m gllm.entrypoints.api_server --port $PORT --master-port $MASTER_PORT \
+    --model-path $MODEL_PATH --pp $PP --launch-mode master --worker-ranks $RANKS
+```
+To launch slave gLLM instance
+```
+python -m gllm.entrypoints.api_server --host $HOST \
+    --master-addr $MASTER_ADDR --master-port $MASTER_PORT \
+    --model-path $MODEL_PATH --pp $PP --launch-mode slave --worker-ranks $RANKS 
+```
+There are something you need to care about
+- Make sure `$MASTER_PORT` and `$MASTER_ADDR` in slave instance can be matched to that in master instance
+- Make sure slave instance can set up connection with master instance using `$MASTER_ADDR`
+- Make sure master instance can set up connection with slave instance using `$HOST`
+- Make sure `$PP` can be matched to `$RANKS` in slave or master instance 
+    - For example, we want to launch two gLLM instances, `$PP` is set to `4`, `$RANKS` in master is set to `0,1`, then `$RANKS` in slave must set to `2,3`
+- Make sure set environment variable `NCCL_SOCKET_IFNAME` `NCCL_IB_DISABLE` properly
 
 ### Client Completions
 ```
@@ -101,5 +145,18 @@ python evaluations/evaluate_MMLU_pro.py --model $MODEL --port $PORT
 ## Roadmap
 
 - [ ] Support TP
-- [ ] Support mult-node deployment
-- [ ] Support as many models as possible
+- [ ] Support more models
+
+
+## Cite Our Work
+```
+@misc{guo2025gllmglobalbalancedpipeline,
+      title={gLLM: Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Token Throttling}, 
+      author={Tianyu Guo and Xianwei Zhang and Jiangsu Du and Zhiguang Chen and Nong Xiao and Yutong Lu},
+      year={2025},
+      eprint={2504.14775},
+      archivePrefix={arXiv},
+      primaryClass={cs.DC},
+      url={https://arxiv.org/abs/2504.14775}, 
+}
+```
