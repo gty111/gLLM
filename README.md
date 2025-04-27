@@ -12,7 +12,7 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 ## What is gLLM?
 
 <p align="center">
-<img src=doc/pic/overview.svg height=200>
+<img src=doc/pic/overview.svg width=500>
 </p>
 
 Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching** and **pipeline parallelism**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
