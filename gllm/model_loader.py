@@ -10,6 +10,7 @@ from huggingface_hub import snapshot_download
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.qwen2 import Qwen2ForCausalLM
+from gllm.models.qwen3 import Qwen3ForCausalLM
 from gllm.utils import get_lock
 
 
@@ -91,6 +92,8 @@ class ModelLoader():
             model_type = ChatGLMForCausalLM
         elif self.architecture == 'Qwen2ForCausalLM':
             model_type = Qwen2ForCausalLM
+        elif self.architecture == 'Qwen3ForCausalLM':
+            model_type = Qwen3ForCausalLM
         else:
             logger.error(f'Unsupported model: {self.architecture}')
             sys.exit(0)
