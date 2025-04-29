@@ -1,8 +1,9 @@
 import torch
 import time
-from logger import logger
 
-from transformers import AutoTokenizer
+from typing import Union
+from logger import logger
+from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
@@ -21,7 +22,7 @@ class ModelRunner():
             logger.info('Enable prefix caching')
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        self.tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = AutoTokenizer.from_pretrained(
             self.model_path, trust_remote_code=True)
         self.maxp = maxp
         self.maxd = maxd
@@ -41,11 +42,14 @@ class ModelRunner():
             dtype=self.model.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads,
             kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size)
 
-    def tokenize(self, content, chat: bool = False):
+    def encode(self, content, chat: bool = False):
         if chat:
             return self.tokenizer.apply_chat_template(content, add_generation_prompt=True)
         else:
             return self.tokenizer.encode(content)
+        
+    def decode(self, content):
+        return self.tokenizer.decode(content, True, True)
 
     @torch.inference_mode()
     def step_once(self, input_data: InputData = None, hidden_states=None, residual=None):
@@ -100,4 +104,4 @@ class ModelRunner():
             f'#input: {seq.prompt_len} #output: {len(seq.token_ids[seq.prompt_len:])} '
             f'elapsed time: {elapsed_time} s rate(prefill/decode): {prefill_rate}/{decode_rate} toks/s\n')
         # -----metric end--------
-        return self.tokenizer.decode(seq.token_ids[seq.prompt_len:], True, True)
+        return self.decode(seq.token_ids[seq.prompt_len:])

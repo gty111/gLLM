@@ -81,8 +81,7 @@ class LLM():
         assert prompts is not None or tokens is not None
         num_seqs = len(prompts) if prompts is not None else len(tokens)
         for idx in range(num_seqs):
-            token_ids = tokens[idx] if tokens is not None else self.model_runner.tokenizer.encode(
-                prompts[idx])
+            token_ids = tokens[idx] if tokens is not None else self.model_runner.encode(prompts[idx])
             output_len_each = output_lens[idx] if output_lens is not None else None
             if self.check_seq_length(token_ids, output_len_each):
                 seq = self.allocate_seq(token_ids, output_len_each, False, temperature,
@@ -97,10 +96,8 @@ class LLM():
             pbar.update(len(self.scheduler.finish_ids)-cur_finish_num)
 
         for request in requests:
-            request.prompt = self.model_runner.tokenizer.decode(
-                request.token_ids[:request.prompt_len], True, True)
-            request.output = self.model_runner.tokenizer.decode(
-                request.token_ids[request.prompt_len:], True, True)
+            request.prompt = self.model_runner.decode(request.token_ids[:request.prompt_len])
+            request.output = self.model_runner.decode(request.token_ids[request.prompt_len:])
 
         self.free_finish_ids(self.scheduler.get_finish_ids())
         return requests
@@ -126,8 +123,7 @@ class LLM():
                     prompt, history=history, role='user').get("input_ids").numpy().tolist()[0]
             else:
                 history.append({"role": "user", "content": prompt})
-                tokens = self.model_runner.tokenizer.apply_chat_template(
-                    history, add_generation_prompt=True)
+                tokens = self.model_runner.encode(history, chat=True)
             seq = self.allocate_seq(tokens)
             output_text = self.model_runner.stream_inference(seq)
 

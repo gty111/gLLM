@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Union
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 
@@ -29,7 +29,7 @@ class Sequence():
         self.computed_token_num = 0
         self.to_compute_token_num = 0
 
-    def detokenize_inc(self, tokenizer: Optional[PreTrainedTokenizer | PreTrainedTokenizerFast]):
+    def detokenize_inc(self, tokenizer: Union[PreTrainedTokenizer | PreTrainedTokenizerFast]):
         added_space = ' ' if ' ' in tokenizer.decode(
             self.token_ids[self.cur_length-1:self.cur_length+1], True, True).strip() else ''
         delta_text = tokenizer.decode(
