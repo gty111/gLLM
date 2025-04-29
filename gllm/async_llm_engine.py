@@ -1,5 +1,6 @@
 import asyncio
 import torch.multiprocessing as mp
+import sys
 
 from logger import logger
 from typing import List, Dict
@@ -131,6 +132,9 @@ class PipeAsyncLLM(LLM):
         self.running_maps: Dict[int, Sequence] = dict()
         
         if self.launch_mode != 'normal':
+            if self.worker_ranks is None:
+                logger.error('Please specify arg --ranks when the launching mode is master/slave')
+                sys.exit(1)
             self.act_worker_ranks = [int(i) for i in self.worker_ranks.split(',')]
             assert len(self.act_worker_ranks) != 0
         else:
@@ -154,6 +158,8 @@ class PipeAsyncLLM(LLM):
         logger.info(f'Launching worker {self.act_worker_ranks} ...')
         if self.use_async_worker:
             logger.warning(f'AsyncWorker is an experimental feature')
+        if self.launch_mode != 'normal':
+            logger.warning(f'Multi-node support is an experimental feature')
             
         self.process_list = []
         for local_rank, pp_rank in enumerate(self.act_worker_ranks):

@@ -104,7 +104,7 @@ if __name__ == '__main__':
     parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
     parser.add_argument('--use-async-worker', help='Experimental feature for worker implemented by async', action='store_true')
     parser.add_argument('--launch-mode', type=str, choices=['normal', 'master', 'slave'], default='normal')
-    parser.add_argument('--worker-ranks',type=str,help='Specify the rank of workers like 0,1',default=None)
+    parser.add_argument('--ranks',type=str,help='Specify the ranks of worker like 0,1', default=None)
     args = parser.parse_args()
 
     llm_cls = PipeAsyncLLM if not args.disable_pipe_schedule else AsyncLLM
@@ -113,7 +113,7 @@ if __name__ == '__main__':
                   master_port=args.master_port,
                   zmq_port_base=args.zmq_port_base,
                   launch_mode=args.launch_mode,
-                  worker_ranks=args.worker_ranks,
+                  worker_ranks=args.ranks,
                   load_format=args.load_format,
                   model_path=args.model_path,
                   gpu_memory_util=args.gpu_memory_util,
