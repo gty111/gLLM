@@ -7,16 +7,16 @@ from gllm import LLM
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Benchmark offline serving throughput')
-    parser.add_argument('--model-path', type=str, required=True)
-    parser.add_argument('--share-gpt-path', type=str, required=True)
+    parser.add_argument('--model', type=str, required=True)
+    parser.add_argument('--sharegpt-path', type=str, required=True)
     parser.add_argument('--num-prompt', type=int, default=8)
     parser.add_argument('--print-output', action="store_true")
     parser.add_argument('--gpu-memory-util', type=float, default=0.9)
     args = parser.parse_args()
 
-    llm = LLM(args.model_path, gpu_memory_util=args.gpu_memory_util)
+    llm = LLM(args.model, gpu_memory_util=args.gpu_memory_util)
     llm.init()
-    with open(args.share_gpt_path) as f:
+    with open(args.sharegpt_path) as f:
         completions = json.load(f)
         tokens = []
         output_lens = []

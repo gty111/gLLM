@@ -50,12 +50,12 @@ pip install -v -e .
 
 ### Interactive Offline Chat
 ```
-python examples/chat.py --model-path $MODEL_PATH
+python examples/chat.py --model $MODEL_PATH
 ```
 
 ### Offline Batch Inference
 ```
-python examples/batch_inference.py --model-path $MODEL \
+python examples/batch_inference.py --model $MODEL \
     --share-gpt-path $SHARE_GPT_PATH --num-prompt $NUM_PROMPT \
     --gpu-memory-util $GPU_MEMORY_UTIL
 ```
