@@ -58,10 +58,10 @@ class Qwen2Attention(nn.Module):
 
 
 class Qwen2DecoderLayer(nn.Module):
-    def __init__(self, layer_id: int, config):
+    def __init__(self, layer_id: int, config, attention_type=Qwen2Attention, mlp_type=Qwen2MLP):
         super().__init__()
-        self.self_attn = Qwen2Attention(layer_id, config)
-        self.mlp = Qwen2MLP(config)
+        self.self_attn = attention_type(layer_id, config)
+        self.mlp = mlp_type(config)
         self.input_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps, config.torch_dtype)
         self.post_attention_layernorm = RMSNorm(
@@ -84,15 +84,16 @@ class Qwen2DecoderLayer(nn.Module):
 
 
 class Qwen2Model(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, decoder_layer_type=Qwen2DecoderLayer):
         super().__init__()
         if get_pp_rank() == 0 or config.tie_word_embeddings and get_pp_rank() == get_pp_size() - 1:
             self.embed_tokens = nn.Embedding(
                 config.vocab_size, config.hidden_size, dtype=config.torch_dtype, device='cuda')
         self.start_layer, self.end_layer = get_pp_layers(
             config.num_hidden_layers)
+        
         self.layers = nn.ModuleList([
-            Qwen2DecoderLayer(i-self.start_layer, config)
+            decoder_layer_type(i-self.start_layer, config)
             for i in range(self.start_layer, self.end_layer)
         ])
         if get_pp_rank() == get_pp_size() - 1:
@@ -114,14 +115,14 @@ class Qwen2Model(nn.Module):
 
 
 class Qwen2ForCausalLM(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, model_type=Qwen2Model):
         super().__init__()
         self.config = config
         self.max_model_len = config.max_position_embeddings
         self.dtype = config.torch_dtype
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.model = Qwen2Model(config)
+        self.head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
+        self.model = model_type(config)
         self.num_layers = len(self.model.layers)
         self.ret_residual = True
         if get_pp_rank() == get_pp_size() - 1:
@@ -156,7 +157,7 @@ class Qwen2ForCausalLM(nn.Module):
 
         # assert len(parameters) == len(weights)
         num_attn_heads = self.config.num_attention_heads
-        head_dim = self.config.hidden_size // num_attn_heads
+        head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // num_attn_heads)
         num_kv_heads = self.config.num_key_value_heads
         intermediate_size = self.config.intermediate_size
         for k, v in parameters.items():

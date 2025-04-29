@@ -46,5 +46,4 @@ class FlashAttention():
                                      softmax_scale=self.scaling,
                                      causal=True,
                                      block_table=input_data.block_table)
-
-        return out.view(-1, self.hidden_size)
+        return out.view(-1, out.shape[-2]*out.shape[-1])
