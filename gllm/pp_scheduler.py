@@ -60,15 +60,15 @@ class PPScheduler():
             logger.info('before output process')
             schedule_seqs: List[Sequence] = self.batch_running.popleft()
             next_tokens = self.next_tokens_queue.popleft()
-            send_tokens = []
             ipc_package = IPCPackage([])
 
             for idx, seq in enumerate(schedule_seqs):
                 seq.computed_token_num += seq.to_compute_token_num
                 if seq.computed_prompt():
-                    ipc_package.act_schedule_ids.append(seq.seq_id)
-                    send_tokens.append(next_tokens[idx])
                     seq.token_ids.append(next_tokens[idx])
+                if seq.is_send_token():
+                    ipc_package.act_schedule_ids.append(seq.seq_id)
+                    ipc_package.next_tokens.append(seq.token_ids[-2])
                 if seq.is_finish():
                     ipc_package.free_ids.append(seq.seq_id)
                     self.memory_manager.free(seq)
@@ -76,7 +76,6 @@ class PPScheduler():
                     self.seqs_to_decode.appendleft(seq)
                 else:
                     self.seqs_to_prefill.appendleft(seq)
-            ipc_package.next_tokens = send_tokens
             logger.info('after output process')
             return ipc_package
         else:
@@ -101,6 +100,7 @@ class PPScheduler():
             
     def schedule_once(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
+            logger.info('before schedule')
             schedule_seqs = self.schedule() if not self.use_naive_schedule else self.schedule_naive()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
