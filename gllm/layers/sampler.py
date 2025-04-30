@@ -1,5 +1,7 @@
 import torch
 
+from logger import logger
+
 from gllm.input_data import InputData
 
 class Sampler():
@@ -16,8 +18,9 @@ class Sampler():
         # q = torch.empty_like(probs)
         # q.exponential_()
         # return probs.div_(q).argmax(dim=1).cpu().numpy().tolist()
-        return torch.multinomial(probs, 1).squeeze(1).cpu().numpy().tolist()
-
+        
+        # Note: we do not synchronize the result to cpu here
+        return torch.multinomial(probs, 1).squeeze(1)
 
 def _apply_top_k_top_p(
     logits: torch.Tensor,

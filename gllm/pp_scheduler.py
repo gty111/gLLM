@@ -57,6 +57,7 @@ class PPScheduler():
         
     def process_output(self):
         if len(self.next_tokens_queue) != 0:
+            logger.info('before output process')
             schedule_seqs: List[Sequence] = self.batch_running.popleft()
             next_tokens = self.next_tokens_queue.popleft()
             send_tokens = []
@@ -76,6 +77,7 @@ class PPScheduler():
                 else:
                     self.seqs_to_prefill.appendleft(seq)
             ipc_package.next_tokens = send_tokens
+            logger.info('after output process')
             return ipc_package
         else:
             return None

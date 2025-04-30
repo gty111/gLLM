@@ -138,7 +138,7 @@ class Worker:
                 self.comm.send_schedule(schedule_seqs)
             output = self.model_runner.step_once(input_data)
 
-            if type(output) != list:
+            if self.pp_size != 1:
                 send_pp_data(output, self.get_pp_next_rank())
             else:
                 self.pp_scheduler.add_next_tokens(output)

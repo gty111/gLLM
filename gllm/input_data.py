@@ -26,18 +26,20 @@ class InputData():
         self.seqs = seqs
         self.memory_manager = memory_manager
         self.page_size = memory_manager.page_size
-        self.slot_mapping_tensor = self.get_slot_mapping()
-        self.tokens = self.get_tokens()
         self.positions = self.get_position()
         self.max_seq_len, self.seq_start_loc = self.get_seq_len_loc()
         self.block_table = self.get_block_table()
         self.max_query_len, self.query_start_loc = self.get_query_len_loc()
+        self.tokens = self.get_tokens()
+        self.slot_mapping_tensor = self.get_slot_mapping()
 
         assert self.tokens.shape == self.positions.shape
 
     def get_tokens(self):
         tokens_list = []
         for seq in self.seqs:
+            # get future token
+            seq.token_ids[-1] = int(seq.token_ids[-1])
             tokens_list.extend(
                 seq.token_ids[seq.computed_token_num:seq.computed_token_num+seq.to_compute_token_num])
         return async_tensor_h2d(

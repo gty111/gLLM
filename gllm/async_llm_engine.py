@@ -218,7 +218,7 @@ class PipeAsyncLLM(LLM):
             if ipc_package is not None:
                 for idx, id in enumerate(ipc_package.act_schedule_ids):
                     seq: Sequence = self.running_maps[id]
-                    seq.token_ids.append(ipc_package.next_tokens[idx])
+                    seq.token_ids.append(int(ipc_package.next_tokens[idx]))
                     self.async_streams[id].put(
                         seq.detokenize_inc(self.model_runner.tokenizer))
                     if id in ipc_package.free_ids:
