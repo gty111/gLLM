@@ -3,6 +3,7 @@ import torch
 from logger import logger
 
 from gllm.input_data import InputData
+from gllm.dist_utils import get_pp_size
 
 class Sampler():
     
@@ -21,12 +22,16 @@ class Sampler():
         
         # Note: we do not synchronize the result to cpu here
         # logger.info('before mult')
-        next_tokens = torch.multinomial(probs, 1).squeeze(1).to('cpu',non_blocking=True)
-        event = torch.cuda.Event(interprocess=True)
-        event.record()
+        non_blocking = get_pp_size() == 1 
+        next_tokens = torch.multinomial(probs, 1).squeeze(1).to('cpu',non_blocking=non_blocking)
+        if non_blocking:
+            event = torch.cuda.Event(interprocess=True)
+            event.record()
         # event.synchronize()
         # logger.info('after mult')
-        return next_tokens, event
+            return next_tokens, event
+        else:
+            return next_tokens.numpy().tolist()
         
 
 def _apply_top_k_top_p(

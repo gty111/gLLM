@@ -11,7 +11,7 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 
 class InputData():
-    def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager, event:torch.cuda.Event):
+    def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager, event:torch.cuda.Event=None):
         assert len(seqs) != 0
         if get_pp_rank() == get_pp_size() - 1:
             self.temperature = async_tensor_h2d(

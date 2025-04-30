@@ -119,9 +119,9 @@ class Worker:
 
     def recv_next_tokens(self):
         if self.pp_size != 1:  # recv tokens from last rank
-            next_tokens = self.comm.recv_tokens()
-            if next_tokens is not None:
-                self.pp_scheduler.add_next_tokens(next_tokens)
+            output = self.comm.recv_tokens()
+            if output is not None:
+                self.pp_scheduler.add_next_tokens(output)
 
     def process_output(self):
         ipc_package = self.pp_scheduler.process_output()

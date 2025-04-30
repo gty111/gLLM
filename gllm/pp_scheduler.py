@@ -63,9 +63,13 @@ class PPScheduler():
         if len(self.next_tokens_queue) != 0:
             # logger.info('before output process')
             schedule_seqs: List[Sequence] = self.batch_running.popleft()
-            next_tokens, self.event = self.next_tokens_queue.popleft()
+            output = self.next_tokens_queue.popleft()
+            if self.pp_size == 1:
+                next_tokens, self.event = output
+            else:
+                next_tokens = output
             ipc_package = IPCPackage([])
-            ipc_package.event = self.event.ipc_handle()
+            
             for idx, seq in enumerate(schedule_seqs):
                 seq.computed_token_num += seq.to_compute_token_num
                 if seq.computed_prompt():

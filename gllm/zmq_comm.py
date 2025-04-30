@@ -84,7 +84,6 @@ class zmqComm:
         
 
     def send_tokens(self, tokens):
-        assert type(tokens) == list
         tokens_bytes = pickle.dumps(tokens)
         self.token_socket.send(tokens_bytes, copy=False)
 
