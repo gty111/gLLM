@@ -1,6 +1,7 @@
 import asyncio
 import torch.multiprocessing as mp
 import sys
+import torch
 
 from logger import logger
 from typing import List, Dict
@@ -216,6 +217,8 @@ class PipeAsyncLLM(LLM):
             check_worker_alive(self.mp_alive)
             ipc_package = self.comm.recv_output()
             if ipc_package is not None:
+                event = torch.cuda.Event.from_ipc_handle(torch.device('cuda:0'),ipc_package.event)
+                event.synchronize()
                 for idx, id in enumerate(ipc_package.act_schedule_ids):
                     seq: Sequence = self.running_maps[id]
                     seq.token_ids.append(int(ipc_package.next_tokens[idx]))

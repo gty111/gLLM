@@ -20,7 +20,14 @@ class Sampler():
         # return probs.div_(q).argmax(dim=1).cpu().numpy().tolist()
         
         # Note: we do not synchronize the result to cpu here
-        return torch.multinomial(probs, 1).squeeze(1)
+        # logger.info('before mult')
+        next_tokens = torch.multinomial(probs, 1).squeeze(1).to('cpu',non_blocking=True)
+        event = torch.cuda.Event(interprocess=True)
+        event.record()
+        # event.synchronize()
+        # logger.info('after mult')
+        return next_tokens, event
+        
 
 def _apply_top_k_top_p(
     logits: torch.Tensor,

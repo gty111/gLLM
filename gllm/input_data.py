@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from logger import logger
 
 from typing import List
 
@@ -10,7 +11,7 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 
 
 class InputData():
-    def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
+    def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager, event:torch.cuda.Event):
         assert len(seqs) != 0
         if get_pp_rank() == get_pp_size() - 1:
             self.temperature = async_tensor_h2d(
@@ -30,8 +31,14 @@ class InputData():
         self.max_seq_len, self.seq_start_loc = self.get_seq_len_loc()
         self.block_table = self.get_block_table()
         self.max_query_len, self.query_start_loc = self.get_query_len_loc()
-        self.tokens = self.get_tokens()
         self.slot_mapping_tensor = self.get_slot_mapping()
+        # wait future tokens
+        # logger.info('before event syn')
+        if event is not None:
+            event.synchronize()
+        # logger.info('after event syn')
+        self.tokens = self.get_tokens()
+        # logger.info('after input data')
 
         assert self.tokens.shape == self.positions.shape
 
@@ -92,8 +99,7 @@ class InputData():
                 slot_idx = i % self.page_size
                 slot_mapping.append(seq.page_table[page_idx]*self.page_size+slot_idx)
                 # update hash of newly generated page in decode stage
-                if isinstance(self.memory_manager, PrefixMemoryManager) and seq.to_compute_token_num == 1 and slot_idx==self.page_size-1:
-                    self.memory_manager.segment.update((*seq.token_ids,),seq.page_table[page_idx])
-
+                if isinstance(self.memory_manager, PrefixMemoryManager) and seq.to_compute_token_num == 1 and slot_idx==0 and page_idx > 1:
+                    self.memory_manager.segment.update((*seq.token_ids[:-1],),seq.page_table[page_idx-1])
         return async_tensor_h2d(
             slot_mapping, torch.int64, 'cuda', True)

@@ -56,4 +56,4 @@ class Sequence():
         return self.computed_token_num >= self.prompt_len
     
     def is_send_token(self):
-        return self.computed_token_num > self.prompt_len + 2
+        return self.computed_token_num > self.prompt_len

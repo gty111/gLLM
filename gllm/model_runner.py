@@ -56,8 +56,8 @@ class ModelRunner():
         output = self.model(input_data, hidden_states, residual)
         if get_pp_rank() == get_pp_size() - 1:
             logits = self.model.compute_logits(input_data, output)
-            next_tokens = self.model.sample(input_data, logits)
-            return next_tokens
+            next_tokens, event = self.model.sample(input_data, logits)
+            return next_tokens, event
         else:
             return output
 

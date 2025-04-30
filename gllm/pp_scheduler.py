@@ -1,5 +1,6 @@
 import time
 import random
+import torch
 
 from collections import deque
 from functools import reduce
@@ -37,6 +38,9 @@ class PPScheduler():
         # num wait tokens
         self.num_wait_tokens = 0
         
+        # advance schedule
+        self.event: torch.Event = None
+        
     def get_num_free_pages(self):
         return self.memory_manager.get_num_free_pages()
 
@@ -57,11 +61,11 @@ class PPScheduler():
         
     def process_output(self):
         if len(self.next_tokens_queue) != 0:
-            logger.info('before output process')
+            # logger.info('before output process')
             schedule_seqs: List[Sequence] = self.batch_running.popleft()
-            next_tokens = self.next_tokens_queue.popleft()
+            next_tokens, self.event = self.next_tokens_queue.popleft()
             ipc_package = IPCPackage([])
-
+            ipc_package.event = self.event.ipc_handle()
             for idx, seq in enumerate(schedule_seqs):
                 seq.computed_token_num += seq.to_compute_token_num
                 if seq.computed_prompt():
@@ -76,7 +80,7 @@ class PPScheduler():
                     self.seqs_to_decode.appendleft(seq)
                 else:
                     self.seqs_to_prefill.appendleft(seq)
-            logger.info('after output process')
+            # logger.info('after output process')
             return ipc_package
         else:
             return None
@@ -100,13 +104,13 @@ class PPScheduler():
             
     def schedule_once(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
-            logger.info('before schedule')
+            # logger.info('before schedule')
             schedule_seqs = self.schedule() if not self.use_naive_schedule else self.schedule_naive()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
-            return schedule_seqs
+            return schedule_seqs, self.event
         else: 
-            return []
+            return [], None
 
     def schedule_naive(self):
         schedule_prefill_seqs = []
