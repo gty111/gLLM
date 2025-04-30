@@ -32,14 +32,10 @@ class InputData():
         self.block_table = self.get_block_table()
         self.max_query_len, self.query_start_loc = self.get_query_len_loc()
         self.slot_mapping_tensor = self.get_slot_mapping()
-        # wait future tokens
-        # logger.info('before event syn')
+        # wait future tokens (only used for single gpu)
         if event is not None:
             event.synchronize()
-        # logger.info('after event syn')
         self.tokens = self.get_tokens()
-        # logger.info('after input data')
-
         assert self.tokens.shape == self.positions.shape
 
     def get_tokens(self):

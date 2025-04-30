@@ -126,25 +126,20 @@ class Worker:
     def process_output(self):
         ipc_package = self.pp_scheduler.process_output()
         if ipc_package is not None:
-            # logger.info('before send ipc package')
             self.comm.send_output(ipc_package)
         
     def schedule_forward(self):
         schedule_seqs, event = self.pp_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
-            # logger.info('before inputdata')
             input_data = InputData(
                 schedule_seqs, self.model_runner.memory_manager, event)
             if self.pp_size > 1:
                 self.comm.send_schedule(schedule_seqs)
-            # logger.info('before step once')
             output = self.model_runner.step_once(input_data)
-            # logger.info('after step once')
             if self.pp_size != 1:
                 send_pp_data(output, self.get_pp_next_rank())
             else:
                 self.pp_scheduler.add_next_tokens(output)
-            # logger.info('after add next tokens')
 
     def run_driver(self):
         self.recv_requests()

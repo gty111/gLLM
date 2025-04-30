@@ -61,7 +61,6 @@ class PPScheduler():
         
     def process_output(self):
         if len(self.next_tokens_queue) != 0:
-            # logger.info('before output process')
             schedule_seqs: List[Sequence] = self.batch_running.popleft()
             output = self.next_tokens_queue.popleft()
             if self.pp_size == 1:
@@ -84,7 +83,6 @@ class PPScheduler():
                     self.seqs_to_decode.appendleft(seq)
                 else:
                     self.seqs_to_prefill.appendleft(seq)
-            # logger.info('after output process')
             return ipc_package
         else:
             return None
@@ -108,7 +106,6 @@ class PPScheduler():
             
     def schedule_once(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
-            # logger.info('before schedule')
             schedule_seqs = self.schedule() if not self.use_naive_schedule else self.schedule_naive()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)

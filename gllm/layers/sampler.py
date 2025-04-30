@@ -20,15 +20,12 @@ class Sampler():
         # q.exponential_()
         # return probs.div_(q).argmax(dim=1).cpu().numpy().tolist()
         
-        # Note: we do not synchronize the result to cpu here
-        # logger.info('before mult')
+        # Note: we may not synchronize the result to cpu here
         non_blocking = get_pp_size() == 1 
         next_tokens = torch.multinomial(probs, 1).squeeze(1).to('cpu',non_blocking=non_blocking)
         if non_blocking:
             event = torch.cuda.Event(interprocess=True)
             event.record()
-        # event.synchronize()
-        # logger.info('after mult')
             return next_tokens, event
         else:
             return next_tokens.numpy().tolist()
