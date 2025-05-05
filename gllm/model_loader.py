@@ -1,6 +1,5 @@
 import glob
 import torch
-import time
 
 from safetensors import safe_open
 from transformers import AutoConfig, GenerationConfig
@@ -14,7 +13,6 @@ from gllm.models.qwen2_moe import Qwen2MoeForCausalLM
 from gllm.models.qwen3 import Qwen3ForCausalLM
 from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.utils import get_lock
-from gllm.dist_utils import get_pp_rank
 
 
 class ModelLoader():

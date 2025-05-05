@@ -3,7 +3,6 @@ import torch.nn.functional as F
 
 from typing import Optional
 from torch import nn
-from logger import logger
 
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe.fused_moe_triton.layer import FusedMoE
