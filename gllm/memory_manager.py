@@ -39,8 +39,7 @@ class MemoryManager():
             dist.all_gather_object(num_pages_all, num_pages)
             self.num_pages = min(num_pages_all)
 
-        if get_pp_rank() == 0:
-            logger.info(f'Allocate {self.num_pages} pages ({self.page_size} tokens/page)')
+        logger.info(f'Allocate {self.num_pages} pages ({self.page_size} tokens/page)')
 
         self.segment = Segment(self.num_layers, self.num_pages,
                                self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)

@@ -1,7 +1,7 @@
 
 #include <torch/all.h>
 #include "ops.h"
-#include "registration.h"
+#include "core/registration.h"
 
 // #include <torch/library.h>
 

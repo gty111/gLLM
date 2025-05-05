@@ -13,8 +13,10 @@ import tqdm
 
 from logger import logger
 from functools import partial
-from typing import Awaitable, Callable, ParamSpec, TypeVar, Union, Optional
+from typing import (Awaitable, Callable, ParamSpec, TypeVar, Union, Optional, Dict, Any,
+                    List)
 from pathlib import Path
+from torch.library import Library
 
 P = ParamSpec('P')
 K = TypeVar("K")
@@ -106,3 +108,72 @@ def get_lock(model_name_or_path: Union[str, Path],
 def get_model_load_pbar(num_totals):
     return tqdm.tqdm(total=num_totals,ncols=100,
                     bar_format='Loading model weights ... {l_bar}{bar}{r_bar}')
+    
+def set_weight_attrs(
+    weight: torch.Tensor,
+    weight_attrs: Optional[Dict[str, Any]],
+):
+    """Set attributes on a weight tensor.
+
+    This method is used to set attributes on a weight tensor. This method
+    will not overwrite existing attributes.
+
+    Args:
+        weight: The weight tensor.
+        weight_attrs: A dictionary of attributes to set on the weight tensor.
+    """
+    if weight_attrs is None:
+        return
+    for key, value in weight_attrs.items():
+        assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
+        setattr(weight, key, value)
+
+gllm_lib = Library("gllm", "FRAGMENT")  # noqa
+ 
+def direct_register_custom_op(
+    op_name: str,
+    op_func: Callable,
+    mutates_args: List[str],
+    fake_impl: Optional[Callable] = None,
+    target_lib: Optional[Library] = None,
+):
+    """
+    `torch.library.custom_op` can have significant overhead because it
+    needs to consider complicated dispatching logic. This function
+    directly registers a custom op and dispatches it to the CUDA backend.
+    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
+    for more details.
+
+    By default, the custom op is registered to the vLLM library. If you
+    want to register it to a different library, you can pass the library
+    object to the `target_lib` argument.
+
+    IMPORTANT: the lifetime of the operator is tied to the lifetime of the
+    library object. If you want to bind the operator to a different library,
+    make sure the library object is alive when the operator is used.
+    """
+    import torch.library
+
+    if hasattr(torch.library, "infer_schema"):
+        schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
+    else:
+        # for pytorch 2.4
+        import torch._custom_op.impl
+
+        schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
+
+    my_lib = target_lib or gllm_lib
+    my_lib.define(op_name + schema_str)
+    my_lib.impl(op_name, op_func, "CUDA")
+    if fake_impl is not None:
+        my_lib._register_fake(op_name, fake_impl)
+        
+def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda.get_device_name(device_id)
+    
+def round_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+def ceil_div(a, b):
+    return (a + b - 1) // b

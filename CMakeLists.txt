@@ -127,6 +127,30 @@ define_gpu_extension_target(
   USE_SABI 3
   WITH_SOABI)
 
+#
+# _moe_C extension
+#
+
+set(VLLM_MOE_EXT_SRC
+  "csrc/moe/torch_bindings.cpp"
+  "csrc/moe/moe_align_sum_kernels.cu"
+  "csrc/moe/topk_softmax_kernels.cu")
+
+set_gencode_flags_for_srcs(
+  SRCS "${VLLM_MOE_EXT_SRC}"
+  CUDA_ARCHS "${CUDA_ARCHS}")
+
+message(STATUS "Enabling moe extension.")
+define_gpu_extension_target(
+  _moe_C
+  DESTINATION gllm
+  LANGUAGE ${VLLM_GPU_LANG}
+  SOURCES ${VLLM_MOE_EXT_SRC}
+  COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+  ARCHITECTURES ${VLLM_GPU_ARCHES}
+  USE_SABI 3
+  WITH_SOABI)
+
 
 
 # vLLM flash attention requires VLLM_GPU_ARCHES to contain the set of target

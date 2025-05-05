@@ -1,16 +1,11 @@
 import torch
 
-from typing import Optional
 from torch import nn
 
-from gllm.layers.activation import SiluAndMul
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
-from gllm.layers.sampler import Sampler
 from gllm.input_data import InputData
-from gllm.dist_utils import get_pp_layers, get_pp_size, get_pp_rank, get_local_rank
-from gllm.utils import get_model_load_pbar
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
@@ -31,9 +26,8 @@ class Qwen3Attention(nn.Module):
         self.qkv_bias = getattr(config, 'attention_bias', False)
         
         self.qkv_proj = nn.Linear(
-            self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=self.qkv_bias, dtype=config.torch_dtype, device='cuda')
-        self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size,
-                                bias=False, dtype=config.torch_dtype, device='cuda')
+            self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=self.qkv_bias)
+        self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim, config.max_position_embeddings, self.rope_theta, True, config.torch_dtype)
         self.attn = FlashAttention(
