@@ -18,9 +18,9 @@ class Qwen2MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.gate_up_proj = nn.Linear(config.hidden_size, config.intermediate_size
-                                      * 2, bias=False, dtype=config.torch_dtype, device='cuda')
+                                      * 2, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size,
-                                   bias=False, dtype=config.torch_dtype, device='cuda')
+                                   bias=False)
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -38,13 +38,13 @@ class Qwen2Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = getattr(config,'rope_theta',10000)
+        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.qkv_proj = nn.Linear(
-            self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=True, dtype=config.torch_dtype, device='cuda')
-        self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size,
-                                bias=False, dtype=config.torch_dtype, device='cuda')
+            self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=True)
+        self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim, config.max_position_embeddings, self.rope_theta, True, config.torch_dtype)
+            self.head_dim, self.head_dim, self.max_position_embeddings, self.rope_theta, True, config.torch_dtype)
         self.attn = FlashAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
 
@@ -88,7 +88,7 @@ class Qwen2Model(nn.Module):
         super().__init__()
         if get_pp_rank() == 0 or config.tie_word_embeddings and get_pp_rank() == get_pp_size() - 1:
             self.embed_tokens = nn.Embedding(
-                config.vocab_size, config.hidden_size, dtype=config.torch_dtype, device='cuda')
+                config.vocab_size, config.hidden_size)
         self.start_layer, self.end_layer = get_pp_layers(
             config.num_hidden_layers)
         
@@ -127,13 +127,12 @@ class Qwen2ForCausalLM(nn.Module):
         self.ret_residual = True
         if get_pp_rank() == get_pp_size() - 1:
             if config.tie_word_embeddings:
-                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, 
-                                         dtype=config.torch_dtype, device='cuda', bias=False)
+                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
                 self.lm_head.weight = self.model.embed_tokens.weight
             else:
                 self.lm_head = nn.Linear(
                     config.hidden_size, config.vocab_size, 
-                    bias=False, dtype=config.torch_dtype, device='cuda')
+                    bias=False)
         self.sampler = Sampler()
     
     def forward(self, input_data: InputData, hidden_states=None, residual=None):

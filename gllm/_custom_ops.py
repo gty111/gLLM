@@ -1,9 +1,15 @@
 import torch
+import contextlib
 
 try:
     import gllm._C
 except ImportError as e:
     print(e)
+    
+supports_moe_ops = False
+with contextlib.suppress(ImportError):
+    import gllm._moe_C  # noqa: F401
+    supports_moe_ops = True
 
 # cache ops
 def reshape_and_cache_flash(
@@ -52,3 +58,25 @@ def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
 def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
                        weight: torch.Tensor, epsilon: float) -> None:
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
+
+def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+                 token_expert_indicies: torch.Tensor,
+                 gating_output: torch.Tensor) -> None:
+    torch.ops._moe_C.topk_softmax(topk_weights, topk_ids,
+                                  token_expert_indicies, gating_output)
+
+def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,
+                         block_size: int, sorted_token_ids: torch.Tensor,
+                         experts_ids: torch.Tensor,
+                         num_tokens_post_pad: torch.Tensor) -> None:
+    torch.ops._moe_C.moe_align_block_size(topk_ids, num_experts, block_size,
+                                          sorted_token_ids, experts_ids,
+                                          num_tokens_post_pad)
+
+def sgl_moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,
+                             block_size: int, sorted_token_ids: torch.Tensor,
+                             experts_ids: torch.Tensor,
+                             num_tokens_post_pad: torch.Tensor) -> None:
+    torch.ops._moe_C.sgl_moe_align_block_size(topk_ids, num_experts,
+                                              block_size, sorted_token_ids,
+                                              experts_ids, num_tokens_post_pad)

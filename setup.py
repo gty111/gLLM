@@ -308,6 +308,7 @@ def get_requirements() -> List[str]:
 ext_modules = []
 
 ext_modules.append(CMakeExtension(name="gllm._C"))
+ext_modules.append(CMakeExtension(name="gllm._moe_C"))
 ext_modules.append(
     CMakeExtension(name="gllm.vllm_flash_attn.vllm_flash_attn_c"))
 

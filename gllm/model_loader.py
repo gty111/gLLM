@@ -1,17 +1,20 @@
 import glob
 import torch
-import sys
+import time
 
-from logger import logger
 from safetensors import safe_open
 from transformers import AutoConfig, GenerationConfig
 from huggingface_hub import snapshot_download
+from logger import logger
 
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.qwen2 import Qwen2ForCausalLM
+from gllm.models.qwen2_moe import Qwen2MoeForCausalLM
 from gllm.models.qwen3 import Qwen3ForCausalLM
+from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.utils import get_lock
+from gllm.dist_utils import get_pp_rank
 
 
 class ModelLoader():
@@ -94,16 +97,23 @@ class ModelLoader():
             model_type = Qwen2ForCausalLM
         elif self.architecture == 'Qwen3ForCausalLM':
             model_type = Qwen3ForCausalLM
+        elif self.architecture == 'Qwen2MoeForCausalLM':
+            model_type = Qwen2MoeForCausalLM
+        elif self.architecture == 'Qwen3MoeForCausalLM':
+            model_type = Qwen3MoeForCausalLM
         else:
-            logger.error(f'Unsupported model: {self.architecture}')
-            sys.exit(0)
+            raise Exception(f'Unsupported model: {self.architecture}')
+        
+        logger.info(f'Model architecture: {self.architecture}')
         return model_type
 
     def load_model(self, mp_load_progress=None):
         model_type = self.get_model_type()
+        torch.set_default_dtype(self.dtype)
         
         if self.load_format == 'auto':
             self.load_weights()
+            torch.set_default_device('cuda')
             model = model_type(self.config)
             model.load_weights(self.weights,mp_load_progress)
             return model

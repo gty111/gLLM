@@ -16,7 +16,7 @@ class RMSNorm(nn.Module):
         self.variance_size_override = None
         self.hidden_size = hidden_size
         self.weight = nn.Parameter(torch.ones(
-            hidden_size, dtype=dtype, device='cuda'))
+            hidden_size, dtype=dtype))
         self.has_weight = True
         
     def forward(
