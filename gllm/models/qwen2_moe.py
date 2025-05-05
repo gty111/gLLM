@@ -3,6 +3,7 @@ import torch.nn.functional as F
 
 from typing import Optional
 from torch import nn
+from logger import logger
 
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -30,7 +31,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                               bias=False)
         
         if getattr(config, 'shared_expert_intermediate_size', 0) > 0:
-            self.shared_expert = Qwen2MoeMLP(config)
+            self.shared_expert = Qwen2MoeMLP(config, shared_expert=True)
         else:
             self.shared_expert = None
         if hasattr(config, 'shared_expert_intermediate_size'):
@@ -132,6 +133,7 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // num_attn_heads)
         num_kv_heads = self.config.num_key_value_heads
         intermediate_size = self.config.moe_intermediate_size
+        shared_expert_intermediate_size = getattr(self.config, 'shared_expert_intermediate_size', None)
         for k, v in parameters.items():
             # resolve PP layer
             if 'layers' in k:
@@ -152,15 +154,18 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                        num_kv_heads)*head_dim] = weights[k.replace('qkv_proj', 'k_proj')]
                 v.data[(num_attn_heads +
                        num_kv_heads)*head_dim:] = weights[k.replace('qkv_proj', 'v_proj')]
-            elif k.find('w13_weight') != -1:
+            elif k.find('w13_weight') != -1: # expert
                 for expert_idx in range(self.config.num_experts):
                     v.data[expert_idx, :intermediate_size, :] = weights[k.replace(
                         'w13_weight', f'{expert_idx}.gate_proj.weight')]
                     v.data[expert_idx, intermediate_size:, :] = weights[k.replace(
                         'w13_weight', f'{expert_idx}.up_proj.weight')]
-            elif k.find('w2_weight') != -1:
+            elif k.find('w2_weight') != -1: # expert
                 for expert_idx in range(self.config.num_experts):
                     v.data[expert_idx].copy_(weights[k.replace('w2_weight', f'{expert_idx}.down_proj.weight')])
+            elif k.find('gate_up_proj') != -1: # shared_expert
+                v.data[:shared_expert_intermediate_size, :] = weights[k.replace('gate_up_proj','gate_proj')]
+                v.data[shared_expert_intermediate_size:, :] = weights[k.replace('gate_up_proj','up_proj')]
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
