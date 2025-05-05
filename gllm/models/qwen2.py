@@ -15,11 +15,15 @@ from gllm.utils import get_model_load_pbar
 
 class Qwen2MLP(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, shared_expert=False):
         super().__init__()
-        self.gate_up_proj = nn.Linear(config.hidden_size, config.intermediate_size
+        if not shared_expert:
+            intermediate_size = config.intermediate_size
+        else:
+            intermediate_size = config.shared_expert_intermediate_size
+        self.gate_up_proj = nn.Linear(config.hidden_size, intermediate_size
                                       * 2, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size,
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size,
                                    bias=False)
         self.act_fn = SiluAndMul()
 
