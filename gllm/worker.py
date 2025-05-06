@@ -47,7 +47,7 @@ class Worker:
         
         init_dist(self.pp_size, self.local_rank, self.pp_rank, self.master_addr, 
                   self.master_port, self.assigned_layers)
-        torch.cuda.set_device(f'cuda:{self.pp_rank}')
+        torch.cuda.set_device(f'cuda:{self.local_rank}')
         
         self.comm.init()
         

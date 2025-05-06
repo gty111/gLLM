@@ -117,5 +117,6 @@ class ModelLoader():
             return model
         else:
             assert self.load_format == 'dummy'
+            torch.set_default_device('cuda')
             model = model_type(self.config)
             return model
