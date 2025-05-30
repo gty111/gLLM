@@ -9,7 +9,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
 from gllm.input_data import InputData
-from gllm.dist_utils import get_pp_layers, get_pp_size, get_pp_rank, get_local_rank
+from gllm.dist_utils import get_pp_layers, get_pp_size, get_pp_rank, get_local_rank, is_pp_last_rank
 from gllm.utils import get_model_load_pbar
 
 
@@ -71,7 +71,9 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_data: InputData, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]):
+    def forward(self, input_data: InputData, 
+                hidden_states: torch.Tensor, 
+                residual: Optional[torch.Tensor]):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -90,7 +92,7 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     def __init__(self, config, decoder_layer_type=Qwen2DecoderLayer):
         super().__init__()
-        if get_pp_rank() == 0 or config.tie_word_embeddings and get_pp_rank() == get_pp_size() - 1:
+        if get_pp_rank() == 0 or config.tie_word_embeddings and is_pp_last_rank():
             self.embed_tokens = nn.Embedding(
                 config.vocab_size, config.hidden_size)
         self.start_layer, self.end_layer = get_pp_layers(
@@ -100,7 +102,7 @@ class Qwen2Model(nn.Module):
             decoder_layer_type(i-self.start_layer, config)
             for i in range(self.start_layer, self.end_layer)
         ])
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             self.norm = RMSNorm(
                 config.hidden_size, config.rms_norm_eps)
 
@@ -111,7 +113,7 @@ class Qwen2Model(nn.Module):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 input_data, hidden_states, residual)
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             hidden_states, _ = self.norm(hidden_states, residual)
             return hidden_states
         else:
@@ -129,7 +131,7 @@ class Qwen2ForCausalLM(nn.Module):
         self.model = model_type(config)
         self.num_layers = len(self.model.layers)
         self.ret_residual = True
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             if config.tie_word_embeddings:
                 self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
                 self.lm_head.weight = self.model.embed_tokens.weight

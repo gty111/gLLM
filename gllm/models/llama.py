@@ -9,7 +9,7 @@ from gllm.layers.rotary_embedding import RotaryEmbedding, LinearScalingRotaryEmb
 from gllm.layers.attention import FlashAttention
 from gllm.input_data import InputData
 from gllm.layers.sampler import Sampler
-from gllm.dist_utils import get_pp_layers, get_pp_rank, get_pp_size, get_local_rank
+from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank
 from gllm.utils import get_model_load_pbar
 
 
@@ -129,7 +129,7 @@ class LlamaModel(nn.Module):
         if get_pp_rank() == 0:
             self.embed_tokens = nn.Embedding(
                 config.vocab_size, config.hidden_size)
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             self.norm = RMSNorm(
                 config.hidden_size, config.rms_norm_eps)
 
@@ -139,7 +139,7 @@ class LlamaModel(nn.Module):
         for layer in self.layers:
             hidden_states, residual = layer(
                 input_data, hidden_states, residual)
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             hidden_states, _ = self.norm(hidden_states, residual)
             return hidden_states
         else:
@@ -157,7 +157,7 @@ class LlamaForCausalLM(nn.Module):
         self.num_layers = len(self.model.layers)
         self.config = config
         self.ret_residual = True
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             self.lm_head = nn.Linear(
                 config.hidden_size, config.vocab_size, bias=False)
         self.sampler = Sampler()
