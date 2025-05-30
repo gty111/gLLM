@@ -25,7 +25,7 @@ class GLMAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim // 2, config.seq_length, getattr(config,'rope_theta',10000), False, config.torch_dtype)
+            self.head_dim, self.head_dim // 2, config.seq_length, getattr(config,'rope_theta',10000), False)
         self.attn = FlashAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
 
@@ -33,9 +33,9 @@ class GLMAttention(nn.Module):
         self.qkv_hidden_size = self.projection_size + 2 * \
             self.head_dim * config.multi_query_group_num
         self.query_key_value = nn.Linear(self.hidden_size, self.qkv_hidden_size,
-                                         bias=config.add_bias_linear or config.add_qkv_bias, dtype=config.torch_dtype, device='cuda')
+                                         bias=config.add_bias_linear or config.add_qkv_bias)
         self.dense = nn.Linear(self.projection_size, self.hidden_size,
-                               bias=config.add_bias_linear, dtype=config.torch_dtype, device='cuda')
+                               bias=config.add_bias_linear)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.query_key_value(hidden_states)
@@ -51,10 +51,10 @@ class GLMMLP(nn.Module):
         super().__init__()
         self.add_bias = config.add_bias_linear
         self.dense_h_to_4h = nn.Linear(
-            config.hidden_size, config.ffn_hidden_size*2, bias=self.add_bias, dtype=config.torch_dtype, device='cuda')
+            config.hidden_size, config.ffn_hidden_size*2, bias=self.add_bias)
         self.activation_func = SiluAndMul()
         self.dense_4h_to_h = nn.Linear(
-            config.ffn_hidden_size, config.hidden_size, bias=self.add_bias, dtype=config.torch_dtype, device='cuda')
+            config.ffn_hidden_size, config.hidden_size, bias=self.add_bias)
 
     def forward(self, hidden_states):
         # [s, b, 4hp]
@@ -73,13 +73,13 @@ class GLMBlock(nn.Module):
 
         assert config.rmsnorm
         self.input_layernorm = RMSNorm(
-            config.hidden_size, config.layernorm_epsilon, config.torch_dtype)
+            config.hidden_size, config.layernorm_epsilon)
 
         self.self_attention = GLMAttention(layer_id, config)
         self.hidden_dropout = config.hidden_dropout
 
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, config.layernorm_epsilon, config.torch_dtype)
+            config.hidden_size, config.layernorm_epsilon)
 
         self.mlp = GLMMLP(config)
 
@@ -127,7 +127,7 @@ class GLMTransformer(nn.Module):
                 assert config.rmsnorm
                 layer_norm_func = RMSNorm
                 self.final_layernorm = layer_norm_func(
-                    config.hidden_size, config.layernorm_epsilon, config.torch_dtype)
+                    config.hidden_size, config.layernorm_epsilon)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         for layer in self.layers:
@@ -145,14 +145,14 @@ class ChatGLMModel(nn.Module):
         super().__init__()
 
         self.embedding = nn.Embedding(
-            config.padded_vocab_size, config.hidden_size, dtype=config.torch_dtype, device='cuda')
+            config.padded_vocab_size, config.hidden_size)
 
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
 
         self.encoder = GLMTransformer(config)
         self.output_layer = nn.Linear(
-            config.hidden_size, config.padded_vocab_size, bias=False, dtype=config.torch_dtype, device='cuda')
+            config.hidden_size, config.padded_vocab_size, bias=False)
 
     def forward(self, input_data: InputData, hidden_states=None):
         if get_pp_rank() == 0:
@@ -169,7 +169,6 @@ class ChatGLMForCausalLM(nn.Module):
 
         self.config = config
         self.max_model_len = config.seq_length
-        self.dtype = config.torch_dtype
         self.num_kv_heads = config.multi_query_group_num
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.transformer = ChatGLMModel(config)

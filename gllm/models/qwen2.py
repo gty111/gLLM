@@ -48,7 +48,7 @@ class Qwen2Attention(nn.Module):
             self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim, self.max_position_embeddings, self.rope_theta, True, config.torch_dtype)
+            self.head_dim, self.head_dim, self.max_position_embeddings, self.rope_theta, True)
         self.attn = FlashAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
 
@@ -67,9 +67,9 @@ class Qwen2DecoderLayer(nn.Module):
         self.self_attn = attention_type(layer_id, config)
         self.mlp = mlp_type(config)
         self.input_layernorm = RMSNorm(
-            config.hidden_size, config.rms_norm_eps, config.torch_dtype)
+            config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, config.rms_norm_eps, config.torch_dtype)
+            config.hidden_size, config.rms_norm_eps)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]):
         if residual is None:
@@ -102,7 +102,7 @@ class Qwen2Model(nn.Module):
         ])
         if get_pp_rank() == get_pp_size() - 1:
             self.norm = RMSNorm(
-                config.hidden_size, config.rms_norm_eps, config.torch_dtype)
+                config.hidden_size, config.rms_norm_eps)
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         if get_pp_rank() == 0:

@@ -15,7 +15,6 @@ class RotaryEmbedding(nn.Module):
         max_position_embeddings: int,
         base: float,
         is_neox_style: bool,
-        dtype,
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -26,7 +25,7 @@ class RotaryEmbedding(nn.Module):
 
         cache = self._compute_cos_sin_cache()
 
-        cache = cache.to(dtype=dtype,device='cuda')
+        cache = cache.to(dtype=torch.get_default_dtype())
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base):
@@ -84,14 +83,13 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         max_position_embeddings: int,
         base: int,
         is_neox_style: bool,
-        scaling_factors: Union[List[float], float],
-        dtype: torch.dtype,
+        scaling_factors: Union[List[float], float]
     ) -> None:
         if isinstance(scaling_factors, float):
             scaling_factors = [scaling_factors]
         self.scaling_factors: List[float] = scaling_factors  # noqa
         super().__init__(head_size, rotary_dim, max_position_embeddings, base,
-                         is_neox_style, dtype)
+                         is_neox_style)
         # Lazy initialized.
         self._scaling_factor_to_offset: Dict[float, int]
 
@@ -142,7 +140,6 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         max_position_embeddings: int,
         base: int,
         is_neox_style: bool,
-        dtype: torch.dtype,
         scaling_factor: float,
         low_freq_factor: float,
         high_freq_factor: float,
@@ -153,7 +150,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         self.high_freq_factor = high_freq_factor
         self.orig_max_position = orig_max_position
         super().__init__(head_size, rotary_dim, max_position_embeddings, base,
-                         is_neox_style, dtype)
+                         is_neox_style)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         inv_freqs = super()._compute_inv_freq(base)

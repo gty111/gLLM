@@ -29,11 +29,11 @@ class Qwen3Attention(nn.Module):
             self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=self.qkv_bias)
         self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim, config.max_position_embeddings, self.rope_theta, True, config.torch_dtype)
+            self.head_dim, self.head_dim, config.max_position_embeddings, self.rope_theta, True)
         self.attn = FlashAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
-        self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps, config.torch_dtype)
-        self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps, config.torch_dtype)
+        self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.qkv_proj(hidden_states)

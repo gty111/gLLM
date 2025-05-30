@@ -20,14 +20,6 @@ class ModelLoader():
         self.model_path = model_path
         self.load_config()
         self.load_format = load_format
-        
-    def get_dtype(self, dtype: str):
-        if dtype == 'float16':
-            return torch.float16
-        elif dtype == 'bfloat16':
-            return torch.bfloat16
-        else:
-            assert 0
 
     def get_finish_tokens(self):
         return self.get_model_type().get_finish_tokens(self.config)
