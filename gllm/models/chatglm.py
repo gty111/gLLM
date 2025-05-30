@@ -9,7 +9,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
-from gllm.dist_utils import get_pp_layers, get_pp_rank, get_pp_size, get_local_rank
+from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank
 from gllm.utils import get_model_load_pbar
 
 
@@ -122,7 +122,7 @@ class GLMTransformer(nn.Module):
         self.layers = nn.ModuleList(
             [GLMBlock(i-self.start_layer, config) for i in range(self.start_layer, self.end_layer)])
 
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             if self.post_layer_norm:
                 assert config.rmsnorm
                 layer_norm_func = RMSNorm
@@ -133,7 +133,7 @@ class GLMTransformer(nn.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states, input_data)
         # Final layer norm.
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             if self.post_layer_norm:
                 hidden_states = self.final_layernorm(hidden_states)
 
@@ -174,7 +174,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.transformer = ChatGLMModel(config)
         self.num_layers = len(self.transformer.encoder.layers)
         self.ret_residual = False
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             self.lm_head = self.transformer.output_layer
         self.sampler = Sampler()
 

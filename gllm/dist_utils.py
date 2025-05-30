@@ -60,6 +60,9 @@ def get_pp_rank():
 def get_local_rank():
     return _LOCAL_RANK
 
+def is_pp_last_rank():
+    return get_pp_rank() == get_pp_size() - 1
+
 def get_pp_size():
     return _PP_SIZE
 

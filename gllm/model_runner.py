@@ -9,7 +9,7 @@ from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.dist_utils import get_pp_rank, get_pp_size
+from gllm.dist_utils import is_pp_last_rank
 
 
 class ModelRunner():
@@ -54,7 +54,7 @@ class ModelRunner():
     @torch.inference_mode()
     def step_once(self, input_data: InputData = None, hidden_states=None, residual=None):
         output = self.model(input_data, hidden_states, residual)
-        if get_pp_rank() == get_pp_size() - 1:
+        if is_pp_last_rank():
             logits = self.model.compute_logits(input_data, output)
             next_tokens = self.model.sample(input_data, logits)
             return next_tokens
