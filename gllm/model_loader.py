@@ -63,8 +63,8 @@ class ModelLoader():
                                                 allow_patterns=["*.safetensors", "*.bin"],
                                                 ignore_patterns=["original/**/*"])
                 return self.load_weights_from_local(cached_path)
-        except Exception:
-            return False
+        except Exception as e:
+            raise Exception(f'Failed to load {self.model_path} because of {e}!')
 
     def load_weights(self):
         self.weights = {}
