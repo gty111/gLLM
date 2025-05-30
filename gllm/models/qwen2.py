@@ -9,7 +9,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
 from gllm.input_data import InputData
-from gllm.dist_utils import get_pp_layers, get_pp_size, get_pp_rank, get_local_rank, is_pp_last_rank
+from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank
 from gllm.utils import get_model_load_pbar
 
 
@@ -32,7 +32,7 @@ class Qwen2MLP(nn.Module):
 
 
 class Qwen2Attention(nn.Module):
-    def __init__(self, layer_id: int, config):
+    def __init__(self, layer_id: int, config, qkv_bias=True):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -45,7 +45,7 @@ class Qwen2Attention(nn.Module):
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
         self.qkv_proj = nn.Linear(
-            self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=True)
+            self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=qkv_bias)
         self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size, bias=False)
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim, self.max_position_embeddings, self.rope_theta, True)
