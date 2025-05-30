@@ -163,3 +163,7 @@ python evaluations/evaluate_MMLU_pro.py --model $MODEL --port $PORT
       url={https://arxiv.org/abs/2504.14775}, 
 }
 ```
+
+## Acknowledgment
+
+We studied the architecture and implemented code reuse from these existing projects: [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [TD-Pipe]().
