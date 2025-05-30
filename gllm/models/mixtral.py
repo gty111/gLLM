@@ -1,0 +1,134 @@
+import torch
+import torch.nn.functional as F
+
+from typing import Optional, Dict
+from torch import nn
+
+from gllm.layers.layernorm import RMSNorm
+from gllm.layers.moe.fused_moe_triton.layer import FusedMoE
+from gllm.input_data import InputData
+from gllm.dist_utils import get_local_rank
+from gllm.utils import get_model_load_pbar
+
+from .qwen2 import Qwen2Attention
+from .qwen2 import Qwen2Model
+from .qwen2 import Qwen2ForCausalLM
+
+class MixtralMoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        self.hidden_size = config.hidden_size
+        self.experts = FusedMoE(num_experts=config.num_local_experts,
+                                top_k=config.num_experts_per_tok,
+                                hidden_size=self.hidden_size,
+                                intermediate_size=config.intermediate_size,
+                                reduce_results=True,
+                                renormalize=True)
+        self.gate = nn.Linear(config.hidden_size,
+                              config.num_local_experts,
+                              bias=False)
+        
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # NOTE: hidden_states can have either 1D or 2D shape.
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        final_hidden_states = self.experts(hidden_states=hidden_states,
+                                           router_logits=router_logits)
+
+        return final_hidden_states.view(orig_shape)
+
+class MixtralAttention(Qwen2Attention):
+    def __init__(self, layer_id, config):
+        super().__init__(layer_id, config, qkv_bias=False)
+
+class MixtralDecoderLayer(nn.Module):
+    
+    def __init__(self, layer_id, config):
+        super().__init__()
+        
+        self.self_attn = MixtralAttention(layer_id, config)
+        self.block_sparse_moe = MixtralMoE(config)
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                config.rms_norm_eps)
+    
+    def forward(self, input_data: InputData, 
+                hidden_states: torch.Tensor, 
+                residual: Optional[torch.Tensor]):
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+        hidden_states = self.self_attn(input_data, hidden_states)
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        hidden_states = self.block_sparse_moe(hidden_states)
+        return hidden_states, residual
+    
+
+class MixtralModel(Qwen2Model):
+    def __init__(self, config):
+        super().__init__(config, MixtralDecoderLayer)
+
+        
+class MixtralForCausalLM(Qwen2ForCausalLM):
+    def __init__(self, config):
+        super().__init__(config, MixtralModel)
+        
+    def load_weights(self, weights: Dict, mp_load_progress=None):
+        parameters = dict(self.named_parameters())
+        if mp_load_progress is not None:
+            mp_load_progress[get_local_rank()*2] = len(parameters)
+            mp_load_progress[get_local_rank()*2+1] = 0
+        else:
+            pbar = get_model_load_pbar(len(parameters))
+
+        num_attn_heads = self.config.num_attention_heads
+        head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // num_attn_heads)
+        num_kv_heads = self.config.num_key_value_heads
+        intermediate_size = self.config.intermediate_size
+        
+        for k, v in parameters.items():
+            # resolve PP layer
+            if 'layers' in k:
+                k_list = k.split('.')
+                k_list[2] = str(int(k_list[2])+self.model.start_layer)
+                k = '.'.join(k_list)
+            if k.find('self_attn.qkv_proj.weight') != -1:
+                v.data[:num_attn_heads*head_dim, :] = weights[k.replace(
+                    'qkv_proj', 'q_proj')]
+                v.data[num_attn_heads*head_dim:(num_attn_heads +
+                       num_kv_heads)*head_dim, :] = weights[k.replace('qkv_proj', 'k_proj')]
+                v.data[(num_attn_heads +
+                       num_kv_heads)*head_dim:, :] = weights[k.replace('qkv_proj', 'v_proj')]
+            elif k.find('self_attn.qkv_proj.bias') != -1:
+                v.data[:num_attn_heads*head_dim] = weights[k.replace(
+                    'qkv_proj', 'q_proj')]
+                v.data[num_attn_heads*head_dim:(num_attn_heads +
+                       num_kv_heads)*head_dim] = weights[k.replace('qkv_proj', 'k_proj')]
+                v.data[(num_attn_heads +
+                       num_kv_heads)*head_dim:] = weights[k.replace('qkv_proj', 'v_proj')]
+            elif k.find('w13_weight') != -1: # expert
+                for expert_idx in range(self.config.num_local_experts):
+                    v.data[expert_idx, :intermediate_size, :] = weights[k.replace(
+                        'w13_weight', f'{expert_idx}.w1.weight')]
+                    v.data[expert_idx, intermediate_size:, :] = weights[k.replace(
+                        'w13_weight', f'{expert_idx}.w3.weight')]
+            elif k.find('w2_weight') != -1: # expert
+                for expert_idx in range(self.config.num_local_experts):
+                    v.data[expert_idx].copy_(weights[k.replace('w2_weight', f'{expert_idx}.w2.weight')])
+            else:
+                v.data.copy_(weights[k])
+            if mp_load_progress is not None:
+                mp_load_progress[get_local_rank()*2+1] += 1
+            else:
+                pbar.update(1)
