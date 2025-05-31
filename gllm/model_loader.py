@@ -102,6 +102,8 @@ class ModelLoader():
 
     def load_model(self, mp_load_progress=None):
         model_type = self.get_model_type()
+        
+        logger.info(f'Set default dtype: {self.dtype}')
         torch.set_default_dtype(self.dtype)
         
         if self.load_format == 'auto':

@@ -6,7 +6,6 @@ from logger import logger
 
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
-from gllm.dist_utils import get_pp_rank
 
 
 class MemoryManager():
@@ -42,7 +41,7 @@ class MemoryManager():
         logger.info(f'Allocate {self.num_pages} pages ({self.page_size} tokens/page)')
 
         self.segment = Segment(self.num_layers, self.num_pages,
-                               self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)
+                               self.page_size, self.kv_head_num, self.kv_head_dim)
 
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping_tensor: torch.Tensor):
         from gllm import _custom_ops as ops
@@ -79,8 +78,7 @@ class Segment():
                  num_pages: int,
                  page_size: int,
                  kv_head_num: int,
-                 kv_head_dim: int,
-                 dtype: torch.dtype):
+                 kv_head_dim: int):
         self.num_layers = num_layers
         self.num_pages = num_pages
         self.page_size = page_size
@@ -88,9 +86,9 @@ class Segment():
         self.kv_head_dim = kv_head_dim
         # We don't need zero initialization here
         self.k_cache = [torch.ones(
-            (num_pages, page_size, kv_head_num, kv_head_dim), dtype=dtype, device='cuda') for _ in range(num_layers)]
+            (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
         self.v_cache = [torch.ones(
-            (num_pages, page_size, kv_head_num, kv_head_dim), dtype=dtype, device='cuda') for _ in range(num_layers)]
+            (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
         self.allocatorID = AllocatorID(0, num_pages-1)
 
     def allocate(self):
@@ -113,7 +111,7 @@ class PrefixMemoryManager(MemoryManager):
         super().__init__(*args, **kwargs)
 
         del self.segment
-        self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim, self.dtype)
+        self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim)
         
         # for prefill stage
         self.num_allocated_pages = 0
