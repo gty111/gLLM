@@ -9,7 +9,7 @@ from gllm.layers.rotary_embedding import RotaryEmbedding, LinearScalingRotaryEmb
 from gllm.layers.attention import FlashAttention
 from gllm.input_data import InputData
 from gllm.layers.sampler import Sampler
-from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank
+from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank, resolve_pp_layer
 from gllm.utils import get_model_load_pbar
 
 
@@ -187,11 +187,7 @@ class LlamaForCausalLM(nn.Module):
         num_kv_heads = self.config.num_key_value_heads
         intermediate_size = self.config.intermediate_size
         for k, v in parameters.items():
-            # resolve PP layer
-            if 'layers' in k:
-                k_list = k.split('.')
-                k_list[2] = str(int(k_list[2])+self.model.start_layer)
-                k = '.'.join(k_list)
+            k = resolve_pp_layer(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj') != -1:
                 v.data[:num_attn_heads*head_dim, :] = weights[k.replace(
                     'qkv_proj', 'q_proj')]
