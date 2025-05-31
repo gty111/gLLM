@@ -103,3 +103,12 @@ def get_pp_layers(num_layers):
                     ))
     
     return assigned_layers
+
+# Set the correct layer index
+def resolve_pp_layer(layer_name, idx, start_layer_idx):
+    if 'layers' in layer_name:
+        layer_name_list = layer_name.split('.')
+        layer_name_list[idx] = str(int(layer_name_list[idx])+start_layer_idx)
+        return '.'.join(layer_name_list)
+    else:
+        return layer_name

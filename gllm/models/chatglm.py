@@ -9,7 +9,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.sampler import Sampler
-from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank
+from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank, resolve_pp_layer
 from gllm.utils import get_model_load_pbar
 
 
@@ -198,11 +198,7 @@ class ChatGLMForCausalLM(nn.Module):
             pbar = get_model_load_pbar(len(parameters))
         
         for k, v in parameters.items():
-            # resolve PP layer
-            if 'layers' in k:
-                k_list = k.split('.')
-                k_list[3] = str(int(k_list[3])+self.transformer.encoder.start_layer)
-                k = '.'.join(k_list)
+            k = resolve_pp_layer(k, 3, self.transformer.encoder.start_layer)
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')
             v.data.copy_(weights[k])

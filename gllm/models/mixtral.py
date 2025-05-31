@@ -7,7 +7,7 @@ from torch import nn
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe.fused_moe_triton.layer import FusedMoE
 from gllm.input_data import InputData
-from gllm.dist_utils import get_local_rank
+from gllm.dist_utils import get_local_rank, resolve_pp_layer
 from gllm.utils import get_model_load_pbar
 
 from .qwen2 import Qwen2Attention
@@ -98,11 +98,7 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
         intermediate_size = self.config.intermediate_size
         
         for k, v in parameters.items():
-            # resolve PP layer
-            if 'layers' in k:
-                k_list = k.split('.')
-                k_list[2] = str(int(k_list[2])+self.model.start_layer)
-                k = '.'.join(k_list)
+            k = resolve_pp_layer(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
                 v.data[:num_attn_heads*head_dim, :] = weights[k.replace(
                     'qkv_proj', 'q_proj')]
