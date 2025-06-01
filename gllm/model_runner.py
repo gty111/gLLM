@@ -10,6 +10,7 @@ from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.dist_utils import is_pp_last_rank
+from gllm.layers.sampler import Sampler
 
 
 class ModelRunner():
@@ -29,6 +30,7 @@ class ModelRunner():
         self.kvthresh = kvthresh
         self.minp = minp
         self.iterp = iterp
+        self.sampler = Sampler()
 
         # lazy init
         self.model = None
@@ -56,7 +58,7 @@ class ModelRunner():
         output = self.model(input_data, hidden_states, residual)
         if is_pp_last_rank():
             logits = self.model.compute_logits(input_data, output)
-            next_tokens = self.model.sample(input_data, logits)
+            next_tokens = self.sampler.forward(logits, input_data)
             return next_tokens
         else:
             return output

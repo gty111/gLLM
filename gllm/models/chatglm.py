@@ -8,7 +8,6 @@ from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
-from gllm.layers.sampler import Sampler
 from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank, resolve_pp_layer
 from gllm.utils import get_model_load_pbar
 
@@ -176,7 +175,6 @@ class ChatGLMForCausalLM(nn.Module):
         self.ret_residual = False
         if is_pp_last_rank():
             self.lm_head = self.transformer.output_layer
-        self.sampler = Sampler()
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.transformer(input_data, hidden_states)
@@ -185,9 +183,6 @@ class ChatGLMForCausalLM(nn.Module):
         # fetch hidden_states of last token in each seq
         idx_list = input_data.query_start_loc - 1
         return self.lm_head(hidden_states[idx_list[1:]])
-
-    def sample(self, input_data: InputData, logits: torch.Tensor):
-        return self.sampler.forward(logits, input_data)
 
     def load_weights(self, weights, mp_load_progress):
         parameters = dict(self.named_parameters())
