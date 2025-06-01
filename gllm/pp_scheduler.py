@@ -21,7 +21,7 @@ class PPScheduler():
         self.iterp = iterp 
         self.page_size = page_size
         self.kvthresh = kvthresh
-        self.num_kvthresh_pages = self.kvthresh * self.memory_manager.get_num_free_pages()
+        self.num_kvthresh_pages = int(self.kvthresh * self.memory_manager.get_num_free_pages())
 
         # seqs to schedule
         self.seqs_to_prefill: deque[Sequence] = deque()
@@ -95,7 +95,7 @@ class PPScheduler():
             self.log_num_preempt_seqs = self.num_preempt_seqs
             logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}')
             logger.warning(
-                'Try increase --ratio-free-pages or the performance is poor!')
+                'Try increase --kvthresh or the performance is poor!')
             
     def schedule_once(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
