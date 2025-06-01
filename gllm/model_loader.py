@@ -96,24 +96,27 @@ class ModelLoader():
             model_type = MixtralForCausalLM
         else:
             raise Exception(f'Unsupported model: {self.architecture}')
-        
-        logger.info(f'Model architecture: {self.architecture}')
         return model_type
 
     def load_model(self, mp_load_progress=None):
         model_type = self.get_model_type()
         
-        logger.info(f'Set default dtype: {self.dtype}')
         torch.set_default_dtype(self.dtype)
         
+        # Load weights to CPU memory
         if self.load_format == 'auto':
             self.load_weights()
-            torch.set_default_device('cuda')
-            model = model_type(self.config)
+        
+        torch.set_default_device('cuda')
+        
+        # Init model whose weights are on GPU memory 
+        free_gpu_memory_before, _ = torch.cuda.mem_get_info()
+        model = model_type(self.config)
+        free_gpu_memory_after, _ = torch.cuda.mem_get_info()
+        model_size_gb = round((free_gpu_memory_before - free_gpu_memory_after)/(2**30),2)
+        logger.info(f'Model architecture: {self.architecture}, Default dtype: {self.dtype}, Load model weights {model_size_gb} GB')
+        
+        # Load weights from CPU memory to GPU memory 
+        if self.load_format == 'auto':
             model.load_weights(self.weights,mp_load_progress)
-            return model
-        else:
-            assert self.load_format == 'dummy'
-            torch.set_default_device('cuda')
-            model = model_type(self.config)
-            return model
+        return model

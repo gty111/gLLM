@@ -54,8 +54,10 @@ def init_dist(pp_size, local_rank, pp_rank, master_addr, master_port, assigned_l
     _LOCAL_RANK = local_rank
     _PP_SIZE = pp_size
     _ASSIGNED_LAYERS = assigned_layers
-    dist.init_process_group(init_method=f'tcp://{master_addr}:{master_port}', 
-                        backend='nccl', world_size=pp_size, rank=pp_rank)
+    init_method = f'tcp://{master_addr}:{master_port}'
+    backend = 'nccl'
+    logger.info(f'NCCL: Init_method {init_method}, Backend {backend}, Word_size {pp_size}')
+    dist.init_process_group(init_method=init_method, backend=backend, world_size=pp_size, rank=pp_rank)
 
 def get_pp_layers(num_layers):
     if _ASSIGNED_LAYERS is None:
@@ -74,11 +76,11 @@ def get_pp_layers(num_layers):
         assigned_layers = [sum(total_assigned_layers[:get_pp_rank()]), sum(total_assigned_layers[:get_pp_rank()+1])]
     
     if get_pp_size() > 1:
-        logger.info('Assigned layers: (%3d,%3d) #total: %2d'%
+        logger.info('Assigned %2d layers: (%3d,%3d)'%
                     (
+                        assigned_layers[1]-assigned_layers[0],
                         assigned_layers[0],
                         assigned_layers[1]-1,
-                        assigned_layers[1]-assigned_layers[0]
                     ))
     
     return assigned_layers

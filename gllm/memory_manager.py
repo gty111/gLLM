@@ -6,6 +6,7 @@ from logger import logger
 
 from gllm.allocatorID import AllocatorID
 from gllm.sequence import Sequence
+from gllm.utils import get_dtype_bytes
 
 
 class MemoryManager():
@@ -24,25 +25,28 @@ class MemoryManager():
         self.dtype = dtype
         self.vocab_size = vocab_size
 
+        free_mem_size, _ = torch.cuda.mem_get_info()
+        num_max_pages = free_mem_size // self.get_sizeof_KV_per_page()
+        num_pages = int(num_max_pages * gpu_memory_util)
+        
         if not dist.is_initialized():
-            free_mem_size, _ = torch.cuda.mem_get_info()
-            num_max_pages = free_mem_size // (
-                2*num_layers*page_size*kv_head_num*kv_head_dim*2)
-            self.num_pages = int(num_max_pages * gpu_memory_util)
+            self.num_pages = num_pages
         else:
-            free_mem_size, _ = torch.cuda.mem_get_info()
-            num_max_pages = free_mem_size // (
-                2*num_layers*page_size*kv_head_num*kv_head_dim*2)
-            num_pages = int(num_max_pages * gpu_memory_util)
             num_pages_all = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(num_pages_all, num_pages)
             self.num_pages = min(num_pages_all)
 
-        logger.info(f'Allocate {self.num_pages} pages ({self.page_size} tokens/page)')
+        logger.info(f'KV cache: {self.num_pages} pages ({self.page_size} tokens/page), '
+                    f'{round(self.get_sizeof_KV_per_page()/(2**10*self.page_size),2)} KB (per token), '
+                    f'{round(self.num_pages*self.get_sizeof_KV_per_page()/(2**30),2)} GB (total)')
 
         self.segment = Segment(self.num_layers, self.num_pages,
                                self.page_size, self.kv_head_num, self.kv_head_dim)
 
+    def get_sizeof_KV_per_page(self): # Bytes
+        # 2: K cache and V cache 
+        return  2 * self.num_layers * self.page_size * self.kv_head_num * self.kv_head_dim * get_dtype_bytes(self.dtype)  
+    
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping_tensor: torch.Tensor):
         from gllm import _custom_ops as ops
         ops.reshape_and_cache_flash(k_cache,
