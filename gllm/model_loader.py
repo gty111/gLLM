@@ -96,14 +96,12 @@ class ModelLoader():
             model_type = MixtralForCausalLM
         else:
             raise Exception(f'Unsupported model: {self.architecture}')
-        
-        logger.info(f'Model architecture: {self.architecture}')
         return model_type
 
     def load_model(self, mp_load_progress=None):
         model_type = self.get_model_type()
         
-        logger.info(f'Set default dtype: {self.dtype}')
+        logger.info(f'Model architecture: {self.architecture}, Default dtype: {self.dtype}')
         torch.set_default_dtype(self.dtype)
         
         if self.load_format == 'auto':

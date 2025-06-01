@@ -72,7 +72,7 @@ class Worker:
 
         self.mp_alive[self.local_rank] = 1
 
-        logger.info(f'Init')
+        logger.info(f'Initialization complete')
 
     def recv_schedule_seqs(self):
         seqs = self.comm.recv_schedule()
