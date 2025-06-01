@@ -52,7 +52,6 @@ class Worker:
         self.comm.init()
         
         self.model_runner.init(self.mp_load_progress)
-        self.dtype = self.model_runner.memory_manager.dtype
         self.hidden_size = self.model_runner.model_loader.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual
         
@@ -85,7 +84,7 @@ class Worker:
         if len(self.schedule_queue) != 0:
             input_data = self.schedule_queue.popleft()
             intermediate_data = recv_pp_data(
-                self.get_pp_last_rank(), self.dtype,
+                self.get_pp_last_rank(),
                 [input_data.tokens.shape[0], self.hidden_size], self.ret_residual)
             self.run_queue.append((input_data, intermediate_data))
 
