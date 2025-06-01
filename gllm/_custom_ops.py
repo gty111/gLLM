@@ -52,6 +52,8 @@ def batched_rotary_embedding(positions: torch.Tensor, query: torch.Tensor,
 # layer norm ops
 def rms_norm(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
              epsilon: float) -> None:
+    # TODO: Remove this contiguous call when the kernel is updated to support non-contiguous input
+    input = input.contiguous()
     torch.ops._C.rms_norm(out, input, weight, epsilon)
 
 
