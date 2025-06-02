@@ -28,6 +28,8 @@ class Sequence():
         # used for prefix cache and chunked prefill
         self.computed_token_num = 0
         self.to_compute_token_num = 0
+        # used for abort
+        self.is_abort = False
 
     def detokenize_inc(self, tokenizer: Union[PreTrainedTokenizer | PreTrainedTokenizerFast]):
         added_space = ' ' if ' ' in tokenizer.decode(

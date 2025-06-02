@@ -108,12 +108,12 @@ class zmqComm:
         else:
             return None
 
-    def send_schedule(self, seqs):
+    def send_schedule_seqs(self, seqs):
         seqs_bytes = pickle.dumps(seqs)
         for socket in self.schedule_sockets:
             socket.send(seqs_bytes, copy=False)
 
-    def recv_schedule(self):
+    def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
             seqs = pickle.loads(recv_bytes)
@@ -121,11 +121,11 @@ class zmqComm:
         else:
             return None
 
-    def send_requests(self, ipc_package):
+    def send_ipc_package(self, ipc_package):
         ipc_bytes = pickle.dumps(ipc_package)
         self.request_socket.send(ipc_bytes, copy=False)
 
-    def recv_requests(self):
+    def recv_ipc_package(self):
         if self.request_socket.poll(timeout=0) != 0:
             recv_bytes = self.request_socket.recv(copy=False)
             ipc_package = pickle.loads(recv_bytes)

@@ -45,6 +45,9 @@ class AsyncStream:
         if isinstance(result, Exception):
             raise result
         return result
+    
+    async def is_disconnected(self):
+        return await self._raw_request.is_disconnected()
 
 
 def _log_task_completion(task: asyncio.Task) -> None:
@@ -129,7 +132,8 @@ class PipeAsyncLLM(LLM):
         self.schedule_engine = None
 
         self.wait_lists: List[Sequence] = []
-        self.running_maps: Dict[int, Sequence] = dict()
+        self.abort_ids: List[int] = []
+        self.running_maps: Dict[int, Sequence] = dict() # seq_id => Sequence
         
         if self.launch_mode != 'normal':
             if self.worker_ranks is None:
@@ -210,28 +214,46 @@ class PipeAsyncLLM(LLM):
         if self.schedule_engine is None:
             self.start_schedule_engine()
         return stream
-
-    async def run_schedule_engine(self):
-        while True:
-            check_worker_alive(self.mp_alive)
-            ipc_package = self.comm.recv_output()
-            if ipc_package is not None:
-                for idx, id in enumerate(ipc_package.act_schedule_ids):
+    
+    async def check_abort_seqs(self):
+        for id, seq in self.running_maps.items():
+            if await self.async_streams[id].is_disconnected() and not seq.is_abort:
+                self.abort_ids.append(id)
+                seq.is_abort = True
+                
+    def recv_ipc_package(self):
+        ipc_package:IPCPackage = self.comm.recv_output()
+        if ipc_package is not None:
+            for idx, id in enumerate(ipc_package.act_schedule_ids):
+                if len(ipc_package.next_tokens) != 0:
                     seq: Sequence = self.running_maps[id]
                     seq.token_ids.append(ipc_package.next_tokens[idx])
                     self.async_streams[id].put(
                         seq.detokenize_inc(self.model_runner.tokenizer))
-                    if id in ipc_package.free_ids:
-                        self.running_maps.pop(id)
-                        self.async_streams[id].finish()
-                        del self.async_streams[id]
-                self.free_finish_ids(ipc_package.free_ids)
-            if len(self.wait_lists) != 0:
-                for seq in self.wait_lists:
-                    self.running_maps[seq.seq_id] = seq
-                ipc_package = IPCPackage(self.wait_lists)
-                self.wait_lists = []
-                self.comm.send_requests(ipc_package)
+                if id in ipc_package.free_ids:
+                    self.running_maps.pop(id)
+                    self.async_streams[id].finish()
+                    del self.async_streams[id]
+            self.free_finish_ids(ipc_package.free_ids)
+
+    def send_ipc_package(self):
+        if len(self.wait_lists) != 0 or len(self.abort_ids) != 0:
+            for seq in self.wait_lists:
+                self.running_maps[seq.seq_id] = seq
+            ipc_package = IPCPackage(self.wait_lists)
+            if len(self.abort_ids) != 0:
+                logger.warning(f'Abort {len(self.abort_ids)} request(s) due to loss of network connection')
+            ipc_package.abort_ids = self.abort_ids
+            self.wait_lists = []
+            self.abort_ids = []
+            self.comm.send_ipc_package(ipc_package)
+
+    async def run_schedule_engine(self):
+        while True:
+            check_worker_alive(self.mp_alive)
+            self.recv_ipc_package()
+            await self.check_abort_seqs()
+            self.send_ipc_package()
             await asyncio.sleep(0)
 
     def start_worker(self, local_rank, pp_rank):

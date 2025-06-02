@@ -11,6 +11,7 @@ from gllm.model_runner import ModelRunner
 from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
 from gllm.zmq_comm import zmqComm
 from gllm.pp_scheduler import PPScheduler
+from gllm.scheduler import IPCPackage
 
 # Used with PipeAsyncLLM
 class Worker:
@@ -75,7 +76,7 @@ class Worker:
         logger.info(f'Initialization complete')
 
     def recv_schedule_seqs(self):
-        seqs = self.comm.recv_schedule()
+        seqs = self.comm.recv_schedule_seqs()
         if seqs is not None:
             self.schedule_queue.append(
                 InputData(seqs, self.model_runner.memory_manager))
@@ -111,20 +112,25 @@ class Worker:
             else:
                 send_pp_data(output, self.get_pp_next_rank())
 
-    def recv_requests(self):
-        ipc_package = self.comm.recv_requests()
+    def recv_ipc_package(self):
+        ipc_package:IPCPackage = self.comm.recv_ipc_package()
         if ipc_package is not None:
             self.pp_scheduler.add_new_requests(ipc_package.schedule_lists)
+            self.pp_scheduler.add_abort_ids(ipc_package.abort_ids)
 
     def recv_next_tokens(self):
         if self.pp_size != 1:  # recv tokens from last rank
             next_tokens = self.comm.recv_tokens()
             if next_tokens is not None:
                 self.pp_scheduler.add_next_tokens(next_tokens)
+                
+    def check_abort_seqs(self):
+        ipc_package = self.pp_scheduler.check_abort_seqs()
+        if ipc_package is not None:
+            self.comm.send_output(ipc_package)
 
     def process_output(self):
         ipc_package = self.pp_scheduler.process_output()
-
         if ipc_package is not None:
             self.comm.send_output(ipc_package)
 
@@ -134,7 +140,7 @@ class Worker:
             input_data = InputData(
                 schedule_seqs, self.model_runner.memory_manager)
             if self.pp_size > 1:
-                self.comm.send_schedule(schedule_seqs)
+                self.comm.send_schedule_seqs(schedule_seqs)
             output = self.model_runner.step_once(input_data)
 
             if type(output) != list:
@@ -143,7 +149,8 @@ class Worker:
                 self.pp_scheduler.add_next_tokens(output)
 
     def run_driver(self):
-        self.recv_requests()
+        self.check_abort_seqs()
+        self.recv_ipc_package()
         self.recv_next_tokens()
         self.schedule_forward()
         self.process_output()
