@@ -36,6 +36,8 @@ class PPScheduler():
         self.log_num_preempt_seqs = 0
         # num wait tokens
         self.num_wait_tokens = 0
+        # abort ids
+        self.abort_ids = set()
         
     def get_num_free_pages(self):
         return self.memory_manager.get_num_free_pages()
@@ -48,7 +50,10 @@ class PPScheduler():
     def update_num_wait_tokens(self):
         self.num_wait_tokens = reduce(
             lambda x, y: x + len(y.token_ids) - y.computed_token_num, self.seqs_to_prefill, 0)
-        
+    
+    def add_abort_ids(self, abort_ids):
+        self.abort_ids.update(abort_ids)
+    
     def add_new_requests(self, seqs):
         self.seqs_to_prefill.extend(seqs)    
     
@@ -96,7 +101,27 @@ class PPScheduler():
             logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}')
             logger.warning(
                 'Try increase --kvthresh or the performance is poor!')
-            
+    
+    def check_abort_seqs_list(self, seqs:deque, ipc_package:IPCPackage):
+        for seq in list(seqs):
+            if len(self.abort_ids) == 0:
+                break
+            id = seq.seq_id
+            if id in self.abort_ids:
+                ipc_package.free_ids.append(id)
+                self.memory_manager.free(seq)
+                seqs.remove(seq)
+                self.abort_ids.remove(id)
+    
+    def check_abort_seqs(self):
+        ipc_package = IPCPackage([])
+        self.check_abort_seqs_list(self.seqs_to_prefill, ipc_package)
+        self.check_abort_seqs_list(self.seqs_to_decode, ipc_package)
+        if len(ipc_package.free_ids) != 0:
+            return ipc_package
+        else:
+            return None
+    
     def schedule_once(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
             schedule_seqs = self.schedule() if not self.use_naive_schedule else self.schedule_naive()

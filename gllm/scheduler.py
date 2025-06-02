@@ -11,8 +11,9 @@ class IPCPackage:
     def __init__(self, schedule_lists: List[Sequence]):
         # front-end => worker
         self.schedule_lists = schedule_lists
+        self.abort_ids = [] # seq_ids to abort
         # worker => front-end
-        self.free_ids = []
+        self.free_ids = [] # seq_ids to free
         self.act_schedule_ids = []
         self.next_tokens = []
 
