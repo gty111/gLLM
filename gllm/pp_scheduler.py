@@ -150,6 +150,9 @@ class PPScheduler():
             schedule_decode_seqs)
 
         num_tokens_budget -= len(schedule_decode_seqs)
+        
+        num_tokens_budget = min(num_tokens_budget, self.page_size * \
+            max(self.get_num_free_pages()-self.num_kvthresh_pages, 0))
 
         # prefill
         prefill_batched_token_nums = 0
@@ -166,6 +169,9 @@ class PPScheduler():
                 seq.to_compute_token_num = num_tokens_budget
                 num_tokens_budget = 0
             schedule_prefill_seqs.append(seq)
+            
+        self.memory_manager.pre_allocate_page(
+            schedule_prefill_seqs)
 
         if time.time()-self.log_time > 1:
             self.log_time = time.time()
