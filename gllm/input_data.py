@@ -54,7 +54,7 @@ class InputData():
     def get_seq_len_loc(self):
         max_seqlen = 0
         cu_seqs_len_num = 0
-        seq_start_loc = [0]
+        seq_start_loc = []
         for seq in self.seqs:
             seq_len = seq.computed_token_num + seq.to_compute_token_num
             cu_seqs_len_num += seq_len

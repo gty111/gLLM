@@ -70,7 +70,7 @@ class cmake_build_ext(build_ext):
     def compute_num_jobs(self):
         # `num_jobs` is either the value of the MAX_JOBS environment variable
         # (if defined) or the number of CPUs available.
-        num_jobs = None
+        num_jobs = os.environ['MAX_JOBS']
         if num_jobs is not None:
             num_jobs = int(num_jobs)
             logger.info("Using MAX_JOBS=%d as the number of jobs.", num_jobs)
@@ -309,9 +309,12 @@ ext_modules = []
 
 ext_modules.append(CMakeExtension(name="gllm._C"))
 ext_modules.append(CMakeExtension(name="gllm._moe_C"))
-ext_modules.append(
-    CMakeExtension(name="gllm.vllm_flash_attn.vllm_flash_attn_c"))
+ext_modules.append(CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa2_C"))
 
+# if get_nvcc_cuda_version() >= Version("12.3"):
+#     # FA3 requires CUDA 12.3 or later
+#     ext_modules.append(
+#         CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
 
 setup(
     name="gllm",
