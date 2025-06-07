@@ -41,7 +41,7 @@ class FlashAttention():
                                      v_cache,
                                      cu_seqlens_q=input_data.query_start_loc,
                                      max_seqlen_q=input_data.max_query_len,
-                                     cu_seqlens_k=input_data.seq_start_loc,
+                                     seqused_k=input_data.seq_start_loc,
                                      max_seqlen_k=input_data.max_seq_len,
                                      softmax_scale=self.scaling,
                                      causal=True,
