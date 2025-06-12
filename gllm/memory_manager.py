@@ -113,6 +113,8 @@ class Segment():
 class PrefixMemoryManager(MemoryManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
+        logger.info('Enable prefix caching')
 
         del self.segment
         self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim)

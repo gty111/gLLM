@@ -8,7 +8,7 @@ from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
-from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank, resolve_pp_layer
+from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, resolve_pp_layer
 from gllm.utils import get_model_load_pbar
 
 
@@ -121,7 +121,7 @@ class GLMTransformer(nn.Module):
         self.layers = nn.ModuleList(
             [GLMBlock(i-self.start_layer, config) for i in range(self.start_layer, self.end_layer)])
 
-        if is_pp_last_rank():
+        if is_last_pp_rank():
             if self.post_layer_norm:
                 assert config.rmsnorm
                 layer_norm_func = RMSNorm
@@ -132,7 +132,7 @@ class GLMTransformer(nn.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states, input_data)
         # Final layer norm.
-        if is_pp_last_rank():
+        if is_last_pp_rank():
             if self.post_layer_norm:
                 hidden_states = self.final_layernorm(hidden_states)
 
@@ -173,7 +173,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.transformer = ChatGLMModel(config)
         self.num_layers = len(self.transformer.encoder.layers)
         self.ret_residual = False
-        if is_pp_last_rank():
+        if is_last_pp_rank():
             self.lm_head = self.transformer.output_layer
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):

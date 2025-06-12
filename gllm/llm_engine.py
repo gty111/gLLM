@@ -15,13 +15,14 @@ class LLM():
     def __init__(self, model_path, host=None, master_addr=None, master_port=None, 
                  zmq_port_base=None, launch_mode=None, worker_ranks=None, load_format='auto', 
                  gpu_memory_util=0.9, page_size=16, maxd=256,maxp=2048, minp=32, 
-                 iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1):
+                 iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1, tp_size=1):
         init_logger()
         self.model_path = model_path
         self.model_runner = ModelRunner(
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, 
             maxp, maxd, kvthresh, minp, iterp)
         self.pp_size = pp_size
+        self.tp_size = tp_size
         self.host = host
         self.master_addr = master_addr
         self.master_port = master_port

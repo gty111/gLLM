@@ -8,21 +8,25 @@ from logger import logger
 
 from gllm.input_data import InputData
 from gllm.model_runner import ModelRunner
-from gllm.dist_utils import init_dist, send_pp_data, recv_pp_data
 from gllm.zmq_comm import zmqComm
 from gllm.pp_scheduler import PPScheduler
 from gllm.scheduler import IPCPackage
+from gllm.dist_utils import (init_dist, send_pp_data, recv_pp_data, 
+                             get_rank, get_world_size, is_last_pp_rank,
+                             get_pp_size, get_next_pp_rank, get_last_pp_rank)
 
 # Used with PipeAsyncLLM
 class Worker:
 
-    def __init__(self, model_runner: ModelRunner, local_rank, pp_rank, pp_size,
-                 master_addr, master_port, comm: zmqComm, mp_alive,
+    def __init__(self, model_runner: ModelRunner, local_rank, pp_rank, tp_rank, 
+                 pp_size, tp_size, master_addr, master_port, comm: zmqComm, mp_alive,
                  mp_load_progress, assigned_layers, use_naive_schedule):
         self.model_runner = model_runner
         self.local_rank = local_rank
         self.pp_rank = pp_rank
+        self.tp_rank = tp_rank
         self.pp_size = pp_size
+        self.tp_size = tp_size
         self.master_addr = master_addr
         self.master_port = master_port
         self.comm = comm
@@ -31,24 +35,19 @@ class Worker:
         self.assigned_layers = assigned_layers
         self.use_naive_schedule = use_naive_schedule
 
-    def get_pp_next_rank(self):
-        return (self.pp_rank + 1) % self.pp_size
-
-    def get_pp_last_rank(self):
-        return (self.pp_rank - 1 + self.pp_size) % self.pp_size
-
     def init_logger(self):
         formater = logging.Formatter(
-            f"[%(asctime)s %(filename)s:%(lineno)d Worker {self.pp_rank}] %(levelname)s - %(message)s")
+            f"[%(asctime)s %(filename)s:%(lineno)d PP{self.pp_rank} TP{self.tp_rank}] %(levelname)s - %(message)s")
         for handler in logger.handlers:
             handler.setFormatter(formater)
 
     def init(self):
         self.init_logger()
         
-        init_dist(self.pp_size, self.local_rank, self.pp_rank, self.master_addr, 
+        init_dist(self.pp_size, self.tp_size , self.local_rank, self.pp_rank, self.tp_rank, self.master_addr, 
                   self.master_port, self.assigned_layers)
         torch.cuda.set_device(f'cuda:{self.local_rank}')
+        self.rank = get_rank()
         
         self.comm.init()
         
@@ -56,7 +55,7 @@ class Worker:
         self.hidden_size = self.model_runner.model_loader.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual
         
-        if self.pp_rank == 0:
+        if self.rank == 0:
             self.pp_scheduler = PPScheduler(self.pp_size,
                                             self.model_runner.memory_manager, 
                                             self.use_naive_schedule,
@@ -65,6 +64,9 @@ class Worker:
                                             self.model_runner.iterp,
                                             self.model_runner.page_size,
                                             self.model_runner.kvthresh)
+        elif self.pp_rank == 0:
+            # Input data for each rank except 0
+            self.schedule_queue = deque()
         else:
             # Input data for each rank except 0
             self.schedule_queue = deque()
@@ -78,18 +80,20 @@ class Worker:
     def recv_schedule_seqs(self):
         seqs = self.comm.recv_schedule_seqs()
         if seqs is not None:
+            # logger.info(f'receive schedule seqs')
             self.schedule_queue.append(
                 InputData(seqs, self.model_runner.memory_manager))
 
     def recv_intermediate_data(self):
         if len(self.schedule_queue) != 0:
             input_data = self.schedule_queue.popleft()
+            # logger.info(f'Try receive pp data {get_last_pp_rank()}')
             intermediate_data = recv_pp_data(
-                self.get_pp_last_rank(),
+                get_last_pp_rank(),
                 [input_data.tokens.shape[0], self.hidden_size], self.ret_residual)
             self.run_queue.append((input_data, intermediate_data))
 
-    def forward(self):
+    def forward_pp(self):
         if len(self.run_queue) != 0:
             hidden_states = None
             residual = None
@@ -97,26 +101,35 @@ class Worker:
                 input_data, (hidden_states_future, residual_future,
                              hidden_states, residual) = self.run_queue[0]
                 if not (hidden_states_future.is_completed() and residual_future.is_completed()):
-                    return
+                    hidden_states_future.wait()
+                    residual_future.wait()
             else:
                 input_data, (hidden_states_future,
                              hidden_states) = self.run_queue[0]
                 if not hidden_states_future.is_completed():
-                    return
+                    hidden_states_future.wait()
 
             self.run_queue.popleft()
             output = self.model_runner.step_once(
                 input_data, hidden_states, residual)
-            if self.pp_rank == self.pp_size - 1:
+            if type(output) is list:
                 self.comm.send_tokens(output)
-            else:
-                send_pp_data(output, self.get_pp_next_rank())
+            elif not is_last_pp_rank():
+                send_pp_data(output, get_next_pp_rank())
 
     def recv_ipc_package(self):
-        ipc_package:IPCPackage = self.comm.recv_ipc_package()
-        if ipc_package is not None:
-            self.pp_scheduler.add_new_requests(ipc_package.schedule_lists)
-            self.pp_scheduler.add_abort_ids(ipc_package.abort_ids)
+        # To avoid request accumulation, we fetch all packages in comm
+        cum_ipc_package = IPCPackage([])
+        while True:
+            ipc_package:IPCPackage = self.comm.recv_ipc_package()
+            if ipc_package is not None:
+                cum_ipc_package.schedule_lists.extend(ipc_package.schedule_lists)
+                cum_ipc_package.abort_ids.extend(ipc_package.abort_ids)
+            else:
+                break
+        if len(cum_ipc_package.schedule_lists) != 0 or len(cum_ipc_package.abort_ids) != 0:
+            self.pp_scheduler.add_new_requests(cum_ipc_package.schedule_lists)
+            self.pp_scheduler.add_abort_ids(cum_ipc_package.abort_ids)
 
     def recv_next_tokens(self):
         if self.pp_size != 1:  # recv tokens from last rank
@@ -134,17 +147,26 @@ class Worker:
         if ipc_package is not None:
             self.comm.send_output(ipc_package)
 
+    def forward_tp(self):
+        if len(self.schedule_queue) != 0:
+            input_data = self.schedule_queue.popleft()
+            output = self.model_runner.step_once(input_data)
+            if get_pp_size() != 1:
+                # logger.info(f'Send pp data {get_next_pp_rank()}')
+                send_pp_data(output, get_next_pp_rank())
+    
     def schedule_forward(self):
         schedule_seqs = self.pp_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
             input_data = InputData(
                 schedule_seqs, self.model_runner.memory_manager)
-            if self.pp_size > 1:
+            if get_world_size() > 1:
                 self.comm.send_schedule_seqs(schedule_seqs)
             output = self.model_runner.step_once(input_data)
 
             if type(output) != list:
-                send_pp_data(output, self.get_pp_next_rank())
+                # logger.info(f'Send pp data {get_next_pp_rank()}')
+                send_pp_data(output, get_next_pp_rank())
             else:
                 self.pp_scheduler.add_next_tokens(output)
 
@@ -154,11 +176,15 @@ class Worker:
         self.recv_next_tokens()
         self.schedule_forward()
         self.process_output()
+        
+    def run_first_tp(self):
+        self.recv_schedule_seqs()
+        self.forward_tp()
 
     def run_other(self):
         self.recv_schedule_seqs()
         self.recv_intermediate_data()
-        self.forward()
+        self.forward_pp()
 
     def handle_keyboardInterrupt(self):
         logger.info(f'Exit')
@@ -176,8 +202,10 @@ def run_worker(worker: Worker):
     try:
         worker.init()
         while True:
-            if worker.pp_rank == 0:
+            if worker.rank == 0:
                 worker.run_driver()
+            elif worker.pp_rank == 0:
+                worker.run_first_tp()
             else:
                 worker.run_other()
     except KeyboardInterrupt as e:

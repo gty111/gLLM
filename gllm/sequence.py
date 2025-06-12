@@ -44,11 +44,8 @@ class Sequence():
         return delta_text
 
     def is_finish(self):
-        if (not self.ignore_eos and self.token_ids[-1] in self.finish_tokens
-                ) or len(self.token_ids) - self.prompt_len >= self.output_len:
-            return True
-        else:
-            return False
+        return (not self.ignore_eos and self.token_ids[-1] in self.finish_tokens
+                    ) or len(self.token_ids) - self.prompt_len >= self.output_len
         
     def preempt(self):
         self.computed_token_num = 0
