@@ -101,13 +101,12 @@ class Worker:
                 input_data, (hidden_states_future, residual_future,
                              hidden_states, residual) = self.run_queue[0]
                 if not (hidden_states_future.is_completed() and residual_future.is_completed()):
-                    hidden_states_future.wait()
-                    residual_future.wait()
+                    return
             else:
                 input_data, (hidden_states_future,
                              hidden_states) = self.run_queue[0]
                 if not hidden_states_future.is_completed():
-                    hidden_states_future.wait()
+                    return
 
             self.run_queue.popleft()
             output = self.model_runner.step_once(
