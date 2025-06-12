@@ -42,7 +42,7 @@ class LinearBase(torch.nn.Module):
                        input_size_per_partition: int,
                        output_partition_sizes: list[int], 
                        params_dtype: torch.dtype):
-        weight = Parameter(torch.empty(sum(output_partition_sizes),
+        weight = Parameter(torch.rand(sum(output_partition_sizes),
                                        input_size_per_partition,
                                        dtype=params_dtype),
                            requires_grad=False)
@@ -120,7 +120,7 @@ class RowParallelLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size, dtype=params_dtype))
+                torch.rand(self.output_size, dtype=params_dtype))
         else:
             self.register_parameter("bias", None)
             
@@ -214,7 +214,7 @@ class ColumnParallelLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size_per_partition,
+                torch.rand(self.output_size_per_partition,
                             dtype=params_dtype))
         else:
             self.register_parameter("bias", None)
