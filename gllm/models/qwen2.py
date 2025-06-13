@@ -49,9 +49,7 @@ class Qwen2Attention(nn.Module):
         self.num_heads = self.total_num_heads // tp_size
         
         self.total_num_kv_heads = config.num_key_value_heads
-
         assert self.total_num_kv_heads % tp_size == 0
-
         self.num_kv_heads = self.total_num_kv_heads // tp_size
         
         self.head_dim = self.hidden_size // self.total_num_heads

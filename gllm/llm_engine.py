@@ -107,16 +107,16 @@ class LLM():
         self.model_runner.init()
         architecture = self.model_runner.model_loader.architecture
         print("\nWelcome to the chatbot!\n"
-              "Type '\exit' to exit the chatbot.\n"
-              "Type '\clear' to clear the chatbot's history.\n")
+              "Type '\\exit' to exit the chatbot.\n"
+              "Type '\\clear' to clear the chatbot's history.\n")
         history = []
         while True:
             prompt = input(">>> ")
             print()
-            if prompt == '\clear':
+            if prompt == '\\clear':
                 history = []
                 continue
-            elif prompt == '\exit':
+            elif prompt == '\\exit':
                 break
 
             if architecture == 'ChatGLMModel' and hasattr(self.model_runner.tokenizer, 'build_chat_input'):
