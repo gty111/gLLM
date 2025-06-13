@@ -7,12 +7,15 @@ from torch import nn
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe.fused_moe_triton.layer import FusedMoE
 from gllm.input_data import InputData
-from gllm.dist_utils import get_local_rank, resolve_pp_layer
+from gllm.dist_utils import get_local_rank, resolve_pp_layer, get_tp_size
 from gllm.utils import get_model_load_pbar
 
 from .qwen2 import Qwen2Attention
 from .qwen2 import Qwen2Model
 from .qwen2 import Qwen2ForCausalLM
+
+from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
+                           copy_gate_up_proj_weight, copy_single_proj)
 
 class MixtralMoE(nn.Module):
     def __init__(self, config):
@@ -84,44 +87,57 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
     def __init__(self, config):
         super().__init__(config, MixtralModel)
         
-    def load_weights(self, weights: Dict, mp_load_progress=None):
+    def load_weights(self, weights, mp_load_progress=None):
         parameters = dict(self.named_parameters())
         if mp_load_progress is not None:
             mp_load_progress[get_local_rank()*2] = len(parameters)
             mp_load_progress[get_local_rank()*2+1] = 0
         else:
             pbar = get_model_load_pbar(len(parameters))
+            
+        tp_size = get_tp_size()
+        
+        total_num_heads = self.config.num_attention_heads
+        assert total_num_heads % tp_size == 0
+        num_heads = total_num_heads // tp_size
+        
+        total_num_kv_heads = self.config.num_key_value_heads
+        assert total_num_kv_heads % tp_size == 0
+        num_kv_heads = total_num_kv_heads // tp_size
+        
+        head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // total_num_heads)
 
-        num_attn_heads = self.config.num_attention_heads
-        head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // num_attn_heads)
-        num_kv_heads = self.config.num_key_value_heads
-        intermediate_size = self.config.intermediate_size
+        intermediate_size_partition = self.config.intermediate_size // tp_size
+            
+        num_experts = self.config.num_local_experts
         
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
-                v.data[:num_attn_heads*head_dim, :] = weights[k.replace(
-                    'qkv_proj', 'q_proj')]
-                v.data[num_attn_heads*head_dim:(num_attn_heads +
-                       num_kv_heads)*head_dim, :] = weights[k.replace('qkv_proj', 'k_proj')]
-                v.data[(num_attn_heads +
-                       num_kv_heads)*head_dim:, :] = weights[k.replace('qkv_proj', 'v_proj')]
+                copy_qkv_proj_weight(v.data, 
+                                     weights[k.replace('qkv_proj', 'q_proj')], 
+                                     weights[k.replace('qkv_proj', 'k_proj')], 
+                                     weights[k.replace('qkv_proj', 'v_proj')],
+                                     num_heads, num_kv_heads, head_dim)
             elif k.find('self_attn.qkv_proj.bias') != -1:
-                v.data[:num_attn_heads*head_dim] = weights[k.replace(
-                    'qkv_proj', 'q_proj')]
-                v.data[num_attn_heads*head_dim:(num_attn_heads +
-                       num_kv_heads)*head_dim] = weights[k.replace('qkv_proj', 'k_proj')]
-                v.data[(num_attn_heads +
-                       num_kv_heads)*head_dim:] = weights[k.replace('qkv_proj', 'v_proj')]
+                copy_qkv_proj_bias(v.data, 
+                                   weights[k.replace('qkv_proj', 'q_proj')], 
+                                   weights[k.replace('qkv_proj', 'k_proj')], 
+                                   weights[k.replace('qkv_proj', 'v_proj')],
+                                   num_heads, num_kv_heads, head_dim)
             elif k.find('w13_weight') != -1: # expert
-                for expert_idx in range(self.config.num_local_experts):
-                    v.data[expert_idx, :intermediate_size, :] = weights[k.replace(
-                        'w13_weight', f'{expert_idx}.w1.weight')]
-                    v.data[expert_idx, intermediate_size:, :] = weights[k.replace(
-                        'w13_weight', f'{expert_idx}.w3.weight')]
+                for expert_idx in range(num_experts):
+                    copy_gate_up_proj_weight(v.data[expert_idx],
+                                             weights[k.replace('w13_weight', f'{expert_idx}.w1.weight')],
+                                             weights[k.replace('w13_weight', f'{expert_idx}.w3.weight')],
+                                             intermediate_size_partition)
             elif k.find('w2_weight') != -1: # expert
-                for expert_idx in range(self.config.num_local_experts):
-                    v.data[expert_idx].copy_(weights[k.replace('w2_weight', f'{expert_idx}.w2.weight')])
+                for expert_idx in range(num_experts):
+                    copy_single_proj(v.data[expert_idx], 
+                                     weights[k.replace('w2_weight', f'{expert_idx}.w2.weight')], 
+                                     intermediate_size_partition)
+            elif k.find('self_attn.o_proj') != -1:
+                copy_single_proj(v.data, weights[k], num_heads*head_dim)
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
