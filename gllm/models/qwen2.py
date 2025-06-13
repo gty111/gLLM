@@ -10,9 +10,11 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
 from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
-                             resolve_pp_layer, get_tp_size, get_tp_rank)
+                             resolve_pp_layer, get_tp_size)
 from gllm.utils import get_model_load_pbar
 
+from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
+                           copy_gate_up_proj_weight, copy_single_proj)
 
 class Qwen2MLP(nn.Module):
 
@@ -201,28 +203,26 @@ class Qwen2ForCausalLM(nn.Module):
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
-                v.data[:num_heads*head_dim, :] = weights[k.replace(
-                    'qkv_proj', 'q_proj')][get_tp_rank()*num_heads*head_dim:(get_tp_rank()+1)*num_heads*head_dim,:]
-                v.data[num_heads*head_dim:(num_heads +
-                       num_kv_heads)*head_dim, :] = weights[k.replace('qkv_proj', 'k_proj')][get_tp_rank()*num_kv_heads*head_dim:(get_tp_rank()+1)*num_kv_heads*head_dim,:]
-                v.data[(num_heads +
-                       num_kv_heads)*head_dim:, :] = weights[k.replace('qkv_proj', 'v_proj')][get_tp_rank()*num_kv_heads*head_dim:(get_tp_rank()+1)*num_kv_heads*head_dim,:]
+                copy_qkv_proj_weight(v.data, 
+                                     weights[k.replace('qkv_proj', 'q_proj')], 
+                                     weights[k.replace('qkv_proj', 'k_proj')], 
+                                     weights[k.replace('qkv_proj', 'v_proj')],
+                                     num_heads, num_kv_heads, head_dim)
             elif k.find('self_attn.qkv_proj.bias') != -1:
-                v.data[:num_heads*head_dim] = weights[k.replace(
-                    'qkv_proj', 'q_proj')][get_tp_rank()*num_heads*head_dim:(get_tp_rank()+1)*num_heads*head_dim]
-                v.data[num_heads*head_dim:(num_heads +
-                       num_kv_heads)*head_dim] = weights[k.replace('qkv_proj', 'k_proj')][get_tp_rank()*num_kv_heads*head_dim:(get_tp_rank()+1)*num_kv_heads*head_dim]
-                v.data[(num_heads +
-                       num_kv_heads)*head_dim:] = weights[k.replace('qkv_proj', 'v_proj')][get_tp_rank()*num_kv_heads*head_dim:(get_tp_rank()+1)*num_kv_heads*head_dim]
+                copy_qkv_proj_bias(v.data, 
+                                   weights[k.replace('qkv_proj', 'q_proj')], 
+                                   weights[k.replace('qkv_proj', 'k_proj')], 
+                                   weights[k.replace('qkv_proj', 'v_proj')],
+                                   num_heads, num_kv_heads, head_dim)
             elif k.find('self_attn.o_proj') != -1:
-                v.data.copy_(weights[k][: , get_tp_rank()*num_heads*head_dim:(get_tp_rank()+1)*num_heads*head_dim])
+                copy_single_proj(v.data, weights[k], num_heads*head_dim)
             elif k.find('gate_up_proj') != -1:
-                v.data[:intermediate_size_partition, :] = weights[k.replace(
-                    'gate_up_proj', 'gate_proj')][get_tp_rank()*intermediate_size_partition:(get_tp_rank()+1)*intermediate_size_partition, :]
-                v.data[intermediate_size_partition:, :] = weights[k.replace(
-                    'gate_up_proj', 'up_proj')][get_tp_rank()*intermediate_size_partition:(get_tp_rank()+1)*intermediate_size_partition, :]
+                copy_gate_up_proj_weight(v.data,
+                                         weights[k.replace('gate_up_proj', 'gate_proj')],
+                                         weights[k.replace('gate_up_proj', 'up_proj')],
+                                         intermediate_size_partition)
             elif k.find('down_proj') != -1:
-                v.data.copy_(weights[k][:, get_tp_rank()*intermediate_size_partition:(get_tp_rank()+1)*intermediate_size_partition])
+                copy_single_proj(v.data, weights[k], intermediate_size_partition)
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:

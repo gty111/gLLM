@@ -1,10 +1,9 @@
 import torch
 
-from enum import Enum
 from typing import Optional, Callable
-from torch.nn.parameter import UninitializedParameter
 
 from gllm.utils import set_weight_attrs
+from gllm.dist_utils import get_tp_size, tensor_model_parallel_all_reduce
 from gllm.layers.moe.topk import select_experts
 from gllm.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
@@ -136,10 +135,13 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
             
+        self.tp_size = get_tp_size()
+        
         self.routed_scaling_factor = routed_scaling_factor
         self.top_k = top_k
         self.num_experts = num_experts
-        self.intermediate_size_per_partition = intermediate_size
+        assert intermediate_size % self.tp_size == 0
+        self.intermediate_size_per_partition = intermediate_size // self.tp_size
         self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
@@ -175,5 +177,8 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
+        
+        if self.reduce_results and self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states

@@ -15,6 +15,9 @@ from .qwen2 import Qwen2Attention as Qwen2MoeAttention
 from .qwen2 import Qwen2Model
 from .qwen2 import Qwen2ForCausalLM
 
+from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
+                           copy_gate_up_proj_weight, copy_single_proj)
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
