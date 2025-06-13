@@ -18,6 +18,7 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **token throttling** and **pipeline parallelism**, gLLM provides basic functionality (offline/online inference and interactive chat) to support large language model inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** (~4k loc) code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
+- [2025/06/14]: Tensor parallelism is now integrated, allowing joint deploying with pipeline parallelism :sunglasses:
 - [2025/05/05]: MoE architecture is supported. Try Qwen2/3 MoE models :star_struck:
 - [2025/04/29]: Qwen3 day 1 support. Come and try Qwen3 :tada:
 - [2025/04/27]: gLLM is open sourced :earth_asia:
@@ -43,7 +44,7 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 
 ## Install gLLM
 ```
-pip install torch==2.7.0
+pip install torch==2.5.1
 pip install -v -e .
 ```
 
@@ -73,7 +74,7 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
 ```
 # To see the description of args, run 'python -m gllm.entrypoints.api_server -h'
 python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
-    --enable-prefix-caching --pp $PP
+    --enable-prefix-caching --pp $PP --tp $TP
 ```
 
 ### Launch OpenAI-Compatible Server (Multi-node)
@@ -148,7 +149,6 @@ python evaluations/evaluate_MMLU_pro.py --model $MODEL --port $PORT
 
 ## Roadmap
 
-- [ ] Support TP
 - [ ] Support more models
 
 
