@@ -80,14 +80,12 @@ class Worker:
     def recv_schedule_seqs(self):
         seqs = self.comm.recv_schedule_seqs()
         if seqs is not None:
-            # logger.info(f'receive schedule seqs')
             self.schedule_queue.append(
                 InputData(seqs, self.model_runner.memory_manager))
 
     def recv_intermediate_data(self):
         if len(self.schedule_queue) != 0:
             input_data = self.schedule_queue.popleft()
-            # logger.info(f'Try receive pp data {get_last_pp_rank()}')
             intermediate_data = recv_pp_data(
                 get_last_pp_rank(),
                 [input_data.tokens.shape[0], self.hidden_size], self.ret_residual)
@@ -151,7 +149,6 @@ class Worker:
             input_data = self.schedule_queue.popleft()
             output = self.model_runner.step_once(input_data)
             if get_pp_size() != 1:
-                # logger.info(f'Send pp data {get_next_pp_rank()}')
                 send_pp_data(output, get_next_pp_rank())
     
     def schedule_forward(self):
@@ -164,7 +161,6 @@ class Worker:
             output = self.model_runner.step_once(input_data)
 
             if type(output) != list:
-                # logger.info(f'Send pp data {get_next_pp_rank()}')
                 send_pp_data(output, get_next_pp_rank())
             else:
                 self.pp_scheduler.add_next_tokens(output)
