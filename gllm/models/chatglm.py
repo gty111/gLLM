@@ -3,12 +3,14 @@ import torch
 from torch import nn
 from copy import deepcopy
 
+from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, QKVParallelLinear
 from gllm.input_data import InputData
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
-from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, resolve_pp_layer
+from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
+                             resolve_pp_layer, get_tp_size, get_tp_rank)
 from gllm.utils import get_model_load_pbar
 
 
@@ -16,9 +18,21 @@ class GLMAttention(nn.Module):
     def __init__(self, layer_id: int, config):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.multi_query_group_num
-        self.head_dim = self.hidden_size // self.num_heads
+        tp_size = get_tp_size()
+        
+        self.total_num_heads = config.num_attention_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        
+        self.total_num_kv_heads = (config.multi_query_group_num
+                                   if config.multi_query_attention else
+                                   config.num_attention_heads)
+
+        assert self.total_num_kv_heads % tp_size == 0
+
+        self.num_kv_heads =  self.total_num_kv_heads // tp_size
+        
+        self.head_dim = self.hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -31,10 +45,20 @@ class GLMAttention(nn.Module):
         self.projection_size = config.kv_channels * self.num_heads
         self.qkv_hidden_size = self.projection_size + 2 * \
             self.head_dim * config.multi_query_group_num
-        self.query_key_value = nn.Linear(self.hidden_size, self.qkv_hidden_size,
-                                         bias=config.add_bias_linear or config.add_qkv_bias)
-        self.dense = nn.Linear(self.projection_size, self.hidden_size,
-                               bias=config.add_bias_linear)
+            
+        self.query_key_value = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=config.add_bias_linear or config.add_qkv_bias,
+        )
+        
+        self.dense = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=config.add_bias_linear,
+        )
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.query_key_value(hidden_states)
@@ -49,11 +73,20 @@ class GLMMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.add_bias = config.add_bias_linear
-        self.dense_h_to_4h = nn.Linear(
-            config.hidden_size, config.ffn_hidden_size*2, bias=self.add_bias)
+        
+        self.dense_h_to_4h = MergedColumnParallelLinear(
+            config.hidden_size,
+            [config.ffn_hidden_size] * 2,
+            bias = self.add_bias
+        )
+        
         self.activation_func = SiluAndMul()
-        self.dense_4h_to_h = nn.Linear(
-            config.ffn_hidden_size, config.hidden_size, bias=self.add_bias)
+        
+        self.dense_4h_to_h = RowParallelLinear(
+            config.ffn_hidden_size,
+            config.hidden_size,
+            bias = self.add_bias
+        )
 
     def forward(self, hidden_states):
         # [s, b, 4hp]
@@ -191,12 +224,54 @@ class ChatGLMForCausalLM(nn.Module):
             mp_load_progress[get_local_rank()*2+1] = 0
         else:
             pbar = get_model_load_pbar(len(parameters))
+            
+        tp_size = get_tp_size()
+        
+        total_num_heads = self.config.num_attention_heads
+        assert total_num_heads % tp_size == 0
+        num_heads = total_num_heads // tp_size
+        
+        total_num_kv_heads = (self.config.multi_query_group_num
+                                   if self.config.multi_query_attention else
+                                   self.config.num_attention_heads)
+        
+        # Number of KV heads is greater than TP size, so we partition
+        # the KV heads across multiple tensor parallel GPUs.
+        assert total_num_kv_heads % tp_size == 0
+
+        num_kv_heads = max(1, total_num_kv_heads // tp_size)
+        
+        head_dim = self.config.hidden_size // total_num_heads
+        
+        intermediate_size_partition = self.config.ffn_hidden_size // tp_size
         
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 3, self.transformer.encoder.start_layer)
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')
-            v.data.copy_(weights[k])
+            if 'dense_h_to_4h.weight' in k:
+                v.data[:intermediate_size_partition, :] = weights[k][get_tp_rank()*intermediate_size_partition:(get_tp_rank()+1)*intermediate_size_partition, :]
+                v.data[intermediate_size_partition:, :] = weights[k][(get_tp_size()+get_tp_rank())*intermediate_size_partition:(get_tp_size()+get_tp_rank()+1)*intermediate_size_partition, :]
+            elif 'dense_4h_to_h.weight' in k:
+                dim_each = weights[k].shape[1] // tp_size
+                v.data.copy_(weights[k][:, get_tp_rank()*dim_each:(get_tp_rank()+1)*dim_each])
+            elif 'query_key_value.weight' in k:
+                v.data[:num_heads*head_dim, :] = weights[k][get_tp_rank()*num_heads*head_dim:(get_tp_rank()+1)*num_heads*head_dim,:]
+                v.data[num_heads*head_dim:(num_heads+num_kv_heads)*head_dim, :] = weights[k][(
+                    get_tp_size()*num_heads+get_tp_rank()*num_kv_heads)*head_dim:(get_tp_size()*num_heads+(get_tp_rank()+1)*num_kv_heads)*head_dim,:]
+                v.data[(num_heads+num_kv_heads)*head_dim:, :] = weights[k][(
+                    get_tp_size()*(num_heads+num_kv_heads)+get_tp_rank()*num_kv_heads)*head_dim:(get_tp_size()*(num_heads+num_kv_heads)+(get_tp_rank()+1)*num_kv_heads)*head_dim,:]
+            elif 'query_key_value.bias' in k:
+                v.data[:num_heads*head_dim] = weights[k][get_tp_rank()*num_heads*head_dim:(get_tp_rank()+1)*num_heads*head_dim]
+                v.data[num_heads*head_dim:(num_heads+num_kv_heads)*head_dim] = weights[k][(
+                    get_tp_size()*num_heads+get_tp_rank()*num_kv_heads)*head_dim:(get_tp_size()*num_heads+(get_tp_rank()+1)*num_kv_heads)*head_dim]
+                v.data[(num_heads+num_kv_heads)*head_dim:] = weights[k][(
+                    get_tp_size()*(num_heads+num_kv_heads)+get_tp_rank()*num_kv_heads)*head_dim:(get_tp_size()*(num_heads+num_kv_heads)+(get_tp_rank()+1)*num_kv_heads)*head_dim]
+            elif 'dense.weight' in k:
+                dim_each = weights[k].shape[1] // tp_size
+                v.data.copy_(weights[k][:, get_tp_rank()*dim_each:(get_tp_rank()+1)*dim_each])
+            else:
+                v.data.copy_(weights[k])
             if mp_load_progress is not None:
                 mp_load_progress[get_local_rank()*2+1] += 1
             else:

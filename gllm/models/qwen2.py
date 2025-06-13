@@ -49,15 +49,10 @@ class Qwen2Attention(nn.Module):
         self.num_heads = self.total_num_heads // tp_size
         
         self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+
+        assert self.total_num_kv_heads % tp_size == 0
+
+        self.num_kv_heads = self.total_num_kv_heads // tp_size
         
         self.head_dim = self.hidden_size // self.total_num_heads
         
@@ -198,15 +193,10 @@ class Qwen2ForCausalLM(nn.Module):
         num_heads = total_num_heads // tp_size
         
         total_num_kv_heads = self.config.num_key_value_heads
-        if total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % total_num_kv_heads == 0
-        num_kv_heads = max(1, total_num_kv_heads // tp_size)
+
+        assert total_num_kv_heads % tp_size == 0
+        
+        num_kv_heads = total_num_kv_heads // tp_size
         
         intermediate_size_partition = self.config.intermediate_size // tp_size
         
