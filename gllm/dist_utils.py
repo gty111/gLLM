@@ -79,8 +79,19 @@ def get_tp_size():
 def get_assigned_layers():
     return _ASSIGNED_LAYERS
 
+def get_tp_group():
+    return _TP_GROUP
+
+def init_tp_group():
+    global _TP_GROUP
+    tp_groups = [list(range(_pp_rank*get_tp_size(), (_pp_rank+1)*get_tp_size())) for _pp_rank in range(get_pp_size())]
+    for tp_ranks in tp_groups:
+        tp_group = dist.new_group(tp_ranks)
+        if _RANK in tp_ranks:
+            _TP_GROUP = tp_group
+
 def init_dist(pp_size, tp_size, local_rank, pp_rank, tp_rank, master_addr, master_port, assigned_layers):
-    global _RANK, _PP_RANK, _TP_RANK, _PP_SIZE, _TP_SIZE, _WORLD_SIZE, _ASSIGNED_LAYERS, _LOCAL_RANK, _TP_GROUP
+    global _RANK, _PP_RANK, _TP_RANK, _PP_SIZE, _TP_SIZE, _WORLD_SIZE, _ASSIGNED_LAYERS, _LOCAL_RANK, _TP_GROUP, _PP_GROUP
     _RANK = pp_rank * tp_size + tp_rank
     _PP_RANK = pp_rank
     _TP_RANK = tp_rank
@@ -90,13 +101,14 @@ def init_dist(pp_size, tp_size, local_rank, pp_rank, tp_rank, master_addr, maste
     _WORLD_SIZE = pp_size * tp_size
     _ASSIGNED_LAYERS = assigned_layers
     
-    tp_rank_list = list(range(pp_rank*tp_size, (pp_rank+1)*tp_size))
+    self_tp_ranks = list(range(pp_rank*tp_size, (pp_rank+1)*tp_size))
     
     init_method = f'tcp://{master_addr}:{master_port}'
     backend = 'nccl'
-    logger.info(f'NCCL: Init_method {init_method}, Backend {backend}, Rank {_RANK}, TP Groups {tp_rank_list}, Word_size {_WORLD_SIZE}')
+    logger.info(f'NCCL: Init_method {init_method}, Backend {backend}, Rank {_RANK}, TP Groups {self_tp_ranks}, Word_size {_WORLD_SIZE}')
     dist.init_process_group(init_method=init_method, backend=backend, world_size=_WORLD_SIZE, rank=_RANK)
-    _TP_GROUP = dist.new_group(tp_rank_list)
+    
+    init_tp_group()
 
 def get_pp_layers(num_layers):
     if _ASSIGNED_LAYERS is None:
@@ -135,7 +147,7 @@ def resolve_pp_layer(layer_name, idx, start_layer_idx):
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    dist.all_reduce(input_, group=_TP_GROUP)
+    dist.all_reduce(input_, group=get_tp_group())
     return input_
 
 def ensure_divisibility(numerator, denominator):

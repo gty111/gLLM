@@ -37,17 +37,17 @@ class Worker:
 
     def init_logger(self):
         formater = logging.Formatter(
-            f"[%(asctime)s %(filename)s:%(lineno)d PP{self.pp_rank} TP{self.tp_rank}] %(levelname)s - %(message)s")
+            f"[%(asctime)s %(filename)s:%(lineno)d Worker{self.pp_rank*self.tp_size+self.tp_rank} PP{self.pp_rank} TP{self.tp_rank}] %(levelname)s - %(message)s")
         for handler in logger.handlers:
             handler.setFormatter(formater)
 
     def init(self):
         self.init_logger()
-        
         init_dist(self.pp_size, self.tp_size , self.local_rank, self.pp_rank, self.tp_rank, self.master_addr, 
                   self.master_port, self.assigned_layers)
-        torch.cuda.set_device(f'cuda:{self.local_rank}')
         self.rank = get_rank()
+        torch.cuda.set_device(f'cuda:{self.local_rank}')
+        
         
         self.comm.init()
         
