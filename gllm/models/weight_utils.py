@@ -1,4 +1,4 @@
-from gllm.dist_utils import get_tp_rank, get_tp_size
+from gllm.dist_utils import get_tp_rank
 
 def copy_qkv_proj_weight(dst_qkv, src_q, src_k, src_v, num_heads, num_kv_heads, head_dim):
     dst_qkv[:num_heads*head_dim, :] = src_q[get_tp_rank()*num_heads*head_dim:(get_tp_rank()+1)*num_heads*head_dim,:]
