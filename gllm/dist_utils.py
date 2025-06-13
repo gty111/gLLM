@@ -80,7 +80,7 @@ def get_assigned_layers():
     return _ASSIGNED_LAYERS
 
 def init_dist(pp_size, tp_size, local_rank, pp_rank, tp_rank, master_addr, master_port, assigned_layers):
-    global _RANK, _PP_RANK, _TP_RANK, _PP_SIZE, _TP_SIZE, _WORLD_SIZE, _ASSIGNED_LAYERS, _LOCAL_RANK, _TP_GROUP, _PP_GROUP
+    global _RANK, _PP_RANK, _TP_RANK, _PP_SIZE, _TP_SIZE, _WORLD_SIZE, _ASSIGNED_LAYERS, _LOCAL_RANK, _TP_GROUP
     _RANK = pp_rank * tp_size + tp_rank
     _PP_RANK = pp_rank
     _TP_RANK = tp_rank
@@ -92,11 +92,10 @@ def init_dist(pp_size, tp_size, local_rank, pp_rank, tp_rank, master_addr, maste
     
     tp_rank_list = list(range(pp_rank*tp_size, (pp_rank+1)*tp_size))
     
-    os.environ['MASTER_ADDR'] = master_addr
-    os.environ['MASTER_PORT'] = master_port
+    init_method = f'tcp://{master_addr}:{master_port}'
     backend = 'nccl'
-    logger.info(f'NCCL: {master_addr}:{master_port} Backend {backend}, Rank {_RANK}, TP Groups {tp_rank_list}, Word_size {_WORLD_SIZE}')
-    dist.init_process_group(backend=backend, world_size=_WORLD_SIZE, rank=_RANK)
+    logger.info(f'NCCL: Init_method {init_method}, Backend {backend}, Rank {_RANK}, TP Groups {tp_rank_list}, Word_size {_WORLD_SIZE}')
+    dist.init_process_group(init_method=init_method, backend=backend, world_size=_WORLD_SIZE, rank=_RANK)
     _TP_GROUP = dist.new_group(tp_rank_list)
 
 def get_pp_layers(num_layers):
