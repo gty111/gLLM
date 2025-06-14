@@ -5,7 +5,7 @@ from typing import List
 
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
-from gllm.allocatorID import AllocatorID
+from gllm.id_allocator import IDAllocator
 from gllm.frontend_scheduler import FrontendScheduler
 from gllm.input_data import InputData
 from gllm.utils import init_logger
@@ -29,7 +29,7 @@ class LLM():
         self.zmq_port_base = zmq_port_base
         self.launch_mode = launch_mode
         self.worker_ranks = worker_ranks
-        self.allocatorID = AllocatorID(0, 99999)
+        self.id_allocator = IDAllocator(0, 99999)
         self.scheduler = FrontendScheduler(
             maxd, maxp, kvthresh, page_size)
         self.finish_tokens = self.model_runner.model_loader.generation_config.eos_token_id
@@ -54,7 +54,7 @@ class LLM():
         top_p = self.generation_config.top_p if top_p is None else top_p
         top_k = self.generation_config.top_k if top_k is None else top_k
         repetition_penalty = self.generation_config.repetition_penalty if repetition_penalty is None else repetition_penalty
-        return Sequence(self.allocatorID.allocate(), token_ids,
+        return Sequence(self.id_allocator.allocate(), token_ids,
                         self.finish_tokens, output_len, ignore_eos,
                         temperature, top_p, top_k, repetition_penalty)
 
@@ -63,7 +63,7 @@ class LLM():
 
     def free_finish_ids(self, finish_ids:List[int]):
         for id in finish_ids:
-            self.allocatorID.free(id)
+            self.id_allocator.free(id)
 
     def init(self):
         self.model_runner.init()

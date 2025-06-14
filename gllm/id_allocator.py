@@ -1,7 +1,7 @@
 from collections import deque
 
 
-class AllocatorID():
+class IDAllocator():
     def __init__(self, start_num=1, end_num=1000):
         self.size = end_num - start_num + 1
         self.free_ids = deque(range(start_num, end_num+1))
