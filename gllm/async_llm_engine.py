@@ -13,7 +13,7 @@ from gllm.async_worker import AsyncWorker, run_worker_async
 from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
 from gllm.sequence import Sequence
-from gllm.scheduler import IPCPackage
+from gllm.frontend_scheduler import IPCPackage
 from gllm.zmq_comm import zmqComm
 
 

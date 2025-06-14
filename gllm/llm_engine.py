@@ -6,7 +6,7 @@ from typing import List
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 from gllm.allocatorID import AllocatorID
-from gllm.scheduler import Scheduler
+from gllm.frontend_scheduler import FrontendScheduler
 from gllm.input_data import InputData
 from gllm.utils import init_logger
 
@@ -30,7 +30,7 @@ class LLM():
         self.launch_mode = launch_mode
         self.worker_ranks = worker_ranks
         self.allocatorID = AllocatorID(0, 99999)
-        self.scheduler = Scheduler(
+        self.scheduler = FrontendScheduler(
             maxd, maxp, kvthresh, page_size)
         self.finish_tokens = self.model_runner.model_loader.generation_config.eos_token_id
         if type(self.finish_tokens) == int:

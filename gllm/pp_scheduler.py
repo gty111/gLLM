@@ -8,7 +8,7 @@ from logger import logger
 
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.scheduler import IPCPackage
+from gllm.frontend_scheduler import IPCPackage
 from gllm.dist_utils import get_world_size
 
 

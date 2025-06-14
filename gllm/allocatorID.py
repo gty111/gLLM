@@ -2,9 +2,9 @@ from collections import deque
 
 
 class AllocatorID():
-    def __init__(self, minnum=1, maxnum=1000):
-        self.size = maxnum - minnum + 1
-        self.free_ids = deque(range(minnum, maxnum+1))
+    def __init__(self, start_num=1, end_num=1000):
+        self.size = end_num - start_num + 1
+        self.free_ids = deque(range(start_num, end_num+1))
 
     def allocate(self, id:int=None):
         if id is None:
@@ -16,13 +16,8 @@ class AllocatorID():
         return id
 
     def free(self, id: int):
-        # assert id not in self.free_ids
-        
         # append instead of appendleft to improve prefix cache hit rate
         self.free_ids.append(id)
-
-    def is_empty(self):
-        return len(self.free_ids) == self.size
 
     def get_num_used_ids(self):
         return self.size - len(self.free_ids)
