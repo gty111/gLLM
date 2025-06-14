@@ -21,7 +21,7 @@ set(CUDA_SUPPORTED_ARCHS "7.0;7.5;8.0;8.6;8.9;9.0")
 
 
 # Supported/expected torch versions for CUDA.
-set(TORCH_SUPPORTED_VERSION_CUDA "2.7.0")
+set(TORCH_SUPPORTED_VERSION_CUDA "2.5.1")
 
 #
 # Try to find python package with an executable that exactly matches

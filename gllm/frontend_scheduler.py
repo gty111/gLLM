@@ -17,7 +17,7 @@ class IPCPackage:
         self.act_schedule_ids = []
         self.next_tokens = []
 
-class Scheduler:
+class FrontendScheduler:
     def __init__(self, maxd: int, maxp: int, kvthresh: float,
                  page_size: int) -> None:
         self.prompt_lists: List[Sequence] = []  # seqs to prefill

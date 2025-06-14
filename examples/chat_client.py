@@ -22,14 +22,14 @@ model = models.data[0].id
 messages = []
 
 print("\nWelcome to the chatbot!\n"
-      "Type '\exit' to exit the chatbot.\n"
-      "Type '\clear' to clear the chatbot's history.\n")
+      "Type '\\exit' to exit the chatbot.\n"
+      "Type '\\clear' to clear the chatbot's history.\n")
 
 while True:
     prompt = input('>>> ')
-    if prompt == '\exit':
+    if prompt == '\\exit':
         break
-    elif prompt == '\clear':
+    elif prompt == '\\clear':
         messages = []
     messages.append({'role': 'user', 'content': prompt})
     chat_completion = client.chat.completions.create(

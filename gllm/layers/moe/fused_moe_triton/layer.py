@@ -1,18 +1,11 @@
 import torch
 
-from enum import Enum
 from typing import Optional, Callable
-from torch.nn.parameter import UninitializedParameter
 
 from gllm.utils import set_weight_attrs
+from gllm.dist_utils import get_tp_size, tensor_model_parallel_all_reduce
 from gllm.layers.moe.topk import select_experts
 from gllm.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
-class FusedMoeWeightScaleSupported(Enum):
-    TENSOR = "tensor"
-    CHANNEL = "channel"
-    GROUP = "group"
-    BLOCK = "block"
 
 class FusedMoEMethod(torch.nn.Module):
     def __init__(self):
@@ -142,10 +135,13 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
             
+        self.tp_size = get_tp_size()
+        
         self.routed_scaling_factor = routed_scaling_factor
         self.top_k = top_k
         self.num_experts = num_experts
-        self.intermediate_size_per_partition = intermediate_size
+        assert intermediate_size % self.tp_size == 0
+        self.intermediate_size_per_partition = intermediate_size // self.tp_size
         self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.use_grouped_topk = use_grouped_topk
@@ -168,144 +164,7 @@ class FusedMoE(torch.nn.Module):
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
-            weight_loader=self.weight_loader,
         )
-        
-    def weight_loader(self, param: torch.nn.Parameter,
-                      loaded_weight: torch.Tensor, weight_name: str,
-                      shard_id: str, expert_id: int) -> None:
-
-        expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
-        if expert_id == -1:
-            return
-
-        # compressed-tensors checkpoints with packed weights are stored flipped
-        # TODO (mgoin): check self.quant_method.quant_config.quant_format
-        # against known CompressionFormat enum values that have this quality
-        loaded_weight = loaded_weight.t().contiguous() if (
-            self.quant_method.__class__.__name__
-            == "CompressedTensorsWNA16MoEMethod") else loaded_weight
-
-        if shard_id not in ("w1", "w2", "w3"):
-            raise ValueError(f"shard_id must be ['w1','w2','w3'] but "
-                             f"got {shard_id}.")
-
-        WEIGHT_SCALE_SUPPORTED = [
-            e.value for e in FusedMoeWeightScaleSupported
-        ]
-        # Fetch the dim to shard the parameter/loaded weight
-        # based on the shard id. This will be whatever
-        # dimension intermediate_size_per_partition is used.
-        SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
-
-        is_gguf_weight = getattr(param, "is_gguf_weight", False)
-        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
-        if is_gguf_weight_type:
-            param.weight_type = loaded_weight.item()
-            param.data.copy_(loaded_weight)
-            return
-
-        # is_transposed: if the dim to shard the weight
-        # should be flipped. Required by GPTQ, compressed-tensors
-        # should be whatever dimension intermediate_size_per_partition is
-        is_transposed = getattr(param, "is_transposed", False)
-        shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if is_transposed:
-            shard_dim = int(not shard_dim)
-
-        full_load = len(loaded_weight.shape) == 3
-        if full_load:
-            shard_dim += 1
-
-        # Materialize GGUF UninitializedParameter
-        if is_gguf_weight and isinstance(param, UninitializedParameter):
-            final_shape = list(loaded_weight.shape)
-            if shard_id in ["w1", "w3"]:
-                final_shape[1] *= 2
-            final_shape[shard_dim] = final_shape[shard_dim] // self.tp_size
-            param.materialize(final_shape, dtype=loaded_weight.dtype)
-
-        expert_data = param.data if full_load else param.data[expert_id]
-        # Case input scale: input_scale loading is only supported for fp8
-        if "input_scale" in weight_name:
-            # this is needed for compressed-tensors only
-            loaded_weight = loaded_weight.to(param.data.device)
-
-            if param.data[expert_id] != 1 and (param.data[expert_id] -
-                                               loaded_weight).abs() > 1e-5:
-                raise ValueError(
-                    "input_scales of w1 and w3 of a layer "
-                    f"must be equal. But got {param.data[expert_id]} "
-                    f"vs. {loaded_weight}")
-
-            self._load_single_value(param=param,
-                                    loaded_weight=loaded_weight,
-                                    expert_id=expert_id)
-            return
-
-        # Case g_idx
-        if "g_idx" in weight_name:
-            self._load_g_idx(shard_dim=0,
-                             shard_id=shard_id,
-                             loaded_weight=loaded_weight,
-                             expert_data=expert_data,
-                             tp_rank=self.tp_rank)
-            return
-
-        # Case weight scales, zero_points and offset
-        if ("scale" in weight_name or "zero" in weight_name
-                or "offset" in weight_name):
-            # load the weight scales and zp based on the quantization scheme
-            # supported weight scales/zp can be found in
-            # FusedMoeWeightScaleSupported
-            # TODO @dsikka: once hardened, refactor to use vLLM Parameters
-            # specific to each case
-            quant_method = getattr(param, "quant_method", None)
-            if quant_method == FusedMoeWeightScaleSupported.CHANNEL.value:
-                self._load_per_channel_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank)
-            elif quant_method in [
-                    FusedMoeWeightScaleSupported.GROUP.value,
-                    FusedMoeWeightScaleSupported.BLOCK.value,
-            ]:
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                    load_full_w2=getattr(param, "load_full_w2", False))
-            elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
-                self._load_per_tensor_weight_scale(shard_id=shard_id,
-                                                   param=param,
-                                                   loaded_weight=loaded_weight,
-                                                   expert_id=expert_id)
-            else:
-                raise ValueError(
-                    f"quant method must be one of {WEIGHT_SCALE_SUPPORTED}")
-            return
-
-        # Case weight_shape
-        if "weight_shape" in weight_name:
-            # only required by compressed-tensors
-            self._load_single_value(param=param,
-                                    loaded_weight=loaded_weight,
-                                    expert_id=expert_id)
-            return
-
-        # Case model weights
-        if "weight" in weight_name:
-            self._load_model_weight_or_group_weight_scale(
-                shard_id=shard_id,
-                shard_dim=shard_dim,
-                loaded_weight=loaded_weight,
-                expert_data=expert_data,
-                tp_rank=self.tp_rank)
-            return
         
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         # Matrix multiply.
@@ -318,5 +177,8 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
+        
+        if self.reduce_results and self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states

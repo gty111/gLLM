@@ -100,6 +100,7 @@ if __name__ == '__main__':
     parser.add_argument('--use-naive-schedule', help='Use scheduling policy in Sarathi-Serve', action='store_true')
     parser.add_argument('--enable-prefix-caching', help='Enable KV cache reuse across requests', action='store_true')
     parser.add_argument('--pp', type=int, help='Number of pipeline stages', default=1)
+    parser.add_argument('--tp', type=int, help='Number of tensor parallel degrees', default=1)
     parser.add_argument('--load-format', type=str, choices=['auto','dummy'], help='auto: actually load model weights; dummy: initialize the model with random values', default='auto')
     parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
     parser.add_argument('--use-async-worker', help='Experimental feature for worker implemented by async', action='store_true')
@@ -125,6 +126,7 @@ if __name__ == '__main__':
                   kvthresh=args.kvthresh,
                   enable_prefix_caching=args.enable_prefix_caching,
                   pp_size=args.pp,
+                  tp_size=args.tp,
                   assigned_layers=args.assigned_layers,
                   use_naive_schedule=args.use_naive_schedule,
                   use_async_worker=args.use_async_worker)

@@ -9,7 +9,7 @@ from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.dist_utils import is_pp_last_rank
+from gllm.dist_utils import is_output_rank, get_tp_size
 from gllm.layers.sampler import Sampler
 
 
@@ -19,8 +19,6 @@ class ModelRunner():
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
         self.enable_prefix_caching = enable_prefix_caching
-        if self.enable_prefix_caching:
-            logger.info('Enable prefix caching')
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size
         self.tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = AutoTokenizer.from_pretrained(
@@ -41,7 +39,7 @@ class ModelRunner():
         memory_manager_cls = PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util, num_layers=self.model.num_layers,
-            dtype=self.model_loader.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads,
+            dtype=self.model_loader.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads//get_tp_size(),
             kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size)
 
     def encode(self, content, chat: bool = False):
@@ -56,7 +54,7 @@ class ModelRunner():
     @torch.inference_mode()
     def step_once(self, input_data: InputData = None, hidden_states=None, residual=None):
         output = self.model(input_data, hidden_states, residual)
-        if is_pp_last_rank():
+        if is_output_rank():
             logits = self.model.compute_logits(input_data, output)
             next_tokens = self.sampler.forward(logits, input_data)
             return next_tokens

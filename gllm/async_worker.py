@@ -19,6 +19,10 @@ class AsyncWorker(Worker):
         return super().run_driver()
     
     @async_wrapper
+    async def run_first_tp(self):
+        return super().run_first_tp()
+    
+    @async_wrapper
     async def run_other(self):
         return super().run_other()
 
@@ -36,8 +40,10 @@ async def launch_async_tasks(worker: AsyncWorker):
     worker.init()
 
     ats = AsyncTasks()
-    if worker.pp_rank == 0:
+    if worker.rank == 0:
         ats.add_task(worker.run_driver)
+    elif worker.pp_rank == 0:
+        ats.add_task(worker.run_first_tp)
     else:
         ats.add_task(worker.run_other)
     await ats.wait()

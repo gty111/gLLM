@@ -1,33 +1,42 @@
 import torch
 
-from torch import nn
-
+from gllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
+from gllm.modules.attention import Attention
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 from .qwen2 import Qwen2DecoderLayer
 from .qwen2 import Qwen2ForCausalLM
 
-class Qwen3Attention(nn.Module):
+class Qwen3Attention(Attention):
     def __init__(self, layer_id, config):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = getattr(config, 'head_dim', self.hidden_size // self.num_heads)
-        self.num_kv_heads = config.num_key_value_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        head_dim = getattr(config, 'head_dim', None)
+        super().__init__(config.num_attention_heads,
+                         config.num_key_value_heads,
+                         config.hidden_size,
+                         head_dim)
+        
         self.rope_theta = getattr(config, "rope_theta", 1000000)
         self.qkv_bias = getattr(config, 'attention_bias', False)
         
-        self.qkv_proj = nn.Linear(
-            self.hidden_size, (self.num_heads+self.num_kv_heads*2)*self.head_dim, bias=self.qkv_bias)
-        self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size, bias=False)
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=self.qkv_bias
+        )
+        
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias = False
+        )
+        
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim, config.max_position_embeddings, self.rope_theta, True)
         self.attn = FlashAttention(

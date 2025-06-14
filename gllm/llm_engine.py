@@ -5,8 +5,8 @@ from typing import List
 
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
-from gllm.allocatorID import AllocatorID
-from gllm.scheduler import Scheduler
+from gllm.id_allocator import IDAllocator
+from gllm.frontend_scheduler import FrontendScheduler
 from gllm.input_data import InputData
 from gllm.utils import init_logger
 
@@ -15,21 +15,22 @@ class LLM():
     def __init__(self, model_path, host=None, master_addr=None, master_port=None, 
                  zmq_port_base=None, launch_mode=None, worker_ranks=None, load_format='auto', 
                  gpu_memory_util=0.9, page_size=16, maxd=256,maxp=2048, minp=32, 
-                 iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1):
+                 iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1, tp_size=1):
         init_logger()
         self.model_path = model_path
         self.model_runner = ModelRunner(
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, 
             maxp, maxd, kvthresh, minp, iterp)
         self.pp_size = pp_size
+        self.tp_size = tp_size
         self.host = host
         self.master_addr = master_addr
         self.master_port = master_port
         self.zmq_port_base = zmq_port_base
         self.launch_mode = launch_mode
         self.worker_ranks = worker_ranks
-        self.allocatorID = AllocatorID(0, 99999)
-        self.scheduler = Scheduler(
+        self.id_allocator = IDAllocator(0, 99999)
+        self.scheduler = FrontendScheduler(
             maxd, maxp, kvthresh, page_size)
         self.finish_tokens = self.model_runner.model_loader.generation_config.eos_token_id
         if type(self.finish_tokens) == int:
@@ -53,7 +54,7 @@ class LLM():
         top_p = self.generation_config.top_p if top_p is None else top_p
         top_k = self.generation_config.top_k if top_k is None else top_k
         repetition_penalty = self.generation_config.repetition_penalty if repetition_penalty is None else repetition_penalty
-        return Sequence(self.allocatorID.allocate(), token_ids,
+        return Sequence(self.id_allocator.allocate(), token_ids,
                         self.finish_tokens, output_len, ignore_eos,
                         temperature, top_p, top_k, repetition_penalty)
 
@@ -62,7 +63,7 @@ class LLM():
 
     def free_finish_ids(self, finish_ids:List[int]):
         for id in finish_ids:
-            self.allocatorID.free(id)
+            self.id_allocator.free(id)
 
     def init(self):
         self.model_runner.init()
@@ -106,16 +107,16 @@ class LLM():
         self.model_runner.init()
         architecture = self.model_runner.model_loader.architecture
         print("\nWelcome to the chatbot!\n"
-              "Type '\exit' to exit the chatbot.\n"
-              "Type '\clear' to clear the chatbot's history.\n")
+              "Type '\\exit' to exit the chatbot.\n"
+              "Type '\\clear' to clear the chatbot's history.\n")
         history = []
         while True:
             prompt = input(">>> ")
             print()
-            if prompt == '\clear':
+            if prompt == '\\clear':
                 history = []
                 continue
-            elif prompt == '\exit':
+            elif prompt == '\\exit':
                 break
 
             if architecture == 'ChatGLMModel' and hasattr(self.model_runner.tokenizer, 'build_chat_input'):

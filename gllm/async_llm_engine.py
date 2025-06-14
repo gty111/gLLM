@@ -13,7 +13,7 @@ from gllm.async_worker import AsyncWorker, run_worker_async
 from gllm.worker import Worker, run_worker
 from gllm.input_data import InputData
 from gllm.sequence import Sequence
-from gllm.scheduler import IPCPackage
+from gllm.frontend_scheduler import IPCPackage
 from gllm.zmq_comm import zmqComm
 
 
@@ -142,7 +142,7 @@ class PipeAsyncLLM(LLM):
             self.act_worker_ranks = [int(i) for i in self.worker_ranks.split(',')]
             assert len(self.act_worker_ranks) != 0
         else:
-            self.act_worker_ranks = list(range(self.pp_size))
+            self.act_worker_ranks = list(range(self.pp_size*self.tp_size))
         self.num_workers = len(self.act_worker_ranks)
 
         self.ctx = mp.get_context('spawn')
@@ -156,7 +156,7 @@ class PipeAsyncLLM(LLM):
         self.token_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
 
         self.comm = zmqComm(self.host, self.zmq_port_base, self.launch_mode, self.master_addr, 
-                            0, 0, self.schedule_path, self.output_path, self.token_path)
+                            self.schedule_path, self.output_path, self.token_path, frontend=True)
         self.comm.init()
 
         logger.info(f'Launching worker {self.act_worker_ranks} ...')
@@ -166,8 +166,10 @@ class PipeAsyncLLM(LLM):
             logger.warning(f'Multi-node support is an experimental feature')
             
         self.process_list = []
-        for local_rank, pp_rank in enumerate(self.act_worker_ranks):
-            self.start_worker(local_rank, pp_rank)
+        for local_rank, rank in enumerate(self.act_worker_ranks):
+            pp_rank = rank // self.tp_size
+            tp_rank = rank % self.tp_size
+            self.start_worker(local_rank, pp_rank, tp_rank)
 
         if kwargs['load_format'] == 'auto':
             self.load_progress()
@@ -256,21 +258,21 @@ class PipeAsyncLLM(LLM):
             self.send_ipc_package()
             await asyncio.sleep(0)
 
-    def start_worker(self, local_rank, pp_rank):
+    def start_worker(self, local_rank, pp_rank, tp_rank):
         worker_cls = Worker if not self.use_async_worker else AsyncWorker
         comm = zmqComm(self.host,
                        self.zmq_port_base,
                        self.launch_mode,
                        self.master_addr,
-                       pp_rank,
-                       self.pp_size,
                        self.schedule_path,
                        self.output_path,
                        self.token_path)
         worker = worker_cls(self.model_runner,
                             local_rank,
                             pp_rank,
+                            tp_rank,
                             self.pp_size,
+                            self.tp_size,
                             self.master_addr,
                             self.master_port,
                             comm,

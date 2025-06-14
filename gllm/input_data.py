@@ -3,7 +3,7 @@ import numpy as np
 
 from typing import List
 
-from gllm.dist_utils import is_pp_last_rank
+from gllm.dist_utils import is_last_pp_rank
 from gllm.utils import async_tensor_h2d
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
@@ -12,7 +12,7 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 class InputData():
     def __init__(self, seqs: List[Sequence], memory_manager: MemoryManager):
         assert len(seqs) != 0
-        if is_pp_last_rank():
+        if is_last_pp_rank():
             self.temperature = async_tensor_h2d(
                 [seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], memory_manager.dtype, 'cuda', True)
             self.top_p = async_tensor_h2d(
