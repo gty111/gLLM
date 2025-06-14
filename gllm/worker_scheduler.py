@@ -12,7 +12,7 @@ from gllm.frontend_scheduler import IPCPackage
 from gllm.dist_utils import get_world_size
 
 
-class PPScheduler():
+class WorkerScheduler():
     def __init__(self, pp_size, memory_manager:MemoryManager, use_naive_schedule, maxp, minp, iterp, page_size, kvthresh):
         self.pp_size = pp_size
         self.memory_manager = memory_manager

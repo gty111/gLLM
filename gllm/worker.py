@@ -9,7 +9,7 @@ from logger import logger
 from gllm.input_data import InputData
 from gllm.model_runner import ModelRunner
 from gllm.zmq_comm import zmqComm
-from gllm.pp_scheduler import PPScheduler
+from gllm.worker_scheduler import WorkerScheduler
 from gllm.frontend_scheduler import IPCPackage
 from gllm.dist_utils import (init_dist, send_pp_data, recv_pp_data, 
                              get_rank, get_world_size, is_last_pp_rank,
@@ -37,7 +37,8 @@ class Worker:
 
     def init_logger(self):
         formater = logging.Formatter(
-            f"[%(asctime)s %(filename)s:%(lineno)d Worker{self.pp_rank*self.tp_size+self.tp_rank} PP{self.pp_rank} TP{self.tp_rank}] %(levelname)s - %(message)s")
+            f'[%(asctime)s %(filename)s:%(lineno)d Worker{self.pp_rank*self.tp_size+self.tp_rank} '
+            f'PP{self.pp_rank} TP{self.tp_rank}] %(levelname)s - %(message)s')
         for handler in logger.handlers:
             handler.setFormatter(formater)
 
@@ -56,14 +57,16 @@ class Worker:
         self.ret_residual = self.model_runner.model.ret_residual
         
         if self.rank == 0:
-            self.pp_scheduler = PPScheduler(self.pp_size,
-                                            self.model_runner.memory_manager, 
-                                            self.use_naive_schedule,
-                                            self.model_runner.maxp,
-                                            self.model_runner.minp,
-                                            self.model_runner.iterp,
-                                            self.model_runner.page_size,
-                                            self.model_runner.kvthresh)
+            self.worker_scheduler = WorkerScheduler(
+                self.pp_size,
+                self.model_runner.memory_manager, 
+                self.use_naive_schedule,
+                self.model_runner.maxp,
+                self.model_runner.minp,
+                self.model_runner.iterp,
+                self.model_runner.page_size,
+                self.model_runner.kvthresh
+            )
         elif self.pp_rank == 0:
             # Input data for each rank except 0
             self.schedule_queue = deque()
@@ -125,22 +128,22 @@ class Worker:
             else:
                 break
         if len(cum_ipc_package.schedule_lists) != 0 or len(cum_ipc_package.abort_ids) != 0:
-            self.pp_scheduler.add_new_requests(cum_ipc_package.schedule_lists)
-            self.pp_scheduler.add_abort_ids(cum_ipc_package.abort_ids)
+            self.worker_scheduler.add_new_requests(cum_ipc_package.schedule_lists)
+            self.worker_scheduler.add_abort_ids(cum_ipc_package.abort_ids)
 
     def recv_next_tokens(self):
         if self.pp_size != 1:  # recv tokens from last rank
             next_tokens = self.comm.recv_tokens()
             if next_tokens is not None:
-                self.pp_scheduler.add_next_tokens(next_tokens)
+                self.worker_scheduler.add_next_tokens(next_tokens)
                 
     def check_abort_seqs(self):
-        ipc_package = self.pp_scheduler.check_abort_seqs()
+        ipc_package = self.worker_scheduler.check_abort_seqs()
         if ipc_package is not None:
             self.comm.send_output(ipc_package)
 
     def process_output(self):
-        ipc_package = self.pp_scheduler.process_output()
+        ipc_package = self.worker_scheduler.process_output()
         if ipc_package is not None:
             self.comm.send_output(ipc_package)
 
@@ -152,7 +155,7 @@ class Worker:
                 send_pp_data(output, get_next_pp_rank())
     
     def schedule_forward(self):
-        schedule_seqs = self.pp_scheduler.schedule_once()
+        schedule_seqs = self.worker_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
             input_data = InputData(
                 schedule_seqs, self.model_runner.memory_manager)
@@ -163,7 +166,7 @@ class Worker:
             if type(output) != list:
                 send_pp_data(output, get_next_pp_rank())
             else:
-                self.pp_scheduler.add_next_tokens(output)
+                self.worker_scheduler.add_next_tokens(output)
 
     def run_driver(self):
         self.check_abort_seqs()
