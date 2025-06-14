@@ -141,22 +141,15 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         else:
             pbar = get_model_load_pbar(len(parameters))
             
-        tp_size = get_tp_size()
-        
-        total_num_heads = self.config.num_attention_heads
-        assert total_num_heads % tp_size == 0
-        num_heads = total_num_heads // tp_size
-        
-        total_num_kv_heads = self.config.num_key_value_heads
-        assert total_num_kv_heads % tp_size == 0
-        num_kv_heads = total_num_kv_heads // tp_size
-        
-        head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // total_num_heads)
+        attn = self.model.layers[0].self_attn
+        num_heads = attn.num_heads
+        num_kv_heads = attn.num_kv_heads
+        head_dim = attn.head_dim
 
-        intermediate_size_partition = self.config.moe_intermediate_size // tp_size
+        intermediate_size_partition = self.config.moe_intermediate_size // get_tp_size()
         shared_expert_intermediate_size_partition = getattr(self.config, 'shared_expert_intermediate_size', None)
         if shared_expert_intermediate_size_partition:
-            shared_expert_intermediate_size_partition = shared_expert_intermediate_size_partition // tp_size
+            shared_expert_intermediate_size_partition = shared_expert_intermediate_size_partition // get_tp_size()
         
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 2, self.model.start_layer)

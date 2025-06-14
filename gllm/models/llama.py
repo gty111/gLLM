@@ -8,7 +8,8 @@ from gllm.layers.layernorm import RMSNorm
 from gllm.layers.rotary_embedding import RotaryEmbedding, LinearScalingRotaryEmbedding, Llama3RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.input_data import InputData
-from gllm.dist_utils import get_pp_layers, get_pp_rank, is_last_pp_rank, get_tp_size
+from gllm.dist_utils import get_pp_layers, get_pp_rank, is_last_pp_rank
+from gllm.modules.attention import Attention
 
 from .qwen2 import Qwen2MLP, Qwen2ForCausalLM
 
@@ -18,30 +19,12 @@ class LlamaMLP(Qwen2MLP):
         super().__init__(config, False)
 
 
-class LlamaAttention(nn.Module):
+class LlamaAttention(Attention):
 
     def __init__(self, layer_id: int, config):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        
-        tp_size = get_tp_size()
-        
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        
-        self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        
-        self.head_dim = self.hidden_size // self.total_num_heads
+        super().__init__(config.num_attention_heads,
+                         config.num_key_value_heads,
+                         config.hidden_size)
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
@@ -82,13 +65,8 @@ class LlamaAttention(nn.Module):
                 self.head_dim, self.head_dim, config.max_position_embeddings,
                 self.rope_theta, True)
 
-        self.scaling = self.head_dim**-0.5
-
         self.attn = FlashAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
-
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.qkv_proj(hidden_states)

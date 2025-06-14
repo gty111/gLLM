@@ -1,3 +1,5 @@
+# Resolve weights loading for TP
+
 from gllm.dist_utils import get_tp_rank
 
 def copy_qkv_proj_weight(dst_qkv, src_q, src_k, src_v, num_heads, num_kv_heads, head_dim):

@@ -12,6 +12,7 @@ from gllm.input_data import InputData
 from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
                              resolve_pp_layer, get_tp_size)
 from gllm.utils import get_model_load_pbar
+from gllm.modules.attention import Attention
 
 from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
                            copy_gate_up_proj_weight, copy_single_proj)
@@ -38,27 +39,12 @@ class Qwen2MLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_up_proj(x)))
 
 
-class Qwen2Attention(nn.Module):
+class Qwen2Attention(Attention):
     def __init__(self, layer_id: int, config, qkv_bias=True):
-        super().__init__()
-        
-        self.hidden_size = config.hidden_size
-        
-        tp_size = get_tp_size()
-        
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        
-        self.total_num_kv_heads = config.num_key_value_heads
-        assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
-        
-        self.head_dim = self.hidden_size // self.total_num_heads
-        
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        super().__init__(config.num_attention_heads,
+                         config.num_key_value_heads,
+                         config.hidden_size)
+
         self.rope_theta = getattr(config,'rope_theta',10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
@@ -185,20 +171,12 @@ class Qwen2ForCausalLM(nn.Module):
         else:
             pbar = get_model_load_pbar(len(parameters))
 
-        tp_size = get_tp_size()
+        attn = self.model.layers[0].self_attn
+        num_heads = attn.num_heads
+        num_kv_heads = attn.num_kv_heads
+        head_dim = attn.head_dim
         
-        total_num_heads = self.config.num_attention_heads
-        head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // total_num_heads)
-        assert total_num_heads % tp_size == 0
-        num_heads = total_num_heads // tp_size
-        
-        total_num_kv_heads = self.config.num_key_value_heads
-
-        assert total_num_kv_heads % tp_size == 0
-        
-        num_kv_heads = total_num_kv_heads // tp_size
-        
-        intermediate_size_partition = self.config.intermediate_size // tp_size
+        intermediate_size_partition = self.config.intermediate_size // get_tp_size()
         
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 2, self.model.start_layer)

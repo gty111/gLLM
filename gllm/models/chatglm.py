@@ -12,30 +12,20 @@ from gllm.layers.layernorm import RMSNorm
 from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
                              resolve_pp_layer, get_tp_size, get_tp_rank)
 from gllm.utils import get_model_load_pbar
+from gllm.modules.attention import Attention
+
+from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
+                           copy_gate_up_proj_weight, copy_single_proj)
 
 
-class GLMAttention(nn.Module):
+class GLMAttention(Attention):
     def __init__(self, layer_id: int, config):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        tp_size = get_tp_size()
-        
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        
-        self.total_num_kv_heads = (config.multi_query_group_num
-                                   if config.multi_query_attention else
-                                   config.num_attention_heads)
-
-        assert self.total_num_kv_heads % tp_size == 0
-
-        self.num_kv_heads =  self.total_num_kv_heads // tp_size
-        
-        self.head_dim = self.hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        total_num_kv_heads = (config.multi_query_group_num 
+                              if config.multi_query_attention else 
+                              config.num_attention_heads)
+        super().__init__(config.num_attention_heads,
+                         total_num_kv_heads,
+                         config.hidden_size)
 
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim // 2, config.seq_length, getattr(config,'rope_theta',10000), False)
@@ -154,8 +144,7 @@ class GLMTransformer(nn.Module):
         self.layers = nn.ModuleList(
             [GLMBlock(i-self.start_layer, config) for i in range(self.start_layer, self.end_layer)])
 
-        if is_last_pp_rank():
-            if self.post_layer_norm:
+        if is_last_pp_rank() and self.post_layer_norm:
                 assert config.rmsnorm
                 layer_norm_func = RMSNorm
                 self.final_layernorm = layer_norm_func(
@@ -225,53 +214,35 @@ class ChatGLMForCausalLM(nn.Module):
         else:
             pbar = get_model_load_pbar(len(parameters))
             
-        tp_size = get_tp_size()
+        attn = self.transformer.encoder.layers[0].self_attention
+        num_heads = attn.num_heads
+        num_kv_heads = attn.num_kv_heads
+        head_dim = attn.head_dim
         
-        total_num_heads = self.config.num_attention_heads
-        assert total_num_heads % tp_size == 0
-        num_heads = total_num_heads // tp_size
+        intermediate_size = self.config.ffn_hidden_size
+        intermediate_size_partition = intermediate_size // get_tp_size()
         
-        total_num_kv_heads = (self.config.multi_query_group_num
-                                   if self.config.multi_query_attention else
-                                   self.config.num_attention_heads)
-        
-        # Number of KV heads is greater than TP size, so we partition
-        # the KV heads across multiple tensor parallel GPUs.
-        assert total_num_kv_heads % tp_size == 0
-
-        num_kv_heads = max(1, total_num_kv_heads // tp_size)
-        
-        head_dim = self.config.hidden_size // total_num_heads
-        
-        intermediate_size_partition = self.config.ffn_hidden_size // tp_size
+        q_index = num_heads*head_dim*get_tp_size()
+        k_index = (num_heads+num_kv_heads)*head_dim*get_tp_size()
         
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 3, self.transformer.encoder.start_layer)
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')
+            
+            weight = weights[k]
             if 'dense_h_to_4h.weight' in k:
-                v.data[:intermediate_size_partition, :] = weights[k][get_tp_rank()*intermediate_size_partition:(get_tp_rank()+1)*intermediate_size_partition, :]
-                v.data[intermediate_size_partition:, :] = weights[k][(get_tp_size()+get_tp_rank())*intermediate_size_partition:(get_tp_size()+get_tp_rank()+1)*intermediate_size_partition, :]
+                copy_gate_up_proj_weight(v.data, weight[:intermediate_size], weight[intermediate_size:], intermediate_size_partition)
             elif 'dense_4h_to_h.weight' in k:
-                dim_each = weights[k].shape[1] // tp_size
-                v.data.copy_(weights[k][:, get_tp_rank()*dim_each:(get_tp_rank()+1)*dim_each])
+                copy_single_proj(v.data, weight, intermediate_size_partition)
             elif 'query_key_value.weight' in k:
-                v.data[:num_heads*head_dim, :] = weights[k][get_tp_rank()*num_heads*head_dim:(get_tp_rank()+1)*num_heads*head_dim,:]
-                v.data[num_heads*head_dim:(num_heads+num_kv_heads)*head_dim, :] = weights[k][(
-                    get_tp_size()*num_heads+get_tp_rank()*num_kv_heads)*head_dim:(get_tp_size()*num_heads+(get_tp_rank()+1)*num_kv_heads)*head_dim,:]
-                v.data[(num_heads+num_kv_heads)*head_dim:, :] = weights[k][(
-                    get_tp_size()*(num_heads+num_kv_heads)+get_tp_rank()*num_kv_heads)*head_dim:(get_tp_size()*(num_heads+num_kv_heads)+(get_tp_rank()+1)*num_kv_heads)*head_dim,:]
+                copy_qkv_proj_weight(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'query_key_value.bias' in k:
-                v.data[:num_heads*head_dim] = weights[k][get_tp_rank()*num_heads*head_dim:(get_tp_rank()+1)*num_heads*head_dim]
-                v.data[num_heads*head_dim:(num_heads+num_kv_heads)*head_dim] = weights[k][(
-                    get_tp_size()*num_heads+get_tp_rank()*num_kv_heads)*head_dim:(get_tp_size()*num_heads+(get_tp_rank()+1)*num_kv_heads)*head_dim]
-                v.data[(num_heads+num_kv_heads)*head_dim:] = weights[k][(
-                    get_tp_size()*(num_heads+num_kv_heads)+get_tp_rank()*num_kv_heads)*head_dim:(get_tp_size()*(num_heads+num_kv_heads)+(get_tp_rank()+1)*num_kv_heads)*head_dim]
+                copy_qkv_proj_bias(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'dense.weight' in k:
-                dim_each = weights[k].shape[1] // tp_size
-                v.data.copy_(weights[k][:, get_tp_rank()*dim_each:(get_tp_rank()+1)*dim_each])
+                copy_single_proj(v.data, weight, num_heads*head_dim)
             else:
-                v.data.copy_(weights[k])
+                v.data.copy_(weight)
             if mp_load_progress is not None:
                 mp_load_progress[get_local_rank()*2+1] += 1
             else:

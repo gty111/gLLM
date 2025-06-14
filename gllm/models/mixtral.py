@@ -1,7 +1,6 @@
 import torch
-import torch.nn.functional as F
 
-from typing import Optional, Dict
+from typing import Optional
 from torch import nn
 
 from gllm.layers.layernorm import RMSNorm
@@ -95,20 +94,13 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
         else:
             pbar = get_model_load_pbar(len(parameters))
             
-        tp_size = get_tp_size()
-        
-        total_num_heads = self.config.num_attention_heads
-        assert total_num_heads % tp_size == 0
-        num_heads = total_num_heads // tp_size
-        
-        total_num_kv_heads = self.config.num_key_value_heads
-        assert total_num_kv_heads % tp_size == 0
-        num_kv_heads = total_num_kv_heads // tp_size
-        
-        head_dim = getattr(self.config, 'head_dim', self.config.hidden_size // total_num_heads)
+        attn = self.model.layers[0].self_attn
+        num_heads = attn.num_heads
+        num_kv_heads = attn.num_kv_heads
+        head_dim = attn.head_dim
 
-        intermediate_size_partition = self.config.intermediate_size // tp_size
-            
+        intermediate_size_partition = self.config.intermediate_size // get_tp_size()
+        
         num_experts = self.config.num_local_experts
         
         for k, v in parameters.items():
