@@ -4,7 +4,7 @@ import torch.distributed as dist
 from typing import List, Set
 from logger import logger
 
-from gllm.allocatorID import AllocatorID
+from gllm.id_allocator import IDAllocator
 from gllm.sequence import Sequence
 from gllm.utils import get_dtype_bytes
 
@@ -93,26 +93,28 @@ class Segment():
             (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
         self.v_cache = [torch.ones(
             (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
-        self.allocatorID = AllocatorID(0, num_pages-1)
+        self.id_allocator = IDAllocator(0, num_pages-1)
 
     def allocate(self):
-        pagenum = self.allocatorID.allocate()
+        pagenum = self.id_allocator.allocate()
         return pagenum
 
     def free(self, page_num: int):
-        self.allocatorID.free(page_num)
+        self.id_allocator.free(page_num)
 
     def get_num_free_pages(self):
-        return self.allocatorID.get_num_free_ids()
+        return self.id_allocator.get_num_free_ids()
 
     # return percent of used memory
     def get_memory_util(self):
-        return round(100 * self.allocatorID.get_num_used_ids()/self.allocatorID.size, 2)
+        return round(100 * self.id_allocator.get_num_used_ids()/self.id_allocator.size, 2)
 
 
 class PrefixMemoryManager(MemoryManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        
+        logger.info('Enable prefix caching')
 
         del self.segment
         self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim)
@@ -182,7 +184,7 @@ class PrefixSegment(Segment):
         page_hash = hash(token_ids)
         if page_hash in self.hash2page:
             page_num = self.hash2page[page_hash]
-            self.allocatorID.allocate(page_num)
+            self.id_allocator.allocate(page_num)
             # print(f'reuse {page_num}')
             self.page_ref_num[page_num] += 1
             return page_num
@@ -191,7 +193,7 @@ class PrefixSegment(Segment):
 
     def allocate(self, token_ids: Set[int] = None):
         page_hash = hash(token_ids) if token_ids is not None else None
-        page_num = self.allocatorID.allocate()
+        page_num = self.id_allocator.allocate()
         # print(f'allocate {page_num}')
         if self.page2hash[page_num] != 0 and self.page2hash[page_num] in self.hash2page:
             del self.hash2page[self.page2hash[page_num]]
@@ -206,4 +208,4 @@ class PrefixSegment(Segment):
         self.page_ref_num[page_num] -= 1
         if self.page_ref_num[page_num] == 0:
             # print(f'free {page_num}')
-            self.allocatorID.free(page_num)
+            self.id_allocator.free(page_num)

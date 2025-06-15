@@ -70,7 +70,7 @@ class cmake_build_ext(build_ext):
     def compute_num_jobs(self):
         # `num_jobs` is either the value of the MAX_JOBS environment variable
         # (if defined) or the number of CPUs available.
-        num_jobs = os.environ['MAX_JOBS']
+        num_jobs = os.environ.get('MAX_JOBS', '32')
         if num_jobs is not None:
             num_jobs = int(num_jobs)
             logger.info("Using MAX_JOBS=%d as the number of jobs.", num_jobs)
@@ -267,7 +267,7 @@ def get_path(*filepath) -> str:
 
 
 def get_gllm_version() -> str:
-    version = '0.0.1'
+    version = '0.0.2'
 
     cuda_version = str(get_nvcc_cuda_version())
     if cuda_version != MAIN_CUDA_VERSION:

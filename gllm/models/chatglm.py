@@ -3,25 +3,31 @@ import torch
 from torch import nn
 from copy import deepcopy
 
+from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, QKVParallelLinear
+from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 from gllm.input_data import InputData
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
-from gllm.dist_utils import get_pp_layers, get_pp_rank, get_local_rank, is_pp_last_rank, resolve_pp_layer
+from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
+                             resolve_pp_layer, get_tp_size)
 from gllm.utils import get_model_load_pbar
+from gllm.modules.attention import Attention
+
+from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
+                           copy_gate_up_proj_weight, copy_single_proj_col,
+                           copy_single_proj_row)
 
 
-class GLMAttention(nn.Module):
+class GLMAttention(Attention):
     def __init__(self, layer_id: int, config):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.multi_query_group_num
-        self.head_dim = self.hidden_size // self.num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        total_num_kv_heads = (config.multi_query_group_num 
+                              if config.multi_query_attention else 
+                              config.num_attention_heads)
+        super().__init__(config.num_attention_heads,
+                         total_num_kv_heads,
+                         config.hidden_size)
 
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim // 2, config.seq_length, getattr(config,'rope_theta',10000), False)
@@ -31,10 +37,20 @@ class GLMAttention(nn.Module):
         self.projection_size = config.kv_channels * self.num_heads
         self.qkv_hidden_size = self.projection_size + 2 * \
             self.head_dim * config.multi_query_group_num
-        self.query_key_value = nn.Linear(self.hidden_size, self.qkv_hidden_size,
-                                         bias=config.add_bias_linear or config.add_qkv_bias)
-        self.dense = nn.Linear(self.projection_size, self.hidden_size,
-                               bias=config.add_bias_linear)
+            
+        self.query_key_value = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=config.add_bias_linear or config.add_qkv_bias,
+        )
+        
+        self.dense = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=config.add_bias_linear,
+        )
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.query_key_value(hidden_states)
@@ -49,11 +65,20 @@ class GLMMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.add_bias = config.add_bias_linear
-        self.dense_h_to_4h = nn.Linear(
-            config.hidden_size, config.ffn_hidden_size*2, bias=self.add_bias)
+        
+        self.dense_h_to_4h = MergedColumnParallelLinear(
+            config.hidden_size,
+            [config.ffn_hidden_size] * 2,
+            bias = self.add_bias
+        )
+        
         self.activation_func = SiluAndMul()
-        self.dense_4h_to_h = nn.Linear(
-            config.ffn_hidden_size, config.hidden_size, bias=self.add_bias)
+        
+        self.dense_4h_to_h = RowParallelLinear(
+            config.ffn_hidden_size,
+            config.hidden_size,
+            bias = self.add_bias
+        )
 
     def forward(self, hidden_states):
         # [s, b, 4hp]
@@ -121,8 +146,7 @@ class GLMTransformer(nn.Module):
         self.layers = nn.ModuleList(
             [GLMBlock(i-self.start_layer, config) for i in range(self.start_layer, self.end_layer)])
 
-        if is_pp_last_rank():
-            if self.post_layer_norm:
+        if is_last_pp_rank() and self.post_layer_norm:
                 assert config.rmsnorm
                 layer_norm_func = RMSNorm
                 self.final_layernorm = layer_norm_func(
@@ -132,7 +156,7 @@ class GLMTransformer(nn.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states, input_data)
         # Final layer norm.
-        if is_pp_last_rank():
+        if is_last_pp_rank():
             if self.post_layer_norm:
                 hidden_states = self.final_layernorm(hidden_states)
 
@@ -143,15 +167,20 @@ class ChatGLMModel(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.embedding = nn.Embedding(
-            config.padded_vocab_size, config.hidden_size)
+        self.embedding = VocabParallelEmbedding(
+            config.padded_vocab_size,
+            config.hidden_size,
+        )
 
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
 
         self.encoder = GLMTransformer(config)
-        self.output_layer = nn.Linear(
-            config.hidden_size, config.padded_vocab_size, bias=False)
+        self.output_layer = ParallelLMHead(
+            config.padded_vocab_size,
+            config.hidden_size,
+            bias=False,
+        )
 
     def forward(self, input_data: InputData, hidden_states=None):
         if get_pp_rank() == 0:
@@ -173,7 +202,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.transformer = ChatGLMModel(config)
         self.num_layers = len(self.transformer.encoder.layers)
         self.ret_residual = False
-        if is_pp_last_rank():
+        if is_last_pp_rank():
             self.lm_head = self.transformer.output_layer
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
@@ -191,12 +220,39 @@ class ChatGLMForCausalLM(nn.Module):
             mp_load_progress[get_local_rank()*2+1] = 0
         else:
             pbar = get_model_load_pbar(len(parameters))
+            
+        attn = self.transformer.encoder.layers[0].self_attention
+        num_heads = attn.num_heads
+        num_kv_heads = attn.num_kv_heads
+        head_dim = attn.head_dim
+        
+        intermediate_size = self.config.ffn_hidden_size
+        intermediate_size_partition = intermediate_size // get_tp_size()
+        vocab_size_partition = self.config.padded_vocab_size // get_tp_size()
+        
+        q_index = num_heads*head_dim*get_tp_size()
+        k_index = (num_heads+num_kv_heads)*head_dim*get_tp_size()
         
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 3, self.transformer.encoder.start_layer)
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')
-            v.data.copy_(weights[k])
+            
+            weight = weights[k]
+            if 'dense_h_to_4h.weight' in k:
+                copy_gate_up_proj_weight(v.data, weight[:intermediate_size], weight[intermediate_size:], intermediate_size_partition)
+            elif 'dense_4h_to_h.weight' in k:
+                copy_single_proj_col(v.data, weight, intermediate_size_partition)
+            elif 'query_key_value.weight' in k:
+                copy_qkv_proj_weight(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
+            elif 'query_key_value.bias' in k:
+                copy_qkv_proj_bias(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
+            elif 'dense.weight' in k:
+                copy_single_proj_col(v.data, weight, num_heads*head_dim)
+            elif 'embedding' in k or 'output_layer' in k:
+                copy_single_proj_row(v.data, weight, vocab_size_partition)
+            else:
+                v.data.copy_(weight)
             if mp_load_progress is not None:
                 mp_load_progress[get_local_rank()*2+1] += 1
             else:

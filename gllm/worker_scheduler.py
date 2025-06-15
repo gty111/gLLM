@@ -8,10 +8,11 @@ from logger import logger
 
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.scheduler import IPCPackage
+from gllm.frontend_scheduler import IPCPackage
+from gllm.dist_utils import get_world_size
 
 
-class PPScheduler():
+class WorkerScheduler():
     def __init__(self, pp_size, memory_manager:MemoryManager, use_naive_schedule, maxp, minp, iterp, page_size, kvthresh):
         self.pp_size = pp_size
         self.memory_manager = memory_manager
@@ -197,7 +198,7 @@ class PPScheduler():
         # prefill
         prefill_token_budget = self.page_size * \
             max(self.get_num_free_pages()-self.num_kvthresh_pages, 0)
-        if self.pp_size > 1 and prefill_token_budget != 0:
+        if get_world_size() > 1 and prefill_token_budget != 0:
             self.update_num_wait_tokens()
             free_ratio = self.memory_manager.get_memory_free()
             # a = ratio_threshold_free_pages
