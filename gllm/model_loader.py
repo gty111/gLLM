@@ -114,7 +114,7 @@ class ModelLoader():
         model = model_type(self.config)
         free_gpu_memory_after, _ = torch.cuda.mem_get_info()
         model_size_gb = round((free_gpu_memory_before - free_gpu_memory_after)/(2**30),2)
-        logger.info(f'Model architecture: {self.architecture}, Default dtype: {self.dtype}, Load model weights {model_size_gb} GB')
+        logger.info(f'Model architecture: {self.architecture}, Default dtype: {self.dtype}, Model weights {model_size_gb} GB')
         
         # Load weights from CPU memory to GPU memory 
         if self.load_format == 'auto':

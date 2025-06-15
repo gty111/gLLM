@@ -54,6 +54,9 @@ def get_tp_rank():
 def get_local_rank():
     return _LOCAL_RANK
 
+def get_output_rank():
+    return (get_pp_size() - 1) * get_tp_size()
+
 def is_output_rank():
     return is_last_pp_rank() and is_first_tp_rank()
 
