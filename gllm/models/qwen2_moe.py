@@ -17,7 +17,7 @@ from .qwen2 import Qwen2Model
 from .qwen2 import Qwen2ForCausalLM
 
 from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj)
+                           copy_gate_up_proj_weight, copy_single_proj_col)
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
@@ -173,7 +173,7 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                                              intermediate_size_partition)
             elif k.find('w2_weight') != -1: # expert
                 for expert_idx in range(self.config.num_experts):
-                    copy_single_proj(v.data[expert_idx], 
+                    copy_single_proj_col(v.data[expert_idx], 
                                      weights[k.replace('w2_weight', f'{expert_idx}.down_proj.weight')], 
                                      intermediate_size_partition)
             elif k.find('gate_up_proj.weight') != -1: # shared_expert
@@ -182,7 +182,7 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                                          weights[k.replace('gate_up_proj', 'up_proj')],
                                          shared_expert_intermediate_size_partition)
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj(v.data, weights[k], num_heads*head_dim)
+                copy_single_proj_col(v.data, weights[k], num_heads*head_dim)
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:

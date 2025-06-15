@@ -11,11 +11,13 @@ class Attention(nn.Module):
         tp_size = get_tp_size()
         
         self.total_num_heads = total_num_heads
-        assert self.total_num_heads % tp_size == 0
+        if self.total_num_heads % tp_size != 0:
+            raise Exception(f'total_num_heads({self.total_num_heads}) is not divisible by tp_size({tp_size})')
         self.num_heads = self.total_num_heads // tp_size
         
         self.total_num_kv_heads = total_num_kv_heads
-        assert self.total_num_kv_heads % tp_size == 0
+        if self.total_num_kv_heads % tp_size != 0:
+            raise Exception(f'total_num_kv_heads({self.total_num_kv_heads}) is not divisible by tp_size({tp_size})')
         self.num_kv_heads =  self.total_num_kv_heads // tp_size
         
         self.head_dim = (self.hidden_size // self.total_num_heads 

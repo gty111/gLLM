@@ -20,6 +20,10 @@ def copy_gate_up_proj_weight(dst, src_gate, src_up, intermediate_size_partition)
     dst[:intermediate_size_partition, :] = src_gate[get_tp_rank()*intermediate_size_partition:(get_tp_rank()+1)*intermediate_size_partition, :]
     dst[intermediate_size_partition:, :] = src_up[get_tp_rank()*intermediate_size_partition:(get_tp_rank()+1)*intermediate_size_partition, :]
     
-def copy_single_proj(dst, src, size_partition):
+def copy_single_proj_col(dst, src, size_partition):
     # partition on column
     dst.copy_(src[: , get_tp_rank()*size_partition:(get_tp_rank()+1)*size_partition])
+
+def copy_single_proj_row(dst, src, size_partition):
+    # partition on row
+    dst.copy_(src[get_tp_rank()*size_partition:(get_tp_rank()+1)*size_partition, :])

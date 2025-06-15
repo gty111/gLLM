@@ -11,7 +11,7 @@ from gllm.input_data import InputData
 from gllm.dist_utils import get_pp_layers, get_pp_rank, is_last_pp_rank
 from gllm.modules.attention import Attention
 
-from .qwen2 import Qwen2MLP, Qwen2ForCausalLM
+from .qwen2 import Qwen2MLP, Qwen2ForCausalLM, Qwen2Model
 
 class LlamaMLP(Qwen2MLP):
 
@@ -110,32 +110,10 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class LlamaModel(nn.Module):
+class LlamaModel(Qwen2Model):
 
     def __init__(self, config):
-        super().__init__()
-        self.start_layer, self.end_layer = get_pp_layers(
-            config.num_hidden_layers)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(
-            layer_id-self.start_layer, config) for layer_id in range(self.start_layer, self.end_layer)])
-        if get_pp_rank() == 0:
-            self.embed_tokens = nn.Embedding(
-                config.vocab_size, config.hidden_size)
-        if is_last_pp_rank():
-            self.norm = RMSNorm(
-                config.hidden_size, config.rms_norm_eps)
-
-    def forward(self, input_data: InputData, hidden_states=None, residual=None):
-        if get_pp_rank() == 0:
-            hidden_states = self.embed_tokens(input_data.tokens)
-        for layer in self.layers:
-            hidden_states, residual = layer(
-                input_data, hidden_states, residual)
-        if is_last_pp_rank():
-            hidden_states, _ = self.norm(hidden_states, residual)
-            return hidden_states
-        else:
-            return hidden_states, residual
+        super().__init__(config, LlamaDecoderLayer)
 
 
 class LlamaForCausalLM(Qwen2ForCausalLM):

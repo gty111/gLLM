@@ -143,9 +143,9 @@ python evaluations/evaluate_MMLU_pro.py --model $MODEL --port $PORT
 ## Supported Models
 
 - Qwen Series: Qwen3, Qwen2.5, Qwen2
-- Llama Series: Llama3.1, Llama3, Llama2 and deepseek-coder
+- Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
-- ChatGLM Series: Chatglm3 and glm4
+- ChatGLM Series: Glm4 and Chatglm3 
 
 ## Roadmap
 

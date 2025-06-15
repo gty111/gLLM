@@ -1,6 +1,5 @@
 import torch.distributed as dist
 import torch
-import os
 
 from logger import logger
 from collections.abc import Sequence
@@ -144,6 +143,33 @@ def resolve_pp_layer(layer_name, idx, start_layer_idx):
         return '.'.join(layer_name_list)
     else:
         return layer_name
+    
+def tensor_model_parallel_all_gather(input_: torch.Tensor, dim=-1) -> torch.Tensor:
+    """All-gather the input tensor across model parallel group."""
+    if dim < 0:
+        # Convert negative dim to positive.
+        dim += input_.dim()
+    input_size = input_.size()
+    # NOTE: we have to use concat-style all-gather here,
+    # stack-style all-gather has compatibility issues with
+    # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
+    output_size = (input_size[0] * get_tp_size(), ) + input_size[1:]
+    # Allocate output tensor.
+    output_tensor = torch.empty(output_size,
+                                dtype=input_.dtype,
+                                device=input_.device)
+    # All-gather.
+    dist.all_gather_into_tensor(output_tensor,
+                                input_,
+                                group=get_tp_group())
+    # Reshape
+    output_tensor = output_tensor.reshape((get_tp_size(), ) + input_size)
+    output_tensor = output_tensor.movedim(0, dim)
+    output_tensor = output_tensor.reshape(input_size[:dim] +
+                                            (get_tp_size() *
+                                            input_size[dim], ) +
+                                            input_size[dim + 1:])
+    return output_tensor
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""

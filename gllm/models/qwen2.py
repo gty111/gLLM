@@ -1,9 +1,11 @@
 import torch
 
+from logger import logger
 from typing import Optional
 from torch import nn
 
 from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, QKVParallelLinear
+from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
@@ -15,7 +17,8 @@ from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
 
 from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj)
+                           copy_gate_up_proj_weight, copy_single_proj_col,
+                           copy_single_proj_row)
 
 class Qwen2MLP(nn.Module):
 
@@ -107,9 +110,11 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     def __init__(self, config, decoder_layer_type=Qwen2DecoderLayer):
         super().__init__()
-        if get_pp_rank() == 0 or config.tie_word_embeddings and is_last_pp_rank():
-            self.embed_tokens = nn.Embedding(
-                config.vocab_size, config.hidden_size)
+        if get_pp_rank() == 0 or (config.tie_word_embeddings and is_last_pp_rank()):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
         self.start_layer, self.end_layer = get_pp_layers(
             config.num_hidden_layers)
         
@@ -147,13 +152,12 @@ class Qwen2ForCausalLM(nn.Module):
         self.num_layers = len(self.model.layers)
         self.ret_residual = True
         if is_last_pp_rank():
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+            )
             if config.tie_word_embeddings:
-                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-                self.lm_head.weight = self.model.embed_tokens.weight
-            else:
-                self.lm_head = nn.Linear(
-                    config.hidden_size, config.vocab_size, 
-                    bias=False)
+                self.lm_head.tie_weights(self.model.embed_tokens)
     
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.model(input_data, hidden_states, residual)
@@ -177,6 +181,7 @@ class Qwen2ForCausalLM(nn.Module):
         head_dim = attn.head_dim
         
         intermediate_size_partition = self.config.intermediate_size // get_tp_size()
+        vocab_size_partition = self.config.vocab_size // get_tp_size()
         
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 2, self.model.start_layer)
@@ -193,14 +198,16 @@ class Qwen2ForCausalLM(nn.Module):
                                    weights[k.replace('qkv_proj', 'v_proj')],
                                    num_heads, num_kv_heads, head_dim)
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj(v.data, weights[k], num_heads*head_dim)
+                copy_single_proj_col(v.data, weights[k], num_heads*head_dim)
             elif k.find('gate_up_proj') != -1:
                 copy_gate_up_proj_weight(v.data,
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
                                          weights[k.replace('gate_up_proj', 'up_proj')],
                                          intermediate_size_partition)
             elif k.find('down_proj') != -1:
-                copy_single_proj(v.data, weights[k], intermediate_size_partition)
+                copy_single_proj_col(v.data, weights[k], intermediate_size_partition)
+            elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
+                copy_single_proj_row(v.data, weights[k], vocab_size_partition)
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:

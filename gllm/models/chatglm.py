@@ -4,18 +4,20 @@ from torch import nn
 from copy import deepcopy
 
 from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, QKVParallelLinear
+from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 from gllm.input_data import InputData
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
-                             resolve_pp_layer, get_tp_size, get_tp_rank)
+                             resolve_pp_layer, get_tp_size)
 from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
 
 from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj)
+                           copy_gate_up_proj_weight, copy_single_proj_col,
+                           copy_single_proj_row)
 
 
 class GLMAttention(Attention):
@@ -165,15 +167,20 @@ class ChatGLMModel(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.embedding = nn.Embedding(
-            config.padded_vocab_size, config.hidden_size)
+        self.embedding = VocabParallelEmbedding(
+            config.padded_vocab_size,
+            config.hidden_size,
+        )
 
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
 
         self.encoder = GLMTransformer(config)
-        self.output_layer = nn.Linear(
-            config.hidden_size, config.padded_vocab_size, bias=False)
+        self.output_layer = ParallelLMHead(
+            config.padded_vocab_size,
+            config.hidden_size,
+            bias=False,
+        )
 
     def forward(self, input_data: InputData, hidden_states=None):
         if get_pp_rank() == 0:
@@ -221,6 +228,7 @@ class ChatGLMForCausalLM(nn.Module):
         
         intermediate_size = self.config.ffn_hidden_size
         intermediate_size_partition = intermediate_size // get_tp_size()
+        vocab_size_partition = self.config.padded_vocab_size // get_tp_size()
         
         q_index = num_heads*head_dim*get_tp_size()
         k_index = (num_heads+num_kv_heads)*head_dim*get_tp_size()
@@ -234,13 +242,15 @@ class ChatGLMForCausalLM(nn.Module):
             if 'dense_h_to_4h.weight' in k:
                 copy_gate_up_proj_weight(v.data, weight[:intermediate_size], weight[intermediate_size:], intermediate_size_partition)
             elif 'dense_4h_to_h.weight' in k:
-                copy_single_proj(v.data, weight, intermediate_size_partition)
+                copy_single_proj_col(v.data, weight, intermediate_size_partition)
             elif 'query_key_value.weight' in k:
                 copy_qkv_proj_weight(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'query_key_value.bias' in k:
                 copy_qkv_proj_bias(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'dense.weight' in k:
-                copy_single_proj(v.data, weight, num_heads*head_dim)
+                copy_single_proj_col(v.data, weight, num_heads*head_dim)
+            elif 'embedding' in k or 'output_layer' in k:
+                copy_single_proj_row(v.data, weight, vocab_size_partition)
             else:
                 v.data.copy_(weight)
             if mp_load_progress is not None:
