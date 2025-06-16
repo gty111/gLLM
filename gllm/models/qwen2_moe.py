@@ -17,7 +17,8 @@ from .qwen2 import Qwen2Model
 from .qwen2 import Qwen2ForCausalLM
 
 from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj_col)
+                           copy_gate_up_proj_weight, copy_single_proj_col,
+                           copy_single_proj_row)
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
@@ -150,6 +151,7 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         shared_expert_intermediate_size_partition = getattr(self.config, 'shared_expert_intermediate_size', None)
         if shared_expert_intermediate_size_partition:
             shared_expert_intermediate_size_partition = shared_expert_intermediate_size_partition // get_tp_size()
+        vocab_size_partition = self.config.vocab_size // get_tp_size()
         
         for k, v in parameters.items():
             k = resolve_pp_layer(k, 2, self.model.start_layer)
@@ -183,6 +185,8 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                                          shared_expert_intermediate_size_partition)
             elif k.find('self_attn.o_proj') != -1:
                 copy_single_proj_col(v.data, weights[k], num_heads*head_dim)
+            elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
+                copy_single_proj_row(v.data, weights[k], vocab_size_partition)
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
