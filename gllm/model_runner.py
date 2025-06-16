@@ -74,7 +74,7 @@ class ModelRunner():
         seq.to_compute_token_num = len(seq) - seq.computed_token_num
         self.memory_manager.pre_allocate_page([seq])
         next_token = self.step_once(InputData([seq], self.memory_manager))[0]
-        seq.token_ids.append(next_token)
+        seq.append(next_token)
         seq.computed_token_num += seq.to_compute_token_num
         seq.to_compute_token_num = 1
         prefill_end = time.time()
@@ -90,7 +90,7 @@ class ModelRunner():
             next_token = self.step_once(
                 InputData([seq], self.memory_manager))[0]
             seq.computed_token_num += seq.to_compute_token_num
-            seq.token_ids.append(next_token)
+            seq.append(next_token)
         print("\n")
         decode_end = time.time()
         # ------decode end-------

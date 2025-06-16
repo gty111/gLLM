@@ -33,6 +33,9 @@ class Sequence():
         
     def __len__(self):
         return len(self.token_ids)
+    
+    def append(self, token_id):
+        self.token_ids.append(token_id)
 
     def detokenize_inc(self, tokenizer: Union[PreTrainedTokenizer | PreTrainedTokenizerFast]):
         added_space = ' ' if ' ' in tokenizer.decode(

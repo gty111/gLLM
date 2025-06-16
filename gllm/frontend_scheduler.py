@@ -100,7 +100,7 @@ class FrontendScheduler:
 
     def update_seqs(self, ipc_package: IPCPackage, next_tokens: List[int], memory_manager: MemoryManager):
         for idx, seq in enumerate(ipc_package.schedule_lists):
-            seq.token_ids.append(next_tokens[idx])
+            seq.append(next_tokens[idx])
             seq.computed_token_num += seq.to_compute_token_num
             if seq.is_finish():
                 memory_manager.free(seq)
