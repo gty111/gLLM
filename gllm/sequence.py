@@ -34,14 +34,17 @@ class Sequence():
     def __len__(self):
         return len(self.token_ids)
     
+    def __getitem__(self, key):
+        return self.token_ids[key]
+    
     def append(self, token_id):
         self.token_ids.append(token_id)
 
     def detokenize_inc(self, tokenizer: Union[PreTrainedTokenizer | PreTrainedTokenizerFast]):
         added_space = ' ' if ' ' in tokenizer.decode(
-            self.token_ids[self.cur_length-1:self.cur_length+1], True, True).strip() else ''
+            self[self.cur_length-1:self.cur_length+1], True, True).strip() else ''
         delta_text = tokenizer.decode(
-            self.token_ids[self.cur_length:], True, True)
+            self[self.cur_length:], True, True)
         if delta_text.endswith('�'):
             return ''
         if len(delta_text) > 0 and delta_text[0] != ' ':
@@ -50,7 +53,7 @@ class Sequence():
         return delta_text
 
     def is_finish(self):
-        return (not self.ignore_eos and self.token_ids[-1] in self.finish_tokens
+        return (not self.ignore_eos and self[-1] in self.finish_tokens
                     ) or len(self) - self.prompt_len >= self.output_len
         
     def preempt(self):

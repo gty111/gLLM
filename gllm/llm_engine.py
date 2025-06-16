@@ -78,7 +78,7 @@ class LLM():
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None,
                  temperature=None, top_p=None, top_k=None):
-        requests: List[Sequence] = []
+        seqs: List[Sequence] = []
         assert prompts is not None or tokens is not None
         num_seqs = len(prompts) if prompts is not None else len(tokens)
         for idx in range(num_seqs):
@@ -87,21 +87,21 @@ class LLM():
             if self.check_seq_length(token_ids, output_len_each):
                 seq = self.allocate_seq(token_ids, output_len_each, False, temperature,
                                         top_p, top_k)
-                requests.append(seq)
-        self.add_requests(requests)
+                seqs.append(seq)
+        self.add_requests(seqs)
 
-        pbar = tqdm.tqdm(total=len(requests),ncols=100)
-        while len(self.scheduler.finish_ids) != len(requests):
+        pbar = tqdm.tqdm(total=len(seqs),ncols=100)
+        while len(self.scheduler.finish_ids) != len(seqs):
             cur_finish_num = len(self.scheduler.finish_ids)
             self.step()
             pbar.update(len(self.scheduler.finish_ids)-cur_finish_num)
 
-        for request in requests:
-            request.prompt = self.model_runner.decode(request.token_ids[:request.prompt_len])
-            request.output = self.model_runner.decode(request.token_ids[request.prompt_len:])
+        for seq in seqs:
+            seq.prompt = self.model_runner.decode(seq[:seq.prompt_len])
+            seq.output = self.model_runner.decode(seq[seq.prompt_len:])
 
         self.free_finish_ids(self.scheduler.get_finish_ids())
-        return requests
+        return seqs
 
     def chat(self):
         self.model_runner.init()

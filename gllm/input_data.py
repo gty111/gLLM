@@ -38,8 +38,7 @@ class InputData():
     def get_tokens(self):
         tokens_list = []
         for seq in self.seqs:
-            tokens_list.extend(
-                seq.token_ids[seq.computed_token_num:seq.computed_token_num+seq.to_compute_token_num])
+            tokens_list.extend(seq[seq.computed_token_num:seq.computed_token_num+seq.to_compute_token_num])
         return async_tensor_h2d(
             tokens_list, torch.long, 'cuda', True)
 

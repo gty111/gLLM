@@ -101,9 +101,9 @@ class ModelRunner():
         prefill_rate = round(
             seq.prompt_len / elapsed_prefill_time, 2)
         decode_rate = round(
-            len(seq.token_ids[seq.prompt_len:]) / elapsed_decode_time, 2)
+            len(seq[seq.prompt_len:]) / elapsed_decode_time, 2)
         print(
-            f'#input: {seq.prompt_len} #output: {len(seq.token_ids[seq.prompt_len:])} '
+            f'#input: {seq.prompt_len} #output: {len(seq[seq.prompt_len:])} '
             f'elapsed time: {elapsed_time} s rate(prefill/decode): {prefill_rate}/{decode_rate} toks/s\n')
         # -----metric end--------
-        return self.decode(seq.token_ids[seq.prompt_len:])
+        return self.decode(seq[seq.prompt_len:])
