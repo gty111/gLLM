@@ -26,7 +26,6 @@ class ModelLoader():
         return self.get_model_type().get_finish_tokens(self.config)
     
     def load_safetensors(self, path):
-        # load .safetensor
         weights_path = glob.glob(f"{path}/*.safetensors")
         for weight_path in weights_path:
             with safe_open(weight_path, framework="pt", device="cpu") as f:
@@ -68,7 +67,7 @@ class ModelLoader():
         if self.load_weights_from_huggingface(self.model_path):
             return
 
-        raise Exception(f'Failed to load {self.model_path}!')
+        raise Exception(f'Failed to load {self.model_path} from local or huggingface!')
 
     def load_config(self):
         self.config = AutoConfig.from_pretrained(self.model_path,trust_remote_code=True)

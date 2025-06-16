@@ -71,10 +71,10 @@ class ModelRunner():
         prefill_start = time.time()
         if isinstance(self.memory_manager, PrefixMemoryManager):
             self.memory_manager.pre_allocate_computed_page([seq])
-        seq.to_compute_token_num = len(seq.token_ids) - seq.computed_token_num
+        seq.to_compute_token_num = len(seq) - seq.computed_token_num
         self.memory_manager.pre_allocate_page([seq])
         next_token = self.step_once(InputData([seq], self.memory_manager))[0]
-        seq.token_ids.append(next_token)
+        seq.append(next_token)
         seq.computed_token_num += seq.to_compute_token_num
         seq.to_compute_token_num = 1
         prefill_end = time.time()
@@ -90,7 +90,7 @@ class ModelRunner():
             next_token = self.step_once(
                 InputData([seq], self.memory_manager))[0]
             seq.computed_token_num += seq.to_compute_token_num
-            seq.token_ids.append(next_token)
+            seq.append(next_token)
         print("\n")
         decode_end = time.time()
         # ------decode end-------
@@ -101,9 +101,9 @@ class ModelRunner():
         prefill_rate = round(
             seq.prompt_len / elapsed_prefill_time, 2)
         decode_rate = round(
-            len(seq.token_ids[seq.prompt_len:]) / elapsed_decode_time, 2)
+            len(seq[seq.prompt_len:]) / elapsed_decode_time, 2)
         print(
-            f'#input: {seq.prompt_len} #output: {len(seq.token_ids[seq.prompt_len:])} '
+            f'#input: {seq.prompt_len} #output: {len(seq[seq.prompt_len:])} '
             f'elapsed time: {elapsed_time} s rate(prefill/decode): {prefill_rate}/{decode_rate} toks/s\n')
         # -----metric end--------
-        return self.decode(seq.token_ids[seq.prompt_len:])
+        return self.decode(seq[seq.prompt_len:])

@@ -30,22 +30,31 @@ class Sequence():
         self.to_compute_token_num = 0
         # used for abort
         self.is_abort = False
+        
+    def __len__(self):
+        return len(self.token_ids)
+    
+    def __getitem__(self, key):
+        return self.token_ids[key]
+    
+    def append(self, token_id):
+        self.token_ids.append(token_id)
 
     def detokenize_inc(self, tokenizer: Union[PreTrainedTokenizer | PreTrainedTokenizerFast]):
         added_space = ' ' if ' ' in tokenizer.decode(
-            self.token_ids[self.cur_length-1:self.cur_length+1], True, True).strip() else ''
+            self[self.cur_length-1:self.cur_length+1], True, True).strip() else ''
         delta_text = tokenizer.decode(
-            self.token_ids[self.cur_length:], True, True)
+            self[self.cur_length:], True, True)
         if delta_text.endswith('�'):
             return ''
         if len(delta_text) > 0 and delta_text[0] != ' ':
             delta_text = added_space + delta_text
-        self.cur_length = len(self.token_ids)
+        self.cur_length = len(self)
         return delta_text
 
     def is_finish(self):
-        return (not self.ignore_eos and self.token_ids[-1] in self.finish_tokens
-                    ) or len(self.token_ids) - self.prompt_len >= self.output_len
+        return (not self.ignore_eos and self[-1] in self.finish_tokens
+                    ) or len(self) - self.prompt_len >= self.output_len
         
     def preempt(self):
         self.computed_token_num = 0
