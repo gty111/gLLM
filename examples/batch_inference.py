@@ -47,7 +47,7 @@ if __name__ == '__main__':
         num_output_tokens = 0
         for seq in seqs:
             num_input_tokens += seq.prompt_len
-            num_output_tokens += len(seq.token_ids) - seq.prompt_len
+            num_output_tokens += len(seq) - seq.prompt_len
             if args.print_output:
                 print('*'*10)
                 print(f'prompt:\n{seq.prompt}')

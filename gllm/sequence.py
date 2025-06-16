@@ -30,6 +30,9 @@ class Sequence():
         self.to_compute_token_num = 0
         # used for abort
         self.is_abort = False
+        
+    def __len__(self):
+        return len(self.token_ids)
 
     def detokenize_inc(self, tokenizer: Union[PreTrainedTokenizer | PreTrainedTokenizerFast]):
         added_space = ' ' if ' ' in tokenizer.decode(
@@ -40,12 +43,12 @@ class Sequence():
             return ''
         if len(delta_text) > 0 and delta_text[0] != ' ':
             delta_text = added_space + delta_text
-        self.cur_length = len(self.token_ids)
+        self.cur_length = len(self)
         return delta_text
 
     def is_finish(self):
         return (not self.ignore_eos and self.token_ids[-1] in self.finish_tokens
-                    ) or len(self.token_ids) - self.prompt_len >= self.output_len
+                    ) or len(self) - self.prompt_len >= self.output_len
         
     def preempt(self):
         self.computed_token_num = 0

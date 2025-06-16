@@ -50,7 +50,7 @@ class WorkerScheduler():
 
     def update_num_wait_tokens(self):
         self.num_wait_tokens = reduce(
-            lambda x, y: x + len(y.token_ids) - y.computed_token_num, self.seqs_to_prefill, 0)
+            lambda x, y: x + len(y) - y.computed_token_num, self.seqs_to_prefill, 0)
     
     def add_abort_ids(self, abort_ids):
         self.abort_ids.update(abort_ids)
@@ -160,9 +160,8 @@ class WorkerScheduler():
         while len(self.seqs_to_prefill) != 0 and num_tokens_budget != 0:
             seq = self.seqs_to_prefill.popleft()
             self.memory_manager.pre_allocate_page([seq])
-            if len(seq.token_ids)-seq.computed_token_num <= num_tokens_budget:
-                seq.to_compute_token_num = len(
-                    seq.token_ids) - seq.computed_token_num
+            if len(seq)-seq.computed_token_num <= num_tokens_budget:
+                seq.to_compute_token_num = len(seq) - seq.computed_token_num
                 prefill_batched_token_nums += seq.to_compute_token_num
                 num_tokens_budget -= seq.to_compute_token_num
             else:
@@ -217,9 +216,8 @@ class WorkerScheduler():
             seq = self.seqs_to_prefill.popleft()
             if isinstance(self.memory_manager, PrefixMemoryManager) and seq.computed_token_num == 0:
                 self.memory_manager.pre_allocate_computed_page([seq])
-            if len(seq.token_ids)-seq.computed_token_num <= prefill_token_budget:
-                seq.to_compute_token_num = len(
-                    seq.token_ids) - seq.computed_token_num
+            if len(seq)-seq.computed_token_num <= prefill_token_budget:
+                seq.to_compute_token_num = len(seq) - seq.computed_token_num
                 prefill_batched_token_nums += seq.to_compute_token_num
                 prefill_token_budget -= seq.to_compute_token_num
             else:

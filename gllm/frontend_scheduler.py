@@ -69,15 +69,14 @@ class FrontendScheduler:
         if self.num_free_pages > self.num_kvthresh_pages:
             cu_seqs_len = 0
             for seq in self.prompt_lists:
-                num_page = (len(seq.token_ids) +
+                num_page = (len(seq) +
                             self.page_size-1) // self.page_size
-                if cu_seqs_len + len(seq.token_ids) <= self.max_batch_tokens and (
+                if cu_seqs_len + len(seq) <= self.max_batch_tokens and (
                         self.num_free_pages - num_page - cur_prefill_budget > self.num_kvthresh_pages):
-                    cu_seqs_len += len(seq.token_ids)
+                    cu_seqs_len += len(seq)
                     if isinstance(memory_manager, PrefixMemoryManager):
                         memory_manager.pre_allocate_computed_page([seq])
-                    seq.to_compute_token_num = len(
-                        seq.token_ids) - seq.computed_token_num
+                    seq.to_compute_token_num = len(seq) - seq.computed_token_num
                     memory_manager.pre_allocate_page([seq])
                     prefill_schedule_lists.append(seq)
                     cur_prefill_budget += num_page

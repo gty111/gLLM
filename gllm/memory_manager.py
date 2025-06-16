@@ -134,11 +134,11 @@ class PrefixMemoryManager(MemoryManager):
     def pre_allocate_computed_page(self, seqs: List[Sequence]):
         for seq in seqs:
             assert len(seq.page_table) == 0
-            num_page = (len(seq.token_ids) + self.page_size - 1) // self.page_size 
+            num_page = (len(seq) + self.page_size - 1) // self.page_size 
             if not seq.computed_prompt():
                 self.num_allocated_pages += num_page
             for i in range(num_page):
-                if (i+1)*self.page_size <= len(seq.token_ids):
+                if (i+1)*self.page_size <= len(seq):
                     page_num = self.segment.has_computed((*seq.token_ids[:(i+1)*self.page_size],))
                     if page_num is not None:
                         seq.page_table.append(page_num)
@@ -154,7 +154,7 @@ class PrefixMemoryManager(MemoryManager):
             len_page_table = len(seq.page_table)
             num_page = (seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1) // self.page_size - len_page_table
             for i in range(len_page_table,len_page_table+num_page):
-                if (i+1)*self.page_size <= len(seq.token_ids):
+                if (i+1)*self.page_size <= len(seq):
                     page_num = self.segment.allocate(
                             (*seq.token_ids[:(i+1)*self.page_size],))
                 else:
