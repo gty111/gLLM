@@ -159,7 +159,6 @@ class WorkerScheduler():
         prefill_batched_token_nums = 0
         while len(self.seqs_to_prefill) != 0 and num_tokens_budget != 0:
             seq = self.seqs_to_prefill.popleft()
-            self.memory_manager.pre_allocate_page([seq])
             if len(seq)-seq.computed_token_num <= num_tokens_budget:
                 seq.to_compute_token_num = len(seq) - seq.computed_token_num
                 prefill_batched_token_nums += seq.to_compute_token_num
