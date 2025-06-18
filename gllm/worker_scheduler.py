@@ -70,14 +70,14 @@ class WorkerScheduler():
 
             for idx, seq in enumerate(schedule_seqs):
                 seq.computed_token_num += seq.to_compute_token_num
-                if seq.computed_prompt():
+                if seq.computed_prompt:
                     ipc_package.act_schedule_ids.append(seq.seq_id)
                     send_tokens.append(next_tokens[idx])
                     seq.append(next_tokens[idx])
-                if seq.is_finish():
+                if seq.is_finish:
                     ipc_package.free_ids.append(seq.seq_id)
                     self.memory_manager.free(seq)
-                elif seq.computed_prompt():
+                elif seq.computed_prompt:
                     self.seqs_to_decode.appendleft(seq)
                 else:
                     self.seqs_to_prefill.appendleft(seq)

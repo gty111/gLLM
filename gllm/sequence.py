@@ -52,6 +52,7 @@ class Sequence():
         self.cur_length = len(self)
         return delta_text
 
+    @property
     def is_finish(self):
         return (not self.ignore_eos and self[-1] in self.finish_tokens
                     ) or len(self) - self.prompt_len >= self.output_len
@@ -60,5 +61,10 @@ class Sequence():
         self.computed_token_num = 0
         self.page_table = []
 
+    @property
     def computed_prompt(self):
         return self.computed_token_num >= self.prompt_len
+    
+    @property
+    def seq_len(self):
+        return self.computed_token_num + self.to_compute_token_num

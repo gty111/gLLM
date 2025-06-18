@@ -6,7 +6,7 @@ from typing import List
 from gllm.dist_utils import is_last_pp_rank
 from gllm.utils import async_tensor_h2d
 from gllm.sequence import Sequence
-from gllm.memory_manager import MemoryManager, PrefixMemoryManager
+from gllm.memory_manager import MemoryManager
 
 
 class InputData():
@@ -38,7 +38,7 @@ class InputData():
     def get_tokens(self):
         tokens_list = []
         for seq in self.seqs:
-            tokens_list.extend(seq[seq.computed_token_num:seq.computed_token_num+seq.to_compute_token_num])
+            tokens_list.extend(seq[seq.computed_token_num:seq.seq_len])
         return async_tensor_h2d(
             tokens_list, torch.long, 'cuda', True)
 
@@ -46,12 +46,12 @@ class InputData():
         positions_list = []
         for seq in self.seqs:
             positions_list.extend(
-                range(seq.computed_token_num, seq.computed_token_num+seq.to_compute_token_num))
+                range(seq.computed_token_num, seq.seq_len))
         return async_tensor_h2d(
             positions_list, torch.long, 'cuda', True)
 
     def get_seq_len_loc(self):
-        seq_start_loc = [seq.computed_token_num + seq.to_compute_token_num for seq in self.seqs]
+        seq_start_loc = [seq.seq_len for seq in self.seqs]
         max_seqlen = max(seq_start_loc)
         return max_seqlen, async_tensor_h2d(seq_start_loc, torch.int32, 'cuda', True)
 
@@ -78,7 +78,7 @@ class InputData():
     def get_slot_mapping(self):
         slot_mapping = []
         for seq in self.seqs:
-            for i in range(seq.computed_token_num,seq.computed_token_num+seq.to_compute_token_num):
+            for i in range(seq.computed_token_num,seq.seq_len):
                 page_idx = i // self.page_size
                 slot_idx = i % self.page_size
                 slot_mapping.append(seq.page_table[page_idx]*self.page_size+slot_idx)

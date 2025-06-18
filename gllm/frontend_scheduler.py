@@ -103,7 +103,7 @@ class FrontendScheduler:
         for idx, seq in enumerate(ipc_package.schedule_lists):
             seq.append(next_tokens[idx])
             seq.computed_token_num += seq.to_compute_token_num
-            if seq.is_finish():
+            if seq.is_finish:
                 memory_manager.free(seq)
                 self.finish_ids.append(seq.seq_id)
             else:

@@ -57,7 +57,7 @@ class MemoryManager():
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
-            num_page = (seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1) // self.page_size - len(seq.page_table)
+            num_page = (seq.seq_len + self.page_size - 1) // self.page_size - len(seq.page_table)
             for _ in range(num_page):
                 seq.page_table.append(
                     self.segment.allocate())
@@ -135,7 +135,7 @@ class PrefixMemoryManager(MemoryManager):
         for seq in seqs:
             assert len(seq.page_table) == 0
             num_page = (len(seq) + self.page_size - 1) // self.page_size 
-            if not seq.computed_prompt():
+            if not seq.computed_prompt:
                 self.num_allocated_pages += num_page
             for i in range(num_page):
                 if (i+1)*self.page_size <= len(seq):
@@ -152,10 +152,10 @@ class PrefixMemoryManager(MemoryManager):
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
             # update hash of newly generated page in decode stage
-            if seq.computed_prompt() and len(seq) % self.page_size == 0:
+            if seq.computed_prompt and len(seq) % self.page_size == 0:
                 self.segment.update((*seq[:],), seq.page_table[-1])
             len_page_table = len(seq.page_table)
-            num_page = (seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1) // self.page_size - len_page_table
+            num_page = (seq.seq_len + self.page_size - 1) // self.page_size - len_page_table
             for i in range(len_page_table,len_page_table+num_page):
                 if (i+1)*self.page_size <= len(seq):
                     page_num = self.segment.allocate(

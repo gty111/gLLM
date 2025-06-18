@@ -2,7 +2,6 @@ import torch
 import time
 
 from typing import Union
-from logger import logger
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from gllm.model_loader import ModelLoader
@@ -84,7 +83,7 @@ class ModelRunner():
         decode_start = time.time()
         while True:
             print(seq.detokenize_inc(self.tokenizer), end='', flush=True)
-            if seq.is_finish():
+            if seq.is_finish:
                 break
             self.memory_manager.pre_allocate_page([seq])
             next_token = self.step_once(
