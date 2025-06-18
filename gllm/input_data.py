@@ -1,6 +1,8 @@
 import torch
 import numpy as np
+import time
 
+from logger import logger
 from typing import List
 
 from gllm.dist_utils import is_last_pp_rank
@@ -52,11 +54,8 @@ class InputData():
 
     def get_seq_len_loc(self):
         max_seqlen = 0
-        seq_start_loc = []
-        for seq in self.seqs:
-            seq_len = seq.computed_token_num + seq.to_compute_token_num
-            seq_start_loc.append(seq_len)
-            max_seqlen = max(seq_len, max_seqlen)
+        seq_start_loc = [seq.computed_token_num + seq.to_compute_token_num for seq in self.seqs]
+        max_seqlen = max(seq_start_loc)
         return max_seqlen, async_tensor_h2d(seq_start_loc, torch.int32, 'cuda', True)
 
     def get_query_len_loc(self):
