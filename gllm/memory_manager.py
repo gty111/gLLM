@@ -151,6 +151,9 @@ class PrefixMemoryManager(MemoryManager):
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
+            # update hash of newly generated page in decode stage
+            if seq.computed_prompt() and len(seq) % self.page_size == 0:
+                self.segment.update((*seq[:],), seq.page_table[-1])
             len_page_table = len(seq.page_table)
             num_page = (seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1) // self.page_size - len_page_table
             for i in range(len_page_table,len_page_table+num_page):
