@@ -13,7 +13,8 @@ from gllm.worker_scheduler import WorkerScheduler
 from gllm.frontend_scheduler import IPCPackage
 from gllm.dist_utils import (init_dist, send_pp_data, recv_pp_data, 
                              get_rank, get_world_size, is_last_pp_rank,
-                             get_pp_size, get_next_pp_rank, get_last_pp_rank)
+                             get_pp_size, get_next_pp_rank, get_last_pp_rank,
+                             is_output_rank)
 
 # Used with PipeAsyncLLM
 class Worker:
@@ -112,7 +113,7 @@ class Worker:
             self.run_queue.popleft()
             output = self.model_runner.step_once(
                 input_data, hidden_states, residual)
-            if type(output) is list:
+            if is_output_rank():
                 self.comm.send_tokens(output)
             elif not is_last_pp_rank():
                 send_pp_data(output, get_next_pp_rank())
@@ -163,7 +164,7 @@ class Worker:
                 self.comm.send_schedule_seqs(schedule_seqs)
             output = self.model_runner.step_once(input_data)
 
-            if type(output) != list:
+            if not is_output_rank():
                 send_pp_data(output, get_next_pp_rank())
             else:
                 self.worker_scheduler.add_next_tokens(output)
