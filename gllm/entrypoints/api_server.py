@@ -83,27 +83,35 @@ async def run_server(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Launch gLLM server')
+    # Network
     parser.add_argument('--host', type=str, help='Host addr', default='0.0.0.0')
     parser.add_argument('--port', type=int, help='Uvicorn port', default=8000)
     parser.add_argument('--master-addr', type=str, help='NCCL addr', default='0.0.0.0')
     parser.add_argument('--master-port', type=str, help='NCCL port', default='8001')
     parser.add_argument('--zmq-port-base', type=int, help='ZeroMQ port', default=8002)
+    # Model
     parser.add_argument('--model-path', help='Path to the model, either from local disk or from huggingface', type=str, required=True)
+    parser.add_argument('--load-format', type=str, choices=['auto','dummy'], help='auto: actually load model weights; dummy: initialize the model with random values', default='auto')
+    parser.add_argument('--disable-thinking', help='Disable thinking in inference models', action='store_true')
+    # Runtime
     parser.add_argument('--disable-pipe-schedule', help='Use AsyncLLM backend (used for performance comparsion)', action="store_true")
+    parser.add_argument('--use-async-worker', help='Experimental feature for worker implemented by async', action='store_true')
     parser.add_argument('--gpu-memory-util', type=float, help='GPU memory utilization for KV cache (excluding model weights)', default=0.9)
+    parser.add_argument('--enable-prefix-caching', help='Enable KV cache reuse across requests', action='store_true')
     parser.add_argument('--page-size', type=int, help='Number of tokens in a page', default=16)
+    # Parallelism
+    parser.add_argument('--pp', type=int, help='Number of pipeline stages', default=1)
+    parser.add_argument('--tp', type=int, help='Number of tensor parallel degrees', default=1)
+    parser.add_argument('--disable-ep', help='Disable expert parallelism (EP is enable by default)', action='store_true')
+    parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
+    # Token Throttling
     parser.add_argument('--maxd', type=int, help='Maximum decode token count, used in AsyncLLM and offline infernce', default=512)
     parser.add_argument('--maxp', type=int, help='Maximum token count in prefill', default=2048)
     parser.add_argument('--minp', type=int, help='Minimum token count in prefill, used in PipeAsyncLLM', default=32)
     parser.add_argument('--iterp', type=int, help='Number of iterations to process waiting prefill tokens, used in PipeAsyncLLM', default=8)
     parser.add_argument('--kvthresh', type=float, help='KV cache threshold for prefill operations', default=0.05)
     parser.add_argument('--use-naive-schedule', help='Use scheduling policy in Sarathi-Serve', action='store_true')
-    parser.add_argument('--enable-prefix-caching', help='Enable KV cache reuse across requests', action='store_true')
-    parser.add_argument('--pp', type=int, help='Number of pipeline stages', default=1)
-    parser.add_argument('--tp', type=int, help='Number of tensor parallel degrees', default=1)
-    parser.add_argument('--load-format', type=str, choices=['auto','dummy'], help='auto: actually load model weights; dummy: initialize the model with random values', default='auto')
-    parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
-    parser.add_argument('--use-async-worker', help='Experimental feature for worker implemented by async', action='store_true')
+    # Multi-Node deployment
     parser.add_argument('--launch-mode', type=str, choices=['normal', 'master', 'slave'], default='normal')
     parser.add_argument('--ranks',type=str,help='Specify the ranks of worker like 0,1', default=None)
     args = parser.parse_args()
@@ -127,9 +135,11 @@ if __name__ == '__main__':
                   enable_prefix_caching=args.enable_prefix_caching,
                   pp_size=args.pp,
                   tp_size=args.tp,
+                  use_ep=not args.disable_ep,
                   assigned_layers=args.assigned_layers,
                   use_naive_schedule=args.use_naive_schedule,
-                  use_async_worker=args.use_async_worker)
+                  use_async_worker=args.use_async_worker,
+                  use_thinking=not args.disable_thinking)
     
     if args.launch_mode != 'slave':
         asyncio.run(run_server(args))

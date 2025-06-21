@@ -11,7 +11,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
-                             resolve_pp_layer, get_tp_size)
+                             resolve_pp_layer_idx, get_tp_size)
 from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
 
@@ -234,7 +234,7 @@ class ChatGLMForCausalLM(nn.Module):
         k_index = (num_heads+num_kv_heads)*head_dim*get_tp_size()
         
         for k, v in parameters.items():
-            k = resolve_pp_layer(k, 3, self.transformer.encoder.start_layer)
+            k = resolve_pp_layer_idx(k, 3, self.transformer.encoder.start_layer)
             if 'embedding' in k:
                 k = k.replace('embedding', 'embedding.word_embeddings')
             

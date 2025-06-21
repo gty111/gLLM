@@ -15,14 +15,16 @@ class LLM():
     def __init__(self, model_path, host=None, master_addr=None, master_port=None, 
                  zmq_port_base=None, launch_mode=None, worker_ranks=None, load_format='auto', 
                  gpu_memory_util=0.9, page_size=16, maxd=256,maxp=2048, minp=32, 
-                 iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1, tp_size=1):
+                 iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1, tp_size=1, use_ep=True,
+                 assigned_layers=None, use_naive_schedule=False, use_async_worker=False, use_thinking=True):
         init_logger()
         self.model_path = model_path
         self.model_runner = ModelRunner(
-            load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, 
+            load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, use_thinking,
             maxp, maxd, kvthresh, minp, iterp)
         self.pp_size = pp_size
         self.tp_size = tp_size
+        self.use_ep = use_ep
         self.host = host
         self.master_addr = master_addr
         self.master_port = master_port
@@ -37,6 +39,10 @@ class LLM():
             self.finish_tokens = [self.finish_tokens]
         self.model_max_length = self.model_runner.tokenizer.model_max_length
         self.generation_config = self.model_runner.model_loader.generation_config
+        
+        self.assigned_layers = assigned_layers
+        self.use_naive_schedule = use_naive_schedule
+        self.use_async_worker = use_async_worker
 
     def check_seq_length(self, token_ids: List[int], output_len: int):
         max_seq_length = len(

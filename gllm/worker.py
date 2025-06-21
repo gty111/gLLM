@@ -20,7 +20,7 @@ from gllm.dist_utils import (init_dist, send_pp_data, recv_pp_data,
 class Worker:
 
     def __init__(self, model_runner: ModelRunner, local_rank, pp_rank, tp_rank, 
-                 pp_size, tp_size, master_addr, master_port, comm: zmqComm, mp_alive,
+                 pp_size, tp_size, use_ep, master_addr, master_port, comm: zmqComm, mp_alive,
                  mp_load_progress, assigned_layers, use_naive_schedule):
         self.model_runner = model_runner
         self.local_rank = local_rank
@@ -28,6 +28,7 @@ class Worker:
         self.tp_rank = tp_rank
         self.pp_size = pp_size
         self.tp_size = tp_size
+        self.use_ep = use_ep
         self.master_addr = master_addr
         self.master_port = master_port
         self.comm = comm
@@ -37,15 +38,16 @@ class Worker:
         self.use_naive_schedule = use_naive_schedule
 
     def init_logger(self):
+        tp_ep_log = 'TP' if not self.use_ep else 'TP/EP'
         formater = logging.Formatter(
             f'[%(asctime)s %(filename)s:%(lineno)d Worker{self.pp_rank*self.tp_size+self.tp_rank} '
-            f'PP{self.pp_rank} TP{self.tp_rank}] %(levelname)s - %(message)s')
+            f'PP{self.pp_rank} {tp_ep_log}{self.tp_rank}] %(levelname)s - %(message)s')
         for handler in logger.handlers:
             handler.setFormatter(formater)
 
     def init(self):
         self.init_logger()
-        init_dist(self.pp_size, self.tp_size , self.local_rank, self.pp_rank, self.tp_rank, self.master_addr, 
+        init_dist(self.pp_size, self.tp_size, self.use_ep, self.local_rank, self.pp_rank, self.tp_rank, self.master_addr, 
                   self.master_port, self.assigned_layers)
         self.rank = get_rank()
         torch.cuda.set_device(f'cuda:{self.local_rank}')

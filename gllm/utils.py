@@ -14,7 +14,7 @@ import tqdm
 from logger import logger
 from functools import partial
 from typing import (Awaitable, Callable, ParamSpec, TypeVar, Union, Optional, Dict, Any,
-                    List)
+                    List, Tuple)
 from pathlib import Path
 from torch.library import Library
 
@@ -136,6 +136,7 @@ def direct_register_custom_op(
     mutates_args: List[str],
     fake_impl: Optional[Callable] = None,
     target_lib: Optional[Library] = None,
+    tags: Tuple[torch.Tag, ...] = (),
 ):
     """
     `torch.library.custom_op` can have significant overhead because it
@@ -163,7 +164,7 @@ def direct_register_custom_op(
         schema_str = torch._custom_op.impl.infer_schema(op_func, mutates_args)
 
     my_lib = target_lib or gllm_lib
-    my_lib.define(op_name + schema_str)
+    my_lib.define(op_name + schema_str, tags=tags)
     my_lib.impl(op_name, op_func, "CUDA")
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)

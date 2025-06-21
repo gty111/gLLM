@@ -32,12 +32,15 @@ def recv_obj_list(obj_list, src):
 _RANK=0
 _PP_RANK=0
 _TP_RANK=0
+_EP_RANK=0
 _LOCAL_RANK=0
 _PP_SIZE=1
 _TP_SIZE=1
+_EP_SIZE=1
 _WORLD_SIZE=1
 _ASSIGNED_LAYERS=None
 _TP_GROUP=None
+_USE_EP=True
 
 def get_rank():
     return _RANK
@@ -50,6 +53,9 @@ def get_pp_rank():
 
 def get_tp_rank():
     return _TP_RANK
+
+def get_ep_rank():
+    return _EP_RANK
 
 def get_local_rank():
     return _LOCAL_RANK
@@ -66,6 +72,9 @@ def is_first_tp_rank():
 def is_last_pp_rank():
     return get_pp_rank() == get_pp_size() - 1
 
+def is_use_ep():
+    return _USE_EP
+
 def get_next_pp_rank():
     return get_rank() + get_tp_size()
 
@@ -77,6 +86,9 @@ def get_pp_size():
 
 def get_tp_size():
     return _TP_SIZE
+
+def get_ep_size():
+    return _EP_SIZE
 
 def get_assigned_layers():
     return _ASSIGNED_LAYERS
@@ -92,14 +104,18 @@ def init_tp_group():
         if _RANK in tp_ranks:
             _TP_GROUP = tp_group
 
-def init_dist(pp_size, tp_size, local_rank, pp_rank, tp_rank, master_addr, master_port, assigned_layers):
-    global _RANK, _PP_RANK, _TP_RANK, _PP_SIZE, _TP_SIZE, _WORLD_SIZE, _ASSIGNED_LAYERS, _LOCAL_RANK, _TP_GROUP, _PP_GROUP
+def init_dist(pp_size, tp_size, use_ep, local_rank, pp_rank, tp_rank, master_addr, master_port, assigned_layers):
+    global _RANK, _PP_RANK, _TP_RANK, _PP_SIZE, _TP_SIZE, _WORLD_SIZE, _ASSIGNED_LAYERS, _LOCAL_RANK, _TP_GROUP
+    global _EP_SIZE, _EP_RANK, _USE_EP
     _RANK = pp_rank * tp_size + tp_rank
     _PP_RANK = pp_rank
     _TP_RANK = tp_rank
+    _EP_RANK = _TP_RANK if use_ep else 0
     _LOCAL_RANK = local_rank
     _PP_SIZE = pp_size
     _TP_SIZE = tp_size
+    _EP_SIZE = _TP_SIZE if use_ep else 1
+    _USE_EP = use_ep
     _WORLD_SIZE = pp_size * tp_size
     _ASSIGNED_LAYERS = assigned_layers
     
@@ -107,7 +123,8 @@ def init_dist(pp_size, tp_size, local_rank, pp_rank, tp_rank, master_addr, maste
     
     init_method = f'tcp://{master_addr}:{master_port}'
     backend = 'nccl'
-    logger.info(f'NCCL: Init_method {init_method}, Backend {backend}, Rank {_RANK}, TP Groups {self_tp_ranks}, Word_size {_WORLD_SIZE}')
+    tp_ep_log = 'TP Groups' if not use_ep else 'TP/EP Groups'
+    logger.info(f'NCCL: Init_method {init_method}, Backend {backend}, Rank {_RANK}, {tp_ep_log} {self_tp_ranks}, Word_size {_WORLD_SIZE}')
     dist.init_process_group(init_method=init_method, backend=backend, world_size=_WORLD_SIZE, rank=_RANK)
     
     init_tp_group()
@@ -138,14 +155,21 @@ def get_pp_layers(num_layers):
     
     return assigned_layers
 
-# Set the correct layer index
-def resolve_pp_layer(layer_name, idx, start_layer_idx):
+# Set the correct layer index for PP
+def resolve_pp_layer_idx(layer_name, idx, start_layer_idx):
     if 'layers' in layer_name:
         layer_name_list = layer_name.split('.')
         layer_name_list[idx] = str(int(layer_name_list[idx])+start_layer_idx)
         return '.'.join(layer_name_list)
     else:
         return layer_name
+    
+def resolve_ep_expert_idx(expert_idx, expert_map):
+    if expert_map is not None:
+        local_expert_idx = expert_map[expert_idx]
+    else:
+        local_expert_idx = expert_idx
+    return local_expert_idx
     
 def tensor_model_parallel_all_gather(input_: torch.Tensor, dim=-1) -> torch.Tensor:
     """All-gather the input tensor across model parallel group."""

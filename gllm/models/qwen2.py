@@ -12,7 +12,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
 from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
-                             resolve_pp_layer, get_tp_size)
+                             resolve_pp_layer_idx, get_tp_size)
 from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
 
@@ -184,7 +184,7 @@ class Qwen2ForCausalLM(nn.Module):
         vocab_size_partition = self.config.vocab_size // get_tp_size()
         
         for k, v in parameters.items():
-            k = resolve_pp_layer(k, 2, self.model.start_layer)
+            k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
                 copy_qkv_proj_weight(v.data, 
                                      weights[k.replace('qkv_proj', 'q_proj')], 

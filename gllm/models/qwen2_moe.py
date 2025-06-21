@@ -5,10 +5,11 @@ from typing import Optional
 from torch import nn
 
 from gllm.layers.layernorm import RMSNorm
-from gllm.layers.moe.fused_moe_triton.layer import FusedMoE
+from gllm.layers.moe.fused_moe_triton.layer import FusedMoE, determine_expert_map
 from gllm.input_data import InputData
-from gllm.dist_utils import (get_local_rank, resolve_pp_layer, get_tp_size, 
-                             tensor_model_parallel_all_reduce)
+from gllm.dist_utils import (get_local_rank, resolve_pp_layer_idx, get_tp_size, 
+                             tensor_model_parallel_all_reduce, is_use_ep,
+                             get_ep_rank, resolve_ep_expert_idx, get_ep_size)
 from gllm.utils import get_model_load_pbar
 
 from .qwen2 import Qwen2MLP as Qwen2MoeMLP
@@ -147,14 +148,16 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
 
-        intermediate_size_partition = self.config.moe_intermediate_size // get_tp_size()
+        intermediate_size = self.config.moe_intermediate_size
+        intermediate_size_partition = intermediate_size // get_tp_size()
         shared_expert_intermediate_size_partition = getattr(self.config, 'shared_expert_intermediate_size', None)
         if shared_expert_intermediate_size_partition:
             shared_expert_intermediate_size_partition = shared_expert_intermediate_size_partition // get_tp_size()
         vocab_size_partition = self.config.vocab_size // get_tp_size()
+        _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), self.config.num_experts)
         
         for k, v in parameters.items():
-            k = resolve_pp_layer(k, 2, self.model.start_layer)
+            k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
                 copy_qkv_proj_weight(v.data, 
                                      weights[k.replace('qkv_proj', 'q_proj')], 
@@ -169,15 +172,23 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                                    num_heads, num_kv_heads, head_dim)
             elif k.find('w13_weight') != -1: # expert
                 for expert_idx in range(self.config.num_experts):
-                    copy_gate_up_proj_weight(v.data[expert_idx],
+                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
+                    if local_expert_idx == -1:
+                        continue
+                    copy_gate_up_proj_weight(v.data[local_expert_idx],
                                              weights[k.replace('w13_weight', f'{expert_idx}.gate_proj.weight')],
                                              weights[k.replace('w13_weight', f'{expert_idx}.up_proj.weight')],
-                                             intermediate_size_partition)
+                                             intermediate_size_partition if not is_use_ep() else intermediate_size,
+                                             not is_use_ep())
             elif k.find('w2_weight') != -1: # expert
                 for expert_idx in range(self.config.num_experts):
-                    copy_single_proj_col(v.data[expert_idx], 
-                                     weights[k.replace('w2_weight', f'{expert_idx}.down_proj.weight')], 
-                                     intermediate_size_partition)
+                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
+                    if local_expert_idx == -1:
+                        continue
+                    copy_single_proj_col(v.data[local_expert_idx],
+                                         weights[k.replace('w2_weight', f'{expert_idx}.down_proj.weight')],
+                                         intermediate_size_partition if not is_use_ep() else intermediate_size,
+                                         not is_use_ep())
             elif k.find('gate_up_proj.weight') != -1: # shared_expert
                 copy_gate_up_proj_weight(v.data,
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
