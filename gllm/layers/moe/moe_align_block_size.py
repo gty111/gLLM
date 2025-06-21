@@ -2,9 +2,10 @@ import torch
 import triton
 import triton.language as tl
 
-from typing import Tuple, Optional
+from typing import Optional
 
 from gllm.utils import round_up, ceil_div
+from gllm import _custom_ops as ops
 
 @triton.jit
 def moe_align_block_size_stage1(
@@ -139,13 +140,14 @@ def moe_align_block_size_triton(
         tokens_per_thread,
     )
 
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
     expert_map: Optional[torch.Tensor] = None,
     pad_sorted_ids: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
     size for matrix multiplication.
@@ -216,7 +218,6 @@ def moe_align_block_size(
                 num_tokens_post_pad,
             )
         else:
-            from gllm import _custom_ops as ops
             # Currently requires num_experts=256
             ops.sgl_moe_align_block_size(
                 topk_ids,
@@ -227,7 +228,6 @@ def moe_align_block_size(
                 num_tokens_post_pad,
             )
     else:
-        from gllm import _custom_ops as ops
         ops.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
                                  expert_ids, num_tokens_post_pad)
     if expert_map is not None:
