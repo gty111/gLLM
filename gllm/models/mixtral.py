@@ -4,9 +4,11 @@ from typing import Optional
 from torch import nn
 
 from gllm.layers.layernorm import RMSNorm
-from gllm.layers.moe.fused_moe_triton.layer import FusedMoE
+from gllm.layers.moe.fused_moe_triton.layer import FusedMoE, determine_expert_map
 from gllm.input_data import InputData
-from gllm.dist_utils import get_local_rank, resolve_pp_layer_idx, get_tp_size
+from gllm.dist_utils import (get_local_rank, resolve_pp_layer_idx, get_tp_size,
+                             get_ep_size, get_ep_rank, resolve_ep_expert_idx,
+                             is_use_ep)
 from gllm.utils import get_model_load_pbar
 
 from .qwen2 import Qwen2Attention
@@ -14,7 +16,8 @@ from .qwen2 import Qwen2Model
 from .qwen2 import Qwen2ForCausalLM
 
 from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj_col)
+                           copy_gate_up_proj_weight, copy_single_proj_col,
+                           copy_single_proj_row)
 
 class MixtralMoE(nn.Module):
     def __init__(self, config):
@@ -99,9 +102,14 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
 
-        intermediate_size_partition = self.config.intermediate_size // get_tp_size()
+        intermediate_size = self.config.intermediate_size
+        intermediate_size_partition = intermediate_size // get_tp_size()
+        
+        vocab_size_partition = self.config.vocab_size // get_tp_size()
         
         num_experts = self.config.num_local_experts
+        
+        _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), num_experts)
         
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
@@ -119,17 +127,27 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
                                    num_heads, num_kv_heads, head_dim)
             elif k.find('w13_weight') != -1: # expert
                 for expert_idx in range(num_experts):
-                    copy_gate_up_proj_weight(v.data[expert_idx],
+                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
+                    if local_expert_idx == -1:
+                        continue
+                    copy_gate_up_proj_weight(v.data[local_expert_idx],
                                              weights[k.replace('w13_weight', f'{expert_idx}.w1.weight')],
                                              weights[k.replace('w13_weight', f'{expert_idx}.w3.weight')],
-                                             intermediate_size_partition)
+                                             intermediate_size_partition if not is_use_ep() else intermediate_size,
+                                             not is_use_ep())
             elif k.find('w2_weight') != -1: # expert
                 for expert_idx in range(num_experts):
-                    copy_single_proj_col(v.data[expert_idx], 
-                                     weights[k.replace('w2_weight', f'{expert_idx}.w2.weight')], 
-                                     intermediate_size_partition)
+                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
+                    if local_expert_idx == -1:
+                        continue
+                    copy_single_proj_col(v.data[local_expert_idx],
+                                         weights[k.replace('w2_weight', f'{expert_idx}.w2.weight')],
+                                         intermediate_size_partition if not is_use_ep() else intermediate_size,
+                                         not is_use_ep())
             elif k.find('self_attn.o_proj') != -1:
                 copy_single_proj_col(v.data, weights[k], num_heads*head_dim)
+            elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
+                copy_single_proj_row(v.data, weights[k], vocab_size_partition)
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
