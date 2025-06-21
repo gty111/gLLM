@@ -9,7 +9,7 @@ from gllm.layers.moe.fused_moe_triton.layer import FusedMoE, determine_expert_ma
 from gllm.input_data import InputData
 from gllm.dist_utils import (get_local_rank, resolve_pp_layer_idx, get_tp_size, 
                              tensor_model_parallel_all_reduce, is_use_ep,
-                             get_tp_rank, resolve_ep_expert_idx)
+                             get_ep_rank, resolve_ep_expert_idx, get_ep_size)
 from gllm.utils import get_model_load_pbar
 
 from .qwen2 import Qwen2MLP as Qwen2MoeMLP
@@ -154,7 +154,7 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         if shared_expert_intermediate_size_partition:
             shared_expert_intermediate_size_partition = shared_expert_intermediate_size_partition // get_tp_size()
         vocab_size_partition = self.config.vocab_size // get_tp_size()
-        _, expert_map = determine_expert_map(get_tp_size(), get_tp_rank(), self.config.num_experts)
+        _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), self.config.num_experts)
         
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
