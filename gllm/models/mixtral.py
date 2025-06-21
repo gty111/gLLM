@@ -6,7 +6,7 @@ from torch import nn
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe.fused_moe_triton.layer import FusedMoE
 from gllm.input_data import InputData
-from gllm.dist_utils import get_local_rank, resolve_pp_layer, get_tp_size
+from gllm.dist_utils import get_local_rank, resolve_pp_layer_idx, get_tp_size
 from gllm.utils import get_model_load_pbar
 
 from .qwen2 import Qwen2Attention
@@ -104,7 +104,7 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
         num_experts = self.config.num_local_experts
         
         for k, v in parameters.items():
-            k = resolve_pp_layer(k, 2, self.model.start_layer)
+            k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
                 copy_qkv_proj_weight(v.data, 
                                      weights[k.replace('qkv_proj', 'q_proj')], 

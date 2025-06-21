@@ -3,7 +3,8 @@ import torch
 from typing import Optional
 
 from gllm.utils import set_weight_attrs
-from gllm.dist_utils import get_tp_size, tensor_model_parallel_all_reduce, get_tp_rank
+from gllm.dist_utils import (get_tp_size, tensor_model_parallel_all_reduce, 
+                             get_ep_rank, is_use_ep, get_ep_size)
 from gllm.layers.moe.topk import select_experts
 from gllm.layers.moe.fused_moe_triton.fused_moe import fused_experts
 
@@ -135,19 +136,26 @@ class FusedMoE(torch.nn.Module):
             params_dtype = torch.get_default_dtype()
             
         self.tp_size = get_tp_size()
-        self.ep_rank = get_tp_rank()
+        self.ep_size = get_ep_size()
+        self.ep_rank = get_ep_rank()
         
-        # Use EP by default 
-        self.local_num_experts, self.expert_map = determine_expert_map(
-            ep_size=self.tp_size,
-            ep_rank=self.ep_rank,
-            global_num_experts=self.global_num_experts
-        )
+        self.global_num_experts = num_experts
+        
+        if is_use_ep():
+            self.local_num_experts, self.expert_map = determine_expert_map(
+                ep_size=self.ep_size,
+                ep_rank=self.ep_rank,
+                global_num_experts=self.global_num_experts
+            )
+            self.intermediate_size_per_partition = intermediate_size
+        else:
+            self.local_num_experts, self.expert_map = (self.global_num_experts,
+                                                       None)
+            assert intermediate_size % self.tp_size == 0
+            self.intermediate_size_per_partition = intermediate_size // self.tp_size
         
         self.top_k = top_k
-        self.global_num_experts = num_experts
-        assert intermediate_size % self.tp_size == 0
-        self.intermediate_size_per_partition = intermediate_size // self.tp_size
+        
         self.reduce_results = reduce_results
         self.renormalize = renormalize
         self.activation = activation
@@ -157,7 +165,7 @@ class FusedMoE(torch.nn.Module):
         
         self.fusedMoEMethod.create_weights(
             layer=self,
-            num_experts=num_experts,
+            num_experts=self.local_num_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,

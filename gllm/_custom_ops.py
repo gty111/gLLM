@@ -67,6 +67,10 @@ def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
     torch.ops._moe_C.topk_softmax(topk_weights, topk_ids,
                                   token_expert_indicies, gating_output)
 
+# moe
+def moe_sum(input: torch.Tensor, output: torch.Tensor):
+    torch.ops._moe_C.moe_sum(input, output)
+
 def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,
                          block_size: int, sorted_token_ids: torch.Tensor,
                          experts_ids: torch.Tensor,

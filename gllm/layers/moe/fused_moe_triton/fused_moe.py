@@ -181,6 +181,17 @@ def try_get_optimal_moe_config(
     return config
 
 @triton.jit
+def write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N, offs_token,
+                          token_mask, BLOCK_SIZE_M, BLOCK_SIZE_N,
+                          compute_type):
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[
+        None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+@triton.jit
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -410,7 +421,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
                             use_int8_w8a16: bool,
                             use_int4_w4a16: bool,
                             per_channel_quant: bool,
-                            block_shape: Optional[list[int]] = None) -> None:
+                            block_shape: Optional[List[int]] = None) -> None:
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -501,7 +512,7 @@ def inplace_fused_experts(hidden_states: torch.Tensor,
                           w2_zp: Optional[torch.Tensor] = None,
                           a1_scale: Optional[torch.Tensor] = None,
                           a2_scale: Optional[torch.Tensor] = None,
-                          block_shape: Optional[list[int]] = None) -> None:
+                          block_shape: Optional[List[int]] = None) -> None:
     fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids, True,
                        activation, apply_router_weight_on_input, use_fp8_w8a8,
                        use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
@@ -531,7 +542,7 @@ def inplace_fused_experts_fake(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[list[int]] = None) -> None:
+        block_shape: Optional[List[int]] = None) -> None:
     pass
 
 
@@ -565,7 +576,7 @@ def outplace_fused_experts(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[list[int]] = None) -> torch.Tensor:
+        block_shape: Optional[List[int]] = None) -> torch.Tensor:
     return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids,
                               False, activation, apply_router_weight_on_input,
                               use_fp8_w8a8, use_int8_w8a8, use_int8_w8a16,
@@ -595,7 +606,7 @@ def outplace_fused_experts_fake(
         w2_zp: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[list[int]] = None) -> torch.Tensor:
+        block_shape: Optional[List[int]] = None) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
 
@@ -645,7 +656,7 @@ def fused_experts(hidden_states: torch.Tensor,
                   w2_zp: Optional[torch.Tensor] = None,
                   a1_scale: Optional[torch.Tensor] = None,
                   a2_scale: Optional[torch.Tensor] = None,
-                  block_shape: Optional[list[int]] = None,
+                  block_shape: Optional[List[int]] = None,
                   ) -> torch.Tensor:
     return dispatch_fused_experts_func(inplace)(
         hidden_states=hidden_states,
@@ -693,7 +704,7 @@ def fused_experts_impl(
     w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
+    block_shape: Optional[List[int]] = None,
 ) -> torch.Tensor:
     # Check constraints.
     if use_int4_w4a16:

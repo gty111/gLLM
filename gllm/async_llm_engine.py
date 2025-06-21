@@ -64,10 +64,8 @@ def _log_task_completion(task: asyncio.Task) -> None:
 class AsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
-        kwargs.pop('assigned_layers')
-        kwargs.pop('use_naive_schedule')
-        kwargs.pop('use_async_worker')
-        assert kwargs['pp_size'] == 1 and "AsyncLLM doesn't support degree of PP > 1"
+        if kwargs['pp_size'] != 1 or kwargs['tp_size'] != 1:
+            raise Exception('TP and PP are not support by AsyncLLM, please use PipeAsyncLLM!')
         super().__init__(*args, **kwargs)
         super().init()
 
@@ -120,10 +118,6 @@ class AsyncLLM(LLM):
 class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):
-        self.assigned_layers = kwargs.pop('assigned_layers')
-        self.use_naive_schedule = kwargs.pop('use_naive_schedule')
-        self.use_async_worker = kwargs.pop('use_async_worker')
-
         super().__init__(*args, **kwargs)
 
         logger.info('Using PipeAsyncLLM backend')
@@ -273,6 +267,7 @@ class PipeAsyncLLM(LLM):
                             tp_rank,
                             self.pp_size,
                             self.tp_size,
+                            self.use_ep,
                             self.master_addr,
                             self.master_port,
                             comm,

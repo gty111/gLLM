@@ -14,10 +14,11 @@ from gllm.layers.sampler import Sampler
 
 class ModelRunner():
     def __init__(self, load_format: str, model_path: str, gpu_memory_util: float, page_size: int,
-                 enable_prefix_caching: bool, maxp, maxd, kvthresh, minp, iterp):
+                 enable_prefix_caching: bool, use_thinking: bool, maxp, maxd, kvthresh, minp, iterp):
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
         self.enable_prefix_caching = enable_prefix_caching
+        self.use_thinking = use_thinking
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size
         self.tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = AutoTokenizer.from_pretrained(
@@ -43,7 +44,7 @@ class ModelRunner():
 
     def encode(self, content, chat: bool = False):
         if chat:
-            return self.tokenizer.apply_chat_template(content, add_generation_prompt=True)
+            return self.tokenizer.apply_chat_template(content, add_generation_prompt=True, enable_thinking=self.use_thinking)
         else:
             return self.tokenizer.encode(content)
         
