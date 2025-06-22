@@ -267,7 +267,7 @@ def get_path(*filepath) -> str:
 
 
 def get_gllm_version() -> str:
-    version = '0.0.2'
+    version = '0.0.3'
 
     cuda_version = str(get_nvcc_cuda_version())
     if cuda_version != MAIN_CUDA_VERSION:
