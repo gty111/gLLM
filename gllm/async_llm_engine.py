@@ -61,60 +61,6 @@ def _log_task_completion(task: asyncio.Task) -> None:
         logger.error("Engine background task failed", exc_info=e)
 
 
-class AsyncLLM(LLM):
-
-    def __init__(self, *args, **kwargs):
-        if kwargs['pp_size'] != 1 or kwargs['tp_size'] != 1:
-            raise Exception('TP and PP are not support by AsyncLLM, please use PipeAsyncLLM!')
-        super().__init__(*args, **kwargs)
-        super().init()
-
-        logger.info('Using AsyncLLM backend')
-
-        self.async_streams: Dict[int, AsyncStream] = {}
-        self.background_engine = None
-
-    async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
-                                 temperature: float, top_p: float, top_k: float, repetition_penalty: float):
-        seq = self.allocate_seq(token_ids, output_len, ignore_eos,
-                                temperature, top_p, top_k, repetition_penalty)
-        stream = AsyncStream(raw_request)
-        assert seq.seq_id not in self.async_streams
-        self.async_streams[seq.seq_id] = stream
-        await make_async(self.add_requests)(requests=[seq])
-        if self.background_engine is None:
-            self.start_background_engine()
-        return stream
-
-    async def step_async(self):
-        ipc_package = self.scheduler.schedule(
-            self.model_runner.memory_manager, log=True)
-        next_tokens = await make_async(self.model_runner.step_once)(
-            InputData(ipc_package.schedule_lists, self.model_runner.memory_manager))
-        self.scheduler.update_seqs(
-            ipc_package, next_tokens, self.model_runner.memory_manager)
-        for seq in ipc_package.schedule_lists:
-            self.async_streams[seq.seq_id].put(
-                seq.detokenize_inc(self.model_runner.tokenizer))
-        for seq_id in self.scheduler.finish_ids:
-            self.async_streams[seq_id].finish()
-            del self.async_streams[seq_id]
-        self.free_finish_ids(self.scheduler.get_finish_ids())
-
-    async def run_engine(self):
-        while self.scheduler.has_seqs():
-            await self.step_async()
-        self.background_engine = None
-
-    def start_background_engine(self):
-        self._background_loop_unshielded = asyncio.get_event_loop(
-        ).create_task(self.run_engine())
-        self._background_loop_unshielded.add_done_callback(
-            _log_task_completion)
-        self.background_engine = asyncio.shield(
-            self._background_loop_unshielded)
-
-
 class PipeAsyncLLM(LLM):
 
     def __init__(self, *args, **kwargs):

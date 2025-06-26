@@ -8,18 +8,16 @@ import traceback
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from http import HTTPStatus
-from typing import Union
 
 from gllm.utils import make_async
 from gllm.entrypoints.protocol import ChatCompletionRequest, CompletionRequest, ModelList, ModelCard, ModelPermission, ErrorResponse
-from gllm.async_llm_engine import AsyncLLM, PipeAsyncLLM
+from gllm.async_llm_engine import PipeAsyncLLM
 from gllm.entrypoints.serving_chat import chat_completion_stream_generator, chat_completion_generator
 from gllm.entrypoints.serving_completions import completion_stream_generator, completion_generator
 
 router = APIRouter()
 
-llm: Union[AsyncLLM|PipeAsyncLLM] = None
-
+llm: PipeAsyncLLM = None
 
 @router.get("/v1/models")
 async def show_available_models():
@@ -94,7 +92,6 @@ if __name__ == '__main__':
     parser.add_argument('--load-format', type=str, choices=['auto','dummy'], help='auto: actually load model weights; dummy: initialize the model with random values', default='auto')
     parser.add_argument('--disable-thinking', help='Disable thinking in inference models', action='store_true')
     # Runtime
-    parser.add_argument('--disable-pipe-schedule', help='Use AsyncLLM backend (used for performance comparsion)', action="store_true")
     parser.add_argument('--use-async-worker', help='Experimental feature for worker implemented by async', action='store_true')
     parser.add_argument('--gpu-memory-util', type=float, help='GPU memory utilization for KV cache (excluding model weights)', default=0.9)
     parser.add_argument('--enable-prefix-caching', help='Enable KV cache reuse across requests', action='store_true')
@@ -105,7 +102,7 @@ if __name__ == '__main__':
     parser.add_argument('--disable-ep', help='Disable expert parallelism (EP is enable by default)', action='store_true')
     parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
     # Token Throttling
-    parser.add_argument('--maxd', type=int, help='Maximum decode token count, used in AsyncLLM and offline infernce', default=512)
+    parser.add_argument('--maxd', type=int, help='Maximum decode token count, used in LLM (offline infernce)', default=512)
     parser.add_argument('--maxp', type=int, help='Maximum token count in prefill', default=2048)
     parser.add_argument('--minp', type=int, help='Minimum token count in prefill, used in PipeAsyncLLM', default=32)
     parser.add_argument('--iterp', type=int, help='Number of iterations to process waiting prefill tokens, used in PipeAsyncLLM', default=8)
@@ -116,8 +113,7 @@ if __name__ == '__main__':
     parser.add_argument('--ranks',type=str,help='Specify the ranks of worker like 0,1', default=None)
     args = parser.parse_args()
 
-    llm_cls = PipeAsyncLLM if not args.disable_pipe_schedule else AsyncLLM
-    llm = llm_cls(host=args.host,
+    llm = PipeAsyncLLM(host=args.host,
                   master_addr=args.master_addr,
                   master_port=args.master_port,
                   zmq_port_base=args.zmq_port_base,

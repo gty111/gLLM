@@ -17,7 +17,7 @@ class IPCPackage:
         self.act_schedule_ids = []
         self.next_tokens = []
 
-# Only used for LLM or AsyncLLM
+# Only used for LLM (offline inference)
 class FrontendScheduler:
     def __init__(self, maxd: int, maxp: int, kvthresh: float,
                  page_size: int) -> None:
