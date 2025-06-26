@@ -8,7 +8,7 @@ from logger import logger
 
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.frontend_scheduler import IPCPackage
+from gllm.comm import IPCPackage
 from gllm.dist_utils import get_world_size
 
 
@@ -39,6 +39,8 @@ class WorkerScheduler():
         self.num_wait_tokens = 0
         # abort ids
         self.abort_ids = set()
+        # log
+        self.log = True
         
     def get_num_free_pages(self):
         return self.memory_manager.get_num_free_pages()
@@ -60,6 +62,9 @@ class WorkerScheduler():
     
     def add_next_tokens(self, next_tokens):
         self.next_tokens_queue.append(next_tokens)
+    
+    def set_log(self, log):
+        self.log = log
         
     def process_output(self):
         if len(self.next_tokens_queue) != 0:
@@ -99,9 +104,7 @@ class WorkerScheduler():
         self.num_preempt_seqs += len(preempt_seqs)
         if self.num_preempt_seqs - self.log_num_preempt_seqs >= 10:
             self.log_num_preempt_seqs = self.num_preempt_seqs
-            logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}')
-            logger.warning(
-                'Try increase --kvthresh or the performance is poor!')
+            logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}, Try increase --kvthresh or the performance is poor!')
     
     def check_abort_seqs_list(self, seqs:deque, ipc_package:IPCPackage):
         for seq in list(seqs):
@@ -172,7 +175,7 @@ class WorkerScheduler():
         self.memory_manager.pre_allocate_page(
             schedule_prefill_seqs)
 
-        if time.time()-self.log_time > 1:
+        if self.log and time.time()-self.log_time > 1:
             self.log_time = time.time()
             log_info = '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
                 len(self.seqs_to_prefill),
@@ -250,7 +253,7 @@ class WorkerScheduler():
         self.memory_manager.pre_allocate_page(
             schedule_decode_seqs)
 
-        if time.time()-self.log_time > 1:
+        if self.log and time.time()-self.log_time > 1:
             self.log_time = time.time()
             log_info = '#wait: %4d/%8d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
                 len(self.seqs_to_prefill),

@@ -12,10 +12,16 @@ if __name__ == '__main__':
     parser.add_argument('--num-prompt', type=int, default=8)
     parser.add_argument('--print-output', action="store_true")
     parser.add_argument('--gpu-memory-util', type=float, default=0.9)
+    parser.add_argument('--kvthresh', type=float, default=0.2)
+    parser.add_argument('--pp', type=int, default=1)
+    parser.add_argument('--tp', type=int, default=1)
     args = parser.parse_args()
 
-    llm = LLM(args.model, gpu_memory_util=args.gpu_memory_util)
-    llm.init()
+    llm = LLM(args.model, 
+              gpu_memory_util=args.gpu_memory_util, 
+              kvthresh=args.kvthresh,
+              pp_size=args.pp,
+              tp_size=args.tp)
     with open(args.sharegpt_path) as f:
         completions = json.load(f)
         tokens = []

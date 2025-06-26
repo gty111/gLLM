@@ -1,10 +1,24 @@
 import zmq
 import pickle
 
+from typing import List
+
 from gllm.utils import make_socket
 from gllm.dist_utils import (send_obj_list, recv_obj_list, get_rank, 
                              is_output_rank, get_world_size, get_pp_size,
                              get_output_rank)
+from gllm.sequence import Sequence
+
+class IPCPackage:
+    def __init__(self, schedule_lists: List[Sequence]):
+        # front-end => worker
+        self.log = True
+        self.schedule_lists = schedule_lists
+        self.abort_ids = [] # seq_ids to abort
+        # worker => front-end
+        self.free_ids = [] # seq_ids to free
+        self.act_schedule_ids = []
+        self.next_tokens = []
 
 class zmqComm:
     def __init__(self, host_addr, port_base, launch_mode, master_addr, 

@@ -23,7 +23,8 @@ K = TypeVar("K")
 T = TypeVar("T")
 
 def init_logger():
-    formater = logging.Formatter(f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s")
+    formater = logging.Formatter(f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s",
+                                 datefmt="%H:%M:%S")
     for handler in logger.handlers:
         handler.setFormatter(formater)
 
@@ -82,13 +83,7 @@ def wait_worker(mp_alive,num_worker):
         if num_worker_start == num_worker:
             break
         time.sleep(1)
-        
-def check_worker_alive(mp_alive):
-    for i in mp_alive:
-        if i==-1:
-            sys.exit()
             
-
 temp_dir = tempfile.gettempdir()
 
 def get_lock(model_name_or_path: Union[str, Path],

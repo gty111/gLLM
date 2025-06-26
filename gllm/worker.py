@@ -8,9 +8,8 @@ from logger import logger
 
 from gllm.input_data import InputData
 from gllm.model_runner import ModelRunner
-from gllm.zmq_comm import zmqComm
+from gllm.comm import zmqComm, IPCPackage
 from gllm.worker_scheduler import WorkerScheduler
-from gllm.frontend_scheduler import IPCPackage
 from gllm.dist_utils import (init_dist, send_pp_data, recv_pp_data, 
                              get_rank, get_world_size, is_last_pp_rank,
                              get_pp_size, get_next_pp_rank, get_last_pp_rank,
@@ -41,14 +40,16 @@ class Worker:
         tp_ep_log = 'TP' if not self.use_ep else 'TP/EP'
         formater = logging.Formatter(
             f'[%(asctime)s %(filename)s:%(lineno)d Worker{self.pp_rank*self.tp_size+self.tp_rank} '
-            f'PP{self.pp_rank} {tp_ep_log}{self.tp_rank}] %(levelname)s - %(message)s')
+            f'PP{self.pp_rank} {tp_ep_log}{self.tp_rank}] %(levelname)s - %(message)s',
+            datefmt="%H:%M:%S")
         for handler in logger.handlers:
             handler.setFormatter(formater)
 
     def init(self):
         self.init_logger()
-        init_dist(self.pp_size, self.tp_size, self.use_ep, self.local_rank, self.pp_rank, self.tp_rank, self.master_addr, 
-                  self.master_port, self.assigned_layers)
+        if self.pp_size > 1 or self.tp_size > 1:
+            init_dist(self.pp_size, self.tp_size, self.use_ep, self.local_rank, self.pp_rank, self.tp_rank, self.master_addr, 
+                    self.master_port, self.assigned_layers)
         self.rank = get_rank()
         torch.cuda.set_device(f'cuda:{self.local_rank}')
         
@@ -83,12 +84,14 @@ class Worker:
 
         logger.info(f'Initialization complete')
 
+    # driver worker => other workers
     def recv_schedule_seqs(self):
         seqs = self.comm.recv_schedule_seqs()
         if seqs is not None:
             self.schedule_queue.append(
                 InputData(seqs, self.model_runner.memory_manager))
 
+    # pp last rank => pp next rank
     def recv_intermediate_data(self):
         if len(self.schedule_queue) != 0:
             input_data = self.schedule_queue.popleft()
@@ -128,11 +131,13 @@ class Worker:
             if ipc_package is not None:
                 cum_ipc_package.schedule_lists.extend(ipc_package.schedule_lists)
                 cum_ipc_package.abort_ids.extend(ipc_package.abort_ids)
+                cum_ipc_package.log &= ipc_package.log
             else:
                 break
         if len(cum_ipc_package.schedule_lists) != 0 or len(cum_ipc_package.abort_ids) != 0:
             self.worker_scheduler.add_new_requests(cum_ipc_package.schedule_lists)
             self.worker_scheduler.add_abort_ids(cum_ipc_package.abort_ids)
+            self.worker_scheduler.set_log(cum_ipc_package.log)
 
     def recv_next_tokens(self):
         if self.pp_size != 1:  # recv tokens from last rank
