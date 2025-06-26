@@ -6,10 +6,6 @@ from fastapi import Request
 
 from gllm.utils import make_async
 from gllm.llm_engine import LLM
-from gllm.async_worker import AsyncWorker, run_worker_async
-from gllm.worker import Worker, run_worker
-from gllm.comm import zmqComm
-
 
 class AsyncStream:
 
