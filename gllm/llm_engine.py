@@ -1,20 +1,22 @@
 import tqdm
+import torch.multiprocessing as mp
+import sys
 
 from logger import logger
-from typing import List
+from typing import List, Dict
 
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 from gllm.id_allocator import IDAllocator
-from gllm.frontend_scheduler import FrontendScheduler
-from gllm.input_data import InputData
-from gllm.utils import init_logger
-
+from gllm.utils import init_logger, random_uuid, wait_worker, get_model_load_pbar
+from gllm.comm import zmqComm, IPCPackage
+from gllm.worker import Worker, run_worker
+from gllm.async_worker import AsyncWorker, run_worker_async
 
 class LLM():
-    def __init__(self, model_path, host=None, master_addr=None, master_port=None, 
-                 zmq_port_base=None, launch_mode=None, worker_ranks=None, load_format='auto', 
-                 gpu_memory_util=0.9, page_size=16, maxd=256,maxp=2048, minp=32, 
+    def __init__(self, model_path, host=None, master_addr:str='0.0.0.0', master_port:str='8000', 
+                 zmq_port_base:int=8001, launch_mode:str='normal', worker_ranks:str=None, 
+                 load_format:str='auto', gpu_memory_util=0.9, page_size=16, maxd=256,maxp=2048, minp=32, 
                  iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1, tp_size=1, use_ep=True,
                  assigned_layers=None, use_naive_schedule=False, use_async_worker=False, use_thinking=True):
         init_logger()
@@ -32,8 +34,6 @@ class LLM():
         self.launch_mode = launch_mode
         self.worker_ranks = worker_ranks
         self.id_allocator = IDAllocator(0, 99999)
-        self.scheduler = FrontendScheduler(
-            maxd, maxp, kvthresh, page_size)
         self.finish_tokens = self.model_runner.model_loader.generation_config.eos_token_id
         if type(self.finish_tokens) == int:
             self.finish_tokens = [self.finish_tokens]
@@ -43,6 +43,159 @@ class LLM():
         self.assigned_layers = assigned_layers
         self.use_naive_schedule = use_naive_schedule
         self.use_async_worker = use_async_worker
+        
+        # Interact with workers
+        self.wait_lists: List[Sequence] = []
+        self.abort_ids: List[int] = []
+        self.running_maps: Dict[int, Sequence] = dict() # seq_id => Sequence
+        self.async_streams = None
+        
+        # Init workers
+        if self.launch_mode != 'normal':
+            if self.worker_ranks is None:
+                logger.error('Please specify arg --ranks when the launching mode is master/slave')
+                sys.exit(1)
+            self.act_worker_ranks = [int(i) for i in self.worker_ranks.split(',')]
+            assert len(self.act_worker_ranks) != 0
+        else:
+            self.act_worker_ranks = list(range(self.pp_size*self.tp_size))
+        self.num_workers = len(self.act_worker_ranks)
+
+        self.ctx = mp.get_context('spawn')
+        self.mp_alive = self.ctx.Array('i', [0 for i in range(self.num_workers)])
+        self.mp_load_progress = self.ctx.Array(
+            'i', [0 for i in range(self.num_workers*2)])
+
+        ipc_path_prefix = random_uuid()
+        self.schedule_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
+        self.output_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_output'
+        self.token_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_token'
+
+        self.comm = zmqComm(self.host, self.zmq_port_base, self.launch_mode, self.master_addr, 
+                            self.schedule_path, self.output_path, self.token_path, frontend=True)
+        self.comm.init()
+
+        logger.info(f'Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size} ...')
+        if self.use_async_worker:
+            logger.warning(f'AsyncWorker is an experimental feature')
+        if self.launch_mode != 'normal':
+            logger.warning(f'Multi-node support is an experimental feature')
+            
+        self.process_list = []
+        for local_rank, rank in enumerate(self.act_worker_ranks):
+            pp_rank = rank // self.tp_size
+            tp_rank = rank % self.tp_size
+            self.start_worker(local_rank, pp_rank, tp_rank)
+
+        if load_format == 'auto':
+            self.load_progress()
+
+        # wait worker start
+        wait_worker(self.mp_alive, self.num_workers)
+        
+    def start_worker(self, local_rank, pp_rank, tp_rank):
+        worker_cls = Worker if not self.use_async_worker else AsyncWorker
+        comm = zmqComm(self.host,
+                       self.zmq_port_base,
+                       self.launch_mode,
+                       self.master_addr,
+                       self.schedule_path,
+                       self.output_path,
+                       self.token_path)
+        worker = worker_cls(self.model_runner,
+                            local_rank,
+                            pp_rank,
+                            tp_rank,
+                            self.pp_size,
+                            self.tp_size,
+                            self.use_ep,
+                            self.master_addr,
+                            self.master_port,
+                            comm,
+                            self.mp_alive,
+                            self.mp_load_progress,
+                            self.assigned_layers,
+                            self.use_naive_schedule)
+        process = self.ctx.Process(
+                    target=run_worker if not self.use_async_worker else run_worker_async,
+                    args=(worker,),
+                    daemon=True)
+        self.process_list.append(process)
+        process.start()
+    
+    def load_progress(self):
+        total_weights = 0
+        while True:
+            self.check_worker_alive()
+            ready = True
+            total_weights = 0
+            for i in range(self.num_workers):
+                if self.mp_load_progress[i*2] == 0:
+                    ready = False
+                    continue
+                total_weights += self.mp_load_progress[i*2]
+            if ready:
+                break
+        pbar = get_model_load_pbar(total_weights)
+        last_total_weights = 0
+        while True:
+            self.check_worker_alive()
+            cur_total_weights = 0
+            for i in range(self.num_workers):
+                cur_total_weights += self.mp_load_progress[i*2+1]
+            pbar.update(cur_total_weights-last_total_weights)
+            last_total_weights = cur_total_weights
+            if cur_total_weights == total_weights:
+                break
+        
+    def check_worker_alive(self):
+        for i in self.mp_alive:
+            if i==-1:
+                sys.exit()
+        
+    def add_requests(self, requests: List[Sequence]):
+        self.wait_lists.extend(requests)
+    
+    def recv_ipc_package(self):
+        '''
+        return: number of finished requests in each schedule
+        '''
+        ipc_package:IPCPackage = self.comm.recv_output()
+        if ipc_package is not None:
+            for idx, id in enumerate(ipc_package.act_schedule_ids):
+                if len(ipc_package.next_tokens) != 0:
+                    seq: Sequence = self.running_maps[id]
+                    seq.append(ipc_package.next_tokens[idx])
+                    if self.async_streams:
+                        self.async_streams[id].put(
+                            seq.detokenize_inc(self.model_runner.tokenizer))
+                if id in ipc_package.free_ids:
+                    self.running_maps.pop(id)
+                    if self.async_streams:
+                        self.async_streams[id].finish()
+                        del self.async_streams[id]
+            self.free_finish_ids(ipc_package.free_ids)
+            return len(ipc_package.free_ids)
+        return 0
+
+    def send_ipc_package(self, log=True):
+        if len(self.wait_lists) != 0 or len(self.abort_ids) != 0:
+            for seq in self.wait_lists:
+                self.running_maps[seq.seq_id] = seq
+            ipc_package = IPCPackage(self.wait_lists)
+            if len(self.abort_ids) != 0:
+                logger.warning(f'Abort {len(self.abort_ids)} request(s) due to loss of network connection')
+            ipc_package.abort_ids = self.abort_ids
+            ipc_package.log = log
+            self.wait_lists = []
+            self.abort_ids = []
+            self.comm.send_ipc_package(ipc_package)
+            
+    def schedule(self, log=True):
+        self.check_worker_alive()
+        num_finish_seqs = self.recv_ipc_package()
+        self.send_ipc_package(log)
+        return num_finish_seqs
 
     def check_seq_length(self, token_ids: List[int], output_len: int):
         max_seq_length = len(
@@ -64,23 +217,9 @@ class LLM():
                         self.finish_tokens, output_len, ignore_eos,
                         temperature, top_p, top_k, repetition_penalty)
 
-    def add_requests(self, requests: List[Sequence]):
-        self.scheduler.add_requests(requests)
-
     def free_finish_ids(self, finish_ids:List[int]):
         for id in finish_ids:
             self.id_allocator.free(id)
-
-    def init(self):
-        self.model_runner.init()
-        self.scheduler.set_total_num_free_pages(self.model_runner.memory_manager.get_num_free_pages())
-
-    def step(self):
-        if self.model_runner.model is None:
-            self.init()
-        scheduleOutput = self.scheduler.schedule(self.model_runner.memory_manager)
-        next_tokens = self.model_runner.step_once(InputData(scheduleOutput.schedule_lists, self.model_runner.memory_manager))
-        self.scheduler.update_seqs(scheduleOutput, next_tokens, self.model_runner.memory_manager)
 
     def generate(self, prompts: List[str] = None, tokens: List[List[int]] = None, output_lens: List[int] = None,
                  temperature=None, top_p=None, top_k=None):
@@ -97,20 +236,17 @@ class LLM():
         self.add_requests(seqs)
 
         pbar = tqdm.tqdm(total=len(seqs),ncols=100)
-        while len(self.scheduler.finish_ids) != len(seqs):
-            cur_finish_num = len(self.scheduler.finish_ids)
-            self.step()
-            pbar.update(len(self.scheduler.finish_ids)-cur_finish_num)
+        while pbar.n != len(seqs):
+            num_finish_seqs = self.schedule(log=False)
+            pbar.update(num_finish_seqs)
 
         for seq in seqs:
             seq.prompt = self.model_runner.decode(seq[:seq.prompt_len])
             seq.output = self.model_runner.decode(seq[seq.prompt_len:])
 
-        self.free_finish_ids(self.scheduler.get_finish_ids())
         return seqs
 
     def chat(self):
-        self.model_runner.init()
         architecture = self.model_runner.model_loader.architecture
         print("\nWelcome to the chatbot!\n"
               "Type '\\exit' to exit the chatbot.\n"
@@ -131,8 +267,15 @@ class LLM():
             else:
                 history.append({"role": "user", "content": prompt})
                 tokens = self.model_runner.encode(history, chat=True)
+            
             seq = self.allocate_seq(tokens)
-            output_text = self.model_runner.stream_inference(seq)
+            self.add_requests([seq])
+            while len(self.running_maps) != 0 or len(self.wait_lists) != 0:
+                self.schedule(log=False)
+                print(seq.detokenize_inc(self.model_runner.tokenizer), end='', flush=True)
+            print("\n")
+            
+            output_text = self.model_runner.decode(seq[seq.prompt_len:])
 
             if architecture == 'ChatGLMModel' and hasattr(self.model_runner.tokenizer, 'build_chat_input'):
                 _, history = self.model_runner.model.process_response(
