@@ -1,5 +1,4 @@
 import torch
-import time
 
 from typing import Union
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
