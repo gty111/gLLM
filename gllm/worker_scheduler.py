@@ -13,10 +13,12 @@ from gllm.dist_utils import get_world_size
 
 
 class WorkerScheduler():
-    def __init__(self, pp_size, memory_manager:MemoryManager, use_naive_schedule, maxp, minp, iterp, page_size, kvthresh):
+    def __init__(self, pp_size, memory_manager:MemoryManager, use_naive_schedule, 
+                 maxd, maxp, minp, iterp, page_size, kvthresh):
         self.pp_size = pp_size
         self.memory_manager = memory_manager
         self.use_naive_schedule = use_naive_schedule
+        self.maxd = maxd
         self.maxp = maxp
         self.minp = minp
         self.iterp = iterp 
@@ -240,6 +242,8 @@ class WorkerScheduler():
             # because we want to solve the situation when #seqs=5 pp_size=4
             decode_token_budget = (
                 num_total_decode_seqs + random.randint(0, self.pp_size-1)) // self.pp_size
+        
+        decode_token_budget = min(self.maxd, decode_token_budget)
 
         self.check_preempt(decode_token_budget)
 

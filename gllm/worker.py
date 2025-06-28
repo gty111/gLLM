@@ -65,6 +65,7 @@ class Worker:
                 self.pp_size,
                 self.model_runner.memory_manager, 
                 self.use_naive_schedule,
+                self.model_runner.maxd,
                 self.model_runner.maxp,
                 self.model_runner.minp,
                 self.model_runner.iterp,
