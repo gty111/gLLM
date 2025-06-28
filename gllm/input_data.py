@@ -29,9 +29,9 @@ class InputData():
         self.slot_mapping_tensor = self.get_slot_mapping()
         self.tokens = self.get_tokens()
         self.positions = self.get_position()
-        self.max_seq_len, self.seq_start_loc = self.get_seq_len_loc()
+        self.max_seq_len, self.seq_start_loc = self.get_seq_lens()
         self.block_table = self.get_block_table()
-        self.max_query_len, self.query_start_loc = self.get_query_len_loc()
+        self.max_query_len, self.query_start_loc = self.get_query_start_loc()
 
         assert self.tokens.shape == self.positions.shape
 
@@ -50,21 +50,18 @@ class InputData():
         return async_tensor_h2d(
             positions_list, torch.long, 'cuda', True)
 
-    def get_seq_len_loc(self):
-        seq_start_loc = [seq.seq_len for seq in self.seqs]
-        max_seqlen = max(seq_start_loc)
-        return max_seqlen, async_tensor_h2d(seq_start_loc, torch.int32, 'cuda', True)
+    def get_seq_lens(self):
+        seq_lens = [seq.seq_len for seq in self.seqs]
+        max_seqlen = max(seq_lens)
+        return max_seqlen, async_tensor_h2d(seq_lens, torch.int32, 'cuda', True)
 
-    def get_query_len_loc(self):
-        max_query_len = 0
-        cu_query_len = 0
-        query_start_loc = [0]
-        for seq in self.seqs:
-            query_len = seq.to_compute_token_num
-            cu_query_len += query_len
-            query_start_loc.append(cu_query_len)
-            max_query_len = max(query_len, max_query_len)
-        return max_query_len, async_tensor_h2d(query_start_loc, torch.int32, 'cuda', True)
+    def get_query_start_loc(self):
+        query_lens = [0] + [seq.to_compute_token_num for seq in self.seqs]
+        max_query_len = max(query_lens)
+        query_start_loc = torch.from_numpy(np.cumsum(query_lens)).to(device='cuda', 
+                                                                    dtype=torch.int32, 
+                                                                    non_blocking=True)
+        return max_query_len, query_start_loc
 
     def get_block_table(self):
         block_tables_list = [seq.page_table for seq in self.seqs]
@@ -73,7 +70,7 @@ class InputData():
             (len(block_tables_list), max_num_block), 0, dtype=np.int32)
         for idx, block_table in enumerate(block_tables_list):
             block_tables[idx, :len(block_table)] = block_table
-        return torch.from_numpy(block_tables).to(device='cuda',non_blocking=True)
+        return torch.from_numpy(block_tables).to(device='cuda', non_blocking=True)
 
     def get_slot_mapping(self):
         slot_mapping = []
