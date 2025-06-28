@@ -37,6 +37,7 @@ class WorkerScheduler():
         # preempt seqs
         self.num_preempt_seqs = 0
         self.log_num_preempt_seqs = 0
+        self.delta_log_num_preempt_seqs = 10
         # num wait tokens
         self.num_wait_tokens = 0
         # abort ids
@@ -104,8 +105,9 @@ class WorkerScheduler():
         self.seqs_to_prefill.extendleft(preempt_seqs)
 
         self.num_preempt_seqs += len(preempt_seqs)
-        if self.num_preempt_seqs - self.log_num_preempt_seqs >= 10:
+        if self.num_preempt_seqs - self.log_num_preempt_seqs >= self.delta_log_num_preempt_seqs:
             self.log_num_preempt_seqs = self.num_preempt_seqs
+            self.delta_log_num_preempt_seqs *= 2
             logger.warning(f'#Preempted seqs: {self.num_preempt_seqs}, Try increase --kvthresh or the performance is poor!')
     
     def check_abort_seqs_list(self, seqs:deque, ipc_package:IPCPackage):
