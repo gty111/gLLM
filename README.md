@@ -137,7 +137,7 @@ python benchmarks/benchmark_prefix_serving.py \
 
 ### Evaluate Output Quality
 ```
-python evaluations/evaluate_MMLU_pro.py --model $MODEL
+python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 ```
 
 ## Supported Models
