@@ -137,8 +137,7 @@ python benchmarks/benchmark_prefix_serving.py \
 
 ### Evaluate Output Quality
 ```
-# Launch server first
-python evaluations/evaluate_MMLU_pro.py --model $MODEL --port $PORT
+python evaluations/evaluate_MMLU_pro.py --model $MODEL
 ```
 
 ## Supported Models

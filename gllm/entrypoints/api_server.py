@@ -102,11 +102,11 @@ if __name__ == '__main__':
     parser.add_argument('--disable-ep', help='Disable expert parallelism (EP is enable by default)', action='store_true')
     parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
     # Token Throttling
-    parser.add_argument('--maxd', type=int, help='Maximum decode token count, used in LLM (offline infernce)', default=512)
-    parser.add_argument('--maxp', type=int, help='Maximum token count in prefill', default=2048)
-    parser.add_argument('--minp', type=int, help='Minimum token count in prefill, used in PipeAsyncLLM', default=32)
-    parser.add_argument('--iterp', type=int, help='Number of iterations to process waiting prefill tokens, used in PipeAsyncLLM', default=8)
-    parser.add_argument('--kvthresh', type=float, help='KV cache threshold for prefill operations', default=0.05)
+    parser.add_argument('--maxd', type=int, help='Maximum decode token count per batch (Token Throttling)', default=2048)
+    parser.add_argument('--maxp', type=int, help='Maximum prefill token count per batch (Token Throttling) or token budget in Sarathi-Serve', default=2048)
+    parser.add_argument('--minp', type=int, help='Minimum prefill token count per batch (Token Throttling)', default=32)
+    parser.add_argument('--iterp', type=int, help='Number of iterations to process waiting prefill tokens (Token Throttling)', default=8)
+    parser.add_argument('--kvthresh', type=float, help='KV cache threshold for prefill operations (Token Throttling)', default=0.05)
     parser.add_argument('--use-naive-schedule', help='Use scheduling policy in Sarathi-Serve', action='store_true')
     # Multi-Node deployment
     parser.add_argument('--launch-mode', type=str, choices=['normal', 'master', 'slave'], default='normal')
