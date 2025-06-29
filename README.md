@@ -137,6 +137,7 @@ python benchmarks/benchmark_prefix_serving.py \
 
 ### Evaluate Output Quality
 ```
+# Launch server first
 python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 ```
 
