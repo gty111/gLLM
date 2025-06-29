@@ -1,14 +1,16 @@
 # adopt from https://github.com/TIGER-AI-Lab/MMLU-Pro/blob/main/evaluate_from_api.py
+
 import re
 import random
 import argparse
 import asyncio
 
-from gllm import LLM
-
 from tqdm import tqdm
 from datasets import load_dataset
 
+from backend_request_func import async_request_openai_chat_completions, RequestFuncInput
+
+API_KEY = "EMPTY"
 random.seed(12345)
 
 def load_mmlu_pro():
@@ -80,7 +82,7 @@ def extract_final(text):
         return None
 
 
-def single_request(single_question, cot_examples_dict):
+def single_request(api_url, single_question, cot_examples_dict, pbar):
     category = single_question["category"]
     cot_examples = cot_examples_dict[category]
     question = single_question["question"]
@@ -92,44 +94,43 @@ def single_request(single_question, cot_examples_dict):
         prompt += format_example(each["question"],
                                  each["options"], each["cot_content"])
     input_text = format_example(question, options)
+
     prompt = prompt + input_text
-    
-    return prompt
+
+    request_func_input = RequestFuncInput(prompt=prompt,
+                                          api_url=api_url,
+                                          prompt_len=len(prompt),
+                                          output_len=args.output_len,
+                                          model=args.model,
+                                          )
+    return async_request_openai_chat_completions(request_func_input=request_func_input, pbar=pbar)
 
 
 
 async def evaluate(subjects):
+    api_url = f"http://{args.host}:{args.port}/v1/chat/completions"
     test_df, dev_df = load_mmlu_pro()
     if not subjects:
         subjects = list(test_df.keys())
     print("assigned subjects", subjects)
     category_record = {'total':{'#correct':0,'#wrong':0}}
     
-    llm = LLM(model_path=args.model,
-              gpu_memory_util=args.gpu_memory_util,
-              kvthresh=args.kvthresh,
-              pp_size=args.pp,
-              tp_size=args.tp,
-              enable_prefix_caching=True,
-              use_thinking=False)
-    
-    print(f"generating requests ...")
-    prompts = []
+    print(f"Sending requests ...")
+    pbar = tqdm()
+    tasks = []
     test_data_total = []
     for subject in subjects:
         test_data = test_df[subject][:args.num_per_sub]
         test_data_total.extend(test_data)
         for each in test_data:
-            prompts.append(single_request(each, dev_df))
-    
-    seqs = llm.generate(prompts, output_lens=[args.output_len for i in range(len(prompts))])
-    
-    outputs = [seq.output for seq in seqs]
-    
+            tasks.append(single_request(api_url, each, dev_df, pbar))
+    pbar.total = len(tasks)
+    completions = await asyncio.gather(*tasks)
+    pbar.close()
     print(f"Processing completions ...")
-    for idx, each in tqdm(enumerate(test_data_total),total=len(prompts)):
+    for idx, each in tqdm(enumerate(test_data_total),total=len(tasks)):
         label = each["answer"]
-        response = outputs[idx]
+        response = completions[idx].generated_text
         response = response.replace('**', '')
         pred = extract_answer(response)
         category = each["category"]
@@ -160,10 +161,8 @@ if __name__ == "__main__":
     parser.add_argument("--assigned_subjects", "-a", type=str, default="all",
                         help="business, law, psychology, biology, chemistry, history, other, health, "
                              "economics, math, physics, computer science, philosophy, engineering")
-    parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--pp", type=int, default=1)
-    parser.add_argument('--gpu-memory-util', type=float, default=0.9)
-    parser.add_argument('--kvthresh', type=float, default=0.2)
+    parser.add_argument("--host", type=str, default='0.0.0.0')
+    parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--output-len", type=int, default=1024)
     parser.add_argument("--num-per-sub", type=int, default=100)
     assigned_subjects = []

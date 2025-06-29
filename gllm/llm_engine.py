@@ -16,7 +16,7 @@ from gllm.async_worker import AsyncWorker, run_worker_async
 class LLM():
     def __init__(self, model_path, host=None, master_addr:str='0.0.0.0', master_port:str='8000', 
                  zmq_port_base:int=8001, launch_mode:str='normal', worker_ranks:str=None, 
-                 load_format:str='auto', gpu_memory_util=0.9, page_size=16, maxd=256,maxp=2048, minp=32, 
+                 load_format:str='auto', gpu_memory_util=0.9, page_size=16, maxd=2048, maxp=2048, minp=32, 
                  iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1, tp_size=1, use_ep=True,
                  assigned_layers=None, use_naive_schedule=False, use_async_worker=False, use_thinking=True):
         init_logger()
