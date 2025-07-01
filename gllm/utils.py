@@ -2,8 +2,6 @@ import asyncio
 import uuid
 import torch
 import zmq
-import time
-import sys
 import os
 import hashlib
 import filelock
@@ -73,16 +71,6 @@ def make_socket(ctx, path: str, type):
     else:
         assert 0
 
-def wait_worker(mp_alive,num_worker):
-    while True:
-        num_worker_start = 0
-        for i in mp_alive:
-            if i==-1:
-                sys.exit()
-            num_worker_start += i
-        if num_worker_start == num_worker:
-            break
-        time.sleep(1)
             
 temp_dir = tempfile.gettempdir()
 
