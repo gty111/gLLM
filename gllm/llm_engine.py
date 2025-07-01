@@ -1,6 +1,7 @@
 import tqdm
 import torch.multiprocessing as mp
 import sys
+import time
 
 from logger import logger
 from typing import List, Dict
@@ -8,7 +9,7 @@ from typing import List, Dict
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 from gllm.id_allocator import IDAllocator
-from gllm.utils import init_logger, random_uuid, wait_worker, get_model_load_pbar
+from gllm.utils import init_logger, random_uuid, get_model_load_pbar
 from gllm.comm import zmqComm, IPCPackage
 from gllm.worker import Worker, run_worker
 from gllm.async_worker import AsyncWorker, run_worker_async
@@ -21,6 +22,7 @@ class LLM():
                  assigned_layers=None, use_naive_schedule=False, use_async_worker=False, use_thinking=True):
         init_logger()
         self.model_path = model_path
+        self.load_format = load_format
         self.model_runner = ModelRunner(
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, use_thinking,
             maxp, maxd, kvthresh, minp, iterp)
@@ -51,6 +53,23 @@ class LLM():
         self.async_streams = None
         
         # Init workers
+        self.init_workers()
+
+        # wait worker start
+        self.wait_workers()
+    
+    def wait_workers(self):
+        while True:
+            num_worker_start = 0
+            for i in self.mp_alive:
+                if i==-1:
+                    sys.exit()
+                num_worker_start += i
+            if num_worker_start == self.num_workers:
+                break
+            time.sleep(1)
+        
+    def init_workers(self):
         if self.launch_mode != 'normal':
             if self.worker_ranks is None:
                 logger.error('Please specify arg --ranks when the launching mode is master/slave')
@@ -64,7 +83,7 @@ class LLM():
         self.ctx = mp.get_context('spawn')
         self.mp_alive = self.ctx.Array('i', [0 for i in range(self.num_workers)])
         self.mp_load_progress = self.ctx.Array(
-            'i', [0 for i in range(self.num_workers*2)])
+            'i', [0 for _ in range(self.num_workers*2)])
 
         ipc_path_prefix = random_uuid()
         self.schedule_path = f'ipc:///tmp/{ipc_path_prefix}_gllm_schedule'
@@ -87,11 +106,8 @@ class LLM():
             tp_rank = rank % self.tp_size
             self.start_worker(local_rank, pp_rank, tp_rank)
 
-        if load_format == 'auto':
+        if self.load_format == 'auto':
             self.load_progress()
-
-        # wait worker start
-        wait_worker(self.mp_alive, self.num_workers)
         
     def start_worker(self, local_rank, pp_rank, tp_rank):
         worker_cls = Worker if not self.use_async_worker else AsyncWorker
