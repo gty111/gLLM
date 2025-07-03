@@ -238,7 +238,7 @@ class WorkerScheduler():
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
         if num_total_decode_seqs < self.pp_size:
-            decode_token_budget = num_total_decode_seqs
+            decode_token_budget = 1
         else:
             # here we add num_total_decode_seqs to random.randint(0,self.pp_size-1))
             # because we want to solve the situation when #seqs=5 pp_size=4
