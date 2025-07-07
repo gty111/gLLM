@@ -76,6 +76,9 @@ class ModelLoader():
         self.architecture = self.config.architectures[0]
         self.vocab_size = self.config.vocab_size
         self.hidden_size = self.config.hidden_size
+        
+        if hasattr(self.config, 'quantization_config'):
+            raise Exception('Currently, gLLM do not support quantization.')
     
     def get_model_type(self):
         model_type = None
