@@ -23,18 +23,22 @@ class Qwen3Attention(Attention):
         self.rope_theta = getattr(config, "rope_theta", 1000000)
         self.qkv_bias = getattr(config, 'attention_bias', False)
         
+        quant_config = getattr(config, 'quantization_config', None)
+        
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=self.qkv_bias
+            bias=self.qkv_bias,
+            quant_config=quant_config,
         )
         
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
-            bias = False
+            bias = False,
+            quant_config=quant_config,
         )
         
         self.rotary_emb = RotaryEmbedding(

@@ -76,9 +76,7 @@ class ModelLoader():
         self.architecture = self.config.architectures[0]
         self.vocab_size = self.config.vocab_size
         self.hidden_size = self.config.hidden_size
-        
-        if hasattr(self.config, 'quantization_config'):
-            raise Exception('Currently, gLLM do not support quantization.')
+        self.quantization_config = getattr(self.config, 'quantization_config', None)
     
     def get_model_type(self):
         model_type = None
@@ -116,7 +114,9 @@ class ModelLoader():
         model = model_type(self.config)
         free_gpu_memory_after, _ = torch.cuda.mem_get_info()
         model_size_gb = round((free_gpu_memory_before - free_gpu_memory_after)/(2**30),2)
-        logger.info(f'Model architecture: {self.architecture}, Default dtype: {self.dtype}, Model weights {model_size_gb} GB')
+        
+        quant_method_log = f", Quant mehtod: {self.quantization_config['quant_method']}" if self.quantization_config else ''
+        logger.info(f'Model architecture: {self.architecture}, Default dtype: {self.dtype}{quant_method_log}, Model weights {model_size_gb} GB')
         
         # Load weights from CPU memory to GPU memory 
         if self.load_format == 'auto':

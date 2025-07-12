@@ -149,9 +149,12 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
 - ChatGLM Series: Glm4 and Chatglm3 
 
+## Supported Quantization Method
+
+- fp8
+
 ## Roadmap
 
-- [ ] Quantization
 - [ ] Support more models
 
 

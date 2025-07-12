@@ -24,17 +24,20 @@ class Qwen2MLP(nn.Module):
 
     def __init__(self, config, shared_expert=False):
         super().__init__()
+        quant_config = getattr(config, 'quantization_config', None)
         if not shared_expert:
             intermediate_size = config.intermediate_size
         else:
             intermediate_size = config.shared_expert_intermediate_size
         self.gate_up_proj = MergedColumnParallelLinear(config.hidden_size, 
                                                        [intermediate_size]*2, 
-                                                       bias=False)
+                                                       bias=False,
+                                                       quant_config=quant_config)
         
         self.down_proj = RowParallelLinear(intermediate_size,
                                            config.hidden_size,
-                                           bias=False)
+                                           bias=False,
+                                           quant_config=quant_config)
 
         self.act_fn = SiluAndMul()
 
@@ -50,19 +53,22 @@ class Qwen2Attention(Attention):
 
         self.rope_theta = getattr(config,'rope_theta',10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        quant_config = getattr(config, 'quantization_config', None)
 
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=qkv_bias
+            bias=qkv_bias,
+            quant_config=quant_config,
         )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
-            bias=False
+            bias=False,
+            quant_config=quant_config,
         )
 
         self.rotary_emb = RotaryEmbedding(
@@ -186,11 +192,12 @@ class Qwen2ForCausalLM(nn.Module):
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
+                head_dim_patch = head_dim if k.find('scale') == -1 else 1
                 copy_qkv_proj_weight(v.data, 
                                      weights[k.replace('qkv_proj', 'q_proj')], 
                                      weights[k.replace('qkv_proj', 'k_proj')], 
                                      weights[k.replace('qkv_proj', 'v_proj')],
-                                     num_heads, num_kv_heads, head_dim)
+                                     num_heads, num_kv_heads, head_dim_patch)
             elif k.find('self_attn.qkv_proj.bias') != -1:
                 copy_qkv_proj_bias(v.data, 
                                    weights[k.replace('qkv_proj', 'q_proj')], 
@@ -200,10 +207,12 @@ class Qwen2ForCausalLM(nn.Module):
             elif k.find('self_attn.o_proj') != -1:
                 copy_single_proj_col(v.data, weights[k], num_heads*head_dim)
             elif k.find('gate_up_proj') != -1:
+                intermediate_size_partition_patch = (intermediate_size_partition // head_dim 
+                    if k.find('scale') != -1 else intermediate_size_partition)
                 copy_gate_up_proj_weight(v.data,
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
                                          weights[k.replace('gate_up_proj', 'up_proj')],
-                                         intermediate_size_partition)
+                                         intermediate_size_partition_patch)
             elif k.find('down_proj') != -1:
                 copy_single_proj_col(v.data, weights[k], intermediate_size_partition)
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
