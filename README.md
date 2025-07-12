@@ -157,6 +157,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 ## Roadmap
 
 - [ ] Support more models
+- [ ] Support more quantization methods
 
 
 ## Cite Our Work
