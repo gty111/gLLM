@@ -194,15 +194,17 @@ class Worker:
         self.forward_pp()
 
     def handle_keyboardInterrupt(self):
-        logger.info(f'Exit')
-        dist.destroy_process_group()
         self.mp_alive[self.local_rank] = -1
+        logger.info(f'Exit')
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     def handle_exception(self, e):
+        self.mp_alive[self.local_rank] = -1
         logger.error(e)
         traceback.print_exc()
-        dist.destroy_process_group()
-        self.mp_alive[self.local_rank] = -1
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def run_worker(worker: Worker):
