@@ -7,6 +7,7 @@ from functools import partial
 from gllm.dist_utils import (get_tp_size, get_tp_rank, divide, 
                              split_tensor_along_last_dim, tensor_model_parallel_all_reduce)
 from gllm.layers.quantization.fp8 import fp8LinearMethod
+from gllm.utils import get_device_capability
 
 class LinearBase(torch.nn.Module):
     """Base linear layer.
@@ -53,6 +54,8 @@ class LinearBase(torch.nn.Module):
                             requires_grad=False)
             self.register_parameter('weight', weight)
         elif self.quant_config['quant_method'] == 'fp8':
+            if get_device_capability() < 89:
+                raise Exception(f'FP8 quantizaiton method is not supported on device capability less than 89 (current is {get_device_capability()})')
             self.activation_scheme = self.quant_config['activation_scheme']
             self.block_quant = 'weight_block_size' in self.quant_config
             if self.block_quant:
