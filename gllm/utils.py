@@ -8,6 +8,7 @@ import filelock
 import tempfile
 import logging
 import tqdm
+import torch
 
 from logger import logger
 from functools import partial
@@ -168,3 +169,8 @@ def get_dtype_bytes(dtype):
     else:
         info = torch.iinfo(dtype)
     return info.bits // 8  # bits => bytes
+
+def get_device_capability():
+    device = torch.cuda.current_device()
+    capability_arr = torch.cuda.get_device_capability(device)
+    return capability_arr[0]*10 + capability_arr[1]
