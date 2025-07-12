@@ -1,5 +1,5 @@
 <p align="center">
-    <img src=doc/pic/gLLM.svg height=240>
+    <img src=doc/pic/gLLM.svg height=500>
 </p>
 
 <h4 align="center">
@@ -18,6 +18,7 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **token throttling**, **pipeline parallelism**, **expert parallelsim** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (**supported in huggingface**) inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** (~6k loc) code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
+- [2025/07/12]: FP8 quantization for Qwen3/2.5 is supported :tada:
 - [2025/06/27]: gLLM is accepted by SC'25. Congratulations :smiling_face_with_three_hearts:
 - [2025/06/21]: Expert parallelism is integrated :heart_eyes:
 - [2025/06/14]: Tensor parallelism is now integrated, allowing joint deploying with pipeline parallelism :sunglasses:
@@ -149,10 +150,14 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
 - ChatGLM Series: Glm4 and Chatglm3 
 
+## Supported Quantization Method
+
+- fp8
+
 ## Roadmap
 
-- [ ] Quantization
 - [ ] Support more models
+- [ ] Support more quantization methods
 
 
 ## Cite Our Work
