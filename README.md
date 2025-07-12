@@ -1,5 +1,5 @@
 <p align="center">
-    <img src=doc/pic/gLLM.svg height=320>
+    <img src=doc/pic/gLLM.svg height=500>
 </p>
 
 <h4 align="center">
