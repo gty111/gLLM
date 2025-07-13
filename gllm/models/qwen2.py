@@ -186,9 +186,6 @@ class Qwen2ForCausalLM(nn.Module):
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
         
-        intermediate_size_partition = self.config.intermediate_size // get_tp_size()
-        vocab_size_partition = self.config.vocab_size // get_tp_size()
-        
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
@@ -205,18 +202,16 @@ class Qwen2ForCausalLM(nn.Module):
                                    weights[k.replace('qkv_proj', 'v_proj')],
                                    num_heads, num_kv_heads, head_dim)
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj_col(v.data, weights[k], num_heads*head_dim)
+                copy_single_proj_col(v.data, weights[k], v.shape[1])
             elif k.find('gate_up_proj') != -1:
-                intermediate_size_partition_patch = (intermediate_size_partition // head_dim 
-                    if k.find('scale') != -1 else intermediate_size_partition)
                 copy_gate_up_proj_weight(v.data,
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
                                          weights[k.replace('gate_up_proj', 'up_proj')],
-                                         intermediate_size_partition_patch)
+                                         v.shape[0]//get_tp_size())
             elif k.find('down_proj') != -1:
-                copy_single_proj_col(v.data, weights[k], intermediate_size_partition)
+                copy_single_proj_col(v.data, weights[k], v.shape[1])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
-                copy_single_proj_row(v.data, weights[k], vocab_size_partition)
+                copy_single_proj_row(v.data, weights[k], v.shape[0])
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
