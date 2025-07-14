@@ -227,8 +227,6 @@ class ChatGLMForCausalLM(nn.Module):
         head_dim = attn.head_dim
         
         intermediate_size = self.config.ffn_hidden_size
-        intermediate_size_partition = intermediate_size // get_tp_size()
-        vocab_size_partition = self.config.padded_vocab_size // get_tp_size()
         
         q_index = num_heads*head_dim*get_tp_size()
         k_index = (num_heads+num_kv_heads)*head_dim*get_tp_size()
@@ -240,17 +238,17 @@ class ChatGLMForCausalLM(nn.Module):
             
             weight = weights[k]
             if 'dense_h_to_4h.weight' in k:
-                copy_gate_up_proj_weight(v.data, weight[:intermediate_size], weight[intermediate_size:], intermediate_size_partition)
+                copy_gate_up_proj_weight(v.data, weight[:intermediate_size], weight[intermediate_size:], v.shape[0]//2)
             elif 'dense_4h_to_h.weight' in k:
-                copy_single_proj_col(v.data, weight, intermediate_size_partition)
+                copy_single_proj_col(v.data, weight, v.shape[1])
             elif 'query_key_value.weight' in k:
                 copy_qkv_proj_weight(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'query_key_value.bias' in k:
                 copy_qkv_proj_bias(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'dense.weight' in k:
-                copy_single_proj_col(v.data, weight, num_heads*head_dim)
+                copy_single_proj_col(v.data, weight, v.shape[1])
             elif 'embedding' in k or 'output_layer' in k:
-                copy_single_proj_row(v.data, weight, vocab_size_partition)
+                copy_single_proj_row(v.data, weight, v.shape[0])
             else:
                 v.data.copy_(weight)
             if mp_load_progress is not None:
