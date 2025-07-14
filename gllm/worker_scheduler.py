@@ -49,13 +49,13 @@ class WorkerScheduler():
         return self.memory_manager.get_num_free_pages()
 
     def get_num_decode_seqs(self):
-        num_decode_seqs = len(self.seqs_to_decode) + \
-            reduce(lambda x, y: x+len(y), self.batch_running, 0)
+        num_decode_seqs = len(self.seqs_to_decode) + sum(
+            len(i) for i in self.batch_running)
         return num_decode_seqs
 
     def update_num_wait_tokens(self):
-        self.num_wait_tokens = reduce(
-            lambda x, y: x + len(y) - y.computed_token_num, self.seqs_to_prefill, 0)
+        self.num_wait_tokens = sum(len(i) - i.computed_token_num 
+                                   for i in self.seqs_to_prefill)
     
     def add_abort_ids(self, abort_ids):
         self.abort_ids.update(abort_ids)
