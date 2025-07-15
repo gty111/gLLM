@@ -202,16 +202,15 @@ class Qwen2ForCausalLM(nn.Module):
                                    weights[k.replace('qkv_proj', 'v_proj')],
                                    num_heads, num_kv_heads, head_dim)
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj_col(v.data, weights[k], v.shape[1])
+                copy_single_proj_col(v.data, weights[k])
             elif k.find('gate_up_proj') != -1:
                 copy_gate_up_proj_weight(v.data,
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
-                                         weights[k.replace('gate_up_proj', 'up_proj')],
-                                         v.shape[0]//2)
+                                         weights[k.replace('gate_up_proj', 'up_proj')])
             elif k.find('down_proj') != -1:
-                copy_single_proj_col(v.data, weights[k], v.shape[1])
+                copy_single_proj_col(v.data, weights[k])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
-                copy_single_proj_row(v.data, weights[k], v.shape[0])
+                copy_single_proj_row(v.data, weights[k])
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:

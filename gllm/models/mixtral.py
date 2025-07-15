@@ -128,7 +128,6 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
                     copy_gate_up_proj_weight(v.data[local_expert_idx],
                                              weights[k.replace('w13_weight', f'{expert_idx}.w1.weight')],
                                              weights[k.replace('w13_weight', f'{expert_idx}.w3.weight')],
-                                             v.shape[1]//2,
                                              not is_use_ep())
             elif k.find('w2_weight') != -1: # expert
                 for expert_idx in range(num_experts):
@@ -137,12 +136,11 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
                         continue
                     copy_single_proj_col(v.data[local_expert_idx],
                                          weights[k.replace('w2_weight', f'{expert_idx}.w2.weight')],
-                                         v.shape[2],
                                          not is_use_ep())
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj_col(v.data, weights[k], v.shape[1])
+                copy_single_proj_col(v.data, weights[k])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
-                copy_single_proj_row(v.data, weights[k], v.shape[0])
+                copy_single_proj_row(v.data, weights[k])
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
