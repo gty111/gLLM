@@ -148,12 +148,6 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
 
-        intermediate_size = self.config.moe_intermediate_size
-        intermediate_size_partition = intermediate_size // get_tp_size()
-        shared_expert_intermediate_size_partition = getattr(self.config, 'shared_expert_intermediate_size', None)
-        if shared_expert_intermediate_size_partition:
-            shared_expert_intermediate_size_partition = shared_expert_intermediate_size_partition // get_tp_size()
-        vocab_size_partition = self.config.vocab_size // get_tp_size()
         _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), self.config.num_experts)
         
         for k, v in parameters.items():
@@ -178,7 +172,7 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                     copy_gate_up_proj_weight(v.data[local_expert_idx],
                                              weights[k.replace('w13_weight', f'{expert_idx}.gate_proj.weight')],
                                              weights[k.replace('w13_weight', f'{expert_idx}.up_proj.weight')],
-                                             intermediate_size_partition if not is_use_ep() else intermediate_size,
+                                             v.shape[1]//2,
                                              not is_use_ep())
             elif k.find('w2_weight') != -1: # expert
                 for expert_idx in range(self.config.num_experts):
@@ -187,17 +181,17 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                         continue
                     copy_single_proj_col(v.data[local_expert_idx],
                                          weights[k.replace('w2_weight', f'{expert_idx}.down_proj.weight')],
-                                         intermediate_size_partition if not is_use_ep() else intermediate_size,
+                                         v.shape[2],
                                          not is_use_ep())
             elif k.find('gate_up_proj.weight') != -1: # shared_expert
                 copy_gate_up_proj_weight(v.data,
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
                                          weights[k.replace('gate_up_proj', 'up_proj')],
-                                         shared_expert_intermediate_size_partition)
+                                         v.shape[0]//2)
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj_col(v.data, weights[k], num_heads*head_dim)
+                copy_single_proj_col(v.data, weights[k], v.shape[1])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
-                copy_single_proj_row(v.data, weights[k], vocab_size_partition)
+                copy_single_proj_row(v.data, weights[k], v.shape[0])
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
