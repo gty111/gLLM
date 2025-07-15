@@ -37,7 +37,7 @@ class Worker:
         self.use_naive_schedule = use_naive_schedule
 
     def init_logger(self):
-        tp_ep_log = 'TP' if not self.use_ep else 'TP/EP'
+        tp_ep_log = 'TP' if not self.use_ep or self.tp_size == 1 else 'TP/EP'
         formater = logging.Formatter(
             f'[%(asctime)s %(filename)s:%(lineno)d Worker{self.pp_rank*self.tp_size+self.tp_rank} '
             f'PP{self.pp_rank} {tp_ep_log}{self.tp_rank}] %(levelname)s - %(message)s',
