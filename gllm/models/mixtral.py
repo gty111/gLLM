@@ -101,11 +101,6 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
         num_heads = attn.num_heads
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
-
-        intermediate_size = self.config.intermediate_size
-        intermediate_size_partition = intermediate_size // get_tp_size()
-        
-        vocab_size_partition = self.config.vocab_size // get_tp_size()
         
         num_experts = self.config.num_local_experts
         
@@ -133,7 +128,6 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
                     copy_gate_up_proj_weight(v.data[local_expert_idx],
                                              weights[k.replace('w13_weight', f'{expert_idx}.w1.weight')],
                                              weights[k.replace('w13_weight', f'{expert_idx}.w3.weight')],
-                                             intermediate_size_partition if not is_use_ep() else intermediate_size,
                                              not is_use_ep())
             elif k.find('w2_weight') != -1: # expert
                 for expert_idx in range(num_experts):
@@ -142,12 +136,11 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
                         continue
                     copy_single_proj_col(v.data[local_expert_idx],
                                          weights[k.replace('w2_weight', f'{expert_idx}.w2.weight')],
-                                         intermediate_size_partition if not is_use_ep() else intermediate_size,
                                          not is_use_ep())
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj_col(v.data, weights[k], num_heads*head_dim)
+                copy_single_proj_col(v.data, weights[k])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
-                copy_single_proj_row(v.data, weights[k], vocab_size_partition)
+                copy_single_proj_row(v.data, weights[k])
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:
