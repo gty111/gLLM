@@ -83,7 +83,7 @@ def get_moe_configs(
 
     # If no optimized configuration is available, we will use the default
     # configuration
-    logger.warning(
+    logger.debug(
         (
             "Using default MoE kernel config. Performance might be sub-optimal! "
             "Config file not found at %s"
