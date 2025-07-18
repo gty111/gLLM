@@ -264,7 +264,7 @@ class WorkerScheduler():
         self.memory_manager.pre_allocate_page(
             schedule_decode_seqs)
 
-        if self.log and time.time()-self.log_time > 0:
+        if self.log and time.time()-self.log_time > 1:
             self.log_time = time.time()
             log_info = '#wait: %4d/%8d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
                 len(self.seqs_to_prefill),
