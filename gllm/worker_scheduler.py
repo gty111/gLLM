@@ -146,7 +146,9 @@ class WorkerScheduler():
         num_tokens_budget = self.maxp
 
         self.check_preempt(min(num_tokens_budget, len(self.seqs_to_decode)))
+        
         # decode
+        num_total_decode_seqs = self.get_num_decode_seqs()
         for _ in range(num_tokens_budget):
             if len(self.seqs_to_decode) == 0:
                 break
@@ -188,7 +190,7 @@ class WorkerScheduler():
             self.log_time = time.time()
             log_info = '#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
                 len(self.seqs_to_prefill),
-                self.get_num_decode_seqs(),
+                num_total_decode_seqs,
                 prefill_batched_token_nums,
                 len(schedule_decode_seqs),
                 '%.2f' % self.memory_manager.get_memory_util())
