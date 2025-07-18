@@ -163,6 +163,7 @@ class WorkerScheduler():
             max(self.get_num_free_pages()-self.num_kvthresh_pages, 0))
 
         # prefill
+        unfinish_prefill_seqs = deque()
         prefill_batched_token_nums = 0
         while len(self.seqs_to_prefill) != 0 and num_tokens_budget != 0:
             seq = self.seqs_to_prefill.popleft()
@@ -174,10 +175,14 @@ class WorkerScheduler():
                 prefill_batched_token_nums += num_tokens_budget
                 seq.to_compute_token_num = num_tokens_budget
                 num_tokens_budget = 0
+            self.memory_manager.pre_allocate_page([seq])
             schedule_prefill_seqs.append(seq)
-            
-        self.memory_manager.pre_allocate_page(
-            schedule_prefill_seqs)
+            if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
+                seq_new = copy.deepcopy(seq)
+                seq_new.computed_token_num += seq_new.to_compute_token_num
+                unfinish_prefill_seqs.appendleft(seq_new)
+        
+        self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
 
         if self.log and time.time()-self.log_time > 1:
             self.log_time = time.time()
