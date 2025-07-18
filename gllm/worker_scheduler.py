@@ -1,8 +1,8 @@
 import time
 import random
+import copy
 
 from collections import deque
-from functools import reduce
 from typing import List
 from logger import logger
 
@@ -87,8 +87,8 @@ class WorkerScheduler():
                     self.memory_manager.free(seq)
                 elif seq.computed_prompt:
                     self.seqs_to_decode.appendleft(seq)
-                else:
-                    self.seqs_to_prefill.appendleft(seq)
+                else: # unfinished prefill seqs
+                    pass
             ipc_package.next_tokens = send_tokens
             return ipc_package
         else:
@@ -201,6 +201,7 @@ class WorkerScheduler():
         schedule_decode_seqs = []
 
         # prefill
+        unfinish_prefill_seqs = deque()
         prefill_token_budget = self.page_size * \
             max(self.get_num_free_pages()-self.num_kvthresh_pages, 0)
         if get_world_size() > 1 and prefill_token_budget != 0:
@@ -230,10 +231,14 @@ class WorkerScheduler():
                 prefill_batched_token_nums += prefill_token_budget
                 seq.to_compute_token_num = prefill_token_budget
                 prefill_token_budget = 0
+            self.memory_manager.pre_allocate_page([seq])
             schedule_prefill_seqs.append(seq)
-
-        self.memory_manager.pre_allocate_page(
-            schedule_prefill_seqs)
+            if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
+                seq_new = copy.deepcopy(seq)
+                seq_new.computed_token_num += seq_new.to_compute_token_num
+                unfinish_prefill_seqs.appendleft(seq_new)
+        
+        self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
 
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
@@ -259,7 +264,7 @@ class WorkerScheduler():
         self.memory_manager.pre_allocate_page(
             schedule_decode_seqs)
 
-        if self.log and time.time()-self.log_time > 1:
+        if self.log and time.time()-self.log_time > 0:
             self.log_time = time.time()
             log_info = '#wait: %4d/%8d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%' % (
                 len(self.seqs_to_prefill),
