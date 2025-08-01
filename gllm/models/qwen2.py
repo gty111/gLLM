@@ -12,7 +12,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
 from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
-                             resolve_pp_layer_idx, get_tp_size)
+                             resolve_pp_layer_idx, is_first_pp_rank)
 from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
 
@@ -74,7 +74,7 @@ class Qwen2Attention(Attention):
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim, self.max_position_embeddings, self.rope_theta, True)
         self.attn = FlashAttention(
-            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
+            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.qkv_proj(hidden_states)
@@ -116,7 +116,7 @@ class Qwen2DecoderLayer(nn.Module):
 class Qwen2Model(nn.Module):
     def __init__(self, config, decoder_layer_type=Qwen2DecoderLayer):
         super().__init__()
-        if get_pp_rank() == 0 or (config.tie_word_embeddings and is_last_pp_rank()):
+        if is_first_pp_rank() or (config.tie_word_embeddings and is_last_pp_rank()):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -133,7 +133,7 @@ class Qwen2Model(nn.Module):
                 config.hidden_size, config.rms_norm_eps)
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
-        if get_pp_rank() == 0:
+        if is_first_pp_rank():
             hidden_states = self.embed_tokens(input_data.tokens)
         for i in range(len(self.layers)):
             layer = self.layers[i]

@@ -66,7 +66,7 @@ class LlamaAttention(Attention):
                 self.rope_theta, True)
 
         self.attn = FlashAttention(
-            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
+            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim)
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.qkv_proj(hidden_states)

@@ -44,7 +44,7 @@ class Qwen3Attention(Attention):
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim, config.max_position_embeddings, self.rope_theta, True)
         self.attn = FlashAttention(
-            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
+            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim)
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         

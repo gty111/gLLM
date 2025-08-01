@@ -9,6 +9,7 @@ import tempfile
 import logging
 import tqdm
 import torch
+import math
 
 from logger import logger
 from functools import partial
@@ -174,3 +175,8 @@ def get_device_capability():
     device = torch.cuda.current_device()
     capability_arr = torch.cuda.get_device_capability(device)
     return capability_arr[0]*10 + capability_arr[1]
+
+def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0

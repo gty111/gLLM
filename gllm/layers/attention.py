@@ -1,7 +1,7 @@
-from gllm.vllm_flash_attn import flash_attn_varlen_func
 import torch
 
 from gllm.input_data import InputData
+from gllm.vllm_flash_attn import flash_attn_varlen_func
 
 
 class FlashAttention():
@@ -11,14 +11,12 @@ class FlashAttention():
                  scaling: float,
                  num_heads: int,
                  num_key_value_heads: int,
-                 head_dim: int,
-                 hidden_size: int):
+                 head_dim: int):
         self.scaling = scaling
         self.layer_id = layer_id
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.hidden_size = hidden_size
 
     def forward(self,
                 q: torch.Tensor,
