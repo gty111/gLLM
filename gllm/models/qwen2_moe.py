@@ -5,7 +5,7 @@ from typing import Optional
 from torch import nn
 
 from gllm.layers.layernorm import RMSNorm
-from gllm.layers.moe.fused_moe_triton.layer import FusedMoE, determine_expert_map
+from gllm.layers.moe import FusedMoE, determine_expert_map
 from gllm.input_data import InputData
 from gllm.dist_utils import (get_local_rank, resolve_pp_layer_idx, get_tp_size, 
                              tensor_model_parallel_all_reduce, is_use_ep,
