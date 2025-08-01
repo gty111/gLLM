@@ -11,7 +11,7 @@ from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
-                             resolve_pp_layer_idx, get_tp_size)
+                             resolve_pp_layer_idx, get_tp_size, is_first_pp_rank)
 from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
 
@@ -32,7 +32,7 @@ class GLMAttention(Attention):
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim // 2, config.seq_length, getattr(config,'rope_theta',10000), False)
         self.attn = FlashAttention(
-            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim, self.hidden_size)
+            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim)
 
         self.projection_size = config.kv_channels * self.num_heads
         self.qkv_hidden_size = self.projection_size + 2 * \
@@ -183,7 +183,7 @@ class ChatGLMModel(nn.Module):
         )
 
     def forward(self, input_data: InputData, hidden_states=None):
-        if get_pp_rank() == 0:
+        if is_first_pp_rank():
             hidden_states = self.embedding(input_data.tokens)
 
         # Run encoder.

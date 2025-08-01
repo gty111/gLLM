@@ -13,6 +13,7 @@ from gllm.models.qwen2_moe import Qwen2MoeForCausalLM
 from gllm.models.qwen3 import Qwen3ForCausalLM
 from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.models.mixtral import MixtralForCausalLM
+from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 from gllm.utils import get_lock
 
 
@@ -94,6 +95,9 @@ class ModelLoader():
             model_type = Qwen3MoeForCausalLM
         elif self.architecture == 'MixtralForCausalLM':
             model_type = MixtralForCausalLM
+        elif (self.architecture == 'DeepseekV2ForCausalLM' or 
+              self.architecture == 'DeepseekV3ForCausalLM'):
+            model_type = DeepseekV2ForCausalLM
         else:
             raise Exception(f'Unsupported model: {self.architecture}')
         return model_type

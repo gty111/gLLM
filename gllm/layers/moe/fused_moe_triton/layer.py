@@ -52,6 +52,11 @@ class FusedMoEMethod(torch.nn.Module):
         apply_router_weight_on_input: bool = False,
         global_num_experts: int = -1,
         expert_map: Optional[torch.Tensor] = None,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        scoring_func: str = 'softmax',
+        e_score_correction_bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         return self.forward_cuda(
             x=x,
@@ -63,6 +68,11 @@ class FusedMoEMethod(torch.nn.Module):
             apply_router_weight_on_input=apply_router_weight_on_input,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            use_grouped_topk=use_grouped_topk,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias
         )
 
     def forward_cuda(
@@ -76,12 +86,22 @@ class FusedMoEMethod(torch.nn.Module):
         apply_router_weight_on_input: bool = False,
         global_num_experts: int = -1,
         expert_map: Optional[torch.Tensor] = None,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        scoring_func: str = 'softmax',
+        e_score_correction_bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
             top_k=top_k,
             renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias
         )
 
         return fused_experts(
@@ -126,8 +146,13 @@ class FusedMoE(torch.nn.Module):
         intermediate_size: int,
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
         renormalize: bool = True,
-        activation: str = "silu",
+        scoring_func: str = 'softmax',
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        activation: str = 'silu',
         apply_router_weight_on_input: bool = False,
     ):
         super().__init__()
@@ -158,8 +183,19 @@ class FusedMoE(torch.nn.Module):
         
         self.reduce_results = reduce_results
         self.renormalize = renormalize
+        self.use_grouped_topk = use_grouped_topk
+        if self.use_grouped_topk:
+            assert num_expert_group is not None and topk_group is not None
+        self.num_expert_group = num_expert_group
+        self.topk_group = topk_group
+        self.scoring_func = scoring_func
+        self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        
+        if self.scoring_func != 'softmax' and not self.use_grouped_topk:
+            raise ValueError('Only softmax scoring function is supported for '
+                             'non-grouped topk.')
         
         self.fusedMoEMethod = FusedMoEMethod()
         
@@ -183,6 +219,11 @@ class FusedMoE(torch.nn.Module):
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             global_num_experts=self.global_num_experts,
             expert_map=self.expert_map,
+            use_grouped_topk=self.use_grouped_topk,
+            topk_group=self.topk_group,
+            num_expert_group=self.num_expert_group,
+            scoring_func=self.scoring_func,
+            e_score_correction_bias=self.e_score_correction_bias
         )
         
         if self.reduce_results and self.tp_size > 1:
