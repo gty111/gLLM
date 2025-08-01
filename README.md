@@ -146,6 +146,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 ## Supported Models
 
+- DeepSeek Series: DeepSeek V2/3
 - Qwen Series: Qwen3, Qwen2.5, Qwen2
 - Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
