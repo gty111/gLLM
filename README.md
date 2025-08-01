@@ -18,6 +18,7 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **token throttling**, **pipeline parallelism**, **expert parallelsim** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (**supported in huggingface**) inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** (~6k loc) code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
+- [2025/08/01]: DeepSeek V2/3 is supported :clap:
 - [2025/07/12]: FP8 quantization for Qwen3/2.5 is supported :tada:
 - [2025/06/27]: gLLM is accepted by SC'25. Congratulations :smiling_face_with_three_hearts:
 - [2025/06/21]: Expert parallelism is integrated :heart_eyes:
