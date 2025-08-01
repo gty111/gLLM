@@ -148,7 +148,10 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
 
-        _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), self.config.num_experts)
+        num_experts = getattr(self.config, 'num_experts', getattr(self.config, 'n_routed_experts', None))
+        assert num_experts is not None
+
+        _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), num_experts)
         
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
@@ -165,7 +168,7 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                                    weights[k.replace('qkv_proj', 'v_proj')],
                                    num_heads, num_kv_heads, head_dim)
             elif k.find('w13_weight') != -1: # expert
-                for expert_idx in range(self.config.num_experts):
+                for expert_idx in range(num_experts):
                     local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
                     if local_expert_idx == -1:
                         continue
@@ -174,7 +177,7 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                                              weights[k.replace('w13_weight', f'{expert_idx}.up_proj.weight')],
                                              not is_use_ep())
             elif k.find('w2_weight') != -1: # expert
-                for expert_idx in range(self.config.num_experts):
+                for expert_idx in range(num_experts):
                     local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
                     if local_expert_idx == -1:
                         continue
@@ -186,6 +189,10 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
                                          weights[k.replace('gate_up_proj', 'up_proj')])
             elif k.find('self_attn.o_proj') != -1:
+                copy_single_proj_col(v.data, weights[k])
+            elif k.find('q_proj') != -1 or k.find('kv_b_proj') != -1: # Deepseek V2/V3 Attention
+                copy_single_proj_row(v.data, weights[k])
+            elif k.find('down_proj') != -1: # Deepseek MLP
                 copy_single_proj_col(v.data, weights[k])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
                 copy_single_proj_row(v.data, weights[k])

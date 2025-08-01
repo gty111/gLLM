@@ -85,7 +85,7 @@ class DeepseekV2MOE(nn.Module):
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self.gate(hidden_states)
 
         if hidden_states.dtype != torch.float16:
             final_hidden_states = self.experts(
@@ -105,7 +105,7 @@ class DeepseekV2MOE(nn.Module):
                 final_hidden_states = final_hidden_states + shared_output \
                     * (1. / self.routed_scaling_factor)
 
-        if self.tp_size > 1:
+        if get_tp_size() > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
 
@@ -202,20 +202,20 @@ class DeepseekV2Attention(Attention):
         hidden_states: torch.Tensor
     ):
         if self.q_lora_rank is not None:
-            q = self.q_a_proj(hidden_states)[0]
+            q = self.q_a_proj(hidden_states)
             q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_heads,
+            q = self.q_b_proj(q).view(-1, self.num_heads,
                                          self.qk_head_dim)
         else:
-            q = self.q_proj(hidden_states)[0].view(-1, self.num_heads,
+            q = self.q_proj(hidden_states).view(-1, self.num_heads,
                                                    self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],dim=-1)
-        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)
         kv_a, _ = latent_cache.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a)
-        kv = self.kv_b_proj(kv_a)[0]
+        kv = self.kv_b_proj(kv_a)
         kv = kv.view(-1, self.num_heads,
                      self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -332,66 +332,4 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(Qwen2MoeForCausalLM):
     def __init__(self, config):
         super().__init__(config, model_type=DeepseekV2Model)
-        
-    def load_weights(self, weights, mp_load_progress=None):
-        parameters = dict(self.named_parameters())
-        if mp_load_progress is not None:
-            mp_load_progress[get_local_rank()*2] = len(parameters)
-            mp_load_progress[get_local_rank()*2+1] = 0
-        else:
-            pbar = get_model_load_pbar(len(parameters))
-            
-        attn = self.model.layers[0].self_attn
-        num_heads = attn.num_heads
-        num_kv_heads = attn.num_kv_heads
-        head_dim = attn.head_dim
-        
-        num_experts = self.config.n_routed_experts
-
-        _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), num_experts)
-        
-        for k, v in parameters.items():
-            k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
-            if k.find('self_attn.qkv_proj.weight') != -1:
-                copy_qkv_proj_weight(v.data, 
-                                     weights[k.replace('qkv_proj', 'q_proj')], 
-                                     weights[k.replace('qkv_proj', 'k_proj')], 
-                                     weights[k.replace('qkv_proj', 'v_proj')],
-                                     num_heads, num_kv_heads, head_dim)
-            elif k.find('self_attn.qkv_proj.bias') != -1:
-                copy_qkv_proj_bias(v.data, 
-                                   weights[k.replace('qkv_proj', 'q_proj')], 
-                                   weights[k.replace('qkv_proj', 'k_proj')], 
-                                   weights[k.replace('qkv_proj', 'v_proj')],
-                                   num_heads, num_kv_heads, head_dim)
-            elif k.find('w13_weight') != -1: # expert
-                for expert_idx in range(num_experts):
-                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
-                    if local_expert_idx == -1:
-                        continue
-                    copy_gate_up_proj_weight(v.data[local_expert_idx],
-                                             weights[k.replace('w13_weight', f'{expert_idx}.gate_proj.weight')],
-                                             weights[k.replace('w13_weight', f'{expert_idx}.up_proj.weight')],
-                                             not is_use_ep())
-            elif k.find('w2_weight') != -1: # expert
-                for expert_idx in range(num_experts):
-                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
-                    if local_expert_idx == -1:
-                        continue
-                    copy_single_proj_col(v.data[local_expert_idx],
-                                         weights[k.replace('w2_weight', f'{expert_idx}.down_proj.weight')],
-                                         not is_use_ep())
-            elif k.find('gate_up_proj.weight') != -1: # shared_expert
-                copy_gate_up_proj_weight(v.data,
-                                         weights[k.replace('gate_up_proj', 'gate_proj')],
-                                         weights[k.replace('gate_up_proj', 'up_proj')])
-            elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj_col(v.data, weights[k])
-            elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
-                copy_single_proj_row(v.data, weights[k])
-            else:
-                v.data.copy_(weights[k])
-            if mp_load_progress is not None:
-                mp_load_progress[get_local_rank()*2+1] += 1
-            else:
-                pbar.update(1)
+        self.head_dim = self.model.layers[0].self_attn.qk_head_dim

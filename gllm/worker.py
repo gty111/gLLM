@@ -200,11 +200,11 @@ class Worker:
             dist.destroy_process_group()
 
     def handle_exception(self, e):
-        self.mp_alive[self.local_rank] = -1
         logger.error(e)
         traceback.print_exc()
         if dist.is_initialized():
             dist.destroy_process_group()
+        self.mp_alive[self.local_rank] = -1
 
 
 def run_worker(worker: Worker):
