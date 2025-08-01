@@ -123,7 +123,7 @@ def init_dist(pp_size, tp_size, use_ep, local_rank, pp_rank, tp_rank, master_add
     
     init_method = f'tcp://{master_addr}:{master_port}'
     backend = 'nccl'
-    tp_ep_log = 'TP Groups' if not use_ep else 'TP/EP Groups'
+    tp_ep_log = 'TP Groups' if not use_ep or tp_size==1 else 'TP/EP Groups'
     logger.info(f'NCCL: Init_method {init_method}, Backend {backend}, Rank {_RANK}, {tp_ep_log} {self_tp_ranks}, Word_size {_WORLD_SIZE}')
     dist.init_process_group(init_method=init_method, backend=backend, world_size=_WORLD_SIZE, rank=_RANK)
     
