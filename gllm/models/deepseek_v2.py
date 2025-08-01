@@ -3,32 +3,25 @@ import torch.nn as nn
 
 from typing import Optional
 
-from gllm.layers.moe import FusedMoE, determine_expert_map
-from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, QKVParallelLinear, ColumnParallelLinear
-from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
+from gllm.layers.moe import FusedMoE
+from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, ColumnParallelLinear
+from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from gllm.layers.activation import SiluAndMul
-from gllm.layers.rotary_embedding import RotaryEmbedding, DeepseekScalingRotaryEmbedding
+from gllm.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
 from gllm.modules.attention import Attention
-from gllm.utils import yarn_get_mscale, get_model_load_pbar
+from gllm.utils import yarn_get_mscale
 from gllm.dist_utils import (tensor_model_parallel_all_reduce, 
                              get_tp_size, is_first_pp_rank,
-                             get_pp_layers, is_last_pp_rank,
-                             get_local_rank, resolve_pp_layer_idx,
-                             resolve_ep_expert_idx, get_ep_rank,
-                             get_ep_size, is_use_ep)
-
-from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj_col,
-                           copy_single_proj_row)
+                             get_pp_layers, is_last_pp_rank)
 
 from .qwen2_moe import Qwen2MoeForCausalLM
 
 class DeepseekV2MLP(nn.Module):
 
-    def __init__(self, hidden_size, intermediate_size):
+    def __init__(self, hidden_size, intermediate_size, reduce_results: bool = True):
         super().__init__()
 
         self.gate_up_proj = MergedColumnParallelLinear(hidden_size, 
@@ -37,7 +30,8 @@ class DeepseekV2MLP(nn.Module):
         
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
-                                           bias=False)
+                                           bias=False,
+                                           reduce_results=reduce_results)
 
         self.act_fn = SiluAndMul()
 
@@ -77,7 +71,8 @@ class DeepseekV2MOE(nn.Module):
             intermediate_size = (config.moe_intermediate_size *
                                  config.n_shared_experts)
             self.shared_experts = DeepseekV2MLP(config.hidden_size,
-                                                intermediate_size)
+                                                intermediate_size,
+                                                reduce_results=False)
             
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape

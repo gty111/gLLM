@@ -3,6 +3,7 @@ import torch.nn.functional as F
 
 from typing import Optional
 from torch import nn
+from logger import logger
 
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe import FusedMoE, determine_expert_map
@@ -184,16 +185,16 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
                     copy_single_proj_col(v.data[local_expert_idx],
                                          weights[k.replace('w2_weight', f'{expert_idx}.down_proj.weight')],
                                          not is_use_ep())
-            elif k.find('gate_up_proj.weight') != -1: # shared_expert
+            elif k.find('gate_up_proj.weight') != -1: # shared expert or dense layer
                 copy_gate_up_proj_weight(v.data,
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
                                          weights[k.replace('gate_up_proj', 'up_proj')])
+            elif k.find('down_proj.weight') != -1: # shared expert or dense layer
+                copy_single_proj_col(v.data, weights[k])
             elif k.find('self_attn.o_proj') != -1:
                 copy_single_proj_col(v.data, weights[k])
             elif k.find('q_proj') != -1 or k.find('kv_b_proj') != -1: # Deepseek V2/V3 Attention
                 copy_single_proj_row(v.data, weights[k])
-            elif k.find('down_proj') != -1: # Deepseek MLP
-                copy_single_proj_col(v.data, weights[k])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
                 copy_single_proj_row(v.data, weights[k])
             else:
