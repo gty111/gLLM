@@ -200,7 +200,8 @@ class WorkerScheduler():
                 logger.info(log_info)
             else:
                 logger.info(log_info)
-        return schedule_prefill_seqs + schedule_decode_seqs
+        # first decode, then prefill
+        return schedule_decode_seqs + schedule_prefill_seqs
 
     def schedule(self):
 
@@ -286,6 +287,5 @@ class WorkerScheduler():
                 logger.info(log_info)
             else:
                 logger.info(log_info)
-        # with open('log','a') as f:
-        #     f.write(f'{prefill_batched_token_nums} {len(schedule_decode_seqs)}\n')
-        return schedule_prefill_seqs + schedule_decode_seqs
+        # first decode, then prefill
+        return schedule_decode_seqs + schedule_prefill_seqs

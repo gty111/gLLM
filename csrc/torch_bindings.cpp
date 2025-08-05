@@ -81,6 +81,34 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops)
         "            Tensor! key_cache, Tensor! value_cache,"
         "            Tensor slot_mapping) -> ()");
     ops.impl("reshape_and_cache_flash", torch::kCUDA, &reshape_and_cache_flash);
+
+    // Gather cache blocks from src_cache to dst.
+    ops.def(
+        "gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
+        "Tensor cu_seq_lens, int batch_size, Tensor? seq_starts) -> ()");
+    ops.impl("gather_cache", torch::kCUDA, &gather_cache);
+
+    // Concat kv_c and k_pe and cache them.
+    ops.def(
+        "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"
+        "                     Tensor! kv_cache,"
+        "                     Tensor slot_mapping,"
+        "                     str kv_cache_dtype,"
+        "                     Tensor scale) -> ()");
+    ops.impl("concat_and_cache_mla", torch::kCUDA, &concat_and_cache_mla);
+
+    // Merge attn states
+    // Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
+    // can be used to combine partial attention results (in the split-KV case)
+    ops.def(
+        "merge_attn_states("
+        "    Tensor! output,"
+        "    Tensor!? output_lse,"
+        "    Tensor prefix_output,"
+        "    Tensor prefix_lse,"
+        "    Tensor suffix_output,"
+        "    Tensor suffix_lse) -> ()");
+    ops.impl("merge_attn_states", torch::kCUDA, &merge_attn_states);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

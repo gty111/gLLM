@@ -78,7 +78,12 @@ class ModelLoader():
         self.vocab_size = self.config.vocab_size
         self.hidden_size = self.config.hidden_size
         self.quantization_config = getattr(self.config, 'quantization_config', None)
+        self.config.use_mla = self.use_mla
     
+    @property
+    def use_mla(self):
+        return self.architecture in ['DeepseekV2ForCausalLM', 'DeepseekV3ForCausalLM']
+
     def get_model_type(self):
         model_type = None
         if self.architecture == 'LlamaForCausalLM':

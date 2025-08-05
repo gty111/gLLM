@@ -11,7 +11,8 @@ from gllm.utils import get_dtype_bytes
 
 class MemoryManager():
     def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype,
-                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int):
+                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int,
+                 use_mla=False):
         '''
         num_layers: number of hidden layers
         page_size: number of tokens in a page
@@ -24,6 +25,7 @@ class MemoryManager():
         self.kv_head_dim = kv_head_dim
         self.dtype = dtype
         self.vocab_size = vocab_size
+        self.use_mla = use_mla
 
         free_mem_size, _ = torch.cuda.mem_get_info()
         num_max_pages = free_mem_size // self.get_sizeof_KV_per_page()
@@ -40,12 +42,15 @@ class MemoryManager():
                     f'{round(self.get_sizeof_KV_per_page()/(2**10*self.page_size),2)} KB (per token), '
                     f'{round(self.num_pages*self.get_sizeof_KV_per_page()/(2**30),2)} GB (total)')
 
-        self.segment = Segment(self.num_layers, self.num_pages,
-                               self.page_size, self.kv_head_num, self.kv_head_dim)
+        self.segment = Segment(self.num_layers, self.num_pages, self.page_size, 
+                               self.kv_head_num, self.kv_head_dim, use_mla)
 
     def get_sizeof_KV_per_page(self): # Bytes
-        # 2: K cache and V cache 
-        return  2 * self.num_layers * self.page_size * self.kv_head_num * self.kv_head_dim * get_dtype_bytes(self.dtype)  
+        if not self.use_mla:
+            # 2: K cache and V cache 
+            return  2 * self.num_layers * self.page_size * self.kv_head_num * self.kv_head_dim * get_dtype_bytes(self.dtype) 
+        else:
+            return  self.num_layers * self.page_size * self.kv_head_dim * get_dtype_bytes(self.dtype)
     
     def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping_tensor: torch.Tensor):
         from gllm import _custom_ops as ops
@@ -82,17 +87,23 @@ class Segment():
                  num_pages: int,
                  page_size: int,
                  kv_head_num: int,
-                 kv_head_dim: int):
+                 kv_head_dim: int,
+                 use_mla: bool):
         self.num_layers = num_layers
         self.num_pages = num_pages
         self.page_size = page_size
         self.kv_head_num = kv_head_num
         self.kv_head_dim = kv_head_dim
-        # We don't need zero initialization here
-        self.k_cache = [torch.ones(
-            (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
-        self.v_cache = [torch.ones(
-            (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
+
+        if not use_mla:
+            # We don't need zero initialization here
+            self.k_cache = [torch.ones(
+                (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
+            self.v_cache = [torch.ones(
+                (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
+        else:
+            self.kv_cache = [torch.ones(
+                (num_pages, page_size, kv_head_dim)) for _ in range(num_layers)]
         self.id_allocator = IDAllocator(0, num_pages-1)
 
     def allocate(self):

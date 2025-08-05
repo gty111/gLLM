@@ -1,6 +1,8 @@
 import torch
 import contextlib
 
+from typing import Optional
+
 try:
     import gllm._C
 except ImportError as e:
@@ -20,6 +22,37 @@ def reshape_and_cache_flash(
     slot_mapping: torch.Tensor,
 ) -> None:
     torch.ops._C.reshape_and_cache_flash(key, value, key_cache, value_cache, slot_mapping)
+
+def concat_and_cache_mla(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    scale: torch.Tensor,
+) -> None:
+    torch.ops._C.concat_and_cache_mla(kv_c, k_pe, kv_cache,
+                                                slot_mapping, kv_cache_dtype,
+                                                scale)
+
+def gather_cache(src_cache: torch.Tensor,
+                 dst: torch.Tensor,
+                 block_table: torch.Tensor,
+                 cu_seq_lens: torch.Tensor,
+                 batch_size: int,
+                 seq_starts: Optional[torch.Tensor] = None) -> None:
+    torch.ops._C.gather_cache(src_cache, dst, block_table,
+                                        cu_seq_lens, batch_size, seq_starts)
+    
+# merge attn states ops
+def merge_attn_states(output: torch.Tensor,
+                      prefix_output: torch.Tensor,
+                      prefix_lse: torch.Tensor,
+                      suffix_output: torch.Tensor,
+                      suffix_lse: torch.Tensor,
+                      output_lse: Optional[torch.Tensor] = None) -> None:
+    torch.ops._C.merge_attn_states(output, output_lse, prefix_output,
+                                   prefix_lse, suffix_output, suffix_lse)
 
 # activation ops
 def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
