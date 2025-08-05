@@ -161,6 +161,9 @@ def get_device_name(device_id: int = 0) -> str:
 def round_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
 
+def round_down(x: int, y: int) -> int:
+    return (x // y) * y
+
 def ceil_div(a, b):
     return (a + b - 1) // b
 

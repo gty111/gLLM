@@ -35,6 +35,7 @@ class Worker:
         self.mp_load_progress = mp_load_progress
         self.assigned_layers = assigned_layers
         self.use_naive_schedule = use_naive_schedule
+        self.use_mla = model_runner.model_loader.use_mla
 
     def init_logger(self):
         tp_ep_log = 'TP' if not self.use_ep or self.tp_size == 1 else 'TP/EP'
@@ -90,7 +91,8 @@ class Worker:
         seqs = self.comm.recv_schedule_seqs()
         if seqs is not None:
             self.schedule_queue.append(
-                InputData(seqs, self.model_runner.memory_manager))
+                InputData(seqs, self.model_runner.memory_manager,
+                          use_mla=self.use_mla))
 
     # pp last rank => pp next rank
     def recv_intermediate_data(self):
@@ -167,7 +169,8 @@ class Worker:
         schedule_seqs = self.worker_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
             input_data = InputData(
-                schedule_seqs, self.model_runner.memory_manager)
+                schedule_seqs, self.model_runner.memory_manager,
+                use_mla=self.use_mla)
             if get_world_size() > 1:
                 self.comm.send_schedule_seqs(schedule_seqs)
             output = self.model_runner.step_once(input_data)

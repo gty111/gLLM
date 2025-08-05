@@ -8,7 +8,7 @@ from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, Co
 from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
-from gllm.layers.attention import FlashAttention
+from gllm.layers.attention import FlashAttention, MLAAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
 from gllm.modules.attention import Attention
@@ -233,13 +233,158 @@ class DeepseekV2Attention(Attention):
                 -1, self.num_heads * self.v_head_dim)
         output = self.o_proj(attn_output)
         return output
+    
+class DeepseekV2MLAAttention(Attention):
+    def __init__(self, layer_id: int, config):
+        self.hidden_size = config.hidden_size
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        super().__init__(config.num_attention_heads, 
+                         config.num_attention_heads,
+                         self.hidden_size,
+                         self.qk_head_dim)
+        self.v_head_dim = config.v_head_dim
+        self.q_lora_rank = config.q_lora_rank if hasattr(
+            config, 'q_lora_rank') else None
+        self.kv_lora_rank = config.kv_lora_rank
+        self.rope_theta = getattr(config, 'rope_theta', 10000)
+        self.max_poistion_embeddings = getattr(
+            config, 'max_position_embeddings', 8192)
+        self.rope_scaling = getattr(config, 'rope_scaling', None)
+        self.layer_id = layer_id
 
+        if self.q_lora_rank is not None:
+            self.fused_qkv_a_proj = nn.Linear(
+                self.hidden_size,
+                sum([self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]),
+                bias=False)
+        else:
+            self.kv_a_proj_with_mqa = nn.Linear(
+                self.hidden_size,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                bias=False)
+
+        if self.q_lora_rank is not None:
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
+                                         eps=config.rms_norm_eps)
+            self.q_b_proj = ColumnParallelLinear(self.q_lora_rank,
+                                                 self.total_num_heads *
+                                                 self.qk_head_dim,
+                                                 bias=False)
+        else:
+            self.q_proj = ColumnParallelLinear(self.hidden_size,
+                                               self.total_num_heads *
+                                               self.qk_head_dim,
+                                               bias=False)
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
+                                      eps=config.rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False)
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False)
+        
+        if self.rope_scaling:
+            self.rope_scaling['rope_type'] = 'deepseek_yarn'
+            mscale_all_dim = self.rope_scaling.get('mscale_all_dim', False)
+            scaling_factor = self.rope_scaling['factor']
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            self.scaling = self.scaling * mscale * mscale
+
+        extra_kwargs = {
+            k: v
+            for k, v in self.rope_scaling.items()
+            if k in ("extrapolation_factor", "attn_factor", "beta_fast",
+                         "beta_slow", "mscale", "mscale_all_dim")
+        }
+        
+        self.rotary_emb = DeepseekScalingRotaryEmbedding(
+            self.qk_rope_head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position_embeddings=self.rope_scaling[
+                'original_max_position_embeddings'],
+            base=self.rope_theta,
+            is_neox_style=False,
+            scaling_factor=self.rope_scaling['factor'],
+            **extra_kwargs
+        )
+
+        self.mla_attn = MLAAttention(
+            layer_id=layer_id,
+            scale=self.scaling,
+            num_heads=self.num_heads,
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            num_key_value_heads=1,
+            q_lora_rank=self.q_lora_rank,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            qk_head_dim=self.qk_head_dim,
+            v_head_dim=self.v_head_dim,
+            kv_b_proj=self.kv_b_proj,
+        )
+    
+    def forward(
+        self,
+        input_data: InputData,
+        hidden_states: torch.Tensor,
+    ):
+        q_c = None
+        kv_lora = None
+
+        if self.q_lora_rank is not None:
+            qkv_lora = self.fused_qkv_a_proj(hidden_states)
+            q_c, kv_lora = qkv_lora.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                dim=-1,
+            )
+            q_c = self.q_a_layernorm(q_c)
+            q = self.q_b_proj(q_c)
+        else:
+            kv_lora = self.kv_a_proj_with_mqa(hidden_states)
+            q = self.q_proj(hidden_states)
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
+                                   dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        # Add head dim of 1 to k_pe
+        k_pe = k_pe.unsqueeze(1)
+
+        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
+            input_data.positions, q[..., self.qk_nope_head_dim:], k_pe)
+
+        output_shape=(hidden_states.shape[0],
+                    self.num_heads * self.v_head_dim)
+        output = torch.zeros(output_shape,
+                            dtype=q.dtype)
+
+        kv_cache = input_data.memory_manager.segment.kv_cache[self.layer_id]
+
+        attn_out = self.mla_attn.forward(
+            q,
+            kv_c_normed,
+            k_pe,
+            kv_cache=kv_cache,
+            input_data=input_data,
+            output=output,
+            )
+        return self.o_proj(attn_out)
+        
 
 class DeepseekV2DecoderLayer(nn.Module):
     
     def __init__(self, glb_layer_id:int, layer_id:int, config):
         super().__init__()
-        self.self_attn = DeepseekV2Attention(layer_id, config)
+        if not config.use_mla:
+            self.self_attn = DeepseekV2Attention(layer_id, config)
+        else:
+            self.self_attn = DeepseekV2MLAAttention(layer_id, config)
         
         if(config.n_routed_experts is not None
             and glb_layer_id >= config.first_k_dense_replace
@@ -327,4 +472,8 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(Qwen2MoeForCausalLM):
     def __init__(self, config):
         super().__init__(config, model_type=DeepseekV2Model)
-        self.head_dim = self.model.layers[0].self_attn.qk_head_dim
+        attn = self.model.layers[0].self_attn
+        if not config.use_mla:
+            self.head_dim = attn.qk_head_dim
+        else:
+            self.head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
