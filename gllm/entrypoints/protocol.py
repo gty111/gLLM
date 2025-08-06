@@ -11,6 +11,8 @@ from typing_extensions import Annotated, Required, TypedDict
 
 from gllm.utils import random_uuid
 
+_LONG_INFO = torch.iinfo(torch.long)
+
 class CustomChatCompletionContentPartParam(TypedDict, total=False):
     __pydantic_config__ = ConfigDict(extra="allow")  # type: ignore
 
@@ -93,11 +95,25 @@ class UsageInfo(OpenAIBaseModel):
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
 
+class StructuralTag(OpenAIBaseModel):
+    begin: str
+    # schema is the field, but that causes conflicts with pydantic so
+    # instead use structural_tag_schema with an alias
+    structural_tag_schema: Optional[dict[str, Any]] = Field(default=None,
+                                                            alias="schema")
+    end: str
+
+
+class StructuralTagResponseFormat(OpenAIBaseModel):
+    type: Literal["structural_tag"]
+    structures: list[StructuralTag]
+    triggers: list[str]
 
 class ResponseFormat(OpenAIBaseModel):
     # type must be "json_object" or "text"
     type: Literal["text", "json_object"]
 
+AnyResponseFormat = Union[ResponseFormat, StructuralTagResponseFormat]
 
 class StreamOptions(OpenAIBaseModel):
     include_usage: Optional[bool] = True
@@ -123,95 +139,130 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     function: ChatCompletionNamedFunction
     type: Literal["function"] = "function"
 
+# extra="forbid" is a workaround to have kwargs as a field,
+# see https://github.com/pydantic/pydantic/issues/3125
+class LogitsProcessorConstructor(BaseModel):
+    qualname: str
+    args: Optional[list[Any]] = None
+    kwargs: Optional[dict[str, Any]] = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+LogitsProcessors = list[Union[str, LogitsProcessorConstructor]]
 
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
-    messages: List[ChatCompletionMessageParam]
-    model: str
+    messages: list[ChatCompletionMessageParam]
+    model: Optional[str] = None
     frequency_penalty: Optional[float] = 0.0
-    logit_bias: Optional[Dict[str, float]] = None
+    logit_bias: Optional[dict[str, float]] = None
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(
+        default=None,
+        deprecated=
+        'max_tokens is deprecated in favor of the max_completion_tokens field')
+    max_completion_tokens: Optional[int] = None
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
-    response_format: Optional[ResponseFormat] = None
-    seed: Optional[int] = Field(None,
-                                ge=torch.iinfo(torch.long).min,
-                                le=torch.iinfo(torch.long).max)
-    stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
+    response_format: Optional[AnyResponseFormat] = None
+    seed: Optional[int] = Field(None, ge=_LONG_INFO.min, le=_LONG_INFO.max)
+    stop: Optional[Union[str, list[str]]] = []
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    tools: Optional[List[ChatCompletionToolsParam]] = None
-    tool_choice: Optional[Union[Literal["none"],
-                                ChatCompletionNamedToolChoiceParam]] = "none"
+    tools: Optional[list[ChatCompletionToolsParam]] = None
+    tool_choice: Optional[Union[
+        Literal["none"],
+        Literal["auto"],
+        Literal["required"],
+        ChatCompletionNamedToolChoiceParam,
+    ]] = "none"
+
+    # NOTE this will be ignored by vLLM -- the model determines the behavior
+    parallel_tool_calls: Optional[bool] = False
     user: Optional[str] = None
 
-    # doc: begin-chat-completion-sampling-params
+    # --8<-- [start:chat-completion-sampling-params]
     best_of: Optional[int] = None
-    use_beam_search: Optional[bool] = False
+    use_beam_search: bool = False
     top_k: Optional[int] = None
-    min_p: Optional[float] = 0.0
+    min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
-    length_penalty: Optional[float] = 1.0
-    early_stopping: Optional[bool] = False
-    ignore_eos: Optional[bool] = False
-    min_tokens: Optional[int] = 0
-    stop_token_ids: Optional[List[int]] = Field(default_factory=list)
-    skip_special_tokens: Optional[bool] = True
-    spaces_between_special_tokens: Optional[bool] = True
-    # doc: end-chat-completion-sampling-params
+    length_penalty: float = 1.0
+    stop_token_ids: Optional[list[int]] = []
+    include_stop_str_in_output: bool = False
+    ignore_eos: bool = False
+    min_tokens: int = 0
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
+    prompt_logprobs: Optional[int] = None
+    allowed_token_ids: Optional[list[int]] = None
+    bad_words: list[str] = Field(default_factory=list)
+    # --8<-- [end:chat-completion-sampling-params]
 
-    # doc: begin-chat-completion-extra-params
-    echo: Optional[bool] = Field(
+    # --8<-- [start:chat-completion-extra-params]
+    echo: bool = Field(
         default=False,
         description=(
             "If true, the new message will be prepended with the last message "
             "if they belong to the same role."),
     )
-    add_generation_prompt: Optional[bool] = Field(
+    add_generation_prompt: bool = Field(
         default=True,
-        description=("If true, the generation prompt will be added to the chat template. "
-                     "This is a parameter used by chat template in tokenizer config of the "
-                     "model."),
+        description=
+        ("If true, the generation prompt will be added to the chat template. "
+         "This is a parameter used by chat template in tokenizer config of the "
+         "model."),
     )
-    add_special_tokens: Optional[bool] = Field(
+    continue_final_message: bool = Field(
+        default=False,
+        description=
+        ("If this is set, the chat will be formatted so that the final "
+         "message in the chat is open-ended, without any EOS tokens. The "
+         "model will continue this message rather than starting a new one. "
+         "This allows you to \"prefill\" part of the model's response for it. "
+         "Cannot be used at the same time as `add_generation_prompt`."),
+    )
+    add_special_tokens: bool = Field(
         default=False,
         description=(
             "If true, special tokens (e.g. BOS) will be added to the prompt "
             "on top of what is added by the chat template. "
             "For most models, the chat template takes care of adding the "
-            "special tokens so this should be set to False (as is the "
+            "special tokens so this should be set to false (as is the "
             "default)."),
     )
-    documents: Optional[List[Dict[str, str]]] = Field(
+    documents: Optional[list[dict[str, str]]] = Field(
         default=None,
-        description=("A list of dicts representing documents that will be accessible to "
-                     "the model if it is performing RAG (retrieval-augmented generation)."
-                     " If the template does not support RAG, this argument will have no "
-                     "effect. We recommend that each document should be a dict containing "
-                     "\"title\" and \"text\" keys."),
+        description=
+        ("A list of dicts representing documents that will be accessible to "
+         "the model if it is performing RAG (retrieval-augmented generation)."
+         " If the template does not support RAG, this argument will have no "
+         "effect. We recommend that each document should be a dict containing "
+         "\"title\" and \"text\" keys."),
     )
     chat_template: Optional[str] = Field(
         default=None,
         description=(
             "A Jinja template to use for this conversion. "
-            "If this is not passed, the model's default chat template will be "
-            "used instead."),
+            "As of transformers v4.44, default chat template is no longer "
+            "allowed, so you must provide a chat template if the tokenizer "
+            "does not define one."),
     )
-    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+    chat_template_kwargs: Optional[dict[str, Any]] = Field(
         default=None,
-        description=("Additional kwargs to pass to the template renderer. "
-                     "Will be accessible by the chat template."),
-    )
-    include_stop_str_in_output: Optional[bool] = Field(
-        default=False,
         description=(
-            "Whether to include the stop string in the output. "
-            "This is only applied when the stop or stop_token_ids is set."),
+            "Additional keyword args to pass to the template renderer. "
+            "Will be accessible by the chat template."),
+    )
+    mm_processor_kwargs: Optional[dict[str, Any]] = Field(
+        default=None,
+        description=("Additional kwargs to pass to the HF processor."),
     )
     guided_json: Optional[Union[str, dict, BaseModel]] = Field(
         default=None,
@@ -222,7 +273,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=(
             "If specified, the output will follow the regex pattern."),
     )
-    guided_choice: Optional[List[str]] = Field(
+    guided_choice: Optional[list[str]] = Field(
         default=None,
         description=(
             "If specified, the output will be exactly one of the choices."),
@@ -232,19 +283,75 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description=(
             "If specified, the output will follow the context free grammar."),
     )
+    structural_tag: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, the output will follow the structural tag schema."),
+    )
     guided_decoding_backend: Optional[str] = Field(
         default=None,
         description=(
             "If specified, will override the default guided decoding backend "
             "of the server for this specific request. If set, must be either "
-            "'outlines' / 'lm-format-enforcer'"))
+            "'outlines' / 'lm-format-enforcer'"),
+    )
     guided_whitespace_pattern: Optional[str] = Field(
         default=None,
         description=(
             "If specified, will override the default whitespace pattern "
-            "for guided json decoding."))
+            "for guided json decoding."),
+    )
+    priority: int = Field(
+        default=0,
+        description=(
+            "The priority of the request (lower means earlier handling; "
+            "default: 0). Any priority other than 0 will raise an error "
+            "if the served model does not use priority scheduling."),
+    )
+    request_id: str = Field(
+        default_factory=lambda: f"{random_uuid()}",
+        description=(
+            "The request_id related to this request. If the caller does "
+            "not set it, a random_uuid will be generated. This id is used "
+            "through out the inference process and return in response."),
+    )
+    logits_processors: Optional[LogitsProcessors] = Field(
+        default=None,
+        description=(
+            "A list of either qualified names of logits processors, or "
+            "constructor objects, to apply when sampling. A constructor is "
+            "a JSON object with a required 'qualname' field specifying the "
+            "qualified name of the processor class/factory, and optional "
+            "'args' and 'kwargs' fields containing positional and keyword "
+            "arguments. For example: {'qualname': "
+            "'my_module.MyLogitsProcessor', 'args': [1, 2], 'kwargs': "
+            "{'param': 'value'}}."))
+    return_tokens_as_token_ids: Optional[bool] = Field(
+        default=None,
+        description=(
+            "If specified with 'logprobs', tokens are represented "
+            " as strings of the form 'token_id:{token_id}' so that tokens "
+            "that are not JSON-encodable can be identified."))
+    cache_salt: Optional[str] = Field(
+        default=None,
+        description=(
+            "If specified, the prefix cache will be salted with the provided "
+            "string to prevent an attacker to guess prompts in multi-user "
+            "environments. The salt should be random, protected from "
+            "access by 3rd parties, and long enough to be "
+            "unpredictable (e.g., 43 characters base64-encoded, corresponding "
+            "to 256 bit). Not supported by vLLM engine V0."))
+    kv_transfer_params: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="KVTransfer parameters used for disaggregated serving.")
 
-    # doc: end-chat-completion-extra-params
+    vllm_xargs: Optional[dict[str, Union[str, int, float]]] = Field(
+        default=None,
+        description=("Additional request parameters with string or "
+                     "numeric values, used by custom extensions."),
+    )
+
+    # --8<-- [end:chat-completion-extra-params]
 
     @model_validator(mode='before')
     @classmethod
