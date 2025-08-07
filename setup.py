@@ -311,10 +311,10 @@ ext_modules.append(CMakeExtension(name="gllm._C"))
 ext_modules.append(CMakeExtension(name="gllm._moe_C"))
 ext_modules.append(CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa2_C"))
 
-# if get_nvcc_cuda_version() >= Version("12.3"):
-#     # FA3 requires CUDA 12.3 or later
-#     ext_modules.append(
-#         CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
+if get_nvcc_cuda_version() >= Version("12.3"):
+    # FA3 requires CUDA 12.3 or later
+    ext_modules.append(
+        CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa3_C"))
 
 setup(
     name="gllm",
