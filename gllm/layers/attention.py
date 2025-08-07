@@ -9,6 +9,7 @@ from gllm.layers.ops.merge_attn_states import merge_attn_states
 from gllm import _custom_ops as ops
 from gllm.input_data import (InputData, MLACommonPrefillMetadata,
                              MLACommonMetadata)
+from gllm.utils import get_flash_attn_version
 
 
 class FlashAttention():
@@ -24,6 +25,7 @@ class FlashAttention():
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.fa_version = get_flash_attn_version()
 
     def forward(self,
                 q: torch.Tensor,
@@ -50,7 +52,8 @@ class FlashAttention():
                                      max_seqlen_k=input_data.max_seq_len,
                                      softmax_scale=self.scale,
                                      causal=True,
-                                     block_table=input_data.block_table)
+                                     block_table=input_data.block_table,
+                                     fa_version=self.fa_version)
         return out.view(-1, out.shape[-2]*out.shape[-1])
     
 
@@ -76,6 +79,7 @@ class MLAAttention():
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.fa_version = get_flash_attn_version()
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -117,6 +121,7 @@ class MLAAttention():
             v=maybe_padded_v,
             return_softmax_lse=return_softmax_lse,
             softmax_scale=softmax_scale,
+            fa_version=self.fa_version,
             **kwargs,
         )
 
