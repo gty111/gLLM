@@ -4,11 +4,11 @@ import logging
 import os
 import subprocess
 import sys
+import torch
+
 from pathlib import Path
 from shutil import which
 from typing import Dict, List
-
-import torch
 from packaging.version import Version, parse
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
@@ -231,17 +231,18 @@ class cmake_build_ext(build_ext):
         # First, run the standard build_ext command to compile the extensions
         super().run()
 
-        # copy vllm/vllm_flash_attn/*.py from self.build_lib to current
+        # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
         # directory so that they can be included in the editable build
         import glob
-        files = glob.glob(
-            os.path.join(self.build_lib, "gllm", "vllm_flash_attn", "*.py"))
+        files = glob.glob(os.path.join(self.build_lib, "gllm",
+                                       "vllm_flash_attn", "**", "*.py"),
+                          recursive=True)
         for file in files:
             dst_file = os.path.join("gllm/vllm_flash_attn",
-                                    os.path.basename(file))
+                                    file.split("gllm/vllm_flash_attn/")[-1])
             print(f"Copying {file} to {dst_file}")
+            os.makedirs(os.path.dirname(dst_file), exist_ok=True)
             self.copy_file(file, dst_file)
-
 
 def _is_cuda() -> bool:
     has_cuda = torch.version.cuda is not None
