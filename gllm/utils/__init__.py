@@ -213,3 +213,12 @@ def get_flash_attn_version(requires_alibi: bool = False) -> Optional[int]:
 
     assert is_fa_version_supported(fa_version)
     return fa_version
+
+def cast_overflow_tensors(
+    tensors: torch.Tensor,
+    offset: float = 1000,
+) -> torch.Tensor:
+    if tensors.isinf().any() or tensors.isnan().any():
+        clamp_value = torch.finfo(tensors.dtype).max - offset
+        tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
+    return tensors
