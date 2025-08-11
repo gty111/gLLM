@@ -108,17 +108,10 @@ class Worker:
             hidden_states = None
             residual = None
             if self.ret_residual:
-                input_data, (hidden_states_future, residual_future,
-                             hidden_states, residual) = self.run_queue[0]
-                if not (hidden_states_future.is_completed() and residual_future.is_completed()):
-                    return
+                input_data, (hidden_states, residual) = self.run_queue.popleft()
             else:
-                input_data, (hidden_states_future,
-                             hidden_states) = self.run_queue[0]
-                if not hidden_states_future.is_completed():
-                    return
-
-            self.run_queue.popleft()
+                input_data, hidden_states = self.run_queue.popleft()
+            
             output = self.model_runner.step_once(
                 input_data, hidden_states, residual)
             if is_output_rank():
