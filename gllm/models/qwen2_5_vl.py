@@ -2,10 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import TypedDict, Literal, Union, Callable, Optional
+from collections.abc import Mapping
+from typing import TypedDict, Literal, Union, Callable, Optional, NamedTuple
 from flash_attn import flash_attn_varlen_func
 from einops import rearrange
 from functools import partial, lru_cache
+from transformers.models.qwen2_vl import (Qwen2VLImageProcessor,
+                                          Qwen2VLProcessor)
+from transformers.models.qwen2_vl.configuration_qwen2_vl import (
+    Qwen2VLConfig, Qwen2VLVisionConfig)
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+from transformers.models.qwen2_vl.video_processing_qwen2_vl import Qwen2VLVideoProcessor
 
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
@@ -16,6 +23,13 @@ from gllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
 from gllm.dist_utils import divide, split_tensor_along_last_dim
 from gllm.utils import cast_overflow_tensors
 
+
+# For profile run
+_MAX_FRAMES_PER_VIDEO = 16
+
+class ImageSize(NamedTuple):
+    width: int
+    height: int
 
 # === Vision Inputs === #
 
@@ -595,3 +609,174 @@ class Qwen2_5_VisionTransformer(nn.Module):
         reverse_indices = torch.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
+
+class Qwen2_5_VLProcessingInfo():
+
+    def get_hf_config(self):
+        return self.ctx.get_hf_config(Qwen2VLConfig)
+
+    def get_hf_processor(self, **kwargs: object) -> Qwen2VLProcessor:
+        return self.ctx.get_hf_processor(
+            Qwen2VLProcessor,
+            use_fast=kwargs.pop("use_fast", True),
+            **kwargs,
+        )
+
+    def get_image_processor(self, **kwargs: object) -> Qwen2VLImageProcessor:
+        return self.get_hf_processor(**kwargs).image_processor
+
+    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+        return {"image": None, "video": None}
+
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        max_image_tokens = self.get_max_image_tokens()
+        max_video_tokens = self.get_max_video_tokens(seq_len, mm_counts)
+        return {"image": max_image_tokens, "video": max_video_tokens}
+
+    def _get_vision_info(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        num_frames: int = 1,
+        do_resize: bool = True,
+        image_processor: Optional[Qwen2VLImageProcessor],
+    ) -> tuple[ImageSize, int]:
+        if image_processor is None:
+            image_processor = self.get_image_processor()
+
+        hf_config = self.get_hf_config()
+        vision_config = hf_config.vision_config
+        patch_size = vision_config.patch_size
+        merge_size = vision_config.spatial_merge_size
+        temporal_patch_size = vision_config.temporal_patch_size
+
+        if do_resize:
+            resized_height, resized_width = smart_resize(
+                height=image_height,
+                width=image_width,
+                factor=patch_size * merge_size,
+                min_pixels=image_processor.min_pixels,
+                max_pixels=image_processor.max_pixels,
+            )
+            preprocessed_size = ImageSize(width=resized_width,
+                                          height=resized_height)
+        else:
+            preprocessed_size = ImageSize(width=image_width,
+                                          height=image_height)
+
+        # NOTE: Frames are padded to be divisible by `temporal_patch_size`
+        # https://github.com/huggingface/transformers/blob/v4.48.3/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py#L294
+        padded_num_frames = num_frames + num_frames % temporal_patch_size
+
+        grid_t = max(padded_num_frames // temporal_patch_size, 1)
+        grid_h = preprocessed_size.height // patch_size
+        grid_w = preprocessed_size.width // patch_size
+
+        num_patches = grid_t * grid_h * grid_w
+        num_vision_tokens = num_patches // (merge_size**2)
+
+        return preprocessed_size, num_vision_tokens
+
+    def get_num_image_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        image_processor: Optional[Qwen2VLImageProcessor],
+    ) -> int:
+        _, num_image_tokens = self._get_vision_info(
+            image_width=image_width,
+            image_height=image_height,
+            image_processor=image_processor,
+        )
+        return num_image_tokens
+
+    def get_num_video_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        num_frames: int,
+        image_processor: Optional[Qwen2VLImageProcessor],
+    ) -> int:
+        _, num_video_tokens = self._get_vision_info(
+            image_width=image_width,
+            image_height=image_height,
+            num_frames=num_frames,
+            image_processor=image_processor,
+        )
+        return num_video_tokens
+
+    def get_image_size_with_most_features(self) -> ImageSize:
+        max_image_size, _ = self._get_vision_info(
+            image_width=9999999,
+            image_height=9999999,
+            image_processor=None,
+        )
+        return max_image_size
+
+    def get_max_image_tokens(self) -> int:
+        target_width, target_height = self.get_image_size_with_most_features()
+
+        return self.get_num_image_tokens(
+            image_width=target_width,
+            image_height=target_height,
+            image_processor=None,
+        )
+
+    def _get_max_video_frames(self, max_tokens: int) -> int:
+        target_width, target_height = self.get_image_size_with_most_features()
+
+        num_frames = 0
+
+        while True:
+            next_num_frames = num_frames + 1
+            next_max_tokens = self.get_num_video_tokens(
+                image_width=target_width,
+                image_height=target_height,
+                num_frames=next_num_frames,
+                image_processor=None,
+            )
+
+            if next_max_tokens > max_tokens:
+                break
+
+            num_frames = next_num_frames
+
+        return num_frames
+
+    def get_num_frames_with_most_features(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> int:
+        max_images = mm_counts.get("image", 0)
+        max_videos = mm_counts.get("video", 0)
+
+        max_image_tokens = self.get_max_image_tokens() * max_images
+        max_total_frames = self._get_max_video_frames(seq_len -
+                                                      max_image_tokens)
+        max_frames_per_video = min(max_total_frames // max(max_videos, 1),
+                                   _MAX_FRAMES_PER_VIDEO)
+
+        return max(max_frames_per_video, 1)
+
+    def get_max_video_tokens(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> int:
+        target_width, target_height = self.get_image_size_with_most_features()
+
+        return self.get_num_video_tokens(
+            image_width=target_width,
+            image_height=target_height,
+            num_frames=self.get_num_frames_with_most_features(
+                seq_len, mm_counts),
+            image_processor=None,
+        )
