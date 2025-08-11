@@ -13,10 +13,11 @@ class Sampler():
         # top_p top_k
         logits = self._apply_top_k_top_p(logits, input_data.top_p, input_data.top_k)
         probs = torch.softmax(logits, dim=1)
-        # q = torch.empty_like(probs)
-        # q.exponential_()
-        # return probs.div_(q).argmax(dim=1).cpu().numpy().tolist()
-        return torch.multinomial(probs, 1).squeeze(1).cpu().numpy().tolist()
+        
+        q = torch.empty_like(probs)
+        q.exponential_()
+        return probs.div_(q).argmax(dim=1).cpu().numpy().tolist()
+        # return torch.multinomial(probs, 1).squeeze(1).cpu().numpy().tolist()
 
     def _apply_top_k_top_p(
         self,

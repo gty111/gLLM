@@ -16,12 +16,12 @@ def recv_pp_data(src, shape, has_residual):
     hidden_states = torch.zeros(torch.Size(shape))
     if has_residual:
         residual = hidden_states.clone().detach()
-        hidden_states_future = dist.irecv(hidden_states, src)
-        residual_future = dist.irecv(residual, src)
-        return hidden_states_future, residual_future, hidden_states, residual
+        dist.recv(hidden_states, src)
+        dist.recv(residual, src)
+        return hidden_states, residual
     else:
-        hidden_states_future = dist.irecv(hidden_states, src)
-        return hidden_states_future, hidden_states
+        dist.recv(hidden_states, src)
+        return hidden_states
     
 def send_obj_list(obj_list, dst):
     dist.send_object_list(obj_list, dst=dst)
