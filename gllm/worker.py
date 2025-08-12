@@ -20,7 +20,7 @@ class Worker:
 
     def __init__(self, model_runner: ModelRunner, local_rank, pp_rank, tp_rank, 
                  pp_size, tp_size, use_ep, master_addr, master_port, comm: zmqComm, mp_alive,
-                 mp_load_progress, assigned_layers, use_naive_schedule):
+                 mp_load_progress, assigned_layers, use_cp_schedule):
         self.model_runner = model_runner
         self.local_rank = local_rank
         self.pp_rank = pp_rank
@@ -34,7 +34,7 @@ class Worker:
         self.mp_alive = mp_alive
         self.mp_load_progress = mp_load_progress
         self.assigned_layers = assigned_layers
-        self.use_naive_schedule = use_naive_schedule
+        self.use_cp_schedule = use_cp_schedule
         self.use_mla = model_runner.model_loader.use_mla
 
     def init_logger(self):
@@ -65,7 +65,7 @@ class Worker:
             self.worker_scheduler = WorkerScheduler(
                 self.pp_size,
                 self.model_runner.memory_manager, 
-                self.use_naive_schedule,
+                self.use_cp_schedule,
                 self.model_runner.maxd,
                 self.model_runner.maxp,
                 self.model_runner.minp,
