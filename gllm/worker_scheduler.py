@@ -13,11 +13,11 @@ from gllm.dist_utils import get_world_size
 
 
 class WorkerScheduler():
-    def __init__(self, pp_size, memory_manager:MemoryManager, use_naive_schedule, 
+    def __init__(self, pp_size, memory_manager:MemoryManager, use_cp_schedule, 
                  maxd, maxp, minp, iterp, page_size, kvthresh):
         self.pp_size = pp_size
         self.memory_manager = memory_manager
-        self.use_naive_schedule = use_naive_schedule
+        self.use_cp_schedule = use_cp_schedule
         self.maxd = maxd
         self.maxp = maxp
         self.minp = minp
@@ -132,14 +132,14 @@ class WorkerScheduler():
     
     def schedule_once(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
-            schedule_seqs = self.schedule() if not self.use_naive_schedule else self.schedule_naive()
+            schedule_seqs = self.schedule() if not self.use_cp_schedule else self.schedule_chunked_prefill()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
             return schedule_seqs
         else: 
             return []
 
-    def schedule_naive(self):
+    def schedule_chunked_prefill(self):
         schedule_prefill_seqs = []
         schedule_decode_seqs = []
 
