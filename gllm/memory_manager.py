@@ -128,7 +128,8 @@ class PrefixMemoryManager(MemoryManager):
         logger.info('Enable prefix caching')
 
         del self.segment
-        self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, self.kv_head_num, self.kv_head_dim)
+        self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, 
+                                     self.kv_head_num, self.kv_head_dim, self.use_mla)
         
         # for prefill stage
         self.num_allocated_pages = 0
