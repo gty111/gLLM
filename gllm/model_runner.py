@@ -85,7 +85,7 @@ class ModelRunner():
         for message in messages:
             contents = message['content']
             for content in contents:
-                if 'image' in content['type']:
+                if content['type'] == 'image':
                     mm_contents.append(content['image']) 
         return mm_contents if len(mm_contents) != 0 else None
     
@@ -104,7 +104,7 @@ class ModelRunner():
                     seq.computed_token_num,
                     seq.seq_len
                 )
-                position = torch.Tensor(position)
+                position = torch.tensor(position)
                 embedding = self.model.get_input_embeddings(
                     torch.tensor(seq.token_ids[seq.computed_token_num:seq.seq_len]))
             else:
