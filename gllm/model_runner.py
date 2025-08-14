@@ -80,13 +80,21 @@ class ModelRunner():
     def decode(self, content):
         return self.tokenizer.decode(content, True, True)
     
-    def extract_mm(self, messages:Dict):
+    def extract_modify_mm(self, messages:Dict):
         mm_contents = []
         for message in messages:
             contents = message['content']
             for content in contents:
                 if content['type'] == 'image':
                     mm_contents.append(content['image']) 
+                elif content['type'] == 'image_url':
+                    content['type'] = 'image'
+                    data = content['image_url']
+                    del content['image_url']
+                    if type(data) == dict:
+                        data = data['url']
+                    content['image'] = data
+                    mm_contents.append(data)
         return mm_contents if len(mm_contents) != 0 else None
     
     @torch.inference_mode()
