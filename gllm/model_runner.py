@@ -148,7 +148,7 @@ class ModelRunner():
             batch_embeddings.append(embedding)
             batch_positions.append(position)
         input_embeddings = torch.concat(batch_embeddings)
-        positions = torch.concat(batch_positions, dim=1).to(torch.long)
+        positions = torch.concat(batch_positions, dim=1)
         return input_embeddings, positions
         
     @torch.inference_mode()

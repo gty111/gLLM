@@ -1,6 +1,5 @@
 import torch
 
-from logger import logger
 from typing import Optional
 from torch import nn
 
@@ -11,7 +10,7 @@ from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
-from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
+from gllm.dist_utils import (get_pp_layers, get_local_rank, is_last_pp_rank, 
                              resolve_pp_layer_idx, is_first_pp_rank)
 from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
