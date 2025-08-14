@@ -44,7 +44,7 @@ class ModelRunner():
         
         if self.use_mm:
             self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
-            self.image_processor = AutoImageProcessor.from_pretrained(model_path)
+            self.image_processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)
 
         # lazy init
         self.model = None
@@ -140,7 +140,7 @@ class ModelRunner():
             batch_embeddings.append(embedding)
             batch_positions.append(position)
         input_embeddings = torch.concat(batch_embeddings)
-        positions = torch.concat(batch_positions).to(torch.long)
+        positions = torch.concat(batch_positions, dim=1).to(torch.long)
         return input_embeddings, positions
         
     @torch.inference_mode()
