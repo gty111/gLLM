@@ -4,7 +4,8 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 class Sequence():
     def __init__(self, seq_id, token_ids, finish_tokens, output_len=None, ignore_eos=False,
-                 temperature=0.6, top_p=0.9, top_k=10, repetition_penalty=1.0):
+                 temperature=0.6, top_p=0.9, top_k=10, repetition_penalty=1.0,
+                 mm_contents=None):
         self.seq_id = seq_id
         self.token_ids: List[int] = token_ids
         self.prompt_len = len(token_ids)
@@ -30,6 +31,8 @@ class Sequence():
         self.to_compute_token_num = 0
         # used for abort
         self.is_abort = False
+        # used for multimodal input
+        self.mm_contents = mm_contents
         
     def __len__(self):
         return len(self.token_ids)

@@ -7,7 +7,7 @@ from torch import nn
 from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, QKVParallelLinear
 from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 from gllm.layers.activation import SiluAndMul
-from gllm.layers.rotary_embedding import RotaryEmbedding
+from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
@@ -70,9 +70,17 @@ class Qwen2Attention(Attention):
             bias=False,
             quant_config=quant_config,
         )
-
-        self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim, self.max_position_embeddings, self.rope_theta, True)
+        rope_scaling = getattr(config, 'rope_scaling', None)
+        if rope_scaling is None:
+            self.rotary_emb = RotaryEmbedding(
+                self.head_dim, self.head_dim, self.max_position_embeddings, 
+                self.rope_theta, True)
+        else:
+            assert 'mrope_section' in rope_scaling
+            self.rotary_emb = MRotaryEmbedding(
+                self.head_dim, self.head_dim, self.max_position_embeddings,
+                self.rope_theta, True, rope_scaling['mrope_section']
+            )
         self.attn = FlashAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim)
 
@@ -133,7 +141,7 @@ class Qwen2Model(nn.Module):
                 config.hidden_size, config.rms_norm_eps)
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
-        if is_first_pp_rank():
+        if is_first_pp_rank() and hidden_states is None:
             hidden_states = self.embed_tokens(input_data.tokens)
         for i in range(len(self.layers)):
             layer = self.layers[i]

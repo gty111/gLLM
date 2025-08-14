@@ -227,14 +227,16 @@ class LLM():
             return True
 
     def allocate_seq(self, token_ids: List[int], output_len=None, ignore_eos=False,
-                     temperature=None, top_p=None, top_k=None, repetition_penalty=None):
+                     temperature=None, top_p=None, top_k=None, repetition_penalty=None,
+                     mm_contents=None):
         temperature = self.generation_config.temperature if temperature is None else temperature
         top_p = self.generation_config.top_p if top_p is None else top_p
         top_k = self.generation_config.top_k if top_k is None else top_k
         repetition_penalty = self.generation_config.repetition_penalty if repetition_penalty is None else repetition_penalty
         return Sequence(self.id_allocator.allocate(), token_ids,
                         self.finish_tokens, output_len, ignore_eos,
-                        temperature, top_p, top_k, repetition_penalty)
+                        temperature, top_p, top_k, repetition_penalty,
+                        mm_contents)
 
     def free_finish_ids(self, finish_ids:List[int]):
         for id in finish_ids:

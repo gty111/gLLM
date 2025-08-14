@@ -14,6 +14,7 @@ from gllm.models.qwen3 import Qwen3ForCausalLM
 from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.models.mixtral import MixtralForCausalLM
 from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
+from gllm.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from gllm.utils import get_lock
 
 
@@ -22,9 +23,6 @@ class ModelLoader():
         self.model_path = model_path
         self.load_config()
         self.load_format = load_format
-
-    def get_finish_tokens(self):
-        return self.get_model_type().get_finish_tokens(self.config)
     
     def load_safetensors(self, path):
         weights_path = glob.glob(f"{path}/*.safetensors")
@@ -83,6 +81,10 @@ class ModelLoader():
     @property
     def use_mla(self):
         return self.architecture in ['DeepseekV2ForCausalLM', 'DeepseekV3ForCausalLM']
+    
+    @property
+    def use_mm(self):
+        return self.architecture in ['Qwen2_5_VLForConditionalGeneration']
 
     def get_model_type(self):
         model_type = None
@@ -103,6 +105,8 @@ class ModelLoader():
         elif (self.architecture == 'DeepseekV2ForCausalLM' or 
               self.architecture == 'DeepseekV3ForCausalLM'):
             model_type = DeepseekV2ForCausalLM
+        elif self.architecture == 'Qwen2_5_VLForConditionalGeneration':
+            model_type = Qwen2_5_VLForConditionalGeneration
         else:
             raise Exception(f'Unsupported model: {self.architecture}')
         return model_type

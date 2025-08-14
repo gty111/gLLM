@@ -17,3 +17,4 @@ zmq
 aiohttp
 datasets
 pillow
+flash_attn

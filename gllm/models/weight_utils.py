@@ -24,6 +24,15 @@ def copy_gate_up_proj_weight(dst, src_gate, src_up, partition_tp=True):
     else:
         dst[:size_partition, :] = src_gate
         dst[size_partition:, :] = src_up
+
+def copy_gate_up_proj_bias(dst, src_gate, src_up, partition_tp=True):
+    size_partition = dst.shape[0] // 2
+    if partition_tp:
+        dst[:size_partition] = src_gate[get_tp_rank()*size_partition:(get_tp_rank()+1)*size_partition]
+        dst[size_partition:] = src_up[get_tp_rank()*size_partition:(get_tp_rank()+1)*size_partition]
+    else:
+        dst[:size_partition] = src_gate
+        dst[size_partition:] = src_up
     
 def copy_single_proj_col(dst, src, partition_tp=True):
     # partition on column
@@ -37,3 +46,7 @@ def copy_single_proj_row(dst, src):
     # partition on row
     size_partition = dst.shape[0]
     dst.copy_(src[get_tp_rank()*size_partition:(get_tp_rank()+1)*size_partition, :])
+    
+def copy_single_proj(dst, src):
+    size_partition = dst.shape[0]
+    dst.copy_(src[get_tp_rank()*size_partition:(get_tp_rank()+1)*size_partition])
