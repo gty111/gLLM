@@ -98,8 +98,8 @@ def run_single_image(model: str, client) -> None:
 
 # Multi-image input inference
 def run_multi_image(model: str, client) -> None:
-    image1 = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
-    image2 = "https://2026.eurosys.org/img/EuroSys-2026-logo.png"
+    image1 = "https://www.sigops.org/wp-content/uploads/2025/05/ChatGPT-Image-May-4-2025-09_43_00-PM-980x653-1.png"
+    image2 = "https://www.sigops.org/wp-content/uploads/2025/02/Picture1-1204x904.jpg"
     chat_completion_from_url = client.chat.completions.create(
         messages=[
             {
