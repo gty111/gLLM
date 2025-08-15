@@ -240,9 +240,7 @@ class ChatGLMForCausalLM(nn.Module):
                 copy_gate_up_proj(v.data, weight[:intermediate_size], weight[intermediate_size:])
             elif 'dense_4h_to_h.weight' in k:
                 copy_single_proj_dim1(v.data, weight)
-            elif 'query_key_value.weight' in k:
-                copy_qkv_proj(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
-            elif 'query_key_value.bias' in k:
+            elif 'query_key_value' in k:
                 copy_qkv_proj(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'dense.weight' in k:
                 copy_single_proj_dim1(v.data, weight)
