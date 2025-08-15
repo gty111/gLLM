@@ -15,9 +15,8 @@ from gllm.dist_utils import (get_pp_layers, get_local_rank, is_last_pp_rank,
 from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
 
-from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj_col,
-                           copy_single_proj_row)
+from .weight_utils import (copy_qkv_proj, copy_gate_up_proj, 
+                           copy_single_proj_dim1, copy_single_proj_dim0)
 
 class Qwen2MLP(nn.Module):
 
@@ -195,29 +194,23 @@ class Qwen2ForCausalLM(nn.Module):
         
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
-            if k.find('self_attn.qkv_proj.weight') != -1:
-                head_dim_patch = head_dim if k.find('scale') == -1 else 1
-                copy_qkv_proj_weight(v.data, 
+            if k.find('self_attn.qkv_proj') != -1:
+                head_dim_patch = head_dim if k.find('scale') == -1 or k.find('weight') == -1 else 1
+                copy_qkv_proj(v.data, 
                                      weights[k.replace('qkv_proj', 'q_proj')], 
                                      weights[k.replace('qkv_proj', 'k_proj')], 
                                      weights[k.replace('qkv_proj', 'v_proj')],
                                      num_heads, num_kv_heads, head_dim_patch)
-            elif k.find('self_attn.qkv_proj.bias') != -1:
-                copy_qkv_proj_bias(v.data, 
-                                   weights[k.replace('qkv_proj', 'q_proj')], 
-                                   weights[k.replace('qkv_proj', 'k_proj')], 
-                                   weights[k.replace('qkv_proj', 'v_proj')],
-                                   num_heads, num_kv_heads, head_dim)
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj_col(v.data, weights[k])
+                copy_single_proj_dim1(v.data, weights[k])
             elif k.find('gate_up_proj') != -1:
-                copy_gate_up_proj_weight(v.data,
+                copy_gate_up_proj(v.data,
                                          weights[k.replace('gate_up_proj', 'gate_proj')],
                                          weights[k.replace('gate_up_proj', 'up_proj')])
             elif k.find('down_proj') != -1:
-                copy_single_proj_col(v.data, weights[k])
+                copy_single_proj_dim1(v.data, weights[k])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
-                copy_single_proj_row(v.data, weights[k])
+                copy_single_proj_dim0(v.data, weights[k])
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:

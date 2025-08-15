@@ -10,14 +10,13 @@ from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.attention import FlashAttention
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
-from gllm.dist_utils import (get_pp_layers, get_pp_rank, get_local_rank, is_last_pp_rank, 
+from gllm.dist_utils import (get_pp_layers, get_local_rank, is_last_pp_rank, 
                              resolve_pp_layer_idx, get_tp_size, is_first_pp_rank)
 from gllm.utils import get_model_load_pbar
 from gllm.modules.attention import Attention
 
-from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj_col,
-                           copy_single_proj_row)
+from .weight_utils import (copy_qkv_proj, copy_gate_up_proj, 
+                           copy_single_proj_dim1, copy_single_proj_dim0)
 
 
 class GLMAttention(Attention):
@@ -238,17 +237,17 @@ class ChatGLMForCausalLM(nn.Module):
             
             weight = weights[k]
             if 'dense_h_to_4h.weight' in k:
-                copy_gate_up_proj_weight(v.data, weight[:intermediate_size], weight[intermediate_size:])
+                copy_gate_up_proj(v.data, weight[:intermediate_size], weight[intermediate_size:])
             elif 'dense_4h_to_h.weight' in k:
-                copy_single_proj_col(v.data, weight)
+                copy_single_proj_dim1(v.data, weight)
             elif 'query_key_value.weight' in k:
-                copy_qkv_proj_weight(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
+                copy_qkv_proj(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'query_key_value.bias' in k:
-                copy_qkv_proj_bias(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
+                copy_qkv_proj(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
             elif 'dense.weight' in k:
-                copy_single_proj_col(v.data, weight)
+                copy_single_proj_dim1(v.data, weight)
             elif 'embedding' in k or 'output_layer' in k:
-                copy_single_proj_row(v.data, weight)
+                copy_single_proj_dim0(v.data, weight)
             else:
                 v.data.copy_(weight)
             if mp_load_progress is not None:

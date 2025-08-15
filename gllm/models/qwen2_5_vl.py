@@ -21,10 +21,8 @@ from gllm.input_data import InputData
 
 from .utils import merge_multimodal_embeddings
 from .qwen2 import Qwen2ForCausalLM
-from .weight_utils import (copy_gate_up_proj_weight, copy_gate_up_proj_bias,
-                           copy_qkv_proj_weight, copy_qkv_proj_bias,
-                           copy_single_proj_col, copy_single_proj_row,
-                           copy_single_proj)
+from .weight_utils import (copy_gate_up_proj, copy_qkv_proj,
+                           copy_single_proj_dim1, copy_single_proj_dim0)
 
 
 class ImageSize(NamedTuple):
@@ -859,35 +857,22 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             if k.find('gate_up_proj') != -1:
                 src_gate = weights[f'visual.{k.replace('gate_up_proj', 'gate_proj')}']
                 src_up = weights[f'visual.{k.replace('gate_up_proj', 'up_proj')}']
-                if k.find('weight') != -1:
-                    copy_gate_up_proj_weight(v.data, src_gate, src_up)
-                else: # bias
-                    copy_gate_up_proj_bias(v.data, src_gate, src_up)
-            elif k.find('attn.qkv.weight') != -1:
+                copy_gate_up_proj(v.data, src_gate, src_up)
+            elif k.find('attn.qkv') != -1:
                 src_qkv = weights[f'visual.{k}']
                 size_partition = src_qkv.shape[0] // 3
                 src_q, src_k, src_v = src_qkv.split([size_partition, size_partition, size_partition],dim=0)
-                copy_qkv_proj_weight(v.data, src_q, src_k, src_v,
-                                     num_heads, num_heads, head_dim)
-            elif k.find('attn.qkv.bias') != -1:
-                src_qkv = weights[f'visual.{k}']
-                size_partition = src_qkv.shape[0] // 3
-                src_q, src_k, src_v = src_qkv.split([size_partition, size_partition, size_partition],dim=0)
-                copy_qkv_proj_bias(v.data, src_q, src_k, src_v,
+                copy_qkv_proj(v.data, src_q, src_k, src_v,
                                      num_heads, num_heads, head_dim)
             elif k.find('attn.proj.weight') != -1 or k.find('down_proj.weight') != -1:
-                copy_single_proj_col(v.data, weights[f'visual.{k}'])
+                copy_single_proj_dim1(v.data, weights[f'visual.{k}'])
             elif k.find('merger.mlp') != -1:
-                src = weights[f'visual.{k}']
-                if v.ndim == 1:
-                    if v.shape[0] == src.shape[0]:
-                        v = src
-                    else:
-                        copy_single_proj(v.data, weights[f'visual.{k}'])
+                src_data = weights[f'visual.{k}']
+                if k.find('0') != -1:
+                    copy_single_proj_dim0(v.data, src_data)
+                elif k.find('2.weight') != -1:
+                    copy_single_proj_dim1(v.data, src_data)
                 else:
-                    if v.shape[0] == src.shape[0]:
-                        copy_single_proj_col(v.data, src)
-                    else:
-                        copy_single_proj_row(v.data, src) 
+                    v.data.copy_(src_data)
             else:
                 v.data.copy_(weights[f'visual.{k}'])
