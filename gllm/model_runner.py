@@ -84,6 +84,8 @@ class ModelRunner():
         mm_contents = []
         for message in messages:
             contents = message['content']
+            if type(contents) != list:
+                continue
             for content in contents:
                 if content['type'] == 'image':
                     mm_contents.append(content['image']) 
