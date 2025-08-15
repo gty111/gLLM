@@ -18,6 +18,7 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **token throttling**, **pipeline parallelism**, **expert parallelsim** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (**supported in huggingface**) inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** (~6k loc) code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
+- [2025/08/15]: Qwen2.5 VL is supported :hugs:
 - [2025/08/01]: DeepSeek V2/3 is supported :clap:
 - [2025/07/12]: FP8 quantization for Qwen3/2.5 is supported :tada:
 - [2025/06/27]: gLLM is accepted by SC'25. Congratulations :smiling_face_with_three_hearts:
@@ -26,11 +27,17 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 - [2025/05/05]: MoE architecture is supported. Try Qwen2/3 MoE models :star_struck:
 - [2025/04/29]: Qwen3 day 1 support. Come and try Qwen3 :tada:
 - [2025/04/27]: gLLM is open sourced :earth_asia:
+
+<details>
+<summary>Previous News</summary>
+
 - [2025/04/27]: We support multi-node deployments. You can serve your model across different machines :blush:
 - [2025/04/21]: We release our paper on [arXiv:2504.14775](https://arxiv.org/abs/2504.14775) :partying_face:
 - [2025/03/15]: Chunked prefill has been integrated. You can input any length of text you want :hugs:
 - [2025/03/01]: Pipeline parallelism has been integrated. You can run any size of model you want :laughing: 
 - [2025/02/27]: We apply numerous optimizations which lowers CPU overhead a lot :clap: 
+
+</details>
 
 ## Token Throttling
 
@@ -147,7 +154,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 ## Supported Models
 
 - DeepSeek Series: DeepSeek V2/3 (MLA)
-- Qwen Series: Qwen3, Qwen2.5, Qwen2
+- Qwen Series: Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
 - Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
 - ChatGLM Series: Glm4 and Chatglm3 
