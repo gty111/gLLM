@@ -62,9 +62,9 @@ class ModelRunner():
             kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size,
             use_mla=self.model_loader.use_mla)
 
-    def encode(self, messages, chat: bool = False):
+    def encode(self, messages, chat: bool = False, has_mm: bool = False):
         if chat:
-            if not self.use_mm:
+            if not self.use_mm or not has_mm:
                 return self.tokenizer.apply_chat_template(
                     messages, 
                     add_generation_prompt=True, 
