@@ -64,14 +64,8 @@ class Worker:
         if self.rank == 0:
             self.worker_scheduler = WorkerScheduler(
                 self.pp_size,
-                self.model_runner.memory_manager, 
+                self.model_runner, 
                 self.use_cp_schedule,
-                self.model_runner.maxd,
-                self.model_runner.maxp,
-                self.model_runner.minp,
-                self.model_runner.iterp,
-                self.model_runner.page_size,
-                self.model_runner.kvthresh
             )
         elif self.pp_rank == 0:
             # Input data for each rank except 0

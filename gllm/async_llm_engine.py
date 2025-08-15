@@ -60,9 +60,11 @@ class PipeAsyncLLM(LLM):
         self.schedule_engine = None
 
     async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
-                                 temperature: float, top_p: float, top_k: float, repetition_penalty: float):
+                                 temperature: float, top_p: float, top_k: float, repetition_penalty: float,
+                                 mm_contents=None):
         seq = self.allocate_seq(token_ids, output_len, ignore_eos,
-                                temperature, top_p, top_k, repetition_penalty)
+                                temperature, top_p, top_k, repetition_penalty,
+                                mm_contents)
         stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream

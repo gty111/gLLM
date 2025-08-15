@@ -6,7 +6,7 @@ from torch import nn
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe import FusedMoE, determine_expert_map
 from gllm.input_data import InputData
-from gllm.dist_utils import (get_local_rank, resolve_pp_layer_idx, get_tp_size,
+from gllm.dist_utils import (get_local_rank, resolve_pp_layer_idx,
                              get_ep_size, get_ep_rank, resolve_ep_expert_idx,
                              is_use_ep)
 from gllm.utils import get_model_load_pbar
@@ -15,9 +15,8 @@ from .qwen2 import Qwen2Attention
 from .qwen2 import Qwen2Model
 from .qwen2 import Qwen2ForCausalLM
 
-from .weight_utils import (copy_qkv_proj_weight, copy_qkv_proj_bias, 
-                           copy_gate_up_proj_weight, copy_single_proj_col,
-                           copy_single_proj_row)
+from .weight_utils import (copy_qkv_proj, copy_gate_up_proj, 
+                           copy_single_proj_dim1, copy_single_proj_dim0)
 
 class MixtralMoE(nn.Module):
     def __init__(self, config):
@@ -109,13 +108,13 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj.weight') != -1:
-                copy_qkv_proj_weight(v.data, 
+                copy_qkv_proj(v.data, 
                                      weights[k.replace('qkv_proj', 'q_proj')], 
                                      weights[k.replace('qkv_proj', 'k_proj')], 
                                      weights[k.replace('qkv_proj', 'v_proj')],
                                      num_heads, num_kv_heads, head_dim)
             elif k.find('self_attn.qkv_proj.bias') != -1:
-                copy_qkv_proj_bias(v.data, 
+                copy_qkv_proj(v.data, 
                                    weights[k.replace('qkv_proj', 'q_proj')], 
                                    weights[k.replace('qkv_proj', 'k_proj')], 
                                    weights[k.replace('qkv_proj', 'v_proj')],
@@ -125,7 +124,7 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
                     local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
                     if local_expert_idx == -1:
                         continue
-                    copy_gate_up_proj_weight(v.data[local_expert_idx],
+                    copy_gate_up_proj(v.data[local_expert_idx],
                                              weights[k.replace('w13_weight', f'{expert_idx}.w1.weight')],
                                              weights[k.replace('w13_weight', f'{expert_idx}.w3.weight')],
                                              not is_use_ep())
@@ -134,13 +133,13 @@ class MixtralForCausalLM(Qwen2ForCausalLM):
                     local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
                     if local_expert_idx == -1:
                         continue
-                    copy_single_proj_col(v.data[local_expert_idx],
+                    copy_single_proj_dim1(v.data[local_expert_idx],
                                          weights[k.replace('w2_weight', f'{expert_idx}.w2.weight')],
                                          not is_use_ep())
             elif k.find('self_attn.o_proj') != -1:
-                copy_single_proj_col(v.data, weights[k])
+                copy_single_proj_dim1(v.data, weights[k])
             elif k.find('embed_tokens') != -1 or k.find('lm_head') != -1:
-                copy_single_proj_row(v.data, weights[k])
+                copy_single_proj_dim0(v.data, weights[k])
             else:
                 v.data.copy_(weights[k])
             if mp_load_progress is not None:

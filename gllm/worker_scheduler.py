@@ -8,22 +8,23 @@ from logger import logger
 
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
+from gllm.model_runner import ModelRunner
 from gllm.comm import IPCPackage
 from gllm.dist_utils import get_world_size
 
 
 class WorkerScheduler():
-    def __init__(self, pp_size, memory_manager:MemoryManager, use_cp_schedule, 
-                 maxd, maxp, minp, iterp, page_size, kvthresh):
+    def __init__(self, pp_size, model_runner:ModelRunner, use_cp_schedule):
         self.pp_size = pp_size
-        self.memory_manager = memory_manager
+        self.model_runner: ModelRunner = model_runner
+        self.memory_manager: MemoryManager = model_runner.memory_manager
         self.use_cp_schedule = use_cp_schedule
-        self.maxd = maxd
-        self.maxp = maxp
-        self.minp = minp
-        self.iterp = iterp 
-        self.page_size = page_size
-        self.kvthresh = kvthresh
+        self.maxd = model_runner.maxd
+        self.maxp = model_runner.maxp
+        self.minp = model_runner.minp
+        self.iterp = model_runner.iterp 
+        self.page_size = model_runner.page_size
+        self.kvthresh = model_runner.kvthresh
         self.num_kvthresh_pages = int(self.kvthresh * self.memory_manager.get_num_free_pages())
 
         # seqs to schedule
@@ -84,7 +85,7 @@ class WorkerScheduler():
                     seq.append(next_tokens[idx])
                 if seq.is_finish:
                     ipc_package.free_ids.append(seq.seq_id)
-                    self.memory_manager.free(seq)
+                    self.model_runner.free(seq)
                 elif seq.computed_prompt:
                     self.seqs_to_decode.appendleft(seq)
                 else: # unfinished prefill seqs
@@ -98,7 +99,7 @@ class WorkerScheduler():
         preempt_seqs = []
         while self.get_num_free_pages() < num_decode_tokens and len(self.seqs_to_decode) != 0:
             seq_to_preempt = self.seqs_to_decode.popleft()
-            self.memory_manager.free(seq_to_preempt)
+            self.model_runner.free(seq_to_preempt)
             seq_to_preempt.preempt()
             preempt_seqs.append(seq_to_preempt)
 
@@ -117,7 +118,7 @@ class WorkerScheduler():
             id = seq.seq_id
             if id in self.abort_ids:
                 ipc_package.free_ids.append(id)
-                self.memory_manager.free(seq)
+                self.model_runner.free(seq)
                 seqs.remove(seq)
                 self.abort_ids.remove(id)
     

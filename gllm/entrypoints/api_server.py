@@ -28,10 +28,12 @@ async def show_available_models():
 
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
-    token_ids = await make_async(llm.model_runner.encode)(request.messages, chat=True)
+    mm_contents = await make_async(llm.model_runner.extract_modify_mm)(request.messages)
+    token_ids = await make_async(llm.model_runner.encode)(request.messages, chat=True, has_mm=mm_contents is not None)
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
-                                              request.temperature, request.top_p, request.top_k, request.repetition_penalty)
+                                              request.temperature, request.top_p, request.top_k, request.repetition_penalty,
+                                              mm_contents)
     else:
         return ErrorResponse(message="seq length exceeds max model length",
                              type="BadRequestError",
