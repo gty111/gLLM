@@ -83,8 +83,8 @@ def run_single_image(model: str, client) -> None:
                 "content": [
                     {"type": "text", "text": "描述下这个图片?"},
                     {
-                        "type": "image",
-                        "image": image_url,
+                        "type": "image_url",
+                        "image_url": {'url': image_url},
                     },
                 ],
             }
@@ -107,12 +107,12 @@ def run_multi_image(model: str, client) -> None:
                 "content": [
                     {"type": "text", "text": "What's in this image?"},
                     {
-                        "type": "image",
-                        "image": image1,
+                        "type": "image_url",
+                        "image_url": {'url':image1},
                     },
                     {
-                        "type": "image",
-                        "image": image2,
+                        "type": "image_url",
+                        "image_url": {'url':image2},
                     },
                 ],
             }
