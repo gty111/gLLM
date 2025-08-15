@@ -21,6 +21,7 @@ class EmbeddingInfo:
     embedding: torch.Tensor = None
     positions: torch.Tensor = None
     mrope_position_delta:int = None
+    stale: bool = False
 
 class ModelRunner():
     def __init__(self, load_format: str, model_path: str, gpu_memory_util: float, page_size: int,
@@ -109,6 +110,7 @@ class ModelRunner():
             position = None
             if seq.computed_prompt:
                 embedding_info = self.embedding_cache[seq.seq_id]
+                assert embedding_info.stale
                 position = MRotaryEmbedding.get_next_input_positions(
                     embedding_info.mrope_position_delta,
                     seq.computed_token_num,
@@ -118,7 +120,8 @@ class ModelRunner():
                 embedding = self.model.get_input_embeddings(
                     torch.tensor(seq.token_ids[seq.computed_token_num:seq.seq_len]))
             else:
-                if seq.computed_token_num == 0 or seq.seq_id not in self.embedding_cache:
+                embedding_info = None
+                if seq.seq_id not in self.embedding_cache or self.embedding_cache[seq.seq_id].stale:
                     mm_embeddings = None
                     image_grid_thw = None
                     if seq.mm_contents is not None:
@@ -135,8 +138,9 @@ class ModelRunner():
                         video_grid_thw=None,
                         second_per_grid_ts=None,
                     )
-                    self.embedding_cache[seq.seq_id] = EmbeddingInfo(
+                    embedding_info = EmbeddingInfo(
                         prompt_embeddings, prompt_positions, mrope_position_delta)
+                    self.embedding_cache[seq.seq_id] = embedding_info
                     position = prompt_positions[
                         :, seq.computed_token_num:seq.seq_len]
                     embedding = prompt_embeddings[
@@ -147,6 +151,11 @@ class ModelRunner():
                         :, seq.computed_token_num:seq.seq_len]
                     embedding = embedding_info.embedding[
                         seq.computed_token_num:seq.seq_len, :]
+                if seq.seq_len == seq.prompt_len:
+                    # invalidate embedding_cache
+                    embedding_info.stale = True
+                    embedding_info.embedding = None
+                    embedding_info.positions = None
             batch_embeddings.append(embedding)
             batch_positions.append(position)
         input_embeddings = torch.concat(batch_embeddings)
