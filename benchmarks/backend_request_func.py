@@ -237,7 +237,9 @@ async def async_request_openai_completions(
             "best_of": request_func_input.best_of,
             "max_tokens": request_func_input.output_len,
             "stream": True,
-            "ignore_eos": True
+            "ignore_eos": True,
+            "top_p": 1,
+            "top_k": 1,
         }
         headers = {
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"
@@ -319,6 +321,8 @@ async def async_request_openai_chat_completions(
                 },
             ],
             "temperature": 0.0,
+            "top_p": 1,
+            "top_k": 1,
             "max_tokens": request_func_input.output_len,
             "stream": True,
         }
