@@ -9,7 +9,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from http import HTTPStatus
 
-from gllm.utils import make_async
+from gllm.utils import make_async, extract_modify_mm
 from gllm.entrypoints.protocol import ChatCompletionRequest, CompletionRequest, ModelList, ModelCard, ModelPermission, ErrorResponse
 from gllm.async_llm_engine import PipeAsyncLLM
 from gllm.entrypoints.serving_chat import chat_completion_stream_generator, chat_completion_generator
@@ -28,7 +28,7 @@ async def show_available_models():
 
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
-    mm_contents = await make_async(llm.model_runner.extract_modify_mm)(request.messages)
+    mm_contents = await make_async(extract_modify_mm)(request.messages)
     token_ids = await make_async(llm.model_runner.encode)(request.messages, chat=True, has_mm=mm_contents is not None)
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
