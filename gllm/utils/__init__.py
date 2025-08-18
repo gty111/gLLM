@@ -222,3 +222,23 @@ def cast_overflow_tensors(
         clamp_value = torch.finfo(tensors.dtype).max - offset
         tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
     return tensors
+
+
+def extract_modify_mm(messages:Dict):
+    mm_contents = []
+    for message in messages:
+        contents = message['content']
+        if type(contents) != list:
+            continue
+        for content in contents:
+            if content['type'] == 'image':
+                mm_contents.append(content['image']) 
+            elif content['type'] == 'image_url':
+                content['type'] = 'image'
+                data = content['image_url']
+                del content['image_url']
+                if type(data) == dict:
+                    data = data['url']
+                content['image'] = data
+                mm_contents.append(data)
+    return mm_contents if len(mm_contents) != 0 else None
