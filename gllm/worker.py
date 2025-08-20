@@ -103,7 +103,8 @@ class Worker:
         seqs_data = self.comm.recv_schedule_seqs()
         if seqs_data is not None:
             seqs, positions = seqs_data
-            positions = positions.to(f'cuda:{get_local_rank()}')
+            if positions is not None:
+                positions = positions.to(f'cuda:{get_local_rank()}')
             self.schedule_queue.append(
                 InputData(seqs, self.model_runner.memory_manager,
                           use_mla=self.use_mla, positions=positions))
@@ -238,6 +239,8 @@ class Worker:
     def schedule_forward(self):
         schedule_seqs = self.worker_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
+            input_embeddings = None
+            positions = None
             if self.use_mm:
                 input_embeddings, positions = self.mm_prepare_inputs(schedule_seqs)
             input_data = InputData(
