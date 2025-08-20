@@ -1,9 +1,11 @@
 import torch
 
+from attr import dataclass
 from typing import Union, Dict
 from transformers import (AutoTokenizer, PreTrainedTokenizer, 
                           PreTrainedTokenizerFast, AutoProcessor,
                           AutoImageProcessor)
+from transformers.image_utils import load_images
 
 from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
@@ -12,6 +14,11 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.dist_utils import (is_output_rank, get_tp_size, is_last_pp_rank,
                              is_first_pp_rank)
 from gllm.layers.sampler import Sampler
+
+@dataclass
+class EmbeddingInfo:
+    embedding: torch.Tensor = None
+    stale: bool = False
 
 class ModelRunner():
     def __init__(self, load_format: str, model_path: str, gpu_memory_util: float, page_size: int,
@@ -40,6 +47,9 @@ class ModelRunner():
         # lazy init
         self.model = None
         self.memory_manager = None
+        
+        # embedding cache: seq_id => embedding
+        self.embedding_cache:Dict[int,EmbeddingInfo] = {}
 
     def init(self, mp_load_progress=None):
         self.model = self.model_loader.load_model(mp_load_progress)
@@ -67,11 +77,70 @@ class ModelRunner():
         
     def decode(self, content):
         return self.tokenizer.decode(content, True, True)
+    
+    def extract_modify_mm(self, messages:Dict):
+        mm_contents = []
+        for message in messages:
+            contents = message['content']
+            if type(contents) != list:
+                continue
+            for content in contents:
+                if content['type'] == 'image':
+                    mm_contents.append(content['image']) 
+                elif content['type'] == 'image_url':
+                    content['type'] = 'image'
+                    data = content['image_url']
+                    del content['image_url']
+                    if type(data) == dict:
+                        data = data['url']
+                    content['image'] = data
+                    mm_contents.append(data)
+        return mm_contents if len(mm_contents) != 0 else None
+    
+    @torch.inference_mode()
+    def mm_prepare_inputs(self, input_data: InputData):
+        # Calculate the embedding and positions of pic
+        batch_embeddings = []
+        for seq in input_data.seqs:
+            embedding = None
+            if seq.computed_prompt:
+                embedding_info = self.embedding_cache[seq.seq_id]
+                assert embedding_info.stale
+                embedding = self.model.get_input_embeddings(
+                    torch.tensor(seq.token_ids[seq.computed_token_num:seq.seq_len]))
+            else:
+                embedding_info = None
+                if seq.seq_id not in self.embedding_cache or self.embedding_cache[seq.seq_id].stale:
+                    mm_embeddings = None
+                    if seq.mm_contents is not None:
+                        images = load_images(seq.mm_contents)
+                        images_input = self.image_processor(images=images)
+                        mm_embeddings = self.model.get_multimodal_embeddings(**images_input)
+                    prompt_embeddings = self.model.get_input_embeddings(
+                        torch.tensor(seq.token_ids), mm_embeddings)
+                    embedding_info = EmbeddingInfo(prompt_embeddings)
+                    self.embedding_cache[seq.seq_id] = embedding_info
+                    embedding = prompt_embeddings[
+                        seq.computed_token_num:seq.seq_len, :]
+                else:
+                    embedding_info = self.embedding_cache[seq.seq_id]
+                    embedding = embedding_info.embedding[
+                        seq.computed_token_num:seq.seq_len, :]
+                if seq.seq_len == seq.prompt_len:
+                    # invalidate embedding_cache
+                    embedding_info.stale = True
+                    embedding_info.embedding = None
+            batch_embeddings.append(embedding)
+        input_embeddings = torch.concat(batch_embeddings)
+        return input_embeddings
         
     @torch.inference_mode()
-    def step_once(self, input_data: InputData = None, hidden_states=None, 
-                  residual=None, input_embeddings=None):
-        output = self.model(input_data, hidden_states, residual, input_embeddings)
+    def step_once(self, input_data: InputData = None, hidden_states=None, residual=None):
+        if is_first_pp_rank() and self.use_mm:
+            input_embeddings = self.mm_prepare_inputs(input_data)
+            output = self.model(input_data, None, None, input_embeddings)
+        else:
+            output = self.model(input_data, hidden_states, residual)
         if is_last_pp_rank():
             logits = self.model.compute_logits(input_data, output)
             if is_output_rank():
