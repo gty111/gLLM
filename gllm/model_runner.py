@@ -14,13 +14,10 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.dist_utils import (is_output_rank, get_tp_size, is_last_pp_rank,
                              is_first_pp_rank)
 from gllm.layers.sampler import Sampler
-from gllm.layers.rotary_embedding import MRotaryEmbedding
 
 @dataclass
 class EmbeddingInfo:
     embedding: torch.Tensor = None
-    positions: torch.Tensor = None
-    mrope_position_delta:int = None
     stale: bool = False
 
 class ModelRunner():
@@ -104,68 +101,43 @@ class ModelRunner():
     def mm_prepare_inputs(self, input_data: InputData):
         # Calculate the embedding and positions of pic
         batch_embeddings = []
-        batch_positions = []
         for seq in input_data.seqs:
             embedding = None
-            position = None
             if seq.computed_prompt:
                 embedding_info = self.embedding_cache[seq.seq_id]
                 assert embedding_info.stale
-                position = MRotaryEmbedding.get_next_input_positions(
-                    embedding_info.mrope_position_delta,
-                    seq.computed_token_num,
-                    seq.seq_len
-                )
-                position = torch.tensor(position)
                 embedding = self.model.get_input_embeddings(
                     torch.tensor(seq.token_ids[seq.computed_token_num:seq.seq_len]))
             else:
                 embedding_info = None
                 if seq.seq_id not in self.embedding_cache or self.embedding_cache[seq.seq_id].stale:
                     mm_embeddings = None
-                    image_grid_thw = None
                     if seq.mm_contents is not None:
                         images = load_images(seq.mm_contents)
                         images_input = self.image_processor(images=images)
-                        image_grid_thw = images_input['image_grid_thw']
                         mm_embeddings = self.model.get_multimodal_embeddings(**images_input)
                     prompt_embeddings = self.model.get_input_embeddings(
                         torch.tensor(seq.token_ids), mm_embeddings)
-                    prompt_positions, mrope_position_delta = MRotaryEmbedding.get_input_positions(
-                        input_tokens=seq.token_ids,
-                        hf_config=self.model.config,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=None,
-                        second_per_grid_ts=None,
-                    )
-                    embedding_info = EmbeddingInfo(
-                        prompt_embeddings, prompt_positions, mrope_position_delta)
+                    embedding_info = EmbeddingInfo(prompt_embeddings)
                     self.embedding_cache[seq.seq_id] = embedding_info
-                    position = prompt_positions[
-                        :, seq.computed_token_num:seq.seq_len]
                     embedding = prompt_embeddings[
                         seq.computed_token_num:seq.seq_len, :]
                 else:
                     embedding_info = self.embedding_cache[seq.seq_id]
-                    position = embedding_info.positions[
-                        :, seq.computed_token_num:seq.seq_len]
                     embedding = embedding_info.embedding[
                         seq.computed_token_num:seq.seq_len, :]
                 if seq.seq_len == seq.prompt_len:
                     # invalidate embedding_cache
                     embedding_info.stale = True
                     embedding_info.embedding = None
-                    embedding_info.positions = None
             batch_embeddings.append(embedding)
-            batch_positions.append(position)
         input_embeddings = torch.concat(batch_embeddings)
-        positions = torch.concat(batch_positions, dim=1)
-        return input_embeddings, positions
+        return input_embeddings
         
     @torch.inference_mode()
     def step_once(self, input_data: InputData = None, hidden_states=None, residual=None):
         if is_first_pp_rank() and self.use_mm:
-            input_embeddings, input_data.positions = self.mm_prepare_inputs(input_data)
+            input_embeddings = self.mm_prepare_inputs(input_data)
             output = self.model(input_data, None, None, input_embeddings)
         else:
             output = self.model(input_data, hidden_states, residual)
