@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import time
 
 from typing import List, Optional
 from dataclasses import dataclass
@@ -16,7 +17,6 @@ class InputData():
         seqs: List[Sequence], 
         memory_manager: MemoryManager, 
         use_mla: bool = False,
-        positions: torch.Tensor = None,
     ):
         assert len(seqs) != 0
         if is_last_pp_rank():
@@ -34,7 +34,7 @@ class InputData():
         self.memory_manager = memory_manager
         self.page_size = memory_manager.page_size
         self.tokens = self.get_tokens(seqs)
-        self.positions = self.get_position(seqs) if positions is None else positions
+        self.positions = self.get_position(seqs)
         self.slot_mapping_tensor = self.get_slot_mapping(seqs)
         self.block_table = self.get_block_table(seqs)
         self.max_seq_len, self.seq_lens = self.get_seq_lens(seqs)

@@ -231,7 +231,7 @@ class LLM():
                      mm_contents=None):
         temperature = self.generation_config.temperature if temperature is None else temperature
         top_p = self.generation_config.top_p if top_p is None else top_p
-        top_k = 1 if top_k is None else top_k
+        top_k = 1 if self.model_runner.use_mm else self.generation_config.top_k if top_k is None else top_k
         repetition_penalty = self.generation_config.repetition_penalty if repetition_penalty is None else repetition_penalty
         return Sequence(self.id_allocator.allocate(), token_ids,
                         self.finish_tokens, output_len, ignore_eos,
