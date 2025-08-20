@@ -182,7 +182,7 @@ class ChatGLMModel(nn.Module):
         )
 
     def forward(self, input_data: InputData, hidden_states=None):
-        if is_first_pp_rank():
+        if is_first_pp_rank() and hidden_states is None:
             hidden_states = self.embedding(input_data.tokens)
 
         # Run encoder.
@@ -204,7 +204,10 @@ class ChatGLMForCausalLM(nn.Module):
         if is_last_pp_rank():
             self.lm_head = self.transformer.output_layer
 
-    def forward(self, input_data: InputData, hidden_states=None, residual=None):
+    def forward(self, input_data: InputData, hidden_states=None, residual=None, input_embeds=None):
+        if input_embeds is not None:
+            assert hidden_states is None and residual is None
+            hidden_states = input_embeds
         return self.transformer(input_data, hidden_states)
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):

@@ -457,7 +457,7 @@ class DeepseekV2Model(nn.Module):
             
     
     def forward(self, input_data:InputData, hidden_states=None, residual=None):
-        if is_first_pp_rank():
+        if is_first_pp_rank() and hidden_states is None:
             hidden_states = self.embed_tokens(input_data.tokens)
         for layer in self.layers:
             hidden_states, residual = layer(
