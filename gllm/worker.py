@@ -155,8 +155,6 @@ class Worker:
     def schedule_forward(self):
         schedule_seqs = self.worker_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
-            input_embeddings = None
-            positions = None
             input_data = InputData(
                 schedule_seqs, self.model_runner.memory_manager,
                 use_mla=self.use_mla)
