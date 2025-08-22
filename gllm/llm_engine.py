@@ -221,7 +221,7 @@ class LLM():
             token_ids) + output_len if output_len is not None else len(token_ids)
         if max_seq_length > self.model_max_length:
             logger.warning(
-                f'Ignore seq due to the length({max_seq_length}) exceeds max model len({self.model_runner.model.max_model_len})')
+                f'Ignore seq due to the length ({max_seq_length}) exceeds max model len({self.model_max_length})')
             return False
         else:
             return True
