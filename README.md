@@ -55,7 +55,6 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 
 ## Install gLLM
 ```
-pip install torch==2.5.1
 pip install -v -e .
 ```
 
