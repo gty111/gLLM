@@ -19,3 +19,4 @@ datasets
 pillow
 flash_attn==2.8.2 # qwen2_5_vl
 einops # qwen2_5_vl
+torchvision==0.22.1 # qwen2_5_vl
