@@ -136,7 +136,7 @@ def get_pp_layers(num_layers):
     if _ASSIGNED_LAYERS is None:
         num_layers_pp = num_layers // get_pp_size()
         
-        if get_pp_size() <= 4 or num_layers % get_pp_size() != 0:
+        if num_layers % get_pp_size() != 0:
             num_layers_pp += 1
 
         if get_pp_rank() != get_pp_size() - 1:
