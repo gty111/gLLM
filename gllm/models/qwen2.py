@@ -157,7 +157,6 @@ class Qwen2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.max_model_len = config.max_position_embeddings
-        self.dtype = config.torch_dtype
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(config, 'head_dim', config.hidden_size // config.num_attention_heads)
         self.model = model_type(config)

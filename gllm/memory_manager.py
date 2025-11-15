@@ -44,6 +44,10 @@ class MemoryManager():
 
         self.segment = Segment(self.num_layers, self.num_pages, self.page_size, 
                                self.kv_head_num, self.kv_head_dim, use_mla)
+        
+        self.kv_cache_dtype = 'auto'
+        self.k_scale = torch.tensor(1.0, dtype=torch.float32)
+        self.v_scale = self.k_scale
 
     def get_sizeof_KV_per_page(self): # Bytes
         if not self.use_mla:
@@ -58,7 +62,10 @@ class MemoryManager():
                                     v_cache,
                                     self.segment.k_cache[layer_idx],
                                     self.segment.v_cache[layer_idx],
-                                    slot_mapping_tensor)
+                                    slot_mapping_tensor,
+                                    self.kv_cache_dtype,
+                                    self.k_scale,
+                                    self.v_scale)
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
@@ -134,14 +141,6 @@ class PrefixMemoryManager(MemoryManager):
         # for prefill stage
         self.num_allocated_pages = 0
         self.num_hit_pages = 0
-
-    def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping_tensor: torch.Tensor):
-        from gllm import _custom_ops as ops
-        ops.reshape_and_cache_flash(k_cache,
-                                    v_cache,
-                                    self.segment.k_cache[layer_idx],
-                                    self.segment.v_cache[layer_idx],
-                                    slot_mapping_tensor)
 
     def pre_allocate_computed_page(self, seqs: List[Sequence]):
         for seq in seqs:
