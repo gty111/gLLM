@@ -71,7 +71,7 @@ class ModelLoader():
     def load_config(self):
         self.config = AutoConfig.from_pretrained(self.model_path,trust_remote_code=True)
         self.generation_config = GenerationConfig.from_pretrained(self.model_path)
-        self.dtype = self.config.torch_dtype
+        self.dtype = self.config.dtype
         self.architecture = self.config.architectures[0]
         self.vocab_size = self.config.vocab_size
         self.hidden_size = self.config.hidden_size

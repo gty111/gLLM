@@ -2,17 +2,15 @@ import importlib.util
 import io
 import logging
 import os
-import subprocess
 import sys
 import torch
+import re
+import shutil
 
-from pathlib import Path
 from shutil import which
-from typing import Dict, List
-from packaging.version import Version, parse
+from typing import List
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
-from torch.utils.cpp_extension import CUDA_HOME
 
 
 def load_module_from_path(module_name, path):
@@ -25,8 +23,6 @@ def load_module_from_path(module_name, path):
 
 ROOT_DIR = os.path.dirname(__file__)
 logger = logging.getLogger(__name__)
-
-GLLM_TARGET_DEVICE = os.getenv("GLLM_TARGET_DEVICE", "cuda")
 
 # gLLM only supports Linux platform
 assert sys.platform.startswith(
@@ -60,207 +56,89 @@ class CMakeExtension(Extension):
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
-class cmake_build_ext(build_ext):
-    # A dict of extension directories that have been configured.
-    did_config: Dict[str, bool] = {}
 
-    #
-    # Determine number of compilation jobs and optionally nvcc compile threads.
-    #
-    def compute_num_jobs(self):
-        # `num_jobs` is either the value of the MAX_JOBS environment variable
-        # (if defined) or the number of CPUs available.
-        num_jobs = os.environ.get('MAX_JOBS', '32')
-        if num_jobs is not None:
-            num_jobs = int(num_jobs)
-            logger.info("Using MAX_JOBS=%d as the number of jobs.", num_jobs)
-        else:
-            try:
-                # os.sched_getaffinity() isn't universally available, so fall
-                #  back to os.cpu_count() if we get an error here.
-                num_jobs = len(os.sched_getaffinity(0))
-            except AttributeError:
-                num_jobs = min(os.cpu_count(), 32)
+class precompiled_build_ext(build_ext):
+    """Disables extension building when using precompiled binaries."""
 
-        nvcc_threads = None
-        if _is_cuda() and get_nvcc_cuda_version() >= Version("11.2"):
-            # `nvcc_threads` is either the value of the NVCC_THREADS
-            # environment variable (if defined) or 1.
-            # when it is set, we reduce `num_jobs` to avoid
-            # overloading the system.
-            nvcc_threads = None
-            if nvcc_threads is not None:
-                nvcc_threads = int(nvcc_threads)
-                logger.info(
-                    "Using NVCC_THREADS=%d as the number of nvcc threads.",
-                    nvcc_threads)
-            else:
-                nvcc_threads = 1
-            num_jobs = max(1, num_jobs // nvcc_threads)
-
-        return num_jobs, nvcc_threads
-
-    #
-    # Perform cmake configuration for a single extension.
-    #
-    def configure(self, ext: CMakeExtension) -> None:
-        # If we've already configured using the CMakeLists.txt for
-        # this extension, exit early.
-        if ext.cmake_lists_dir in cmake_build_ext.did_config:
-            return
-
-        cmake_build_ext.did_config[ext.cmake_lists_dir] = True
-
-        # Select the build type.
-        # Note: optimization level + debug info are set by the build type
-        default_cfg = "Debug" if self.debug else "RelWithDebInfo"
-        cfg = os.getenv("CMAKE_BUILD_TYPE") or default_cfg
-
-        cmake_args = [
-            '-DCMAKE_BUILD_TYPE={}'.format(cfg),
-        ]
-
-        if is_sccache_available():
-            cmake_args += [
-                '-DCMAKE_C_COMPILER_LAUNCHER=sccache',
-                '-DCMAKE_CXX_COMPILER_LAUNCHER=sccache',
-                '-DCMAKE_CUDA_COMPILER_LAUNCHER=sccache',
-                '-DCMAKE_HIP_COMPILER_LAUNCHER=sccache',
-            ]
-        elif is_ccache_available():
-            cmake_args += [
-                '-DCMAKE_C_COMPILER_LAUNCHER=ccache',
-                '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache',
-                '-DCMAKE_CUDA_COMPILER_LAUNCHER=ccache',
-                '-DCMAKE_HIP_COMPILER_LAUNCHER=ccache',
-            ]
-
-        # Pass the python executable to cmake so it can find an exact
-        # match.
-        cmake_args += ['-DGLLM_PYTHON_EXECUTABLE={}'.format(sys.executable)]
-
-        # Pass the python path to cmake so it can reuse the build dependencies
-        # on subsequent calls to python.
-        cmake_args += ['-DVLLM_PYTHON_PATH={}'.format(":".join(sys.path))]
-
-        # Override the base directory for FetchContent downloads to $ROOT/.deps
-        # This allows sharing dependencies between profiles,
-        # and plays more nicely with sccache.
-        # To override this, set the FETCHCONTENT_BASE_DIR environment variable.
-        fc_base_dir = os.path.join(ROOT_DIR, ".deps")
-        fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
-        cmake_args += ['-DFETCHCONTENT_BASE_DIR={}'.format(fc_base_dir)]
-
-        #
-        # Setup parallelism and build tool
-        #
-        num_jobs, nvcc_threads = self.compute_num_jobs()
-
-        if nvcc_threads:
-            cmake_args += ['-DNVCC_THREADS={}'.format(nvcc_threads)]
-
-        if is_ninja_available():
-            build_tool = ['-G', 'Ninja']
-            cmake_args += [
-                '-DCMAKE_JOB_POOL_COMPILE:STRING=compile',
-                '-DCMAKE_JOB_POOLS:STRING=compile={}'.format(num_jobs),
-            ]
-        else:
-            # Default build tool to whatever cmake picks.
-            build_tool = []
-        subprocess.check_call(
-            ['cmake', ext.cmake_lists_dir, *build_tool, *cmake_args],
-            cwd=self.build_temp)
+    def run(self) -> None:
+        assert _is_cuda(), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
 
     def build_extensions(self) -> None:
-        # Ensure that CMake is present and working
+        print("Skipping build_ext: using precompiled extensions.")
+        return
+
+class precompiled_wheel_utils:
+    """Extracts libraries and other files from an existing wheel."""
+
+    @staticmethod
+    def extract_precompiled_and_patch_package(wheel_url_or_path: str) -> dict:
+        import tempfile
+        import zipfile
+
+        temp_dir = None
         try:
-            subprocess.check_output(['cmake', '--version'])
-        except OSError as e:
-            raise RuntimeError('Cannot find CMake executable') from e
+            if not os.path.isfile(wheel_url_or_path):
+                wheel_filename = wheel_url_or_path.split("/")[-1]
+                temp_dir = tempfile.mkdtemp(prefix="vllm-wheels")
+                wheel_path = os.path.join(temp_dir, wheel_filename)
+                print(f"Downloading wheel from {wheel_url_or_path} to {wheel_path}")
+                from urllib.request import urlretrieve
 
-        # Create build directory if it does not exist.
-        if not os.path.exists(self.build_temp):
-            os.makedirs(self.build_temp)
+                urlretrieve(wheel_url_or_path, filename=wheel_path)
+            else:
+                wheel_path = wheel_url_or_path
+                print(f"Using existing wheel at {wheel_path}")
 
-        targets = []
+            package_data_patch = {}
 
-        def target_name(s: str) -> str:
-            return s.removeprefix("gllm.").removeprefix("vllm_flash_attn.")
+            with zipfile.ZipFile(wheel_path) as wheel:
+                files_to_copy = [
+                    "vllm/_C.abi3.so",
+                    "vllm/_moe_C.abi3.so",
+                    "vllm/_flashmla_C.abi3.so",
+                    "vllm/_flashmla_extension_C.abi3.so",
+                    "vllm/_sparse_flashmla_C.abi3.so",
+                    "vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so",
+                    "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so",
+                    "vllm/cumem_allocator.abi3.so",
+                ]
 
-        # Build all the extensions
-        for ext in self.extensions:
-            self.configure(ext)
-            targets.append(target_name(ext.name))
+                compiled_regex = re.compile(
+                    r"vllm/vllm_flash_attn/(?:[^/.][^/]*/)*(?!\.)[^/]*\.py"
+                )
+                file_members = list(
+                    filter(lambda x: x.filename in files_to_copy, wheel.filelist)
+                )
+                file_members += list(
+                    filter(lambda x: compiled_regex.match(x.filename), wheel.filelist)
+                )
 
-        num_jobs, _ = self.compute_num_jobs()
+                for file in file_members:
+                    target_file_name = file.filename.replace("vllm/", "gllm/")
+                    print(f"[extract] {file.filename} to {target_file_name}")
+                    target_path = os.path.join(".", target_file_name)
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    with (
+                        wheel.open(file.filename) as src,
+                        open(target_path, "wb") as dst,
+                    ):
+                        shutil.copyfileobj(src, dst)
 
-        build_args = [
-            "--build",
-            ".",
-            f"-j={num_jobs}",
-            *[f"--target={name}" for name in targets],
-        ]
+                    pkg = os.path.dirname(file.filename).replace("/", ".")
+                    package_data_patch.setdefault(pkg, []).append(
+                        os.path.basename(file.filename)
+                    )
 
-        subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
+            return package_data_patch
+        finally:
+            if temp_dir is not None:
+                print(f"Removing temporary directory {temp_dir}")
+                shutil.rmtree(temp_dir)
 
-        # Install the libraries
-        for ext in self.extensions:
-            # Install the extension into the proper location
-            outdir = Path(self.get_ext_fullpath(ext.name)).parent.absolute()
-
-            # Skip if the install directory is the same as the build directory
-            if outdir == self.build_temp:
-                continue
-
-            # CMake appends the extension prefix to the install path,
-            # and outdir already contains that prefix, so we need to remove it.
-            prefix = outdir
-            for i in range(ext.name.count('.')):
-                prefix = prefix.parent
-
-            # prefix here should actually be the same for all components
-            install_args = [
-                "cmake", "--install", ".", "--prefix", prefix, "--component",
-                target_name(ext.name)
-            ]
-
-            subprocess.check_call(install_args, cwd=self.build_temp)
-
-    def run(self):
-        # First, run the standard build_ext command to compile the extensions
-        super().run()
-
-        # copy vllm/vllm_flash_attn/**/*.py from self.build_lib to current
-        # directory so that they can be included in the editable build
-        import glob
-        files = glob.glob(os.path.join(self.build_lib, "gllm",
-                                       "vllm_flash_attn", "**", "*.py"),
-                          recursive=True)
-        for file in files:
-            dst_file = os.path.join("gllm/vllm_flash_attn",
-                                    file.split("gllm/vllm_flash_attn/")[-1])
-            print(f"Copying {file} to {dst_file}")
-            os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-            self.copy_file(file, dst_file)
 
 def _is_cuda() -> bool:
     has_cuda = torch.version.cuda is not None
-    return GLLM_TARGET_DEVICE == "cuda" and has_cuda
-
-
-def get_nvcc_cuda_version() -> Version:
-    """Get the CUDA version from nvcc.
-
-    Adapted from https://github.com/NVIDIA/apex/blob/8b7a1ff183741dd8f9b87e7bafd04cfde99cea28/setup.py
-    """
-    assert CUDA_HOME is not None, "CUDA_HOME is not set"
-    nvcc_output = subprocess.check_output([CUDA_HOME + "/bin/nvcc", "-V"],
-                                          universal_newlines=True)
-    output = nvcc_output.split()
-    release_idx = output.index("release") + 1
-    nvcc_cuda_version = parse(output[release_idx].split(",")[0])
-    return nvcc_cuda_version
+    return has_cuda
 
 
 def get_path(*filepath) -> str:
@@ -268,12 +146,8 @@ def get_path(*filepath) -> str:
 
 
 def get_gllm_version() -> str:
-    version = '0.0.3'
-
-    cuda_version = str(get_nvcc_cuda_version())
-    if cuda_version != MAIN_CUDA_VERSION:
-        cuda_version_str = cuda_version.replace(".", "")[:3]
-        version += f"+cu{cuda_version_str}"
+    version = '0.0.4'
+    version += "+precompiled"
 
     return version
 
@@ -311,11 +185,49 @@ ext_modules = []
 ext_modules.append(CMakeExtension(name="gllm._C"))
 ext_modules.append(CMakeExtension(name="gllm._moe_C"))
 ext_modules.append(CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa2_C"))
+ext_modules.append(
+    CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa3_C"))
+    
+package_data = {
+    "vllm": [
+        "py.typed",
+        "model_executor/layers/fused_moe/configs/*.json",
+        "model_executor/layers/quantization/utils/configs/*.json",
+    ]
+}
+    
 
-if get_nvcc_cuda_version() >= Version("12.3"):
-    # FA3 requires CUDA 12.3 or later
-    ext_modules.append(
-        CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa3_C"))
+assert _is_cuda(), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
+wheel_location = os.getenv("GLLM_PRECOMPILED_WHEEL_LOCATION", None)
+if wheel_location is not None:
+    wheel_url = wheel_location
+else:
+    import platform
+
+    arch = platform.machine()
+    if arch == "x86_64":
+        wheel_tag = "manylinux1_x86_64"
+    elif arch == "aarch64":
+        wheel_tag = "manylinux2014_aarch64"
+    else:
+        raise ValueError(f"Unsupported architecture: {arch}")
+    wheel_url = "https://wheels.vllm.ai/b8b302cde434df8c9289a2b465406b47ebab1c2d/vllm-0.11.0%2Bcu129-cp38-abi3-manylinux1_x86_64.whl"
+    nightly_wheel_url = (
+        f"https://wheels.vllm.ai/nightly/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
+    )
+    from urllib.request import urlopen
+
+    try:
+        with urlopen(wheel_url) as resp:
+            if resp.status != 200:
+                wheel_url = nightly_wheel_url
+    except Exception as e:
+        print(f"[warn] Falling back to nightly wheel: {e}")
+        wheel_url = nightly_wheel_url
+
+patch = precompiled_wheel_utils.extract_precompiled_and_patch_package(wheel_url)
+for pkg, files in patch.items():
+    package_data.setdefault(pkg, []).extend(files)
 
 setup(
     name="gllm",
@@ -339,5 +251,6 @@ setup(
     python_requires=">=3.8",
     install_requires=get_requirements(),
     ext_modules=ext_modules,
-    cmdclass={"build_ext": cmake_build_ext},
+    cmdclass={"build_ext": precompiled_build_ext},
+    package_data=package_data,
 )

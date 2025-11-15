@@ -1,22 +1,21 @@
-pydantic >= 2.9  # Required for fastapi >= 0.113.0
-numpy < 2.0.0
+pydantic >= 2.11.7
+numpy
 cmake>=3.21
 ninja
 packaging
 setuptools>=61
 wheel
 tqdm
-transformers >= 4.51.1
-fastapi >= 0.107.0, < 0.113.0; python_version < '3.9'
-fastapi >= 0.107.0, != 0.113.*, != 0.114.0; python_version >= '3.9'
-uvicorn[standard]
-openai >= 1.52.0
+transformers >= 4.55.2
+fastapi[standard] >= 0.115.0
+openai >= 1.99.1
 logger
-torch==2.7.1
+torch==2.8.0
+torchvision==0.23.0
 zmq
 aiohttp
 datasets
 pillow
-flash_attn==2.8.2 # qwen2_5_vl
+flash_attn==2.8.3
 einops # qwen2_5_vl
-torchvision==0.22.1 # qwen2_5_vl
+
