@@ -1,5 +1,4 @@
 import zmq
-import pickle
 
 from typing import List
 
@@ -8,7 +7,6 @@ from gllm.dist_utils import (send_obj_list, recv_obj_list, get_rank,
                              is_output_rank, get_world_size, get_pp_size,
                              get_output_rank, get_tp_size)
 from gllm.sequence import Sequence
-from gllm.input_data import InputData
 
 class IPCPackage:
     def __init__(self, schedule_lists: List[Sequence]):
@@ -53,8 +51,8 @@ class zmqComm:
                 if get_world_size() != 1:
                     if self.launch_mode == 'normal':
                         # rank 0 => other ranks : batched seqs
-                        self.schedule_first_pp_sockets = []
-                        self.schedule_other_sockets = []
+                        self.schedule_first_pp_sockets: List[zmq.Socket] = []
+                        self.schedule_other_sockets: List[zmq.Socket] = []
                         for rank in range(1, get_world_size()):
                             socket = make_socket(self.ctx, f'{self.schedule_path}_{rank}', zmq.PUSH)
                             if rank < get_tp_size():
@@ -106,54 +104,46 @@ class zmqComm:
 
     def send_tokens(self, tokens):
         assert type(tokens) == list
-        tokens_bytes = pickle.dumps(tokens)
-        self.token_socket.send(tokens_bytes, copy=False)
+        self.token_socket.send_pyobj(tokens)
 
     def recv_tokens(self):
         if self.token_socket.poll(timeout=0) != 0:
-            recv_bytes = self.token_socket.recv(copy=False)
-            next_tokens = pickle.loads(recv_bytes)
+            next_tokens = self.token_socket.recv_pyobj()
             return next_tokens
         else:
             return None
 
     def send_output(self, output):
-        output_bytes = pickle.dumps(output)
-        self.output_socket.send(output_bytes, copy=False)
+        self.output_socket.send_pyobj(output)
 
     def recv_output(self):
         if self.output_socket.poll(timeout=0) != 0:
-            recv_bytes = self.output_socket.recv(copy=False)
-            output = pickle.loads(recv_bytes)
+            output = self.output_socket.recv_pyobj()
             return output
         else:
             return None
 
     def send_schedule_seqs(self, seqs, is_first_pp:bool):
-        seqs_bytes = pickle.dumps(seqs)
         if is_first_pp:
             schedule_sockets = self.schedule_first_pp_sockets
         else:
             schedule_sockets = self.schedule_other_sockets
         for socket in schedule_sockets:
-            socket.send(seqs_bytes, copy=False)
+            socket.send_pyobj(seqs)
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
-            recv_bytes = self.schedule_socket.recv(copy=False)
-            seqs, positions = pickle.loads(recv_bytes)
+            seqs, positions = self.schedule_socket.recv_pyobj()
             return seqs, positions
         else:
             return None
 
     def send_ipc_package(self, ipc_package):
-        ipc_bytes = pickle.dumps(ipc_package)
-        self.request_socket.send(ipc_bytes, copy=False)
+        self.request_socket.send_pyobj(ipc_package)
 
     def recv_ipc_package(self):
         if self.request_socket.poll(timeout=0) != 0:
-            recv_bytes = self.request_socket.recv(copy=False)
-            ipc_package = pickle.loads(recv_bytes)
+            ipc_package = self.request_socket.recv_pyobj()
             return ipc_package
         else:
             return None
