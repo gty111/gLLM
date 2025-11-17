@@ -124,6 +124,7 @@ class ModelRunner():
                 embedding_info = None
                 if seq.seq_id not in self.embedding_cache or self.embedding_cache[seq.seq_id].stale:
                     mm_embeddings = None
+                    image_grid_thw = None
                     if seq.mm_contents is not None:
                         images = load_images(seq.mm_contents)
                         images_input = self.image_processor(images=images)
@@ -155,7 +156,7 @@ class ModelRunner():
             batch_embeddings.append(embedding)
             batch_positions.append(position)
         input_embeddings = torch.concat(batch_embeddings)
-        positions = torch.concat(batch_positions)
+        positions = torch.concat(batch_positions,dim=1)
         return input_embeddings, positions
         
     @torch.inference_mode()
