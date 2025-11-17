@@ -82,11 +82,14 @@ class Worker:
 
     # driver worker => other workers
     def recv_schedule_seqs(self):
-        seqs = self.comm.recv_schedule_seqs()
-        if seqs is not None:
-            self.schedule_queue.append(
-                InputData(seqs, self.model_runner.memory_manager,
-                          use_mla=self.use_mla))
+        recv_data = self.comm.recv_schedule_seqs()
+        if recv_data is not None:
+            seqs, positions = recv_data
+            input_data = InputData(seqs, self.model_runner.memory_manager, use_mla=self.use_mla)
+            if positions is not None:
+                positions = positions.to(f'cuda:{self.local_rank}')
+                input_data.positions = positions
+            self.schedule_queue.append(input_data)
 
     # pp last rank => pp next rank
     def recv_intermediate_data(self):
@@ -147,8 +150,12 @@ class Worker:
 
     def forward_tp(self):
         if len(self.schedule_queue) != 0:
-            input_data = self.schedule_queue.popleft()
-            output = self.model_runner.step_once(input_data)
+            input_data:InputData = self.schedule_queue.popleft()
+            input_embeddings = None
+            if self.model_runner.use_mm:
+                input_embeddings, positions = self.model_runner.mm_prepare_inputs(input_data.seqs)
+                input_data.positions = positions
+            output = self.model_runner.step_once(input_data, input_embeddings=input_embeddings)
             if get_pp_size() != 1:
                 send_pp_data(output, get_next_pp_rank())
     
@@ -158,9 +165,16 @@ class Worker:
             input_data = InputData(
                 schedule_seqs, self.model_runner.memory_manager,
                 use_mla=self.use_mla)
+            input_embeddings = None
+            positions = None
             if get_world_size() > 1:
-                self.comm.send_schedule_seqs(schedule_seqs)
-            output = self.model_runner.step_once(input_data)
+                self.comm.send_schedule_seqs((schedule_seqs, None), True)
+            if self.model_runner.use_mm:
+                input_embeddings, positions = self.model_runner.mm_prepare_inputs(schedule_seqs)
+                input_data.positions = positions
+            if get_world_size() > 1:
+                self.comm.send_schedule_seqs((schedule_seqs, positions), False)
+            output = self.model_runner.step_once(input_data,input_embeddings=input_embeddings)
 
             if not is_output_rank():
                 send_pp_data(output, get_next_pp_rank())

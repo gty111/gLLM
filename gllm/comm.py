@@ -6,8 +6,9 @@ from typing import List
 from gllm.utils import make_socket
 from gllm.dist_utils import (send_obj_list, recv_obj_list, get_rank, 
                              is_output_rank, get_world_size, get_pp_size,
-                             get_output_rank)
+                             get_output_rank, get_tp_size)
 from gllm.sequence import Sequence
+from gllm.input_data import InputData
 
 class IPCPackage:
     def __init__(self, schedule_lists: List[Sequence]):
@@ -52,21 +53,25 @@ class zmqComm:
                 if get_world_size() != 1:
                     if self.launch_mode == 'normal':
                         # rank 0 => other ranks : batched seqs
-                        self.schedule_sockets = []
-                        for i in range(1, get_world_size()):
-                            self.schedule_sockets.append(make_socket(
-                                self.ctx, f'{self.schedule_path}_{i}', zmq.PUSH))
+                        self.schedule_first_pp_sockets = []
+                        self.schedule_other_sockets = []
+                        for rank in range(1, get_world_size()):
+                            socket = make_socket(self.ctx, f'{self.schedule_path}_{rank}', zmq.PUSH)
+                            if rank < get_tp_size():
+                                self.schedule_first_pp_sockets.append(socket)
+                            else:
+                                self.schedule_other_sockets.append(socket)
                         # last rank => rank 0 : next tokens
                         self.token_socket = make_socket(
                             self.ctx, self.token_path, zmq.PULL)
                     else:
                         # rank 0 => other ranks : batched seqs
                         self.schedule_sockets = []
-                        for i in range(1, get_world_size()):
-                            port_each = self.port_base+i
-                            send_obj_list([port_each],i)
+                        for rank in range(1, get_world_size()):
+                            port_each = self.port_base+rank
+                            send_obj_list([port_each],rank)
                             addr_each = [None]
-                            recv_obj_list(addr_each,i)
+                            recv_obj_list(addr_each,rank)
                             self.schedule_sockets.append(make_socket(
                                 self.ctx, f'tcp://{addr_each[0]}:{port_each}', zmq.PUSH))
                         # output rank => rank 0 : next tokens
@@ -124,16 +129,20 @@ class zmqComm:
         else:
             return None
 
-    def send_schedule_seqs(self, seqs):
+    def send_schedule_seqs(self, seqs, is_first_pp:bool):
         seqs_bytes = pickle.dumps(seqs)
-        for socket in self.schedule_sockets:
+        if is_first_pp:
+            schedule_sockets = self.schedule_first_pp_sockets
+        else:
+            schedule_sockets = self.schedule_other_sockets
+        for socket in schedule_sockets:
             socket.send(seqs_bytes, copy=False)
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
             recv_bytes = self.schedule_socket.recv(copy=False)
-            seqs = pickle.loads(recv_bytes)
-            return seqs
+            seqs, positions = pickle.loads(recv_bytes)
+            return seqs, positions
         else:
             return None
 

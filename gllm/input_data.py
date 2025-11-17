@@ -82,7 +82,7 @@ class InputData():
 
                     workspace = torch.empty(
                         (chunked_prefill_workspace_size, 
-                         self.memory_manager.kv_head_dim)
+                        memory_manager.kv_head_dim)
                     )
 
                     num_prefills_with_context = (context_lens > 0).sum().item()
