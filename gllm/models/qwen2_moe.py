@@ -24,6 +24,7 @@ from .weight_utils import (copy_qkv_proj, copy_gate_up_proj,
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
+        quant_config = getattr(config, 'quantization_config', None)
         self.tp_size = get_tp_size()
 
         if self.tp_size > config.num_experts:
@@ -36,7 +37,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                                 hidden_size=config.hidden_size,
                                 intermediate_size=config.moe_intermediate_size,
                                 reduce_results=False,
-                                renormalize=config.norm_topk_prob)
+                                renormalize=config.norm_topk_prob,
+                                quant_config=quant_config)
         self.gate = nn.Linear(config.hidden_size,
                               config.num_experts,
                               bias=False)
@@ -156,11 +158,12 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
             if k.find('self_attn.qkv_proj') != -1:
+                head_dim_patch = head_dim if k.find('scale') == -1 or k.find('weight') == -1 else 1
                 copy_qkv_proj(v.data, 
                                      weights[k.replace('qkv_proj', 'q_proj')], 
                                      weights[k.replace('qkv_proj', 'k_proj')], 
                                      weights[k.replace('qkv_proj', 'v_proj')],
-                                     num_heads, num_kv_heads, head_dim)
+                                     num_heads, num_kv_heads, head_dim_patch)
             elif k.find('w13_weight') != -1: # expert
                 for expert_idx in range(num_experts):
                     local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)

@@ -70,8 +70,11 @@ class zmqComm:
                             send_obj_list([port_each],rank)
                             addr_each = [None]
                             recv_obj_list(addr_each,rank)
-                            self.schedule_sockets.append(make_socket(
-                                self.ctx, f'tcp://{addr_each[0]}:{port_each}', zmq.PUSH))
+                            socket = make_socket(self.ctx, f'tcp://{addr_each[0]}:{port_each}', zmq.PUSH)
+                            if rank < get_tp_size():
+                                self.schedule_first_pp_sockets.append(socket)
+                            else:
+                                self.schedule_other_sockets.append(socket)
                         # output rank => rank 0 : next tokens
                         port_token = self.port_base + get_world_size()
                         self.token_socket = make_socket(
