@@ -58,16 +58,11 @@ class FusedMoEMethod(torch.nn.Module):
         scoring_func: str = 'softmax',
         e_score_correction_bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        return self.forward_cuda(
-            x=x,
-            layer=layer,
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
             router_logits=router_logits,
             top_k=top_k,
             renormalize=renormalize,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
             use_grouped_topk=use_grouped_topk,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
@@ -75,12 +70,77 @@ class FusedMoEMethod(torch.nn.Module):
             e_score_correction_bias=e_score_correction_bias
         )
 
-    def forward_cuda(
+        return fused_experts(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=True,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+        )
+        
+class Fp8MoEMethod(FusedMoEMethod):
+    def __init__(self, quant_config):
+        super().__init__()
+        self.quant_config = quant_config
+        self.weight_block_size = self.quant_config['weight_block_size']
+        
+        
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=torch.float8_e4m3fn,
+            extra_weight_attrs=extra_weight_attrs,
+        )
+        
+        block_n, block_k = (
+            self.weight_block_size[0],
+            self.weight_block_size[1],
+        )
+
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                (hidden_size + block_k - 1) // block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                (hidden_size + block_n - 1) // block_n,
+                (intermediate_size_per_partition + block_k - 1) // block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        assert self.quant_config['activation_scheme'] == "dynamic"
+    
+    def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        top_k: int,
         router_logits: torch.Tensor,
+        top_k: int,
         renormalize: bool,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
@@ -115,6 +175,10 @@ class FusedMoEMethod(torch.nn.Module):
             apply_router_weight_on_input=apply_router_weight_on_input,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
+            use_fp8_w8a8=True,
+            w1_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            block_shape=self.weight_block_size,
         )
 
 class FusedMoE(torch.nn.Module):
@@ -154,8 +218,11 @@ class FusedMoE(torch.nn.Module):
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = 'silu',
         apply_router_weight_on_input: bool = False,
+        quant_config = None,
     ):
         super().__init__()
+        
+        self.quant_config = quant_config
         
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -197,19 +264,28 @@ class FusedMoE(torch.nn.Module):
             raise ValueError('Only softmax scoring function is supported for '
                              'non-grouped topk.')
         
-        self.fusedMoEMethod = FusedMoEMethod()
+        self.quant_method = self.dispatch_quant_method()
         
-        self.fusedMoEMethod.create_weights(
+        self.quant_method.create_weights(
             layer=self,
             num_experts=self.local_num_experts,
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
         )
+    
+    def dispatch_quant_method(self):
+        if self.quant_config is None:
+            return FusedMoEMethod()
+        elif self.quant_config['quant_method'] == 'fp8':
+            assert 'weight_block_size' in self.quant_config
+            return Fp8MoEMethod(self.quant_config)
+        else:
+            raise Exception(f"gLLM do not support quant_method {self.quant_config['quant_method']}")
         
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         # Matrix multiply.
-        final_hidden_states = self.fusedMoEMethod.apply(
+        final_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
             router_logits=router_logits,

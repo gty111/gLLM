@@ -4,6 +4,9 @@ import triton.language as tl
 
 from typing import Optional
 
+from gllm.utils import cdiv
+from gllm import _custom_ops as ops
+
 def fp8LinearMethod(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -493,3 +496,30 @@ def per_token_group_quant_fp8(
         )
 
     return x_q, x_s
+
+
+
+def _fp8_quantize(
+    A: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    per_act_token: bool,
+    block_shape: list[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Perform fp8 quantization on the inputs.  If a block_shape
+    is provided, the output will be blocked.
+    """
+    if block_shape is None:
+        # TODO(luka): use QuantFP8 custom op
+        #  https://github.com/vllm-project/vllm/issues/20711
+        A, A_scale = ops.scaled_fp8_quant(
+            A, A_scale, use_per_token_if_dynamic=per_act_token
+        )
+    else:
+        assert not per_act_token
+        assert len(block_shape) == 2
+        _, block_k = block_shape[0], block_shape[1]
+        A, A_scale = per_token_group_quant_fp8(A, block_k)
+        assert cdiv(A.size(-1), block_k) == A_scale.size(-1)
+
+    return A, A_scale

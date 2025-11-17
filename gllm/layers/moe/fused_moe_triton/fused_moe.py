@@ -8,10 +8,10 @@ import triton.language as tl
 from logger import logger
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
-from gllm.utils import direct_register_custom_op
-from gllm.utils import get_device_name
+from gllm.utils import direct_register_custom_op, get_device_name
 from gllm.layers.moe.moe_align_block_size import moe_align_block_size
 from gllm import _custom_ops as ops
+from gllm.layers.quantization.fp8 import _fp8_quantize
 
 padding_size = 128 if bool(int(os.getenv("GLLM_MOE_PADDING", "0"))) else 0
 
@@ -426,8 +426,14 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
-    assert A_scale is None
-    assert B_scale is None
+    if use_fp8_w8a8 or use_int8_w8a8:
+        assert B_scale is not None
+        assert block_shape is None or triton.cdiv(
+            B.size(-2), block_shape[0]
+        ) == B_scale.size(-2)
+        assert block_shape is None or triton.cdiv(
+            B.size(-1), block_shape[1]
+        ) == B_scale.size(-1)
 
     M = A.shape[0]
     num_tokens = M * top_k
@@ -682,6 +688,19 @@ def fused_experts(hidden_states: torch.Tensor,
         block_shape=block_shape)
 
 
+def moe_kernel_quantize_input(
+    A: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    quant_dtype: None | torch.dtype | str,
+    per_act_token_quant: bool,
+    block_shape: list[int] | None = None,
+    is_fp4_scale_swizzled: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if quant_dtype == torch.float8_e4m3fn:
+        return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+    else:
+        return A, A_scale
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -736,7 +755,9 @@ def fused_experts_impl(
                                         use_int8_w8a16=use_int8_w8a16,
                                         use_int4_w4a16=use_int4_w4a16,
                                         dtype=hidden_states.dtype)
-
+    
+    quant_dtype = None if not use_fp8_w8a8 else torch.float8_e4m3fn
+    
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
         w1.shape,
@@ -798,15 +819,22 @@ def fused_experts_impl(
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
+        qcurr_hidden_states, a1q_scale = moe_kernel_quantize_input(
+            A=curr_hidden_states,
+            A_scale=a1_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=block_shape,
+        )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'],
                                  global_num_experts, expert_map))
 
-        invoke_fused_moe_kernel(curr_hidden_states,
+        invoke_fused_moe_kernel(qcurr_hidden_states,
                                 w1,
                                 intermediate_cache1,
-                                a1_scale,
+                                a1q_scale,
                                 w1_scale,
                                 w1_zp,
                                 curr_topk_weights,
@@ -832,11 +860,19 @@ def fused_experts_impl(
                                       intermediate_cache1.view(-1, N))
         else:
             raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+        
+        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+            A=curr_hidden_states,
+            A_scale=a2_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=block_shape,
+        )
 
-        invoke_fused_moe_kernel(intermediate_cache2,
+        invoke_fused_moe_kernel(qintermediate_cache2,
                                 w2,
                                 intermediate_cache3,
-                                a2_scale,
+                                a2q_scale,
                                 w2_scale,
                                 w2_zp,
                                 curr_topk_weights,
