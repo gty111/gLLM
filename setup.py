@@ -189,14 +189,11 @@ ext_modules.append(
     CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa3_C"))
     
 package_data = {
-    "vllm": [
-        "py.typed",
-        "model_executor/layers/fused_moe/configs/*.json",
-        "model_executor/layers/quantization/utils/configs/*.json",
+    "gllm": [
+        "layers/moe/fused_moe_triton/configs/*.json",
     ]
 }
     
-
 assert _is_cuda(), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
 wheel_location = os.getenv("GLLM_PRECOMPILED_WHEEL_LOCATION", None)
 if wheel_location is not None:
@@ -212,18 +209,6 @@ else:
     else:
         raise ValueError(f"Unsupported architecture: {arch}")
     wheel_url = "https://wheels.vllm.ai/b8b302cde434df8c9289a2b465406b47ebab1c2d/vllm-0.11.0%2Bcu129-cp38-abi3-manylinux1_x86_64.whl"
-    nightly_wheel_url = (
-        f"https://wheels.vllm.ai/nightly/vllm-1.0.0.dev-cp38-abi3-{wheel_tag}.whl"
-    )
-    from urllib.request import urlopen
-
-    try:
-        with urlopen(wheel_url) as resp:
-            if resp.status != 200:
-                wheel_url = nightly_wheel_url
-    except Exception as e:
-        print(f"[warn] Falling back to nightly wheel: {e}")
-        wheel_url = nightly_wheel_url
 
 patch = precompiled_wheel_utils.extract_precompiled_and_patch_package(wheel_url)
 for pkg, files in patch.items():
