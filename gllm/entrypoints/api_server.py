@@ -49,8 +49,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
     token_ids = await make_async(llm.model_runner.encode)(request.prompt)
-    if llm.check_seq_length(token_ids, request.max_completion_tokens):
-        stream = await llm.add_requests_async(raw_request, token_ids, request.max_completion_tokens, request.ignore_eos,
+    if llm.check_seq_length(token_ids, request.max_tokens):
+        stream = await llm.add_requests_async(raw_request, token_ids, request.max_tokens, request.ignore_eos,
                                               request.temperature, request.top_p, request.top_k, request.repetition_penalty)
     else:
         return ErrorResponse(message="seq length exceeds max model length",
@@ -105,7 +105,7 @@ if __name__ == '__main__':
     parser.add_argument('--assigned-layers', type=str, help='If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15', default=None)
     # Token Throttling
     parser.add_argument('--maxd', type=int, help='Maximum decode token count per batch (Token Throttling)', default=2048)
-    parser.add_argument('--maxp', type=int, help='Maximum prefill token count per batch (Token Throttling) or token budget in Sarathi-Serve', default=2048)
+    parser.add_argument('--maxp', type=int, help='Maximum prefill token count per batch (Token Throttling) or token budget in Sarathi-Serve', default=8192)
     parser.add_argument('--minp', type=int, help='Minimum prefill token count per batch (Token Throttling)', default=32)
     parser.add_argument('--iterp', type=int, help='Number of iterations to process waiting prefill tokens (Token Throttling)', default=8)
     parser.add_argument('--kvthresh', type=float, help='KV cache threshold for prefill operations (Token Throttling)', default=0.05)
