@@ -57,8 +57,10 @@ class Sequence():
 
     @property
     def is_finish(self):
-        return (not self.ignore_eos and self[-1] in self.finish_tokens
-                    ) or len(self) - self.prompt_len >= self.output_len
+        return self.computed_prompt and (
+            (not self.ignore_eos and self[-1] in self.finish_tokens
+             ) or len(self) - self.prompt_len >= self.output_len
+            )
         
     def preempt(self):
         self.computed_token_num = 0
