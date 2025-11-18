@@ -862,7 +862,7 @@ def fused_experts_impl(
             raise ValueError(f"Unsupported FusedMoe activation: {activation}")
         
         qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-            A=curr_hidden_states,
+            A=intermediate_cache2,
             A_scale=a2_scale,
             quant_dtype=quant_dtype,
             per_act_token_quant=per_channel_quant,
