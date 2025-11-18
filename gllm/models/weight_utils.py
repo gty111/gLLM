@@ -9,6 +9,11 @@ def copy_qkv_proj(dst_qkv, src_q, src_k, src_v, num_heads, num_kv_heads, head_di
     dst_qkv[(num_heads +
             num_kv_heads)*head_dim:] = src_v[get_tp_rank()*num_kv_heads*head_dim:(get_tp_rank()+1)*num_kv_heads*head_dim]
 
+def copy_qkv_a_proj(dst, q_a_proj, kv_a_proj_with_mqa):
+    size_partition = q_a_proj.shape[0]
+    dst[:size_partition] = q_a_proj
+    dst[size_partition:] = kv_a_proj_with_mqa
+
 def copy_gate_up_proj(dst, src_gate, src_up, partition_tp=True):
     size_partition = dst.shape[0] // 2
     if partition_tp:

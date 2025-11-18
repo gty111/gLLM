@@ -6,7 +6,7 @@ from functools import partial
 
 from gllm.dist_utils import (get_tp_size, get_tp_rank, divide, 
                              split_tensor_along_last_dim, tensor_model_parallel_all_reduce)
-from gllm.layers.quantization.fp8 import fp8LinearMethod
+from gllm.layers.quantization.fp8 import fp8LinearMethod, validate_fp8_block_shape
 from gllm.utils import get_device_capability
 
 class LinearBase(torch.nn.Module):
@@ -43,10 +43,12 @@ class LinearBase(torch.nn.Module):
         self.return_bias = return_bias
         self.quant_config = quant_config
 
-    def create_weights(self,
-                       input_size_per_partition: int,
-                       output_partition_sizes: list[int], 
-                       params_dtype: torch.dtype):
+    def create_weights(
+        self,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int], 
+        params_dtype: torch.dtype
+    ):
         if self.quant_config is None:
             weight = Parameter(torch.rand(sum(output_partition_sizes),
                                         input_size_per_partition,
@@ -61,19 +63,14 @@ class LinearBase(torch.nn.Module):
             if self.block_quant:
                 self.weight_block_size = self.quant_config['weight_block_size']
                 block_n, block_k = self.weight_block_size
-                if get_tp_size() > 1 :
-                    if input_size_per_partition % block_k != 0:
-                        raise ValueError(
-                            f"Weight input_size_per_partition = "
-                            f"{input_size_per_partition} is not divisible by "
-                            f"weight quantization block_k = {block_k}.")
-                    if len(output_partition_sizes) > 1:
-                        for output_partition_size in output_partition_sizes:
-                            if output_partition_size % block_n != 0:
-                                raise ValueError(
-                                    f"Weight output_partition_size = "
-                                    f"{output_partition_size} is not divisible by "
-                                    f"weight quantization block_n = {block_n}.")
+                validate_fp8_block_shape(
+                    layer=self,
+                    input_size=self.input_size,
+                    output_size=self.output_size,
+                    input_size_per_partition=input_size_per_partition,
+                    output_partition_sizes=output_partition_sizes,
+                    block_size=self.weight_block_size
+                )
             weight_dtype = torch.float8_e4m3fn
             weight = Parameter(torch.rand(sum(output_partition_sizes),
                                           input_size_per_partition).to(weight_dtype),
@@ -263,9 +260,10 @@ class ColumnParallelLinear(LinearBase):
         output_sizes: Optional[list[int]] = None,
         return_bias: bool = False,
         quant_config = None,
+        disable_tp: bool = False,
     ):
         # Divide the weight matrix along the last dimension.
-        self.tp_size = get_tp_size()
+        self.tp_size = get_tp_size() if not disable_tp else 1
         self.input_size_per_partition = input_size
         self.output_size_per_partition = divide(output_size, self.tp_size)
         self.output_partition_sizes = [self.output_size_per_partition]
@@ -345,9 +343,10 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         params_dtype: Optional[torch.dtype] = None,
         return_bias: bool = False,
         quant_config = None,
+        disable_tp: bool = False,
     ):
         self.output_sizes = output_sizes
-        tp_size = get_tp_size()
+        tp_size = get_tp_size() if not disable_tp else 1
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         super().__init__(input_size=input_size,
                          output_size=sum(output_sizes),
@@ -355,7 +354,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                          skip_bias_add=skip_bias_add,
                          params_dtype=params_dtype,
                          return_bias=return_bias,
-                         quant_config=quant_config)
+                         quant_config=quant_config,
+                         disable_tp=disable_tp)
         
 
 class QKVParallelLinear(ColumnParallelLinear):
@@ -429,3 +429,75 @@ class QKVParallelLinear(ColumnParallelLinear):
                          params_dtype=params_dtype,
                          return_bias=return_bias,
                          quant_config=quant_config)
+        
+        
+class ReplicatedLinear(LinearBase):
+    """Replicated linear layer.
+
+    Args:
+        input_size: input dimension of the linear layer.
+        output_size: output dimension of the linear layer.
+        bias: If true, add bias.
+        skip_bias_add: If true, skip adding bias but instead return it.
+        params_dtype: Data type for the parameters.
+        quant_config: Quantization configure.
+        prefix: The name of the layer in the state dict, including all parents
+                        (e.g. model.layers.0.qkv_proj)
+        return_bias: If true, return bias together with outputs in forward pass.
+        disable_tp: Take no effect for replicated linear layers.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config = None,
+        *,
+        return_bias: bool = False,
+    ):
+        # If MergedReplicatedLinear, use output size of each partition.
+        if hasattr(self, "output_sizes"):
+            self.output_partition_sizes = self.output_sizes
+        else:
+            self.output_partition_sizes = [output_size]
+
+        super().__init__(
+            input_size,
+            output_size,
+            skip_bias_add,
+            params_dtype,
+            return_bias=return_bias,
+            quant_config=quant_config,
+        )
+
+        self.create_weights(
+            self.input_size,
+            self.output_partition_sizes,
+            self.params_dtype,
+        )
+
+        if bias:
+            self.bias = Parameter(
+                torch.empty(self.output_size, dtype=self.params_dtype)
+            )
+        else:
+            self.register_parameter("bias", None)
+            
+        self.quant_method = self.dispatch_quant_method()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+        assert self.quant_method is not None
+
+        output = self.quant_method(x, self.weight, bias=bias)
+        output_bias = self.bias if self.skip_bias_add else None
+
+        if not self.return_bias:
+            return output
+        return output, output_bias

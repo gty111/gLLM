@@ -107,6 +107,8 @@ class MLAAttention():
         self.W_UV = W_UV.transpose(0, 1)
         # Convert from (L, N, P) to (N, P, L)
         self.W_UK_T = W_UK.permute(1, 2, 0)
+        
+        self.kv_cache_dtype = 'auto'
 
     def _flash_attn_varlen_diff_headdims(self, q, k, v, softmax_scale,
                                          return_softmax_lse, **kwargs):
@@ -171,6 +173,7 @@ class MLAAttention():
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        k_scale: torch.Tensor,
     ):
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
@@ -183,12 +186,14 @@ class MLAAttention():
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            ops.gather_cache(
+            ops.gather_and_maybe_dequant_cache(
                 src_cache=kv_c_and_k_pe_cache,
                 dst=workspace,
                 block_table=prefill_metadata.block_table,
                 cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
                 batch_size=attn_metadata.num_prefills,
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=k_scale,
                 seq_starts=prefill_metadata.chunked_context.starts[i],
             )
 
@@ -254,14 +259,14 @@ class MLAAttention():
         k_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        k_scale: torch.Tensor,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
 
         has_context = attn_metadata.prefill.chunked_context is not None
-        kv_nope = self.kv_b_proj(kv_c_normed).view(\
+        kv_nope = self.kv_b_proj(kv_c_normed).view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = kv_nope\
-            .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
@@ -275,8 +280,8 @@ class MLAAttention():
 
         if has_context:
             suffix_output, suffix_lse = output
-            context_output, context_lse = self._compute_prefill_context( \
-                q, kv_c_and_k_pe_cache, attn_metadata)
+            context_output, context_lse = self._compute_prefill_context(
+                q, kv_c_and_k_pe_cache, attn_metadata, k_scale)
 
             output = torch.empty_like(suffix_output)
             merge_attn_states(
@@ -389,14 +394,14 @@ class MLAAttention():
                 k_pe.squeeze(1),
                 kv_cache,
                 attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype='auto',
+                kv_cache_dtype=self.kv_cache_dtype,
                 scale=self._k_scale,
             )
 
         if has_prefill:
             output[num_decode_tokens:] = self._forward_prefill(
                 prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
-                attn_metadata)
+                attn_metadata, self._k_scale)
 
         if has_decode:
             assert attn_metadata.decode is not None
