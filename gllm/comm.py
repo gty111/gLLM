@@ -49,10 +49,10 @@ class zmqComm:
                     self.ctx, self.output_path, zmq.PUSH)
                 
                 if get_world_size() != 1:
+                    self.schedule_first_pp_sockets: List[zmq.Socket] = []
+                    self.schedule_other_sockets: List[zmq.Socket] = []
                     if self.launch_mode == 'normal':
                         # rank 0 => other ranks : batched seqs
-                        self.schedule_first_pp_sockets: List[zmq.Socket] = []
-                        self.schedule_other_sockets: List[zmq.Socket] = []
                         for rank in range(1, get_world_size()):
                             socket = make_socket(self.ctx, f'{self.schedule_path}_{rank}', zmq.PUSH)
                             if rank < get_tp_size():

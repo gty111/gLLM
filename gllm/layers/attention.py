@@ -3,7 +3,7 @@ import torch
 from typing import Optional
 
 from gllm.vllm_flash_attn import flash_attn_varlen_func
-from gllm.layers.linear import ColumnParallelLinear
+from gllm.layers.linear import ColumnParallelLinear, LinearBase
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 from gllm.layers.ops.merge_attn_states import merge_attn_states
 from gllm import _custom_ops as ops
@@ -93,13 +93,28 @@ class MLAAttention():
 
         self._k_scale = torch.tensor(1.0, dtype=torch.float32)
 
-        kv_b_proj_weight = self.kv_b_proj.weight.T
+        self.W_UV = None
+        self.W_UK_T = None
+        
+        self.kv_cache_dtype = 'auto'
+    
+    def process_weights(self):    
+        def get_and_maybe_dequant_weights(layer: LinearBase):
+            eye = torch.eye(layer.input_size_per_partition)
+            dequant_weights = layer.quant_method(
+                eye,
+                layer.weight,
+                bias=None
+            )
+            del eye
+            return dequant_weights.T
+        kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
         kv_b_proj_weight = kv_b_proj_weight.view(
             self.kv_lora_rank,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
-
+        
         W_UK, W_UV = kv_b_proj_weight.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
@@ -158,19 +173,31 @@ class MLAAttention():
             return_softmax_lse=True,
         )
 
-    def _v_up_proj(self, x):
+    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
+        # Convert from (B, N * V) to (N, B, V)
+        out = out.view(-1, self.num_heads, self.v_head_dim).transpose(0, 1)
+
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
-        x = torch.bmm(x, self.W_UV)
+        if self.W_UV is None:
+            self.process_weights()
+        torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
+
         # Convert from (N, B, V) to (B, N * V)
-        return x.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
+        out_new = out.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
+
+        # Adjust output buffer shape back to the original (B, N * V)
+        N, B, V = out.shape
+        out.resize_((B, N * V))
+        out.copy_(out_new)  # Copy result
 
     def _compute_prefill_context(
         self,
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        k_scale: torch.Tensor,
     ):
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
@@ -183,12 +210,14 @@ class MLAAttention():
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            ops.gather_cache(
+            ops.gather_and_maybe_dequant_cache(
                 src_cache=kv_c_and_k_pe_cache,
                 dst=workspace,
                 block_table=prefill_metadata.block_table,
                 cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
                 batch_size=attn_metadata.num_prefills,
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=k_scale,
                 seq_starts=prefill_metadata.chunked_context.starts[i],
             )
 
@@ -254,14 +283,14 @@ class MLAAttention():
         k_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        k_scale: torch.Tensor,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
 
         has_context = attn_metadata.prefill.chunked_context is not None
-        kv_nope = self.kv_b_proj(kv_c_normed).view(\
+        kv_nope = self.kv_b_proj(kv_c_normed).view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = kv_nope\
-            .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
@@ -275,8 +304,8 @@ class MLAAttention():
 
         if has_context:
             suffix_output, suffix_lse = output
-            context_output, context_lse = self._compute_prefill_context( \
-                q, kv_c_and_k_pe_cache, attn_metadata)
+            context_output, context_lse = self._compute_prefill_context(
+                q, kv_c_and_k_pe_cache, attn_metadata, k_scale)
 
             output = torch.empty_like(suffix_output)
             merge_attn_states(
@@ -295,30 +324,35 @@ class MLAAttention():
 
     def _forward_decode(
         self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
     ) -> torch.Tensor:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-        B = q_nope.shape[0]
+        if self.kv_cache_dtype.startswith("fp8"):
+            raise NotImplementedError("FP8 Triton MLA not yet supported")
 
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        o = torch.zeros(B,
-                        self.num_heads,
-                        self.kv_lora_rank,
-                        dtype=q.dtype,
-                        device=q.device)
+        if type(q) is tuple:
+            q = torch.cat(q, dim=-1)
 
-        num_kv_splits = 4  # TODO: heuristic
+        assert isinstance(q, torch.Tensor)
+        B = q.shape[0]
+        q_num_heads = q.shape[1]
+        o = torch.zeros(
+            B, q_num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+        )
+        lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
+
+        # For batch invariance, use only 1 split to ensure deterministic reduction
+        num_kv_splits = 4
 
         # TODO(lucas) Allocate ahead of time
         attn_logits = torch.empty(
             (
                 B,
-                self.num_heads,
+                q_num_heads,
                 num_kv_splits,
                 # NOTE(lucas) idk why the +1 is here but sglang has it so we
                 # just mirror that
@@ -330,16 +364,25 @@ class MLAAttention():
 
         # Add a head dim of 1
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
-        kv_c_cache = kv_c_and_k_pe_cache[..., :self.kv_lora_rank]
+        kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
         # Run MQA
-        decode_attention_fwd(q, kv_c_and_k_pe_cache, kv_c_cache, o,
-                             attn_metadata.decode.block_table,
-                             attn_metadata.decode.seq_lens, attn_logits,
-                             num_kv_splits, self.scale, PAGE_SIZE)
+        decode_attention_fwd(
+            q,
+            kv_c_and_k_pe_cache,
+            kv_c_cache,
+            o,
+            lse,
+            attn_metadata.decode.block_table,
+            attn_metadata.decode.seq_lens,
+            attn_logits,
+            num_kv_splits,
+            self.scale,
+            PAGE_SIZE,
+        )
 
-        return self._v_up_proj(o)
+        return o, lse
     
     def forward(
         self,
@@ -368,9 +411,11 @@ class MLAAttention():
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
-        assert attn_metadata.num_decodes is not None and \
-            attn_metadata.num_prefills is not None and \
-            attn_metadata.num_decode_tokens is not None
+        assert (
+            attn_metadata.num_decodes is not None 
+            and attn_metadata.num_prefills is not None 
+            and attn_metadata.num_decode_tokens is not None
+        )
 
         has_decode = attn_metadata.num_decodes > 0
         has_prefill = attn_metadata.num_prefills > 0
@@ -389,14 +434,14 @@ class MLAAttention():
                 k_pe.squeeze(1),
                 kv_cache,
                 attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype='auto',
+                kv_cache_dtype=self.kv_cache_dtype,
                 scale=self._k_scale,
             )
 
         if has_prefill:
             output[num_decode_tokens:] = self._forward_prefill(
                 prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
-                attn_metadata)
+                attn_metadata, self._k_scale)
 
         if has_decode:
             assert attn_metadata.decode is not None
@@ -404,12 +449,28 @@ class MLAAttention():
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             # Convert from (B, N, P) to (N, B, P)
             decode_q_nope = decode_q_nope.transpose(0, 1)
+            
+            N, B, P = decode_q_nope.shape
+            if self.W_UK_T is None:
+                self.process_weights()
+            _, _, L = self.W_UK_T.shape
+            
+            decode_ql_nope = decode_q_nope.new_empty((N, B, L))
+            
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-            decode_ql_nope = torch.bmm(decode_q_nope, self.W_UK_T)
+            torch.bmm(decode_q_nope, self.W_UK_T, out=decode_ql_nope)
+            
             # Convert from (N, B, L) to (B, N, L)
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
+            
+            decode_q = (decode_ql_nope, decode_q_pe)
+            
+            # call decode attn
+            attn_out, lse = self._forward_decode(
+                decode_q, kv_cache, attn_metadata
+            )
 
-            output[:num_decode_tokens] = self._forward_decode(
-                decode_ql_nope, decode_q_pe, kv_cache, attn_metadata)
+            # v_up projection
+            self._v_up_proj(attn_out, out=output[:num_decode_tokens])
 
         return output_padded

@@ -1,17 +1,12 @@
 import torch
-import contextlib
 
 from typing import Optional
 
 try:
     import gllm._C
+    import gllm._moe_C
 except ImportError as e:
     print(e)
-    
-supports_moe_ops = False
-with contextlib.suppress(ImportError):
-    import gllm._moe_C  # noqa: F401
-    supports_moe_ops = True
 
 # cache ops
 def reshape_and_cache_flash(
@@ -37,18 +32,30 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
-    torch.ops._C.concat_and_cache_mla(kv_c, k_pe, kv_cache,
+    torch.ops._C_cache_ops.concat_and_cache_mla(kv_c, k_pe, kv_cache,
                                                 slot_mapping, kv_cache_dtype,
                                                 scale)
 
-def gather_cache(src_cache: torch.Tensor,
-                 dst: torch.Tensor,
-                 block_table: torch.Tensor,
-                 cu_seq_lens: torch.Tensor,
-                 batch_size: int,
-                 seq_starts: Optional[torch.Tensor] = None) -> None:
-    torch.ops._C.gather_cache(src_cache, dst, block_table,
-                                        cu_seq_lens, batch_size, seq_starts)
+def gather_and_maybe_dequant_cache(
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    batch_size: int,
+    kv_cache_dtype: str,
+    scale: torch.Tensor,
+    seq_starts: torch.Tensor | None = None,
+) -> None:
+    torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        batch_size,
+        kv_cache_dtype,
+        scale,
+        seq_starts,
+    )
     
 # merge attn states ops
 def merge_attn_states(output: torch.Tensor,
@@ -110,18 +117,26 @@ def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
     torch.ops._moe_C.moe_sum(input, output)
 
-def moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,
-                         block_size: int, sorted_token_ids: torch.Tensor,
-                         experts_ids: torch.Tensor,
-                         num_tokens_post_pad: torch.Tensor) -> None:
-    torch.ops._moe_C.moe_align_block_size(topk_ids, num_experts, block_size,
-                                          sorted_token_ids, experts_ids,
-                                          num_tokens_post_pad)
-
-def sgl_moe_align_block_size(topk_ids: torch.Tensor, num_experts: int,
-                             block_size: int, sorted_token_ids: torch.Tensor,
-                             experts_ids: torch.Tensor,
-                             num_tokens_post_pad: torch.Tensor) -> None:
-    torch.ops._moe_C.sgl_moe_align_block_size(topk_ids, num_experts,
-                                              block_size, sorted_token_ids,
-                                              experts_ids, num_tokens_post_pad)
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    experts_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    torch.ops._moe_C.moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_token_ids,
+        experts_ids,
+        num_tokens_post_pad,
+    )
+    
+def grouped_topk(scores: torch.Tensor, scores_with_bias: torch.Tensor,
+                 num_expert_group: int, topk_group: int, topk: int,
+                 renormalize: bool, routed_scaling_factor: float):
+    return torch.ops._moe_C.grouped_topk(scores, scores_with_bias,
+                                         num_expert_group, topk_group, topk,
+                                         renormalize, routed_scaling_factor)

@@ -4,10 +4,11 @@ import torch.nn as nn
 from typing import Optional
 
 from gllm.layers.moe import FusedMoE
-from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, ColumnParallelLinear
+from gllm.layers.linear import (MergedColumnParallelLinear, RowParallelLinear, ColumnParallelLinear,
+                                ReplicatedLinear)
 from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from gllm.layers.activation import SiluAndMul
-from gllm.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
+from gllm.layers.rotary_embedding import YaRNScalingRotaryEmbedding
 from gllm.layers.attention import FlashAttention, MLAAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
@@ -21,17 +22,23 @@ from .qwen2_moe import Qwen2MoeForCausalLM
 
 class DeepseekV2MLP(nn.Module):
 
-    def __init__(self, hidden_size, intermediate_size, reduce_results: bool = True):
+    def __init__(self, hidden_size, intermediate_size, reduce_results: bool = True, quant_config = None):
         super().__init__()
 
-        self.gate_up_proj = MergedColumnParallelLinear(hidden_size, 
-                                                       [intermediate_size]*2, 
-                                                       bias=False)
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size, 
+            [intermediate_size]*2, 
+            bias=False,
+            quant_config=quant_config
+        )
         
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           reduce_results=reduce_results)
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results
+        )
 
         self.act_fn = SiluAndMul()
 
@@ -42,14 +49,17 @@ class DeepseekV2MOE(nn.Module):
     def __init__(self, config):
         super().__init__()
         
+        quant_config = getattr(config, 'quantization_config', None)
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts: int = config.n_shared_experts
-        self.gate = nn.Linear(config.hidden_size,
-                              config.n_routed_experts,
-                              bias=False)
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.n_routed_experts,
+            bias=False,
+        )
         if config.topk_method == 'noaux_tc':
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts))
+                torch.empty(config.n_routed_experts, dtype=torch.float32))
         else:
             self.gate.e_score_correction_bias = None
         
@@ -65,14 +75,18 @@ class DeepseekV2MOE(nn.Module):
             topk_group=config.topk_group,
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
+            quant_config=quant_config,
         )
         
         if config.n_shared_experts is not None:
             intermediate_size = (config.moe_intermediate_size *
                                  config.n_shared_experts)
-            self.shared_experts = DeepseekV2MLP(config.hidden_size,
-                                                intermediate_size,
-                                                reduce_results=False)
+            self.shared_experts = DeepseekV2MLP(
+                config.hidden_size,
+                intermediate_size,
+                reduce_results=False,
+                quant_config=quant_config
+            )
             
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -109,6 +123,7 @@ class DeepseekV2MOE(nn.Module):
 class DeepseekV2Attention(Attention):
     
     def __init__(self, layer_id: int, config):
+        quant_config = getattr(config, 'quantization_config', None)
         self.hidden_size = config.hidden_size
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -127,36 +142,54 @@ class DeepseekV2Attention(Attention):
         self.rope_scaling = getattr(config, 'rope_scaling', None)
         
         if self.q_lora_rank is not None:
-            self.q_a_proj = nn.Linear(self.hidden_size,
-                                      self.q_lora_rank,
-                                      bias=False)
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
-                                         eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(self.q_lora_rank,
-                                                 self.total_num_heads * 
-                                                 self.qk_head_dim,
-                                                 bias=False)
+            self.q_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank,
+                bias=False,
+                quant_config=quant_config)
+            self.q_a_layernorm = RMSNorm(
+                self.q_lora_rank,
+                eps=config.rms_norm_eps
+            )
+            self.q_b_proj = ColumnParallelLinear(
+                self.q_lora_rank,
+                self.total_num_heads * 
+                self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config
+            )
         else:
-            self.q_proj = ColumnParallelLinear(self.hidden_size,
-                                               self.total_num_heads *
-                                               self.qk_head_dim,
-                                               bias=False)
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.total_num_heads *
+                self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config
+            )
         
-        self.kv_a_proj_with_mqa = nn.Linear(
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
             self.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False)
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
-                                      eps=config.rms_norm_eps)
+            bias=False,
+            quant_config=quant_config
+        )
+        self.kv_a_layernorm = RMSNorm(
+            self.kv_lora_rank,
+            eps=config.rms_norm_eps
+        )
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False)
+            bias=False,
+            quant_config=quant_config
+        )
         # O projection
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
             self.hidden_size,
-            bias=False)
+            bias=False,
+            quant_config=quant_config
+        )
         
         if self.rope_scaling:
             self.rope_scaling['rope_type'] = 'deepseek_yarn'
@@ -168,11 +201,10 @@ class DeepseekV2Attention(Attention):
         extra_kwargs = {
             k: v
             for k, v in self.rope_scaling.items()
-            if k in ("extrapolation_factor", "attn_factor", "beta_fast",
-                         "beta_slow", "mscale", "mscale_all_dim")
+            if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
         }
         
-        self.rotary_emb = DeepseekScalingRotaryEmbedding(
+        self.rotary_emb = YaRNScalingRotaryEmbedding(
             self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
             max_position_embeddings=self.rope_scaling[
@@ -236,6 +268,7 @@ class DeepseekV2Attention(Attention):
     
 class DeepseekV2MLAAttention(Attention):
     def __init__(self, layer_id: int, config):
+        quant_config = getattr(config, 'quantization_config', None)
         self.hidden_size = config.hidden_size
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_rope_head_dim = config.qk_rope_head_dim
@@ -255,15 +288,18 @@ class DeepseekV2MLAAttention(Attention):
         self.layer_id = layer_id
 
         if self.q_lora_rank is not None:
-            self.fused_qkv_a_proj = nn.Linear(
+            self.fused_qkv_a_proj = MergedColumnParallelLinear(
                 self.hidden_size,
-                sum([self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]),
-                bias=False)
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                bias=False,
+                quant_config=quant_config,
+                disable_tp=True)
         else:
-            self.kv_a_proj_with_mqa = nn.Linear(
+            self.kv_a_proj_with_mqa = ReplicatedLinear(
                 self.hidden_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
-                bias=False)
+                bias=False,
+                quant_config=quant_config)
 
         if self.q_lora_rank is not None:
             self.q_a_layernorm = RMSNorm(self.q_lora_rank,
@@ -271,22 +307,26 @@ class DeepseekV2MLAAttention(Attention):
             self.q_b_proj = ColumnParallelLinear(self.q_lora_rank,
                                                  self.total_num_heads *
                                                  self.qk_head_dim,
-                                                 bias=False)
+                                                 bias=False,
+                                                 quant_config=quant_config)
         else:
             self.q_proj = ColumnParallelLinear(self.hidden_size,
                                                self.total_num_heads *
                                                self.qk_head_dim,
-                                               bias=False)
+                                               bias=False,
+                                               quant_config=quant_config)
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
                                       eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False)
+            bias=False,
+            quant_config=quant_config)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
             self.hidden_size,
-            bias=False)
+            bias=False,
+            quant_config=quant_config)
         
         if self.rope_scaling:
             self.rope_scaling['rope_type'] = 'deepseek_yarn'
@@ -299,10 +339,10 @@ class DeepseekV2MLAAttention(Attention):
             k: v
             for k, v in self.rope_scaling.items()
             if k in ("extrapolation_factor", "attn_factor", "beta_fast",
-                         "beta_slow", "mscale", "mscale_all_dim")
+                         "beta_slow")
         }
         
-        self.rotary_emb = DeepseekScalingRotaryEmbedding(
+        self.rotary_emb = YaRNScalingRotaryEmbedding(
             self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
             max_position_embeddings=self.rope_scaling[
@@ -381,6 +421,7 @@ class DeepseekV2DecoderLayer(nn.Module):
     
     def __init__(self, glb_layer_id:int, layer_id:int, config):
         super().__init__()
+        quant_config = getattr(config, 'quantization_config', None)
         if not config.use_mla:
             self.self_attn = DeepseekV2Attention(layer_id, config)
         else:
@@ -392,12 +433,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             self.mlp = DeepseekV2MOE(config)
         else:
             self.mlp = DeepseekV2MLP(config.hidden_size,
-                                     config.intermediate_size)
+                                     config.intermediate_size,
+                                     quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
         self.routed_scaling_factor = config.routed_scaling_factor
+        
+        self.layer_id = layer_id
         
     def forward(self, input_data:InputData,
                 hidden_states: torch.Tensor,

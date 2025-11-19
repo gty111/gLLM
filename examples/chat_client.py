@@ -31,6 +31,7 @@ while True:
         break
     elif prompt == '\\clear':
         messages = []
+        continue
     messages.append({'role': 'user', 'content': prompt})
     chat_completion = client.chat.completions.create(
         messages=messages,
