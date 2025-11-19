@@ -89,8 +89,6 @@ python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
 
 ### Launch OpenAI-Compatible Server (Multi-node)
 
-> Experimental feature
-
 gLLM can be launched in three modes: (1) `normal`, used for single-node multiple GPUs (2) `master`, used for multi-node deployment (3) `slave`, used for multi-node deployment.
 
 To launch master gLLM instance
