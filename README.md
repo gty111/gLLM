@@ -23,7 +23,7 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 - [2025/08/15]: Qwen2.5 VL is supported :hugs:
 - [2025/08/01]: DeepSeek V2 is supported :clap:
 - [2025/07/12]: FP8 quantization for Qwen3/2.5 is supported :tada:
-- [2025/06/27]: [gLLM](https://dl.acm.org/doi/full/10.1145/3712285.3759823) is accepted by SC'25. Congratulations :smiling_face_with_three_hearts:
+- [2025/06/27]: [gLLM](https://doi.org/10.1145/3712285.3759823) is accepted by SC'25. Congratulations :smiling_face_with_three_hearts:
 - [2025/06/21]: Expert parallelism is integrated :heart_eyes:
 - [2025/06/14]: Tensor parallelism is now integrated, allowing joint deploying with pipeline parallelism :sunglasses:
 - [2025/05/05]: MoE architecture is supported. Try Qwen2/3 MoE models :star_struck:
