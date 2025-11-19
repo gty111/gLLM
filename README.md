@@ -18,10 +18,12 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **token throttling**, **pipeline parallelism**, **expert parallelsim** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (**supported in huggingface**) inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** (~6k loc) code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
+- [2025/11/19]: DeepSeek V3 is supported :laughing:
+- [2025/09/19]: [DynaPipe](https://openreview.net/forum?id=D6w7wIN360) is accepted by NeurIPS'25. Congratulations :smiling_face_with_three_hearts:
 - [2025/08/15]: Qwen2.5 VL is supported :hugs:
-- [2025/08/01]: DeepSeek V2/3 is supported :clap:
+- [2025/08/01]: DeepSeek V2 is supported :clap:
 - [2025/07/12]: FP8 quantization for Qwen3/2.5 is supported :tada:
-- [2025/06/27]: gLLM is accepted by SC'25. Congratulations :smiling_face_with_three_hearts:
+- [2025/06/27]: [gLLM](https://dl.acm.org/doi/full/10.1145/3712285.3759823) is accepted by SC'25. Congratulations :smiling_face_with_three_hearts:
 - [2025/06/21]: Expert parallelism is integrated :heart_eyes:
 - [2025/06/14]: Tensor parallelism is now integrated, allowing joint deploying with pipeline parallelism :sunglasses:
 - [2025/05/05]: MoE architecture is supported. Try Qwen2/3 MoE models :star_struck:
@@ -167,15 +169,34 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 
 ## Cite Our Work
+
 ```
-@misc{guo2025gllmglobalbalancedpipeline,
-      title={gLLM: Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Token Throttling}, 
-      author={Tianyu Guo and Xianwei Zhang and Jiangsu Du and Zhiguang Chen and Nong Xiao and Yutong Lu},
-      year={2025},
-      eprint={2504.14775},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2504.14775}, 
+@inproceedings{10.1145/3712285.3759823,
+author = {Guo, Tianyu and Zhang, Xianwei and Du, Jiangsu and Chen, Zhiguang and Xiao, Nong and Lu, Yutong},
+title = {gLLM: Global Balanced Pipeline Parallelism Systems for Distributed LLMs Serving with Token Throttling},
+year = {2025},
+isbn = {9798400714665},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3712285.3759823},
+doi = {10.1145/3712285.3759823},
+booktitle = {Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis},
+pages = {1725–1741},
+numpages = {17},
+keywords = {LLM, Inference, Parallelism, Pipeline Bubbles, Throttling, Runtime},
+location = {},
+series = {SC '25}
+}
+```
+
+```
+@inproceedings{
+xu2025dynapipe,
+title={DynaPipe: Dynamic Layer Redistribution for Efficient Serving of {LLM}s with Pipeline Parallelism},
+author={HongXin Xu and Tianyu Guo and Xianwei Zhang},
+booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+year={2025},
+url={https://openreview.net/forum?id=D6w7wIN360}
 }
 ```
 
