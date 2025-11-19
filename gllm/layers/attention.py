@@ -3,7 +3,7 @@ import torch
 from typing import Optional
 
 from gllm.vllm_flash_attn import flash_attn_varlen_func
-from gllm.layers.linear import ColumnParallelLinear
+from gllm.layers.linear import ColumnParallelLinear, LinearBase
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 from gllm.layers.ops.merge_attn_states import merge_attn_states
 from gllm import _custom_ops as ops
@@ -93,13 +93,28 @@ class MLAAttention():
 
         self._k_scale = torch.tensor(1.0, dtype=torch.float32)
 
-        kv_b_proj_weight = self.kv_b_proj.weight.T
+        self.W_UV = None
+        self.W_UK_T = None
+        
+        self.kv_cache_dtype = 'auto'
+    
+    def process_weights(self):    
+        def get_and_maybe_dequant_weights(layer: LinearBase):
+            eye = torch.eye(layer.input_size_per_partition)
+            dequant_weights = layer.quant_method(
+                eye,
+                layer.weight,
+                bias=None
+            )
+            del eye
+            return dequant_weights.T
+        kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
         kv_b_proj_weight = kv_b_proj_weight.view(
             self.kv_lora_rank,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
-
+        
         W_UK, W_UV = kv_b_proj_weight.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
@@ -107,8 +122,6 @@ class MLAAttention():
         self.W_UV = W_UV.transpose(0, 1)
         # Convert from (L, N, P) to (N, P, L)
         self.W_UK_T = W_UK.permute(1, 2, 0)
-        
-        self.kv_cache_dtype = 'auto'
 
     def _flash_attn_varlen_diff_headdims(self, q, k, v, softmax_scale,
                                          return_softmax_lse, **kwargs):
@@ -167,6 +180,8 @@ class MLAAttention():
         out = out.view(-1, self.num_heads, self.v_head_dim).transpose(0, 1)
 
         # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
+        if self.W_UV is None:
+            self.process_weights()
         torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
 
         # Convert from (N, B, V) to (B, N * V)
@@ -436,6 +451,8 @@ class MLAAttention():
             decode_q_nope = decode_q_nope.transpose(0, 1)
             
             N, B, P = decode_q_nope.shape
+            if self.W_UK_T is None:
+                self.process_weights()
             _, _, L = self.W_UK_T.shape
             
             decode_ql_nope = decode_q_nope.new_empty((N, B, L))

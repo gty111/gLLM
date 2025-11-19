@@ -2,14 +2,13 @@ import torch
 import torch.nn as nn
 
 from typing import Optional
-from logger import logger
 
 from gllm.layers.moe import FusedMoE
 from gllm.layers.linear import (MergedColumnParallelLinear, RowParallelLinear, ColumnParallelLinear,
                                 ReplicatedLinear)
 from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from gllm.layers.activation import SiluAndMul
-from gllm.layers.rotary_embedding import DeepseekScalingRotaryEmbedding
+from gllm.layers.rotary_embedding import YaRNScalingRotaryEmbedding
 from gllm.layers.attention import FlashAttention, MLAAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.input_data import InputData
@@ -202,11 +201,10 @@ class DeepseekV2Attention(Attention):
         extra_kwargs = {
             k: v
             for k, v in self.rope_scaling.items()
-            if k in ("extrapolation_factor", "attn_factor", "beta_fast",
-                         "beta_slow", "mscale", "mscale_all_dim")
+            if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
         }
         
-        self.rotary_emb = DeepseekScalingRotaryEmbedding(
+        self.rotary_emb = YaRNScalingRotaryEmbedding(
             self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
             max_position_embeddings=self.rope_scaling[
@@ -322,7 +320,8 @@ class DeepseekV2MLAAttention(Attention):
         self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False)
+            bias=False,
+            quant_config=quant_config)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
             self.hidden_size,
@@ -340,10 +339,10 @@ class DeepseekV2MLAAttention(Attention):
             k: v
             for k, v in self.rope_scaling.items()
             if k in ("extrapolation_factor", "attn_factor", "beta_fast",
-                         "beta_slow", "mscale", "mscale_all_dim")
+                         "beta_slow")
         }
         
-        self.rotary_emb = DeepseekScalingRotaryEmbedding(
+        self.rotary_emb = YaRNScalingRotaryEmbedding(
             self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
             max_position_embeddings=self.rope_scaling[
