@@ -54,7 +54,7 @@ class GLMAttention(Attention):
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(input_data.positions, q, k)
+        q, k = self.rotary_emb(input_data.get_position(), q, k)
         attn_output = self.attn.forward(q, k, v, input_data)
         output = self.dense(attn_output)
         return output
@@ -183,7 +183,7 @@ class ChatGLMModel(nn.Module):
 
     def forward(self, input_data: InputData, hidden_states=None):
         if is_first_pp_rank() and hidden_states is None:
-            hidden_states = self.embedding(input_data.tokens)
+            hidden_states = self.embedding(input_data.get_tokens())
 
         # Run encoder.
         hidden_states = self.encoder(input_data, hidden_states)
@@ -212,7 +212,7 @@ class ChatGLMForCausalLM(nn.Module):
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
         # fetch hidden_states of last token in each seq
-        idx_list = input_data.query_start_loc - 1
+        idx_list = input_data.get_query_start_loc() - 1
         return self.lm_head(hidden_states[idx_list[1:]])
 
     def load_weights(self, weights, mp_load_progress):

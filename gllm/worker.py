@@ -84,20 +84,24 @@ class Worker:
     def recv_schedule_seqs(self):
         recv_data = self.comm.recv_schedule_seqs()
         if recv_data is not None:
-            seqs, positions = recv_data
-            input_data = InputData(seqs, self.model_runner.memory_manager, use_mla=self.use_mla)
-            if positions is not None:
-                positions = positions.to(f'cuda:{self.local_rank}')
-                input_data.positions = positions
+            seqs, mrope_positions = recv_data
+            input_data = InputData(
+                use_buffer=False,
+                memory_manager=self.model_runner.memory_manager,
+                max_seq_length=self.model_runner.tokenizer.model_max_length,
+            )
+            input_data.cal_input(seqs)
+            if mrope_positions is not None:
+                input_data.set_mrope_position(mrope_positions)
             self.schedule_queue.append(input_data)
 
     # pp last rank => pp next rank
     def recv_intermediate_data(self):
         if len(self.schedule_queue) != 0:
-            input_data = self.schedule_queue.popleft()
+            input_data:InputData = self.schedule_queue.popleft()
             intermediate_data = recv_pp_data(
                 get_last_pp_rank(),
-                [input_data.tokens.shape[0], self.hidden_size], self.ret_residual)
+                [input_data.tokens_cpu.shape[0], self.hidden_size], self.ret_residual)
             self.run_queue.append((input_data, intermediate_data))
 
     def forward_pp(self):
@@ -109,8 +113,8 @@ class Worker:
             else:
                 input_data, hidden_states = self.run_queue.popleft()
             
-            output = self.model_runner.step_once(
-                input_data, hidden_states, residual)
+            self.model_runner.set_input(input_data)
+            output = self.model_runner.step_once(hidden_states=hidden_states, residual=residual)
             if is_output_rank():
                 self.comm.send_tokens(output)
             elif not is_last_pp_rank():
@@ -150,31 +154,30 @@ class Worker:
 
     def forward_tp(self):
         if len(self.schedule_queue) != 0:
-            input_data:InputData = self.schedule_queue.popleft()
+            input_data: InputData = self.schedule_queue.popleft()
+            self.model_runner.set_input(input_data)
             input_embeddings = None
             if self.model_runner.use_mm:
-                input_embeddings, positions = self.model_runner.mm_prepare_inputs(input_data.seqs)
-                input_data.positions = positions
-            output = self.model_runner.step_once(input_data, input_embeddings=input_embeddings)
+                input_embeddings, mrope_positions = self.model_runner.mm_prepare_inputs(input_data.seqs)
+                self.model_runner.set_mrope_positions(mrope_positions)
+            output = self.model_runner.step_once(input_embeddings=input_embeddings)
             if get_pp_size() != 1:
                 send_pp_data(output, get_next_pp_rank())
     
     def schedule_forward(self):
         schedule_seqs = self.worker_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
-            input_data = InputData(
-                schedule_seqs, self.model_runner.memory_manager,
-                use_mla=self.use_mla)
+            self.model_runner.prepare_input(schedule_seqs)
             input_embeddings = None
-            positions = None
+            mrope_positions = None
             if get_world_size() > 1:
                 self.comm.send_schedule_seqs((schedule_seqs, None), True)
             if self.model_runner.use_mm:
-                input_embeddings, positions = self.model_runner.mm_prepare_inputs(schedule_seqs)
-                input_data.positions = positions
+                input_embeddings, mrope_positions = self.model_runner.mm_prepare_inputs(schedule_seqs)
+                self.model_runner.set_mrope_positions(mrope_positions)
             if get_world_size() > 1:
-                self.comm.send_schedule_seqs((schedule_seqs, positions), False)
-            output = self.model_runner.step_once(input_data,input_embeddings=input_embeddings)
+                self.comm.send_schedule_seqs((schedule_seqs, mrope_positions), False)
+            output = self.model_runner.step_once(input_embeddings=input_embeddings)
 
             if not is_output_rank():
                 send_pp_data(output, get_next_pp_rank())

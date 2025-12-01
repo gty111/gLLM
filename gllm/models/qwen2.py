@@ -85,7 +85,7 @@ class Qwen2Attention(Attention):
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(input_data.positions, q, k)
+        q, k = self.rotary_emb(input_data.get_position(), q, k)
         attn_output = self.attn.forward(q, k, v, input_data)
         output = self.o_proj(attn_output)
         return output
@@ -140,7 +140,7 @@ class Qwen2Model(nn.Module):
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         if is_first_pp_rank() and hidden_states is None:
-            hidden_states = self.embed_tokens(input_data.tokens)
+            hidden_states = self.embed_tokens(input_data.get_tokens())
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -178,7 +178,7 @@ class Qwen2ForCausalLM(nn.Module):
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
         # fetch hidden_states of last token in each seq
-        idx_list = input_data.query_start_loc - 1
+        idx_list = input_data.get_query_start_loc() - 1
         return self.lm_head(hidden_states[idx_list[1:]])
 
     def load_weights(self, weights, mp_load_progress=None):

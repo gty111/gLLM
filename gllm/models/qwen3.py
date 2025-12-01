@@ -60,7 +60,7 @@ class Qwen3Attention(Attention):
                            self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(input_data.positions, q, k)
+        q, k = self.rotary_emb(input_data.get_position(), q, k)
         attn_output = self.attn.forward(q, k, v, input_data)
         output = self.o_proj(attn_output)
         return output

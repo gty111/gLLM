@@ -71,7 +71,7 @@ class LlamaAttention(Attention):
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=1)
-        q, k = self.rotary_emb(input_data.positions, q, k)
+        q, k = self.rotary_emb(input_data.get_position(), q, k)
         attn_output = self.attn.forward(q, k, v, input_data)
         output = self.o_proj(attn_output)
         return output
