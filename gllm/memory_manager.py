@@ -132,8 +132,6 @@ class MemoryManager():
 class PrefixMemoryManager(MemoryManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        logger.info('Enable prefix caching')
 
     def init(self):
         super().init(segment_cls=PrefixSegment)

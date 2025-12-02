@@ -46,6 +46,7 @@ class InputData():
     def cal_input(self, seqs: List[Sequence]):
         assert len(seqs) != 0
         self.seqs = seqs
+        self.embedding_size = 0
         if is_last_pp_rank():
             self.temperature = async_tensor_h2d(
                 [seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], self.memory_manager.dtype, 'cuda', True)

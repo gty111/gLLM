@@ -170,10 +170,7 @@ class Qwen2ForCausalLM(nn.Module):
             if config.tie_word_embeddings:
                 self.lm_head.tie_weights(self.model.embed_tokens)
     
-    def forward(self, input_data: InputData, hidden_states=None, residual=None, inputs_embeds=None):
-        if inputs_embeds is not None:
-            assert hidden_states is None and residual is None
-            hidden_states = inputs_embeds
+    def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.model(input_data, hidden_states, residual)
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
