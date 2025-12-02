@@ -1,5 +1,5 @@
 <p align="center">
-    <img src=doc/pic/gLLM.svg height=500>
+    <img src=doc/pic/gLLM.svg height=600>
 </p>
 
 <h4 align="center">
@@ -18,7 +18,7 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **token throttling**, **pipeline parallelism**, **expert parallelsim** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (**supported in huggingface**) inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** (~6k loc) code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
-- [2025/11/19]: DeepSeek V3 is supported :laughing:
+- [2025/11/19]: DeepSeek V3/R1 is supported :laughing:
 - [2025/09/19]: [DynaPipe](https://openreview.net/forum?id=D6w7wIN360) is accepted by NeurIPS'25. Congratulations :smiling_face_with_three_hearts:
 - [2025/08/15]: Qwen2.5 VL is supported :hugs:
 - [2025/08/01]: DeepSeek V2 is supported :clap:
@@ -152,7 +152,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 ## Supported Models
 
-- DeepSeek Series: DeepSeek V2/3 (MLA)
+- DeepSeek Series: DeepSeek R1, DeepSeek V3, DeepSeek V2
 - Qwen Series: Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
 - Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
