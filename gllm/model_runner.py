@@ -80,6 +80,8 @@ class ModelRunner():
         max_tokens_ret = self.maxp if self.use_cp_schedule else self.maxp + self.maxd
         self.output_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
         self.output_residual = torch.zeros((max_tokens_ret, self.hidden_size))
+        # Init KV cache at last
+        self.memory_manager.init()
 
     def encode(self, messages, chat: bool = False, has_mm: bool = False):
         if chat:
