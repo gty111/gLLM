@@ -32,7 +32,10 @@ class FlashAttention():
                 k: torch.Tensor,
                 v: torch.Tensor,
                 input_data: InputData):
-
+        # profile run
+        if not hasattr(input_data.memory_manager, "segment"):
+            return q
+        
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
@@ -389,11 +392,16 @@ class MLAAttention():
         q: torch.Tensor,
         k_c_normed: torch.Tensor,  # key in unified attn
         k_pe: torch.Tensor,  # value in unified attn
-        kv_cache: torch.Tensor,
         input_data: InputData,
         output: torch.Tensor,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
+        
+        # profile run
+        if not hasattr(input_data.memory_manager, "segment"):
+            return output
+        
+        kv_cache = input_data.memory_manager.segment.kv_cache[self.layer_id]
 
         attn_metadata = input_data.metadata
         if attn_metadata is None:

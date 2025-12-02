@@ -826,11 +826,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         input_data: InputData, 
         hidden_states=None, 
         residual=None,
-        inputs_embeds=None,
     ):
-        if inputs_embeds is not None:
-            assert hidden_states is None and residual is None
-            hidden_states = inputs_embeds
         return self.language_model(
             input_data,
             hidden_states,

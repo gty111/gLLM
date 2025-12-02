@@ -55,6 +55,8 @@ class ModelRunner():
         self.model = None
         self.memory_manager = None
         self.input_data = None
+        self.input_hidden_states = None
+        self.input_residual = None
         self.output_hidden_states = None
         self.output_residual = None
         
@@ -76,10 +78,14 @@ class ModelRunner():
             memory_manager=self.memory_manager,
             use_buffer=True,
         )
-        # Output buffer
         max_tokens_ret = self.maxp if self.use_cp_schedule else self.maxp + self.maxd
+        self.input_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
+        self.input_residual = torch.zeros((max_tokens_ret, self.hidden_size))
+        # Output buffer
         self.output_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
         self.output_residual = torch.zeros((max_tokens_ret, self.hidden_size))
+        # Profile run
+        self.profile_run()
         # Init KV cache at last
         self.memory_manager.init()
 
@@ -178,22 +184,63 @@ class ModelRunner():
         positions = torch.concat(batch_positions,dim=1)
         return input_embeddings, positions
     
-    def prepare_input(self, seqs:List[Sequence]):
-        self.input_data.cal_and_set_input(seqs)
+    def prepare_hidden_states_residual(self, hidden_states=None, residual=None):
+        if hidden_states is not None and residual is not None:
+            num_cal_tokens = self.input_data.tokens_cpu.shape[0]
+            self.input_hidden_states[:num_cal_tokens] = hidden_states
+            self.input_residual[:num_cal_tokens] = residual
+        elif hidden_states is not None:
+            assert is_first_pp_rank()
+            self.input_hidden_states[:hidden_states.shape[0]] = hidden_states
+            self.input_data.embedding_size = hidden_states.shape[0]
     
-    def set_input(self, input_data:InputData):
+    def cal_input(self, seqs:List[Sequence], hidden_states=None, residual=None):
+        self.input_data.cal_and_set_input(seqs)
+        self.prepare_hidden_states_residual(hidden_states, residual)
+    
+    def set_input(self, input_data:InputData, hidden_states=None, residual=None):
         self.input_data.set_input_from_prebuilt(input_data)
+        self.prepare_hidden_states_residual(hidden_states, residual)
     
     def set_mrope_positions(self, mrope_postions):
         self.input_data.set_mrope_position(mrope_postions)
     
     @torch.inference_mode()
-    def step_once(self, hidden_states=None, residual=None, input_embeddings=None):
+    def profile_run(self):
+        seqs = [Sequence(idx, [1], [0], output_len=1) for idx in 
+                range(self.maxp if self.use_cp_schedule else self.maxd)]
+        for seq in seqs:
+            seq.page_table.append(seq.seq_id)
+            seq.computed_token_num = 0
+            seq.to_compute_token_num = 1
+        self.cal_input(seqs)
+        num_cal_toknes = self.input_data.tokens_cpu.shape[0]
+        if is_first_pp_rank():
+            self.model(self.input_data)
+        else:
+            self.model(
+                self.input_data, 
+                self.input_hidden_states[:num_cal_toknes], 
+                self.input_residual[:num_cal_toknes]
+            )
+    
+    @torch.inference_mode()
+    def step_once(self):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if is_first_pp_rank() and self.use_mm:
-            output = self.model(self.input_data, None, None, input_embeddings)
+            output = self.model(
+                self.input_data, 
+                self.input_hidden_states[:self.input_data.embedding_size] 
+                if self.input_data.embedding_size > 0 else None
+            )
+        elif is_first_pp_rank():
+            output = self.model(self.input_data)
         else:
-            output = self.model(self.input_data, hidden_states, residual)
+            output = self.model(
+                self.input_data, 
+                self.input_hidden_states[:num_cal_tokens], 
+                self.input_residual[:num_cal_tokens]
+            )
         if isinstance(output, tuple):
             assert len(output) == 2
             self.output_hidden_states[:num_cal_tokens], self.output_residual[:num_cal_tokens] = output

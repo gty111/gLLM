@@ -113,8 +113,8 @@ class Worker:
             else:
                 input_data, hidden_states = self.run_queue.popleft()
             
-            self.model_runner.set_input(input_data)
-            output = self.model_runner.step_once(hidden_states=hidden_states, residual=residual)
+            self.model_runner.set_input(input_data, hidden_states, residual)
+            output = self.model_runner.step_once()
             if is_output_rank():
                 self.comm.send_tokens(output)
             elif not is_last_pp_rank():
@@ -155,19 +155,18 @@ class Worker:
     def forward_tp(self):
         if len(self.schedule_queue) != 0:
             input_data: InputData = self.schedule_queue.popleft()
-            self.model_runner.set_input(input_data)
             input_embeddings = None
             if self.model_runner.use_mm:
                 input_embeddings, mrope_positions = self.model_runner.mm_prepare_inputs(input_data.seqs)
                 self.model_runner.set_mrope_positions(mrope_positions)
-            output = self.model_runner.step_once(input_embeddings=input_embeddings)
+            self.model_runner.set_input(input_data, input_embeddings)
+            output = self.model_runner.step_once()
             if get_pp_size() != 1:
                 send_pp_data(output, get_next_pp_rank())
     
     def schedule_forward(self):
         schedule_seqs = self.worker_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
-            self.model_runner.prepare_input(schedule_seqs)
             input_embeddings = None
             mrope_positions = None
             if get_world_size() > 1:
@@ -177,7 +176,9 @@ class Worker:
                 self.model_runner.set_mrope_positions(mrope_positions)
             if get_world_size() > 1:
                 self.comm.send_schedule_seqs((schedule_seqs, mrope_positions), False)
-            output = self.model_runner.step_once(input_embeddings=input_embeddings)
+            
+            self.model_runner.cal_input(schedule_seqs, input_embeddings)
+            output = self.model_runner.step_once()
 
             if not is_output_rank():
                 send_pp_data(output, get_next_pp_rank())

@@ -404,13 +404,10 @@ class DeepseekV2MLAAttention(Attention):
         output = torch.zeros(output_shape,
                             dtype=q.dtype)
 
-        kv_cache = input_data.memory_manager.segment.kv_cache[self.layer_id]
-
         attn_out = self.mla_attn.forward(
             q,
             kv_c_normed,
             k_pe,
-            kv_cache=kv_cache,
             input_data=input_data,
             output=output,
             )
