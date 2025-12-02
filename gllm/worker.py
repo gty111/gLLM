@@ -58,7 +58,7 @@ class Worker:
         self.comm.init()
         
         self.model_runner.init(self.mp_load_progress)
-        self.hidden_size = self.model_runner.model_loader.hidden_size
+        self.hidden_size = self.model_runner.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual
         
         if self.rank == 0:

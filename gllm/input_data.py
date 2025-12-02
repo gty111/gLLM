@@ -59,6 +59,7 @@ class InputData():
             
         self.tokens_cpu = self._cal_tokens(seqs)
         self.positions_cpu = self._cal_position(seqs)
+        assert self.tokens_cpu.shape == self.positions_cpu.shape
         self.slot_mapping_cpu = self._cal_slot_mapping(seqs)
         self.block_table_cpu = self._cal_block_table(seqs)
         self.max_seq_len, self.seq_lens_cpu = self._cal_seq_lens(seqs)

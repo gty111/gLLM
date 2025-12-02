@@ -216,15 +216,16 @@ class WorkerScheduler():
         if get_world_size() > 1 and prefill_token_budget != 0:
             self.update_num_wait_tokens()
             free_ratio = self.memory_manager.get_memory_free()
-            # a = ratio_threshold_free_pages
-            # free_ratio in [1,a] | prefill_ratio in [1,0]
+            # free_ratio in [kvthresh,1] | prefill_ratio in [0,1]
             prefill_ratio = (free_ratio - self.kvthresh) / (1-self.kvthresh)
             prefill_ratio = max(prefill_ratio, 0)
             prefill_token_budget = min(
                 round(prefill_ratio * self.maxp),
                 prefill_token_budget)
-            prefill_token_budget = min(
-                max(self.num_wait_tokens//self.iterp, self.minp), prefill_token_budget)
+            # Use WT only when the number of waiting seqs is greater than 1
+            if len(self.seqs_to_prefill) > 1:
+                prefill_token_budget = min(
+                    max(self.num_wait_tokens//self.iterp, self.minp), prefill_token_budget)
         else:
             prefill_token_budget = min(self.maxp, prefill_token_budget)
         prefill_batched_token_nums = 0
