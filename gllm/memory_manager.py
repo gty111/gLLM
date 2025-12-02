@@ -8,6 +8,44 @@ from gllm.id_allocator import IDAllocator
 from gllm.sequence import Sequence
 from gllm.utils import get_dtype_bytes
 
+class Segment():
+    def __init__(self,
+                 num_layers: int,
+                 num_pages: int,
+                 page_size: int,
+                 kv_head_num: int,
+                 kv_head_dim: int,
+                 use_mla: bool):
+        self.num_layers = num_layers
+        self.num_pages = num_pages
+        self.page_size = page_size
+        self.kv_head_num = kv_head_num
+        self.kv_head_dim = kv_head_dim
+
+        if not use_mla:
+            # We don't need zero initialization here
+            self.k_cache = [torch.ones(
+                (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
+            self.v_cache = [torch.ones(
+                (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
+        else:
+            self.kv_cache = [torch.ones(
+                (num_pages, page_size, kv_head_dim)) for _ in range(num_layers)]
+        self.id_allocator = IDAllocator(0, num_pages-1)
+
+    def allocate(self):
+        pagenum = self.id_allocator.allocate()
+        return pagenum
+
+    def free(self, page_num: int):
+        self.id_allocator.free(page_num)
+
+    def get_num_free_pages(self):
+        return self.id_allocator.get_num_free_ids()
+
+    # return percent of used memory
+    def get_memory_util(self):
+        return round(100 * self.id_allocator.get_num_used_ids()/self.id_allocator.size, 2)
 
 class MemoryManager():
     def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype,
@@ -19,6 +57,7 @@ class MemoryManager():
         kv_head_num: number of k/v heads
         kv_head_dim: dimension of k/v head
         '''
+        self.gpu_memory_util = gpu_memory_util
         self.num_layers = num_layers
         self.page_size = page_size
         self.kv_head_num = kv_head_num
@@ -26,10 +65,11 @@ class MemoryManager():
         self.dtype = dtype
         self.vocab_size = vocab_size
         self.use_mla = use_mla
-
+    
+    def init(self, segment_cls=Segment):
         free_mem_size, _ = torch.cuda.mem_get_info()
         num_max_pages = free_mem_size // self.get_sizeof_KV_per_page()
-        num_pages = int(num_max_pages * gpu_memory_util)
+        num_pages = int(num_max_pages * self.gpu_memory_util)
         
         if not dist.is_initialized():
             self.num_pages = num_pages
@@ -42,8 +82,10 @@ class MemoryManager():
                     f'{round(self.get_sizeof_KV_per_page()/(2**10*self.page_size),2)} KB (per token), '
                     f'{round(self.num_pages*self.get_sizeof_KV_per_page()/(2**30),2)} GB (total)')
 
-        self.segment = Segment(self.num_layers, self.num_pages, self.page_size, 
-                               self.kv_head_num, self.kv_head_dim, use_mla)
+        self.segment = segment_cls(
+            self.num_layers, self.num_pages, self.page_size, 
+            self.kv_head_num, self.kv_head_dim, self.use_mla
+        )
         
         self.kv_cache_dtype = 'auto'
         self.k_scale = torch.tensor(1.0, dtype=torch.float32)
@@ -87,56 +129,14 @@ class MemoryManager():
     def get_memory_free(self):
         return self.get_num_free_pages() / self.num_pages
 
-
-class Segment():
-    def __init__(self,
-                 num_layers: int,
-                 num_pages: int,
-                 page_size: int,
-                 kv_head_num: int,
-                 kv_head_dim: int,
-                 use_mla: bool):
-        self.num_layers = num_layers
-        self.num_pages = num_pages
-        self.page_size = page_size
-        self.kv_head_num = kv_head_num
-        self.kv_head_dim = kv_head_dim
-
-        if not use_mla:
-            # We don't need zero initialization here
-            self.k_cache = [torch.ones(
-                (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
-            self.v_cache = [torch.ones(
-                (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
-        else:
-            self.kv_cache = [torch.ones(
-                (num_pages, page_size, kv_head_dim)) for _ in range(num_layers)]
-        self.id_allocator = IDAllocator(0, num_pages-1)
-
-    def allocate(self):
-        pagenum = self.id_allocator.allocate()
-        return pagenum
-
-    def free(self, page_num: int):
-        self.id_allocator.free(page_num)
-
-    def get_num_free_pages(self):
-        return self.id_allocator.get_num_free_ids()
-
-    # return percent of used memory
-    def get_memory_util(self):
-        return round(100 * self.id_allocator.get_num_used_ids()/self.id_allocator.size, 2)
-
-
 class PrefixMemoryManager(MemoryManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
         logger.info('Enable prefix caching')
 
-        del self.segment
-        self.segment = PrefixSegment(self.num_layers, self.num_pages, self.page_size, 
-                                     self.kv_head_num, self.kv_head_dim, self.use_mla)
+    def init(self):
+        super().init(segment_cls=PrefixSegment)
         
         # for prefill stage
         self.num_allocated_pages = 0
