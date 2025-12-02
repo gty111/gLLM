@@ -248,7 +248,7 @@ class DeepseekV2Attention(Attention):
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = latent_cache[:, :, self.kv_lora_rank:]
         
-        q_pe, k_pe = self.rotary_emb(input_data.positions, q_pe, k_pe)
+        q_pe, k_pe = self.rotary_emb(input_data.get_position(), q_pe, k_pe)
         
         q[..., self.qk_nope_head_dim:] = q_pe
         k = torch.empty_like(q)
@@ -397,7 +397,7 @@ class DeepseekV2MLAAttention(Attention):
         k_pe = k_pe.unsqueeze(1)
 
         q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
-            input_data.positions, q[..., self.qk_nope_head_dim:], k_pe)
+            input_data.get_position(), q[..., self.qk_nope_head_dim:], k_pe)
 
         output_shape=(hidden_states.shape[0],
                     self.num_heads * self.v_head_dim)
@@ -502,7 +502,7 @@ class DeepseekV2Model(nn.Module):
     
     def forward(self, input_data:InputData, hidden_states=None, residual=None):
         if is_first_pp_rank() and hidden_states is None:
-            hidden_states = self.embed_tokens(input_data.tokens)
+            hidden_states = self.embed_tokens(input_data.get_tokens())
         for layer in self.layers:
             hidden_states, residual = layer(
                 input_data, hidden_states, residual)

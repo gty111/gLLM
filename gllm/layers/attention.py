@@ -38,7 +38,7 @@ class FlashAttention():
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
 
         input_data.memory_manager.batch_store(
-            self.layer_id, k, v, input_data.slot_mapping_tensor)
+            self.layer_id, k, v, input_data.get_slot_mapping())
 
         k_cache = input_data.memory_manager.segment.k_cache[self.layer_id]
         v_cache = input_data.memory_manager.segment.v_cache[self.layer_id]
@@ -46,13 +46,13 @@ class FlashAttention():
         out = flash_attn_varlen_func(q,
                                      k_cache,
                                      v_cache,
-                                     cu_seqlens_q=input_data.query_start_loc,
+                                     cu_seqlens_q=input_data.get_query_start_loc(),
                                      max_seqlen_q=input_data.max_query_len,
-                                     seqused_k=input_data.seq_lens,
+                                     seqused_k=input_data.get_seq_lens(),
                                      max_seqlen_k=input_data.max_seq_len,
                                      softmax_scale=self.scale,
                                      causal=True,
-                                     block_table=input_data.block_table,
+                                     block_table=input_data.get_block_table(),
                                      fa_version=self.fa_version)
         return out.view(-1, out.shape[-2]*out.shape[-1])
     

@@ -25,7 +25,7 @@ class LLM():
         self.load_format = load_format
         self.model_runner = ModelRunner(
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, use_thinking,
-            maxp, maxd, kvthresh, minp, iterp)
+            maxp, maxd, kvthresh, minp, iterp, use_cp_schedule)
         self.pp_size = pp_size
         self.tp_size = tp_size
         self.use_ep = use_ep

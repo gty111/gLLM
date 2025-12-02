@@ -26,7 +26,8 @@ class EmbeddingInfo:
 
 class ModelRunner():
     def __init__(self, load_format: str, model_path: str, gpu_memory_util: float, page_size: int,
-                 enable_prefix_caching: bool, use_thinking: bool, maxp, maxd, kvthresh, minp, iterp):
+                 enable_prefix_caching: bool, use_thinking: bool, maxp, maxd, kvthresh, minp, iterp,
+                 use_cp_schedule: bool):
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
         self.enable_prefix_caching = enable_prefix_caching
@@ -40,6 +41,7 @@ class ModelRunner():
         self.kvthresh = kvthresh
         self.minp = minp
         self.iterp = iterp
+        self.use_cp_schedule = use_cp_schedule
         self.sampler = Sampler()
         
         self.use_mm = self.model_loader.use_mm
@@ -51,6 +53,7 @@ class ModelRunner():
         # lazy init
         self.model = None
         self.memory_manager = None
+        self.input_data = None
         
         # embedding cache: seq_id => embedding
         self.embedding_cache:Dict[int,EmbeddingInfo] = {}
@@ -63,6 +66,13 @@ class ModelRunner():
             dtype=self.model_loader.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads//get_tp_size(),
             kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size,
             use_mla=self.model_loader.use_mla)
+        # Input buffer
+        self.input_data = InputData(
+            max_running_seqs=self.maxp if self.use_cp_schedule else self.maxd, 
+            max_seq_length=self.tokenizer.model_max_length,
+            memory_manager=self.memory_manager,
+            use_buffer=True,
+        )
 
     def encode(self, messages, chat: bool = False, has_mm: bool = False):
         if chat:
@@ -158,17 +168,26 @@ class ModelRunner():
         input_embeddings = torch.concat(batch_embeddings)
         positions = torch.concat(batch_positions,dim=1)
         return input_embeddings, positions
-        
+    
+    def prepare_input(self, seqs:List[Sequence]):
+        self.input_data.cal_and_set_input(seqs)
+    
+    def set_input(self, input_data:InputData):
+        self.input_data.set_input_from_prebuilt(input_data)
+    
+    def set_mrope_positions(self, mrope_postions):
+        self.input_data.set_mrope_position(mrope_postions)
+    
     @torch.inference_mode()
-    def step_once(self, input_data: InputData = None, hidden_states=None, residual=None, input_embeddings=None):
+    def step_once(self, hidden_states=None, residual=None, input_embeddings=None):
         if is_first_pp_rank() and self.use_mm:
-            output = self.model(input_data, None, None, input_embeddings)
+            output = self.model(self.input_data, None, None, input_embeddings)
         else:
-            output = self.model(input_data, hidden_states, residual)
+            output = self.model(self.input_data, hidden_states, residual)
         if is_last_pp_rank():
-            logits = self.model.compute_logits(input_data, output)
+            logits = self.model.compute_logits(self.input_data, output)
             if is_output_rank():
-                next_tokens = self.sampler.forward(logits, input_data)
+                next_tokens = self.sampler.forward(logits, self.input_data)
                 return next_tokens
             return output
         else:
