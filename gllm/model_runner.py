@@ -45,6 +45,7 @@ class ModelRunner():
         self.sampler = Sampler()
         
         self.use_mm = self.model_loader.use_mm
+        self.hidden_size = self.model_loader.hidden_size
         
         if self.use_mm:
             self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
@@ -54,6 +55,8 @@ class ModelRunner():
         self.model = None
         self.memory_manager = None
         self.input_data = None
+        self.output_hidden_states = None
+        self.output_residual = None
         
         # embedding cache: seq_id => embedding
         self.embedding_cache:Dict[int,EmbeddingInfo] = {}
@@ -73,6 +76,10 @@ class ModelRunner():
             memory_manager=self.memory_manager,
             use_buffer=True,
         )
+        # Output buffer
+        max_tokens_ret = self.maxp if self.use_cp_schedule else self.maxp + self.maxd
+        self.output_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
+        self.output_residual = torch.zeros((max_tokens_ret, self.hidden_size))
 
     def encode(self, messages, chat: bool = False, has_mm: bool = False):
         if chat:
@@ -180,18 +187,23 @@ class ModelRunner():
     
     @torch.inference_mode()
     def step_once(self, hidden_states=None, residual=None, input_embeddings=None):
+        num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if is_first_pp_rank() and self.use_mm:
             output = self.model(self.input_data, None, None, input_embeddings)
         else:
             output = self.model(self.input_data, hidden_states, residual)
+        if isinstance(output, tuple):
+            assert len(output) == 2
+            self.output_hidden_states[:num_cal_tokens], self.output_residual[:num_cal_tokens] = output
+        else:
+            assert isinstance(output, torch.Tensor)
+            self.output_hidden_states[:num_cal_tokens] = output
         if is_last_pp_rank():
-            logits = self.model.compute_logits(self.input_data, output)
+            logits = self.model.compute_logits(self.input_data, self.output_hidden_states[:num_cal_tokens])
             if is_output_rank():
                 next_tokens = self.sampler.forward(logits, self.input_data)
                 return next_tokens
-            return output
-        else:
-            return output
+        return self.output_hidden_states[:num_cal_tokens], self.output_residual[:num_cal_tokens]
 
     def free(self, seq: Sequence):
         self.memory_manager.free(seq)
