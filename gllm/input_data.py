@@ -4,7 +4,6 @@ import numpy as np
 from typing import List, Optional
 from dataclasses import dataclass
 
-from gllm.dist_utils import is_last_pp_rank
 from gllm.utils import async_tensor_h2d, ceil_div, round_down
 from gllm.sequence import Sequence
 from gllm.memory_manager import MemoryManager
@@ -43,20 +42,21 @@ class InputData():
                 self.decode_seq_lens = torch.zeros(max_running_seqs, dtype=torch.int32)
                 self.prefill_query_start_loc = torch.zeros(max_running_seqs+1, dtype=torch.int32)
         
+    def prepare_sample(self):
+        self.temperature = async_tensor_h2d(
+            [seq.temperature if seq.temperature > 1e-5 else 1 for seq in self.seqs], self.memory_manager.dtype, 'cuda', True)
+        self.top_p = async_tensor_h2d(
+            [seq.top_p for seq in self.seqs], self.memory_manager.dtype, 'cuda', True)
+        self.top_k = async_tensor_h2d(
+            [seq.top_k if seq.top_k != -1 else self.memory_manager.vocab_size for seq in self.seqs], self.memory_manager.dtype, 'cuda', True)
+        repetition_penalty = async_tensor_h2d(
+            [seq.repetition_penalty for seq in self.seqs], self.memory_manager.dtype, 'cuda', True)
+        self.repetition_penalty = repetition_penalty.unsqueeze(dim=1).repeat(1, self.memory_manager.vocab_size)
+    
     def cal_input(self, seqs: List[Sequence]):
         assert len(seqs) != 0
         self.seqs = seqs
         self.embedding_size = 0
-        if is_last_pp_rank():
-            self.temperature = async_tensor_h2d(
-                [seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], self.memory_manager.dtype, 'cuda', True)
-            self.top_p = async_tensor_h2d(
-                [seq.top_p for seq in seqs], self.memory_manager.dtype, 'cuda', True)
-            self.top_k = async_tensor_h2d(
-                [seq.top_k if seq.top_k != -1 else self.memory_manager.vocab_size for seq in seqs], self.memory_manager.dtype, 'cuda', True)
-            repetition_penalty = async_tensor_h2d(
-                [seq.repetition_penalty for seq in seqs], self.memory_manager.dtype, 'cuda', True)
-            self.repetition_penalty = repetition_penalty.unsqueeze(dim=1).repeat(1, self.memory_manager.vocab_size)
             
         self.tokens_cpu = self._cal_tokens(seqs)
         self.positions_cpu = self._cal_position(seqs)
@@ -89,7 +89,7 @@ class InputData():
         self.copy_to_input_buffer()
         
     def set_input_from_prebuilt(self, input_data):
-        common_attrs_copy = ["tokens_cpu", "positions_cpu", "mrope_positions_cpu", "slot_mapping_cpu", 
+        common_attrs_copy = ["seqs", "tokens_cpu", "positions_cpu", "mrope_positions_cpu", "slot_mapping_cpu", 
                       "block_table_cpu", "max_seq_len", "seq_lens_cpu", "max_query_len", "query_start_loc_cpu", 
                       "temperature", "top_p", "top_k", "repetition_penalty"]
         mla_attrs_copy = ["num_actual_tokens", "num_decodes", "num_decode_tokens", "num_prefills",
