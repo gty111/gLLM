@@ -16,10 +16,8 @@ def recv_pp_data(src, num_tokens, recv_hidden_states, recv_residual, has_residua
     if has_residual:
         dist.recv(recv_hidden_states[:num_tokens], src)
         dist.recv(recv_residual[:num_tokens], src)
-        return recv_hidden_states[:num_tokens], recv_residual[:num_tokens]
     else:
         dist.recv(recv_hidden_states[:num_tokens], src)
-        return recv_hidden_states[:num_tokens]
     
 def send_obj_list(obj_list, dst):
     dist.send_object_list(obj_list, dst=dst)
