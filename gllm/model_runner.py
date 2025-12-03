@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 from logger import logger
 
 from attr import dataclass
@@ -13,9 +14,10 @@ from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.dist_utils import (is_output_rank, get_tp_size, is_last_pp_rank,
-                             is_first_pp_rank)
+                             is_first_pp_rank, get_rank, get_tp_group)
 from gllm.layers.sampler import Sampler
 from gllm.layers.rotary_embedding import MRotaryEmbedding
+from gllm.utils import get_current_device_stream_fast
 
 @dataclass
 class EmbeddingInfo:
@@ -27,7 +29,7 @@ class EmbeddingInfo:
 class ModelRunner():
     def __init__(self, load_format: str, model_path: str, gpu_memory_util: float, page_size: int,
                  enable_prefix_caching: bool, use_thinking: bool, maxp, maxd, kvthresh, minp, iterp,
-                 use_cp_schedule: bool):
+                 use_cp_schedule: bool, enable_cuda_graph:bool):
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
         self.enable_prefix_caching = enable_prefix_caching
@@ -62,6 +64,13 @@ class ModelRunner():
         
         # embedding cache: seq_id => embedding
         self.embedding_cache:Dict[int,EmbeddingInfo] = {}
+        
+        # cuda graph
+        self.enable_cuda_graph = enable_cuda_graph if not self.model_loader.use_mla else False
+        self.size_to_graph:Dict[int,torch.cuda.CUDAGraph] = dict()
+        self.size_stride = 1
+        self.capture_sizes = list(range(256,1,-self.size_stride))
+        self.capture_sizes.extend(range(self.size_stride,0,-1))
 
     def init(self, mp_load_progress=None):
         self.model = self.model_loader.load_model(mp_load_progress)
@@ -71,6 +80,7 @@ class ModelRunner():
             dtype=self.model_loader.dtype, page_size=self.page_size, kv_head_num=self.model.num_kv_heads//get_tp_size(),
             kv_head_dim=self.model.head_dim, vocab_size=self.model_loader.vocab_size,
             use_mla=self.model_loader.use_mla)
+        
         # Input buffer
         self.input_data = InputData(
             max_running_seqs=self.maxp if self.use_cp_schedule else self.maxd, 
@@ -79,15 +89,23 @@ class ModelRunner():
             use_buffer=True,
         )
         max_tokens_ret = self.maxp if self.use_cp_schedule else self.maxp + self.maxd
+        self.max_tokens_ret = max_tokens_ret
         self.input_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
         self.input_residual = torch.zeros((max_tokens_ret, self.hidden_size))
+        
         # Output buffer
         self.output_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
         self.output_residual = torch.zeros((max_tokens_ret, self.hidden_size))
+        
         # Profile run
         self.profile_run()
-        # Init KV cache at last
+        
+        # Init KV cache
         self.memory_manager.init()
+        
+        # Capture cuda graph
+        if self.enable_cuda_graph:
+            self.capture_graph()
 
     def encode(self, messages, chat: bool = False, has_mm: bool = False):
         if chat:
@@ -184,48 +202,70 @@ class ModelRunner():
         positions = torch.concat(batch_positions,dim=1)
         return input_embeddings, positions
     
-    def prepare_hidden_states_residual(self, hidden_states=None, residual=None):
-        if hidden_states is not None and residual is not None:
-            num_cal_tokens = self.input_data.tokens_cpu.shape[0]
-            self.input_hidden_states[:num_cal_tokens] = hidden_states
-            self.input_residual[:num_cal_tokens] = residual
-        elif hidden_states is not None:
+    def prepare_hidden_states(self, hidden_states=None):
+        if hidden_states is not None:
             assert is_first_pp_rank()
             self.input_hidden_states[:hidden_states.shape[0]] = hidden_states
             self.input_data.embedding_size = hidden_states.shape[0]
     
-    def cal_input(self, seqs:List[Sequence], hidden_states=None, residual=None):
+    def cal_input(self, seqs:List[Sequence], hidden_states=None):
         self.input_data.cal_and_set_input(seqs)
-        self.prepare_hidden_states_residual(hidden_states, residual)
+        self.prepare_hidden_states(hidden_states)
     
-    def set_input(self, input_data:InputData, hidden_states=None, residual=None):
+    def set_input(self, input_data:InputData):
         self.input_data.set_input_from_prebuilt(input_data)
-        self.prepare_hidden_states_residual(hidden_states, residual)
     
     def set_mrope_positions(self, mrope_postions):
         self.input_data.set_mrope_position(mrope_postions)
     
-    @torch.inference_mode()
-    def profile_run(self):
-        seqs = [Sequence(idx, [1], [0], output_len=1) for idx in 
-                range(self.maxp if self.use_cp_schedule else self.maxd)]
+    def create_dummy_seqs(self, size):
+        seqs = [Sequence(idx, [1,2], [], output_len=1) for idx in range(size)]
         for seq in seqs:
             seq.page_table.append(seq.seq_id)
-            seq.computed_token_num = 0
+            seq.prompt_len = 1
+            seq.computed_token_num = 1
             seq.to_compute_token_num = 1
+        return seqs
+    
+    @torch.inference_mode()
+    def profile_run(self):
+        seqs = self.create_dummy_seqs(self.maxp if self.use_cp_schedule else self.maxd)
         self.cal_input(seqs)
-        num_cal_toknes = self.input_data.tokens_cpu.shape[0]
+        num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if is_first_pp_rank():
             self.model(self.input_data)
         else:
             self.model(
                 self.input_data, 
-                self.input_hidden_states[:num_cal_toknes], 
-                self.input_residual[:num_cal_toknes]
+                self.input_hidden_states[:num_cal_tokens], 
+                self.input_residual[:num_cal_tokens]
             )
     
     @torch.inference_mode()
-    def step_once(self):
+    def capture_graph(self):
+        if get_rank() == 0:
+            logger.info(f"Cuda graph capture sizes: {self.capture_sizes}")
+        memory_pool = torch.cuda.graph_pool_handle()
+        self.stream = torch.cuda.Stream()
+        # ensure all initialization operations complete before attempting to
+        # capture the graph on another stream
+        curr_stream = get_current_device_stream_fast()
+        if curr_stream != self.stream:
+            self.stream.wait_stream(curr_stream)
+        for size in self.capture_sizes:
+            seqs = self.create_dummy_seqs(size)
+            self.cal_input(seqs)
+            g = torch.cuda.CUDAGraph()
+            if get_rank() == 0:
+                logger.info(f"Capturing cuda graph for size {size}")
+            torch.cuda.synchronize()
+            dist.barrier(get_tp_group())
+            with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=self.stream):
+                self.forward()
+            self.size_to_graph[size] = g
+    
+    @torch.inference_mode()
+    def forward(self):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if is_first_pp_rank() and self.use_mm:
             output = self.model(
@@ -247,9 +287,25 @@ class ModelRunner():
         else:
             assert isinstance(output, torch.Tensor)
             self.output_hidden_states[:num_cal_tokens] = output
+    
+    def check_decode_batch(self):
+        for seq in self.input_data.seqs:
+            if not seq.computed_prompt:
+                return False
+        return True
+    
+    @torch.inference_mode()
+    def step_once(self):
+        num_cal_tokens = self.input_data.tokens_cpu.shape[0]
+        # Decode batch use cuda graph
+        if self.check_decode_batch() and num_cal_tokens in self.size_to_graph:
+            self.size_to_graph[num_cal_tokens].replay()
+        else:
+            self.forward()
         if is_last_pp_rank():
             logits = self.model.compute_logits(self.input_data, self.output_hidden_states[:num_cal_tokens])
             if is_output_rank():
+                self.input_data.cal_sample()
                 next_tokens = self.sampler.forward(logits, self.input_data)
                 return next_tokens
         return self.output_hidden_states[:num_cal_tokens], self.output_residual[:num_cal_tokens]

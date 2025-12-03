@@ -98,6 +98,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpu-memory-util', type=float, help='GPU memory utilization for KV cache (excluding model weights)', default=0.9)
     parser.add_argument('--enable-prefix-caching', help='Enable KV cache reuse across requests', action='store_true')
     parser.add_argument('--page-size', type=int, help='Number of tokens in a page', default=16)
+    parser.add_argument('--enable-cuda-graph', help='Enable cuda graph', action='store_true')
     # Parallelism
     parser.add_argument('--pp', type=int, help='Number of pipeline stages', default=1)
     parser.add_argument('--tp', type=int, help='Number of tensor parallel degrees', default=1)
@@ -125,6 +126,7 @@ if __name__ == '__main__':
                   model_path=args.model_path,
                   gpu_memory_util=args.gpu_memory_util,
                   page_size=args.page_size,
+                  enable_cuda_graph=args.enable_cuda_graph,
                   maxd=args.maxd,
                   maxp=args.maxp,
                   minp=args.minp,

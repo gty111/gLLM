@@ -47,16 +47,6 @@ class InputData():
         assert len(seqs) != 0
         self.seqs = seqs
         self.embedding_size = 0
-        if is_last_pp_rank():
-            self.temperature = async_tensor_h2d(
-                [seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], self.memory_manager.dtype, 'cuda', True)
-            self.top_p = async_tensor_h2d(
-                [seq.top_p for seq in seqs], self.memory_manager.dtype, 'cuda', True)
-            self.top_k = async_tensor_h2d(
-                [seq.top_k if seq.top_k != -1 else self.memory_manager.vocab_size for seq in seqs], self.memory_manager.dtype, 'cuda', True)
-            repetition_penalty = async_tensor_h2d(
-                [seq.repetition_penalty for seq in seqs], self.memory_manager.dtype, 'cuda', True)
-            self.repetition_penalty = repetition_penalty.unsqueeze(dim=1).repeat(1, self.memory_manager.vocab_size)
             
         self.tokens_cpu = self._cal_tokens(seqs)
         self.positions_cpu = self._cal_position(seqs)
@@ -68,6 +58,18 @@ class InputData():
         
         if self.use_mla:
             self._cal_mla_metadata(seqs)
+    
+    def cal_sample(self):
+        seqs = self.seqs
+        self.temperature = async_tensor_h2d(
+            [seq.temperature if seq.temperature > 1e-5 else 1 for seq in seqs], self.memory_manager.dtype, 'cuda', True)
+        self.top_p = async_tensor_h2d(
+            [seq.top_p for seq in seqs], self.memory_manager.dtype, 'cuda', True)
+        self.top_k = async_tensor_h2d(
+            [seq.top_k if seq.top_k != -1 else self.memory_manager.vocab_size for seq in seqs], self.memory_manager.dtype, 'cuda', True)
+        repetition_penalty = async_tensor_h2d(
+            [seq.repetition_penalty for seq in seqs], self.memory_manager.dtype, 'cuda', True)
+        self.repetition_penalty = repetition_penalty.unsqueeze(dim=1).repeat(1, self.memory_manager.vocab_size)
     
     def copy_to_input_buffer(self):
         assert self.use_buffer

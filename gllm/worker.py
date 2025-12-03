@@ -75,6 +75,10 @@ class Worker:
             self.schedule_queue = deque()
             # Input data and intermediate data for rank except 0
             self.run_queue = deque()
+            # Recv buffer
+            max_tokens_ret = self.model_runner.max_tokens_ret
+            self.recv_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
+            self.recv_residual = torch.zeros((max_tokens_ret, self.hidden_size))
 
         self.mp_alive[self.local_rank] = 1
 
@@ -95,25 +99,18 @@ class Worker:
                 input_data.set_mrope_position(mrope_positions)
             self.schedule_queue.append(input_data)
 
-    # pp last rank => pp next rank
-    def recv_intermediate_data(self):
+    def forward_pp(self):
         if len(self.schedule_queue) != 0:
             input_data:InputData = self.schedule_queue.popleft()
-            intermediate_data = recv_pp_data(
+            # pp last rank => pp next rank
+            recv_pp_data(
                 get_last_pp_rank(),
-                [input_data.tokens_cpu.shape[0], self.hidden_size], self.ret_residual)
-            self.run_queue.append((input_data, intermediate_data))
-
-    def forward_pp(self):
-        if len(self.run_queue) != 0:
-            hidden_states = None
-            residual = None
-            if self.ret_residual:
-                input_data, (hidden_states, residual) = self.run_queue.popleft()
-            else:
-                input_data, hidden_states = self.run_queue.popleft()
-            
-            self.model_runner.set_input(input_data, hidden_states, residual)
+                input_data.tokens_cpu.shape[0],
+                self.model_runner.input_hidden_states,
+                self.model_runner.input_residual,
+                self.ret_residual
+            )
+            self.model_runner.set_input(input_data)
             output = self.model_runner.step_once()
             if is_output_rank():
                 self.comm.send_tokens(output)
@@ -198,7 +195,6 @@ class Worker:
 
     def run_other(self):
         self.recv_schedule_seqs()
-        self.recv_intermediate_data()
         self.forward_pp()
 
     def handle_keyboardInterrupt(self):
