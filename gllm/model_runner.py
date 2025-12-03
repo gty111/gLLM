@@ -1,5 +1,4 @@
 import torch
-from logger import logger
 
 from attr import dataclass
 from typing import Union, Dict, List
@@ -184,23 +183,19 @@ class ModelRunner():
         positions = torch.concat(batch_positions,dim=1)
         return input_embeddings, positions
     
-    def prepare_hidden_states_residual(self, hidden_states=None, residual=None):
-        if hidden_states is not None and residual is not None:
-            num_cal_tokens = self.input_data.tokens_cpu.shape[0]
-            self.input_hidden_states[:num_cal_tokens] = hidden_states
-            self.input_residual[:num_cal_tokens] = residual
-        elif hidden_states is not None:
+    def prepare_hidden_states(self, hidden_states=None):
+        if hidden_states is not None:
             assert is_first_pp_rank()
             self.input_hidden_states[:hidden_states.shape[0]] = hidden_states
             self.input_data.embedding_size = hidden_states.shape[0]
     
-    def cal_input(self, seqs:List[Sequence], hidden_states=None, residual=None):
+    def cal_input(self, seqs:List[Sequence], hidden_states=None):
         self.input_data.cal_and_set_input(seqs)
-        self.prepare_hidden_states_residual(hidden_states, residual)
+        self.prepare_hidden_states(hidden_states)
     
-    def set_input(self, input_data:InputData, hidden_states=None, residual=None):
+    def set_input(self, input_data:InputData, hidden_states=None):
         self.input_data.set_input_from_prebuilt(input_data)
-        self.prepare_hidden_states_residual(hidden_states, residual)
+        self.prepare_hidden_states(hidden_states)
     
     def set_mrope_positions(self, mrope_postions):
         self.input_data.set_mrope_position(mrope_postions)
