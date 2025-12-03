@@ -250,6 +250,7 @@ class ModelRunner():
         if is_last_pp_rank():
             logits = self.model.compute_logits(self.input_data, self.output_hidden_states[:num_cal_tokens])
             if is_output_rank():
+                self.input_data.prepare_sample()
                 next_tokens = self.sampler.forward(logits, self.input_data)
                 return next_tokens
         return self.output_hidden_states[:num_cal_tokens], self.output_residual[:num_cal_tokens]
