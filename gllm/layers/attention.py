@@ -399,6 +399,7 @@ class MLAAttention():
         
         # profile run
         if not hasattr(input_data.memory_manager, "segment"):
+            self.process_weights()
             return output
         
         kv_cache = input_data.memory_manager.segment.kv_cache[self.layer_id]

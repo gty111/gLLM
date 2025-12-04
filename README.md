@@ -15,9 +15,10 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 <img src=doc/pic/overview.svg width=500>
 </p>
 
-Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **token throttling**, **pipeline parallelism**, **expert parallelsim** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (**supported in huggingface**) inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** (~6k loc) code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
+Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **cuda graph**, **token throttling**, **pipeline parallelism**, **expert parallelsim** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (**supported in huggingface**) inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
 
 *Latest News* :fire:
+- [2025/12/04]: Cuda graph is supported :tada:
 - [2025/11/19]: DeepSeek V3/R1 is supported :laughing:
 - [2025/09/19]: [DynaPipe](https://openreview.net/forum?id=D6w7wIN360) is accepted by NeurIPS'25. Congratulations :smiling_face_with_three_hearts:
 - [2025/08/15]: Qwen2.5 VL is supported :hugs:
