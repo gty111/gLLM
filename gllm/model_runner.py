@@ -227,7 +227,7 @@ class ModelRunner():
         self.input_data.cal_and_set_input(seqs)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if self.use_mm:
-            self.input_data.set_mrope_positions(torch.zeros((3,num_cal_tokens), device='cpu'))
+            self.input_data.set_mrope_position(torch.zeros((3,num_cal_tokens), device='cpu'))
         if is_first_pp_rank():
             self.model(self.input_data)
         else:
@@ -248,7 +248,7 @@ class ModelRunner():
             seqs = self.create_dummy_seqs(size)
             self.input_data.cal_and_set_input(seqs=seqs)
             if self.use_mm:
-                self.input_data.set_mrope_positions(torch.zeros((3,size), device='cpu'))
+                self.input_data.set_mrope_position(torch.zeros((3,size), device='cpu'))
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(cuda_graph=g, pool=memory_pool):
                 self.forward()
