@@ -104,7 +104,7 @@ class Worker:
                 self.model_runner.input_residual, 
                 self.ret_residual
             )
-            self.model_runner.set_input(input_data)
+            self.model_runner.prepare_input(input_data=input_data)
             output = self.model_runner.step_once()
             if is_output_rank():
                 self.comm.send_tokens(output)
@@ -146,11 +146,7 @@ class Worker:
     def forward_tp(self):
         if len(self.schedule_queue) != 0:
             input_data: InputData = self.schedule_queue.popleft()
-            input_embeddings = None
-            if self.model_runner.use_mm:
-                input_embeddings, mrope_positions = self.model_runner.mm_prepare_inputs(input_data.seqs)
-                self.model_runner.set_mrope_positions(mrope_positions)
-            self.model_runner.set_input(input_data, input_embeddings)
+            self.model_runner.prepare_input(input_data=input_data)
             output = self.model_runner.step_once()
             if get_pp_size() != 1:
                 send_pp_data(output, get_next_pp_rank())
@@ -158,17 +154,11 @@ class Worker:
     def schedule_forward(self):
         schedule_seqs = self.worker_scheduler.schedule_once()
         if len(schedule_seqs) != 0:
-            input_embeddings = None
-            mrope_positions = None
             if get_world_size() > 1:
                 self.comm.send_schedule_seqs((schedule_seqs, None), True)
-            if self.model_runner.use_mm:
-                input_embeddings, mrope_positions = self.model_runner.mm_prepare_inputs(schedule_seqs)
-                self.model_runner.set_mrope_positions(mrope_positions)
+            self.model_runner.prepare_input(schedule_seqs)
             if get_world_size() > 1:
-                self.comm.send_schedule_seqs((schedule_seqs, mrope_positions), False)
-            
-            self.model_runner.cal_input(schedule_seqs, input_embeddings)
+                self.comm.send_schedule_seqs((schedule_seqs, self.model_runner.input_data.mrope_positions_cpu), False)
             output = self.model_runner.step_once()
 
             if not is_output_rank():

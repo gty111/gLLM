@@ -14,7 +14,7 @@ from gllm.sequence import Sequence
 from gllm.input_data import InputData
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.dist_utils import (is_output_rank, get_tp_size, is_last_pp_rank,
-                             is_first_pp_rank, get_rank)
+                             is_first_pp_rank, get_local_rank)
 from gllm.layers.sampler import Sampler
 from gllm.layers.rotary_embedding import MRotaryEmbedding
 
@@ -54,19 +54,19 @@ class ModelRunner():
             self.image_processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)
 
         # lazy init
-        self.model = None
-        self.memory_manager = None
-        self.input_data = None
-        self.input_hidden_states = None
-        self.input_residual = None
-        self.output_hidden_states = None
-        self.output_residual = None
+        self.model: torch.nn.Module = None
+        self.memory_manager: MemoryManager = None
+        self.input_data: InputData = None
+        self.input_hidden_states: torch.Tensor = None
+        self.input_residual: torch.Tensor = None
+        self.output_hidden_states: torch.Tensor = None
+        self.output_residual: torch.Tensor = None
         
         # embedding cache: seq_id => embedding
         self.embedding_cache:Dict[int,EmbeddingInfo] = {}
         
         # cuda graph
-        self.enable_cuda_graph = enable_cuda_graph if not self.use_mm and not self.use_mla else False
+        self.enable_cuda_graph = enable_cuda_graph
         self.max_cuda_graph_bs = max_cuda_graph_bs
         self.size_to_graph:Dict[int,torch.cuda.CUDAGraph] = dict()
         self.capture_sizes = list(range(self.max_cuda_graph_bs, 0, -1))
@@ -195,22 +195,22 @@ class ModelRunner():
         positions = torch.concat(batch_positions,dim=1)
         return input_embeddings, positions
     
-    def prepare_hidden_states(self, hidden_states=None):
+    def prepare_input_embeddings(self, hidden_states=None):
         if hidden_states is not None:
             assert is_first_pp_rank()
             self.input_hidden_states[:hidden_states.shape[0]] = hidden_states
             self.input_data.embedding_size = hidden_states.shape[0]
     
-    def cal_input(self, seqs:List[Sequence], hidden_states=None):
-        self.input_data.cal_and_set_input(seqs)
-        self.prepare_hidden_states(hidden_states)
-    
-    def set_input(self, input_data:InputData, hidden_states=None):
-        self.input_data.set_input_from_prebuilt(input_data)
-        self.prepare_hidden_states(hidden_states)
-    
-    def set_mrope_positions(self, mrope_postions):
-        self.input_data.set_mrope_position(mrope_postions)
+    def prepare_input(self, seqs:List[Sequence]=None, input_data:InputData=None):
+        if input_data is not None:
+            self.input_data.set_input_from_prebuilt(input_data)
+        else:
+            assert seqs is not None
+            self.input_data.cal_and_set_input(seqs)
+        if self.use_mm and is_first_pp_rank():
+            input_embeddings, mrope_positions = self.mm_prepare_inputs(self.input_data.seqs)
+            self.input_data.set_mrope_position(mrope_positions)
+            self.prepare_input_embeddings(input_embeddings)
     
     def create_dummy_seqs(self, size):
         seqs = [Sequence(idx, [1,2], [], output_len=1) for idx in range(size)]
@@ -224,27 +224,31 @@ class ModelRunner():
     @torch.inference_mode()
     def profile_run(self):
         seqs = self.create_dummy_seqs(self.maxp if self.use_cp_schedule else self.maxd)
-        self.cal_input(seqs)
-        num_cal_toknes = self.input_data.tokens_cpu.shape[0]
+        self.input_data.cal_and_set_input(seqs)
+        num_cal_tokens = self.input_data.tokens_cpu.shape[0]
+        if self.use_mm:
+            self.input_data.set_mrope_positions(torch.zeros((3,num_cal_tokens), device='cpu'))
         if is_first_pp_rank():
             self.model(self.input_data)
         else:
             self.model(
                 self.input_data, 
-                self.input_hidden_states[:num_cal_toknes], 
-                self.input_residual[:num_cal_toknes]
+                self.input_hidden_states[:num_cal_tokens], 
+                self.input_residual[:num_cal_tokens]
             )
     
     @torch.inference_mode()
     def capture_graph(self):
         iterator = self.capture_sizes
-        if get_rank() == 0:
+        if get_local_rank() == 0:
             # logger.info(f"Capturing cuda graph for sizes {self.capture_sizes}")
-            iterator = tqdm(self.capture_sizes, desc="Capturing CUDA Graphs", ncols=120)
+            iterator = tqdm(self.capture_sizes, desc="Capturing CUDA Graphs", ncols=100)
         memory_pool = torch.cuda.graph_pool_handle()
         for size in iterator:
             seqs = self.create_dummy_seqs(size)
-            self.cal_input(seqs)
+            self.input_data.cal_and_set_input(seqs=seqs)
+            if self.use_mm:
+                self.input_data.set_mrope_positions(torch.zeros((3,size), device='cpu'))
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(cuda_graph=g, pool=memory_pool):
                 self.forward()

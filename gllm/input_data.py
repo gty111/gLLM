@@ -60,6 +60,7 @@ class InputData():
             
         self.tokens_cpu = self._cal_tokens(seqs)
         self.positions_cpu = self._cal_position(seqs)
+        self.mrope_positions_cpu = None
         assert self.tokens_cpu.shape == self.positions_cpu.shape
         self.slot_mapping_cpu = self._cal_slot_mapping(seqs)
         self.block_table_cpu = self._cal_block_table(seqs)
@@ -122,12 +123,12 @@ class InputData():
         return torch.tensor(positions_list, dtype=torch.long, device="cpu")
     
     def get_position(self):
-        if hasattr(self, "mrope_positions_cpu") and self.mrope_positions_cpu is not None:
+        if self.mrope_positions_cpu is not None:
             return self.mrope_positions[:, :self.mrope_positions_cpu.shape[1]]
         else:
             return self.positions[:self.positions_cpu.shape[0]]
     
-    def set_mrope_position(self, mrope_positions):
+    def set_mrope_position(self, mrope_positions: torch.Tensor):
         self.mrope_positions_cpu = mrope_positions
         if self.use_buffer:
             self.mrope_positions[:, :self.mrope_positions_cpu.shape[1]].copy_(self.mrope_positions_cpu, non_blocking=True)
