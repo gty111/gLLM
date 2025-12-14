@@ -599,7 +599,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         tokens_per_second = getattr(hf_config.vision_config,
                                     "tokens_per_second", 1.0)
 
-        input_tokens_tensor = torch.tensor(input_tokens)
+        input_tokens_tensor = torch.tensor(input_tokens, device='cpu')
         vision_start_indices = torch.argwhere(
             input_tokens_tensor == vision_start_token_id).squeeze(1)
         vision_tokens = input_tokens_tensor[vision_start_indices + 1]
@@ -650,15 +650,15 @@ class MRotaryEmbedding(RotaryEmbedding):
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(
                 llm_pos_ids_list) > 0 else 0
             llm_pos_ids_list.append(
-                torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                torch.arange(text_len, device='cpu').view(1, -1).expand(3, -1) + st_idx)
 
-            t_index = (torch.arange(llm_grid_t).view(-1, 1).expand(
+            t_index = (torch.arange(llm_grid_t, device='cpu').view(-1, 1).expand(
                 -1, llm_grid_h * llm_grid_w) * video_second_per_grid_t *
                        tokens_per_second).long().flatten()
 
-            h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(
+            h_index = torch.arange(llm_grid_h, device='cpu').view(1, -1, 1).expand(
                 llm_grid_t, -1, llm_grid_w).flatten()
-            w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(
+            w_index = torch.arange(llm_grid_w, device='cpu').view(1, 1, -1).expand(
                 llm_grid_t, llm_grid_h, -1).flatten()
             llm_pos_ids_list.append(
                 torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
@@ -669,7 +669,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 llm_pos_ids_list) > 0 else 0
             text_len = len(input_tokens) - st
             llm_pos_ids_list.append(
-                torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                torch.arange(text_len, device='cpu').view(1, -1).expand(3, -1) + st_idx)
 
         llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
         mrope_position_delta = (llm_positions.max() + 1 -
