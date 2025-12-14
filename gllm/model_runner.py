@@ -139,7 +139,7 @@ class ModelRunner():
     
     @torch.inference_mode()
     def mm_prepare_inputs(self, seqs: List[Sequence]):
-        # Calculate the embedding and positions of pic
+        # Calculate the embedding (on cuda) and positions (on cpu) of pic
         batch_embeddings = []
         batch_positions = []
         for seq in seqs:
@@ -155,12 +155,12 @@ class ModelRunner():
                     seq.computed_token_num,
                     seq.seq_len,
                 )
-                position = torch.tensor(position)
+                position = torch.tensor(position, device='cpu')
             else:
                 embedding_info = None
                 if seq.seq_id not in self.embedding_cache or self.embedding_cache[seq.seq_id].stale:
                     mm_embeddings = None
-                    image_grid_thw = None
+                    image_grid_thw:torch.Tensor = None
                     if seq.mm_contents is not None:
                         images = load_images(seq.mm_contents)
                         images_input = self.image_processor(images=images)
@@ -171,7 +171,7 @@ class ModelRunner():
                     prompt_positions, mrope_position_delta = MRotaryEmbedding.get_input_positions(
                         input_tokens=seq.token_ids,
                         hf_config=self.model.config,
-                        image_grid_thw=image_grid_thw,
+                        image_grid_thw=image_grid_thw.cpu(),
                         video_grid_thw=None,
                         second_per_grid_ts=None,
                     )
