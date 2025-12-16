@@ -168,10 +168,12 @@ class ModelRunner():
                         mm_embeddings = self.model.get_multimodal_embeddings(**images_input)
                     prompt_embeddings = self.model.get_input_embeddings(
                         torch.tensor(seq.token_ids), mm_embeddings)
+                    if image_grid_thw is not None:
+                        image_grid_thw = image_grid_thw.cpu()
                     prompt_positions, mrope_position_delta = MRotaryEmbedding.get_input_positions(
                         input_tokens=seq.token_ids,
                         hf_config=self.model.config,
-                        image_grid_thw=image_grid_thw.cpu(),
+                        image_grid_thw=image_grid_thw,
                         video_grid_thw=None,
                         second_per_grid_ts=None,
                     )
