@@ -147,7 +147,7 @@ def get_path(*filepath) -> str:
 
 
 def get_gllm_version() -> str:
-    version = "0.0.4"
+    version = "0.0.5"
     version += "+precompiled"
 
     return version
