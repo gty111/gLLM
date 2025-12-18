@@ -1,12 +1,13 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
-from typing import Optional
-
-from gllm.utils import cdiv
 from gllm import _custom_ops as ops
 from gllm.dist_utils import get_tp_size
+from gllm.utils import cdiv
+
 
 def validate_fp8_block_shape(
     layer: torch.nn.Module,
@@ -49,6 +50,7 @@ def validate_fp8_block_shape(
                     f"weight quantization block_n = {block_n}."
                 )
 
+
 def fp8LinearMethod(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -61,18 +63,20 @@ def fp8LinearMethod(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
-    
-    q_input, x_scale = per_token_group_quant_fp8(
-            input_2d, block_size[1], column_major_scales=False)
 
-    output = w8a8_block_fp8_matmul(q_input, weight, x_scale, weight_scale,
-                                    block_size, input.dtype)
+    q_input, x_scale = per_token_group_quant_fp8(
+        input_2d, block_size[1], column_major_scales=False
+    )
+
+    output = w8a8_block_fp8_matmul(
+        q_input, weight, x_scale, weight_scale, block_size, input.dtype
+    )
 
     if bias is not None:
         output = output + bias
     return output.to(dtype=input.dtype).view(*output_shape)
 
-    
+
 def w8a8_block_fp8_matmul(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -109,7 +113,7 @@ def w8a8_block_fp8_matmul(
     assert triton.cdiv(N, block_n) == Bs.shape[0]
     assert triton.cdiv(K, block_k) == Bs.shape[1]
 
-    C_shape = A.shape[:-1] + (N, )
+    C_shape = A.shape[:-1] + (N,)
     C = A.new_empty(C_shape, dtype=output_dtype)
 
     configs = None
@@ -130,8 +134,9 @@ def w8a8_block_fp8_matmul(
         }
 
     def grid(META):
-        return (triton.cdiv(M, META["BLOCK_SIZE_M"]) *
-                triton.cdiv(N, META["BLOCK_SIZE_N"]), )
+        return (
+            triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        )
 
     _w8a8_block_fp8_matmul[grid](
         A,
@@ -158,6 +163,7 @@ def w8a8_block_fp8_matmul(
     )
 
     return C
+
 
 @triton.jit
 def _w8a8_block_fp8_matmul(
@@ -218,12 +224,8 @@ def _w8a8_block_fp8_matmul(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs,
-                    mask=offs_k[None, :] < K - k * BLOCK_SIZE_K,
-                    other=0.0)
-        b = tl.load(b_ptrs,
-                    mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
-                    other=0.0)
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
@@ -246,10 +248,10 @@ def _w8a8_block_fp8_matmul(
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
-    
+
+
 def input_to_float8(
-        x: torch.Tensor,
-        dtype: Optional[torch.dtype] = None
+    x: torch.Tensor, dtype: Optional[torch.dtype] = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """This function quantizes input values to float8 values "
     "with tensor-wise quantization."""
@@ -261,12 +263,15 @@ def input_to_float8(
     x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
+
 # Normalize the group_shape to the full extent for any dims that are -1
-def _normalize_quant_group_shape(x: torch.Tensor, group_shape: tuple[int,
-                                                                     int]):
+def _normalize_quant_group_shape(x: torch.Tensor, group_shape: tuple[int, int]):
     # -1 means full extent
-    return (group_shape[0] if group_shape[0] > 0 else x.shape[-2],
-            group_shape[1] if group_shape[1] > 0 else x.shape[-1])
+    return (
+        group_shape[0] if group_shape[0] > 0 else x.shape[-2],
+        group_shape[1] if group_shape[1] > 0 else x.shape[-1],
+    )
+
 
 # Useful when treating N-dimensional group scaling as extended numpy-style
 # broadcasting in numpy simply stretches dimensions with an extent of 1 to match
@@ -286,10 +291,13 @@ def group_broadcast(t, shape):
     for i, s in enumerate(shape):
         if t.shape[i] != s and t.shape[i] != 1:
             assert s % t.shape[i] == 0
-            t = t.unsqueeze(i + 1)\
-                .expand(*t.shape[:i+1], s // t.shape[i], *t.shape[i+1:])\
+            t = (
+                t.unsqueeze(i + 1)
+                .expand(*t.shape[: i + 1], s // t.shape[i], *t.shape[i + 1 :])
                 .flatten(i, i + 1)
+            )
     return t
+
 
 # inverses `scaled_quantize`
 def scaled_dequantize(
@@ -307,7 +315,8 @@ def scaled_dequantize(
         if group_shape is None:
             raise AssertionError(
                 "if x_s is 1D tensor, group_shape must be provided otherwise "
-                "its ambiguous which dimension to broadcast x_s to")
+                "its ambiguous which dimension to broadcast x_s to"
+            )
         # unsqueeze the scales for the dimension where we want to broadcast
         # across the full extent
         if group_shape[0] == x_q.shape[-2]:
@@ -317,13 +326,15 @@ def scaled_dequantize(
         else:
             raise AssertionError(
                 "if x_s is a vector we should be broadcasting it to the full "
-                "extent of one of the dimensions")
+                "extent of one of the dimensions"
+            )
 
     if group_shape is not None:
         assert x_s.shape[-1] == x_q.shape[-1] // group_shape[1]
         assert x_s.shape[-2] == x_q.shape[-2] // group_shape[0]
     x_s = group_broadcast(x_s.to(torch.float32), x_q.shape)
     return (x_q.to(torch.float32) * x_s).to(out_dtype)
+
 
 def block_quant_to_tensor_quant(
     x_q_block: torch.Tensor,
@@ -370,8 +381,9 @@ def _per_token_group_quant_fp8(
     row_g_id = g_id % groups_per_row
 
     # Ensure offset calculations use int64 to prevent overflow
-    y_ptr_offset = (row.to(tl.int64) * y_row_stride) + (row_g_id.to(tl.int64) *
-                                                        group_size)
+    y_ptr_offset = (row.to(tl.int64) * y_row_stride) + (
+        row_g_id.to(tl.int64) * group_size
+    )
     y_ptr += y_ptr_offset
 
     y_q_ptr_offset = g_id.to(tl.int64) * group_size
@@ -423,8 +435,9 @@ def _per_token_group_quant_fp8_colmajor(
     row_g_id = g_id % groups_per_row
 
     # Ensure offset calculations use int64 to prevent overflow
-    y_ptr_offset = (row.to(tl.int64) * y_row_stride) + (row_g_id.to(tl.int64) *
-                                                        group_size)
+    y_ptr_offset = (row.to(tl.int64) * y_row_stride) + (
+        row_g_id.to(tl.int64) * group_size
+    )
     y_ptr += y_ptr_offset
 
     y_q_ptr_offset = g_id.to(tl.int64) * group_size
@@ -436,8 +449,7 @@ def _per_token_group_quant_fp8_colmajor(
     scale_col = g_id % blocks_per_row
     scale_row = g_id // blocks_per_row
     # Ensure offset calculation uses int64 for y_s_ptr
-    y_s_ptr_offset = (scale_col.to(tl.int64) * y_s_col_stride) + scale_row.to(
-        tl.int64)
+    y_s_ptr_offset = (scale_col.to(tl.int64) * y_s_col_stride) + scale_row.to(tl.int64)
     y_s_ptr += y_s_ptr_offset
 
     cols = tl.arange(0, BLOCK)  # group_size <= BLOCK
@@ -477,9 +489,10 @@ def per_token_group_quant_fp8(
         scaling factor for quantization.
     """
     dtype = torch.float8_e4m3fn if dtype is None else dtype
-    assert (x.shape[-1] % group_size == 0), (
+    assert x.shape[-1] % group_size == 0, (
         f"the last dimension of `x` {x.shape[-1]} must be divisible "
-        f"by `group_size` {group_size}")
+        f"by `group_size` {group_size}"
+    )
     assert x.stride(-1) == 1, "`x` groups must be contiguous"
 
     finfo = torch.finfo(dtype)
@@ -494,11 +507,10 @@ def per_token_group_quant_fp8(
     M = x.numel() // group_size
     N = group_size
     if column_major_scales:
-        shape = (x.shape[-1] // group_size, ) + x.shape[:-1]
-        x_s = torch.empty(shape, device=x.device,
-                          dtype=torch.float32).permute(-1, -2)
+        shape = (x.shape[-1] // group_size,) + x.shape[:-1]
+        x_s = torch.empty(shape, device=x.device, dtype=torch.float32).permute(-1, -2)
     else:
-        shape = x.shape[:-1] + (x.shape[-1] // group_size, )
+        shape = x.shape[:-1] + (x.shape[-1] // group_size,)
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     BLOCK = triton.next_power_of_2(N)
@@ -506,7 +518,7 @@ def per_token_group_quant_fp8(
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
     if column_major_scales:
-        _per_token_group_quant_fp8_colmajor[(M, )](
+        _per_token_group_quant_fp8_colmajor[(M,)](
             x,
             x_q,
             x_s,
@@ -522,7 +534,7 @@ def per_token_group_quant_fp8(
             num_stages=num_stages,
         )
     else:
-        _per_token_group_quant_fp8[(M, )](
+        _per_token_group_quant_fp8[(M,)](
             x,
             x_q,
             x_s,
@@ -538,7 +550,6 @@ def per_token_group_quant_fp8(
         )
 
     return x_q, x_s
-
 
 
 def _fp8_quantize(

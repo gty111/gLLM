@@ -1,10 +1,10 @@
+from typing import Optional
+
 import torch
 import triton
 
-from typing import Optional
-
-from gllm.utils import round_up
 from gllm import _custom_ops as ops
+from gllm.utils import round_up
 
 
 def moe_align_block_size(
@@ -12,7 +12,7 @@ def moe_align_block_size(
     block_size: int,
     num_experts: int,
     expert_map: Optional[torch.Tensor] = None,
-    pad_sorted_ids: bool = False
+    pad_sorted_ids: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block

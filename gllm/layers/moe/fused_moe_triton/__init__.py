@@ -1,7 +1,8 @@
-from typing import Optional, Dict, Any
 from contextlib import contextmanager
+from typing import Any, Dict, Optional
 
 _config: Optional[Dict[str, Any]] = None
+
 
 @contextmanager
 def override_config(config):

@@ -1,21 +1,24 @@
+from typing import List, Set
+
 import torch
 import torch.distributed as dist
-
-from typing import List, Set
 from logger import logger
 
 from gllm.id_allocator import IDAllocator
 from gllm.sequence import Sequence
 from gllm.utils import get_dtype_bytes
 
-class Segment():
-    def __init__(self,
-                 num_layers: int,
-                 num_pages: int,
-                 page_size: int,
-                 kv_head_num: int,
-                 kv_head_dim: int,
-                 use_mla: bool):
+
+class Segment:
+    def __init__(
+        self,
+        num_layers: int,
+        num_pages: int,
+        page_size: int,
+        kv_head_num: int,
+        kv_head_dim: int,
+        use_mla: bool,
+    ):
         self.num_layers = num_layers
         self.num_pages = num_pages
         self.page_size = page_size
@@ -24,14 +27,20 @@ class Segment():
 
         if not use_mla:
             # We don't need zero initialization here
-            self.k_cache = [torch.ones(
-                (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
-            self.v_cache = [torch.ones(
-                (num_pages, page_size, kv_head_num, kv_head_dim)) for _ in range(num_layers)]
+            self.k_cache = [
+                torch.ones((num_pages, page_size, kv_head_num, kv_head_dim))
+                for _ in range(num_layers)
+            ]
+            self.v_cache = [
+                torch.ones((num_pages, page_size, kv_head_num, kv_head_dim))
+                for _ in range(num_layers)
+            ]
         else:
-            self.kv_cache = [torch.ones(
-                (num_pages, page_size, kv_head_dim)) for _ in range(num_layers)]
-        self.id_allocator = IDAllocator(0, num_pages-1)
+            self.kv_cache = [
+                torch.ones((num_pages, page_size, kv_head_dim))
+                for _ in range(num_layers)
+            ]
+        self.id_allocator = IDAllocator(0, num_pages - 1)
 
     def allocate(self):
         pagenum = self.id_allocator.allocate()
@@ -45,18 +54,29 @@ class Segment():
 
     # return percent of used memory
     def get_memory_util(self):
-        return round(100 * self.id_allocator.get_num_used_ids()/self.id_allocator.size, 2)
+        return round(
+            100 * self.id_allocator.get_num_used_ids() / self.id_allocator.size, 2
+        )
 
-class MemoryManager():
-    def __init__(self, gpu_memory_util: float, num_layers: int, dtype: torch.dtype,
-                 page_size: int, kv_head_num: int, kv_head_dim: int, vocab_size: int,
-                 use_mla=False):
-        '''
+
+class MemoryManager:
+    def __init__(
+        self,
+        gpu_memory_util: float,
+        num_layers: int,
+        dtype: torch.dtype,
+        page_size: int,
+        kv_head_num: int,
+        kv_head_dim: int,
+        vocab_size: int,
+        use_mla=False,
+    ):
+        """
         num_layers: number of hidden layers
         page_size: number of tokens in a page
         kv_head_num: number of k/v heads
         kv_head_dim: dimension of k/v head
-        '''
+        """
         self.gpu_memory_util = gpu_memory_util
         self.num_layers = num_layers
         self.page_size = page_size
@@ -65,12 +85,12 @@ class MemoryManager():
         self.dtype = dtype
         self.vocab_size = vocab_size
         self.use_mla = use_mla
-    
+
     def init(self, segment_cls=Segment):
         free_mem_size, _ = torch.cuda.mem_get_info()
         num_max_pages = free_mem_size // self.get_sizeof_KV_per_page()
         num_pages = int(num_max_pages * self.gpu_memory_util)
-        
+
         if not dist.is_initialized():
             self.num_pages = num_pages
         else:
@@ -78,43 +98,71 @@ class MemoryManager():
             dist.all_gather_object(num_pages_all, num_pages)
             self.num_pages = min(num_pages_all)
 
-        logger.info(f'KV cache: {self.num_pages} pages ({self.page_size} tokens/page), '
-                    f'{round(self.get_sizeof_KV_per_page()/(2**10*self.page_size),2)} KB (per token), '
-                    f'{round(self.num_pages*self.get_sizeof_KV_per_page()/(2**30),2)} GB (total)')
+        logger.info(
+            f"KV cache: {self.num_pages} pages ({self.page_size} tokens/page), "
+            f"{round(self.get_sizeof_KV_per_page()/(2**10*self.page_size),2)} KB (per token), "
+            f"{round(self.num_pages*self.get_sizeof_KV_per_page()/(2**30),2)} GB (total)"
+        )
 
         self.segment = segment_cls(
-            self.num_layers, self.num_pages, self.page_size, 
-            self.kv_head_num, self.kv_head_dim, self.use_mla
+            self.num_layers,
+            self.num_pages,
+            self.page_size,
+            self.kv_head_num,
+            self.kv_head_dim,
+            self.use_mla,
         )
-        
-        self.kv_cache_dtype = 'auto'
+
+        self.kv_cache_dtype = "auto"
         self.k_scale = torch.tensor(1.0, dtype=torch.float32)
         self.v_scale = self.k_scale
 
-    def get_sizeof_KV_per_page(self): # Bytes
+    def get_sizeof_KV_per_page(self):  # Bytes
         if not self.use_mla:
-            # 2: K cache and V cache 
-            return  2 * self.num_layers * self.page_size * self.kv_head_num * self.kv_head_dim * get_dtype_bytes(self.dtype) 
+            # 2: K cache and V cache
+            return (
+                2
+                * self.num_layers
+                * self.page_size
+                * self.kv_head_num
+                * self.kv_head_dim
+                * get_dtype_bytes(self.dtype)
+            )
         else:
-            return  self.num_layers * self.page_size * self.kv_head_dim * get_dtype_bytes(self.dtype)
-    
-    def batch_store(self, layer_idx: int, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping_tensor: torch.Tensor):
+            return (
+                self.num_layers
+                * self.page_size
+                * self.kv_head_dim
+                * get_dtype_bytes(self.dtype)
+            )
+
+    def batch_store(
+        self,
+        layer_idx: int,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        slot_mapping_tensor: torch.Tensor,
+    ):
         from gllm import _custom_ops as ops
-        ops.reshape_and_cache_flash(k_cache,
-                                    v_cache,
-                                    self.segment.k_cache[layer_idx],
-                                    self.segment.v_cache[layer_idx],
-                                    slot_mapping_tensor,
-                                    self.kv_cache_dtype,
-                                    self.k_scale,
-                                    self.v_scale)
+
+        ops.reshape_and_cache_flash(
+            k_cache,
+            v_cache,
+            self.segment.k_cache[layer_idx],
+            self.segment.v_cache[layer_idx],
+            slot_mapping_tensor,
+            self.kv_cache_dtype,
+            self.k_scale,
+            self.v_scale,
+        )
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
-            num_page = (seq.seq_len + self.page_size - 1) // self.page_size - len(seq.page_table)
+            num_page = (seq.seq_len + self.page_size - 1) // self.page_size - len(
+                seq.page_table
+            )
             for _ in range(num_page):
-                seq.page_table.append(
-                    self.segment.allocate())
+                seq.page_table.append(self.segment.allocate())
 
     def free(self, seq: Sequence):
         for page_num in seq.page_table:
@@ -125,9 +173,10 @@ class MemoryManager():
 
     def get_memory_util(self):
         return self.segment.get_memory_util()
-    
+
     def get_memory_free(self):
         return self.get_num_free_pages() / self.num_pages
+
 
 class PrefixMemoryManager(MemoryManager):
     def __init__(self, *args, **kwargs):
@@ -135,7 +184,7 @@ class PrefixMemoryManager(MemoryManager):
 
     def init(self):
         super().init(segment_cls=PrefixSegment)
-        
+
         # for prefill stage
         self.num_allocated_pages = 0
         self.num_hit_pages = 0
@@ -143,12 +192,14 @@ class PrefixMemoryManager(MemoryManager):
     def pre_allocate_computed_page(self, seqs: List[Sequence]):
         for seq in seqs:
             assert len(seq.page_table) == 0
-            num_page = (len(seq) + self.page_size - 1) // self.page_size 
+            num_page = (len(seq) + self.page_size - 1) // self.page_size
             if not seq.computed_prompt:
                 self.num_allocated_pages += num_page
             for i in range(num_page):
-                if (i+1)*self.page_size <= len(seq):
-                    page_num = self.segment.has_computed((*seq[:(i+1)*self.page_size],))
+                if (i + 1) * self.page_size <= len(seq):
+                    page_num = self.segment.has_computed(
+                        (*seq[: (i + 1) * self.page_size],)
+                    )
                     if page_num is not None:
                         seq.page_table.append(page_num)
                         seq.computed_token_num += self.page_size
@@ -164,17 +215,20 @@ class PrefixMemoryManager(MemoryManager):
             if seq.computed_prompt and len(seq) % self.page_size == 0:
                 self.segment.update((*seq[:],), seq.page_table[-1])
             len_page_table = len(seq.page_table)
-            num_page = (seq.seq_len + self.page_size - 1) // self.page_size - len_page_table
-            for i in range(len_page_table,len_page_table+num_page):
-                if (i+1)*self.page_size <= len(seq):
+            num_page = (
+                seq.seq_len + self.page_size - 1
+            ) // self.page_size - len_page_table
+            for i in range(len_page_table, len_page_table + num_page):
+                if (i + 1) * self.page_size <= len(seq):
                     page_num = self.segment.allocate(
-                            (*seq[:(i+1)*self.page_size],))
+                        (*seq[: (i + 1) * self.page_size],)
+                    )
                 else:
                     page_num = self.segment.allocate()
                 seq.page_table.append(page_num)
-    
+
     def get_cache_hit_rate(self):
-        return round(100 * self.num_hit_pages/self.num_allocated_pages, 2)
+        return round(100 * self.num_hit_pages / self.num_allocated_pages, 2)
 
 
 class PrefixSegment(Segment):
@@ -185,13 +239,12 @@ class PrefixSegment(Segment):
         self.page2hash = [0 for _ in range(self.num_pages)]
 
     def update(self, token_ids: Set[int], page_num: int):
-        '''update page hash
-        '''
+        """update page hash"""
         page_hash = hash(token_ids)
         if page_hash not in self.hash2page:
             self.page2hash[page_num] = page_hash
             self.hash2page[page_hash] = page_num
-            
+
     def has_computed(self, token_ids):
         page_hash = hash(token_ids)
         if page_hash in self.hash2page:

@@ -2,13 +2,13 @@ import importlib.util
 import io
 import logging
 import os
-import sys
-import torch
 import re
 import shutil
-
+import sys
 from shutil import which
 from typing import List
+
+import torch
 from setuptools import Extension, find_packages, setup
 from setuptools.command.build_ext import build_ext
 
@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 
 # gLLM only supports Linux platform
 assert sys.platform.startswith(
-    "linux"), "gLLM only supports Linux platform (including WSL)."
+    "linux"
+), "gLLM only supports Linux platform (including WSL)."
 
 MAIN_CUDA_VERSION = "12.1"
 
@@ -45,16 +46,15 @@ def is_ninja_available() -> bool:
 
 def remove_prefix(text, prefix):
     if text.startswith(prefix):
-        return text[len(prefix):]
+        return text[len(prefix) :]
     return text
 
 
 class CMakeExtension(Extension):
 
-    def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
+    def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
         super().__init__(name, sources=[], py_limited_api=True, **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
-
 
 
 class precompiled_build_ext(build_ext):
@@ -66,6 +66,7 @@ class precompiled_build_ext(build_ext):
     def build_extensions(self) -> None:
         print("Skipping build_ext: using precompiled extensions.")
         return
+
 
 class precompiled_wheel_utils:
     """Extracts libraries and other files from an existing wheel."""
@@ -146,7 +147,7 @@ def get_path(*filepath) -> str:
 
 
 def get_gllm_version() -> str:
-    version = '0.0.4'
+    version = "0.0.4"
     version += "+precompiled"
 
     return version
@@ -185,15 +186,14 @@ ext_modules = []
 ext_modules.append(CMakeExtension(name="gllm._C"))
 ext_modules.append(CMakeExtension(name="gllm._moe_C"))
 ext_modules.append(CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa2_C"))
-ext_modules.append(
-    CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa3_C"))
-    
+ext_modules.append(CMakeExtension(name="gllm.vllm_flash_attn._vllm_fa3_C"))
+
 package_data = {
     "gllm": [
         "layers/moe/fused_moe_triton/configs/*.json",
     ]
 }
-    
+
 assert _is_cuda(), "VLLM_USE_PRECOMPILED is only supported for CUDA builds"
 wheel_location = os.getenv("GLLM_PRECOMPILED_WHEEL_LOCATION", None)
 if wheel_location is not None:
@@ -219,8 +219,10 @@ setup(
     version=get_gllm_version(),
     author="gtyinstinct",
     license="Apache 2.0",
-    description=("A high-throughput and memory-efficient inference and "
-                 "serving engine for LLMs"),
+    description=(
+        "A high-throughput and memory-efficient inference and "
+        "serving engine for LLMs"
+    ),
     long_description=read_readme(),
     long_description_content_type="text/markdown",
     classifiers=[
@@ -231,8 +233,9 @@ setup(
         "License :: OSI Approved :: Apache Software License",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
-    packages=find_packages(exclude=("benchmarks", "csrc", "docs", "examples",
-                                    "tests*")),
+    packages=find_packages(
+        exclude=("benchmarks", "csrc", "docs", "examples", "tests*")
+    ),
     python_requires=">=3.8",
     install_requires=get_requirements(),
     ext_modules=ext_modules,

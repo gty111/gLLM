@@ -1,15 +1,19 @@
-import torch
-
 from typing import Optional
+
+import torch
 
 from gllm import _custom_ops as ops
 
 
-def topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
-                      token_expert_indices: torch.Tensor,
-                      gating_output: torch.Tensor,
-                      renormalize: bool) -> tuple[torch.Tensor, ...]:
+def topk_softmax(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool,
+) -> tuple[torch.Tensor, ...]:
     from gllm import _custom_ops as ops
+
     ops.topk_softmax(
         topk_weights,
         topk_indices,
@@ -20,6 +24,7 @@ def topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_indices
+
 
 def fused_grouped_topk(
     hidden_states: torch.Tensor,
@@ -43,9 +48,16 @@ def fused_grouped_topk(
 
     scores_with_bias = scores + e_score_correction_bias.unsqueeze(0)
     topk_values, topk_indices = ops.grouped_topk(
-        scores, scores_with_bias.to(scores.dtype), num_expert_group,
-        topk_group, topk, renormalize, routed_scaling_factor)
+        scores,
+        scores_with_bias.to(scores.dtype),
+        num_expert_group,
+        topk_group,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+    )
     return topk_values.to(torch.float32), topk_indices.to(torch.int32)
+
 
 # This is used by the Deepseek-V2 and Deepseek-V3 model
 def grouped_topk(
@@ -59,11 +71,7 @@ def grouped_topk(
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        num_expert_group <= 32
-        and topk <= 32
-        and e_score_correction_bias is not None
-    ):
+    if num_expert_group <= 32 and topk <= 32 and e_score_correction_bias is not None:
         return fused_grouped_topk(
             hidden_states=hidden_states,
             gating_output=gating_output,
@@ -171,7 +179,7 @@ def select_experts(
     use_grouped_topk: bool,
     topk_group: Optional[int] = None,
     num_expert_group: Optional[int] = None,
-    scoring_func: str = 'softmax',
+    scoring_func: str = "softmax",
     e_score_correction_bias: Optional[torch.Tensor] = None,
 ):
     # DeepSeekv2 uses grouped_top_k
@@ -186,7 +194,7 @@ def select_experts(
             num_expert_group=num_expert_group,
             topk_group=topk_group,
             scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias
+            e_score_correction_bias=e_score_correction_bias,
         )
     else:
         topk_weights, topk_ids = fused_topk(

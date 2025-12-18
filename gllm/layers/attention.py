@@ -1,25 +1,26 @@
-import torch
-
 from typing import Optional
 
-from gllm.vllm_flash_attn import flash_attn_varlen_func
-from gllm.layers.linear import ColumnParallelLinear, LinearBase
-from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
-from gllm.layers.ops.merge_attn_states import merge_attn_states
+import torch
+
 from gllm import _custom_ops as ops
-from gllm.input_data import (InputData, MLACommonPrefillMetadata,
-                             MLACommonMetadata)
+from gllm.input_data import InputData, MLACommonMetadata, MLACommonPrefillMetadata
+from gllm.layers.linear import ColumnParallelLinear, LinearBase
+from gllm.layers.ops.merge_attn_states import merge_attn_states
+from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 from gllm.utils import get_flash_attn_version
+from gllm.vllm_flash_attn import flash_attn_varlen_func
 
 
-class FlashAttention():
+class FlashAttention:
 
-    def __init__(self,
-                 layer_id: int,
-                 scale: float,
-                 num_heads: int,
-                 num_key_value_heads: int,
-                 head_dim: int):
+    def __init__(
+        self,
+        layer_id: int,
+        scale: float,
+        num_heads: int,
+        num_key_value_heads: int,
+        head_dim: int,
+    ):
         self.scale = scale
         self.layer_id = layer_id
         self.num_heads = num_heads
@@ -27,40 +28,41 @@ class FlashAttention():
         self.head_dim = head_dim
         self.fa_version = get_flash_attn_version()
 
-    def forward(self,
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                input_data: InputData):
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, input_data: InputData
+    ):
         # profile run
         if not hasattr(input_data.memory_manager, "segment"):
             return q
-        
+
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_key_value_heads, self.head_dim)
         v = v.view(-1, self.num_key_value_heads, self.head_dim)
 
         input_data.memory_manager.batch_store(
-            self.layer_id, k, v, input_data.get_slot_mapping())
+            self.layer_id, k, v, input_data.get_slot_mapping()
+        )
 
         k_cache = input_data.memory_manager.segment.k_cache[self.layer_id]
         v_cache = input_data.memory_manager.segment.v_cache[self.layer_id]
 
-        out = flash_attn_varlen_func(q,
-                                     k_cache,
-                                     v_cache,
-                                     cu_seqlens_q=input_data.get_query_start_loc(),
-                                     max_seqlen_q=input_data.max_query_len,
-                                     seqused_k=input_data.get_seq_lens(),
-                                     max_seqlen_k=input_data.max_seq_len,
-                                     softmax_scale=self.scale,
-                                     causal=True,
-                                     block_table=input_data.get_block_table(),
-                                     fa_version=self.fa_version)
-        return out.view(-1, out.shape[-2]*out.shape[-1])
-    
+        out = flash_attn_varlen_func(
+            q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q=input_data.get_query_start_loc(),
+            max_seqlen_q=input_data.max_query_len,
+            seqused_k=input_data.get_seq_lens(),
+            max_seqlen_k=input_data.max_seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            block_table=input_data.get_block_table(),
+            fa_version=self.fa_version,
+        )
+        return out.view(-1, out.shape[-2] * out.shape[-1])
 
-class MLAAttention():
+
+class MLAAttention:
     def __init__(
         self,
         layer_id: int,
@@ -98,40 +100,40 @@ class MLAAttention():
 
         self.W_UV = None
         self.W_UK_T = None
-        
-        self.kv_cache_dtype = 'auto'
-    
-    def process_weights(self):    
+
+        self.kv_cache_dtype = "auto"
+
+    def process_weights(self):
         def get_and_maybe_dequant_weights(layer: LinearBase):
             eye = torch.eye(layer.input_size_per_partition)
-            dequant_weights = layer.quant_method(
-                eye,
-                layer.weight,
-                bias=None
-            )
+            dequant_weights = layer.quant_method(eye, layer.weight, bias=None)
             del eye
             return dequant_weights.T
+
         kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
         kv_b_proj_weight = kv_b_proj_weight.view(
             self.kv_lora_rank,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
-        
+
         W_UK, W_UV = kv_b_proj_weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
 
         # Convert from (L, N, V) to (N, L, V)
         self.W_UV = W_UV.transpose(0, 1)
         # Convert from (L, N, P) to (N, P, L)
         self.W_UK_T = W_UK.permute(1, 2, 0)
 
-    def _flash_attn_varlen_diff_headdims(self, q, k, v, softmax_scale,
-                                         return_softmax_lse, **kwargs):
+    def _flash_attn_varlen_diff_headdims(
+        self, q, k, v, softmax_scale, return_softmax_lse, **kwargs
+    ):
         maybe_padded_v = v
         if self._pad_v:
             maybe_padded_v = torch.nn.functional.pad(
-                v, [0, q.shape[-1] - v.shape[-1]], value=0)
+                v, [0, q.shape[-1] - v.shape[-1]], value=0
+            )
 
         attn_out = flash_attn_varlen_func(
             q=q,
@@ -159,9 +161,10 @@ class MLAAttention():
             assert rest is not None
             return attn_out, rest[0]
         return attn_out
-    
-    def _run_prefill_context_chunk(self, prefill: MLACommonPrefillMetadata,
-                                      chunk_idx: int, q, k, v):
+
+    def _run_prefill_context_chunk(
+        self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
+    ):
         assert prefill.chunked_context is not None
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -224,18 +227,15 @@ class MLAAttention():
                 seq_starts=prefill_metadata.chunked_context.starts[i],
             )
 
-            kv_c_normed = workspace[:toks]\
-                [..., :self.kv_lora_rank]
-            k_pe = workspace[:toks]\
-                [..., self.kv_lora_rank:].unsqueeze(1)
+            kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
+            k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
 
-            kv_nope = self.kv_b_proj(kv_c_normed).view( \
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = kv_nope\
-                .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            kv_nope = self.kv_b_proj(kv_c_normed).view(
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))),
-                          dim=-1)
+            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -263,9 +263,10 @@ class MLAAttention():
                 output_lse = output_lse_tmp
 
         return output, output_lse
-    
-    def _run_prefill_new_tokens(self, prefill: MLACommonPrefillMetadata, q,
-                                   k, v, return_softmax_lse):
+
+    def _run_prefill_new_tokens(
+        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+    ):
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
@@ -292,9 +293,10 @@ class MLAAttention():
 
         has_context = attn_metadata.prefill.chunked_context is not None
         kv_nope = self.kv_b_proj(kv_c_normed).view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        
+
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
         output = self._run_prefill_new_tokens(
@@ -308,7 +310,8 @@ class MLAAttention():
         if has_context:
             suffix_output, suffix_lse = output
             context_output, context_lse = self._compute_prefill_context(
-                q, kv_c_and_k_pe_cache, attn_metadata, k_scale)
+                q, kv_c_and_k_pe_cache, attn_metadata, k_scale
+            )
 
             output = torch.empty_like(suffix_output)
             merge_attn_states(
@@ -321,7 +324,7 @@ class MLAAttention():
 
         # unpad if necessary
         if self._pad_v:
-            output = output[..., :v.shape[-1]]
+            output = output[..., : v.shape[-1]]
 
         return output.flatten(start_dim=-2)
 
@@ -386,7 +389,7 @@ class MLAAttention():
         )
 
         return o, lse
-    
+
     def forward(
         self,
         q: torch.Tensor,
@@ -396,12 +399,12 @@ class MLAAttention():
         output: torch.Tensor,
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
-        
+
         # profile run
         if not hasattr(input_data.memory_manager, "segment"):
             self.process_weights()
             return output
-        
+
         kv_cache = input_data.memory_manager.segment.kv_cache[self.layer_id]
 
         attn_metadata = input_data.metadata
@@ -421,8 +424,8 @@ class MLAAttention():
         k_pe = k_pe[:num_actual_toks, ...]
 
         assert (
-            attn_metadata.num_decodes is not None 
-            and attn_metadata.num_prefills is not None 
+            attn_metadata.num_decodes is not None
+            and attn_metadata.num_prefills is not None
             and attn_metadata.num_decode_tokens is not None
         )
 
@@ -449,35 +452,39 @@ class MLAAttention():
 
         if has_prefill:
             output[num_decode_tokens:] = self._forward_prefill(
-                prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
-                attn_metadata, self._k_scale)
+                prefill_q,
+                prefill_k_c_normed,
+                prefill_k_pe,
+                kv_cache,
+                attn_metadata,
+                self._k_scale,
+            )
 
         if has_decode:
             assert attn_metadata.decode is not None
             decode_q_nope, decode_q_pe = decode_q.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
             # Convert from (B, N, P) to (N, B, P)
             decode_q_nope = decode_q_nope.transpose(0, 1)
-            
+
             N, B, P = decode_q_nope.shape
             if self.W_UK_T is None:
                 self.process_weights()
             _, _, L = self.W_UK_T.shape
-            
+
             decode_ql_nope = decode_q_nope.new_empty((N, B, L))
-            
+
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
             torch.bmm(decode_q_nope, self.W_UK_T, out=decode_ql_nope)
-            
+
             # Convert from (N, B, L) to (B, N, L)
             decode_ql_nope = decode_ql_nope.transpose(0, 1)
-            
+
             decode_q = (decode_ql_nope, decode_q_pe)
-            
+
             # call decode attn
-            attn_out, lse = self._forward_decode(
-                decode_q, kv_cache, attn_metadata
-            )
+            attn_out, lse = self._forward_decode(decode_q, kv_cache, attn_metadata)
 
             # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])

@@ -1,9 +1,10 @@
 import argparse
+
 from openai import OpenAI
 
-parser = argparse.ArgumentParser(description='Chat client')
-parser.add_argument("--stream",action="store_true")
-parser.add_argument("--port",type=int)
+parser = argparse.ArgumentParser(description="Chat client")
+parser.add_argument("--stream", action="store_true")
+parser.add_argument("--port", type=int)
 args = parser.parse_args()
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
@@ -24,12 +25,13 @@ completion = client.completions.create(
     model=model,
     prompt="A robot may not injure a human being",
     stream=args.stream,
-    max_tokens=128)
+    max_tokens=128,
+)
 
 print("Completion results:")
 if args.stream:
     for i in completion:
-        print(i.choices[0].text, end='', flush=True)
+        print(i.choices[0].text, end="", flush=True)
     print()
 else:
     print(completion)

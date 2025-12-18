@@ -37,8 +37,8 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 - [2025/04/27]: We support multi-node deployments. You can serve your model across different machines :blush:
 - [2025/04/21]: We release our paper on [arXiv:2504.14775](https://arxiv.org/abs/2504.14775) :partying_face:
 - [2025/03/15]: Chunked prefill has been integrated. You can input any length of text you want :hugs:
-- [2025/03/01]: Pipeline parallelism has been integrated. You can run any size of model you want :laughing: 
-- [2025/02/27]: We apply numerous optimizations which lowers CPU overhead a lot :clap: 
+- [2025/03/01]: Pipeline parallelism has been integrated. You can run any size of model you want :laughing:
+- [2025/02/27]: We apply numerous optimizations which lowers CPU overhead a lot :clap:
 
 </details>
 
@@ -103,13 +103,13 @@ To launch slave gLLM instance
 ```
 python -m gllm.entrypoints.api_server --host $HOST \
     --master-addr $MASTER_ADDR --master-port $MASTER_PORT \
-    --model-path $MODEL_PATH --pp $PP --launch-mode slave --worker-ranks $RANKS 
+    --model-path $MODEL_PATH --pp $PP --launch-mode slave --worker-ranks $RANKS
 ```
 There are something you need to care about
 - Make sure `$MASTER_PORT` and `$MASTER_ADDR` in slave instance can be matched to that in master instance
 - Make sure slave instance can set up connection with master instance using `$MASTER_ADDR`
 - Make sure master instance can set up connection with slave instance using `$HOST`
-- Make sure `$PP` can be matched to `$RANKS` in slave or master instance 
+- Make sure `$PP` can be matched to `$RANKS` in slave or master instance
     - For example, we want to launch two gLLM instances, `$PP` is set to `4`, `$RANKS` in master is set to `0,1`, then `$RANKS` in slave must set to `2,3`
 - Make sure set environment variable `NCCL_SOCKET_IFNAME` `NCCL_IB_DISABLE` properly
 
@@ -142,7 +142,7 @@ python benchmarks/benchmark_prefix_serving.py \
         --model $MODEL --num-max-users $NUM_USERS \
         --num-min-rounds $NUM_MIN_ROUNDS \
         --num-max-rounds $NUM_MAX_ROUNDS \
-        --port $PORT 
+        --port $PORT
 ```
 
 ### Evaluate Output Quality
@@ -157,7 +157,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 - Qwen Series: Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
 - Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
-- ChatGLM Series: Glm4 and Chatglm3 
+- ChatGLM Series: Glm4 and Chatglm3
 
 ## Supported Quantization Method
 

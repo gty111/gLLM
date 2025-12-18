@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+
 def merge_attn_states(
     output: torch.Tensor,
     prefix_output: torch.Tensor,
@@ -30,5 +31,7 @@ def merge_attn_states(
 
     assert supported_dtypes(output) and supported_headdim(output)
     from gllm._custom_ops import merge_attn_states
-    return merge_attn_states(output, prefix_output, prefix_lse,
-                                suffix_output, suffix_lse, output_lse)
+
+    return merge_attn_states(
+        output, prefix_output, prefix_lse, suffix_output, suffix_lse, output_lse
+    )

@@ -1,13 +1,18 @@
-import torch
-
 from typing import Union
+
+import torch
 from typing_extensions import TypeAlias
 
-NestedTensors: TypeAlias = Union[list["NestedTensors"], list["torch.Tensor"],
-                                 "torch.Tensor", tuple["torch.Tensor", ...]]
+NestedTensors: TypeAlias = Union[
+    list["NestedTensors"],
+    list["torch.Tensor"],
+    "torch.Tensor",
+    tuple["torch.Tensor", ...],
+]
 """
 Uses a list instead of a tensor if the dimensions of each element do not match.
 """
+
 
 def _embedding_count_expression(embeddings: NestedTensors) -> str:
     """
@@ -18,8 +23,8 @@ def _embedding_count_expression(embeddings: NestedTensors) -> str:
     if isinstance(embeddings, torch.Tensor):
         return " x ".join([str(dim) for dim in embeddings.shape[:-1]])
 
-    return " + ".join(
-        _embedding_count_expression(inner) for inner in embeddings)
+    return " + ".join(_embedding_count_expression(inner) for inner in embeddings)
+
 
 def _flatten_embeddings(embeddings: NestedTensors) -> torch.Tensor:
     """
@@ -32,6 +37,7 @@ def _flatten_embeddings(embeddings: NestedTensors) -> torch.Tensor:
         return embeddings.flatten(0, -2)
 
     return torch.cat(tuple(_flatten_embeddings(t) for t in embeddings))
+
 
 def _merge_multimodal_embeddings(
     inputs_embeds: torch.Tensor,
@@ -49,8 +55,9 @@ def _merge_multimodal_embeddings(
     flattened = _flatten_embeddings(multimodal_embeddings)
     try:
         # This is equivalent to: inputs_embeds[is_multimodal] = flattened.
-        inputs_embeds.masked_scatter_(is_multimodal.unsqueeze(-1),
-                                      flattened.to(dtype=inputs_embeds.dtype))
+        inputs_embeds.masked_scatter_(
+            is_multimodal.unsqueeze(-1), flattened.to(dtype=inputs_embeds.dtype)
+        )
     except RuntimeError as e:
         num_expected_tokens = is_multimodal.sum().item()
         assert isinstance(num_expected_tokens, int)
@@ -65,6 +72,7 @@ def _merge_multimodal_embeddings(
             raise ValueError("Error during masked scatter operation") from e
 
     return inputs_embeds
+
 
 def merge_multimodal_embeddings(
     input_ids: torch.Tensor,
@@ -98,8 +106,9 @@ def merge_multimodal_embeddings(
         This updates ``inputs_embeds`` in place.
     """
     if isinstance(placeholder_token_id, list):
-        placeholder_token_id = torch.tensor(placeholder_token_id,
-                                            device=input_ids.device)
+        placeholder_token_id = torch.tensor(
+            placeholder_token_id, device=input_ids.device
+        )
         return _merge_multimodal_embeddings(
             inputs_embeds,
             torch.isin(input_ids, placeholder_token_id),

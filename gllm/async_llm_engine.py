@@ -1,11 +1,12 @@
 import asyncio
+from typing import Dict, List
 
-from logger import logger
-from typing import List, Dict
 from fastapi import Request
+from logger import logger
 
-from gllm.utils import make_async
 from gllm.llm_engine import LLM
+from gllm.utils import make_async
+
 
 class AsyncStream:
 
@@ -35,7 +36,7 @@ class AsyncStream:
         if isinstance(result, Exception):
             raise result
         return result
-    
+
     async def is_disconnected(self):
         return await self._raw_request.is_disconnected()
 
@@ -59,12 +60,28 @@ class PipeAsyncLLM(LLM):
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
 
-    async def add_requests_async(self, raw_request: Request, token_ids: List[int], output_len: int, ignore_eos: bool,
-                                 temperature: float, top_p: float, top_k: float, repetition_penalty: float,
-                                 mm_contents=None):
-        seq = self.allocate_seq(token_ids, output_len, ignore_eos,
-                                temperature, top_p, top_k, repetition_penalty,
-                                mm_contents)
+    async def add_requests_async(
+        self,
+        raw_request: Request,
+        token_ids: List[int],
+        output_len: int,
+        ignore_eos: bool,
+        temperature: float,
+        top_p: float,
+        top_k: float,
+        repetition_penalty: float,
+        mm_contents=None,
+    ):
+        seq = self.allocate_seq(
+            token_ids,
+            output_len,
+            ignore_eos,
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            mm_contents,
+        )
         stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
@@ -72,13 +89,13 @@ class PipeAsyncLLM(LLM):
         if self.schedule_engine is None:
             self.start_schedule_engine()
         return stream
-    
+
     async def check_abort_seqs(self):
         for id, seq in self.running_maps.items():
             if await self.async_streams[id].is_disconnected() and not seq.is_abort:
                 self.abort_ids.append(id)
                 seq.is_abort = True
-                
+
     async def schedule(self):
         while True:
             await self.check_abort_seqs()
@@ -87,9 +104,6 @@ class PipeAsyncLLM(LLM):
 
     def start_schedule_engine(self):
         # launch schedule engine
-        self._schedule_task = asyncio.get_event_loop(
-        ).create_task(self.schedule())
-        self._schedule_task.add_done_callback(
-            _log_task_completion)
-        self.schedule_engine = asyncio.shield(
-            self._schedule_task)
+        self._schedule_task = asyncio.get_event_loop().create_task(self.schedule())
+        self._schedule_task.add_done_callback(_log_task_completion)
+        self.schedule_engine = asyncio.shield(self._schedule_task)
