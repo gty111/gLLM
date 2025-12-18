@@ -111,7 +111,7 @@ if __name__ == '__main__':
     parser.add_argument('--minp', type=int, help='Minimum prefill token count per batch (Token Throttling)', default=32)
     parser.add_argument('--iterp', type=int, help='Number of iterations to process waiting prefill tokens (Token Throttling)', default=8)
     parser.add_argument('--kvthresh', type=float, help='KV cache threshold for prefill operations (Token Throttling)', default=0.05)
-    parser.add_argument('--use-cp-schedule', help='Use scheduling policy in Sarathi-Serve (chunked prefill)', action='store_true')
+    parser.add_argument('--schedule-method', type=str, choices=['split_pd','chunked_prefill','token_throttling'], help='Specify scheduling method', default='chunked_prefill')
     # Multi-Node deployment
     parser.add_argument('--launch-mode', type=str, choices=['normal', 'master', 'slave'], default='normal')
     parser.add_argument('--ranks',type=str,help='Specify the ranks of worker like 0,1', default=None)
@@ -137,7 +137,7 @@ if __name__ == '__main__':
                   tp_size=args.tp,
                   use_ep=not args.disable_ep,
                   assigned_layers=args.assigned_layers,
-                  use_cp_schedule=args.use_cp_schedule,
+                  schedule_method=args.schedule_method,
                   use_async_worker=args.use_async_worker,
                   use_thinking=not args.disable_thinking,
                   enable_cuda_graph=args.enable_cuda_graph,
