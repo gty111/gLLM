@@ -9,7 +9,7 @@ from logger import logger
 from gllm.input_data import InputData
 from gllm.model_runner import ModelRunner
 from gllm.comm import zmqComm, IPCPackage
-from gllm.scheduler import WorkerScheduler
+from gllm.scheduler import Scheduler
 from gllm.dist_utils import (init_dist, send_pp_data, recv_pp_data, 
                              get_rank, get_world_size, is_last_pp_rank,
                              get_pp_size, get_next_pp_rank, get_last_pp_rank,
@@ -62,7 +62,7 @@ class Worker:
         self.ret_residual = self.model_runner.model.ret_residual
         
         if self.rank == 0:
-            self.worker_scheduler = WorkerScheduler(
+            self.worker_scheduler = Scheduler(
                 self.pp_size,
                 self.model_runner, 
                 self.use_cp_schedule,
