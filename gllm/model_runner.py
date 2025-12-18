@@ -28,7 +28,7 @@ class EmbeddingInfo:
 class ModelRunner():
     def __init__(self, load_format: str, model_path: str, gpu_memory_util: float, page_size: int,
                  enable_prefix_caching: bool, use_thinking: bool, maxp, maxd, kvthresh, minp, iterp,
-                 use_cp_schedule: bool, enable_cuda_graph: bool, max_cuda_graph_bs: int):
+                 schedule_method: str, enable_cuda_graph: bool, max_cuda_graph_bs: int):
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
         self.enable_prefix_caching = enable_prefix_caching
@@ -42,7 +42,7 @@ class ModelRunner():
         self.kvthresh = kvthresh
         self.minp = minp
         self.iterp = iterp
-        self.use_cp_schedule = use_cp_schedule
+        self.schedule_method = schedule_method
         self.sampler = Sampler()
         
         self.use_mm = self.model_loader.use_mm
@@ -81,12 +81,12 @@ class ModelRunner():
             use_mla=self.model_loader.use_mla)
         # Input buffer
         self.input_data = InputData(
-            max_running_seqs=self.maxp if self.use_cp_schedule else self.maxd, 
+            max_running_seqs=self.maxp if self.schedule_method in ['chunked_prefill', 'split_pd'] else self.maxd, 
             max_seq_length=self.tokenizer.model_max_length,
             memory_manager=self.memory_manager,
             use_buffer=True,
         )
-        max_tokens_ret = self.maxp if self.use_cp_schedule else self.maxp + self.maxd
+        max_tokens_ret = self.maxp if self.schedule_method in ['chunked_prefill', 'split_pd'] else self.maxp + self.maxd
         self.input_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
         self.input_residual = torch.zeros((max_tokens_ret, self.hidden_size))
         # Output buffer
@@ -225,7 +225,7 @@ class ModelRunner():
     
     @torch.inference_mode()
     def profile_run(self):
-        seqs = self.create_dummy_seqs(self.maxp if self.use_cp_schedule else self.maxd)
+        seqs = self.create_dummy_seqs(self.maxp if self.schedule_method == 'chunked_prefill' else self.maxd)
         self.input_data.cal_and_set_input(seqs)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if self.use_mm:

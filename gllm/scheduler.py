@@ -14,11 +14,11 @@ from gllm.dist_utils import get_world_size
 
 
 class Scheduler():
-    def __init__(self, pp_size, model_runner:ModelRunner, use_cp_schedule):
+    def __init__(self, pp_size, model_runner:ModelRunner, schedule_method):
         self.pp_size = pp_size
         self.model_runner: ModelRunner = model_runner
         self.memory_manager: MemoryManager = model_runner.memory_manager
-        self.use_cp_schedule = use_cp_schedule
+        self.schedule_method = schedule_method
         self.maxd = model_runner.maxd
         self.maxp = model_runner.maxp
         self.minp = model_runner.minp
@@ -45,6 +45,16 @@ class Scheduler():
         self.abort_ids = set()
         # log
         self.log = True
+        # schedule method
+        self.schedule = self.dispatch_schedule_method()
+        
+    def dispatch_schedule_method(self):
+        if self.schedule_method in ['split_pd', 'chunked_prefill']:
+            return self.schedule_chunked_prefill
+        elif self.schedule_method == 'token_throttling':
+            return self.schedule_token_throttling
+        else:
+            assert 0
         
     def get_num_free_pages(self):
         return self.memory_manager.get_num_free_pages()
@@ -95,9 +105,9 @@ class Scheduler():
         else:
             return None
         
-    def check_preempt(self, num_decode_tokens):
+    def check_preempt(self, num_tokens_to_allocate):
         preempt_seqs = []
-        while self.get_num_free_pages() < num_decode_tokens and len(self.seqs_to_decode) != 0:
+        while self.get_num_free_pages() < num_tokens_to_allocate and len(self.seqs_to_decode) != 0:
             seq_to_preempt = self.seqs_to_decode.popleft()
             self.model_runner.free(seq_to_preempt)
             seq_to_preempt.preempt()
@@ -133,12 +143,24 @@ class Scheduler():
     
     def schedule_once(self):
         if len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0 and len(self.batch_running) < self.pp_size:
-            schedule_seqs = self.schedule() if not self.use_cp_schedule else self.schedule_chunked_prefill()
+            schedule_seqs = self.schedule()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
             return schedule_seqs
         else: 
             return []
+        
+    def get_balanced_decode_token_budget(self, num_total_decode_seqs):
+        if num_total_decode_seqs < self.pp_size:
+            decode_token_budget = 1
+        else:
+            # here we add num_total_decode_seqs to random.randint(0,self.pp_size-1))
+            # because we want to solve the situation when #seqs=5 pp_size=4
+            decode_token_budget = (
+                num_total_decode_seqs + random.randint(0, self.pp_size-1)) // self.pp_size
+        
+        decode_token_budget = min(self.maxd, decode_token_budget)
+        return decode_token_budget
 
     def schedule_chunked_prefill(self):
         schedule_prefill_seqs = []
@@ -150,18 +172,26 @@ class Scheduler():
         
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
-        for _ in range(num_tokens_budget):
-            if len(self.seqs_to_decode) == 0:
-                break
-            seq = self.seqs_to_decode.pop()
-            seq.to_compute_token_num = 1
-            schedule_decode_seqs.append(seq)
-
-        self.memory_manager.pre_allocate_page(
-            schedule_decode_seqs)
-
-        num_tokens_budget -= len(schedule_decode_seqs)
+        decode_token_budget = self.get_balanced_decode_token_budget(num_total_decode_seqs)
+        decode_token_budget = min(decode_token_budget, num_tokens_budget)
         
+        if self.schedule_method == 'chunked_prefill' or (
+            self.schedule_method == 'split_pd'
+            and (len(self.seqs_to_prefill) == 0
+            or self.get_num_free_pages() < self.num_kvthresh_pages)
+        ):
+            for _ in range(decode_token_budget):
+                if len(self.seqs_to_decode) == 0:
+                    break
+                seq = self.seqs_to_decode.pop()
+                seq.to_compute_token_num = 1
+                schedule_decode_seqs.append(seq)
+
+            self.memory_manager.pre_allocate_page(
+                schedule_decode_seqs)
+
+            num_tokens_budget -= len(schedule_decode_seqs)
+            
         num_tokens_budget = min(num_tokens_budget, self.page_size * \
             max(self.get_num_free_pages()-self.num_kvthresh_pages, 0))
 
@@ -204,7 +234,7 @@ class Scheduler():
         # first decode, then prefill
         return schedule_decode_seqs + schedule_prefill_seqs
 
-    def schedule(self):
+    def schedule_token_throttling(self):
 
         schedule_prefill_seqs = []
         schedule_decode_seqs = []
@@ -252,15 +282,7 @@ class Scheduler():
 
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
-        if num_total_decode_seqs < self.pp_size:
-            decode_token_budget = 1
-        else:
-            # here we add num_total_decode_seqs to random.randint(0,self.pp_size-1))
-            # because we want to solve the situation when #seqs=5 pp_size=4
-            decode_token_budget = (
-                num_total_decode_seqs + random.randint(0, self.pp_size-1)) // self.pp_size
-        
-        decode_token_budget = min(self.maxd, decode_token_budget)
+        decode_token_budget = self.get_balanced_decode_token_budget(num_total_decode_seqs)
 
         self.check_preempt(decode_token_budget)
 

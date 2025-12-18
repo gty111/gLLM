@@ -19,14 +19,14 @@ class LLM():
                  zmq_port_base:int=8001, launch_mode:str='normal', worker_ranks:str=None, 
                  load_format:str='auto', gpu_memory_util=0.9, page_size=16, maxd=2048, maxp=2048, minp=32, 
                  iterp=8, kvthresh=0.05, enable_prefix_caching=True, pp_size=1, tp_size=1, use_ep=True,
-                 assigned_layers=None, use_cp_schedule=False, use_async_worker=False, use_thinking=True,
+                 assigned_layers=None, schedule_method='chunked_prefill', use_async_worker=False, use_thinking=True,
                  enable_cuda_graph=False, max_cuda_graph_bs=512):
         init_logger()
         self.model_path = model_path
         self.load_format = load_format
         self.model_runner = ModelRunner(
             load_format, model_path, gpu_memory_util, page_size, enable_prefix_caching, use_thinking,
-            maxp, maxd, kvthresh, minp, iterp, use_cp_schedule, enable_cuda_graph, max_cuda_graph_bs)
+            maxp, maxd, kvthresh, minp, iterp, schedule_method, enable_cuda_graph, max_cuda_graph_bs)
         self.pp_size = pp_size
         self.tp_size = tp_size
         self.use_ep = use_ep
@@ -44,10 +44,9 @@ class LLM():
         self.generation_config = self.model_runner.model_loader.generation_config
         
         self.assigned_layers = assigned_layers
-        self.use_cp_schedule = use_cp_schedule
+        self.schedule_method = schedule_method
         self.use_async_worker = use_async_worker
         
-        schedule_method = 'Sarathi-Serve (chunked prefill)' if self.use_cp_schedule else 'Token Throttling'
         logger.info(f'Schedule method: {schedule_method}')
         
         # Interact with workers
@@ -133,7 +132,7 @@ class LLM():
                             self.mp_alive,
                             self.mp_load_progress,
                             self.assigned_layers,
-                            self.use_cp_schedule)
+                            self.schedule_method)
         process = self.ctx.Process(
                     target=run_worker if not self.use_async_worker else run_worker_async,
                     args=(worker,),
