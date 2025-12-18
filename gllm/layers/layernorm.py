@@ -1,7 +1,8 @@
-import torch
+from typing import Optional, Tuple, Union
 
+import torch
 from torch import nn
-from typing import Optional, Union, Tuple
+
 
 class RMSNorm(nn.Module):
 
@@ -16,7 +17,7 @@ class RMSNorm(nn.Module):
         self.hidden_size = hidden_size
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.has_weight = True
-        
+
     def forward(
         self,
         x,
@@ -55,8 +56,10 @@ class RMSNorm(nn.Module):
 
         hidden_size = x.shape[-1]
         if hidden_size != self.hidden_size:
-            raise ValueError("Expected hidden_size to be "
-                             f"{self.hidden_size}, but found: {hidden_size}")
+            raise ValueError(
+                "Expected hidden_size to be "
+                f"{self.hidden_size}, but found: {hidden_size}"
+            )
 
         if self.variance_size_override is None:
             x_var = x
@@ -64,9 +67,10 @@ class RMSNorm(nn.Module):
             if hidden_size < self.variance_size_override:
                 raise ValueError(
                     "Expected hidden_size to be at least "
-                    f"{self.variance_size_override}, but found: {hidden_size}")
+                    f"{self.variance_size_override}, but found: {hidden_size}"
+                )
 
-            x_var = x[:, :, :self.variance_size_override]
+            x_var = x[:, :, : self.variance_size_override]
 
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
 

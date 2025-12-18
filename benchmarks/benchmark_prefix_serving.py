@@ -16,19 +16,21 @@ On the client side, run:
         --num-min-rounds <min_rounds> --num-max-rounds <max_rounds> \
         --num-max-users <max_users>
 """
+
 import argparse
 import asyncio
 import json
 import random
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
-from typing import AsyncGenerator, List, Optional, Tuple
-import warnings
+from typing import List, Optional, Tuple
 
 import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
+
 try:
     from vllm.transformers_utils.tokenizer import get_tokenizer
 except ImportError:
@@ -62,8 +64,8 @@ class BenchmarkMetrics:
     std_itl_ms: float
     p99_itl_ms: float
     avg_latency_ms: float
-    
-    
+
+
 def sample_requests(
     dataset_path: str,
     num_min_rounds: int,
@@ -78,14 +80,14 @@ def sample_requests(
     # Load the dataset.
     with open(dataset_path) as f:
         dataset = json.load(f)
-    
+
     assert num_min_rounds <= num_max_rounds
 
-    dataset = [data for data in dataset if len(
-        data["conversations"]) >= num_min_rounds*2]
-    dataset = [data for data in dataset if data[
-        "conversations"][0]["from"] == "human"]
-    
+    dataset = [
+        data for data in dataset if len(data["conversations"]) >= num_min_rounds * 2
+    ]
+    dataset = [data for data in dataset if data["conversations"][0]["from"] == "human"]
+
     filtered_dataset = []
     user_id = 1
     for i in dataset:
@@ -93,33 +95,43 @@ def sample_requests(
         epoch = 0
         for chat in i["conversations"]:
             if chat["from"] == "human":
-                history.append({"role":"user","content":chat["value"]})
+                history.append({"role": "user", "content": chat["value"]})
             elif chat["from"] == "gpt":
                 if len(history) != 0:
                     # if len(tokenizer(gen_prompt(history)).input_ids) > 4096:
                     #     break
-                    prompt_tokens = tokenizer.apply_chat_template(history,add_generation_prompt=True)
-                    prompt = tokenizer.decode(prompt_tokens,True)
+                    prompt_tokens = tokenizer.apply_chat_template(
+                        history, add_generation_prompt=True
+                    )
+                    prompt = tokenizer.decode(prompt_tokens, True)
                     epoch += 1
                     if fixed_output_len:
-                        filtered_dataset.append((prompt,
-                                            len(tokenizer(prompt).input_ids),
-                                            fixed_output_len,
-                                            user_id,
-                                            epoch))
+                        filtered_dataset.append(
+                            (
+                                prompt,
+                                len(tokenizer(prompt).input_ids),
+                                fixed_output_len,
+                                user_id,
+                                epoch,
+                            )
+                        )
                     else:
-                        filtered_dataset.append((prompt,
-                                            len(tokenizer(prompt).input_ids),
-                                            len(tokenizer(chat['value']).input_ids),
-                                            user_id,
-                                            epoch))
-                history.append({"role":"gpt","content":chat["value"]})
+                        filtered_dataset.append(
+                            (
+                                prompt,
+                                len(tokenizer(prompt).input_ids),
+                                len(tokenizer(chat["value"]).input_ids),
+                                user_id,
+                                epoch,
+                            )
+                        )
+                history.append({"role": "gpt", "content": chat["value"]})
             if epoch == num_max_rounds:
                 break
         user_id += 1
-        if user_id-1 == num_max_users:
+        if user_id - 1 == num_max_users:
             break
-    users = min(user_id,num_max_users)
+    users = min(user_id, num_max_users)
     epochs = len(filtered_dataset) // users
     print(f"#users : {min(user_id,num_max_users)}, #epochs : {epochs}")
     return filtered_dataset
@@ -145,13 +157,12 @@ def calculate_metrics(
             # multiple output tokens may be bundled together
             # Note : this may inflate the output token count slightly
             output_len = len(
-                tokenizer(outputs[i].generated_text,
-                          add_special_tokens=False).input_ids)
+                tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids
+            )
             actual_output_lens.append(output_len)
             total_input += input_requests[i][1]
             if output_len > 1:
-                tpots.append(
-                    (outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+                tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
             latencys.append(outputs[i].latency)
@@ -163,7 +174,8 @@ def calculate_metrics(
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
-            stacklevel=2)
+            stacklevel=2,
+        )
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -171,8 +183,8 @@ def calculate_metrics(
         request_throughput=completed / dur_s,
         input_throughput=total_input / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) *
-        1000,  # ttfts is empty if streaming is not supported by backend
+        mean_ttft_ms=np.mean(ttfts or 0)
+        * 1000,  # ttfts is empty if streaming is not supported by backend
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
         p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
@@ -189,13 +201,16 @@ def calculate_metrics(
 
     return metrics, actual_output_lens
 
-async def user_request(request_func,
-                       model_id,
-                       api_url,
-                       best_of,
-                       use_beam_search,
-                       pbar,
-                       requests,):
+
+async def user_request(
+    request_func,
+    model_id,
+    api_url,
+    best_of,
+    use_beam_search,
+    pbar,
+    requests,
+):
     cur_task = None
     outputs = []
     for request in requests:
@@ -213,10 +228,11 @@ async def user_request(request_func,
             best_of=best_of,
         )
         cur_task = asyncio.create_task(
-            request_func(request_func_input=request_func_input,
-                         pbar=pbar))
+            request_func(request_func_input=request_func_input, pbar=pbar)
+        )
     outputs.append(await cur_task)
     return outputs
+
 
 async def benchmark(
     backend: str,
@@ -234,7 +250,7 @@ async def benchmark(
         raise ValueError(f"Unknown backend: {backend}")
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
-    
+
     # rearrange request by its users
     user_id = 1
     request_rearrange = []
@@ -251,17 +267,21 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks = []
     for request_epoch in request_rearrange:
-        tasks.append(asyncio.create_task(user_request(
-            request_func=request_func,
-            model_id=model_id,
-            api_url=api_url,
-            best_of=best_of,
-            use_beam_search=use_beam_search,
-            pbar=pbar,
-            requests=request_epoch,
-        )))
+        tasks.append(
+            asyncio.create_task(
+                user_request(
+                    request_func=request_func,
+                    model_id=model_id,
+                    api_url=api_url,
+                    best_of=best_of,
+                    use_beam_search=use_beam_search,
+                    pbar=pbar,
+                    requests=request_epoch,
+                )
+            )
+        )
         # await asyncio.sleep(1)
-        
+
     output_all = await asyncio.gather(*tasks)
     outputs = []
     for output_each in output_all:
@@ -279,33 +299,38 @@ async def benchmark(
         tokenizer=tokenizer,
     )
 
-    print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
+    print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
-                                    benchmark_duration))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
-    print("{:<40} {:<10}".format("Total generated tokens:",
-                                 metrics.total_output))
-    print("{:<40} {:<10.2f}".format("Request throughput (req/s):",
-                                    metrics.request_throughput))
-    print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):",
-                                    metrics.input_throughput))
-    print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):",
-                                    metrics.output_throughput))
+    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Request throughput (req/s):", metrics.request_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Input token throughput (tok/s):", metrics.input_throughput
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Output token throughput (tok/s):", metrics.output_throughput
+        )
+    )
     print("{:<40} {:<10.2f}".format("Avg latency (ms):", metrics.avg_latency_ms))
-    print("{s:{c}^{n}}".format(s='Time to First Token', n=50, c='-'))
+    print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
-    print("{:<40} {:<10.2f}".format("Median TTFT (ms):",
-                                    metrics.median_ttft_ms))
+    print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
-    print("{s:{c}^{n}}".format(s='Time per Output Token (excl. 1st token)',
-                               n=50,
-                               c='-'))
+    print(
+        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
+    )
     print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
-    print("{:<40} {:<10.2f}".format("Median TPOT (ms):",
-                                    metrics.median_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
     print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
-    print("{s:{c}^{n}}".format(s='Inter-token Latency', n=50, c='-'))
+    print("{s:{c}^{n}}".format(s="Inter-token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
     print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
@@ -354,16 +379,16 @@ def main(args: argparse.Namespace):
         api_url = f"{args.base_url}{args.endpoint}"
     else:
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
-    tokenizer = get_tokenizer(tokenizer_id,
-                              trust_remote_code=args.trust_remote_code)
-    input_requests = sample_requests(args.dataset, 
-                                     args.num_min_rounds, 
-                                     args.num_max_rounds, 
-                                     args.num_max_users,
-                                     tokenizer,
-                                     args.output_len,
-                                     )
-    
+    tokenizer = get_tokenizer(tokenizer_id, trust_remote_code=args.trust_remote_code)
+    input_requests = sample_requests(
+        args.dataset,
+        args.num_min_rounds,
+        args.num_max_rounds,
+        args.num_max_users,
+        tokenizer,
+        args.output_len,
+    )
+
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -374,7 +399,8 @@ def main(args: argparse.Namespace):
             best_of=args.best_of,
             use_beam_search=args.use_beam_search,
             disable_tqdm=args.disable_tqdm,
-        ))
+        )
+    )
 
     # Save config and results to json
     if args.save_result:
@@ -402,7 +428,8 @@ def main(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Benchmark the online serving throughput.")
+        description="Benchmark the online serving throughput."
+    )
     parser.add_argument(
         "--backend",
         type=str,
@@ -429,10 +456,9 @@ if __name__ == "__main__":
         default="/v1/completions",
         help="API endpoint.",
     )
-    parser.add_argument("--dataset",
-                        type=str,
-                        required=True,
-                        help="Path to the dataset.")
+    parser.add_argument(
+        "--dataset", type=str, required=True, help="Path to the dataset."
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -442,15 +468,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tokenizer",
         type=str,
-        help=
-        "Name or path of the tokenizer, if not using the default model tokenizer.",
+        help="Name or path of the tokenizer, if not using the default model tokenizer.",
     )
     parser.add_argument(
         "--best-of",
         type=int,
         default=1,
-        help="Generates `best_of` sequences per prompt and "
-        "returns the best one.",
+        help="Generates `best_of` sequences per prompt and " "returns the best one.",
     )
     parser.add_argument("--use-beam-search", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -469,21 +493,23 @@ if __name__ == "__main__":
         action="store_true",
         help="Specify to save benchmark results to a json file",
     )
-    parser.add_argument("--num-max-users",
-                        type=int,
-                        default=128,
-                        help="Max number of users")
-    parser.add_argument("--num-max-rounds",
-                        type=int,
-                        default=100,
-                        help="Max number of rounds at least in one conversation")
-    parser.add_argument("--num-min-rounds",
-                        type=int,
-                        default=50,
-                        help="Min number of rounds at least in one conversation")
-    parser.add_argument("--output-len",
-                        type=int,
-                        default=None,
-                        help="Specific length of the output")
+    parser.add_argument(
+        "--num-max-users", type=int, default=128, help="Max number of users"
+    )
+    parser.add_argument(
+        "--num-max-rounds",
+        type=int,
+        default=100,
+        help="Max number of rounds at least in one conversation",
+    )
+    parser.add_argument(
+        "--num-min-rounds",
+        type=int,
+        default=50,
+        help="Min number of rounds at least in one conversation",
+    )
+    parser.add_argument(
+        "--output-len", type=int, default=None, help="Specific length of the output"
+    )
     args = parser.parse_args()
     main(args)

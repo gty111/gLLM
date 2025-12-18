@@ -1,7 +1,8 @@
 import argparse
+
 from openai import OpenAI
 
-parser = argparse.ArgumentParser(description='Chat client')
+parser = argparse.ArgumentParser(description="Chat client")
 parser.add_argument("--num-tokens", type=int, default=2048)
 parser.add_argument("--port", type=int)
 args = parser.parse_args()
@@ -21,29 +22,31 @@ model = models.data[0].id
 
 messages = []
 
-print("\nWelcome to the chatbot!\n"
-      "Type '\\exit' to exit the chatbot.\n"
-      "Type '\\clear' to clear the chatbot's history.\n")
+print(
+    "\nWelcome to the chatbot!\n"
+    "Type '\\exit' to exit the chatbot.\n"
+    "Type '\\clear' to clear the chatbot's history.\n"
+)
 
 while True:
-    prompt = input('>>> ')
-    if prompt == '\\exit':
+    prompt = input(">>> ")
+    if prompt == "\\exit":
         break
-    elif prompt == '\\clear':
+    elif prompt == "\\clear":
         messages = []
         continue
-    messages.append({'role': 'user', 'content': prompt})
+    messages.append({"role": "user", "content": prompt})
     chat_completion = client.chat.completions.create(
         messages=messages,
         model=model,
         stream=True,
         max_tokens=args.num_tokens,
     )
-    reply = ''
+    reply = ""
     print()
     for i in chat_completion:
         reply += i.choices[0].delta.content
-        print(i.choices[0].delta.content, end='', flush=True)
+        print(i.choices[0].delta.content, end="", flush=True)
     print()
     print()
-    messages.append({'role': 'assistant', 'content': reply})
+    messages.append({"role": "assistant", "content": reply})

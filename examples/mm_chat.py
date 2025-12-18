@@ -21,13 +21,13 @@ python openai_chat_completion_client_for_multimodal.py --chat-type audio
 """
 
 import base64
+from argparse import ArgumentParser
 
 import requests
-from openai import OpenAI
 from openai import APIConnectionError, OpenAI
 from openai.pagination import SyncPage
 from openai.types.model import Model
-from argparse import ArgumentParser
+
 
 def get_first_model(client: OpenAI) -> str:
     """
@@ -75,7 +75,7 @@ def run_text_only(model: str, client) -> None:
 # Single-image input inference
 def run_single_image(model: str, client) -> None:
     ## Use image url in the payload
-    image_url = 'https://2026.eurosys.org/img/EuroSys-2026-logo.png'
+    image_url = "https://2026.eurosys.org/img/EuroSys-2026-logo.png"
     chat_completion_from_url = client.chat.completions.create(
         messages=[
             {
@@ -84,7 +84,7 @@ def run_single_image(model: str, client) -> None:
                     {"type": "text", "text": "描述下这个图片?"},
                     {
                         "type": "image_url",
-                        "image_url": {'url': image_url},
+                        "image_url": {"url": image_url},
                     },
                 ],
             }
@@ -95,6 +95,7 @@ def run_single_image(model: str, client) -> None:
 
     result = chat_completion_from_url.choices[0].message.content
     print("Chat completion output from image url:", result)
+
 
 # Multi-image input inference
 def run_multi_image(model: str, client) -> None:
@@ -108,11 +109,11 @@ def run_multi_image(model: str, client) -> None:
                     {"type": "text", "text": "What's in this image?"},
                     {
                         "type": "image_url",
-                        "image_url": {'url':image1},
+                        "image_url": {"url": image1},
                     },
                     {
                         "type": "image_url",
-                        "image_url": {'url':image2},
+                        "image_url": {"url": image2},
                     },
                 ],
             }
@@ -173,7 +174,6 @@ def run_video(model: str, client) -> None:
     print("Chat completion output from base64 encoded image:", result)
 
 
-
 example_function_map = {
     "text-only": run_text_only,
     "single-image": run_single_image,
@@ -195,12 +195,7 @@ def parse_args():
         choices=list(example_function_map.keys()),
         help="Conversation type with multimodal data.",
     )
-    parser.add_argument(
-        '--port',
-        '-p',
-        type=int,
-        default=8000
-    )
+    parser.add_argument("--port", "-p", type=int, default=8000)
     return parser.parse_args()
 
 
@@ -214,7 +209,7 @@ def main(args) -> None:
         api_key=openai_api_key,
         base_url=openai_api_base,
     )
-    
+
     chat_type = args.chat_type
     model = get_first_model(client)
     example_function_map[chat_type](model, client)

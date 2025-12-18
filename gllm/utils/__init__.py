@@ -1,32 +1,45 @@
 import asyncio
-import uuid
-import torch
-import zmq
-import os
 import hashlib
-import filelock
-import tempfile
 import logging
-import tqdm
-import torch
 import math
-
-from logger import logger
+import os
+import tempfile
+import uuid
 from functools import partial
-from typing import (Awaitable, Callable, ParamSpec, TypeVar, Union, Optional, Dict, Any,
-                    List, Tuple)
 from pathlib import Path
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    ParamSpec,
+    Tuple,
+    TypeVar,
+    Union,
+)
+
+import filelock
+import torch
+import tqdm
+import zmq
+from logger import logger
 from torch.library import Library
 
-P = ParamSpec('P')
+P = ParamSpec("P")
 K = TypeVar("K")
 T = TypeVar("T")
 
+
 def init_logger():
-    formater = logging.Formatter(f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s",
-                                 datefmt="%H:%M:%S")
+    formatter = logging.Formatter(
+        f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
     for handler in logger.handlers:
-        handler.setFormatter(formater)
+        handler.setFormatter(formatter)
+
 
 def make_async(func: Callable[P, T]) -> Callable[P, Awaitable[T]]:
     """Take a blocking function, and run it on in an executor thread.
@@ -43,8 +56,10 @@ def make_async(func: Callable[P, T]) -> Callable[P, Awaitable[T]]:
 
     return _async_wrapper
 
+
 def random_uuid() -> str:
     return str(uuid.uuid4().hex)
+
 
 def async_tensor_h2d(
     data: list,
@@ -73,11 +88,11 @@ def make_socket(ctx, path: str, type):
     else:
         assert 0
 
-            
+
 temp_dir = tempfile.gettempdir()
 
-def get_lock(model_name_or_path: Union[str, Path],
-             cache_dir: Optional[str] = None):
+
+def get_lock(model_name_or_path: Union[str, Path], cache_dir: Optional[str] = None):
     lock_dir = cache_dir or temp_dir
     model_name_or_path = str(model_name_or_path)
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
@@ -86,14 +101,18 @@ def get_lock(model_name_or_path: Union[str, Path],
     # add hash to avoid conflict with old users' lock files
     lock_file_name = hash_name + model_name + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
-    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name),
-                             mode=0o666)
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
 
+
 def get_model_load_pbar(num_totals):
-    return tqdm.tqdm(total=num_totals,ncols=100,
-                    bar_format='Loading model weights ... {l_bar}{bar}{r_bar}')
-    
+    return tqdm.tqdm(
+        total=num_totals,
+        ncols=100,
+        bar_format="Loading model weights ... {l_bar}{bar}{r_bar}",
+    )
+
+
 def set_weight_attrs(
     weight: torch.Tensor,
     weight_attrs: Optional[Dict[str, Any]],
@@ -113,8 +132,10 @@ def set_weight_attrs(
         assert not hasattr(weight, key), f"Overwriting existing tensor attribute: {key}"
         setattr(weight, key, value)
 
+
 gllm_lib = Library("gllm", "FRAGMENT")  # noqa
- 
+
+
 def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
@@ -153,23 +174,29 @@ def direct_register_custom_op(
     my_lib.impl(op_name, op_func, "CUDA")
     if fake_impl is not None:
         my_lib._register_fake(op_name, fake_impl)
-        
+
+
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
-    
+
+
 def round_up(x: int, y: int) -> int:
     return ((x + y - 1) // y) * y
+
 
 def round_down(x: int, y: int) -> int:
     return (x // y) * y
 
+
 def ceil_div(a, b):
     return (a + b - 1) // b
+
 
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)
+
 
 def get_dtype_bytes(dtype):
     if dtype.is_floating_point:
@@ -178,45 +205,58 @@ def get_dtype_bytes(dtype):
         info = torch.iinfo(dtype)
     return info.bits // 8  # bits => bytes
 
+
 def get_device_capability():
     device = torch.cuda.current_device()
     capability_arr = torch.cuda.get_device_capability(device)
-    return capability_arr[0]*10 + capability_arr[1]
+    return capability_arr[0] * 10 + capability_arr[1]
+
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
 
+
 def get_flash_attn_version(requires_alibi: bool = False) -> Optional[int]:
     from gllm.vllm_flash_attn.flash_attn_interface import (
-        fa_version_unsupported_reason, is_fa_version_supported)
+        fa_version_unsupported_reason,
+        is_fa_version_supported,
+    )
+
     device_capability = get_device_capability()
 
     assert device_capability is not None
 
     # 1. default version depending on platform
-    fa_version = 3 if (device_capability//10 == 9
-                        and is_fa_version_supported(3)) else 2
+    fa_version = (
+        3 if (device_capability // 10 == 9 and is_fa_version_supported(3)) else 2
+    )
 
     # 2. fallback for unsupported combinations
-    if device_capability//10 == 10 and fa_version == 3:
+    if device_capability // 10 == 10 and fa_version == 3:
         logger.warning_once(
             "Cannot use FA version 3 on Blackwell platform "
-            "defaulting to FA version 2.")
+            "defaulting to FA version 2."
+        )
         fa_version = 2
 
     if requires_alibi and fa_version == 3:
-        logger.warning_once("Cannot use FA version 3 with ALiBi, "
-                            "defaulting to FA version 2.")
+        logger.warning_once(
+            "Cannot use FA version 3 with ALiBi, " "defaulting to FA version 2."
+        )
         fa_version = 2
 
     if not is_fa_version_supported(fa_version):
-        logger.error("Cannot use FA version %d is not supported due to %s",
-                        fa_version, fa_version_unsupported_reason(fa_version))
+        logger.error(
+            "Cannot use FA version %d is not supported due to %s",
+            fa_version,
+            fa_version_unsupported_reason(fa_version),
+        )
 
     assert is_fa_version_supported(fa_version)
     return fa_version
+
 
 def cast_overflow_tensors(
     tensors: torch.Tensor,

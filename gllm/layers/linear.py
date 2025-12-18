@@ -1,13 +1,19 @@
-import torch
-
-from torch.nn.parameter import Parameter
-from typing import Optional, Union
 from functools import partial
+from typing import Optional, Union
 
-from gllm.dist_utils import (get_tp_size, get_tp_rank, divide, 
-                             split_tensor_along_last_dim, tensor_model_parallel_all_reduce)
+import torch
+from torch.nn.parameter import Parameter
+
+from gllm.dist_utils import (
+    divide,
+    get_tp_rank,
+    get_tp_size,
+    split_tensor_along_last_dim,
+    tensor_model_parallel_all_reduce,
+)
 from gllm.layers.quantization.fp8 import fp8LinearMethod, validate_fp8_block_shape
 from gllm.utils import get_device_capability
+
 
 class LinearBase(torch.nn.Module):
     """Base linear layer.
@@ -29,7 +35,7 @@ class LinearBase(torch.nn.Module):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         return_bias: bool = False,
-        quant_config = None,
+        quant_config=None,
     ):
         super().__init__()
 
@@ -46,22 +52,28 @@ class LinearBase(torch.nn.Module):
     def create_weights(
         self,
         input_size_per_partition: int,
-        output_partition_sizes: list[int], 
-        params_dtype: torch.dtype
+        output_partition_sizes: list[int],
+        params_dtype: torch.dtype,
     ):
         if self.quant_config is None:
-            weight = Parameter(torch.rand(sum(output_partition_sizes),
-                                        input_size_per_partition,
-                                        dtype=params_dtype),
-                            requires_grad=False)
-            self.register_parameter('weight', weight)
-        elif self.quant_config['quant_method'] == 'fp8':
+            weight = Parameter(
+                torch.rand(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            self.register_parameter("weight", weight)
+        elif self.quant_config["quant_method"] == "fp8":
             if get_device_capability() < 89:
-                raise Exception(f'FP8 quantizaiton method is not supported on device capability less than 89 (current is {get_device_capability()})')
-            self.activation_scheme = self.quant_config['activation_scheme']
-            self.block_quant = 'weight_block_size' in self.quant_config
+                raise Exception(
+                    f"FP8 quantizaiton method is not supported on device capability less than 89 (current is {get_device_capability()})"
+                )
+            self.activation_scheme = self.quant_config["activation_scheme"]
+            self.block_quant = "weight_block_size" in self.quant_config
             if self.block_quant:
-                self.weight_block_size = self.quant_config['weight_block_size']
+                self.weight_block_size = self.quant_config["weight_block_size"]
                 block_n, block_k = self.weight_block_size
                 validate_fp8_block_shape(
                     layer=self,
@@ -69,57 +81,72 @@ class LinearBase(torch.nn.Module):
                     output_size=self.output_size,
                     input_size_per_partition=input_size_per_partition,
                     output_partition_sizes=output_partition_sizes,
-                    block_size=self.weight_block_size
+                    block_size=self.weight_block_size,
                 )
             weight_dtype = torch.float8_e4m3fn
-            weight = Parameter(torch.rand(sum(output_partition_sizes),
-                                          input_size_per_partition).to(weight_dtype),
-                               requires_grad=False)
-            self.register_parameter('weight', weight)
+            weight = Parameter(
+                torch.rand(sum(output_partition_sizes), input_size_per_partition).to(
+                    weight_dtype
+                ),
+                requires_grad=False,
+            )
+            self.register_parameter("weight", weight)
             if not self.block_quant:
-                scale = Parameter(torch.rand(len(output_partition_sizes),
-                                             dtype=torch.float32),
-                                  requires_grad=False)
+                scale = Parameter(
+                    torch.rand(len(output_partition_sizes), dtype=torch.float32),
+                    requires_grad=False,
+                )
                 scale[:] = torch.finfo(torch.float32).min
-                self.register_parameter('weight_scale', scale)
+                self.register_parameter("weight_scale", scale)
             else:
-                assert self.activation_scheme == 'dynamic'
-                scale = Parameter(torch.rand(
-                    (sum(output_partition_sizes) + block_n - 1) // block_n,
-                    (input_size_per_partition + block_k - 1) // block_k,
-                    dtype=torch.float32),
-                    requires_grad=False
-                    )
+                assert self.activation_scheme == "dynamic"
+                scale = Parameter(
+                    torch.rand(
+                        (sum(output_partition_sizes) + block_n - 1) // block_n,
+                        (input_size_per_partition + block_k - 1) // block_k,
+                        dtype=torch.float32,
+                    ),
+                    requires_grad=False,
+                )
                 scale[:] = torch.finfo(torch.float32).min
-                self.register_parameter('weight_scale_inv', scale)
-            
-            if self.activation_scheme == 'static':
-                scale = Parameter(torch.rand(len(output_partition_sizes),dtype=torch.float32),
-                                  requires_grad=False)
+                self.register_parameter("weight_scale_inv", scale)
+
+            if self.activation_scheme == "static":
+                scale = Parameter(
+                    torch.rand(len(output_partition_sizes), dtype=torch.float32),
+                    requires_grad=False,
+                )
                 scale[:] = torch.finfo(torch.float32).min
-                self.register_parameter('input_scale', scale)
+                self.register_parameter("input_scale", scale)
             else:
-                self.register_parameter('input_scale', None)
+                self.register_parameter("input_scale", None)
         else:
-            raise Exception(f"gLLM do not support quant_method {self.quant_config['quant_method']}")
-    
+            raise Exception(
+                f"gLLM do not support quant_method {self.quant_config['quant_method']}"
+            )
+
     def dispatch_quant_method(self):
         if self.quant_config is None:
             return torch.nn.functional.linear
-        elif self.quant_config['quant_method'] == 'fp8':
+        elif self.quant_config["quant_method"] == "fp8":
             assert self.block_quant
-            return partial(fp8LinearMethod, 
-                           block_size=self.weight_block_size,
-                           weight_scale=self.weight_scale_inv,
-                           input_scale=self.input_scale)
+            return partial(
+                fp8LinearMethod,
+                block_size=self.weight_block_size,
+                weight_scale=self.weight_scale_inv,
+                input_scale=self.input_scale,
+            )
         else:
-            raise Exception(f"gLLM do not support quant_method {self.quant_config['quant_method']}")
-    
+            raise Exception(
+                f"gLLM do not support quant_method {self.quant_config['quant_method']}"
+            )
+
     def forward(
         self, x: torch.Tensor
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         raise NotImplementedError
-    
+
+
 class RowParallelLinear(LinearBase):
     """Linear layer with row parallelism.
 
@@ -162,7 +189,7 @@ class RowParallelLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         reduce_results: bool = True,
         return_bias: bool = False,
-        quant_config = None,
+        quant_config=None,
     ):
         # Divide the weight matrix along the first dimension.
         self.tp_rank = get_tp_rank()
@@ -171,30 +198,35 @@ class RowParallelLinear(LinearBase):
         self.output_size_per_partition = output_size
         self.output_partition_sizes = [output_size]
 
-        super().__init__(input_size,
-                         output_size,
-                         skip_bias_add,
-                         params_dtype,
-                         return_bias=return_bias,
-                         quant_config=quant_config)
-        
-        self.create_weights(self.input_size_per_partition, self.output_partition_sizes, params_dtype)
+        super().__init__(
+            input_size,
+            output_size,
+            skip_bias_add,
+            params_dtype,
+            return_bias=return_bias,
+            quant_config=quant_config,
+        )
+
+        self.create_weights(
+            self.input_size_per_partition, self.output_partition_sizes, params_dtype
+        )
 
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 
         if not reduce_results and (bias and not skip_bias_add):
-            raise ValueError("When not reduce the results, adding bias to the "
-                             "results can lead to incorrect results")
+            raise ValueError(
+                "When not reduce the results, adding bias to the "
+                "results can lead to incorrect results"
+            )
 
         if bias:
-            self.bias = Parameter(
-                torch.rand(self.output_size, dtype=params_dtype))
+            self.bias = Parameter(torch.rand(self.output_size, dtype=params_dtype))
         else:
             self.register_parameter("bias", None)
-            
+
         self.quant_method = self.dispatch_quant_method()
-            
+
     def forward(
         self, input_
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
@@ -203,18 +235,17 @@ class RowParallelLinear(LinearBase):
         else:
             tp_rank = self.tp_rank
             splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size)
+                input_, num_partitions=self.tp_size
+            )
             input_parallel = splitted_input[tp_rank].contiguous()
 
         # Matrix multiply.
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
-        
+
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method(input_parallel,
-                                            self.weight,
-                                            bias=bias_)
-        
+        output_parallel = self.quant_method(input_parallel, self.weight, bias=bias_)
+
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
@@ -225,7 +256,8 @@ class RowParallelLinear(LinearBase):
         if not self.return_bias:
             return output
         return output, output_bias
-    
+
+
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
 
@@ -247,7 +279,7 @@ class ColumnParallelLinear(LinearBase):
         output_sizes: list of output sizes packed into one output, like for QKV
                        the list would be size 3.
         prefix: The name of the layer in the state dict, including all parents
-                        (e.g. model.layers.0.qkv_proj) 
+                        (e.g. model.layers.0.qkv_proj)
     """
 
     def __init__(
@@ -259,7 +291,7 @@ class ColumnParallelLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         output_sizes: Optional[list[int]] = None,
         return_bias: bool = False,
-        quant_config = None,
+        quant_config=None,
         disable_tp: bool = False,
     ):
         # Divide the weight matrix along the last dimension.
@@ -270,46 +302,47 @@ class ColumnParallelLinear(LinearBase):
         # If QKV or MergedColumn, use output size of each partition.
         if hasattr(self, "output_sizes"):
             self.output_partition_sizes = [
-                divide(output_size, self.tp_size)
-                for output_size in self.output_sizes
+                divide(output_size, self.tp_size) for output_size in self.output_sizes
             ]
 
-        super().__init__(input_size,
-                         output_size,
-                         skip_bias_add,
-                         params_dtype,
-                         return_bias=return_bias,
-                         quant_config=quant_config)
-        
-        self.create_weights(self.input_size_per_partition, self.output_partition_sizes, params_dtype)
+        super().__init__(
+            input_size,
+            output_size,
+            skip_bias_add,
+            params_dtype,
+            return_bias=return_bias,
+            quant_config=quant_config,
+        )
+
+        self.create_weights(
+            self.input_size_per_partition, self.output_partition_sizes, params_dtype
+        )
 
         if output_sizes is None:
             output_sizes = [output_size]
 
         if bias:
             self.bias = Parameter(
-                torch.rand(self.output_size_per_partition,
-                            dtype=params_dtype))
+                torch.rand(self.output_size_per_partition, dtype=params_dtype)
+            )
         else:
             self.register_parameter("bias", None)
-        
+
         self.quant_method = self.dispatch_quant_method()
-            
+
     def forward(
         self, input_
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        output_parallel = self.quant_method(input_,
-                                            self.weight,
-                                            bias=bias)
+        output_parallel = self.quant_method(input_, self.weight, bias=bias)
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
             return output_parallel
         return output_parallel, output_bias
-    
-    
+
+
 class MergedColumnParallelLinear(ColumnParallelLinear):
     """Packed linear layers with column parallelism.
 
@@ -342,21 +375,23 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         return_bias: bool = False,
-        quant_config = None,
+        quant_config=None,
         disable_tp: bool = False,
     ):
         self.output_sizes = output_sizes
         tp_size = get_tp_size() if not disable_tp else 1
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
-        super().__init__(input_size=input_size,
-                         output_size=sum(output_sizes),
-                         bias=bias,
-                         skip_bias_add=skip_bias_add,
-                         params_dtype=params_dtype,
-                         return_bias=return_bias,
-                         quant_config=quant_config,
-                         disable_tp=disable_tp)
-        
+        super().__init__(
+            input_size=input_size,
+            output_size=sum(output_sizes),
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            return_bias=return_bias,
+            quant_config=quant_config,
+            disable_tp=disable_tp,
+        )
+
 
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
@@ -395,7 +430,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         skip_bias_add: bool = False,
         params_dtype: Optional[torch.dtype] = None,
         return_bias: bool = False,
-        quant_config = None,
+        quant_config=None,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -408,29 +443,31 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size,
-                                               self.total_num_kv_heads)
+            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
         else:
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
         input_size = self.hidden_size
-        output_size = (self.num_heads +
-                       2 * self.num_kv_heads) * tp_size * self.head_size
+        output_size = (
+            (self.num_heads + 2 * self.num_kv_heads) * tp_size * self.head_size
+        )
         self.output_sizes = [
             self.num_heads * self.head_size * tp_size,  # q_proj
             self.num_kv_heads * self.head_size * tp_size,  # k_proj
-            self.num_kv_heads * self.head_size * tp_size,  # v_proj 
+            self.num_kv_heads * self.head_size * tp_size,  # v_proj
         ]
 
-        super().__init__(input_size=input_size,
-                         output_size=output_size,
-                         bias=bias,
-                         skip_bias_add=skip_bias_add,
-                         params_dtype=params_dtype,
-                         return_bias=return_bias,
-                         quant_config=quant_config)
-        
-        
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            return_bias=return_bias,
+            quant_config=quant_config,
+        )
+
+
 class ReplicatedLinear(LinearBase):
     """Replicated linear layer.
 
@@ -454,7 +491,7 @@ class ReplicatedLinear(LinearBase):
         bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
-        quant_config = None,
+        quant_config=None,
         *,
         return_bias: bool = False,
     ):
@@ -485,7 +522,7 @@ class ReplicatedLinear(LinearBase):
             )
         else:
             self.register_parameter("bias", None)
-            
+
         self.quant_method = self.dispatch_quant_method()
 
     def forward(

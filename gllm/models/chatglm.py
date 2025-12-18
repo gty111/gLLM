@@ -1,42 +1,65 @@
-import torch
-
-from torch import nn
 from copy import deepcopy
 
-from gllm.layers.linear import MergedColumnParallelLinear, RowParallelLinear, QKVParallelLinear
-from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
-from gllm.input_data import InputData
-from gllm.layers.rotary_embedding import RotaryEmbedding
-from gllm.layers.attention import FlashAttention
-from gllm.layers.activation import SiluAndMul
-from gllm.layers.layernorm import RMSNorm
-from gllm.dist_utils import (get_pp_layers, get_local_rank, is_last_pp_rank, 
-                             resolve_pp_layer_idx, get_tp_size, is_first_pp_rank)
-from gllm.utils import get_model_load_pbar
-from gllm.modules.attention import Attention
+import torch
+from torch import nn
 
-from .weight_utils import (copy_qkv_proj, copy_gate_up_proj, 
-                           copy_single_proj_dim1, copy_single_proj_dim0)
+from gllm.dist_utils import (
+    get_local_rank,
+    get_pp_layers,
+    get_tp_size,
+    is_first_pp_rank,
+    is_last_pp_rank,
+    resolve_pp_layer_idx,
+)
+from gllm.input_data import InputData
+from gllm.layers.activation import SiluAndMul
+from gllm.layers.attention import FlashAttention
+from gllm.layers.layernorm import RMSNorm
+from gllm.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from gllm.layers.rotary_embedding import RotaryEmbedding
+from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
+from gllm.modules.attention import Attention
+from gllm.utils import get_model_load_pbar
+
+from .weight_utils import (
+    copy_gate_up_proj,
+    copy_qkv_proj,
+    copy_single_proj_dim0,
+    copy_single_proj_dim1,
+)
 
 
 class GLMAttention(Attention):
     def __init__(self, layer_id: int, config):
-        total_num_kv_heads = (config.multi_query_group_num 
-                              if config.multi_query_attention else 
-                              config.num_attention_heads)
-        super().__init__(config.num_attention_heads,
-                         total_num_kv_heads,
-                         config.hidden_size)
+        total_num_kv_heads = (
+            config.multi_query_group_num
+            if config.multi_query_attention
+            else config.num_attention_heads
+        )
+        super().__init__(
+            config.num_attention_heads, total_num_kv_heads, config.hidden_size
+        )
 
         self.rotary_emb = RotaryEmbedding(
-            self.head_dim, self.head_dim // 2, config.seq_length, getattr(config,'rope_theta',10000), False)
+            self.head_dim,
+            self.head_dim // 2,
+            config.seq_length,
+            getattr(config, "rope_theta", 10000),
+            False,
+        )
         self.attn = FlashAttention(
-            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim)
+            layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim
+        )
 
         self.projection_size = config.kv_channels * self.num_heads
-        self.qkv_hidden_size = self.projection_size + 2 * \
-            self.head_dim * config.multi_query_group_num
-            
+        self.qkv_hidden_size = (
+            self.projection_size + 2 * self.head_dim * config.multi_query_group_num
+        )
+
         self.query_key_value = QKVParallelLinear(
             self.hidden_size,
             self.head_dim,
@@ -44,7 +67,7 @@ class GLMAttention(Attention):
             self.total_num_kv_heads,
             bias=config.add_bias_linear or config.add_qkv_bias,
         )
-        
+
         self.dense = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
@@ -64,19 +87,15 @@ class GLMMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.add_bias = config.add_bias_linear
-        
+
         self.dense_h_to_4h = MergedColumnParallelLinear(
-            config.hidden_size,
-            [config.ffn_hidden_size] * 2,
-            bias = self.add_bias
+            config.hidden_size, [config.ffn_hidden_size] * 2, bias=self.add_bias
         )
-        
+
         self.activation_func = SiluAndMul()
-        
+
         self.dense_4h_to_h = RowParallelLinear(
-            config.ffn_hidden_size,
-            config.hidden_size,
-            bias = self.add_bias
+            config.ffn_hidden_size, config.hidden_size, bias=self.add_bias
         )
 
     def forward(self, hidden_states):
@@ -91,18 +110,20 @@ class GLMMLP(nn.Module):
 class GLMBlock(nn.Module):
     def __init__(self, layer_id, config):
         super().__init__()
-        self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
+        self.apply_residual_connection_post_layernorm = (
+            config.apply_residual_connection_post_layernorm
+        )
         self.fp32_residual_connection = config.fp32_residual_connection
 
         assert config.rmsnorm
-        self.input_layernorm = RMSNorm(
-            config.hidden_size, config.layernorm_epsilon)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.layernorm_epsilon)
 
         self.self_attention = GLMAttention(layer_id, config)
         self.hidden_dropout = config.hidden_dropout
 
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, config.layernorm_epsilon)
+            config.hidden_size, config.layernorm_epsilon
+        )
 
         self.mlp = GLMMLP(config)
 
@@ -143,13 +164,18 @@ class GLMTransformer(nn.Module):
 
         self.start_layer, self.end_layer = get_pp_layers(config.num_layers)
         self.layers = nn.ModuleList(
-            [GLMBlock(i-self.start_layer, config) for i in range(self.start_layer, self.end_layer)])
+            [
+                GLMBlock(i - self.start_layer, config)
+                for i in range(self.start_layer, self.end_layer)
+            ]
+        )
 
         if is_last_pp_rank() and self.post_layer_norm:
-                assert config.rmsnorm
-                layer_norm_func = RMSNorm
-                self.final_layernorm = layer_norm_func(
-                    config.hidden_size, config.layernorm_epsilon)
+            assert config.rmsnorm
+            layer_norm_func = RMSNorm
+            self.final_layernorm = layer_norm_func(
+                config.hidden_size, config.layernorm_epsilon
+            )
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         for layer in self.layers:
@@ -204,7 +230,13 @@ class ChatGLMForCausalLM(nn.Module):
         if is_last_pp_rank():
             self.lm_head = self.transformer.output_layer
 
-    def forward(self, input_data: InputData, hidden_states=None, residual=None, input_embeds=None):
+    def forward(
+        self,
+        input_data: InputData,
+        hidden_states=None,
+        residual=None,
+        input_embeds=None,
+    ):
         if input_embeds is not None:
             assert hidden_states is None and residual is None
             hidden_states = input_embeds
@@ -218,41 +250,51 @@ class ChatGLMForCausalLM(nn.Module):
     def load_weights(self, weights, mp_load_progress):
         parameters = dict(self.named_parameters())
         if mp_load_progress is not None:
-            mp_load_progress[get_local_rank()*2] = len(parameters)
-            mp_load_progress[get_local_rank()*2+1] = 0
+            mp_load_progress[get_local_rank() * 2] = len(parameters)
+            mp_load_progress[get_local_rank() * 2 + 1] = 0
         else:
             pbar = get_model_load_pbar(len(parameters))
-            
+
         attn = self.transformer.encoder.layers[0].self_attention
         num_heads = attn.num_heads
         num_kv_heads = attn.num_kv_heads
         head_dim = attn.head_dim
-        
+
         intermediate_size = self.config.ffn_hidden_size
-        
-        q_index = num_heads*head_dim*get_tp_size()
-        k_index = (num_heads+num_kv_heads)*head_dim*get_tp_size()
-        
+
+        q_index = num_heads * head_dim * get_tp_size()
+        k_index = (num_heads + num_kv_heads) * head_dim * get_tp_size()
+
         for k, v in parameters.items():
             k = resolve_pp_layer_idx(k, 3, self.transformer.encoder.start_layer)
-            if 'embedding' in k:
-                k = k.replace('embedding', 'embedding.word_embeddings')
-            
+            if "embedding" in k:
+                k = k.replace("embedding", "embedding.word_embeddings")
+
             weight = weights[k]
-            if 'dense_h_to_4h.weight' in k:
-                copy_gate_up_proj(v.data, weight[:intermediate_size], weight[intermediate_size:])
-            elif 'dense_4h_to_h.weight' in k:
+            if "dense_h_to_4h.weight" in k:
+                copy_gate_up_proj(
+                    v.data, weight[:intermediate_size], weight[intermediate_size:]
+                )
+            elif "dense_4h_to_h.weight" in k:
                 copy_single_proj_dim1(v.data, weight)
-            elif 'query_key_value' in k:
-                copy_qkv_proj(v.data, weight[:q_index], weight[q_index:k_index], weight[k_index:], num_heads, num_kv_heads, head_dim)
-            elif 'dense.weight' in k:
+            elif "query_key_value" in k:
+                copy_qkv_proj(
+                    v.data,
+                    weight[:q_index],
+                    weight[q_index:k_index],
+                    weight[k_index:],
+                    num_heads,
+                    num_kv_heads,
+                    head_dim,
+                )
+            elif "dense.weight" in k:
                 copy_single_proj_dim1(v.data, weight)
-            elif 'embedding' in k or 'output_layer' in k:
+            elif "embedding" in k or "output_layer" in k:
                 copy_single_proj_dim0(v.data, weight)
             else:
                 v.data.copy_(weight)
             if mp_load_progress is not None:
-                mp_load_progress[get_local_rank()*2+1] += 1
+                mp_load_progress[get_local_rank() * 2 + 1] += 1
             else:
                 pbar.update(1)
 
@@ -267,16 +309,17 @@ class ChatGLMForCausalLM(nn.Module):
             if not metadata.strip():
                 content = content.strip()
                 history.append(
-                    {"role": "assistant", "metadata": metadata, "content": content})
+                    {"role": "assistant", "metadata": metadata, "content": content}
+                )
                 content = content.replace("[[训练时间]]", "2023年")
             else:
                 history.append(
-                    {"role": "assistant", "metadata": metadata, "content": content})
+                    {"role": "assistant", "metadata": metadata, "content": content}
+                )
                 if history[0]["role"] == "system" and "tools" in history[0]:
                     content = "\n".join(content.split("\n")[1:-1])
                     parameters = eval(content)
-                    content = {"name": metadata.strip(),
-                               "parameters": parameters}
+                    content = {"name": metadata.strip(), "parameters": parameters}
                 else:
                     content = {"name": metadata.strip(), "content": content}
         return content, history

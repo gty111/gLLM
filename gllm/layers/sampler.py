@@ -2,18 +2,19 @@ import torch
 
 from gllm.input_data import InputData
 
-class Sampler():
-    
+
+class Sampler:
+
     def forward(self, logits: torch.Tensor, input_data: InputData):
         # repetition_penalty
-        logits /= torch.where(logits>0, input_data.repetition_penalty, 1.0)
-        logits *= torch.where(logits<=0, 1.0, input_data.repetition_penalty)
+        logits /= torch.where(logits > 0, input_data.repetition_penalty, 1.0)
+        logits *= torch.where(logits <= 0, 1.0, input_data.repetition_penalty)
         # temperature
         logits.div_(input_data.temperature.unsqueeze_(dim=1))
         # top_p top_k
         logits = self._apply_top_k_top_p(logits, input_data.top_p, input_data.top_k)
         probs = torch.softmax(logits, dim=1)
-        
+
         q = torch.empty_like(probs)
         q.exponential_()
         return probs.div_(q).argmax(dim=1).cpu().numpy().tolist()
@@ -43,10 +44,11 @@ class Sampler():
         logits_sort.masked_fill_(top_p_mask, -float("inf"))
 
         # Re-sort the probabilities.
-        src = torch.arange(logits_idx.shape[-1],
-                        device=logits_idx.device).expand_as(logits_idx)
-        logits_idx_inv = torch.empty_like(logits_idx).scatter_(dim=-1,
-                                                            index=logits_idx,
-                                                            src=src)
+        src = torch.arange(logits_idx.shape[-1], device=logits_idx.device).expand_as(
+            logits_idx
+        )
+        logits_idx_inv = torch.empty_like(logits_idx).scatter_(
+            dim=-1, index=logits_idx, src=src
+        )
         logits = torch.gather(logits_sort, dim=-1, index=logits_idx_inv)
         return logits
