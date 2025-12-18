@@ -145,7 +145,9 @@ class ModelLoader:
             else ""
         )
         logger.info(
-            f"Model architecture: {self.architecture}, Default dtype: {self.dtype}{quant_method_log}, Model weights {model_size_gb} GB"
+            f"Model architecture: {self.architecture}, "
+            f"Default dtype: {self.dtype}{quant_method_log}, "
+            f"Model weights {model_size_gb} GB"
         )
 
         # Load weights from CPU memory to GPU memory

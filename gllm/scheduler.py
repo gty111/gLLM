@@ -130,7 +130,8 @@ class Scheduler:
             self.log_num_preempt_seqs = self.num_preempt_seqs
             self.delta_log_num_preempt_seqs *= 2
             logger.warning(
-                f"#Preempted seqs: {self.num_preempt_seqs}, Try increase --kvthresh or the performance is poor!"
+                f"#Preempted seqs: {self.num_preempt_seqs}, "
+                "Try increase --kvthresh or the performance is poor!"
             )
 
     def check_abort_seqs_list(self, seqs: deque, ipc_package: IPCPackage):
