@@ -13,7 +13,7 @@ from gllm.comm import IPCPackage
 from gllm.dist_utils import get_world_size
 
 
-class WorkerScheduler():
+class Scheduler():
     def __init__(self, pp_size, model_runner:ModelRunner, use_cp_schedule):
         self.pp_size = pp_size
         self.model_runner: ModelRunner = model_runner
