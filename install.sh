@@ -9,9 +9,7 @@ WHEEL_FILE="vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl"
 
 # Only download if file doesn't exist
 if [ ! -f "$WHEEL_FILE" ]; then
-    wget "$WHEEL_URL" -O "$WHEEL_FILE"
-    # Check if wget succeeded
-    if [ $? -ne 0 ]; then
+    if ! wget "$WHEEL_URL" -O "$WHEEL_FILE"; then
         echo "Error: Failed to download $WHEEL_FILE. Please check your network or URL."
         exit 1
     fi
