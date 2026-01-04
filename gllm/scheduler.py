@@ -214,7 +214,7 @@ class Scheduler:
         for _ in range(decode_token_budget):
             if len(self.seqs_to_decode) == 0:
                 break
-            seq = self.seqs_to_decode.pop()
+            seq = self.seqs_to_decode.popleft()
             seq.to_compute_token_num = 1
             decode_batch.append(seq)
 
