@@ -1,3 +1,4 @@
+import threading
 from typing import List
 
 import zmq
@@ -154,7 +155,7 @@ class zmqComm:
         else:
             schedule_sockets = self.schedule_other_sockets
         for socket in schedule_sockets:
-            socket.send_pyobj(seqs)
+            threading.Thread(target=socket.send_pyobj, args=(seqs,)).start()
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
