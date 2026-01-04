@@ -94,7 +94,7 @@ class Worker:
         self.ret_residual = self.model_runner.model.ret_residual
 
         if self.rank == 0:
-            self.worker_scheduler = Scheduler(
+            self.scheduler = Scheduler(
                 self.pp_size,
                 self.model_runner,
                 self.schedule_method,
@@ -158,23 +158,23 @@ class Worker:
             len(cum_ipc_package.schedule_lists) != 0
             or len(cum_ipc_package.abort_ids) != 0
         ):
-            self.worker_scheduler.add_new_requests(cum_ipc_package.schedule_lists)
-            self.worker_scheduler.add_abort_ids(cum_ipc_package.abort_ids)
-            self.worker_scheduler.set_log(cum_ipc_package.log)
+            self.scheduler.add_new_requests(cum_ipc_package.schedule_lists)
+            self.scheduler.add_abort_ids(cum_ipc_package.abort_ids)
+            self.scheduler.set_log(cum_ipc_package.log)
 
     def recv_next_tokens(self):
         if self.pp_size != 1:  # recv tokens from last rank
             next_tokens = self.comm.recv_tokens()
             if next_tokens is not None:
-                self.worker_scheduler.add_next_tokens(next_tokens)
+                self.scheduler.add_next_tokens(next_tokens)
 
     def check_abort_seqs(self):
-        ipc_package = self.worker_scheduler.check_abort_seqs()
+        ipc_package = self.scheduler.check_abort_seqs()
         if ipc_package is not None:
             self.comm.send_output(ipc_package)
 
     def process_output(self):
-        ipc_package = self.worker_scheduler.process_output()
+        ipc_package = self.scheduler.process_output()
         if ipc_package is not None:
             self.comm.send_output(ipc_package)
 
@@ -187,7 +187,7 @@ class Worker:
                 send_pp_data(output, get_next_pp_rank())
 
     def schedule_forward(self):
-        schedule_seqs = self.worker_scheduler.schedule_once()
+        schedule_seqs = self.scheduler.schedule_once()
         if len(schedule_seqs) != 0:
             if get_world_size() > 1:
                 self.comm.send_schedule_seqs((schedule_seqs, None), True)
@@ -202,7 +202,7 @@ class Worker:
             if not is_output_rank():
                 send_pp_data(output, get_next_pp_rank())
             else:
-                self.worker_scheduler.add_next_tokens(output)
+                self.scheduler.add_next_tokens(output)
 
     def run_driver(self):
         self.check_abort_seqs()
