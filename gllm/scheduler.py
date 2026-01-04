@@ -52,9 +52,9 @@ class Scheduler:
 
     def dispatch_schedule_method(self):
         if self.schedule_method in ["split_pd", "chunked_prefill"]:
-            return self.schedule_chunked_prefill
+            return self.chunked_prefill
         elif self.schedule_method == "token_throttling":
-            return self.schedule_token_throttling
+            return self.token_throttling
         else:
             assert 0
 
@@ -179,13 +179,50 @@ class Scheduler:
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
 
-    def schedule_chunked_prefill(self):
-        schedule_prefill_seqs = []
-        schedule_decode_seqs = []
+    def schedule_prefill_batch(self, prefill_token_budget):
+        prefill_batch: List[Sequence] = []
+        unfinish_prefill_seqs = deque()
+        prefill_batched_token_nums = 0
+        while len(self.seqs_to_prefill) != 0 and prefill_token_budget != 0:
+            seq = self.seqs_to_prefill.popleft()
+            if (
+                isinstance(self.memory_manager, PrefixMemoryManager)
+                and seq.computed_token_num == 0
+            ):
+                self.memory_manager.pre_allocate_computed_page([seq])
+            if len(seq) - seq.computed_token_num <= prefill_token_budget:
+                seq.to_compute_token_num = len(seq) - seq.computed_token_num
+                prefill_batched_token_nums += seq.to_compute_token_num
+                prefill_token_budget -= seq.to_compute_token_num
+            else:
+                prefill_batched_token_nums += prefill_token_budget
+                seq.to_compute_token_num = prefill_token_budget
+                prefill_token_budget = 0
+            self.memory_manager.pre_allocate_page([seq])
+            prefill_batch.append(seq)
+            if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
+                seq_new = copy.deepcopy(seq)
+                seq_new.computed_token_num += seq_new.to_compute_token_num
+                unfinish_prefill_seqs.appendleft(seq_new)
 
+        self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
+        return prefill_batch, prefill_batched_token_nums
+
+    def schedule_decode_batch(self, decode_token_budget):
+        decode_batch: List[Sequence] = []
+        self.check_preempt(min(decode_token_budget, len(self.seqs_to_decode)))
+        for _ in range(decode_token_budget):
+            if len(self.seqs_to_decode) == 0:
+                break
+            seq = self.seqs_to_decode.pop()
+            seq.to_compute_token_num = 1
+            decode_batch.append(seq)
+
+        self.memory_manager.pre_allocate_page(decode_batch)
+        return decode_batch
+
+    def chunked_prefill(self):
         num_tokens_budget = self.maxp
-
-        self.check_preempt(min(num_tokens_budget, len(self.seqs_to_decode)))
 
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
@@ -194,51 +231,25 @@ class Scheduler:
         )
         decode_token_budget = min(decode_token_budget, num_tokens_budget)
 
-        if self.schedule_method == "chunked_prefill" or (
-            self.schedule_method == "split_pd"
-            and (
-                len(self.seqs_to_prefill) == 0
-                or self.get_num_free_pages() < self.num_kvthresh_pages
-            )
+        if self.schedule_method == "split_pd" and (
+            len(self.seqs_to_prefill) != 0
+            and self.get_num_free_pages() >= self.num_kvthresh_pages
         ):
-            for _ in range(decode_token_budget):
-                if len(self.seqs_to_decode) == 0:
-                    break
-                seq = self.seqs_to_decode.pop()
-                seq.to_compute_token_num = 1
-                schedule_decode_seqs.append(seq)
+            decode_token_budget = 0
 
-            self.memory_manager.pre_allocate_page(schedule_decode_seqs)
+        decode_batch = self.schedule_decode_batch(decode_token_budget)
+        num_tokens_budget -= len(decode_batch)
 
-            num_tokens_budget -= len(schedule_decode_seqs)
-
+        # prefill
         num_tokens_budget = min(
             num_tokens_budget,
             self.page_size
             * max(self.get_num_free_pages() - self.num_kvthresh_pages, 0),
         )
 
-        # prefill
-        unfinish_prefill_seqs = deque()
-        prefill_batched_token_nums = 0
-        while len(self.seqs_to_prefill) != 0 and num_tokens_budget != 0:
-            seq = self.seqs_to_prefill.popleft()
-            if len(seq) - seq.computed_token_num <= num_tokens_budget:
-                seq.to_compute_token_num = len(seq) - seq.computed_token_num
-                prefill_batched_token_nums += seq.to_compute_token_num
-                num_tokens_budget -= seq.to_compute_token_num
-            else:
-                prefill_batched_token_nums += num_tokens_budget
-                seq.to_compute_token_num = num_tokens_budget
-                num_tokens_budget = 0
-            self.memory_manager.pre_allocate_page([seq])
-            schedule_prefill_seqs.append(seq)
-            if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
-                seq_new = copy.deepcopy(seq)
-                seq_new.computed_token_num += seq_new.to_compute_token_num
-                unfinish_prefill_seqs.appendleft(seq_new)
-
-        self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
+        prefill_batch, prefill_batched_token_nums = self.schedule_prefill_batch(
+            num_tokens_budget
+        )
 
         if self.log and time.time() - self.log_time > 1:
             self.log_time = time.time()
@@ -248,7 +259,7 @@ class Scheduler:
                     len(self.seqs_to_prefill),
                     num_total_decode_seqs,
                     prefill_batched_token_nums,
-                    len(schedule_decode_seqs),
+                    len(decode_batch),
                     "%.2f" % self.memory_manager.get_memory_util(),
                 )
             )
@@ -260,15 +271,10 @@ class Scheduler:
             else:
                 logger.info(log_info)
         # first decode, then prefill
-        return schedule_decode_seqs + schedule_prefill_seqs
+        return decode_batch + prefill_batch
 
-    def schedule_token_throttling(self):
-
-        schedule_prefill_seqs = []
-        schedule_decode_seqs = []
-
+    def token_throttling(self):
         # prefill
-        unfinish_prefill_seqs = deque()
         prefill_token_budget = self.page_size * max(
             self.get_num_free_pages() - self.num_kvthresh_pages, 0
         )
@@ -289,30 +295,10 @@ class Scheduler:
                 )
         else:
             prefill_token_budget = min(self.maxp, prefill_token_budget)
-        prefill_batched_token_nums = 0
-        while len(self.seqs_to_prefill) != 0 and prefill_token_budget != 0:
-            seq = self.seqs_to_prefill.popleft()
-            if (
-                isinstance(self.memory_manager, PrefixMemoryManager)
-                and seq.computed_token_num == 0
-            ):
-                self.memory_manager.pre_allocate_computed_page([seq])
-            if len(seq) - seq.computed_token_num <= prefill_token_budget:
-                seq.to_compute_token_num = len(seq) - seq.computed_token_num
-                prefill_batched_token_nums += seq.to_compute_token_num
-                prefill_token_budget -= seq.to_compute_token_num
-            else:
-                prefill_batched_token_nums += prefill_token_budget
-                seq.to_compute_token_num = prefill_token_budget
-                prefill_token_budget = 0
-            self.memory_manager.pre_allocate_page([seq])
-            schedule_prefill_seqs.append(seq)
-            if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
-                seq_new = copy.deepcopy(seq)
-                seq_new.computed_token_num += seq_new.to_compute_token_num
-                unfinish_prefill_seqs.appendleft(seq_new)
 
-        self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
+        prefill_batch, prefill_batched_token_nums = self.schedule_prefill_batch(
+            prefill_token_budget
+        )
 
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
@@ -320,16 +306,7 @@ class Scheduler:
             num_total_decode_seqs
         )
 
-        self.check_preempt(decode_token_budget)
-
-        for _ in range(decode_token_budget):
-            if len(self.seqs_to_decode) == 0:
-                break
-            seq = self.seqs_to_decode.popleft()
-            seq.to_compute_token_num = 1
-            schedule_decode_seqs.append(seq)
-
-        self.memory_manager.pre_allocate_page(schedule_decode_seqs)
+        decode_batch = self.schedule_decode_batch(decode_token_budget)
 
         if self.log and time.time() - self.log_time > 1:
             self.log_time = time.time()
@@ -340,7 +317,7 @@ class Scheduler:
                     self.num_wait_tokens,
                     num_total_decode_seqs,
                     prefill_batched_token_nums,
-                    len(schedule_decode_seqs),
+                    len(decode_batch),
                     "%.2f" % self.memory_manager.get_memory_util(),
                 )
             )
@@ -352,4 +329,4 @@ class Scheduler:
             else:
                 logger.info(log_info)
         # first decode, then prefill
-        return schedule_decode_seqs + schedule_prefill_seqs
+        return decode_batch + prefill_batch
