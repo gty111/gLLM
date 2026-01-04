@@ -173,7 +173,7 @@ class InputData:
 
         self.copy_to_input_buffer()
 
-    def _cal_tokens(self, seqs):
+    def _cal_tokens(self, seqs: List[Sequence]):
         tokens_list = []
         for seq in seqs:
             tokens_list.extend(seq[seq.computed_token_num : seq.seq_len])
@@ -182,7 +182,7 @@ class InputData:
     def get_tokens(self):
         return self.tokens[: self.tokens_cpu.shape[0]]
 
-    def _cal_position(self, seqs):
+    def _cal_position(self, seqs: List[Sequence]):
         positions_list = []
         for seq in seqs:
             positions_list.extend(range(seq.computed_token_num, seq.seq_len))
@@ -201,7 +201,7 @@ class InputData:
                 self.mrope_positions_cpu, non_blocking=True
             )
 
-    def _cal_seq_lens(self, seqs):
+    def _cal_seq_lens(self, seqs: List[Sequence]):
         seq_lens = [seq.seq_len for seq in seqs]
         return max(seq_lens), torch.tensor(
             seq_lens, dtype=torch.int32, device="cpu", pin_memory=True
@@ -210,7 +210,7 @@ class InputData:
     def get_seq_lens(self):
         return self.seq_lens[: self.seq_lens_cpu.shape[0]]
 
-    def _cal_query_start_loc(self, seqs):
+    def _cal_query_start_loc(self, seqs: List[Sequence]):
         query_lens = [0] + [seq.to_compute_token_num for seq in seqs]
         return max(query_lens), torch.from_numpy(np.cumsum(query_lens)).to(
             device="cpu", dtype=torch.int32
@@ -219,7 +219,7 @@ class InputData:
     def get_query_start_loc(self):
         return self.query_start_loc[: self.query_start_loc_cpu.shape[0]]
 
-    def _cal_block_table(self, seqs):
+    def _cal_block_table(self, seqs: List[Sequence]):
         block_tables_list = [seq.page_table for seq in seqs]
         block_tables = np.full(
             (len(block_tables_list), self.max_num_block), 0, dtype=np.int32
@@ -231,7 +231,7 @@ class InputData:
     def get_block_table(self):
         return self.block_table[: self.block_table_cpu.shape[0]]
 
-    def _cal_slot_mapping(self, seqs):
+    def _cal_slot_mapping(self, seqs: List[Sequence]):
         slot_mapping = []
         for seq in seqs:
             for i in range(seq.computed_token_num, seq.seq_len):
