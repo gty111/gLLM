@@ -99,9 +99,6 @@ class Worker:
                 self.model_runner,
                 self.schedule_method,
             )
-        elif self.pp_rank == 0:
-            # Input data for each rank except 0
-            self.schedule_queue = deque()
         else:
             # Input data for each rank except 0
             self.schedule_queue = deque()
