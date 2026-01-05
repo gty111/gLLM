@@ -198,13 +198,13 @@ class Scheduler:
                 prefill_batched_token_nums += prefill_token_budget
                 seq.to_compute_token_num = prefill_token_budget
                 prefill_token_budget = 0
-            self.memory_manager.pre_allocate_page([seq])
             prefill_batch.append(seq)
             if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
                 seq_new = copy.deepcopy(seq)
                 seq_new.computed_token_num += seq_new.to_compute_token_num
                 unfinish_prefill_seqs.appendleft(seq_new)
 
+        self.memory_manager.pre_allocate_page(prefill_batch)
         self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
         return prefill_batch, prefill_batched_token_nums
 
