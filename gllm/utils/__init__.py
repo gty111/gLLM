@@ -109,7 +109,7 @@ def get_model_load_pbar(num_totals):
     return tqdm.tqdm(
         total=num_totals,
         ncols=100,
-        bar_format="Loading model weights ... {l_bar}{bar}{r_bar}",
+        bar_format="Loading model weights: {l_bar}{bar}{r_bar}",
     )
 
 
