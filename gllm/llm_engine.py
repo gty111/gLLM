@@ -147,7 +147,7 @@ class LLM:
         self.comm.init()
 
         logger.info(
-            f"Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size} ..."
+            f"Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size}"
         )
         if self.use_async_worker:
             logger.warning(f"AsyncWorker is an experimental feature")

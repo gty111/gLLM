@@ -85,29 +85,28 @@ class Scheduler:
         self.log = log
 
     def process_output(self):
-        if len(self.next_tokens_queue) != 0:
-            schedule_seqs: List[Sequence] = self.batch_running.popleft()
-            next_tokens = self.next_tokens_queue.popleft()
-            send_tokens = []
-            ipc_package = IPCPackage([])
-
-            for idx, seq in enumerate(schedule_seqs):
-                seq.computed_token_num += seq.to_compute_token_num
-                if seq.computed_prompt:
-                    ipc_package.act_schedule_ids.append(seq.seq_id)
-                    send_tokens.append(next_tokens[idx])
-                    seq.append(next_tokens[idx])
-                if seq.is_finish:
-                    ipc_package.free_ids.append(seq.seq_id)
-                    self.model_runner.free(seq)
-                elif seq.computed_prompt:
-                    self.seqs_to_decode.appendleft(seq)
-                else:  # unfinished prefill seqs
-                    pass
-            ipc_package.next_tokens = send_tokens
-            return ipc_package
-        else:
+        if len(self.next_tokens_queue) == 0:
             return None
+
+        schedule_seqs: List[Sequence] = self.batch_running.popleft()
+        next_tokens = self.next_tokens_queue.popleft()
+
+        ipc_package = IPCPackage([])
+
+        for idx, seq in enumerate(schedule_seqs):
+            seq.computed_token_num += seq.to_compute_token_num
+            if seq.computed_prompt:
+                ipc_package.act_schedule_ids.append(seq.seq_id)
+                ipc_package.next_tokens.append(next_tokens[idx])
+                seq.append(next_tokens[idx])
+            if seq.is_finish:
+                ipc_package.free_ids.append(seq.seq_id)
+                self.model_runner.free(seq)
+            elif seq.computed_prompt:
+                self.seqs_to_decode.appendleft(seq)
+            else:  # unfinished prefill seqs
+                pass
+        return ipc_package
 
     def check_preempt(self, num_tokens_to_allocate):
         preempt_seqs = []
