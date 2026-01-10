@@ -176,7 +176,11 @@ class InputData:
     def _cal_tokens(self, seqs: List[Sequence]):
         tokens_list = []
         for seq in seqs:
-            tokens_list.extend(seq[seq.computed_token_num : seq.seq_len])
+            tokens_list.extend(
+                seq[seq.computed_token_num : seq.seq_len]
+                if seq.to_compute_tokens is None
+                else seq.to_compute_tokens
+            )
         return torch.tensor(tokens_list, dtype=torch.long, device="cpu")
 
     def get_tokens(self):

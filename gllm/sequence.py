@@ -44,6 +44,9 @@ class Sequence:
         self.is_abort = False
         # used for multimodal input
         self.mm_contents = mm_contents
+        # used to remove redundant token_ids
+        self.to_compute_tokens = None
+        self.has_schedule = False
 
     def __len__(self):
         return len(self.token_ids)

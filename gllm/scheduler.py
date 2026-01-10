@@ -153,6 +153,23 @@ class Scheduler:
         else:
             return None
 
+    def post_schedule(self, schedule_seqs):
+        # We drop token_ids and extract to_compute_tokens here,
+        # since it is not fully used and may increase overhead of zmq.
+        post_schedule_seqs = []
+        for seq in schedule_seqs:
+            if seq.has_schedule:
+                post_schedule_seq = copy.copy(seq)
+                post_schedule_seq.to_compute_tokens = seq[
+                    seq.computed_token_num : seq.seq_len
+                ]
+                post_schedule_seq.token_ids = None
+                post_schedule_seqs.append(post_schedule_seq)
+            else:
+                post_schedule_seqs.append(seq)
+                seq.has_schedule = True
+        return post_schedule_seqs
+
     def schedule_once(self):
         if (
             len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0
@@ -161,9 +178,10 @@ class Scheduler:
             schedule_seqs = self.schedule()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
-            return schedule_seqs
-        else:
-            return []
+                post_schedule_seqs = self.post_schedule(schedule_seqs)
+                return post_schedule_seqs
+
+        return []
 
     def get_balanced_decode_token_budget(self, num_total_decode_seqs):
         if num_total_decode_seqs < self.pp_size:
