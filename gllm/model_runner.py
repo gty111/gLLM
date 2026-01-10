@@ -280,7 +280,6 @@ class ModelRunner:
             seq.prompt_len = 1
             seq.computed_token_num = 1
             seq.to_compute_token_num = 1
-            seq.to_compute_tokens = [2]
         return seqs
 
     @torch.inference_mode()
