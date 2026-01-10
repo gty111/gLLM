@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# Install the specified version of torch
-pip install torch==2.8.0
-
 # Download vLLM wheel
 WHEEL_URL="https://wheels.vllm.ai/0.11.0/vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl"
 WHEEL_FILE="vllm-0.11.0-cp38-abi3-manylinux1_x86_64.whl"
@@ -20,3 +17,6 @@ export GLLM_PRECOMPILED_WHEEL_LOCATION=$(readlink -f "$WHEEL_FILE")
 
 # Install the package in the current directory
 pip install -v -e .
+
+pip install psutil
+pip install --no-cache-dir --no-build-isolation flash_attn
