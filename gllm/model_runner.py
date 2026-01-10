@@ -191,7 +191,7 @@ class ModelRunner:
                 embedding_info = self.embedding_cache[seq.seq_id]
                 assert embedding_info.stale
                 embedding = self.model.get_input_embeddings(
-                    torch.tensor(seq.token_ids[seq.computed_token_num : seq.seq_len])
+                    torch.tensor(seq.to_compute_tokens)
                 )
                 position = MRotaryEmbedding.get_next_input_positions(
                     embedding_info.mrope_position_delta,
@@ -280,6 +280,7 @@ class ModelRunner:
             seq.prompt_len = 1
             seq.computed_token_num = 1
             seq.to_compute_token_num = 1
+            seq.to_compute_tokens = [2]
         return seqs
 
     @torch.inference_mode()

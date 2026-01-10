@@ -187,11 +187,12 @@ class Worker:
         schedule_seqs = self.scheduler.schedule_once()
         if len(schedule_seqs) != 0:
             if get_world_size() > 1:
-                self.comm.send_schedule_seqs((schedule_seqs, None), True)
+                self.comm.send_schedule_seqs(schedule_seqs, None, True)
             self.model_runner.prepare_input(schedule_seqs)
             if get_world_size() > 1:
                 self.comm.send_schedule_seqs(
-                    (schedule_seqs, self.model_runner.input_data.mrope_positions_cpu),
+                    schedule_seqs,
+                    self.model_runner.input_data.mrope_positions_cpu,
                     False,
                 )
             output = self.model_runner.step_once()

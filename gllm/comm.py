@@ -1,6 +1,7 @@
 import threading
-from typing import List
+from typing import List, Optional
 
+import torch
 import zmq
 
 from gllm.dist_utils import (
@@ -149,13 +150,16 @@ class zmqComm:
         else:
             return None
 
-    def send_schedule_seqs(self, seqs, is_first_pp: bool):
+    def send_schedule_seqs(
+        self, seqs: List[Sequence], pos: Optional[torch.Tensor], is_first_pp: bool
+    ):
         if is_first_pp:
             schedule_sockets = self.schedule_first_pp_sockets
         else:
             schedule_sockets = self.schedule_other_sockets
+        data = (seqs, pos)
         for socket in schedule_sockets:
-            threading.Thread(target=socket.send_pyobj, args=(seqs,)).start()
+            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
