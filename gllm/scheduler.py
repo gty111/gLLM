@@ -159,7 +159,7 @@ class Scheduler:
         post_schedule_seqs = []
         for seq in schedule_seqs:
             if seq.has_schedule:
-                post_schedule_seq = copy.deepcopy(seq)
+                post_schedule_seq = copy.copy(seq)
                 post_schedule_seq.to_compute_tokens = seq[
                     seq.computed_token_num : seq.seq_len
                 ]
