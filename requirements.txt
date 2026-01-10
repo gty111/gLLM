@@ -16,5 +16,4 @@ zmq
 aiohttp
 datasets
 pillow
-flash_attn==2.8.3
 einops # qwen2_5_vl

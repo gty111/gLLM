@@ -58,7 +58,7 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 
 ## Install gLLM
 ```
-bash install.sh
+./install.sh
 ```
 
 ## Quickstart
