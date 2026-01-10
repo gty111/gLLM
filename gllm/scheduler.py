@@ -179,9 +179,9 @@ class Scheduler:
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
                 post_schedule_seqs = self.post_schedule(schedule_seqs)
-            return post_schedule_seqs
-        else:
-            return []
+                return post_schedule_seqs
+
+        return []
 
     def get_balanced_decode_token_budget(self, num_total_decode_seqs):
         if num_total_decode_seqs < self.pp_size:
