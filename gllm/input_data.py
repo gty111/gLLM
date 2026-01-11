@@ -30,7 +30,6 @@ class InputData:
 
         if use_buffer:
             assert max_running_seqs is not None and max_seq_length is not None
-
             self.tokens = torch.zeros(max_seq_length, dtype=torch.long)
             self.positions = torch.zeros(max_seq_length, dtype=torch.long)
             self.mrope_positions = torch.zeros((3, max_seq_length), dtype=torch.long)

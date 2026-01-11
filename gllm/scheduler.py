@@ -153,7 +153,7 @@ class Scheduler:
         else:
             return None
 
-    def post_schedule(self, schedule_seqs):
+    def post_schedule(self, schedule_seqs: List[Sequence]):
         # We drop token_ids and extract to_compute_tokens here,
         # since it is not fully used and may increase overhead of zmq.
         post_schedule_seqs = []

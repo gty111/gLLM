@@ -2,6 +2,7 @@ from typing import Dict, List, Union
 
 import torch
 from attr import dataclass
+from logger import logger
 from tqdm import tqdm
 from transformers import (
     AutoImageProcessor,
@@ -11,6 +12,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 from transformers.image_utils import load_images
+from transformers.tokenization_utils_base import VERY_LARGE_INTEGER
 
 from gllm.dist_utils import (
     get_local_rank,
@@ -25,6 +27,7 @@ from gllm.layers.sampler import Sampler
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
+from gllm.utils import unify_decode
 
 
 @dataclass
@@ -98,6 +101,18 @@ class ModelRunner:
         self.size_to_graph: Dict[int, torch.cuda.CUDAGraph] = dict()
         self.capture_sizes = list(range(self.max_cuda_graph_bs, 0, -1))
 
+        # max length
+        self.model_max_length = self.resolve_model_max_length()
+
+    def resolve_model_max_length(self):
+        model_max_length = 8192
+        if self.tokenizer.model_max_length != VERY_LARGE_INTEGER:
+            model_max_length = self.tokenizer.model_max_length
+        if self.model_loader.generation_config.max_length != 20:
+            model_max_length = self.model_loader.generation_config.max_length
+        logger.info(f"Model max length: {model_max_length}")
+        return model_max_length
+
     def init(self, mp_load_progress=None):
         self.model = self.model_loader.load_model(mp_load_progress)
         memory_manager_cls = (
@@ -120,7 +135,7 @@ class ModelRunner:
                 if self.schedule_method in ["chunked_prefill", "split_pd"]
                 else self.maxd
             ),
-            max_seq_length=self.tokenizer.model_max_length,
+            max_seq_length=self.model_max_length,
             memory_manager=self.memory_manager,
             use_buffer=True,
         )
@@ -157,8 +172,8 @@ class ModelRunner:
         else:
             return self.tokenizer.encode(messages)
 
-    def decode(self, content):
-        return self.tokenizer.decode(content, True, True)
+    def decode(self, token_ids):
+        return unify_decode(self.tokenizer, token_ids)
 
     def extract_modify_mm(self, messages: Dict):
         mm_contents = []

@@ -266,3 +266,7 @@ def cast_overflow_tensors(
         clamp_value = torch.finfo(tensors.dtype).max - offset
         tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
     return tensors
+
+
+def unify_decode(tokenizer, token_ids):
+    return tokenizer.decode(token_ids)

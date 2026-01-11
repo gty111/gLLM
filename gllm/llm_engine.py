@@ -78,7 +78,7 @@ class LLM:
         )
         if type(self.finish_tokens) == int:
             self.finish_tokens = [self.finish_tokens]
-        self.model_max_length = self.model_runner.tokenizer.model_max_length
+        self.model_max_length = self.model_runner.model_max_length
         self.generation_config = self.model_runner.model_loader.generation_config
 
         self.assigned_layers = assigned_layers
