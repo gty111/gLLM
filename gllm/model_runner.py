@@ -55,6 +55,7 @@ class ModelRunner:
         schedule_method: str,
         enable_cuda_graph: bool,
         max_cuda_graph_bs: int,
+        model_max_length: int,
     ):
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
@@ -102,10 +103,9 @@ class ModelRunner:
         self.capture_sizes = list(range(self.max_cuda_graph_bs, 0, -1))
 
         # max length
-        self.model_max_length = self.resolve_model_max_length()
+        self.model_max_length = self.resolve_model_max_length(model_max_length)
 
-    def resolve_model_max_length(self):
-        model_max_length = 8192
+    def resolve_model_max_length(self, model_max_length):
         if self.tokenizer.model_max_length != VERY_LARGE_INTEGER:
             model_max_length = self.tokenizer.model_max_length
         if self.model_loader.generation_config.max_length != 20:
