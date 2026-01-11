@@ -110,6 +110,8 @@ class ModelRunner:
             model_max_length = self.tokenizer.model_max_length
         if self.model_loader.generation_config.max_length != 20:
             model_max_length = self.model_loader.generation_config.max_length
+        if model_max_length is None:
+            model_max_length = 8192
         logger.info(f"Model max length: {model_max_length}")
         return model_max_length
 

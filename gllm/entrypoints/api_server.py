@@ -208,7 +208,7 @@ if __name__ == "__main__":
         "--maxp",
         type=int,
         help="Maximum prefill token count per batch (Token Throttling) or token budget in Sarathi-Serve",
-        default=8192,
+        default=None,
     )
     parser.add_argument(
         "--minp",
