@@ -148,7 +148,7 @@ if __name__ == "__main__":
         "--model-max-len",
         type=int,
         help="Maximum sequence length supported by the model (including prompt and generated tokens)",
-        default=8192,
+        default=None,
     )
     # Runtime
     parser.add_argument(
@@ -208,7 +208,7 @@ if __name__ == "__main__":
         "--maxp",
         type=int,
         help="Maximum prefill token count per batch (Token Throttling) or token budget in Sarathi-Serve",
-        default=None,
+        default=8192,
     )
     parser.add_argument(
         "--minp",
