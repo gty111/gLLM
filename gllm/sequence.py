@@ -2,6 +2,8 @@ from typing import List, Union
 
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
+from gllm.utils import unify_decode
+
 
 class Sequence:
     def __init__(
@@ -63,12 +65,12 @@ class Sequence:
         added_space = (
             " "
             if " "
-            in tokenizer.decode(
-                self[self.cur_length - 1 : self.cur_length + 1], True, True
+            in unify_decode(
+                tokenizer, self[self.cur_length - 1 : self.cur_length + 1]
             ).strip()
             else ""
         )
-        delta_text = tokenizer.decode(self[self.cur_length :], True, True)
+        delta_text = unify_decode(tokenizer, self[self.cur_length :])
         if delta_text.endswith("�"):
             return ""
         if len(delta_text) > 0 and delta_text[0] != " ":

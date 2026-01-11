@@ -43,25 +43,27 @@ class LLM:
         use_thinking=True,
         enable_cuda_graph=False,
         max_cuda_graph_bs=512,
+        model_max_length=8192,
     ):
         init_logger()
         self.model_path = model_path
         self.load_format = load_format
         self.model_runner = ModelRunner(
-            load_format,
-            model_path,
-            gpu_memory_util,
-            page_size,
-            enable_prefix_caching,
-            use_thinking,
-            maxp,
-            maxd,
-            kvthresh,
-            minp,
-            iterp,
-            schedule_method,
-            enable_cuda_graph,
-            max_cuda_graph_bs,
+            load_format=load_format,
+            model_path=model_path,
+            gpu_memory_util=gpu_memory_util,
+            page_size=page_size,
+            enable_prefix_caching=enable_prefix_caching,
+            use_thinking=use_thinking,
+            maxp=maxp,
+            maxd=maxd,
+            kvthresh=kvthresh,
+            minp=minp,
+            iterp=iterp,
+            schedule_method=schedule_method,
+            enable_cuda_graph=enable_cuda_graph,
+            max_cuda_graph_bs=max_cuda_graph_bs,
+            model_max_length=model_max_length,
         )
         self.pp_size = pp_size
         self.tp_size = tp_size
@@ -78,7 +80,7 @@ class LLM:
         )
         if type(self.finish_tokens) == int:
             self.finish_tokens = [self.finish_tokens]
-        self.model_max_length = self.model_runner.tokenizer.model_max_length
+        self.model_max_length = self.model_runner.model_max_length
         self.generation_config = self.model_runner.model_loader.generation_config
 
         self.assigned_layers = assigned_layers

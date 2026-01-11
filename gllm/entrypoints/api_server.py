@@ -144,6 +144,12 @@ if __name__ == "__main__":
         help="Disable thinking in inference models",
         action="store_true",
     )
+    parser.add_argument(
+        "--model-max-len",
+        type=int,
+        help="Maximum sequence length supported by the model (including prompt and generated tokens)",
+        default=None,
+    )
     # Runtime
     parser.add_argument(
         "--use-async-worker",
@@ -267,6 +273,7 @@ if __name__ == "__main__":
         use_thinking=not args.disable_thinking,
         enable_cuda_graph=args.enable_cuda_graph,
         max_cuda_graph_bs=args.max_cuda_graph_bs,
+        model_max_length=args.model_max_length,
     )
 
     if args.launch_mode != "slave":

@@ -115,7 +115,7 @@ class Worker:
             input_data = InputData(
                 use_buffer=False,
                 memory_manager=self.model_runner.memory_manager,
-                max_seq_length=self.model_runner.tokenizer.model_max_length,
+                max_seq_length=self.model_runner.model_max_length,
             )
             input_data.cal_input(seqs)
             if mrope_positions is not None:
