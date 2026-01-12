@@ -145,7 +145,7 @@ if __name__ == "__main__":
         action="store_true",
     )
     parser.add_argument(
-        "--model-max-len",
+        "--model-max-length",
         type=int,
         help="Maximum sequence length supported by the model (including prompt and generated tokens)",
         default=None,
