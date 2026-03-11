@@ -6,7 +6,7 @@ packaging
 setuptools>=61
 wheel
 tqdm
-transformers >= 4.55.2
+transformers == 5.3.0
 fastapi[standard] >= 0.115.0
 openai >= 1.99.1
 logger
