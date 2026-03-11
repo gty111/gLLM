@@ -166,7 +166,7 @@ class ModelRunner:
                     messages,
                     add_generation_prompt=True,
                     enable_thinking=self.use_thinking,
-                )
+                ).input_ids
             else:
                 return self.processor.apply_chat_template(
                     messages, tokenize=True, add_generation_prompt=True

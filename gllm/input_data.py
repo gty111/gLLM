@@ -71,7 +71,7 @@ class InputData:
             True,
         )
         repetition_penalty = async_tensor_h2d(
-            [seq.repetition_penalty for seq in self.seqs],
+            [seq.repetition_penalty if seq.repetition_penalty is not None else 1.0 for seq in self.seqs],
             self.memory_manager.dtype,
             "cuda",
             True,
