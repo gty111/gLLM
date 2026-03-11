@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from flash_attn import flash_attn_varlen_func
 from torch import Tensor
 
 from gllm.dist_utils import (
@@ -254,6 +253,8 @@ class Qwen2_5_VisionAttention(nn.Module):
             k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
         q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+        
+        from flash_attn import flash_attn_varlen_func
 
         output = flash_attn_varlen_func(
             q,
