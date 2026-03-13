@@ -900,7 +900,8 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 input_ids,
                 inputs_embeds,
                 multimodal_embeddings,
-                [self.config.image_token_id],
+                [self.config.image_token_id,
+                 self.config.video_token_id],
             )
         return inputs_embeds
 

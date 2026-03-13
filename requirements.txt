@@ -17,3 +17,4 @@ aiohttp
 datasets
 pillow
 einops # qwen2_5_vl
+av # video
