@@ -75,7 +75,7 @@ def run_text_only(model: str, client) -> None:
 # Single-image input inference
 def run_single_image(model: str, client) -> None:
     ## Use image url in the payload
-    image_url = "https://2026.eurosys.org/img/EuroSys-2026-logo.png"
+    image_url = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/stop_sign.jpg"
     chat_completion_from_url = client.chat.completions.create(
         messages=[
             {
