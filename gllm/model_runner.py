@@ -5,13 +5,13 @@ from attr import dataclass
 from logger import logger
 from tqdm import tqdm
 from transformers import (
-    AutoImageProcessor,
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
 )
 from transformers.image_utils import load_images
+from transformers.video_utils import load_video
 from transformers.tokenization_utils_base import VERY_LARGE_INTEGER
 
 from gllm.dist_utils import (
@@ -56,6 +56,8 @@ class ModelRunner:
         enable_cuda_graph: bool,
         max_cuda_graph_bs: int,
         model_max_length: int,
+        mm_processor_min_pixels: int = None,
+        mm_processor_max_pixels: int = None,
     ):
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path)
@@ -80,9 +82,21 @@ class ModelRunner:
 
         if self.use_mm:
             self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
-            self.image_processor = AutoImageProcessor.from_pretrained(
-                model_path, use_fast=True
-            )
+            self.image_processor = self.processor.image_processor
+            self.video_processor = self.processor.video_processor
+            if mm_processor_min_pixels is not None:
+                self.image_processor.min_pixels = mm_processor_min_pixels
+                self.video_processor.min_pixels = mm_processor_min_pixels
+                self.image_processor.size["shortest_edge"] = mm_processor_min_pixels
+                self.video_processor.size["shortest_edge"] = mm_processor_min_pixels
+                logger.info(f"Min pixels: {mm_processor_min_pixels}")
+            if mm_processor_max_pixels is not None:
+                self.image_processor.max_pixels = mm_processor_max_pixels
+                self.video_processor.max_pixels = mm_processor_max_pixels
+                self.image_processor.size["longest_edge"] = mm_processor_max_pixels
+                self.video_processor.size["longest_edge"] = mm_processor_max_pixels
+                logger.info(f"Max pixels: {mm_processor_max_pixels}")
+            
 
         # lazy init
         self.model: torch.nn.Module = None
@@ -178,14 +192,16 @@ class ModelRunner:
         return unify_decode(self.tokenizer, token_ids)
 
     def extract_modify_mm(self, messages: Dict):
-        mm_contents = []
+        mm_contents = {"image": [], "video": []}
         for message in messages:
             contents = message["content"]
             if type(contents) != list:
                 continue
             for content in contents:
                 if content["type"] == "image":
-                    mm_contents.append(content["image"])
+                    mm_contents["image"].append(content["image"])
+                elif content["type"] == "video":
+                    mm_contents["video"].append(content["video"])
                 elif content["type"] == "image_url":
                     content["type"] = "image"
                     data = content["image_url"]
@@ -193,8 +209,16 @@ class ModelRunner:
                     if type(data) == dict:
                         data = data["url"]
                     content["image"] = data
-                    mm_contents.append(data)
-        return mm_contents if len(mm_contents) != 0 else None
+                    mm_contents["image"].append(data)
+                elif content["type"] == "video_url":
+                    content["type"] = "video"
+                    data = content["video_url"]
+                    del content["video_url"]
+                    if type(data) == dict:
+                        data = data["url"]
+                    content["video"] = data
+                    mm_contents["video"].append(data)
+        return mm_contents if len(mm_contents["image"]) + len(mm_contents["video"]) != 0 else None
 
     @torch.inference_mode()
     def mm_prepare_inputs(self, seqs: List[Sequence]):
@@ -224,24 +248,40 @@ class ModelRunner:
                 ):
                     mm_embeddings = None
                     image_grid_thw: torch.Tensor = None
+                    video_grid_thw: torch.Tensor = None
                     if seq.mm_contents is not None:
-                        images = load_images(seq.mm_contents)
-                        images_input = self.image_processor(images=images)
-                        image_grid_thw = images_input["image_grid_thw"]
+                        mm_input = {}
+                        if len(seq.mm_contents["image"]) != 0:
+                            images = load_images(seq.mm_contents["image"])
+                            images_input = self.image_processor(images=images)
+                            mm_input.update(images_input)
+                            image_grid_thw = images_input["image_grid_thw"]
+                        if len(seq.mm_contents["video"]) != 0:
+                            videos = []
+                            for video_content in seq.mm_contents["video"]:
+                                video_data, video_metadata = load_video(video_content)
+                                videos.append(video_data)
+                            videos_input = self.video_processor(videos=videos)
+                            mm_input.update(videos_input)
+                            video_grid_thw = videos_input["video_grid_thw"]
+                        
                         mm_embeddings = self.model.get_multimodal_embeddings(
-                            **images_input
+                            **mm_input
                         )
+                        
                     prompt_embeddings = self.model.get_input_embeddings(
                         torch.tensor(seq.token_ids), mm_embeddings
                     )
                     if image_grid_thw is not None:
                         image_grid_thw = image_grid_thw.cpu()
+                    if video_grid_thw is not None:
+                        video_grid_thw = video_grid_thw.cpu()
                     prompt_positions, mrope_position_delta = (
                         MRotaryEmbedding.get_input_positions(
                             input_tokens=seq.token_ids,
                             hf_config=self.model.config,
                             image_grid_thw=image_grid_thw,
-                            video_grid_thw=None,
+                            video_grid_thw=video_grid_thw,
                             second_per_grid_ts=None,
                         )
                     )

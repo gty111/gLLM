@@ -128,8 +128,7 @@ def run_multi_image(model: str, client) -> None:
 
 # Video input inference
 def run_video(model: str, client) -> None:
-    video_url = "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4"
-    video_base64 = encode_base64_content_from_url(video_url)
+    video_url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-Omni/demo/draw.mp4"
 
     ## Use video url in the payload
     chat_completion_from_url = client.chat.completions.create(
@@ -146,32 +145,11 @@ def run_video(model: str, client) -> None:
             }
         ],
         model=model,
-        max_completion_tokens=64,
+        max_completion_tokens=1024,
     )
 
     result = chat_completion_from_url.choices[0].message.content
     print("Chat completion output from image url:", result)
-
-    ## Use base64 encoded video in the payload
-    chat_completion_from_base64 = client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What's in this video?"},
-                    {
-                        "type": "video_url",
-                        "video_url": {"url": f"data:video/mp4;base64,{video_base64}"},
-                    },
-                ],
-            }
-        ],
-        model=model,
-        max_completion_tokens=64,
-    )
-
-    result = chat_completion_from_base64.choices[0].message.content
-    print("Chat completion output from base64 encoded image:", result)
 
 
 example_function_map = {

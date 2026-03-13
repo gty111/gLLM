@@ -44,6 +44,8 @@ class LLM:
         enable_cuda_graph=False,
         max_cuda_graph_bs=512,
         model_max_length=8192,
+        mm_processor_min_pixels=None,
+        mm_processor_max_pixels=None,
     ):
         init_logger()
         self.model_path = model_path
@@ -64,6 +66,8 @@ class LLM:
             enable_cuda_graph=enable_cuda_graph,
             max_cuda_graph_bs=max_cuda_graph_bs,
             model_max_length=model_max_length,
+            mm_processor_min_pixels=mm_processor_min_pixels,
+            mm_processor_max_pixels=mm_processor_max_pixels,
         )
         self.pp_size = pp_size
         self.tp_size = tp_size

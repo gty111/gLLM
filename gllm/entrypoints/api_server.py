@@ -245,6 +245,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ranks", type=str, help="Specify the ranks of worker like 0,1", default=None
     )
+    # MultiModal 
+    parser.add_argument(
+        "--mm-processor-min-pixels",
+        type=int,
+        help="Minimum pixels for multimodal processor",
+        default=None,
+    )
+    parser.add_argument(
+        "--mm-processor-max-pixels",
+        type=int,
+        help="Maximum pixels for multimodal processor",
+        default=None,
+    )
     args = parser.parse_args()
 
     llm = PipeAsyncLLM(
@@ -274,6 +287,8 @@ if __name__ == "__main__":
         enable_cuda_graph=args.enable_cuda_graph,
         max_cuda_graph_bs=args.max_cuda_graph_bs,
         model_max_length=args.model_max_length,
+        mm_processor_min_pixels=args.mm_processor_min_pixels,
+        mm_processor_max_pixels=args.mm_processor_max_pixels,
     )
 
     if args.launch_mode != "slave":
