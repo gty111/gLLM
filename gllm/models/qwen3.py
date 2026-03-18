@@ -4,7 +4,7 @@ from gllm.input_data import InputData
 from gllm.layers.attention import FlashAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import QKVParallelLinear, RowParallelLinear
-from gllm.layers.rotary_embedding import RotaryEmbedding
+from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from gllm.modules.attention import Attention
 
 from .qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
@@ -42,14 +42,26 @@ class Qwen3Attention(Attention):
             bias=False,
             quant_config=quant_config,
         )
-
-        self.rotary_emb = RotaryEmbedding(
-            self.head_dim,
-            self.head_dim,
-            config.max_position_embeddings,
-            self.rope_theta,
-            True,
-        )
+        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is None:
+            self.rotary_emb = RotaryEmbedding(
+                self.head_dim,
+                self.head_dim,
+                self.max_position_embeddings,
+                self.rope_theta,
+                True,
+            )
+        else:
+            assert "mrope_section" in rope_scaling
+            self.rotary_emb = MRotaryEmbedding(
+                self.head_dim,
+                self.head_dim,
+                self.max_position_embeddings,
+                self.rope_theta,
+                True,
+                rope_scaling["mrope_section"],
+            )
         self.attn = FlashAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim
         )

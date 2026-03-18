@@ -53,23 +53,22 @@ def _merge_multimodal_embeddings(
         This updates ``inputs_embeds`` in place.
     """
     flattened = _flatten_embeddings(multimodal_embeddings)
+    num_expected_tokens = is_multimodal.sum().item()
+
+    if flattened.shape[0] != num_expected_tokens:
+        expr = _embedding_count_expression(multimodal_embeddings)
+        raise ValueError(
+            f"Attempted to assign {expr} = {flattened.shape[0]} "
+            f"multimodal tokens to {num_expected_tokens} placeholders"
+        )
+
     try:
         # This is equivalent to: inputs_embeds[is_multimodal] = flattened.
         inputs_embeds.masked_scatter_(
             is_multimodal.unsqueeze(-1), flattened.to(dtype=inputs_embeds.dtype)
         )
-    except RuntimeError as e:
-        num_expected_tokens = is_multimodal.sum().item()
-        assert isinstance(num_expected_tokens, int)
-
-        if flattened.shape[0] != num_expected_tokens:
-            expr = _embedding_count_expression(multimodal_embeddings)
-            raise ValueError(
-                f"Attempted to assign {expr} = {flattened.shape[0]} "
-                f"multimodal tokens to {num_expected_tokens} placeholders"
-            ) from e
-        else:
-            raise ValueError("Error during masked scatter operation") from e
+    except Exception as e:
+        raise ValueError("Error during masked scatter operation") from e
 
     return inputs_embeds
 

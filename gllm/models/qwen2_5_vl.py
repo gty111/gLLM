@@ -190,6 +190,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         embed_dim: int,
         num_heads: int,
         projection_size: int,
+        quant_config = None,
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
@@ -204,8 +205,13 @@ class Qwen2_5_VisionAttention(nn.Module):
             total_num_heads=num_heads,
             total_num_kv_heads=num_heads,
             bias=True,
+            quant_config=quant_config,
         )
-        self.proj = RowParallelLinear(input_size=projection_size, output_size=embed_dim)
+        self.proj = RowParallelLinear(
+            input_size=projection_size, 
+            output_size=embed_dim,
+            quant_config=quant_config,
+        )
 
     def split_qkv(self, qkv: torch.Tensor) -> tuple[torch.Tensor, ...]:
         # [s, b, 3 * head * head_dim]
@@ -867,7 +873,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 )
         return mm_input_by_modality
 
-    def get_multimodal_embeddings(self, **kwargs: object) -> MultiModalEmbeddings:
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
 
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
@@ -888,22 +894,47 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 video_embeddings = self._process_video_input(multimodal_input)
                 multimodal_embeddings += video_embeddings
         return multimodal_embeddings
-
-    def get_input_embeddings(
+    
+    def get_mm_placeholder_token_ids(self):
+        return [self.config.image_token_id, self.config.video_token_id]
+    
+    def _embed_text_input_ids(
         self,
         input_ids: torch.Tensor,
-        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        embed_input_ids: Callable[[torch.Tensor], torch.Tensor],
+        is_multimodal: torch.Tensor | None,
     ) -> torch.Tensor:
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
-        if multimodal_embeddings is not None and len(multimodal_embeddings) != 0:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids,
-                inputs_embeds,
-                multimodal_embeddings,
-                [self.config.image_token_id,
-                 self.config.video_token_id],
-            )
-        return inputs_embeds
+        if is_multimodal is not None:
+            in_vocab_ids = input_ids.masked_fill(is_multimodal, 0)
+            return embed_input_ids(in_vocab_ids)
+
+        return embed_input_ids(input_ids)
+
+    def embed_input_ids(
+        self,
+        input_ids: Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        is_multimodal: Tensor | None = None,
+    ) -> Tensor:
+        from .utils import _merge_multimodal_embeddings
+
+        # Get text embeddings first; multimodal embeddings will clobber
+        # any invalid contents in the indices of multimodal embeddings
+        # for the in vocabulary and out of vocabulary case.
+        inputs_embeds = self._embed_text_input_ids(
+            input_ids,
+            self.language_model.embed_input_ids,
+            is_multimodal=is_multimodal,
+        )
+
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
+        return _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
 
     def forward(
         self,

@@ -59,8 +59,21 @@ class ModelRunner:
         mm_processor_min_pixels: int = None,
         mm_processor_max_pixels: int = None,
     ):
+        
+        self.max_num_batched_tokens = (
+            maxp
+            if schedule_method in ["chunked_prefill", "split_pd"]
+            else maxp + maxd
+        )
+        
+        self.max_running_seqs = (
+            maxp
+            if schedule_method in ["chunked_prefill", "split_pd"]
+            else maxd
+        )
+        
         self.model_path = model_path
-        self.model_loader = ModelLoader(load_format, model_path)
+        self.model_loader = ModelLoader(load_format, model_path, self.max_num_batched_tokens)
         self.enable_prefix_caching = enable_prefix_caching
         self.use_thinking = use_thinking
         self.gpu_memory_util = gpu_memory_util
@@ -146,25 +159,16 @@ class ModelRunner:
         )
         # Input buffer
         self.input_data = InputData(
-            max_running_seqs=(
-                self.maxp
-                if self.schedule_method in ["chunked_prefill", "split_pd"]
-                else self.maxd
-            ),
+            max_running_seqs=self.max_running_seqs,
             max_seq_length=self.model_max_length,
             memory_manager=self.memory_manager,
             use_buffer=True,
         )
-        max_tokens_ret = (
-            self.maxp
-            if self.schedule_method in ["chunked_prefill", "split_pd"]
-            else self.maxp + self.maxd
-        )
-        self.input_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
-        self.input_residual = torch.zeros((max_tokens_ret, self.hidden_size))
+        self.input_hidden_states = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
+        self.input_residual = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
         # Output buffer
-        self.output_hidden_states = torch.zeros((max_tokens_ret, self.hidden_size))
-        self.output_residual = torch.zeros((max_tokens_ret, self.hidden_size))
+        self.output_hidden_states = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
+        self.output_residual = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
         # Profile run
         self.profile_run()
         # Init KV cache at last
@@ -231,7 +235,7 @@ class ModelRunner:
             if seq.computed_prompt:
                 embedding_info = self.embedding_cache[seq.seq_id]
                 assert embedding_info.stale
-                embedding = self.model.get_input_embeddings(
+                embedding = self.model.embed_input_ids(
                     torch.tensor(seq.to_compute_tokens)
                 )
                 position = MRotaryEmbedding.get_next_input_positions(
@@ -258,19 +262,27 @@ class ModelRunner:
                             image_grid_thw = images_input["image_grid_thw"]
                         if len(seq.mm_contents["video"]) != 0:
                             videos = []
+                            video_metadata = []
                             for video_content in seq.mm_contents["video"]:
-                                video_data, video_metadata = load_video(video_content)
+                                video_data, metadata = load_video(video_content)
                                 videos.append(video_data)
-                            videos_input = self.video_processor(videos=videos)
+                                video_metadata.append(metadata)
+                            videos_input = self.video_processor(
+                                videos=videos,
+                                video_metadata=video_metadata,
+                            )
                             mm_input.update(videos_input)
                             video_grid_thw = videos_input["video_grid_thw"]
-                        
-                        mm_embeddings = self.model.get_multimodal_embeddings(
+                        mm_embeddings = self.model.embed_multimodal(
                             **mm_input
                         )
-                        
-                    prompt_embeddings = self.model.get_input_embeddings(
-                        torch.tensor(seq.token_ids), mm_embeddings
+                    
+                    input_ids = torch.tensor(seq.token_ids)
+                    placeholder_token_id = torch.tensor(self.model.get_mm_placeholder_token_ids())
+                    prompt_embeddings = self.model.embed_input_ids(
+                        input_ids, 
+                        mm_embeddings,
+                        torch.isin(input_ids, placeholder_token_id)
                     )
                     if image_grid_thw is not None:
                         image_grid_thw = image_grid_thw.cpu()
@@ -341,9 +353,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def profile_run(self):
-        seqs = self.create_dummy_seqs(
-            self.maxp if self.schedule_method == "chunked_prefill" else self.maxd
-        )
+        seqs = self.create_dummy_seqs(self.max_running_seqs)
         self.input_data.cal_and_set_input(seqs)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if self.use_mm:
