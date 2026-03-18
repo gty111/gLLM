@@ -28,7 +28,6 @@ from gllm.utils import cast_overflow_tensors
 from gllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
 
 from .qwen2 import Qwen2ForCausalLM
-from .utils import merge_multimodal_embeddings
 from .weight_utils import (
     copy_gate_up_proj,
     copy_qkv_proj,
