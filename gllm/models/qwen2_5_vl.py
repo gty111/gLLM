@@ -929,6 +929,12 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
 
+        if is_multimodal is None:
+            raise ValueError(
+                "is_multimodal must be provided when multimodal_embeddings "
+                "is non-empty"
+            )
+
         return _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=multimodal_embeddings,

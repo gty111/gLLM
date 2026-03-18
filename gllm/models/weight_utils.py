@@ -66,7 +66,7 @@ def copy_single_proj_dim0(dst, src):
     dst.copy_(
         src[get_tp_rank() * size_partition : (get_tp_rank() + 1) * size_partition]
     )
-    
+
 
 def get_tensor_from_dict(weights, k):
     k_language = k.replace('model', 'model.language_model')
@@ -78,8 +78,7 @@ def get_tensor_from_dict(weights, k):
     elif k_visual in weights:
         return weights[k_visual]
     else:
-        for key, value in weights.items():
-            print(key)
-        
-        raise KeyError(f"Fail to extract {k} from weights")
-        
+        raise KeyError(
+            f"Key '{k}' not found in weights dict "
+            f"(also tried '{k_language}' and '{k_visual}')"
+        )
