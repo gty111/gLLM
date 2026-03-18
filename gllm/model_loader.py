@@ -27,7 +27,7 @@ def get_attr_from_config(config, attr_name):
     elif hasattr(config, 'vision_config') and hasattr(getattr(config, 'vision_config'), attr_name):
         return getattr(getattr(config, 'vision_config'), attr_name)
     else:
-        raise KeyError(f'Fail to getattr {attr_name} from {config}')
+        raise KeyError(f"Failed to get attribute '{attr_name}' from config.")
 
 
 class ModelLoader:
