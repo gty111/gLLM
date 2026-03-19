@@ -639,17 +639,14 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         image_token_id = hf_config.image_token_id
         video_token_id = hf_config.video_token_id
-        vision_start_token_id = hf_config.vision_start_token_id
         spatial_merge_size = hf_config.vision_config.spatial_merge_size
         tokens_per_second = getattr(hf_config.vision_config, "tokens_per_second", 1.0)
 
-        input_tokens_tensor = torch.tensor(input_tokens, device="cpu")
-        vision_start_indices = torch.argwhere(
-            input_tokens_tensor == vision_start_token_id
-        ).squeeze(1)
-        vision_tokens = input_tokens_tensor[vision_start_indices + 1]
-        image_nums = (vision_tokens == image_token_id).sum()
-        video_nums = (vision_tokens == video_token_id).sum()
+        # Count multimodal chunks from processor outputs instead of vision token
+        # occurrences. For Qwen3-VL, one video can expand to multiple video tokens,
+        # while video_grid_thw still has one entry per video.
+        image_nums = int(image_grid_thw.shape[0]) if isinstance(image_grid_thw, torch.Tensor) else len(image_grid_thw)
+        video_nums = int(video_grid_thw.shape[0]) if isinstance(video_grid_thw, torch.Tensor) else len(video_grid_thw)
         llm_pos_ids_list: list = []
 
         st = 0

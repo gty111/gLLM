@@ -15,12 +15,25 @@ from gllm.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from gllm.models.qwen2_moe import Qwen2MoeForCausalLM
 from gllm.models.qwen3 import Qwen3ForCausalLM
 from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
+from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from gllm.utils import get_lock
 
 
+def get_attr_from_config(config, attr_name):
+    if hasattr(config, attr_name):
+        return getattr(config, attr_name)
+    elif hasattr(config, 'text_config') and hasattr(getattr(config, 'text_config'), attr_name):
+        return getattr(getattr(config, 'text_config'), attr_name)
+    elif hasattr(config, 'vision_config') and hasattr(getattr(config, 'vision_config'), attr_name):
+        return getattr(getattr(config, 'vision_config'), attr_name)
+    else:
+        raise KeyError(f"Failed to get attribute '{attr_name}' from config.")
+
+
 class ModelLoader:
-    def __init__(self, load_format, model_path):
+    def __init__(self, load_format, model_path, max_num_batched_tokens):
         self.model_path = model_path
+        self.max_num_batched_tokens = max_num_batched_tokens
         self.load_config()
         self.load_format = load_format
 
@@ -78,12 +91,17 @@ class ModelLoader:
             self.generation_config = GenerationConfig.from_pretrained(self.model_path)
         except Exception:
             self.generation_config = GenerationConfig.from_model_config(self.config)
-        self.dtype = self.config.dtype
+        if self.config.dtype is not None:
+            self.dtype = self.config.dtype
+        else:
+            assert hasattr(self.config, "text_config")
+            self.dtype = self.config.text_config.dtype
         self.architecture = self.config.architectures[0]
-        self.vocab_size = self.config.vocab_size
-        self.hidden_size = self.config.hidden_size
+        self.vocab_size = get_attr_from_config(self.config, "vocab_size")
+        self.hidden_size = get_attr_from_config(self.config, "hidden_size")
         self.quantization_config = getattr(self.config, "quantization_config", None)
         self.config.use_mla = self.use_mla
+        self.config.max_num_batched_tokens = self.max_num_batched_tokens
 
     @property
     def use_mla(self):
@@ -91,7 +109,8 @@ class ModelLoader:
 
     @property
     def use_mm(self):
-        return self.architecture in ["Qwen2_5_VLForConditionalGeneration"]
+        return self.architecture in ["Qwen2_5_VLForConditionalGeneration",
+                                     "Qwen3VLForConditionalGeneration"]
 
     def get_model_type(self):
         model_type = None
@@ -116,6 +135,8 @@ class ModelLoader:
             model_type = DeepseekV2ForCausalLM
         elif self.architecture == "Qwen2_5_VLForConditionalGeneration":
             model_type = Qwen2_5_VLForConditionalGeneration
+        elif self.architecture == "Qwen3VLForConditionalGeneration":
+            model_type = Qwen3VLForConditionalGeneration
         else:
             raise Exception(f"Unsupported model: {self.architecture}")
         return model_type

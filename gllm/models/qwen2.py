@@ -29,6 +29,7 @@ from .weight_utils import (
     copy_qkv_proj,
     copy_single_proj_dim0,
     copy_single_proj_dim1,
+    get_tensor_from_dict,
 )
 
 
@@ -174,6 +175,9 @@ class Qwen2Model(nn.Module):
             return hidden_states
         else:
             return hidden_states, residual
+        
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
 
 
 class Qwen2ForCausalLM(nn.Module):
@@ -187,6 +191,8 @@ class Qwen2ForCausalLM(nn.Module):
         )
         self.model = model_type(config)
         self.num_layers = len(self.model.layers)
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
         self.ret_residual = True
         if is_last_pp_rank():
             self.lm_head = ParallelLMHead(
@@ -225,28 +231,31 @@ class Qwen2ForCausalLM(nn.Module):
                 )
                 copy_qkv_proj(
                     v.data,
-                    weights[k.replace("qkv_proj", "q_proj")],
-                    weights[k.replace("qkv_proj", "k_proj")],
-                    weights[k.replace("qkv_proj", "v_proj")],
+                    get_tensor_from_dict(weights, k.replace("qkv_proj", "q_proj")),
+                    get_tensor_from_dict(weights, k.replace("qkv_proj", "k_proj")),
+                    get_tensor_from_dict(weights, k.replace("qkv_proj", "v_proj")),
                     num_heads,
                     num_kv_heads,
                     head_dim_patch,
                 )
             elif k.find("self_attn.o_proj") != -1:
-                copy_single_proj_dim1(v.data, weights[k])
+                copy_single_proj_dim1(v.data, get_tensor_from_dict(weights, k))
             elif k.find("gate_up_proj") != -1:
                 copy_gate_up_proj(
                     v.data,
-                    weights[k.replace("gate_up_proj", "gate_proj")],
-                    weights[k.replace("gate_up_proj", "up_proj")],
+                    get_tensor_from_dict(weights, k.replace("gate_up_proj", "gate_proj")),
+                    get_tensor_from_dict(weights, k.replace("gate_up_proj", "up_proj")),
                 )
             elif k.find("down_proj") != -1:
-                copy_single_proj_dim1(v.data, weights[k])
+                copy_single_proj_dim1(v.data, get_tensor_from_dict(weights, k))
             elif k.find("embed_tokens") != -1 or k.find("lm_head") != -1:
-                copy_single_proj_dim0(v.data, weights[k])
+                copy_single_proj_dim0(v.data, get_tensor_from_dict(weights, k))
             else:
-                v.data.copy_(weights[k])
+                v.data.copy_(get_tensor_from_dict(weights, k))
             if mp_load_progress is not None:
                 mp_load_progress[get_local_rank() * 2 + 1] += 1
             else:
                 pbar.update(1)
+                
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
