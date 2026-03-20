@@ -5,12 +5,13 @@ import numpy as np
 
 from collections.abc import Callable
 from functools import partial, lru_cache
-from logger import logger
 
 from gllm.input_data import InputData
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead
 from gllm.models.utils import _merge_multimodal_embeddings
-from gllm.models.weight_utils import copy_gate_up_proj, copy_qkv_proj, copy_single_proj_dim0, copy_single_proj_dim1
+from gllm.models.weight_utils import (
+    copy_qkv_proj, copy_single_proj_dim0, 
+    copy_single_proj_dim1, get_tensor_from_dict)
 from gllm.layers.linear import ColumnParallelLinear, RowParallelLinear
 from gllm.dist_utils import get_tp_size, is_first_pp_rank, is_last_pp_rank
 
@@ -20,7 +21,6 @@ from .qwen2_5_vl import (MultiModalEmbeddings, Qwen2_5_VLVideoEmbeddingInputs, Q
                          Qwen2_5_VLImageInputs, Qwen2_5_VLImagePixelInputs,
                          Qwen2_5_VLImageEmbeddingInputs)
 from .qwen3 import Qwen3Model, Qwen3ForCausalLM
-from .weight_utils import get_tensor_from_dict
 
 
 class Qwen3_VisionPatchEmbed(nn.Module):
