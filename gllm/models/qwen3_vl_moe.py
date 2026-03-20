@@ -8,7 +8,7 @@ from gllm.models.weight_utils import copy_gate_up_proj, copy_qkv_proj, copy_sing
 from gllm.utils import get_model_load_pbar
 
 from .qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
-from .qwen3_vl import Qwen3VLForConditionalGeneration, Qwen3_VisionTransformer
+from .qwen3_vl import Qwen3VLForConditionalGeneration
 
 
 class Qwen3MoeLLMModel(Qwen3MoeModel):
@@ -123,48 +123,4 @@ class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
 
 class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(self, config):
-        nn.Module.__init__(self)
-        quant_config = getattr(config, "quant_config", None)
-
-        self.config = config
-
-        self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")
-        self.deepstack_num_level = (
-            len(config.vision_config.deepstack_visual_indexes)
-            if self.use_deepstack
-            else 0
-        )
-        self.visual_dim = config.vision_config.out_hidden_size
-        self.multiscale_dim = self.visual_dim * self.deepstack_num_level
-
-        self.visual = Qwen3_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            quant_config=quant_config,
-        )
-
-        if self.use_deepstack:
-            self.deepstack_input_embeds = [
-                torch.zeros(
-                    config.max_num_batched_tokens,
-                    config.text_config.hidden_size,
-                )
-                for _ in range(self.deepstack_num_level)
-            ]
-
-        self.language_model = Qwen3MoeLLMForCausalLM(config.text_config)
-
-        if not is_first_pp_rank() and hasattr(
-            config.vision_config, "deepstack_visual_indexes"
-        ):
-            assert self.language_model.start_layer >= len(
-                config.vision_config.deepstack_visual_indexes
-            ), (
-                "start_layer should be greater than or equal to "
-                "len(deepstack_visual_indexes)"
-            )
-
-        self.num_layers = self.language_model.num_layers
-        self.num_kv_heads = self.language_model.num_kv_heads
-        self.head_dim = self.language_model.head_dim
-        self.ret_residual = self.language_model.ret_residual
+        super().__init__(config, language_model_type=Qwen3MoeLLMForCausalLM)

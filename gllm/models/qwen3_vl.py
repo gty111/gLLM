@@ -472,7 +472,7 @@ class Qwen3LLMForCausalLM(Qwen3ForCausalLM):
 
 class Qwen3VLForConditionalGeneration(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, language_model_type=Qwen3LLMForCausalLM):
         super().__init__()
         quant_config = getattr(config, "quant_config", None)
 
@@ -503,7 +503,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 for _ in range(self.deepstack_num_level)
             ]
 
-        self.language_model = Qwen3LLMForCausalLM(
+        self.language_model = language_model_type(
             config.text_config,
         )
 
