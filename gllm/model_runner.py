@@ -53,7 +53,7 @@ class ModelRunner:
         minp,
         iterp,
         schedule_method: str,
-        enable_cuda_graph: bool,
+        disable_cuda_graph: bool,
         max_cuda_graph_bs: int,
         model_max_length: int,
         mm_processor_min_pixels: int = None,
@@ -124,7 +124,7 @@ class ModelRunner:
         self.embedding_cache: Dict[int, EmbeddingInfo] = {}
 
         # cuda graph
-        self.enable_cuda_graph = enable_cuda_graph
+        self.disable_cuda_graph = disable_cuda_graph
         self.max_cuda_graph_bs = max_cuda_graph_bs
         self.size_to_graph: Dict[int, torch.cuda.CUDAGraph] = dict()
         self.capture_sizes = list(range(self.max_cuda_graph_bs, 0, -1))
@@ -174,7 +174,7 @@ class ModelRunner:
         # Init KV cache at last
         self.memory_manager.init()
 
-        if self.enable_cuda_graph:
+        if not self.disable_cuda_graph:
             self.capture_graph()
 
     def encode(self, messages, chat: bool = False, has_mm: bool = False):
