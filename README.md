@@ -155,7 +155,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 - Kimi Series: K2-Base, K2-Instruct
 - DeepSeek Series: DeepSeek R1, DeepSeek V3, DeepSeek V2
-- Qwen Series: Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
+- Qwen Series: Qwen3 VL, Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
 - Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
 - ChatGLM Series: Glm4 and Chatglm3
