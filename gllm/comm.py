@@ -158,8 +158,20 @@ class zmqComm:
         else:
             schedule_sockets = self.schedule_other_sockets
         data = (seqs, pos)
-        for socket in schedule_sockets:
-            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
+        if len(schedule_sockets) == 1:
+            # Fast path: single target socket — avoid thread creation overhead.
+            schedule_sockets[0].send_pyobj(data)
+        else:
+            # Multiple targets: serialise once then fan-out in parallel threads
+            # so that the serialisation cost is paid only once.
+            import pickle
+            raw = pickle.dumps(data)
+            threads = [
+                threading.Thread(target=socket.send, args=(raw,))
+                for socket in schedule_sockets
+            ]
+            for t in threads:
+                t.start()
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:

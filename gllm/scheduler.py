@@ -218,7 +218,11 @@ class Scheduler:
             self.memory_manager.pre_allocate_page([seq])
             prefill_batch.append(seq)
             if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
-                seq_new = copy.deepcopy(seq)
+                # Use shallow copy instead of deepcopy to avoid copying the large
+                # token_ids list. page_table is a new list per allocation so it's
+                # safe; token_ids is read-only during prefill chunking.
+                seq_new = copy.copy(seq)
+                seq_new.page_table = list(seq.page_table)
                 seq_new.computed_token_num += seq_new.to_compute_token_num
                 unfinish_prefill_seqs.appendleft(seq_new)
 

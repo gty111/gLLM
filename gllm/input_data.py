@@ -70,14 +70,13 @@ class InputData:
             "cuda",
             True,
         )
-        repetition_penalty = async_tensor_h2d(
+        # Keep as (N,) vector; broadcasting in sampler avoids allocating a
+        # (N × vocab_size) tensor on every decode step.
+        self.repetition_penalty = async_tensor_h2d(
             [seq.repetition_penalty for seq in self.seqs],
             self.memory_manager.dtype,
             "cuda",
             True,
-        )
-        self.repetition_penalty = repetition_penalty.unsqueeze(dim=1).repeat(
-            1, self.memory_manager.vocab_size
         )
 
     def cal_input(self, seqs: List[Sequence]):
@@ -173,23 +172,29 @@ class InputData:
         self.copy_to_input_buffer()
 
     def _cal_tokens(self, seqs: List[Sequence]):
-        tokens_list = []
+        # Avoid repeated Python-level list.extend(); collect numpy arrays and
+        # concatenate in one shot.
+        parts = []
         for seq in seqs:
-            tokens_list.extend(
+            tokens = (
                 seq[seq.computed_token_num : seq.seq_len]
                 if seq.to_compute_tokens is None
                 else seq.to_compute_tokens
             )
-        return torch.tensor(tokens_list, dtype=torch.long, device="cpu")
+            parts.append(np.array(tokens, dtype=np.int64))
+        return torch.from_numpy(np.concatenate(parts))
 
     def get_tokens(self):
         return self.tokens[: self.tokens_cpu.shape[0]]
 
     def _cal_position(self, seqs: List[Sequence]):
-        positions_list = []
-        for seq in seqs:
-            positions_list.extend(range(seq.computed_token_num, seq.seq_len))
-        return torch.tensor(positions_list, dtype=torch.long, device="cpu")
+        # Build position ranges with numpy for a single vectorised concat,
+        # avoiding repeated Python-level list.extend() calls.
+        parts = [
+            np.arange(seq.computed_token_num, seq.seq_len, dtype=np.int64)
+            for seq in seqs
+        ]
+        return torch.from_numpy(np.concatenate(parts))
 
     def get_position(self):
         if self.mrope_positions_cpu is not None:
@@ -235,15 +240,24 @@ class InputData:
         return self.block_table[: self.block_table_cpu.shape[0]]
 
     def _cal_slot_mapping(self, seqs: List[Sequence]):
-        slot_mapping = []
+        # Vectorised numpy implementation replaces the nested Python loop.
+        # For each token position i in [computed, seq_len):
+        #   slot = page_table[i // page_size] * page_size + (i % page_size)
+        parts = []
+        page_size = self.page_size
         for seq in seqs:
-            for i in range(seq.computed_token_num, seq.seq_len):
-                page_idx = i // self.page_size
-                slot_idx = i % self.page_size
-                slot_mapping.append(
-                    seq.page_table[page_idx] * self.page_size + slot_idx
-                )
-        return torch.tensor(slot_mapping, dtype=torch.int64, device="cpu")
+            start = seq.computed_token_num
+            end = seq.seq_len
+            if start >= end:
+                continue
+            indices = np.arange(start, end, dtype=np.int64)
+            page_idx = indices // page_size
+            slot_idx = indices % page_size
+            page_table = np.array(seq.page_table, dtype=np.int64)
+            parts.append(page_table[page_idx] * page_size + slot_idx)
+        if parts:
+            return torch.from_numpy(np.concatenate(parts))
+        return torch.zeros(0, dtype=torch.int64)
 
     def get_slot_mapping(self):
         return self.slot_mapping[: self.slot_mapping_cpu.shape[0]]

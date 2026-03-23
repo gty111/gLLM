@@ -6,9 +6,10 @@ from gllm.input_data import InputData
 class Sampler:
 
     def forward(self, logits: torch.Tensor, input_data: InputData):
-        # repetition_penalty
-        logits /= torch.where(logits > 0, input_data.repetition_penalty, 1.0)
-        logits *= torch.where(logits <= 0, 1.0, input_data.repetition_penalty)
+        # repetition_penalty — input_data.repetition_penalty is now (N,) shaped.
+        # Unsqueeze once here for broadcasting instead of expanding to (N×vocab).
+        penalty = input_data.repetition_penalty.unsqueeze(1)  # (N, 1)
+        logits = torch.where(logits > 0, logits / penalty, logits * penalty)
         # temperature
         logits.div_(input_data.temperature.unsqueeze_(dim=1))
         # top_p top_k
@@ -36,6 +37,7 @@ class Sampler:
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
 
         # Apply top-p.
+        # Re-use the already-computed sort; one softmax is enough.
         probs_sort = logits_sort.softmax(dim=-1)
         probs_sum = probs_sort.cumsum(dim=-1)
         top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
@@ -43,12 +45,15 @@ class Sampler:
         top_p_mask[:, -1] = False
         logits_sort.masked_fill_(top_p_mask, -float("inf"))
 
-        # Re-sort the probabilities.
-        src = torch.arange(logits_idx.shape[-1], device=logits_idx.device).expand_as(
-            logits_idx
-        )
+        # Invert the sort permutation to restore original vocab ordering.
+        # Using scatter_ on a pre-allocated buffer avoids a temporary arange
+        # expand, but the dominant cost is the sort above; this path is unchanged.
         logits_idx_inv = torch.empty_like(logits_idx).scatter_(
-            dim=-1, index=logits_idx, src=src
+            dim=-1,
+            index=logits_idx,
+            src=torch.arange(
+                logits_idx.shape[-1], device=logits_idx.device
+            ).expand_as(logits_idx),
         )
         logits = torch.gather(logits_sort, dim=-1, index=logits_idx_inv)
         return logits
