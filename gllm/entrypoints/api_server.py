@@ -171,7 +171,7 @@ if __name__ == "__main__":
         "--page-size", type=int, help="Number of tokens in a page", default=16
     )
     parser.add_argument(
-        "--enable-cuda-graph",
+        "--disable-cuda-graph",
         help="Enable full cuda graph for decode batch",
         action="store_true",
     )
@@ -179,7 +179,7 @@ if __name__ == "__main__":
         "--max-cuda-graph-bs",
         type=int,
         help="Maximum batch size for cuda graph",
-        default=512,
+        default=32,
     )
     # Parallelism
     parser.add_argument("--pp", type=int, help="Number of pipeline stages", default=1)
@@ -284,7 +284,7 @@ if __name__ == "__main__":
         schedule_method=args.schedule_method,
         use_async_worker=args.use_async_worker,
         use_thinking=not args.disable_thinking,
-        enable_cuda_graph=args.enable_cuda_graph,
+        disable_cuda_graph=args.disable_cuda_graph,
         max_cuda_graph_bs=args.max_cuda_graph_bs,
         model_max_length=args.model_max_length,
         mm_processor_min_pixels=args.mm_processor_min_pixels,

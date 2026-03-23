@@ -16,6 +16,7 @@ from gllm.models.qwen2_moe import Qwen2MoeForCausalLM
 from gllm.models.qwen3 import Qwen3ForCausalLM
 from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from gllm.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from gllm.utils import get_lock
 
 
@@ -110,7 +111,8 @@ class ModelLoader:
     @property
     def use_mm(self):
         return self.architecture in ["Qwen2_5_VLForConditionalGeneration",
-                                     "Qwen3VLForConditionalGeneration"]
+                                     "Qwen3VLForConditionalGeneration",
+                                     "Qwen3VLMoeForConditionalGeneration"]
 
     def get_model_type(self):
         model_type = None
@@ -137,6 +139,8 @@ class ModelLoader:
             model_type = Qwen2_5_VLForConditionalGeneration
         elif self.architecture == "Qwen3VLForConditionalGeneration":
             model_type = Qwen3VLForConditionalGeneration
+        elif self.architecture == "Qwen3VLMoeForConditionalGeneration":
+            model_type = Qwen3VLMoeForConditionalGeneration
         else:
             raise Exception(f"Unsupported model: {self.architecture}")
         return model_type
