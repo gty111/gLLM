@@ -1,7 +1,4 @@
-import torch
-import torch.nn as nn
-
-from gllm.dist_utils import get_ep_rank, get_ep_size, get_local_rank, get_tp_size, is_first_pp_rank, is_last_pp_rank, is_use_ep, resolve_ep_expert_idx, resolve_pp_layer_idx
+from gllm.dist_utils import get_ep_rank, get_ep_size, get_local_rank, get_tp_rank, get_tp_size, is_first_pp_rank, is_last_pp_rank, is_use_ep, resolve_ep_expert_idx, resolve_pp_layer_idx
 from gllm.input_data import InputData
 from gllm.layers.moe.fused_moe_triton.layer import determine_expert_map
 from gllm.models.weight_utils import copy_gate_up_proj, copy_qkv_proj, copy_single_proj_dim0, copy_single_proj_dim1, get_tensor_from_dict
@@ -86,21 +83,50 @@ class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
                     head_dim_patch,
                 )
             elif k.find("w13_weight") != -1:  # expert
+                # checkpoint shape: (num_experts, hidden_size, 2 * inter_size)
+                # internal shape:   (local_num_experts, 2 * inter_size_per_partition, hidden_size)
                 w13_weight = get_tensor_from_dict(weights, k.replace("w13_weight", "gate_up_proj"))
                 for expert_idx in range(num_experts):
                     local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
                     if local_expert_idx == -1:
                         continue
-                    assert is_use_ep() or get_tp_size() == 1
-                    v.data[local_expert_idx].copy_(w13_weight[expert_idx].permute(1, 0))
+                    # w13_weight[expert_idx]: (hidden_size, 2 * inter_size)
+                    if not is_use_ep() and get_tp_size() > 1:
+                        # column-parallel: slice along output dim (dim=1) per TP rank
+                        # gate and up are concatenated along dim=1, each of size inter_size
+                        inter_size = w13_weight.shape[-1] // 2
+                        size_partition = inter_size // get_tp_size()
+                        tp_rank = get_tp_rank()
+                        gate_slice = w13_weight[expert_idx][
+                            :, tp_rank * size_partition : (tp_rank + 1) * size_partition
+                        ]
+                        up_slice = w13_weight[expert_idx][
+                            :, inter_size + tp_rank * size_partition : inter_size + (tp_rank + 1) * size_partition
+                        ]
+                        v.data[local_expert_idx][:size_partition].copy_(gate_slice.permute(1, 0))
+                        v.data[local_expert_idx][size_partition:].copy_(up_slice.permute(1, 0))
+                    else:
+                        v.data[local_expert_idx].copy_(w13_weight[expert_idx].permute(1, 0))
             elif k.find("w2_weight") != -1:  # expert
+                # checkpoint shape: (num_experts, inter_size, hidden_size)
+                # internal shape:   (local_num_experts, hidden_size, inter_size_per_partition)
                 w2_weight = get_tensor_from_dict(weights, k.replace("w2_weight", "down_proj"))
                 for expert_idx in range(num_experts):
                     local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
                     if local_expert_idx == -1:
                         continue
-                    assert is_use_ep() or get_tp_size() == 1
-                    v.data[local_expert_idx].copy_(w2_weight[expert_idx].permute(1, 0))
+                    # w2_weight[expert_idx]: (inter_size, hidden_size)
+                    if not is_use_ep() and get_tp_size() > 1:
+                        # row-parallel: slice along input dim (dim=0) per TP rank
+                        inter_size = w2_weight.shape[1]
+                        size_partition = inter_size // get_tp_size()
+                        tp_rank = get_tp_rank()
+                        w2_slice = w2_weight[expert_idx][
+                            tp_rank * size_partition : (tp_rank + 1) * size_partition, :
+                        ]
+                        v.data[local_expert_idx].copy_(w2_slice.permute(1, 0))
+                    else:
+                        v.data[local_expert_idx].copy_(w2_weight[expert_idx].permute(1, 0))
             elif k.find("gate_up_proj.weight") != -1:  # shared expert or dense layer
                 copy_gate_up_proj(
                     v.data,
