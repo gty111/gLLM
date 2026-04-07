@@ -21,11 +21,12 @@ from gllm.dist_utils import (
 )
 from gllm.input_data import InputData
 from gllm.model_runner import ModelRunner
+from gllm.profiler_mixin import TorchProfilerMixin
 from gllm.scheduler import Scheduler
 
 
 # Used with PipeAsyncLLM
-class Worker:
+class Worker(TorchProfilerMixin):
 
     def __init__(
         self,
@@ -59,6 +60,7 @@ class Worker:
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
         self.use_mla = model_runner.model_loader.use_mla
+        self.init_profiler_state()
 
     def init_logger(self):
         tp_ep_log = "TP" if not self.use_ep or self.tp_size == 1 else "TP/EP"
@@ -111,7 +113,21 @@ class Worker:
     def recv_schedule_seqs(self):
         recv_data = self.comm.recv_schedule_seqs()
         if recv_data is not None:
-            seqs, mrope_positions = recv_data
+            profile_session_dir = None
+            cmd_code = 0
+            if len(recv_data) == 3:
+                seqs, mrope_positions, cmd_code = recv_data
+            elif len(recv_data) == 4:
+                seqs, mrope_positions, cmd_code, profile_session_dir = recv_data
+            else:
+                raise Exception(f"Fail to parse {recv_data = }")
+
+            if cmd_code != 0:
+                self._apply_control_cmd(cmd_code, profile_session_dir)
+
+            if len(seqs) == 0:
+                return
+
             input_data = InputData(
                 use_buffer=False,
                 memory_manager=self.model_runner.memory_manager,
@@ -148,7 +164,10 @@ class Worker:
             if ipc_package is not None:
                 cum_ipc_package.schedule_lists.extend(ipc_package.schedule_lists)
                 cum_ipc_package.abort_ids.extend(ipc_package.abort_ids)
-                cum_ipc_package.log &= ipc_package.log
+                if ipc_package.log is not None:
+                    self.scheduler.set_log(ipc_package.log)
+                if ipc_package.control_cmd is not None:
+                    self.sync_control_cmd(ipc_package.control_cmd)
             else:
                 break
         if (
@@ -157,7 +176,6 @@ class Worker:
         ):
             self.scheduler.add_new_requests(cum_ipc_package.schedule_lists)
             self.scheduler.add_abort_ids(cum_ipc_package.abort_ids)
-            self.scheduler.set_log(cum_ipc_package.log)
 
     def recv_next_tokens(self):
         if self.pp_size != 1:  # recv tokens from last rank

@@ -101,6 +101,18 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         return JSONResponse(content=generator.model_dump())
 
 
+@router.post("/start_profile")
+async def start_profile():
+    await make_async(llm.start_profile)()
+    return JSONResponse(content={"message": "Profiler started", "success": True})
+
+
+@router.post("/stop_profile")
+async def stop_profile():
+    await make_async(llm.stop_profile)()
+    return JSONResponse(content={"message": "Profiler stopped", "success": True})
+
+
 async def run_server(args):
     app = fastapi.FastAPI()
     app.include_router(router)
