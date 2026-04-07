@@ -24,6 +24,7 @@ class IPCPackage:
         self.log = True
         self.schedule_lists = schedule_lists
         self.abort_ids = []  # seq_ids to abort
+        self.control_cmd = None  # optional control command (e.g., start/stop profile)
         # worker => front-end
         self.free_ids = []  # seq_ids to free
         self.act_schedule_ids = []
@@ -151,20 +152,30 @@ class zmqComm:
             return None
 
     def send_schedule_seqs(
-        self, seqs: List[Sequence], pos: Optional[torch.Tensor], is_first_pp: bool
+        self,
+        seqs: List[Sequence],
+        pos: Optional[torch.Tensor],
+        is_first_pp: bool,
+        control_cmd_code: int = 0,
     ):
         if is_first_pp:
             schedule_sockets = self.schedule_first_pp_sockets
         else:
             schedule_sockets = self.schedule_other_sockets
-        data = (seqs, pos)
+        data = (seqs, pos, control_cmd_code)
         for socket in schedule_sockets:
+            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
+
+    def broadcast_control_cmd(
+        self, control_cmd_code: int, profile_session_dir: Optional[str] = None
+    ):
+        data = ([], None, control_cmd_code, profile_session_dir)
+        for socket in self.schedule_first_pp_sockets + self.schedule_other_sockets:
             threading.Thread(target=socket.send_pyobj, args=(data,)).start()
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
-            seqs, positions = self.schedule_socket.recv_pyobj()
-            return seqs, positions
+            return self.schedule_socket.recv_pyobj()
         else:
             return None
 

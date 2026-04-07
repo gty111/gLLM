@@ -273,6 +273,17 @@ class LLM:
             self.abort_ids = []
             self.comm.send_ipc_package(ipc_package)
 
+    def send_control_command(self, control_cmd: str):
+        ipc_package = IPCPackage([])
+        ipc_package.control_cmd = control_cmd
+        self.comm.send_ipc_package(ipc_package)
+
+    def start_profile(self):
+        self.send_control_command("start_profile")
+
+    def stop_profile(self):
+        self.send_control_command("stop_profile")
+
     def schedule(self, log=True):
         self.check_worker_alive()
         num_finish_seqs = self.recv_ipc_package()
