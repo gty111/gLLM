@@ -120,7 +120,7 @@ class Worker(TorchProfilerMixin):
             elif len(recv_data) == 4:
                 seqs, mrope_positions, cmd_code, profile_session_dir = recv_data
             else:
-                seqs, mrope_positions = recv_data
+                raise Exception(f"Fail to parse {recv_data = }")
 
             if cmd_code != 0:
                 self._apply_control_cmd(cmd_code, profile_session_dir)
