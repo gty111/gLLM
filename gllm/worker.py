@@ -165,7 +165,7 @@ class Worker(TorchProfilerMixin):
                 cum_ipc_package.schedule_lists.extend(ipc_package.schedule_lists)
                 cum_ipc_package.abort_ids.extend(ipc_package.abort_ids)
                 if ipc_package.log is not None:
-                    self.scheduler.set_log(cum_ipc_package.log)
+                    self.scheduler.set_log(ipc_package.log)
                 if ipc_package.control_cmd is not None:
                     self.sync_control_cmd(ipc_package.control_cmd)
             else:
