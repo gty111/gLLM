@@ -179,7 +179,7 @@ if __name__ == "__main__":
         "--max-cuda-graph-bs",
         type=int,
         help="Maximum batch size for cuda graph",
-        default=32,
+        default=1024,
     )
     # Parallelism
     parser.add_argument("--pp", type=int, help="Number of pipeline stages", default=1)

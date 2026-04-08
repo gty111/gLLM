@@ -450,7 +450,7 @@ class ModelRunner:
         if self.check_decode_batch():
             # Find the smallest captured bucket >= actual batch size.
             padded_size = None
-            for bucket in reversed(self.capture_sizes):  # ascending order
+            for bucket in self.capture_sizes:
                 if bucket >= num_cal_tokens:
                     padded_size = bucket
             if padded_size is not None and padded_size in self.size_to_graph:
