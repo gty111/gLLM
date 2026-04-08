@@ -113,6 +113,11 @@ class MemoryManager:
             self.use_mla,
         )
 
+        # Reserve a dedicated dummy page for CUDA graph padding.
+        # This page is never returned to normal use, so real sequences will
+        # never overwrite it, and padding dummy tokens can safely write here.
+        self.dummy_page: int = self.segment.allocate()
+
         self.kv_cache_dtype = "auto"
         self.k_scale = torch.tensor(1.0, dtype=torch.float32)
         self.v_scale = self.k_scale

@@ -127,7 +127,9 @@ class ModelRunner:
         self.disable_cuda_graph = disable_cuda_graph
         self.max_cuda_graph_bs = max_cuda_graph_bs
         self.size_to_graph: Dict[int, torch.cuda.CUDAGraph] = dict()
-        self.capture_sizes = list(range(self.max_cuda_graph_bs, 0, -1))
+        # Use power-of-two bucket sizes to reduce the number of captured graphs.
+        # At runtime the actual batch is padded up to the nearest bucket.
+        self.capture_sizes = self._build_capture_sizes(self.max_cuda_graph_bs)
 
         # max length
         self.model_max_length = self.resolve_model_max_length(model_max_length)
@@ -141,6 +143,24 @@ class ModelRunner:
             model_max_length = 8192
         logger.info(f"Model max length: {model_max_length}")
         return model_max_length
+
+    @staticmethod
+    def _build_capture_sizes(max_bs: int):
+        """Return power-of-two bucket sizes up to max_bs, in descending order.
+
+        For example, max_bs=20 → [16, 8, 4, 2, 1].
+        We always include 1 as a floor bucket.
+        """
+        sizes = []
+        s = 1
+        while s <= max_bs:
+            sizes.append(s)
+            s *= 2
+        # If max_bs is not itself a power of two, add it as the top bucket so
+        # that batches of exactly max_bs can still use CUDA graph.
+        if sizes[-1] != max_bs:
+            sizes.append(max_bs)
+        return list(reversed(sizes))
 
     def init(self, mp_load_progress=None):
         self.model = self.model_loader.load_model(mp_load_progress)
@@ -373,7 +393,7 @@ class ModelRunner:
     def capture_graph(self):
         iterator = self.capture_sizes
         if get_local_rank() == 0:
-            # logger.info(f"Capturing cuda graph for sizes {self.capture_sizes}")
+            logger.info(f"Capturing CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}")
             iterator = tqdm(self.capture_sizes, desc="Capturing CUDA Graphs", ncols=100)
         memory_pool = torch.cuda.graph_pool_handle()
         for size in iterator:
@@ -426,9 +446,22 @@ class ModelRunner:
     @torch.inference_mode()
     def step_once(self):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
-        # Only decode batch use cuda graph
-        if self.check_decode_batch() and num_cal_tokens in self.size_to_graph:
-            self.size_to_graph[num_cal_tokens].replay()
+        # Only pure decode batches use CUDA graph.
+        if self.check_decode_batch():
+            # Find the smallest captured bucket >= actual batch size.
+            padded_size = None
+            for bucket in reversed(self.capture_sizes):  # ascending order
+                if bucket >= num_cal_tokens:
+                    padded_size = bucket
+            if padded_size is not None and padded_size in self.size_to_graph:
+                # Pad input buffers to the bucket size with dummy values, then
+                # replay the pre-captured graph.
+                num_real_tokens = self.input_data.pad_for_cuda_graph(padded_size)
+                self.size_to_graph[padded_size].replay()
+                # After replay, use only the real-token slice for logits.
+                num_cal_tokens = num_real_tokens
+            else:
+                self.forward()
         else:
             self.forward()
         if is_last_pp_rank():
