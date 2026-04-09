@@ -190,8 +190,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-cuda-graph-bs",
         type=int,
-        help="Maximum batch size for cuda graph",
-        default=32,
+        help=(
+            "Maximum batch size for CUDA graph capture. "
+            "Larger values allow more decode batches to benefit from CUDA graphs "
+            "but increase startup time and GPU memory usage during graph capture. "
+            "Default: 512."
+        ),
+        default=512,
     )
     # Parallelism
     parser.add_argument("--pp", type=int, help="Number of pipeline stages", default=1)

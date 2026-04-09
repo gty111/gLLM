@@ -316,6 +316,56 @@ class InputData:
                     dtype=torch.int32,
                 )
 
+    def pad_for_cuda_graph(self, padded_size: int):
+        """Pad input buffers to padded_size using dummy values.
+
+        This enables CUDA graph replay for a fixed batch size (a power-of-two
+        bucket) even when the actual number of decode tokens is smaller.
+
+        The dummy tokens write their KV entries to memory_manager.dummy_page,
+        which is permanently reserved and never used by real sequences.
+
+        Returns:
+            num_real_tokens (int): the actual (unpadded) token count, so that
+            the caller can slice output_hidden_states[:num_real_tokens] when
+            computing logits after graph replay.
+        """
+        assert self.use_buffer, "pad_for_cuda_graph requires use_buffer=True"
+        num_real_tokens = self.tokens_cpu.shape[0]
+        if num_real_tokens >= padded_size:
+            return num_real_tokens
+
+        dummy_page = self.memory_manager.dummy_page
+        dummy_slot = dummy_page * self.page_size  # slot index within dummy page
+
+        num_pad = padded_size - num_real_tokens
+
+        # tokens: pad with 0
+        self.tokens[num_real_tokens:padded_size].zero_()
+        # positions: pad with 0
+        self.positions[num_real_tokens:padded_size].zero_()
+        # mrope_positions: pad with 0
+        self.mrope_positions[:, num_real_tokens:padded_size].zero_()
+        # slot_mapping: pad with dummy slot so writes go to the reserved page
+        self.slot_mapping[num_real_tokens:padded_size].fill_(dummy_slot)
+        # seq_lens: pad with 1 (avoid division-by-zero in attention kernels)
+        self.seq_lens[len(self.seqs):len(self.seqs) + num_pad].fill_(1)
+        # block_table: pad rows with dummy_page
+        self.block_table[len(self.seqs):len(self.seqs) + num_pad].fill_(dummy_page)
+        # query_start_loc: continue the cumulative sum — each dummy token counts
+        # as 1 query token, so the padded entries are last_loc+1, last_loc+2, ...
+        last_loc = self.query_start_loc[len(self.seqs)]
+        self.query_start_loc[len(self.seqs) + 1:len(self.seqs) + num_pad + 1].copy_(
+            last_loc + torch.arange(1, num_pad + 1, dtype=torch.int32)
+        )
+
+        if self.use_mla:
+            # Pad decode_seq_lens for the dummy sequences so that MLA decode
+            # kernels see a valid (non-zero) sequence length for every row.
+            self.decode_seq_lens[len(self.seqs):len(self.seqs) + num_pad].fill_(1)
+
+        return num_real_tokens
+
     def _set_mla_metadata(self):
         if self.num_prefills > 0:
             self.prefill_query_start_loc[
