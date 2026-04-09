@@ -157,7 +157,18 @@ class DeepseekV2Attention(Attention):
         self.kv_lora_rank = config.kv_lora_rank
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_poistion_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is None:
+            self.rope_scaling = {
+                "factor": 1.0,
+                "original_max_position_embeddings": self.max_poistion_embeddings,
+            }
+        else:
+            self.rope_scaling = dict(rope_scaling)
+            self.rope_scaling.setdefault("factor", 1.0)
+            self.rope_scaling.setdefault(
+                "original_max_position_embeddings", self.max_poistion_embeddings
+            )
 
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedLinear(
@@ -286,7 +297,18 @@ class DeepseekV2MLAAttention(Attention):
         self.kv_lora_rank = config.kv_lora_rank
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_poistion_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is None:
+            self.rope_scaling = {
+                "factor": 1.0,
+                "original_max_position_embeddings": self.max_poistion_embeddings,
+            }
+        else:
+            self.rope_scaling = dict(rope_scaling)
+            self.rope_scaling.setdefault("factor", 1.0)
+            self.rope_scaling.setdefault(
+                "original_max_position_embeddings", self.max_poistion_embeddings
+            )
         self.layer_id = layer_id
 
         if self.q_lora_rank is not None:
