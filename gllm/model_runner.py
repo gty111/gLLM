@@ -148,9 +148,11 @@ class ModelRunner:
     def _build_capture_sizes(max_bs: int):
         """Return power-of-two bucket sizes up to max_bs, in descending order.
 
-        For example, max_bs=20 → [16, 8, 4, 2, 1].
+        For example, max_bs=20 → [20, 16, 8, 4, 2, 1].
         We always include 1 as a floor bucket.
         """
+        if max_bs <= 0:
+            return []
         sizes = []
         s = 1
         while s <= max_bs:
@@ -191,8 +193,9 @@ class ModelRunner:
         self.output_residual = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
         # Profile run
         self.profile_run()
-        # Init KV cache at last
-        self.memory_manager.init()
+        # Init KV cache at last; only reserve the dummy page when CUDA graphs
+        # are actually enabled so we don't waste memory otherwise.
+        self.memory_manager.init(reserve_dummy_page=not self.disable_cuda_graph)
 
         if not self.disable_cuda_graph:
             self.capture_graph()

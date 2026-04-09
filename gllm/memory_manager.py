@@ -86,7 +86,7 @@ class MemoryManager:
         self.vocab_size = vocab_size
         self.use_mla = use_mla
 
-    def init(self, segment_cls=Segment):
+    def init(self, segment_cls=Segment, reserve_dummy_page: bool = False):
         free_mem_size, _ = torch.cuda.mem_get_info()
         num_max_pages = free_mem_size // self.get_sizeof_KV_per_page()
         num_pages = int(num_max_pages * self.gpu_memory_util)
@@ -113,10 +113,11 @@ class MemoryManager:
             self.use_mla,
         )
 
-        # Reserve a dedicated dummy page for CUDA graph padding.
-        # This page is never returned to normal use, so real sequences will
-        # never overwrite it, and padding dummy tokens can safely write here.
-        self.dummy_page: int = self.segment.allocate()
+        # Reserve a dedicated dummy page for CUDA graph padding only when
+        # CUDA graphs are enabled.  This page is never returned to normal use,
+        # so real sequences will never overwrite it, and padding dummy tokens
+        # can safely write here.
+        self.dummy_page: int = self.segment.allocate() if reserve_dummy_page else None
 
         self.kv_cache_dtype = "auto"
         self.k_scale = torch.tensor(1.0, dtype=torch.float32)
@@ -187,8 +188,8 @@ class PrefixMemoryManager(MemoryManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    def init(self):
-        super().init(segment_cls=PrefixSegment)
+    def init(self, reserve_dummy_page: bool = False):
+        super().init(segment_cls=PrefixSegment, reserve_dummy_page=reserve_dummy_page)
 
         # for prefill stage
         self.num_allocated_pages = 0

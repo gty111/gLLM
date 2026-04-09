@@ -352,13 +352,17 @@ class InputData:
         self.seq_lens[len(self.seqs):len(self.seqs) + num_pad].fill_(1)
         # block_table: pad rows with dummy_page
         self.block_table[len(self.seqs):len(self.seqs) + num_pad].fill_(dummy_page)
-        # query_start_loc: pad with the last accumulated value (no new query tokens)
-        last_loc = self.query_start_loc[len(self.seqs)].item()
-        self.query_start_loc[len(self.seqs) + 1:len(self.seqs) + num_pad + 1].fill_(last_loc)
+        # query_start_loc: continue the cumulative sum — each dummy token counts
+        # as 1 query token, so the padded entries are last_loc+1, last_loc+2, ...
+        last_loc = self.query_start_loc[len(self.seqs)]
+        self.query_start_loc[len(self.seqs) + 1:len(self.seqs) + num_pad + 1].copy_(
+            last_loc + torch.arange(1, num_pad + 1, dtype=torch.int32)
+        )
 
-        if self.use_mla and hasattr(self, "metadata") and self.metadata is not None:
-            # num_actual_tokens already reflects the real count — do not change it
-            pass
+        if self.use_mla:
+            # Pad decode_seq_lens for the dummy sequences so that MLA decode
+            # kernels see a valid (non-zero) sequence length for every row.
+            self.decode_seq_lens[len(self.seqs):len(self.seqs) + num_pad].fill_(1)
 
         return num_real_tokens
 
