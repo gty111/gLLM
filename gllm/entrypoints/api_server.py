@@ -36,7 +36,8 @@ llm: PipeAsyncLLM = None
 @router.get("/v1/models")
 async def show_available_models():
     models = ModelList(
-        data=[ModelCard(id=llm.model_path, permission=[ModelPermission()])]
+        data=[ModelCard(id=llm.model_path, root=llm.model_path, 
+                        permission=[ModelPermission()])]
     )
     return JSONResponse(content=models.model_dump())
 
