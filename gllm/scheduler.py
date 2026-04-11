@@ -160,10 +160,16 @@ class Scheduler:
         for seq in schedule_seqs:
             if seq.has_schedule:
                 post_schedule_seq = copy.copy(seq)
-                post_schedule_seq.to_compute_tokens = seq[
-                    seq.computed_token_num : seq.seq_len
-                ]
-                post_schedule_seq.token_ids = None
+                # MM prefill may still need full prompt token_ids to
+                # build (or rebuild) cached multimodal embeddings/positions.
+                # Keep token_ids for unfinished MM prefills; drop otherwise to
+                # reduce IPC payload.
+                keep_full_token_ids = self.model_runner.use_mm and (not seq.computed_prompt)
+                post_schedule_seq.token_ids = seq.token_ids if keep_full_token_ids else None
+                if not keep_full_token_ids:
+                    post_schedule_seq.to_compute_tokens = seq[
+                        seq.computed_token_num : seq.seq_len
+                    ]
                 post_schedule_seqs.append(post_schedule_seq)
             else:
                 post_schedule_seqs.append(seq)

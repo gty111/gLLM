@@ -35,8 +35,6 @@ class EmbeddingInfo:
     embedding: torch.Tensor = None
     prompt_positions: torch.Tensor = None
     mrope_position_delta: torch.Tensor = None
-    stale: bool = False
-
 
 class ModelRunner:
     def __init__(
@@ -257,7 +255,6 @@ class ModelRunner:
             position = None
             if seq.computed_prompt:
                 embedding_info = self.embedding_cache[seq.seq_id]
-                assert embedding_info.stale
                 embedding = self.model.embed_input_ids(
                     torch.tensor(seq.to_compute_tokens)
                 )
@@ -269,10 +266,7 @@ class ModelRunner:
                 position = torch.tensor(position, device="cpu")
             else:
                 embedding_info = None
-                if (
-                    seq.seq_id not in self.embedding_cache
-                    or self.embedding_cache[seq.seq_id].stale
-                ):
+                if seq.seq_id not in self.embedding_cache:
                     mm_embeddings = None
                     image_grid_thw: torch.Tensor = None
                     video_grid_thw: torch.Tensor = None
@@ -338,7 +332,6 @@ class ModelRunner:
                     ]
                 if seq.seq_len == seq.prompt_len:
                     # invalidate embedding_cache
-                    embedding_info.stale = True
                     embedding_info.embedding = None
             batch_embeddings.append(embedding)
             batch_positions.append(position)
@@ -482,3 +475,5 @@ class ModelRunner:
 
     def free(self, seq: Sequence):
         self.memory_manager.free(seq)
+        if self.use_mm:
+            self.embedding_cache.pop(seq.seq_id)
