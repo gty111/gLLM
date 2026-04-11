@@ -475,5 +475,5 @@ class ModelRunner:
 
     def free(self, seq: Sequence):
         self.memory_manager.free(seq)
-        if self.use_mm:
+        if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq.seq_id)
