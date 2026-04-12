@@ -18,8 +18,8 @@ class AsyncWorker(Worker):
         super().__init__(*args, **kwargs)
 
     @async_wrapper
-    async def run_driver(self):
-        return super().run_driver()
+    async def run_tp(self):
+        return super().run_tp()
 
     @async_wrapper
     async def run_first_tp(self):
@@ -46,7 +46,7 @@ async def launch_async_tasks(worker: AsyncWorker):
 
     ats = AsyncTasks()
     if worker.rank == 0:
-        ats.add_task(worker.run_driver)
+        ats.add_task(worker.run_tp)
     elif worker.pp_rank == 0:
         ats.add_task(worker.run_first_tp)
     else:

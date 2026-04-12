@@ -19,7 +19,6 @@ from gllm.dist_utils import (
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
-    is_output_rank,
 )
 from gllm.input_data import InputData
 from gllm.layers.rotary_embedding import MRotaryEmbedding

@@ -12,12 +12,13 @@ from gllm.dist_utils import (
     get_next_pp_rank,
     get_pp_size,
     get_rank,
-    get_world_size,
+    get_tp_group,
+    get_tp_size,
     init_dist,
     is_last_pp_rank,
-    is_output_rank,
     recv_pp_data,
     send_pp_data,
+    is_first_pp_rank,
 )
 from gllm.input_data import InputData
 from gllm.model_runner import ModelRunner
@@ -95,21 +96,21 @@ class Worker(TorchProfilerMixin):
         self.hidden_size = self.model_runner.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual
 
-        if self.rank == 0:
+        if is_first_pp_rank():
             self.scheduler = Scheduler(
                 self.pp_size,
                 self.model_runner,
                 self.schedule_method,
             )
         else:
-            # Input data for each rank except 0
+            # Input data for other PP rank
             self.schedule_queue = deque()
 
         self.mp_alive[self.local_rank] = 1
 
         logger.info(f"Initialization complete")
 
-    # driver worker => other workers
+    # prior PP rank => next PP rank
     def recv_schedule_seqs(self):
         recv_data = self.comm.recv_schedule_seqs()
         if recv_data is not None:
@@ -151,7 +152,12 @@ class Worker(TorchProfilerMixin):
             )
             self.model_runner.prepare_input(input_data=input_data)
             output = self.model_runner.step_once()
-            if is_output_rank():
+            if is_last_pp_rank():
+                # broadcast output in TP group if needed
+                if get_tp_size() > 1:
+                    torch.distributed.broadcast_object_list(
+                        output, src=(get_pp_size()-1)*get_tp_size(), group=get_tp_group()
+                    )
                 self.comm.send_tokens(output)
             elif not is_last_pp_rank():
                 send_pp_data(output, get_next_pp_rank())
@@ -178,7 +184,7 @@ class Worker(TorchProfilerMixin):
             self.scheduler.add_abort_ids(cum_ipc_package.abort_ids)
 
     def recv_next_tokens(self):
-        if self.pp_size != 1:  # recv tokens from last rank
+        if self.pp_size > 1:  # recv tokens from last rank
             next_tokens = self.comm.recv_tokens()
             if next_tokens is not None:
                 self.scheduler.add_next_tokens(next_tokens)
@@ -193,43 +199,25 @@ class Worker(TorchProfilerMixin):
         if ipc_package is not None:
             self.comm.send_output(ipc_package)
 
-    def forward_tp(self):
-        if len(self.schedule_queue) != 0:
-            input_data: InputData = self.schedule_queue.popleft()
-            self.model_runner.prepare_input(input_data=input_data)
-            output = self.model_runner.step_once()
-            if get_pp_size() != 1:
-                send_pp_data(output, get_next_pp_rank())
-
     def schedule_forward(self):
         schedule_seqs = self.scheduler.schedule_once()
         if len(schedule_seqs) != 0:
-            if get_world_size() > 1:
-                self.comm.send_schedule_seqs(schedule_seqs, None, True)
+            if get_pp_size() > 1:
+                self.comm.send_schedule_seqs(schedule_seqs, None)
             self.model_runner.prepare_input(schedule_seqs)
-            if get_world_size() > 1:
-                self.comm.send_schedule_seqs(
-                    schedule_seqs,
-                    self.model_runner.input_data.mrope_positions_cpu,
-                    False,
-                )
             output = self.model_runner.step_once()
 
-            if not is_output_rank():
+            if get_pp_size() > 1:
                 send_pp_data(output, get_next_pp_rank())
             else:
                 self.scheduler.add_next_tokens(output)
 
-    def run_driver(self):
+    def run_tp(self):
         self.check_abort_seqs()
         self.recv_ipc_package()
         self.recv_next_tokens()
         self.schedule_forward()
         self.process_output()
-
-    def run_first_tp(self):
-        self.recv_schedule_seqs()
-        self.forward_tp()
 
     def run_other(self):
         self.recv_schedule_seqs()
@@ -253,10 +241,8 @@ def run_worker(worker: Worker):
     try:
         worker.init()
         while True:
-            if worker.rank == 0:
-                worker.run_driver()
-            elif worker.pp_rank == 0:
-                worker.run_first_tp()
+            if worker.pp_rank == 0:
+                worker.run_tp()
             else:
                 worker.run_other()
     except KeyboardInterrupt as e:

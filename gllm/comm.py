@@ -5,14 +5,12 @@ import torch
 import zmq
 
 from gllm.dist_utils import (
-    get_output_rank,
-    get_pp_size,
     get_rank,
     get_tp_size,
-    get_world_size,
-    is_output_rank,
-    recv_obj_list,
-    send_obj_list,
+    get_tp_rank,
+    get_pp_size,
+    is_first_pp_rank,
+    is_last_pp_rank,
 )
 from gllm.sequence import Sequence
 from gllm.utils import make_socket
@@ -42,6 +40,7 @@ class zmqComm:
         output_path,
         token_path,
         frontend=False,
+        tp_size=1,
     ):
         self.host_addr = host_addr
         self.port_base = port_base
@@ -50,85 +49,87 @@ class zmqComm:
         self.schedule_path = schedule_path
         self.output_path = output_path
         self.token_path = token_path
+        # Frontend
         self.frontend = frontend
+        self.tp_size = tp_size # only used for frontend
+        
+    def get_schedule_path(self, rank):
+        return f"{self.schedule_path}_rank_{rank}"
+    
+    def get_token_path(self, rank):
+        return f"{self.token_path}_rank_{rank}"
+    
+    def init_request_socket(self):
+        # front-end <=> PP rank 0
+        if self.frontend:
+            self.request_sockets = []
+            for tp_rank in range(self.tp_size):
+                self.request_sockets.append(
+                    make_socket(self.ctx, 
+                                self.get_schedule_path(tp_rank), 
+                                zmq.PUSH))
+        elif is_first_pp_rank():
+            self.request_socket = make_socket(
+                self.ctx,
+                self.get_schedule_path(get_tp_rank()),
+                zmq.PULL,
+            )
+    
+    def init_output_socket(self):
+        # frontend <=> rank 0
+        if self.frontend:
+            self.output_socket = make_socket(self.ctx, self.output_path, zmq.PULL)
+        elif get_rank() == 0:
+            self.output_socket = make_socket(self.ctx, self.output_path, zmq.PUSH)
+            
+    def init_pp_schedule_socket(self):
+        # prior PP rank <=> next PP rank
+        if self.frontend:
+            return
+        if not is_first_pp_rank():
+            self.schedule_socket = make_socket(
+                self.ctx,
+                self.get_schedule_path(get_rank()),
+                zmq.PULL,
+            )
+        if not is_last_pp_rank():
+            self.schedule_sockets = []
+            for idx in range(1, get_pp_size()):
+                self.schedule_sockets.append(
+                    make_socket(self.ctx, 
+                                self.get_schedule_path(idx*get_tp_size() + get_rank()), 
+                                zmq.PUSH))
+    
+    def init_token_socket(self):
+        # last PP rank <=> first PP rank
+        if self.frontend:
+            return
+        if is_last_pp_rank():
+            self.token_socket = make_socket(
+                self.ctx,
+                self.get_token_path(get_tp_rank()),
+                zmq.PUSH,
+            )
+        if is_first_pp_rank():
+            self.token_socket = make_socket(
+                self.ctx,
+                self.get_token_path(get_tp_rank()),
+                zmq.PULL,
+            )
+        
 
     def init(self):
         self.ctx = zmq.Context()
-
-        if self.frontend:  # front-end process
-            self.request_socket = make_socket(self.ctx, self.schedule_path, zmq.PUSH)
-            self.output_socket = make_socket(self.ctx, self.output_path, zmq.PULL)
-        else:  # worker process
-            if get_rank() == 0:
-                # front-end => rank 0
-                self.request_socket = make_socket(
-                    self.ctx, self.schedule_path, zmq.PULL
-                )
-                # rank 0 => front-end
-                self.output_socket = make_socket(self.ctx, self.output_path, zmq.PUSH)
-
-                if get_world_size() != 1:
-                    self.schedule_first_pp_sockets: List[zmq.Socket] = []
-                    self.schedule_other_sockets: List[zmq.Socket] = []
-                    if self.launch_mode == "normal":
-                        # rank 0 => other ranks : batched seqs
-                        for rank in range(1, get_world_size()):
-                            socket = make_socket(
-                                self.ctx, f"{self.schedule_path}_{rank}", zmq.PUSH
-                            )
-                            if rank < get_tp_size():
-                                self.schedule_first_pp_sockets.append(socket)
-                            else:
-                                self.schedule_other_sockets.append(socket)
-                        # last rank => rank 0 : next tokens
-                        self.token_socket = make_socket(
-                            self.ctx, self.token_path, zmq.PULL
-                        )
-                    else:
-                        # rank 0 => other ranks : batched seqs
-                        self.schedule_sockets = []
-                        for rank in range(1, get_world_size()):
-                            port_each = self.port_base + rank
-                            send_obj_list([port_each], rank)
-                            addr_each = [None]
-                            recv_obj_list(addr_each, rank)
-                            socket = make_socket(
-                                self.ctx, f"tcp://{addr_each[0]}:{port_each}", zmq.PUSH
-                            )
-                            if rank < get_tp_size():
-                                self.schedule_first_pp_sockets.append(socket)
-                            else:
-                                self.schedule_other_sockets.append(socket)
-                        # output rank => rank 0 : next tokens
-                        port_token = self.port_base + get_world_size()
-                        self.token_socket = make_socket(
-                            self.ctx, f"tcp://{self.master_addr}:{port_token}", zmq.PULL
-                        )
-                        send_obj_list([port_token], get_output_rank())
-            else:
-                # rank 0 => other ranks : batched seqs
-                if self.launch_mode == "normal":
-                    self.schedule_socket = make_socket(
-                        self.ctx, f"{self.schedule_path}_{get_rank()}", zmq.PULL
-                    )
-                else:
-                    port_schedule = [None]
-                    recv_obj_list(port_schedule, 0)
-                    send_obj_list([self.host_addr], 0)
-                    self.schedule_socket = make_socket(
-                        self.ctx, f"tcp://{self.host_addr}:{port_schedule[0]}", zmq.PULL
-                    )
-
-            if is_output_rank() and get_pp_size() != 1:
-                # output rank => rank 0 : next tokens
-                if self.launch_mode == "normal":
-                    self.token_socket = make_socket(self.ctx, self.token_path, zmq.PUSH)
-                else:
-                    port_token = [None]
-                    recv_obj_list(port_token, 0)
-                    self.token_socket = make_socket(
-                        self.ctx, f"tcp://{self.master_addr}:{port_token[0]}", zmq.PUSH
-                    )
+        
+        assert self.launch_mode == "normal"
+        
+        self.init_request_socket()
+        
+        self.init_output_socket()
+        
+        self.init_pp_schedule_socket()
+        
+        self.init_token_socket()
 
     def send_tokens(self, tokens):
         assert type(tokens) == list
@@ -142,7 +143,8 @@ class zmqComm:
             return None
 
     def send_output(self, output):
-        self.output_socket.send_pyobj(output)
+        if get_rank() == 0:
+            self.output_socket.send_pyobj(output)
 
     def recv_output(self):
         if self.output_socket.poll(timeout=0) != 0:
@@ -155,23 +157,18 @@ class zmqComm:
         self,
         seqs: List[Sequence],
         pos: Optional[torch.Tensor],
-        is_first_pp: bool,
         control_cmd_code: int = 0,
     ):
-        if is_first_pp:
-            schedule_sockets = self.schedule_first_pp_sockets
-        else:
-            schedule_sockets = self.schedule_other_sockets
         data = (seqs, pos, control_cmd_code)
-        for socket in schedule_sockets:
-            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
+        for schedule_socket in self.schedule_sockets: 
+            threading.Thread(target=schedule_socket.send_pyobj, args=(data,)).start()
 
-    def broadcast_control_cmd(
+    def send_control_cmd(
         self, control_cmd_code: int, profile_session_dir: Optional[str] = None
     ):
         data = ([], None, control_cmd_code, profile_session_dir)
-        for socket in self.schedule_first_pp_sockets + self.schedule_other_sockets:
-            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
+        for schedule_socket in self.schedule_sockets:
+            threading.Thread(target=schedule_socket.send_pyobj, args=(data,)).start()
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
@@ -180,7 +177,8 @@ class zmqComm:
             return None
 
     def send_ipc_package(self, ipc_package):
-        self.request_socket.send_pyobj(ipc_package)
+        for request_socket in self.request_sockets:
+            threading.Thread(target=request_socket.send_pyobj, args=(ipc_package,)).start()
 
     def recv_ipc_package(self):
         if self.request_socket.poll(timeout=0) != 0:
