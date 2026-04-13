@@ -6,7 +6,7 @@ import time
 import torch
 from logger import logger
 
-from gllm.dist_utils import get_world_size
+from gllm.dist_utils import get_pp_size
 
 
 class TorchProfilerMixin:
@@ -92,7 +92,7 @@ class TorchProfilerMixin:
                 cmd_to_send = 2
 
         if cmd_to_send != 0:
-            if get_world_size() > 1:
+            if get_pp_size() > 1:
                 # Broadcast command over existing schedule sockets to avoid dist sync stalls.
-                self.comm.broadcast_control_cmd(cmd_to_send, profile_session_dir)
+                self.comm.send_control_cmd(cmd_to_send, profile_session_dir)
             self._apply_control_cmd(cmd_to_send, profile_session_dir)

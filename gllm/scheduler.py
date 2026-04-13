@@ -1,5 +1,4 @@
 import copy
-import random
 import time
 from collections import deque
 from typing import List
@@ -12,7 +11,8 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 
-
+# Each scheduler for each TP worker (PP rank 0)
+# must exhibit identical behavior
 class Scheduler:
     def __init__(self, pp_size, model_runner: ModelRunner, schedule_method):
         self.pp_size = pp_size
@@ -193,11 +193,7 @@ class Scheduler:
         if num_total_decode_seqs < self.pp_size:
             decode_token_budget = 1
         else:
-            # here we add num_total_decode_seqs to random.randint(0,self.pp_size-1))
-            # because we want to solve the situation when #seqs=5 pp_size=4
-            decode_token_budget = (
-                num_total_decode_seqs + random.randint(0, self.pp_size - 1)
-            ) // self.pp_size
+            decode_token_budget = num_total_decode_seqs // self.pp_size
 
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
