@@ -11,9 +11,9 @@ from gllm.dist_utils import (
     get_last_pp_rank,
     get_next_pp_rank,
     get_pp_size,
-    get_rank,
-    get_tp_group,
     get_tp_size,
+    get_rank,
+    syn_obj,
     init_dist,
     is_last_pp_rank,
     recv_pp_data,
@@ -153,11 +153,7 @@ class Worker(TorchProfilerMixin):
             self.model_runner.prepare_input(input_data=input_data)
             output = self.model_runner.step_once()
             if is_last_pp_rank():
-                # broadcast output in TP group if needed
-                if get_tp_size() > 1:
-                    torch.distributed.broadcast_object_list(
-                        output, src=(get_pp_size()-1)*get_tp_size(), group=get_tp_group()
-                    )
+                syn_obj(output)
                 self.comm.send_tokens(output)
             elif not is_last_pp_rank():
                 send_pp_data(output, get_next_pp_rank())
@@ -219,6 +215,8 @@ class Worker(TorchProfilerMixin):
             if get_pp_size() > 1:
                 send_pp_data(output, get_next_pp_rank())
             else:
+                if is_last_pp_rank():
+                    syn_obj(output)
                 self.scheduler.add_next_tokens(output)
 
     def run_tp(self):
