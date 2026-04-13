@@ -98,7 +98,7 @@ class Worker(TorchProfilerMixin):
         self.ret_residual = self.model_runner.model.ret_residual
 
         if self.rank == 0:
-            self.scheduler = Scheduler(
+            self.scheduler = self.scheduler_cls(
                 self.pp_size,
                 self.model_runner,
                 self.schedule_method,
