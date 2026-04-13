@@ -202,9 +202,18 @@ class Worker(TorchProfilerMixin):
     def schedule_forward(self):
         schedule_seqs = self.scheduler.schedule_once()
         if len(schedule_seqs) != 0:
-            if get_pp_size() > 1:
-                self.comm.send_schedule_seqs(schedule_seqs, None)
             self.model_runner.prepare_input(schedule_seqs)
+            if get_pp_size() > 1:
+                # Send schedule_seqs with mrope positions (if VL) to other
+                # PP ranks.  Must happen after prepare_input so that
+                # mm_prepare_inputs has computed mrope_positions_cpu.
+                # Without mrope positions, CUDA graph replay on PP rank > 0
+                # reads stale mrope_positions (the graph captures reading
+                # mrope_positions, not positions, when use_mm is True).
+                self.comm.send_schedule_seqs(
+                    schedule_seqs,
+                    self.model_runner.input_data.mrope_positions_cpu,
+                )
             output = self.model_runner.step_once()
 
             if get_pp_size() > 1:
