@@ -149,7 +149,6 @@ class LLM:
             self.output_path,
             self.token_path,
             frontend=True,
-            tp_size=self.tp_size
         )
         self.comm.init()
 
