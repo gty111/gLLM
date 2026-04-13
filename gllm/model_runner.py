@@ -1,4 +1,4 @@
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Optional
 
 import torch
 from attr import dataclass
@@ -28,6 +28,7 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.model_loader import ModelLoader
 from gllm.sequence import Sequence
 from gllm.utils import unify_decode
+from gllm.async_utils import AsyncSchedulerContext, FutureMap
 
 
 @dataclass
@@ -255,9 +256,17 @@ class ModelRunner:
             position = None
             if seq.computed_prompt:
                 embedding_info = self.embedding_cache[seq.seq_id]
-                embedding = self.model.embed_input_ids(
-                    torch.tensor(seq.to_compute_tokens)
-                )
+                # In async scheduling, decode tokens may contain negative
+                # FutureMap placeholder values (e.g. -42).  These will be
+                # resolved on the GPU side via resolve_future(), but here we
+                # need a valid token ID for the embedding lookup.  Clamp to 0
+                # (the actual token value is irrelevant since the embedding is
+                # only used as the model forward's input hidden state, and the
+                # real token ID is resolved on GPU before any KV-cache write).
+                to_compute = torch.tensor(seq.to_compute_tokens)
+                if (to_compute < 0).any():
+                    to_compute = to_compute.clamp(min=0)
+                embedding = self.model.embed_input_ids(to_compute)
                 position = MRotaryEmbedding.get_next_input_positions(
                     embedding_info.mrope_position_delta,
                     seq.computed_token_num,
@@ -352,11 +361,19 @@ class ModelRunner:
             assert seqs is not None
             self.input_data.cal_and_set_input(seqs)
         if self.use_mm and is_first_pp_rank():
-            input_embeddings, mrope_positions = self.mm_prepare_inputs(
-                self.input_data.seqs
-            )
-            self.input_data.set_mrope_position(mrope_positions)
-            self.prepare_input_embeddings(input_embeddings)
+            # Check if VL embeddings were pre-computed (async path).
+            mm_embeddings = getattr(input_data, '_mm_embeddings', None) if input_data is not None else None
+            if mm_embeddings is not None:
+                # Use pre-computed results from _build_prefetched_input.
+                self.input_data.set_mrope_position(input_data._mm_positions)
+                self.prepare_input_embeddings(mm_embeddings)
+            else:
+                # Sync path or no prebuilt data — compute on the spot.
+                input_embeddings, mrope_positions = self.mm_prepare_inputs(
+                    self.input_data.seqs
+                )
+                self.input_data.set_mrope_position(mrope_positions)
+                self.prepare_input_embeddings(input_embeddings)
 
     def create_dummy_seqs(self, size):
         seqs = [Sequence(idx, [1, 2], [], output_len=1) for idx in range(size)]
@@ -476,3 +493,201 @@ class ModelRunner:
         self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq.seq_id)
+            
+class AsyncModelRunner(ModelRunner):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+    def init_async(self, num_prefill_chunks: int = 256):
+        """Initialize async scheduling infrastructure.
+        
+        Sets up CUDA streams and FutureMap circular buffer for non-blocking
+        async scheduling.
+        
+        Args:
+            num_prefill_chunks: Size of prefill chunks for buffer calculation
+        """
+        
+        # Async scheduling: double-buffered pinned CPU buffer for D2H token copy.
+        # Two buffers alternate so batch N's collect can safely read buffer[i]
+        # while batch N+1's D2H writes to buffer[1-i].
+        self._next_tokens_bufs = [
+            torch.zeros(self.max_running_seqs, dtype=torch.long, pin_memory=True, device='cpu'),
+            torch.zeros(self.max_running_seqs, dtype=torch.long, pin_memory=True, device='cpu'),
+        ]
+        self._next_tokens_buf_idx = 0
+        # Dedicated CUDA stream for D2H token copies so they run concurrently
+        # with the next batch's GPU forward pass on the default stream.
+        self.copy_stream = torch.cuda.Stream()
+        # Event recorded on forward_stream after the model forward completes
+        # (input buffers are no longer being read). The default stream waits
+        # on this before overwriting input buffers with the next H2D copy.
+        self._input_consumed_event = torch.cuda.Event()
+        
+        self.future_map: Optional[FutureMap] = None
+        self.async_context: Optional[AsyncSchedulerContext] = None
+        self.schedule_stream: Optional[torch.cuda.Stream] = None
+        self.forward_stream: Optional[torch.cuda.Stream] = None
+        
+        if self.future_map is not None:
+            logger.warning("Async already initialized, skipping re-initialization")
+            return
+        
+        # Create async scheduler context with high-priority schedule stream
+        self.async_context = AsyncSchedulerContext(
+            schedule_stream_priority=0,
+            device=torch.device(f"cuda:{get_local_rank()}"),
+        )
+        
+        # Store stream references for convenient access
+        self.schedule_stream = self.async_context.schedule_stream
+        self.forward_stream = self.async_context.forward_stream
+        
+        # Initialize FutureMap circular buffer for token ID buffering
+        self.future_map = FutureMap(
+            max_running_requests=self.max_running_seqs,
+            context_len=self.model_max_length,
+            chunked_prefill_size=num_prefill_chunks,
+            device=torch.device(f"cuda:{get_local_rank()}"),
+        )
+        
+        logger.info(
+            f"Async scheduling initialized: "
+            f"future_limit={self.future_map.future_limit}, "
+            f"buffer_size={self.future_map.future_buffer_len * 8 / 1024:.1f} KB"
+        )
+        
+    @torch.inference_mode()
+    def run_batch_async(self) -> tuple:
+        """Run the full batch pipeline on forward_stream and return immediately.
+
+        All GPU work — resolve_future, forward, logits, sample, store_to_map,
+        async D2H — is submitted to forward_stream in order.  The CPU returns
+        as soon as the kernel launches are queued (non-blocking).
+
+        Returns:
+            (event, batch_size, future_indices, buf_idx) for step_collect_async.
+            batch_size is saved here because self.input_data will be
+            overwritten by the next batch's prepare_input before collect.
+        """
+        if self.future_map is None:
+            raise RuntimeError("Call init_async() before using async methods")
+
+        num_cal_tokens = self.input_data.tokens_cpu.shape[0]
+        batch_size = len(self.input_data.seqs)
+
+        # Pick the current pinned buffer and flip for next call
+        buf_idx = self._next_tokens_buf_idx
+        self._next_tokens_buf_idx = 1 - buf_idx
+        next_tokens_cpu = self._next_tokens_bufs[buf_idx]
+
+        # All GPU work on forward_stream
+        with torch.cuda.stream(self.forward_stream):
+            # Allocate future indices for this batch's output
+            future_indices = self.future_map.alloc_future_indices(batch_size)
+
+            # Wait for default stream (H2D copies from prepare_input)
+            self.forward_stream.wait_stream(torch.cuda.default_stream())
+
+            # D2D resolve: replace negative placeholders with real tokens
+            self.future_map.resolve_future(
+                self.input_data.tokens[:num_cal_tokens]
+            )
+
+            # VL fixup: after resolve_future, decode tokens in
+            # input_data.tokens now hold real token IDs.  But VL's
+            # mm_prepare_inputs already wrote embeddings for these
+            # positions using placeholder (clamped to 0) values.
+            # Re-compute decode-token embeddings from the resolved
+            # GPU tokens so the model sees correct hidden states.
+            if self.use_mm and is_first_pp_rank() and self.input_data.embedding_size > 0:
+                num_decode_tokens = sum(
+                    1 for s in self.input_data.seqs if s.computed_prompt
+                )
+                if num_decode_tokens > 0:
+                    decode_embeds = self.model.language_model.model.embed_tokens(
+                        self.input_data.tokens[:num_decode_tokens]
+                    )
+                    self.input_hidden_states[:num_decode_tokens] = decode_embeds
+
+            # Model forward (CUDA graph or eager)
+            if self.check_decode_batch():
+                padded_size = None
+                for bucket in self.capture_sizes:
+                    if bucket >= num_cal_tokens:
+                        padded_size = bucket
+                if padded_size is not None and padded_size in self.size_to_graph:
+                    num_real_tokens = self.input_data.pad_for_cuda_graph(padded_size)
+                    self.size_to_graph[padded_size].replay()
+                    num_cal_tokens = num_real_tokens
+                else:
+                    self.forward()
+            else:
+                self.forward()
+
+            # --- logits + sample + store + D2H (all still on forward_stream) ---
+            if is_output_rank():
+                logits = self.model.compute_logits(
+                    self.input_data, self.output_hidden_states[:num_cal_tokens]
+                )
+                self.input_data.prepare_sample()
+                next_tokens_gpu = self.sampler.forward_gpu(logits, self.input_data)
+                n = next_tokens_gpu.shape[0]
+
+                # Store tokens in FutureMap so next batch can D2D resolve them
+                self.future_map.store_to_map(future_indices, next_tokens_gpu)
+
+                # Record event AFTER all shared buffer reads are done.
+                # compute_logits reads query_start_loc (GPU), prepare_sample
+                # reads seqs (CPU list, safe), forward reads tokens/positions/
+                # seq_lens/block_table.  All of these are now finished.
+                # The next prepare_input waits on this event before overwriting
+                # shared GPU buffers.  Only D2H copy follows, which uses
+                # next_tokens_gpu (private) and pinned buffer (double-buffered).
+                self._input_consumed_event.record(self.forward_stream)
+
+                # Async D2H on copy_stream into THIS iteration's pinned buffer
+                with torch.cuda.stream(self.copy_stream):
+                    self.copy_stream.wait_stream(self.forward_stream)
+                    next_tokens_gpu.record_stream(self.copy_stream)
+                    next_tokens_cpu[:n].copy_(next_tokens_gpu, non_blocking=True)
+                    copy_done_event = torch.cuda.Event()
+                    copy_done_event.record()
+
+                return copy_done_event, batch_size, num_cal_tokens, future_indices, buf_idx
+
+            # Non-output ranks: record after forward finishes reading inputs
+            self._input_consumed_event.record(self.forward_stream)
+            event = torch.cuda.Event()
+            event.record()
+            return event, batch_size, num_cal_tokens, future_indices, buf_idx
+
+    @torch.inference_mode()
+    def step_collect_async(self, event, batch_size, num_cal_tokens, buf_idx):
+        """Collect results from run_batch_async after D2H completes.
+
+        Uses the saved batch_size, num_cal_tokens and buf_idx (not
+        self.input_data which may have been overwritten by a later batch's
+        prepare_input).
+        """
+        event.synchronize()
+        if is_last_pp_rank() and is_output_rank():
+            return self._next_tokens_bufs[buf_idx][:batch_size].numpy().tolist()
+        return (
+            self.output_hidden_states[:num_cal_tokens],
+            self.output_residual[:num_cal_tokens],
+        )
+
+    def sync_before_next_prepare(self):
+        """Ensure forward_stream has finished reading shared input buffers.
+
+        Waits on _input_consumed_event (recorded after logits/sample/store
+        but BEFORE D2H copy). This allows the next batch's H2D copies to
+        overlap with the D2H copy of the current batch:
+
+          forward_stream: [resolve(N)] [forward(N)] [logits(N)] [sample(N)] [store(N)] ★event
+          copy_stream:                                                                  [D2H(N)]
+          default_stream:                                                       ↑wait   [H2D(N+1)]
+                                                                                ↑ overlap D2H!
+        """
+        torch.cuda.current_stream().wait_event(self._input_consumed_event)

@@ -1,6 +1,7 @@
 import logging
 import traceback
 from collections import deque
+from typing import Union
 
 import torch
 import torch.distributed as dist
@@ -20,17 +21,16 @@ from gllm.dist_utils import (
     send_pp_data,
 )
 from gllm.input_data import InputData
-from gllm.model_runner import ModelRunner
+from gllm.model_runner import ModelRunner, AsyncModelRunner
 from gllm.profiler_mixin import TorchProfilerMixin
-from gllm.scheduler import Scheduler
+from gllm.scheduler import Scheduler, AsyncScheduler
 
 
-# Used with PipeAsyncLLM
 class Worker(TorchProfilerMixin):
 
     def __init__(
         self,
-        model_runner: ModelRunner,
+        model_runner: Union[ModelRunner,AsyncModelRunner],
         local_rank,
         pp_rank,
         tp_rank,
@@ -44,6 +44,7 @@ class Worker(TorchProfilerMixin):
         mp_load_progress,
         assigned_layers,
         schedule_method,
+        scheduler_cls: Union[type[Scheduler],type[AsyncScheduler]]=Scheduler,
     ):
         self.model_runner = model_runner
         self.local_rank = local_rank
@@ -60,6 +61,7 @@ class Worker(TorchProfilerMixin):
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
         self.use_mla = model_runner.model_loader.use_mla
+        self.scheduler_cls = scheduler_cls
         self.init_profiler_state()
 
     def init_logger(self):
@@ -247,6 +249,145 @@ class Worker(TorchProfilerMixin):
         if dist.is_initialized():
             dist.destroy_process_group()
         self.mp_alive[self.local_rank] = -1
+        
+class AsyncWorker(Worker):
+    def __init__(self, *args, **kwargs):
+        kwargs["scheduler_cls"] = AsyncScheduler
+        super().__init__(*args, **kwargs)
+        
+    def init(self):
+        super().init()
+        
+        # Async scheduling state for driver (rank 0):
+        self._prefetched_input = None
+        self._prefetched_seqs = None
+        # result_queue: FIFO of (event, num_cal_tokens, future_indices, deferred_seqs)
+        # Each entry pairs a batch's GPU event with the seqs that need
+        # finalization once D2H completes.
+        self._result_queue = deque()
+        # FutureMap for GPU circular buffer token ID buffering
+        self.model_runner.init_async(num_prefill_chunks=256)
+        self.future_map = self.model_runner.future_map
+        
+    def schedule_forward_async(self):
+        """Async-scheduling version using FutureMap GPU circular buffer.
+
+          Step 1 — Schedule next batch (CPU only, no GPU sync)
+          Step 2 — Launch current batch on GPU (non-blocking) + deferred process
+          Step 3 — Collect + finalize the batch from TWO iterations ago
+                   (its D2H completed during last iteration's GPU work)
+
+        result_queue depth is 1 in steady state: each iteration pushes one
+        entry (Step 2) and pops one entry (Step 3, from a previous iteration).
+        We never pop the entry we just pushed — only entries already in the
+        queue before Step 2.
+
+        Timeline:
+          Iter N:  [schedule(N+1)] [launch(N+1)] [collect(N-1) + finalize(N-1)]
+                                    ↑ GPU starts     ↑ D2H(N-1) done long ago
+                                                     ← overlaps with GPU(N+1)
+        """
+        # --- Step 1: Receive new requests, schedule next batch (CPU only) ---
+        self.check_abort_seqs()
+        self.recv_ipc_package()
+        self.recv_next_tokens()
+
+        self._build_prefetched_input()
+
+        # --- Step 2: Launch current batch on GPU (non-blocking) ---
+        # Remember queue length BEFORE pushing, so Step 3 only pops old entries.
+        num_pending_before = len(self._result_queue)
+
+        if self._prefetched_input is not None:
+            # Ensure forward_stream from the last batch has finished reading
+            # shared GPU buffers before we overwrite them with H2D copies.
+            self.model_runner.sync_before_next_prepare()
+            self.model_runner.prepare_input(input_data=self._prefetched_input)
+            event, batch_size, num_cal_tokens, future_indices, buf_idx = (
+                self.model_runner.run_batch_async()
+            )
+            self._prefetched_input = None
+            self._prefetched_seqs = None
+
+            # Deferred process: create placeholder tokens, pair with event
+            deferred_seqs = self.scheduler.process_output_deferred(
+                future_indices
+            )
+
+            self._result_queue.append(
+                (event, batch_size, num_cal_tokens, future_indices, buf_idx, deferred_seqs)
+            )
+
+        # --- Step 3: Collect + finalize a PREVIOUS batch ---
+        # Only process entries that were in the queue before Step 2.
+        # This ensures we never synchronize on the batch we just launched.
+        if num_pending_before > 0:
+            event, batch_size, num_cal_tokens, future_indices, buf_idx, deferred_seqs = (
+                self._result_queue.popleft()
+            )
+            output = self.model_runner.step_collect_async(event, batch_size, num_cal_tokens, buf_idx)
+            if not is_output_rank():
+                send_pp_data(output, get_next_pp_rank())
+            else:
+                if deferred_seqs is not None:
+                    ipc_package = self.scheduler.process_output_finalize(
+                        deferred_seqs, output
+                    )
+                    if ipc_package is not None:
+                        self.comm.send_output(ipc_package)
+    
+    def _build_prefetched_input(self):
+        """Schedule and build InputData for the next batch (CPU side only).
+
+        Called while the GPU is executing the current forward pass, so that CPU
+        input preparation overlaps with GPU execution. The result is stored in
+        self._prefetched_input / self._prefetched_seqs.
+
+        For VL models, mm_prepare_inputs is called here (not in prepare_input)
+        so that the vision encoder's GPU work runs on the default stream in
+        parallel with the current batch's forward on forward_stream.  Any
+        implicit cudaStreamSynchronize from .tolist()/.cpu() inside the vision
+        encoder only blocks on default-stream work, not on forward_stream,
+        avoiding a stall before run_batch_async.
+        """
+        schedule_seqs = self.scheduler.schedule_once()
+        if len(schedule_seqs) != 0:
+            next_input = InputData(
+                use_buffer=False,
+                memory_manager=self.model_runner.memory_manager,
+                max_seq_length=self.model_runner.model_max_length,
+            )
+            next_input.cal_input(schedule_seqs)
+
+            # Pre-compute VL embeddings on the default stream while the
+            # current batch runs on forward_stream.
+            if self.model_runner.use_mm:
+                input_embeddings, mrope_positions = (
+                    self.model_runner.mm_prepare_inputs(next_input.seqs)
+                )
+                # Stash on the prebuilt InputData so prepare_input can
+                # skip mm_prepare_inputs and directly use these.
+                next_input._mm_embeddings = input_embeddings
+                next_input._mm_positions = mrope_positions
+                # Also update mrope_positions_cpu so send_schedule_seqs
+                # sends correct positions to other workers.
+                next_input.mrope_positions_cpu = mrope_positions
+
+            if get_world_size() > 1:
+                self.comm.send_schedule_seqs(schedule_seqs, None, True)
+                self.comm.send_schedule_seqs(
+                    schedule_seqs,
+                    next_input.mrope_positions_cpu,
+                    False,
+                )
+            self._prefetched_input = next_input
+            self._prefetched_seqs = schedule_seqs
+        else:
+            self._prefetched_input = None
+            self._prefetched_seqs = None
+    
+    def run_driver(self):
+        self.schedule_forward_async()
 
 
 def run_worker(worker: Worker):

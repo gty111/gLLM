@@ -353,3 +353,94 @@ class Scheduler:
                 logger.info(log_info)
         # first decode, then prefill
         return decode_batch + prefill_batch
+
+class AsyncScheduler(Scheduler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+    def process_output_deferred(self, future_indices):
+        """Deferred output processing for async scheduling with FutureMap.
+
+        Unlike process_output() which needs real CPU token values, this method:
+        1. Updates computed_token_num (no token value needed)
+        2. Appends a NEGATIVE placeholder to seq.token_ids for decode seqs
+        3. Puts decode seqs back into seqs_to_decode immediately
+        4. Does NOT check is_finish (deferred to process_output_finalize)
+        5. Returns list of (batch_idx, seq) pairs for later finalization
+
+        The negative placeholder in seq.token_ids will be resolved on the GPU
+        side via FutureMap.resolve_future() during the next batch's forward pass.
+        """
+        if len(self.batch_running) == 0:
+            return None
+
+        schedule_seqs: List[Sequence] = self.batch_running.popleft()
+
+        # List of (batch_idx, seq) — batch_idx is needed to index into
+        # next_tokens during finalize, since the batch may contain a mix
+        # of prefill and decode seqs.
+        deferred_seqs = []
+
+        for idx, seq in enumerate(schedule_seqs):
+            # Skip seqs that were freed by a previous finalize but got
+            # re-scheduled before the free was visible.
+            if getattr(seq, "_async_freed", False):
+                continue
+
+            seq.computed_token_num += seq.to_compute_token_num
+            if seq.computed_prompt:
+                # Append negative future index as placeholder token.
+                placeholder = -future_indices.indices[idx].item()
+                placeholder_pos = len(seq.token_ids)  # position before append
+                seq.append(placeholder)
+                deferred_seqs.append((idx, seq, placeholder_pos))
+                self.seqs_to_decode.appendleft(seq)
+            # unfinished prefill seqs: do nothing (same as sync path)
+
+        return deferred_seqs
+
+    def process_output_finalize(self, deferred_seqs, next_tokens):
+        """Finalize deferred output processing after D2H copy completes.
+
+        Called one+ iterations later when step_collect provides real CPU tokens.
+        Replaces placeholder tokens with real values, checks is_finish, and
+        builds the IPC package for the frontend.
+
+        Args:
+            deferred_seqs: list of (batch_idx, seq) from process_output_deferred
+            next_tokens: CPU token list from step_collect_async (all batch entries)
+        """
+        ipc_package = IPCPackage([])
+
+        for batch_idx, seq, placeholder_pos in deferred_seqs:
+            # Skip seqs already freed by an earlier finalize
+            if getattr(seq, "_async_freed", False):
+                continue
+
+            real_token = next_tokens[batch_idx]
+            # Replace the placeholder at the exact position it was written,
+            # not [-1], because later batches may have appended more placeholders.
+            seq.token_ids[placeholder_pos] = real_token
+
+            ipc_package.act_schedule_ids.append(seq.seq_id)
+            ipc_package.next_tokens.append(real_token)
+
+            # Check finish using the real token directly, not seq.is_finish,
+            # because seq[-1] may be a placeholder from a later batch.
+            is_eos = not seq.ignore_eos and real_token in seq.finish_tokens
+            # Use placeholder_pos+1 as the generated length at this point,
+            # since later batches may have appended more placeholders.
+            generated_len = placeholder_pos + 1 - seq.prompt_len
+            is_max_len = generated_len >= seq.output_len
+            if seq.computed_prompt and (is_eos or is_max_len):
+                ipc_package.free_ids.append(seq.seq_id)
+                # Mark freed so future deferred/finalize calls skip it.
+                seq._async_freed = True
+                self.model_runner.free(seq)
+                # Remove from seqs_to_decode (added optimistically)
+                try:
+                    self.seqs_to_decode.remove(seq)
+                except ValueError:
+                    pass  # already removed or re-scheduled
+
+        return ipc_package

@@ -170,6 +170,11 @@ if __name__ == "__main__":
         action="store_true",
     )
     parser.add_argument(
+        "--async-scheduling",
+        help="Overlap CPU input preparation for the next batch with GPU execution of the current batch",
+        action="store_true",
+    )
+    parser.add_argument(
         "--gpu-memory-util",
         type=float,
         help="GPU memory utilization for KV cache (excluding model weights)",
@@ -301,6 +306,7 @@ if __name__ == "__main__":
         assigned_layers=args.assigned_layers,
         schedule_method=args.schedule_method,
         use_async_worker=args.use_async_worker,
+        async_scheduling=args.async_scheduling,
         use_thinking=not args.disable_thinking,
         disable_cuda_graph=args.disable_cuda_graph,
         max_cuda_graph_bs=args.max_cuda_graph_bs,
