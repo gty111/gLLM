@@ -11,6 +11,7 @@ from gllm.dist_utils import (
     get_pp_size,
     is_first_pp_rank,
     is_last_pp_rank,
+    is_output_rank,
 )
 from gllm.sequence import Sequence
 from gllm.utils import make_socket
@@ -101,15 +102,19 @@ class zmqComm:
                                 zmq.PUSH))
     
     def init_token_socket(self):
-        # last PP rank <=> first PP rank
-        if self.frontend:
+        # output rank <=> first PP rank
+        if self.frontend or get_pp_size() == 1:
             return
-        if is_last_pp_rank():
-            self.token_socket = make_socket(
-                self.ctx,
-                self.get_token_path(get_tp_rank()),
-                zmq.PUSH,
-            )
+        if is_output_rank():
+            # output rank sends tokens to all TP ranks in the first PP rank
+            self.token_sockets = []
+            for tp_rank in range(get_tp_size()):
+                self.token_sockets.append(
+                    make_socket(
+                        self.ctx,
+                        self.get_token_path(tp_rank),
+                        zmq.PUSH)
+                )
         if is_first_pp_rank():
             self.token_socket = make_socket(
                 self.ctx,
@@ -130,10 +135,15 @@ class zmqComm:
         self.init_pp_schedule_socket()
         
         self.init_token_socket()
+    
+    def thread_send_commond(self, target_socket, data):
+        threading.Thread(target=target_socket.send_pyobj, args=(data,)).start()
 
     def send_tokens(self, tokens):
         assert type(tokens) == list
-        self.token_socket.send_pyobj(tokens)
+        if is_output_rank():
+            for token_socket in self.token_sockets:
+                self.thread_send_commond(token_socket, tokens)
 
     def recv_tokens(self):
         if self.token_socket.poll(timeout=0) != 0:
@@ -144,7 +154,7 @@ class zmqComm:
 
     def send_output(self, output):
         if get_rank() == 0:
-            self.output_socket.send_pyobj(output)
+            self.thread_send_commond(self.output_socket, output)
 
     def recv_output(self):
         if self.output_socket.poll(timeout=0) != 0:
@@ -160,15 +170,15 @@ class zmqComm:
         control_cmd_code: int = 0,
     ):
         data = (seqs, pos, control_cmd_code)
-        for schedule_socket in self.schedule_sockets: 
-            threading.Thread(target=schedule_socket.send_pyobj, args=(data,)).start()
+        for schedule_socket in self.schedule_sockets:
+            self.thread_send_commond(schedule_socket, data)
 
     def send_control_cmd(
         self, control_cmd_code: int, profile_session_dir: Optional[str] = None
     ):
         data = ([], None, control_cmd_code, profile_session_dir)
         for schedule_socket in self.schedule_sockets:
-            threading.Thread(target=schedule_socket.send_pyobj, args=(data,)).start()
+            self.thread_send_commond(schedule_socket, data)
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
@@ -178,7 +188,7 @@ class zmqComm:
 
     def send_ipc_package(self, ipc_package):
         for request_socket in self.request_sockets:
-            threading.Thread(target=request_socket.send_pyobj, args=(ipc_package,)).start()
+            self.thread_send_commond(request_socket, ipc_package)
 
     def recv_ipc_package(self):
         if self.request_socket.poll(timeout=0) != 0:

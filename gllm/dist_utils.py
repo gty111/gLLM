@@ -28,14 +28,6 @@ def send_obj_list(obj_list, dst):
 
 def recv_obj_list(obj_list, src):
     dist.recv_object_list(obj_list, src=src)
-    
-def syn_obj(output):
-    # broadcast output in TP group if needed
-    if get_tp_size() > 1:
-        dist.broadcast_object_list(
-            output, src=(get_pp_size()-1)*get_tp_size(), 
-            group=get_tp_group()
-        )
 
 
 _RANK = 0
@@ -87,6 +79,8 @@ def is_first_tp_rank():
 def is_last_pp_rank():
     return get_pp_rank() == get_pp_size() - 1
 
+def is_output_rank():
+    return is_last_pp_rank() and is_first_tp_rank()
 
 def is_use_ep():
     return _USE_EP

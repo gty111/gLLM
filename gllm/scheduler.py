@@ -11,7 +11,8 @@ from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
 
-
+# Each scheduler for each TP worker (PP rank 0)
+# must exhibit identical behavior
 class Scheduler:
     def __init__(self, pp_size, model_runner: ModelRunner, schedule_method):
         self.pp_size = pp_size
