@@ -149,7 +149,6 @@ class InputData:
             "top_p",
             "top_k",
             "repetition_penalty",
-            "embedding_size",
         ]
         mla_attrs_copy = [
             "num_actual_tokens",
