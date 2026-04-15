@@ -113,33 +113,46 @@ class Worker(TorchProfilerMixin):
         logger.info(f"Initialization complete")
 
     # driver worker => other workers
+    def _handle_recv_data(self, recv_data):
+        """Parse received schedule data and enqueue an InputData."""
+        if recv_data is None:
+            return
+        profile_session_dir = None
+        cmd_code = 0
+        if len(recv_data) == 3:
+            seqs, mrope_positions, cmd_code = recv_data
+        elif len(recv_data) == 4:
+            seqs, mrope_positions, cmd_code, profile_session_dir = recv_data
+        else:
+            raise Exception(f"Fail to parse {recv_data = }")
+
+        if cmd_code != 0:
+            self._apply_control_cmd(cmd_code, profile_session_dir)
+
+        if len(seqs) == 0:
+            return
+
+        input_data = InputData(
+            use_buffer=False,
+            memory_manager=self.model_runner.memory_manager,
+            max_seq_length=self.model_runner.model_max_length,
+        )
+        input_data.cal_input(seqs)
+        if mrope_positions is not None:
+            input_data.set_mrope_position(mrope_positions)
+        self.schedule_queue.append(input_data)
+
     def recv_schedule_seqs(self):
-        recv_data = self.comm.recv_schedule_seqs()
-        if recv_data is not None:
-            profile_session_dir = None
-            cmd_code = 0
-            if len(recv_data) == 3:
-                seqs, mrope_positions, cmd_code = recv_data
-            elif len(recv_data) == 4:
-                seqs, mrope_positions, cmd_code, profile_session_dir = recv_data
-            else:
-                raise Exception(f"Fail to parse {recv_data = }")
+        self._handle_recv_data(self.comm.recv_schedule_seqs())
 
-            if cmd_code != 0:
-                self._apply_control_cmd(cmd_code, profile_session_dir)
+    def recv_schedule_seqs_blocking(self, timeout_ms=100):
+        """Blocking variant for async-scheduling TP followers.
 
-            if len(seqs) == 0:
-                return
-
-            input_data = InputData(
-                use_buffer=False,
-                memory_manager=self.model_runner.memory_manager,
-                max_seq_length=self.model_runner.model_max_length,
-            )
-            input_data.cal_input(seqs)
-            if mrope_positions is not None:
-                input_data.set_mrope_position(mrope_positions)
-            self.schedule_queue.append(input_data)
+        Waits up to *timeout_ms* for rank 0 to send the next batch's
+        schedule data, avoiding empty spin iterations that misalign GPU
+        launches across TP ranks and cause NCCL stalls.
+        """
+        self._handle_recv_data(self.comm.recv_schedule_seqs_blocking(timeout_ms))
 
     def forward_pp(self):
         if len(self.schedule_queue) != 0:
@@ -416,8 +429,12 @@ class AsyncWorker(Worker):
 
         Must use the same ``run_batch_async`` / ``step_collect_async`` ordering as
         the driver so ``forward_stream`` and NCCL collectives stay aligned.
+
+        Uses blocking receive to wait for rank 0's schedule data, ensuring GPU
+        work launches are aligned across all TP ranks and NCCL broadcast
+        inside run_batch_async does not stall waiting for late followers.
         """
-        self.recv_schedule_seqs()
+        self.recv_schedule_seqs_blocking()
 
         num_pending_before = len(self._result_queue)
 

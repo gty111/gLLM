@@ -180,6 +180,17 @@ class zmqComm:
         else:
             return None
 
+    def recv_schedule_seqs_blocking(self, timeout_ms=100):
+        """Block until schedule data arrives or timeout.
+
+        Used by async-scheduling TP followers to avoid spinning empty
+        iterations while rank 0 prepares the next batch.  A short timeout
+        ensures the worker can still respond to shutdown signals.
+        """
+        if self.schedule_socket.poll(timeout=timeout_ms) != 0:
+            return self.schedule_socket.recv_pyobj()
+        return None
+
     def send_ipc_package(self, ipc_package):
         self.request_socket.send_pyobj(ipc_package)
 
