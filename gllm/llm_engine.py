@@ -6,13 +6,12 @@ import torch.multiprocessing as mp
 import tqdm
 from logger import logger
 
-from gllm.async_worker import AsyncWorker, run_worker_async
 from gllm.comm import IPCPackage, zmqComm
 from gllm.id_allocator import IDAllocator
-from gllm.model_runner import ModelRunner
+from gllm.model_runner import ModelRunner, AsyncModelRunner
 from gllm.sequence import Sequence
 from gllm.utils import get_model_load_pbar, init_logger, random_uuid
-from gllm.worker import Worker, run_worker
+from gllm.worker import Worker, AsyncWorker, run_worker
 
 
 class LLM:
@@ -40,6 +39,7 @@ class LLM:
         assigned_layers=None,
         schedule_method="chunked_prefill",
         use_async_worker=False,
+        async_scheduling=False,
         use_thinking=True,
         disable_cuda_graph=False,
         max_cuda_graph_bs=32,
@@ -50,7 +50,8 @@ class LLM:
         init_logger()
         self.model_path = model_path
         self.load_format = load_format
-        self.model_runner = ModelRunner(
+        model_runner_cls = AsyncModelRunner if async_scheduling else ModelRunner
+        self.model_runner = model_runner_cls(
             load_format=load_format,
             model_path=model_path,
             gpu_memory_util=gpu_memory_util,
@@ -90,8 +91,11 @@ class LLM:
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
         self.use_async_worker = use_async_worker
+        self.async_scheduling = async_scheduling
 
         logger.info(f"Schedule method: {schedule_method}")
+        if async_scheduling:
+            logger.info("Async scheduling enabled")
 
         # Interact with workers
         self.wait_lists: List[Sequence] = []
@@ -168,7 +172,7 @@ class LLM:
             self.load_progress()
 
     def start_worker(self, local_rank, pp_rank, tp_rank):
-        worker_cls = Worker if not self.use_async_worker else AsyncWorker
+        worker_cls = Worker if not self.async_scheduling else AsyncWorker
         comm = zmqComm(
             self.host,
             self.zmq_port_base,
@@ -195,7 +199,7 @@ class LLM:
             self.schedule_method,
         )
         process = self.ctx.Process(
-            target=run_worker if not self.use_async_worker else run_worker_async,
+            target=run_worker,
             args=(worker,),
             daemon=True,
         )

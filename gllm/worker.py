@@ -1,6 +1,7 @@
 import logging
 import traceback
 from collections import deque
+from typing import Union
 
 import torch
 import torch.distributed as dist
@@ -12,6 +13,7 @@ from gllm.dist_utils import (
     get_next_pp_rank,
     get_pp_size,
     get_rank,
+    get_tp_rank,
     get_world_size,
     init_dist,
     is_last_pp_rank,
@@ -20,17 +22,16 @@ from gllm.dist_utils import (
     send_pp_data,
 )
 from gllm.input_data import InputData
-from gllm.model_runner import ModelRunner
+from gllm.model_runner import ModelRunner, AsyncModelRunner
 from gllm.profiler_mixin import TorchProfilerMixin
-from gllm.scheduler import Scheduler
+from gllm.scheduler import Scheduler, AsyncScheduler
 
 
-# Used with PipeAsyncLLM
 class Worker(TorchProfilerMixin):
 
     def __init__(
         self,
-        model_runner: ModelRunner,
+        model_runner: Union[ModelRunner,AsyncModelRunner],
         local_rank,
         pp_rank,
         tp_rank,
@@ -44,6 +45,7 @@ class Worker(TorchProfilerMixin):
         mp_load_progress,
         assigned_layers,
         schedule_method,
+        scheduler_cls: Union[type[Scheduler],type[AsyncScheduler]]=Scheduler,
     ):
         self.model_runner = model_runner
         self.local_rank = local_rank
@@ -60,6 +62,7 @@ class Worker(TorchProfilerMixin):
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
         self.use_mla = model_runner.model_loader.use_mla
+        self.scheduler_cls = scheduler_cls
         self.init_profiler_state()
 
     def init_logger(self):
@@ -96,7 +99,7 @@ class Worker(TorchProfilerMixin):
         self.ret_residual = self.model_runner.model.ret_residual
 
         if self.rank == 0:
-            self.scheduler = Scheduler(
+            self.scheduler = self.scheduler_cls(
                 self.pp_size,
                 self.model_runner,
                 self.schedule_method,
@@ -110,33 +113,46 @@ class Worker(TorchProfilerMixin):
         logger.info(f"Initialization complete")
 
     # driver worker => other workers
+    def _handle_recv_data(self, recv_data):
+        """Parse received schedule data and enqueue an InputData."""
+        if recv_data is None:
+            return
+        profile_session_dir = None
+        cmd_code = 0
+        if len(recv_data) == 3:
+            seqs, mrope_positions, cmd_code = recv_data
+        elif len(recv_data) == 4:
+            seqs, mrope_positions, cmd_code, profile_session_dir = recv_data
+        else:
+            raise Exception(f"Fail to parse {recv_data = }")
+
+        if cmd_code != 0:
+            self._apply_control_cmd(cmd_code, profile_session_dir)
+
+        if len(seqs) == 0:
+            return
+
+        input_data = InputData(
+            use_buffer=False,
+            memory_manager=self.model_runner.memory_manager,
+            max_seq_length=self.model_runner.model_max_length,
+        )
+        input_data.cal_input(seqs)
+        if mrope_positions is not None:
+            input_data.set_mrope_position(mrope_positions)
+        self.schedule_queue.append(input_data)
+
     def recv_schedule_seqs(self):
-        recv_data = self.comm.recv_schedule_seqs()
-        if recv_data is not None:
-            profile_session_dir = None
-            cmd_code = 0
-            if len(recv_data) == 3:
-                seqs, mrope_positions, cmd_code = recv_data
-            elif len(recv_data) == 4:
-                seqs, mrope_positions, cmd_code, profile_session_dir = recv_data
-            else:
-                raise Exception(f"Fail to parse {recv_data = }")
+        self._handle_recv_data(self.comm.recv_schedule_seqs())
 
-            if cmd_code != 0:
-                self._apply_control_cmd(cmd_code, profile_session_dir)
+    def recv_schedule_seqs_blocking(self, timeout_ms=100):
+        """Blocking variant for async-scheduling TP followers.
 
-            if len(seqs) == 0:
-                return
-
-            input_data = InputData(
-                use_buffer=False,
-                memory_manager=self.model_runner.memory_manager,
-                max_seq_length=self.model_runner.model_max_length,
-            )
-            input_data.cal_input(seqs)
-            if mrope_positions is not None:
-                input_data.set_mrope_position(mrope_positions)
-            self.schedule_queue.append(input_data)
+        Waits up to *timeout_ms* for rank 0 to send the next batch's
+        schedule data, avoiding empty spin iterations that misalign GPU
+        launches across TP ranks and cause NCCL stalls.
+        """
+        self._handle_recv_data(self.comm.recv_schedule_seqs_blocking(timeout_ms))
 
     def forward_pp(self):
         if len(self.schedule_queue) != 0:
@@ -160,7 +176,7 @@ class Worker(TorchProfilerMixin):
         # To avoid request accumulation, we fetch all packages in comm
         cum_ipc_package = IPCPackage([])
         while True:
-            ipc_package: IPCPackage = self.comm.recv_ipc_package()
+            ipc_package: Optional[IPCPackage] = self.comm.recv_ipc_package()
             if ipc_package is not None:
                 cum_ipc_package.schedule_lists.extend(ipc_package.schedule_lists)
                 cum_ipc_package.abort_ids.extend(ipc_package.abort_ids)
@@ -247,6 +263,224 @@ class Worker(TorchProfilerMixin):
         if dist.is_initialized():
             dist.destroy_process_group()
         self.mp_alive[self.local_rank] = -1
+        
+class AsyncWorker(Worker):
+    def __init__(self, *args, **kwargs):
+        kwargs["scheduler_cls"] = AsyncScheduler
+        super().__init__(*args, **kwargs)
+        
+    def init(self):
+        super().init()
+        
+        # Async scheduling state for driver (rank 0):
+        self._prefetched_input = None
+        self._prefetched_seqs = None
+        # result_queue: FIFO of (event, num_cal_tokens, future_indices, deferred_seqs)
+        # Each entry pairs a batch's GPU event with the seqs that need
+        # finalization once D2H completes.
+        self._result_queue = deque()
+        # FutureMap for GPU circular buffer token ID buffering
+        self.model_runner.init_async(num_prefill_chunks=256)
+        self.future_map = self.model_runner.future_map
+        if self.tp_size > 1:
+            logger.info(
+                "AsyncWorker: tensor-parallel ranks will use run_first_tp_async "
+                "(same CUDA streams / FutureMap as rank 0). tp_size=%s pp_rank=%s",
+                self.tp_size,
+                self.pp_rank,
+            )
+
+    def schedule_forward_async(self):
+        """Async-scheduling version using FutureMap GPU circular buffer.
+
+          Step 1 — Schedule next batch (CPU only, no GPU sync)
+          Step 2 — Launch current batch on GPU (non-blocking) + deferred process
+          Step 3 — Collect + finalize the batch from TWO iterations ago
+                   (its D2H completed during last iteration's GPU work)
+
+        result_queue depth is 1 in steady state: each iteration pushes one
+        entry (Step 2) and pops one entry (Step 3, from a previous iteration).
+        We never pop the entry we just pushed — only entries already in the
+        queue before Step 2.
+
+        Timeline:
+          Iter N:  [schedule(N+1)] [launch(N+1)] [collect(N-1) + finalize(N-1)]
+                                    ↑ GPU starts     ↑ D2H(N-1) done long ago
+                                                     ← overlaps with GPU(N+1)
+        """
+        # --- Step 1: Receive new requests, schedule next batch (CPU only) ---
+        self.check_abort_seqs()
+        self.recv_ipc_package()
+        self.recv_next_tokens()
+
+        self._build_prefetched_input()
+
+        # --- Step 2: Launch current batch on GPU (non-blocking) ---
+        # Remember queue length BEFORE pushing, so Step 3 only pops old entries.
+        num_pending_before = len(self._result_queue)
+
+        if self._prefetched_input is not None:
+            # Ensure forward_stream from the last batch has finished reading
+            # shared GPU buffers before we overwrite them with H2D copies.
+            self.model_runner.sync_before_next_prepare()
+            self.model_runner.prepare_input(input_data=self._prefetched_input)
+            event, batch_size, num_cal_tokens, future_indices, buf_idx = (
+                self.model_runner.run_batch_async()
+            )
+            self._prefetched_input = None
+            self._prefetched_seqs = None
+
+            # Deferred process: create placeholder tokens, pair with event
+            deferred_seqs = self.scheduler.process_output_deferred(
+                future_indices
+            )
+
+            self._result_queue.append(
+                (event, batch_size, num_cal_tokens, future_indices, buf_idx, deferred_seqs)
+            )
+            if self.tp_size > 1:
+                logger.debug(
+                    "[async_sched driver] launch batch_size=%s num_cal_tokens=%s "
+                    "buf_idx=%s pending_before=%s pending_after=%s",
+                    batch_size,
+                    num_cal_tokens,
+                    buf_idx,
+                    num_pending_before,
+                    len(self._result_queue),
+                )
+
+        # --- Step 3: Collect + finalize a PREVIOUS batch ---
+        # Only process entries that were in the queue before Step 2.
+        # This ensures we never synchronize on the batch we just launched.
+        if num_pending_before > 0:
+            event, batch_size, num_cal_tokens, future_indices, buf_idx, deferred_seqs = (
+                self._result_queue.popleft()
+            )
+            output = self.model_runner.step_collect_async(event, batch_size, num_cal_tokens, buf_idx)
+            if self.tp_size > 1:
+                logger.debug(
+                    "[async_sched driver] collect batch_size=%s num_cal_tokens=%s buf_idx=%s",
+                    batch_size,
+                    num_cal_tokens,
+                    buf_idx,
+                )
+            if not is_output_rank():
+                send_pp_data(output, get_next_pp_rank())
+            else:
+                if deferred_seqs is not None:
+                    ipc_package = self.scheduler.process_output_finalize(
+                        deferred_seqs, output
+                    )
+                    if ipc_package is not None:
+                        self.comm.send_output(ipc_package)
+    
+    def _build_prefetched_input(self):
+        """Schedule and build InputData for the next batch (CPU side only).
+
+        Called while the GPU is executing the current forward pass, so that CPU
+        input preparation overlaps with GPU execution. The result is stored in
+        self._prefetched_input / self._prefetched_seqs.
+
+        For VL models, mm_prepare_inputs is called here (not in prepare_input)
+        so that the vision encoder's GPU work runs on the default stream in
+        parallel with the current batch's forward on forward_stream.  Any
+        implicit cudaStreamSynchronize from .tolist()/.cpu() inside the vision
+        encoder only blocks on default-stream work, not on forward_stream,
+        avoiding a stall before run_batch_async.
+        """
+        schedule_seqs = self.scheduler.schedule_once()
+        if len(schedule_seqs) != 0:
+            next_input = InputData(
+                use_buffer=False,
+                memory_manager=self.model_runner.memory_manager,
+                max_seq_length=self.model_runner.model_max_length,
+            )
+            next_input.cal_input(schedule_seqs)
+
+            # Pre-compute VL embeddings on the default stream while the
+            # current batch runs on forward_stream.
+            if self.model_runner.use_mm:
+                input_embeddings, mrope_positions = (
+                    self.model_runner.mm_prepare_inputs(next_input.seqs)
+                )
+                # Stash on the prebuilt InputData so prepare_input can
+                # skip mm_prepare_inputs and directly use these.
+                next_input._mm_embeddings = input_embeddings
+                next_input._mm_positions = mrope_positions
+                # Also update mrope_positions_cpu so send_schedule_seqs
+                # sends correct positions to other workers.
+                next_input.mrope_positions_cpu = mrope_positions
+
+            if get_world_size() > 1:
+                self.comm.send_schedule_seqs(schedule_seqs, None, True)
+                self.comm.send_schedule_seqs(
+                    schedule_seqs,
+                    next_input.mrope_positions_cpu,
+                    False,
+                )
+            self._prefetched_input = next_input
+            self._prefetched_seqs = schedule_seqs
+        else:
+            self._prefetched_input = None
+            self._prefetched_seqs = None
+
+    def run_first_tp_async(self):
+        """First PP non-driver TP ranks: mirror rank-0 async batching (no scheduler).
+
+        Must use the same ``run_batch_async`` / ``step_collect_async`` ordering as
+        the driver so ``forward_stream`` and NCCL collectives stay aligned.
+
+        Uses blocking receive to wait for rank 0's schedule data, ensuring GPU
+        work launches are aligned across all TP ranks and NCCL broadcast
+        inside run_batch_async does not stall waiting for late followers.
+        """
+        self.recv_schedule_seqs_blocking()
+
+        num_pending_before = len(self._result_queue)
+
+        if len(self.schedule_queue) > 0:
+            self.model_runner.sync_before_next_prepare()
+            input_data = self.schedule_queue.popleft()
+            self.model_runner.prepare_input(input_data=input_data)
+            event, batch_size, num_cal_tokens, future_indices, buf_idx = (
+                self.model_runner.run_batch_async()
+            )
+            self._result_queue.append(
+                (event, batch_size, num_cal_tokens, future_indices, buf_idx, None)
+            )
+            logger.debug(
+                "[async_sched tp_follower] rank=%s tp_rank=%s launch "
+                "batch_size=%s num_cal_tokens=%s buf_idx=%s pending_before=%s pending_after=%s",
+                self.rank,
+                get_tp_rank(),
+                batch_size,
+                num_cal_tokens,
+                buf_idx,
+                num_pending_before,
+                len(self._result_queue),
+            )
+
+        if num_pending_before > 0:
+            event, batch_size, num_cal_tokens, future_indices, buf_idx, _ = (
+                self._result_queue.popleft()
+            )
+            output = self.model_runner.step_collect_async(
+                event, batch_size, num_cal_tokens, buf_idx
+            )
+            logger.debug(
+                "[async_sched tp_follower] rank=%s tp_rank=%s collect "
+                "batch_size=%s num_cal_tokens=%s buf_idx=%s",
+                self.rank,
+                get_tp_rank(),
+                batch_size,
+                num_cal_tokens,
+                buf_idx,
+            )
+            if get_pp_size() != 1:
+                send_pp_data(output, get_next_pp_rank())
+
+    def run_driver(self):
+        self.schedule_forward_async()
 
 
 def run_worker(worker: Worker):
@@ -256,7 +490,10 @@ def run_worker(worker: Worker):
             if worker.rank == 0:
                 worker.run_driver()
             elif worker.pp_rank == 0:
-                worker.run_first_tp()
+                if isinstance(worker, AsyncWorker):
+                    worker.run_first_tp_async()
+                else:
+                    worker.run_first_tp()
             else:
                 worker.run_other()
     except KeyboardInterrupt as e:

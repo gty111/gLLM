@@ -1,4 +1,3 @@
-import threading
 from typing import List, Optional
 
 import torch
@@ -163,21 +162,34 @@ class zmqComm:
         else:
             schedule_sockets = self.schedule_other_sockets
         data = (seqs, pos, control_cmd_code)
+        # Synchronous sends: per-batch Thread() spawn was visible in async+TP
+        # driver hot paths (small fan-out); ZMQ PUSH returns quickly for local IPC.
         for socket in schedule_sockets:
-            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
+            socket.send_pyobj(data)
 
     def broadcast_control_cmd(
         self, control_cmd_code: int, profile_session_dir: Optional[str] = None
     ):
         data = ([], None, control_cmd_code, profile_session_dir)
         for socket in self.schedule_first_pp_sockets + self.schedule_other_sockets:
-            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
+            socket.send_pyobj(data)
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:
             return self.schedule_socket.recv_pyobj()
         else:
             return None
+
+    def recv_schedule_seqs_blocking(self, timeout_ms=100):
+        """Block until schedule data arrives or timeout.
+
+        Used by async-scheduling TP followers to avoid spinning empty
+        iterations while rank 0 prepares the next batch.  A short timeout
+        ensures the worker can still respond to shutdown signals.
+        """
+        if self.schedule_socket.poll(timeout=timeout_ms) != 0:
+            return self.schedule_socket.recv_pyobj()
+        return None
 
     def send_ipc_package(self, ipc_package):
         self.request_socket.send_pyobj(ipc_package)

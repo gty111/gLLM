@@ -6,6 +6,15 @@ from gllm.input_data import InputData
 class Sampler:
 
     def forward(self, logits: torch.Tensor, input_data: InputData):
+        return self.forward_gpu(logits, input_data).cpu().numpy().tolist()
+
+    def forward_gpu(self, logits: torch.Tensor, input_data: InputData) -> torch.Tensor:
+        """Same as forward() but returns a GPU tensor without D2H copy.
+
+        Used by async scheduling so the D2H transfer can be initiated with
+        non_blocking=True on a dedicated copy stream, overlapping with
+        CPU-side scheduling work for the next batch.
+        """
         # repetition_penalty
         logits /= torch.where(logits > 0, input_data.repetition_penalty, 1.0)
         logits *= torch.where(logits <= 0, 1.0, input_data.repetition_penalty)
@@ -17,8 +26,7 @@ class Sampler:
 
         q = torch.empty_like(probs)
         q.exponential_()
-        return probs.div_(q).argmax(dim=1).cpu().numpy().tolist()
-        # return torch.multinomial(probs, 1).squeeze(1).cpu().numpy().tolist()
+        return probs.div_(q).argmax(dim=1)
 
     def _apply_top_k_top_p(
         self,
