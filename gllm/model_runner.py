@@ -1,6 +1,7 @@
-from typing import Dict, List, Union, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from attr import dataclass
 from logger import logger
 from tqdm import tqdm
@@ -16,6 +17,8 @@ from transformers.tokenization_utils_base import VERY_LARGE_INTEGER
 
 from gllm.dist_utils import (
     get_local_rank,
+    get_pp_size,
+    get_tp_group,
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
@@ -552,8 +555,8 @@ class AsyncModelRunner(ModelRunner):
         )
         
         logger.info(
-            f"Async scheduling initialized: "
-            f"future_limit={self.future_map.future_limit}, "
+            "Async scheduling initialized: "
+            f"tp_size={get_tp_size()} future_limit={self.future_map.future_limit}, "
             f"buffer_size={self.future_map.future_buffer_len * 8 / 1024:.1f} KB"
         )
         
@@ -626,53 +629,86 @@ class AsyncModelRunner(ModelRunner):
                 self.forward()
 
             # --- logits + sample + store + D2H (all still on forward_stream) ---
-            if is_output_rank():
+            # ParallelLMHead uses tensor_model_parallel_all_gather; every TP rank on
+            # the last PP stage must enter compute_logits, not only is_output_rank().
+            if is_last_pp_rank():
                 logits = self.model.compute_logits(
                     self.input_data, self.output_hidden_states[:num_cal_tokens]
                 )
                 self.input_data.prepare_sample()
-                next_tokens_gpu = self.sampler.forward_gpu(logits, self.input_data)
-                n = next_tokens_gpu.shape[0]
+                next_tokens_gpu = None
+                if is_output_rank():
+                    next_tokens_gpu = self.sampler.forward_gpu(logits, self.input_data)
 
-                # Store tokens in FutureMap so next batch can D2D resolve them
+                if get_tp_size() > 1:
+                    if next_tokens_gpu is None:
+                        next_tokens_gpu = torch.empty(
+                            (batch_size,),
+                            dtype=torch.long,
+                            device=self.input_data.tokens.device,
+                        )
+                    # Keep broadcast on forward_stream (current stream here). Moving
+                    # NCCL to default_stream plus cross-stream events serialized the
+                    # whole step and regressed TPOT vs sync scheduling.
+                    src_leader = (get_pp_size() - 1) * get_tp_size()
+                    dist.broadcast(
+                        next_tokens_gpu, src=src_leader, group=get_tp_group()
+                    )
+
+                assert next_tokens_gpu is not None
                 self.future_map.store_to_map(future_indices, next_tokens_gpu)
 
-                # Record event AFTER all shared buffer reads are done.
-                # compute_logits reads query_start_loc (GPU), prepare_sample
-                # reads seqs (CPU list, safe), forward reads tokens/positions/
-                # seq_lens/block_table.  All of these are now finished.
-                # The next prepare_input waits on this event before overwriting
-                # shared GPU buffers.  Only D2H copy follows, which uses
-                # next_tokens_gpu (private) and pinned buffer (double-buffered).
+                if is_output_rank():
+                    n = next_tokens_gpu.shape[0]
+                    self._input_consumed_event.record(self.forward_stream)
+                    with torch.cuda.stream(self.copy_stream):
+                        self.copy_stream.wait_stream(self.forward_stream)
+                        next_tokens_gpu.record_stream(self.copy_stream)
+                        next_tokens_cpu[:n].copy_(next_tokens_gpu, non_blocking=True)
+                        copy_done_event = torch.cuda.Event()
+                        copy_done_event.record()
+                    return (
+                        copy_done_event,
+                        batch_size,
+                        num_cal_tokens,
+                        future_indices,
+                        buf_idx,
+                    )
+
                 self._input_consumed_event.record(self.forward_stream)
+                event = torch.cuda.Event()
+                event.record(self.forward_stream)
+                return event, batch_size, num_cal_tokens, future_indices, buf_idx
 
-                # Async D2H on copy_stream into THIS iteration's pinned buffer
-                with torch.cuda.stream(self.copy_stream):
-                    self.copy_stream.wait_stream(self.forward_stream)
-                    next_tokens_gpu.record_stream(self.copy_stream)
-                    next_tokens_cpu[:n].copy_(next_tokens_gpu, non_blocking=True)
-                    copy_done_event = torch.cuda.Event()
-                    copy_done_event.record()
-
-                return copy_done_event, batch_size, num_cal_tokens, future_indices, buf_idx
-
-            # Non-output ranks: record after forward finishes reading inputs
+            # Non-last-PP ranks: forward only; inputs consumed after forward.
             self._input_consumed_event.record(self.forward_stream)
             event = torch.cuda.Event()
-            event.record()
+            event.record(self.forward_stream)
             return event, batch_size, num_cal_tokens, future_indices, buf_idx
 
     @torch.inference_mode()
-    def step_collect_async(self, event, batch_size, num_cal_tokens, buf_idx):
-        """Collect results from run_batch_async after D2H completes.
+    def step_collect_async(
+        self, event, batch_size, num_cal_tokens, buf_idx
+    ) -> Union[list, Tuple[torch.Tensor, torch.Tensor], None]:
+        """Finish the async batch: wait for GPU work and return CPU/GPU outputs.
 
         Uses the saved batch_size, num_cal_tokens and buf_idx (not
         self.input_data which may have been overwritten by a later batch's
         prepare_input).
+
+        For last-PP non-output ranks with ``pp_size == 1`` (TP follower only),
+        there is no PP activation to send and no CPU read of activations; the
+        next ``prepare_input`` is already ordered after this batch via
+        ``sync_before_next_prepare`` (``_input_consumed_event``).  Skipping
+        ``event.synchronize()`` here avoids an extra ~2ms/iter CPU block seen
+        on TP followers in Chrome traces (rank1 ``cudaEventSynchronize``).
         """
-        event.synchronize()
         if is_last_pp_rank() and is_output_rank():
+            event.synchronize()
             return self._next_tokens_bufs[buf_idx][:batch_size].numpy().tolist()
+        if is_last_pp_rank() and not is_output_rank() and get_pp_size() == 1:
+            return None
+        event.synchronize()
         return (
             self.output_hidden_states[:num_cal_tokens],
             self.output_residual[:num_cal_tokens],

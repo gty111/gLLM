@@ -1,4 +1,3 @@
-import threading
 from typing import List, Optional
 
 import torch
@@ -163,15 +162,17 @@ class zmqComm:
         else:
             schedule_sockets = self.schedule_other_sockets
         data = (seqs, pos, control_cmd_code)
+        # Synchronous sends: per-batch Thread() spawn was visible in async+TP
+        # driver hot paths (small fan-out); ZMQ PUSH returns quickly for local IPC.
         for socket in schedule_sockets:
-            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
+            socket.send_pyobj(data)
 
     def broadcast_control_cmd(
         self, control_cmd_code: int, profile_session_dir: Optional[str] = None
     ):
         data = ([], None, control_cmd_code, profile_session_dir)
         for socket in self.schedule_first_pp_sockets + self.schedule_other_sockets:
-            threading.Thread(target=socket.send_pyobj, args=(data,)).start()
+            socket.send_pyobj(data)
 
     def recv_schedule_seqs(self):
         if self.schedule_socket.poll(timeout=0) != 0:

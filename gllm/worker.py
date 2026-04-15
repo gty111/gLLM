@@ -13,6 +13,7 @@ from gllm.dist_utils import (
     get_next_pp_rank,
     get_pp_size,
     get_rank,
+    get_tp_rank,
     get_world_size,
     init_dist,
     is_last_pp_rank,
@@ -162,7 +163,7 @@ class Worker(TorchProfilerMixin):
         # To avoid request accumulation, we fetch all packages in comm
         cum_ipc_package = IPCPackage([])
         while True:
-            ipc_package: IPCPackage = self.comm.recv_ipc_package()
+            ipc_package: Optional[IPCPackage] = self.comm.recv_ipc_package()
             if ipc_package is not None:
                 cum_ipc_package.schedule_lists.extend(ipc_package.schedule_lists)
                 cum_ipc_package.abort_ids.extend(ipc_package.abort_ids)
@@ -268,7 +269,14 @@ class AsyncWorker(Worker):
         # FutureMap for GPU circular buffer token ID buffering
         self.model_runner.init_async(num_prefill_chunks=256)
         self.future_map = self.model_runner.future_map
-        
+        if self.tp_size > 1:
+            logger.info(
+                "AsyncWorker: tensor-parallel ranks will use run_first_tp_async "
+                "(same CUDA streams / FutureMap as rank 0). tp_size=%s pp_rank=%s",
+                self.tp_size,
+                self.pp_rank,
+            )
+
     def schedule_forward_async(self):
         """Async-scheduling version using FutureMap GPU circular buffer.
 
@@ -317,6 +325,16 @@ class AsyncWorker(Worker):
             self._result_queue.append(
                 (event, batch_size, num_cal_tokens, future_indices, buf_idx, deferred_seqs)
             )
+            if self.tp_size > 1:
+                logger.debug(
+                    "[async_sched driver] launch batch_size=%s num_cal_tokens=%s "
+                    "buf_idx=%s pending_before=%s pending_after=%s",
+                    batch_size,
+                    num_cal_tokens,
+                    buf_idx,
+                    num_pending_before,
+                    len(self._result_queue),
+                )
 
         # --- Step 3: Collect + finalize a PREVIOUS batch ---
         # Only process entries that were in the queue before Step 2.
@@ -326,6 +344,13 @@ class AsyncWorker(Worker):
                 self._result_queue.popleft()
             )
             output = self.model_runner.step_collect_async(event, batch_size, num_cal_tokens, buf_idx)
+            if self.tp_size > 1:
+                logger.debug(
+                    "[async_sched driver] collect batch_size=%s num_cal_tokens=%s buf_idx=%s",
+                    batch_size,
+                    num_cal_tokens,
+                    buf_idx,
+                )
             if not is_output_rank():
                 send_pp_data(output, get_next_pp_rank())
             else:
@@ -385,7 +410,58 @@ class AsyncWorker(Worker):
         else:
             self._prefetched_input = None
             self._prefetched_seqs = None
-    
+
+    def run_first_tp_async(self):
+        """First PP non-driver TP ranks: mirror rank-0 async batching (no scheduler).
+
+        Must use the same ``run_batch_async`` / ``step_collect_async`` ordering as
+        the driver so ``forward_stream`` and NCCL collectives stay aligned.
+        """
+        self.recv_schedule_seqs()
+
+        num_pending_before = len(self._result_queue)
+
+        if len(self.schedule_queue) > 0:
+            self.model_runner.sync_before_next_prepare()
+            input_data = self.schedule_queue.popleft()
+            self.model_runner.prepare_input(input_data=input_data)
+            event, batch_size, num_cal_tokens, future_indices, buf_idx = (
+                self.model_runner.run_batch_async()
+            )
+            self._result_queue.append(
+                (event, batch_size, num_cal_tokens, future_indices, buf_idx, None)
+            )
+            logger.debug(
+                "[async_sched tp_follower] rank=%s tp_rank=%s launch "
+                "batch_size=%s num_cal_tokens=%s buf_idx=%s pending_before=%s pending_after=%s",
+                self.rank,
+                get_tp_rank(),
+                batch_size,
+                num_cal_tokens,
+                buf_idx,
+                num_pending_before,
+                len(self._result_queue),
+            )
+
+        if num_pending_before > 0:
+            event, batch_size, num_cal_tokens, future_indices, buf_idx, _ = (
+                self._result_queue.popleft()
+            )
+            output = self.model_runner.step_collect_async(
+                event, batch_size, num_cal_tokens, buf_idx
+            )
+            logger.debug(
+                "[async_sched tp_follower] rank=%s tp_rank=%s collect "
+                "batch_size=%s num_cal_tokens=%s buf_idx=%s",
+                self.rank,
+                get_tp_rank(),
+                batch_size,
+                num_cal_tokens,
+                buf_idx,
+            )
+            if get_pp_size() != 1:
+                send_pp_data(output, get_next_pp_rank())
+
     def run_driver(self):
         self.schedule_forward_async()
 
@@ -397,7 +473,10 @@ def run_worker(worker: Worker):
             if worker.rank == 0:
                 worker.run_driver()
             elif worker.pp_rank == 0:
-                worker.run_first_tp()
+                if isinstance(worker, AsyncWorker):
+                    worker.run_first_tp_async()
+                else:
+                    worker.run_first_tp()
             else:
                 worker.run_other()
     except KeyboardInterrupt as e:
