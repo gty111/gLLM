@@ -268,14 +268,16 @@ def moe_align_block_size(
     """
     Align token distribution across experts to be compatible with block size.
 
-    Note: sgl_kernel requires an additional cumsum_buffer parameter.
+    Note: sgl_kernel internally does expert_id = topk_ids[i] + 1, so we must
+    pass num_experts + 1 to account for the shifted indexing. The output
+    expert_ids will be in range [-1, num_experts - 1].
     """
     cumsum_buffer = torch.empty(
-        (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+        (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
     _sgl_moe_align_block_size(
         topk_ids,
-        num_experts,
+        num_experts + 1,
         block_size,
         sorted_token_ids,
         experts_ids,
