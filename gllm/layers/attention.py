@@ -10,6 +10,51 @@ from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
 
+def _flash_attn_paged_varlen(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    cache_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    softmax_scale: float,
+    causal: bool = True,
+    return_softmax_lse: bool = False,
+):
+    """
+    Flash attention with paged KV cache and variable-length sequences.
+
+    Uses flash_attn_with_kvcache which supports both cu_seqlens_q (varlen) and
+    page_table (paged KV cache) simultaneously.
+
+    Args:
+        q: [total_tokens, num_heads, head_dim]
+        k_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        cu_seqlens_q: [batch_size + 1] cumulative query sequence lengths
+        max_seqlen_q: maximum query length
+        cache_seqlens: [batch_size] actual sequence lengths in KV cache
+        page_table: [batch_size, max_blocks_per_seq] block indices
+        softmax_scale: attention scaling factor
+        causal: whether to use causal masking
+        return_softmax_lse: whether to return logsumexp
+    """
+    out = flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_softmax_lse=return_softmax_lse,
+    )
+    return out
+
+
 class FlashAttention:
 
     def __init__(
@@ -44,14 +89,13 @@ class FlashAttention:
         k_cache = input_data.memory_manager.segment.k_cache[self.layer_id]
         v_cache = input_data.memory_manager.segment.v_cache[self.layer_id]
 
-        # Use sgl_kernel flash_attn_with_kvcache for paged attention
-        out = flash_attn_with_kvcache(
+        out = _flash_attn_paged_varlen(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            cache_seqlens=input_data.get_seq_lens(),
             cu_seqlens_q=input_data.get_query_start_loc(),
             max_seqlen_q=input_data.max_query_len,
+            cache_seqlens=input_data.get_seq_lens(),
             page_table=input_data.get_block_table(),
             softmax_scale=self.scale,
             causal=True,
