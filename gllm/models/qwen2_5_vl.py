@@ -345,11 +345,28 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
             stride=kernel_size,
             bias=False,
         )
+        # Workaround for PyTorch 2.9.x which disabled CUDNN Conv3D
+        # (https://github.com/pytorch/pytorch/issues/166122)
+        self._use_linear = (
+            torch.__version__.startswith("2.9.")
+        )
+        self._input_size = in_channels * temporal_patch_size * patch_size * patch_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         L, C = x.shape
         x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.hidden_size)
+        if self._use_linear:
+            # unfold + linear: equivalent to conv3d when kernel_size == stride
+            B, C_in, T, H, W = x.shape
+            K1, K2, K3 = self.temporal_patch_size, self.patch_size, self.patch_size
+            T_out, H_out, W_out = T // K1, H // K2, W // K3
+            x = x.unfold(2, K1, K1).unfold(3, K2, K2).unfold(4, K3, K3)
+            x = x.permute(0, 2, 3, 4, 1, 5, 6, 7).reshape(-1, self._input_size)
+            x = F.linear(x, self.proj.weight.view(self.hidden_size, self._input_size))
+            x = x.view(B, T_out, H_out, W_out, self.hidden_size).permute(0, 4, 1, 2, 3)
+            x = x.reshape(L, self.hidden_size)
+        else:
+            x = self.proj(x).view(L, self.hidden_size)
         return x
 
 
