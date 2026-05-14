@@ -923,11 +923,11 @@ def fused_experts_impl(
         )
 
         if activation == "silu":
-            torch.ops._C.silu_and_mul(
+            ops.silu_and_mul(
                 intermediate_cache2, intermediate_cache1.view(-1, N)
             )
         elif activation == "gelu":
-            torch.ops._C.gelu_and_mul(
+            ops.gelu_and_mul(
                 intermediate_cache2, intermediate_cache1.view(-1, N)
             )
         else:

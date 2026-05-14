@@ -8,7 +8,45 @@ import triton.language as tl
 from torch import nn
 
 from gllm.utils import yarn_get_mscale
-from gllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+
+
+def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
+    """
+    Apply rotary embedding to tensor x using cos and sin.
+
+    Args:
+        x: [batch, seqlen, nheads, headdim] or [1, seqlen, nheads, headdim]
+        cos: [seqlen, rotary_dim/2] or [1, seqlen, rotary_dim/2]
+        sin: [seqlen, rotary_dim/2] or [1, seqlen, rotary_dim/2]
+        interleaved: if True, use GPT-J style (interleaved pairs);
+                     if False, use NeoX style (split halves)
+
+    Returns:
+        Tensor with rotary embedding applied.
+    """
+    rot_dim = cos.shape[-1] * 2
+    x_rot = x[..., :rot_dim]
+    x_pass = x[..., rot_dim:]
+
+    if cos.ndim == 2:
+        # cos/sin: [seqlen, rotary_dim/2] -> broadcast to match x
+        cos = cos.unsqueeze(0).unsqueeze(2)  # [1, seqlen, 1, rotary_dim/2]
+        sin = sin.unsqueeze(0).unsqueeze(2)
+
+    if interleaved:
+        # GPT-J style: pairs are (x0, x1), (x2, x3), ...
+        x1 = x_rot[..., 0::2]
+        x2 = x_rot[..., 1::2]
+        out_rot = torch.stack([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+        out_rot = out_rot.flatten(-2)
+    else:
+        # NeoX style: split into first half and second half
+        half = rot_dim // 2
+        x1 = x_rot[..., :half]
+        x2 = x_rot[..., half:]
+        out_rot = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+    return torch.cat([out_rot, x_pass], dim=-1)
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -517,7 +555,8 @@ def apply_rotary_emb_dispatch(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    return apply_rotary_emb(x.unsqueeze(0), cos, sin, not is_neox_style).squeeze(0)
+    # apply_rotary_emb expects interleaved=True for GPT-J style (not is_neox)
+    return apply_rotary_emb(x.unsqueeze(0), cos, sin, interleaved=not is_neox_style).squeeze(0)
 
 
 class MRotaryEmbedding(RotaryEmbedding):

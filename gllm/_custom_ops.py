@@ -1,15 +1,49 @@
+"""
+Custom ops wrapper for gllm.
+
+This module provides the kernel operation interface used throughout gllm.
+All kernel calls go through this abstraction, making it the single point
+where we can swap backends (sgl-kernel, flashinfer, Triton, etc.).
+
+Previously used vllm's compiled _C.so and _moe_C.so;
+now uses sgl-kernel + flashinfer + custom Triton kernels.
+"""
+
 from typing import Optional
 
 import torch
 
-try:
-    import gllm._C
-    import gllm._moe_C  # noqa: F401
-except ImportError as e:
-    print(e)
+# sgl-kernel imports
+from sgl_kernel import (
+    fused_add_rmsnorm as _sgl_fused_add_rmsnorm,
+    moe_align_block_size as _sgl_moe_align_block_size,
+    moe_fused_gate as _sgl_moe_fused_gate,
+    moe_sum as _sgl_moe_sum,
+    rmsnorm as _sgl_rmsnorm,
+    rotary_embedding as _sgl_rotary_embedding,
+    silu_and_mul as _sgl_silu_and_mul,
+    gelu_and_mul as _sgl_gelu_and_mul,
+    topk_softmax as _sgl_topk_softmax,
+    merge_state_v2 as _sgl_merge_state_v2,
+    sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8,
+)
+
+# Custom Triton kernels
+from gllm.layers.ops.cache_kernels import (
+    concat_and_cache_mla as _triton_concat_and_cache_mla,
+    gather_and_maybe_dequant_cache as _triton_gather_and_maybe_dequant_cache,
+    reshape_and_cache_flash as _triton_reshape_and_cache_flash,
+)
+from gllm.layers.ops.batched_rotary_kernel import (
+    batched_rotary_embedding as _triton_batched_rotary_embedding,
+)
 
 
-# cache ops
+# =============================================================================
+# Cache ops
+# =============================================================================
+
+
 def reshape_and_cache_flash(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -20,15 +54,8 @@ def reshape_and_cache_flash(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache_flash(
-        key,
-        value,
-        key_cache,
-        value_cache,
-        slot_mapping,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
+    _triton_reshape_and_cache_flash(
+        key, value, key_cache, value_cache, slot_mapping, kv_cache_dtype, k_scale, v_scale
     )
 
 
@@ -40,9 +67,7 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.concat_and_cache_mla(
-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-    )
+    _triton_concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale)
 
 
 def gather_and_maybe_dequant_cache(
@@ -55,19 +80,16 @@ def gather_and_maybe_dequant_cache(
     scale: torch.Tensor,
     seq_starts: torch.Tensor | None = None,
 ) -> None:
-    torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
-        src_cache,
-        dst,
-        block_table,
-        cu_seq_lens,
-        batch_size,
-        kv_cache_dtype,
-        scale,
-        seq_starts,
+    _triton_gather_and_maybe_dequant_cache(
+        src_cache, dst, block_table, cu_seq_lens, batch_size, kv_cache_dtype, scale, seq_starts
     )
 
 
-# merge attn states ops
+# =============================================================================
+# Merge attention states
+# =============================================================================
+
+
 def merge_attn_states(
     output: torch.Tensor,
     prefix_output: torch.Tensor,
@@ -76,17 +98,50 @@ def merge_attn_states(
     suffix_lse: torch.Tensor,
     output_lse: Optional[torch.Tensor] = None,
 ) -> None:
-    torch.ops._C.merge_attn_states(
-        output, output_lse, prefix_output, prefix_lse, suffix_output, suffix_lse
+    """
+    Merge two partial attention outputs using log-sum-exp trick.
+
+    sgl_kernel.merge_state_v2 signature:
+        merge_state_v2(v_a, s_a, v_b, s_b, v_merged=None, s_merged=None)
+    """
+    _sgl_merge_state_v2(
+        v_a=prefix_output,
+        s_a=prefix_lse,
+        v_b=suffix_output,
+        s_b=suffix_lse,
+        v_merged=output,
+        s_merged=output_lse,
     )
 
 
-# activation ops
+# =============================================================================
+# Activation ops
+# =============================================================================
+
+
 def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
-    torch.ops._C.silu_and_mul(out, x)
+    """
+    Fused SiLU activation: out = silu(x[..., :d]) * x[..., d:]
+
+    Note: sgl_kernel uses (input, out) parameter order.
+    """
+    _sgl_silu_and_mul(x, out=out)
 
 
-# pos encoding ops
+def gelu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
+    """
+    Fused GELU activation: out = gelu(x[..., :d]) * x[..., d:]
+
+    Note: sgl_kernel uses (input, out) parameter order.
+    """
+    _sgl_gelu_and_mul(x, out=out)
+
+
+# =============================================================================
+# Position encoding ops
+# =============================================================================
+
+
 def rotary_embedding(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -95,9 +150,8 @@ def rotary_embedding(
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    torch.ops._C.rotary_embedding(
-        positions, query, key, head_size, cos_sin_cache, is_neox
-    )
+    """Apply rotary positional embedding in-place."""
+    _sgl_rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
 
 
 def batched_rotary_embedding(
@@ -110,31 +164,43 @@ def batched_rotary_embedding(
     rot_dim: int,
     cos_sin_cache_offsets: torch.Tensor,
 ) -> None:
-    torch.ops._C.batched_rotary_embedding(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        is_neox,
-        rot_dim,
-        cos_sin_cache_offsets,
+    """Apply batched rotary embedding with per-token cache offsets."""
+    _triton_batched_rotary_embedding(
+        positions, query, key, head_size, cos_sin_cache, is_neox, rot_dim, cos_sin_cache_offsets
     )
 
 
-# layer norm ops
+# =============================================================================
+# Layer norm ops
+# =============================================================================
+
+
 def rms_norm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> None:
-    # TODO: Remove this contiguous call when the kernel is updated to support non-contiguous input
+    """
+    RMS normalization: out = (input / RMS(input)) * weight
+
+    sgl_kernel.rmsnorm returns the result; we write to pre-allocated out.
+    """
     input = input.contiguous()
-    torch.ops._C.rms_norm(out, input, weight, epsilon)
+    _sgl_rmsnorm(input, weight, eps=epsilon, out=out)
 
 
 def fused_add_rms_norm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> None:
-    torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
+    """
+    Fused residual + RMS norm (in-place):
+      Step 1: residual += input
+      Step 2: input = (residual / RMS(residual)) * weight
+    """
+    _sgl_fused_add_rmsnorm(input, residual, weight, eps=epsilon)
+
+
+# =============================================================================
+# MoE ops
+# =============================================================================
 
 
 def topk_softmax(
@@ -143,14 +209,22 @@ def topk_softmax(
     token_expert_indicies: torch.Tensor,
     gating_output: torch.Tensor,
 ) -> None:
-    torch.ops._moe_C.topk_softmax(
-        topk_weights, topk_ids, token_expert_indicies, gating_output
+    """
+    Compute top-k softmax for MoE routing.
+
+    Note: sgl_kernel.topk_softmax doesn't use token_expert_indicies.
+    The parameter is kept for API compatibility but ignored.
+    """
+    _sgl_topk_softmax(
+        topk_weights,
+        topk_ids,
+        gating_output,
     )
 
 
-# moe
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
-    torch.ops._moe_C.moe_sum(input, output)
+    """Sum expert outputs: output += sum(input, dim=1)"""
+    _sgl_moe_sum(input, output)
 
 
 def moe_align_block_size(
@@ -161,13 +235,23 @@ def moe_align_block_size(
     experts_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
 ) -> None:
-    torch.ops._moe_C.moe_align_block_size(
+    """
+    Align token distribution across experts to be compatible with block size.
+
+    Note: sgl_kernel requires an additional cumsum_buffer.
+    """
+    # Allocate cumsum buffer needed by sgl_kernel
+    cumsum_buffer = torch.empty(
+        (num_experts + 1,), dtype=torch.int32, device=topk_ids.device
+    )
+    _sgl_moe_align_block_size(
         topk_ids,
         num_experts,
         block_size,
         sorted_token_ids,
         experts_ids,
         num_tokens_post_pad,
+        cumsum_buffer,
     )
 
 
@@ -180,12 +264,49 @@ def grouped_topk(
     renormalize: bool,
     routed_scaling_factor: float,
 ):
-    return torch.ops._moe_C.grouped_topk(
-        scores,
-        scores_with_bias,
-        num_expert_group,
-        topk_group,
-        topk,
-        renormalize,
-        routed_scaling_factor,
+    """
+    Two-stage expert selection (DeepSeek-V2/V3 style).
+
+    Uses sgl_kernel.moe_fused_gate for the fused implementation.
+    """
+    # moe_fused_gate expects the bias to be separate from scores
+    # It takes (input_tensor, bias, num_expert_group, topk_group, topk, ...)
+    # and returns (topk_weights, topk_ids)
+    bias = scores_with_bias - scores  # Extract the bias component
+
+    topk_weights, topk_ids = _sgl_moe_fused_gate(
+        input_tensor=scores,
+        bias=bias,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        topk=topk,
+        routed_scaling_factor=routed_scaling_factor,
     )
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    return topk_weights, topk_ids
+
+
+# =============================================================================
+# Quantization ops
+# =============================================================================
+
+
+def scaled_fp8_quant(
+    input: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+    use_per_token_if_dynamic: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize input tensor to FP8.
+
+    Uses sgl_kernel.sgl_per_token_quant_fp8 for per-token quantization.
+    """
+    output_q = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+    output_s = torch.empty(
+        input.shape[0], dtype=torch.float32, device=input.device
+    )
+    _sgl_per_token_quant_fp8(input, output_q, output_s)
+    return output_q, output_s

@@ -25,7 +25,7 @@ from gllm.layers.linear import (
     RowParallelLinear,
 )
 from gllm.utils import cast_overflow_tensors
-from gllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+from gllm.layers.rotary_embedding import apply_rotary_emb
 
 from .qwen2 import Qwen2ForCausalLM
 from .weight_utils import (
@@ -259,7 +259,7 @@ class Qwen2_5_VisionAttention(nn.Module):
 
         q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
         
-        from flash_attn import flash_attn_varlen_func
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
 
         output = flash_attn_varlen_func(
             q,
