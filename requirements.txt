@@ -5,14 +5,13 @@ transformers >= 4.55.2, < 5
 fastapi[standard] >= 0.115.0
 openai >= 1.99.1
 logger
-torch==2.8.0
-torchvision==0.23.0
+torch==2.9.1
+torchvision==0.24.1
 zmq
 aiohttp
 datasets
 pillow
 einops # qwen2_5_vl
 av # video
-sgl-kernel>=0.4.0
-flashinfer>=0.2.0
+sgl-kernel==0.3.21
 triton
