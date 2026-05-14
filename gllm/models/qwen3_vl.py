@@ -36,19 +36,19 @@ class Qwen3_VisionPatchEmbed(nn.Module):
         self.temporal_patch_size = temporal_patch_size
         self.hidden_size = hidden_size
 
+        from gllm.layers.conv import Conv3dPatchEmbed
+
         kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(
-            in_channels,
-            hidden_size,
-            kernel_size=kernel_size,
-            stride=kernel_size,
-            bias=True,
+        self._conv = Conv3dPatchEmbed(
+            in_channels, hidden_size, kernel_size=kernel_size, bias=True
         )
+        # Keep self.proj as reference for weight loading
+        self.proj = self._conv.proj
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         L, C = x.shape
         x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.hidden_size)
+        x = self._conv(x).view(L, self.hidden_size)
         return x
     
 class Qwen3_VisionMLP(nn.Module):
