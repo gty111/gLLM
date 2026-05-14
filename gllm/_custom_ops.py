@@ -181,10 +181,16 @@ def rms_norm(
     """
     RMS normalization: out = (input / RMS(input)) * weight
 
-    sgl_kernel.rmsnorm returns the result; we write to pre-allocated out.
+    sgl_kernel.rmsnorm requires 2D input; reshape if needed.
     """
     input = input.contiguous()
-    _sgl_rmsnorm(input, weight, eps=epsilon, out=out)
+    orig_shape = input.shape
+    if input.ndim != 2:
+        input = input.view(-1, input.shape[-1])
+        out_2d = out.view(-1, out.shape[-1])
+        _sgl_rmsnorm(input, weight, eps=epsilon, out=out_2d)
+    else:
+        _sgl_rmsnorm(input, weight, eps=epsilon, out=out)
 
 
 def fused_add_rms_norm(
@@ -194,8 +200,16 @@ def fused_add_rms_norm(
     Fused residual + RMS norm (in-place):
       Step 1: residual += input
       Step 2: input = (residual / RMS(residual)) * weight
+
+    sgl_kernel requires 2D tensors; reshape if needed.
     """
-    _sgl_fused_add_rmsnorm(input, residual, weight, eps=epsilon)
+    orig_shape = input.shape
+    if input.ndim != 2:
+        input_2d = input.view(-1, input.shape[-1])
+        residual_2d = residual.view(-1, residual.shape[-1])
+        _sgl_fused_add_rmsnorm(input_2d, residual_2d, weight, eps=epsilon)
+    else:
+        _sgl_fused_add_rmsnorm(input, residual, weight, eps=epsilon)
 
 
 # =============================================================================
