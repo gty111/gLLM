@@ -284,7 +284,7 @@ def moe_align_block_size(
         experts_ids,
         num_tokens_post_pad,
         cumsum_buffer,
-        True,  # pad_sorted_token_ids
+        False,  # pad_sorted_token_ids - match caller's buffer allocation
     )
 
 
