@@ -178,6 +178,12 @@ def apply_rotary_pos_emb_vision(t: torch.Tensor, freqs: torch.Tensor) -> torch.T
     t_ = t.float()
     cos = freqs.cos()
     sin = freqs.sin()
+    # t_: [seq_len, batch, heads, head_dim], cos/sin: [seq_len, rotary_dim/2]
+    # Need to unsqueeze cos/sin to broadcast: [seq_len, 1, 1, rotary_dim/2]
+    ndim_diff = t_.ndim - cos.ndim
+    for _ in range(ndim_diff - 1):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
     output = apply_rotary_emb(t_, cos, sin).type_as(t)
     return output
 
