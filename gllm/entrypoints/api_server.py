@@ -33,6 +33,11 @@ router = APIRouter()
 llm: PipeAsyncLLM = None
 
 
+@router.get("/health")
+async def health():
+    return JSONResponse(content={"status": "ok"})
+
+
 @router.get("/v1/models")
 async def show_available_models():
     models = ModelList(
