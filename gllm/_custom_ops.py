@@ -123,8 +123,17 @@ def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
     """
     Fused SiLU activation: out = silu(x[..., :d]) * x[..., d:]
 
-    Note: sgl_kernel uses (input, out) parameter order.
+    Note: sgl_kernel requires 16-byte alignment on last dim.
+    Falls back to PyTorch native when alignment is not met.
     """
+    # sgl_kernel requires output rows to be 16-byte aligned for subsequent ops
+    d = x.shape[-1] // 2
+    if d * x.element_size() % 16 != 0:
+        # Fallback: output dim not 16-byte aligned (e.g., vision encoder dim=3420 in bf16)
+        x_flat = x.view(-1, x.shape[-1])
+        out_flat = out.view(-1, d)
+        out_flat.copy_(torch.nn.functional.silu(x_flat[..., :d]) * x_flat[..., d:])
+        return
     _sgl_silu_and_mul(x, out=out)
 
 
@@ -132,8 +141,15 @@ def gelu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
     """
     Fused GELU activation: out = gelu(x[..., :d]) * x[..., d:]
 
-    Note: sgl_kernel uses (input, out) parameter order.
+    Note: sgl_kernel requires 16-byte alignment on last dim.
+    Falls back to PyTorch native when alignment is not met.
     """
+    d = x.shape[-1] // 2
+    if d * x.element_size() % 16 != 0:
+        x_flat = x.view(-1, x.shape[-1])
+        out_flat = out.view(-1, d)
+        out_flat.copy_(torch.nn.functional.gelu(x_flat[..., :d]) * x_flat[..., d:])
+        return
     _sgl_gelu_and_mul(x, out=out)
 
 
