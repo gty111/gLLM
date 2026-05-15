@@ -15,7 +15,7 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 <img src=doc/pic/overview.svg width=500>
 </p>
 
-Integreted with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **cuda graph**, **token throttling**, **pipeline parallelism**, **expert parallelsim** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (**supported in huggingface**) inference. gLLM provides **equivalent or superior** offline/online inference speed with mainstream inference engine and **minimal** code base. You can also see gLLM as a LLM inference playground for doing experiment or academic research.
+Integrated with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **cuda graph**, **token throttling**, **pipeline parallelism**, **expert parallelism** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (supported in HuggingFace) inference. gLLM provides **equivalent or superior** offline/online inference speed compared to mainstream inference engines, with a **minimal** code base. You can also see gLLM as an LLM inference playground for experiments or academic research.
 
 *Latest News* :fire:
 - [2025/12/04]: Cuda graph is supported :tada:
@@ -56,27 +56,34 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 <img src=doc/pic/decode_throttling.svg >
 </p>
 
-## Install gLLM
+## Installation
+
+- For development:
+```bash
+uv pip install -e .
 ```
-pip install -e .
+
+- For release:
+```bash
+uv pip install gllm-rt==0.0.6.post1
 ```
 
 ## Quickstart
 
 ### Interactive Offline Chat
-```
+```bash
 python examples/chat.py --model $MODEL_PATH
 ```
 
 ### Offline Batch Inference
-```
+```bash
 python examples/batch_inference.py --model $MODEL \
     --share-gpt-path $SHARE_GPT_PATH --num-prompt $NUM_PROMPT \
     --gpu-memory-util $GPU_MEMORY_UTIL
 ```
 
 ### Offline Benchmark
-```
+```bash
 python benchmarks/benchmark_throughput.py --model $MODEL \
     --dataset $SHAREGPT_PATH --num-prompt $NUM_PROMPT --backend gllm \
     --gpu-memory-util $GPU_MEMORY_UTIL
@@ -84,7 +91,7 @@ python benchmarks/benchmark_throughput.py --model $MODEL \
 
 ### Launch OpenAI-Compatible Server (Intra-node)
 
-```
+```bash
 # To see the description of args, run 'python -m gllm.entrypoints.api_server -h'
 python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
     --enable-prefix-caching --pp $PP --tp $TP
@@ -92,41 +99,41 @@ python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
 
 ### Launch OpenAI-Compatible Server (Multi-node)
 
-gLLM can be launched in three modes: (1) `normal`, used for single-node multiple GPUs (2) `master`, used for multi-node deployment (3) `slave`, used for multi-node deployment.
+gLLM supports three launch modes: (1) `normal` for single-node multiple GPUs, (2) `master` for multi-node deployment, and (3) `slave` for multi-node deployment.
 
-To launch master gLLM instance
-```
+To launch the master instance:
+```bash
 python -m gllm.entrypoints.api_server --port $PORT --master-port $MASTER_PORT \
     --model-path $MODEL_PATH --pp $PP --launch-mode master --worker-ranks $RANKS
 ```
-To launch slave gLLM instance
-```
+To launch the slave instance:
+```bash
 python -m gllm.entrypoints.api_server --host $HOST \
     --master-addr $MASTER_ADDR --master-port $MASTER_PORT \
     --model-path $MODEL_PATH --pp $PP --launch-mode slave --worker-ranks $RANKS
 ```
-There are something you need to care about
-- Make sure `$MASTER_PORT` and `$MASTER_ADDR` in slave instance can be matched to that in master instance
-- Make sure slave instance can set up connection with master instance using `$MASTER_ADDR`
-- Make sure master instance can set up connection with slave instance using `$HOST`
-- Make sure `$PP` can be matched to `$RANKS` in slave or master instance
-    - For example, we want to launch two gLLM instances, `$PP` is set to `4`, `$RANKS` in master is set to `0,1`, then `$RANKS` in slave must set to `2,3`
-- Make sure set environment variable `NCCL_SOCKET_IFNAME` `NCCL_IB_DISABLE` properly
+
+> **Notes:**
+> - Ensure `$MASTER_PORT` and `$MASTER_ADDR` in the slave instance match those in the master instance
+> - Ensure the slave instance can connect to the master instance using `$MASTER_ADDR`
+> - Ensure the master instance can connect to the slave instance using `$HOST`
+> - Ensure `$PP` matches `$RANKS` across instances (e.g., if `$PP=4` and master has `$RANKS=0,1`, then slave must have `$RANKS=2,3`)
+> - Set environment variables `NCCL_SOCKET_IFNAME` and `NCCL_IB_DISABLE` properly
 
 ### Client Completions
-```
+```bash
 # Launch server first
 python examples/client.py --port $PORT
 ```
 
 ### Interactive Online Chat
-```
+```bash
 # Launch server first
 python examples/chat_client.py --port $PORT
 ```
 
 ### Online Benchmark
-```
+```bash
 # Launch server first
 python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
         --dataset-name $DATASET_NAME --dataset-path $DATASET_PATH \
@@ -135,7 +142,7 @@ python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
 ```
 
 ### Online Prefix Benchmark
-```
+```bash
 # Launch server first
 python benchmarks/benchmark_prefix_serving.py \
         --trust-remote-code --backend $BACKEND --dataset $SHAREGPT_PATH \
@@ -146,7 +153,7 @@ python benchmarks/benchmark_prefix_serving.py \
 ```
 
 ### Evaluate Output Quality
-```
+```bash
 # Launch server first
 python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 ```
@@ -160,7 +167,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
 - ChatGLM Series: Glm4 and Chatglm3
 
-## Supported Quantization Method
+## Supported Quantization Methods
 
 - fp8
 
@@ -204,4 +211,4 @@ url={https://openreview.net/forum?id=D6w7wIN360}
 
 ## Acknowledgment
 
-We studied the architecture and implemented code reuse from these existing projects: [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [TD-Pipe]().
+We studied the architecture and reused code from these existing projects: [vLLM](https://github.com/vllm-project/vllm), [SGLang](https://github.com/sgl-project/sglang) and [TD-Pipe]().
