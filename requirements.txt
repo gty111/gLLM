@@ -14,4 +14,3 @@ pillow
 einops # qwen2_5_vl
 av # video
 sgl-kernel==0.3.21
-triton

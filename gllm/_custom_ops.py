@@ -3,10 +3,10 @@ Custom ops wrapper for gllm.
 
 This module provides the kernel operation interface used throughout gllm.
 All kernel calls go through this abstraction, making it the single point
-where we can swap backends (sgl-kernel, flashinfer, Triton, etc.).
+where we can swap backends (sgl-kernel, Triton, etc.).
 
 Previously used vllm's compiled _C.so and _moe_C.so;
-now uses sgl-kernel + flashinfer + custom Triton kernels.
+now uses sgl-kernel + custom Triton kernels.
 """
 
 from typing import Optional
