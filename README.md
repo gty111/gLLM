@@ -58,7 +58,7 @@ Integreted with features like **continuous batching**, **paged attention**, **ch
 
 ## Install gLLM
 ```
-./install.sh
+pip install -e .
 ```
 
 ## Quickstart

@@ -17,7 +17,7 @@ def topk_softmax(
     ops.topk_softmax(
         topk_weights,
         topk_indices,
-        token_expert_indices,
+        token_expert_indices,  # kept for API compat, ignored by sgl_kernel
         gating_output,
     )
     if renormalize:

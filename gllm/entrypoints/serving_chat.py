@@ -10,6 +10,16 @@ from gllm.entrypoints.protocol import (
     UsageInfo,
 )
 
+# Common stop strings that should be stripped from model output
+_STOP_STRINGS = ["<|im_end|>", "<|endoftext|>", "<|end|>", "</s>"]
+
+
+def _strip_stop_strings(text: str) -> str:
+    for s in _STOP_STRINGS:
+        if text.endswith(s):
+            text = text[: -len(s)]
+    return text
+
 
 async def chat_completion_generator(
     stream: AsyncStream, request: ChatCompletionRequest
@@ -17,6 +27,7 @@ async def chat_completion_generator(
     full_text = ""
     async for text in stream:
         full_text += text
+    full_text = _strip_stop_strings(full_text)
     choice_data = ChatCompletionResponseChoice(
         index=0, message=ChatMessage(role="assistant", content=full_text)
     )
@@ -30,6 +41,10 @@ async def chat_completion_stream_generator(
     stream: AsyncStream, request: ChatCompletionRequest
 ):
     async for text in stream:
+        # Strip stop strings if they appear at the end of a chunk
+        text = _strip_stop_strings(text)
+        if not text:
+            continue
         choice_data = ChatCompletionResponseStreamChoice(
             index=0, delta=DeltaMessage(content=text)
         )

@@ -25,7 +25,7 @@ from gllm.layers.linear import (
     RowParallelLinear,
 )
 from gllm.utils import cast_overflow_tensors
-from gllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+from gllm.layers.rotary_embedding import apply_rotary_emb
 
 from .qwen2 import Qwen2ForCausalLM
 from .weight_utils import (
@@ -178,6 +178,12 @@ def apply_rotary_pos_emb_vision(t: torch.Tensor, freqs: torch.Tensor) -> torch.T
     t_ = t.float()
     cos = freqs.cos()
     sin = freqs.sin()
+    # t_: [seq_len, batch, heads, head_dim], cos/sin: [seq_len, rotary_dim/2]
+    # Need to unsqueeze cos/sin to broadcast: [seq_len, 1, 1, rotary_dim/2]
+    ndim_diff = t_.ndim - cos.ndim
+    for _ in range(ndim_diff - 1):
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
     output = apply_rotary_emb(t_, cos, sin).type_as(t)
     return output
 
@@ -259,7 +265,7 @@ class Qwen2_5_VisionAttention(nn.Module):
 
         q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
         
-        from flash_attn import flash_attn_varlen_func
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
 
         output = flash_attn_varlen_func(
             q,
@@ -269,7 +275,6 @@ class Qwen2_5_VisionAttention(nn.Module):
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
-            dropout_p=0.0,
             causal=False,
         )
 
@@ -340,12 +345,24 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
             stride=kernel_size,
             bias=False,
         )
+        self._use_linear = torch.__version__.startswith("2.9.")
+        self._input_size = in_channels * temporal_patch_size * patch_size * patch_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         L, C = x.shape
         x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.hidden_size)
+        if self._use_linear:
+            from gllm.layers.conv import conv3d_patch_forward
+            x = conv3d_patch_forward(x, self.proj.weight, self.proj.bias,
+                                     self.hidden_size, self._input_size, self.kernel_size)
+            x = x.view(L, self.hidden_size)
+        else:
+            x = self.proj(x).view(L, self.hidden_size)
         return x
+
+    @property
+    def kernel_size(self):
+        return (self.temporal_patch_size, self.patch_size, self.patch_size)
 
 
 class Qwen2_5_VisionPatchMerger(nn.Module):

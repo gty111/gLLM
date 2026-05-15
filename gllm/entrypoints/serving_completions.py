@@ -7,12 +7,14 @@ from gllm.entrypoints.protocol import (
     CompletionStreamResponse,
     UsageInfo,
 )
+from gllm.entrypoints.serving_chat import _strip_stop_strings
 
 
 async def completion_generator(stream: AsyncStream, request: CompletionRequest):
     full_text = ""
     async for text in stream:
         full_text += text
+    full_text = _strip_stop_strings(full_text)
     choice_data = CompletionResponseChoice(index=0, text=full_text)
     completion = CompletionResponse(
         choices=[choice_data], model=request.model, usage=UsageInfo()
@@ -22,6 +24,9 @@ async def completion_generator(stream: AsyncStream, request: CompletionRequest):
 
 async def completion_stream_generator(stream: AsyncStream, request: CompletionRequest):
     async for text in stream:
+        text = _strip_stop_strings(text)
+        if not text:
+            continue
         choice_data = CompletionResponseStreamChoice(index=0, text=text)
         chunk = CompletionStreamResponse(choices=[choice_data], model=request.model)
         data = chunk.model_dump_json(exclude_unset=False)

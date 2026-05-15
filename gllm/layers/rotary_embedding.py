@@ -8,7 +8,43 @@ import triton.language as tl
 from torch import nn
 
 from gllm.utils import yarn_get_mscale
-from gllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+
+
+def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
+    """
+    Apply rotary embedding to tensor x using cos and sin.
+
+    Args:
+        x: [..., head_size] - arbitrary leading dims
+        cos: [..., head_size // 2] - must broadcast with x
+        sin: [..., head_size // 2] - must broadcast with x
+        interleaved: if True, use GPT-J style (interleaved pairs);
+                     if False, use NeoX style (split halves)
+
+    Returns:
+        Tensor with rotary embedding applied.
+    """
+    rot_dim = cos.shape[-1] * 2
+    x_rot = x[..., :rot_dim]
+    x_pass = x[..., rot_dim:]
+
+    if not interleaved:
+        # NeoX style: split into first half and second half
+        x1, x2 = x_rot.chunk(2, dim=-1)
+    else:
+        # GPT-J style: interleaved pairs
+        x1 = x_rot[..., ::2]
+        x2 = x_rot[..., 1::2]
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    if not interleaved:
+        out_rot = torch.cat((o1, o2), dim=-1)
+    else:
+        out_rot = torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    if x_pass.shape[-1] > 0:
+        return torch.cat((out_rot, x_pass), dim=-1)
+    return out_rot
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -517,7 +553,10 @@ def apply_rotary_emb_dispatch(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    return apply_rotary_emb(x.unsqueeze(0), cos, sin, not is_neox_style).squeeze(0)
+    # Unsqueeze cos/sin to broadcast over heads dim: [num_tokens, 1, head_size//2]
+    cos = cos.unsqueeze(-2).to(x.dtype)
+    sin = sin.unsqueeze(-2).to(x.dtype)
+    return apply_rotary_emb(x, cos, sin, interleaved=not is_neox_style)
 
 
 class MRotaryEmbedding(RotaryEmbedding):

@@ -7,8 +7,52 @@ from gllm.input_data import InputData, MLACommonMetadata, MLACommonPrefillMetada
 from gllm.layers.linear import ColumnParallelLinear, LinearBase
 from gllm.layers.ops.merge_attn_states import merge_attn_states
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
-from gllm.utils import get_flash_attn_version
-from gllm.vllm_flash_attn import flash_attn_varlen_func
+from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
+
+
+def _flash_attn_paged_varlen(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    cache_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    softmax_scale: float,
+    causal: bool = True,
+    return_softmax_lse: bool = False,
+):
+    """
+    Flash attention with paged KV cache and variable-length sequences.
+
+    Uses flash_attn_with_kvcache which supports both cu_seqlens_q (varlen) and
+    page_table (paged KV cache) simultaneously.
+
+    Args:
+        q: [total_tokens, num_heads, head_dim]
+        k_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        v_cache: [num_blocks, block_size, num_kv_heads, head_dim]
+        cu_seqlens_q: [batch_size + 1] cumulative query sequence lengths
+        max_seqlen_q: maximum query length
+        cache_seqlens: [batch_size] actual sequence lengths in KV cache
+        page_table: [batch_size, max_blocks_per_seq] block indices
+        softmax_scale: attention scaling factor
+        causal: whether to use causal masking
+        return_softmax_lse: whether to return logsumexp
+    """
+    out = flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_softmax_lse=return_softmax_lse,
+    )
+    return out
 
 
 class FlashAttention:
@@ -26,7 +70,6 @@ class FlashAttention:
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.fa_version = get_flash_attn_version()
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, input_data: InputData
@@ -46,18 +89,16 @@ class FlashAttention:
         k_cache = input_data.memory_manager.segment.k_cache[self.layer_id]
         v_cache = input_data.memory_manager.segment.v_cache[self.layer_id]
 
-        out = flash_attn_varlen_func(
-            q,
-            k_cache,
-            v_cache,
+        out = _flash_attn_paged_varlen(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
             cu_seqlens_q=input_data.get_query_start_loc(),
             max_seqlen_q=input_data.max_query_len,
-            seqused_k=input_data.get_seq_lens(),
-            max_seqlen_k=input_data.max_seq_len,
+            cache_seqlens=input_data.get_seq_lens(),
+            page_table=input_data.get_block_table(),
             softmax_scale=self.scale,
             causal=True,
-            block_table=input_data.get_block_table(),
-            fa_version=self.fa_version,
         )
         return out.view(-1, out.shape[-2] * out.shape[-1])
 
@@ -84,7 +125,6 @@ class MLAAttention:
         self.num_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
-        self.fa_version = get_flash_attn_version()
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
@@ -141,21 +181,16 @@ class MLAAttention:
             v=maybe_padded_v,
             return_softmax_lse=return_softmax_lse,
             softmax_scale=softmax_scale,
-            fa_version=self.fa_version,
             **kwargs,
         )
 
-        # Unpack the output if there is multiple results,
-        # triton always returns (output, softmax_lse),
-        # vllm_flash_attn returns (output, softmax_lse) when
-        #  `return_softmax_lse = True`
-        # flash_attn (RoCM) returns (output, softmax_lse, ...) when
-        #  `return_attn_probs = True`
+        # Unpack the output if there are multiple results
+        # sgl_kernel returns (output, softmax_lse) if return_softmax_lse=True
         rest = None
         if isinstance(attn_out, tuple):
             attn_out, *rest = attn_out
 
-        # Remain consistent with old `flash_attn_varlen_func` where there
+        # Remain consistent with old interface where there
         # is only one output tensor if `return_softmax_lse` is False.
         if return_softmax_lse:
             assert rest is not None

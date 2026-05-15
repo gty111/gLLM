@@ -57,14 +57,18 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    # sgl_kernel internally uses (num_experts + 1) buckets due to expert_id +1 shift,
+    # so buffer must be sized accordingly.
+    num_experts_sgl = num_experts + 1
+    max_num_tokens_padded = topk_ids.numel() + num_experts_sgl * (block_size - 1)
     if pad_sorted_ids:
         max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    expert_ids = torch.empty(
+    # torch.zeros fix for padding block
+    expert_ids = torch.zeros(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
