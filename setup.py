@@ -40,7 +40,7 @@ def get_requirements() -> List[str]:
 
 setup(
     name="gllm",
-    version="0.1.0",
+    version="0.0.6",
     author="gtyinstinct",
     license="Apache 2.0",
     description="A high-throughput and memory-efficient inference and serving engine for LLMs",

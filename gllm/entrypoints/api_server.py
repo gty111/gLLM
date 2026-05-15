@@ -40,14 +40,14 @@ async def health():
 
 @router.get("/version")
 async def version():
-    return JSONResponse(content={"version": "0.1.0"})
+    return JSONResponse(content={"version": "0.0.6"})
 
 
 @router.get("/server_info")
 async def server_info():
     return JSONResponse(content={
         "model": llm.model_path if llm else "",
-        "version": "0.1.0",
+        "version": "0.0.6",
         "status": "running",
     })
 
