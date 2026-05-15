@@ -283,7 +283,7 @@ def moe_align_block_size(
         experts_ids,
         num_tokens_post_pad,
         cumsum_buffer,
-        False,
+        True,
     )
 
 
