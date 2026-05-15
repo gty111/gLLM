@@ -26,29 +26,31 @@ class Sampler:
         p: torch.Tensor,
         k: torch.Tensor,
     ) -> torch.Tensor:
-        logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
+        # Use topk instead of full sort for better performance.
+        # Determine the maximum k value needed across the batch.
+        k_long = k.to(torch.long)
+        max_k = min(k_long.max().item(), logits.size(1))
 
-        # Apply top-k.
-        top_k_mask = logits_sort.size(1) - k.to(torch.long)
-        # Get all the top_k values.
-        top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
-        top_k_mask = logits_sort < top_k_mask
-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
+        # Get top-k values and indices (descending order).
+        top_values, top_indices = torch.topk(logits, max_k, dim=-1, sorted=True)
 
-        # Apply top-p.
-        probs_sort = logits_sort.softmax(dim=-1)
-        probs_sum = probs_sort.cumsum(dim=-1)
-        top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
-        # at least one
-        top_p_mask[:, -1] = False
-        logits_sort.masked_fill_(top_p_mask, -float("inf"))
+        # Apply per-sample top-k masking (for samples with k < max_k).
+        if not (k_long == max_k).all():
+            # Create a range tensor [0, 1, ..., max_k-1] and mask positions >= per-sample k
+            range_tensor = torch.arange(max_k, device=logits.device).unsqueeze(0)
+            topk_mask = range_tensor >= k_long.unsqueeze(1)
+            top_values.masked_fill_(topk_mask, -float("inf"))
 
-        # Re-sort the probabilities.
-        src = torch.arange(logits_idx.shape[-1], device=logits_idx.device).expand_as(
-            logits_idx
-        )
-        logits_idx_inv = torch.empty_like(logits_idx).scatter_(
-            dim=-1, index=logits_idx, src=src
-        )
-        logits = torch.gather(logits_sort, dim=-1, index=logits_idx_inv)
+        # Apply top-p filtering on the top-k values.
+        probs_sort = torch.softmax(top_values, dim=-1)
+        probs_cumsum = probs_sort.cumsum(dim=-1)
+        # Remove tokens with cumulative probability above the threshold,
+        # but always keep at least one token (the top-1).
+        top_p_mask = (probs_cumsum - probs_sort) >= p.unsqueeze(dim=1)
+        top_values.masked_fill_(top_p_mask, -float("inf"))
+
+        # Scatter filtered values back to original logit positions.
+        # Fill with -inf first, then place the filtered top-k values.
+        logits.fill_(-float("inf"))
+        logits.scatter_(dim=-1, index=top_indices, src=top_values)
         return logits
