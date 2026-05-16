@@ -66,19 +66,25 @@ class InputData:
                 seq.top_k if seq.top_k != -1 else self.memory_manager.vocab_size
                 for seq in self.seqs
             ],
-            self.memory_manager.dtype,
+            torch.int32,
             "cuda",
             True,
         )
-        repetition_penalty = async_tensor_h2d(
-            [seq.repetition_penalty for seq in self.seqs],
-            self.memory_manager.dtype,
-            "cuda",
-            True,
+        self.needs_repetition_penalty = any(
+            seq.repetition_penalty != 1.0 for seq in self.seqs
         )
-        self.repetition_penalty = repetition_penalty.unsqueeze(dim=1).repeat(
-            1, self.memory_manager.vocab_size
-        )
+        if self.needs_repetition_penalty:
+            repetition_penalty = async_tensor_h2d(
+                [seq.repetition_penalty for seq in self.seqs],
+                self.memory_manager.dtype,
+                "cuda",
+                True,
+            )
+            self.repetition_penalty = repetition_penalty.unsqueeze(dim=1).repeat(
+                1, self.memory_manager.vocab_size
+            )
+        else:
+            self.repetition_penalty = None
 
     def cal_input(self, seqs: List[Sequence]):
         assert len(seqs) != 0
@@ -149,6 +155,7 @@ class InputData:
             "top_p",
             "top_k",
             "repetition_penalty",
+            "needs_repetition_penalty",
         ]
         mla_attrs_copy = [
             "num_actual_tokens",
