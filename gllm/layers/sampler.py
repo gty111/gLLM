@@ -53,7 +53,7 @@ class Sampler:
         seqs = input_data.seqs
         vocab_size = input_data.memory_manager.vocab_size
         return {
-            "is_all_greedy": all(seq.top_k <= 1 for seq in seqs),
+            "is_all_greedy": all(seq.top_k == 1 for seq in seqs),
             "need_top_p_sampling": any(seq.top_p < 1.0 for seq in seqs),
             "need_top_k_sampling": any(
                 seq.top_k != -1 and seq.top_k < vocab_size for seq in seqs
