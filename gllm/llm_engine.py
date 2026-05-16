@@ -235,27 +235,32 @@ class LLM:
     def add_requests(self, requests: List[Sequence]):
         self.wait_lists.extend(requests)
 
+    def _process_output_ipc_package(self, ipc_package: IPCPackage) -> int:
+        for idx, id in enumerate(ipc_package.act_schedule_ids):
+            if len(ipc_package.next_tokens) != 0:
+                seq: Sequence = self.running_maps[id]
+                seq.append(ipc_package.next_tokens[idx])
+                if self.async_streams:
+                    self.async_streams[id].put(
+                        seq.detokenize_inc(self.model_runner.tokenizer)
+                    )
+            if id in ipc_package.free_ids:
+                self.running_maps.pop(id)
+                if self.async_streams:
+                    self.async_streams[id].finish()
+                    del self.async_streams[id]
+        self.free_finish_ids(ipc_package.free_ids)
+        return len(ipc_package.free_ids)
+
     def recv_ipc_package(self):
         """
         return: number of finished requests in each schedule
         """
         ipc_package: IPCPackage = self.comm.recv_output()
         if ipc_package is not None:
-            for idx, id in enumerate(ipc_package.act_schedule_ids):
-                if len(ipc_package.next_tokens) != 0:
-                    seq: Sequence = self.running_maps[id]
-                    seq.append(ipc_package.next_tokens[idx])
-                    if self.async_streams:
-                        self.async_streams[id].put(
-                            seq.detokenize_inc(self.model_runner.tokenizer)
-                        )
-                if id in ipc_package.free_ids:
-                    self.running_maps.pop(id)
-                    if self.async_streams:
-                        self.async_streams[id].finish()
-                        del self.async_streams[id]
-            self.free_finish_ids(ipc_package.free_ids)
-            return len(ipc_package.free_ids)
+            if ipc_package.profile_stopped:
+                return 0
+            return self._process_output_ipc_package(ipc_package)
         return 0
 
     def send_ipc_package(self, log=True):
@@ -281,8 +286,21 @@ class LLM:
     def start_profile(self):
         self.send_control_command("start_profile")
 
-    def stop_profile(self):
+    def stop_profile(self, timeout: float = 300.0):
         self.send_control_command("stop_profile")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.check_worker_alive()
+            ipc_package: IPCPackage = self.comm.recv_output()
+            if ipc_package is None:
+                time.sleep(0.001)
+                continue
+            if ipc_package.profile_stopped:
+                return
+            self._process_output_ipc_package(ipc_package)
+        raise TimeoutError(
+            f"Timed out after {timeout}s waiting for profiler traces to be written"
+        )
 
     def schedule(self, log=True):
         self.check_worker_alive()

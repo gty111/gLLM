@@ -26,6 +26,7 @@ class IPCPackage:
         self.abort_ids = []  # seq_ids to abort
         self.control_cmd = None  # optional control command (e.g., start/stop profile)
         # worker => front-end
+        self.profile_stopped = False  # set when all ranks finished exporting traces
         self.free_ids = []  # seq_ids to free
         self.act_schedule_ids = []
         self.next_tokens = []

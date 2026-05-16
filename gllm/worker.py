@@ -167,7 +167,11 @@ class Worker(TorchProfilerMixin):
                 if ipc_package.log is not None:
                     self.scheduler.set_log(ipc_package.log)
                 if ipc_package.control_cmd is not None:
-                    self.sync_control_cmd(ipc_package.control_cmd)
+                    profile_stopped = self.sync_control_cmd(ipc_package.control_cmd)
+                    if profile_stopped:
+                        ack = IPCPackage([])
+                        ack.profile_stopped = True
+                        self.comm.send_output(ack)
             else:
                 break
         if (

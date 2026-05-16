@@ -4,6 +4,7 @@ import shutil
 import time
 
 import torch
+import torch.distributed as dist
 from logger import logger
 
 from gllm.dist_utils import get_world_size
@@ -71,11 +72,16 @@ class TorchProfilerMixin:
         self.profile_session_dir = None
         logger.info(f"Torch profiler stopped, trace saved to {trace_gz_path}")
 
+    def _sync_profile_stop(self):
+        if get_world_size() > 1 and dist.is_initialized():
+            dist.barrier()
+
     def _apply_control_cmd(self, cmd_code: int, profile_session_dir=None):
         if cmd_code == 1:
             self._start_profiler(profile_session_dir=profile_session_dir)
         elif cmd_code == 2:
             self._stop_profiler()
+            self._sync_profile_stop()
 
     def sync_control_cmd(self, control_cmd):
         cmd_to_send = 0
@@ -96,3 +102,5 @@ class TorchProfilerMixin:
                 # Broadcast command over existing schedule sockets to avoid dist sync stalls.
                 self.comm.broadcast_control_cmd(cmd_to_send, profile_session_dir)
             self._apply_control_cmd(cmd_to_send, profile_session_dir)
+            return cmd_to_send == 2
+        return False

@@ -129,7 +129,13 @@ async def start_profile():
 
 @router.post("/stop_profile")
 async def stop_profile():
-    await make_async(llm.stop_profile)()
+    try:
+        await make_async(llm.stop_profile)()
+    except TimeoutError as e:
+        return JSONResponse(
+            status_code=HTTPStatus.GATEWAY_TIMEOUT,
+            content={"message": str(e), "success": False},
+        )
     return JSONResponse(content={"message": "Profiler stopped", "success": True})
 
 
