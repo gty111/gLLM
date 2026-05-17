@@ -6,10 +6,10 @@ import torch.multiprocessing as mp
 import tqdm
 from logger import logger
 
-from gllm.async_worker import AsyncWorker, run_worker_async
 from gllm.comm import IPCPackage, zmqComm
 from gllm.id_allocator import IDAllocator
-from gllm.model_runner import ModelRunner
+from gllm.model_runner import ModelRunner, OverlapModelRunner
+from gllm.overlap_worker import OverlapWorker, run_overlap_worker
 from gllm.sequence import Sequence
 from gllm.utils import get_model_load_pbar, init_logger, random_uuid
 from gllm.worker import Worker, run_worker
@@ -39,7 +39,7 @@ class LLM:
         use_ep=True,
         assigned_layers=None,
         schedule_method="chunked_prefill",
-        use_async_worker=False,
+        overlap_scheduling=True,
         use_thinking=True,
         disable_cuda_graph=False,
         max_cuda_graph_bs=32,
@@ -50,7 +50,13 @@ class LLM:
         init_logger()
         self.model_path = model_path
         self.load_format = load_format
-        self.model_runner = ModelRunner(
+        if overlap_scheduling and pp_size > 1:
+            logger.warning(
+                "overlap_scheduling is not supported with pp_size>1; disabling overlap"
+            )
+            overlap_scheduling = False
+        model_runner_cls = OverlapModelRunner if overlap_scheduling else ModelRunner
+        self.model_runner = model_runner_cls(
             load_format=load_format,
             model_path=model_path,
             gpu_memory_util=gpu_memory_util,
@@ -89,9 +95,13 @@ class LLM:
 
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
-        self.use_async_worker = use_async_worker
+        self.overlap_scheduling = overlap_scheduling
 
         logger.info(f"Schedule method: {schedule_method}")
+        if self.overlap_scheduling:
+            logger.info(
+                "Overlap scheduling enabled (FutureMap + CPU/GPU overlap, TP only)"
+            )
 
         # Interact with workers
         self.wait_lists: List[Sequence] = []
@@ -155,9 +165,6 @@ class LLM:
         logger.info(
             f"Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size}"
         )
-        if self.use_async_worker:
-            logger.warning(f"AsyncWorker is an experimental feature")
-
         self.process_list = []
         for local_rank, rank in enumerate(self.act_worker_ranks):
             pp_rank = rank // self.tp_size
@@ -168,7 +175,12 @@ class LLM:
             self.load_progress()
 
     def start_worker(self, local_rank, pp_rank, tp_rank):
-        worker_cls = Worker if not self.use_async_worker else AsyncWorker
+        if self.overlap_scheduling:
+            worker_cls = OverlapWorker
+            run_target = run_overlap_worker
+        else:
+            worker_cls = Worker
+            run_target = run_worker
         comm = zmqComm(
             self.host,
             self.zmq_port_base,
@@ -195,7 +207,7 @@ class LLM:
             self.schedule_method,
         )
         process = self.ctx.Process(
-            target=run_worker if not self.use_async_worker else run_worker_async,
+            target=run_target,
             args=(worker,),
             daemon=True,
         )

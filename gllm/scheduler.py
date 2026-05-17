@@ -353,3 +353,62 @@ class Scheduler:
                 logger.info(log_info)
         # first decode, then prefill
         return decode_batch + prefill_batch
+
+
+class OverlapScheduler(Scheduler):
+    """Scheduler with deferred/finalize output processing for overlap scheduling."""
+
+    def process_output_deferred(self, future_slot_ids: list[int]):
+        """Update seq state with placeholders; return metadata for later finalize."""
+        if len(self.batch_running) == 0:
+            return None
+
+        schedule_seqs: List[Sequence] = self.batch_running.popleft()
+        deferred_seqs = []
+
+        for idx, seq in enumerate(schedule_seqs):
+            if getattr(seq, "_overlap_freed", False):
+                continue
+            seq.computed_token_num += seq.to_compute_token_num
+            if seq.computed_prompt:
+                placeholder = -future_slot_ids[idx]
+                placeholder_pos = len(seq.token_ids)
+                seq.append(placeholder)
+                deferred_seqs.append((idx, seq, placeholder_pos))
+                self.seqs_to_decode.appendleft(seq)
+
+        return deferred_seqs
+
+    def process_output_finalize(self, deferred_seqs, next_tokens):
+        """Replace placeholders with real tokens after D2H / PP token delivery."""
+        if deferred_seqs is None:
+            return None
+
+        ipc_package = IPCPackage([])
+
+        for batch_idx, seq, placeholder_pos in deferred_seqs:
+            if getattr(seq, "_overlap_freed", False):
+                continue
+
+            real_token = next_tokens[batch_idx]
+            seq.token_ids[placeholder_pos] = real_token
+
+            if seq.computed_prompt:
+                ipc_package.act_schedule_ids.append(seq.seq_id)
+                ipc_package.next_tokens.append(real_token)
+
+            is_eos = not seq.ignore_eos and real_token in seq.finish_tokens
+            generated_len = placeholder_pos + 1 - seq.prompt_len
+            is_max_len = generated_len >= seq.output_len
+            if seq.computed_prompt and (is_eos or is_max_len):
+                ipc_package.free_ids.append(seq.seq_id)
+                seq._overlap_freed = True
+                self.model_runner.free(seq)
+                try:
+                    self.seqs_to_decode.remove(seq)
+                except ValueError:
+                    pass
+
+        return ipc_package if (
+            ipc_package.act_schedule_ids or ipc_package.free_ids
+        ) else None

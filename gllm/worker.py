@@ -1,6 +1,7 @@
 import logging
 import traceback
 from collections import deque
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -20,7 +21,7 @@ from gllm.dist_utils import (
     send_pp_data,
 )
 from gllm.input_data import InputData
-from gllm.model_runner import ModelRunner
+from gllm.model_runner import ModelRunner, OverlapModelRunner
 from gllm.profiler_mixin import TorchProfilerMixin
 from gllm.scheduler import Scheduler
 
@@ -30,7 +31,7 @@ class Worker(TorchProfilerMixin):
 
     def __init__(
         self,
-        model_runner: ModelRunner,
+        model_runner: Union[ModelRunner,OverlapModelRunner],
         local_rank,
         pp_rank,
         tp_rank,
@@ -160,7 +161,7 @@ class Worker(TorchProfilerMixin):
         # To avoid request accumulation, we fetch all packages in comm
         cum_ipc_package = IPCPackage([])
         while True:
-            ipc_package: IPCPackage = self.comm.recv_ipc_package()
+            ipc_package: Optional[IPCPackage] = self.comm.recv_ipc_package()
             if ipc_package is not None:
                 cum_ipc_package.schedule_lists.extend(ipc_package.schedule_lists)
                 cum_ipc_package.abort_ids.extend(ipc_package.abort_ids)

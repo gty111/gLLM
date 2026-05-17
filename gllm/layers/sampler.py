@@ -20,7 +20,8 @@ def _fused_top_k_top_p_sample(
 
 class Sampler:
 
-    def forward(self, logits: torch.Tensor, input_data: InputData) -> list[int]:
+    def forward_gpu(self, logits: torch.Tensor, input_data: InputData) -> torch.Tensor:
+        """Sample on GPU; caller is responsible for D2H."""
         flags = self._get_sampling_flags(input_data)
 
         if flags["need_repetition_penalty"]:
@@ -29,35 +30,22 @@ class Sampler:
         if flags["is_all_greedy"]:
             if flags["need_temperature"]:
                 logits.div_(input_data.temperature.unsqueeze(1))
-            return torch.argmax(logits, dim=-1).cpu().tolist()
+            return torch.argmax(logits, dim=-1)
 
         if flags["need_temperature"]:
             logits.div_(input_data.temperature.unsqueeze(1))
 
-        simple_case = (
-            not flags["need_top_p_sampling"] and not flags["need_top_k_sampling"]
-        )
         probs = torch.softmax(logits, dim=-1)
+        return _fused_top_k_top_p_sample(probs, input_data.top_k, input_data.top_p)
 
-        if simple_case:
-            batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
-        else:
-            batch_next_token_ids = _fused_top_k_top_p_sample(
-                probs, input_data.top_k, input_data.top_p
-            )
-
-        return batch_next_token_ids.cpu().tolist()
+    def forward(self, logits: torch.Tensor, input_data: InputData) -> list[int]:
+        return self.forward_gpu(logits, input_data).cpu().tolist()
 
     @staticmethod
     def _get_sampling_flags(input_data: InputData) -> dict[str, bool]:
         seqs = input_data.seqs
-        vocab_size = input_data.memory_manager.vocab_size
         return {
             "is_all_greedy": all(seq.top_k == 1 for seq in seqs),
-            "need_top_p_sampling": any(seq.top_p < 1.0 for seq in seqs),
-            "need_top_k_sampling": any(
-                seq.top_k != -1 and seq.top_k < vocab_size for seq in seqs
-            ),
             "need_repetition_penalty": getattr(
                 input_data, "needs_repetition_penalty", False
             ),

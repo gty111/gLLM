@@ -184,9 +184,11 @@ if __name__ == "__main__":
     )
     # Runtime
     parser.add_argument(
-        "--use-async-worker",
-        help="Experimental feature for worker implemented by async",
-        action="store_true",
+        "--overlap-scheduling",
+        dest="overlap_scheduling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="CPU/GPU overlap scheduling with FutureMap (default: on; requires pp=1)",
     )
     parser.add_argument(
         "--gpu-memory-util",
@@ -319,7 +321,7 @@ if __name__ == "__main__":
         use_ep=not args.disable_ep,
         assigned_layers=args.assigned_layers,
         schedule_method=args.schedule_method,
-        use_async_worker=args.use_async_worker,
+        overlap_scheduling=args.overlap_scheduling,
         use_thinking=not args.disable_thinking,
         disable_cuda_graph=args.disable_cuda_graph,
         max_cuda_graph_bs=args.max_cuda_graph_bs,
