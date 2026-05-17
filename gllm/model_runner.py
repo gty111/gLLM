@@ -1,6 +1,7 @@
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from attr import dataclass
 from logger import logger
 from tqdm import tqdm
@@ -14,8 +15,10 @@ from transformers.image_utils import load_images
 from transformers.video_utils import load_video
 from transformers.tokenization_utils_base import VERY_LARGE_INTEGER
 
+from gllm.async_utils import FutureMap, OverlapRuntime
 from gllm.dist_utils import (
     get_local_rank,
+    get_output_rank,
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
@@ -256,9 +259,10 @@ class ModelRunner:
             position = None
             if seq.computed_prompt:
                 embedding_info = self.embedding_cache[seq.seq_id]
-                embedding = self.model.embed_input_ids(
-                    torch.tensor(seq.to_compute_tokens)
-                )
+                to_compute = torch.tensor(seq.to_compute_tokens)
+                if (to_compute < 0).any():
+                    to_compute = to_compute.clamp(min=0)
+                embedding = self.model.embed_input_ids(to_compute)
                 position = MRotaryEmbedding.get_next_input_positions(
                     embedding_info.mrope_position_delta,
                     seq.computed_token_num,
@@ -477,3 +481,145 @@ class ModelRunner:
         self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq.seq_id)
+
+
+class OverlapModelRunner(ModelRunner):
+    """ModelRunner with FutureMap-based overlap scheduling (TP, pp_size=1 only)."""
+
+    def init(self, mp_load_progress=None):
+        super().init(mp_load_progress)
+        self.init_overlap()
+
+    def init_overlap(self, num_prefill_chunks: int = 256) -> None:
+        device = torch.device(f"cuda:{get_local_rank()}")
+        self.overlap_runtime = OverlapRuntime(device)
+        self.forward_stream = self.overlap_runtime.forward_stream
+        self.copy_stream = self.overlap_runtime.copy_stream
+        self.future_map = FutureMap(
+            max_running_requests=self.max_running_seqs,
+            context_len=self.model_max_length,
+            chunked_prefill_size=num_prefill_chunks,
+            device=device,
+        )
+        self._next_tokens_bufs = [
+            torch.zeros(
+                self.max_running_seqs,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            ),
+            torch.zeros(
+                self.max_running_seqs,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            ),
+        ]
+        self._next_tokens_buf_idx = 0
+        logger.info(
+            "Overlap scheduling enabled: future_limit=%s tp_size=%s",
+            self.future_map.future_limit,
+            get_tp_size(),
+        )
+
+    def sync_before_next_prepare(self) -> None:
+        self.overlap_runtime.input_consumed_event.synchronize()
+
+    def _run_forward_on_stream(self, num_cal_tokens: int) -> int:
+        if self.check_decode_batch():
+            padded_size = None
+            for bucket in self.capture_sizes:
+                if bucket >= num_cal_tokens:
+                    padded_size = bucket
+            if padded_size is not None and padded_size in self.size_to_graph:
+                num_cal_tokens = self.input_data.pad_for_cuda_graph(padded_size)
+                self.size_to_graph[padded_size].replay()
+            else:
+                self.forward()
+        else:
+            self.forward()
+        return num_cal_tokens
+
+    def _fixup_vl_decode_embeddings(self, num_decode_tokens: int) -> None:
+        if (
+            self.use_mm
+            and is_first_pp_rank()
+            and self.input_data.embedding_size > 0
+            and num_decode_tokens > 0
+        ):
+            decode_embeds = self.model.language_model.model.embed_tokens(
+                self.input_data.tokens[:num_decode_tokens]
+            )
+            self.input_hidden_states[:num_decode_tokens] = decode_embeds
+
+    @torch.inference_mode()
+    def run_batch_async(self) -> Tuple[torch.cuda.Event, int, List[int], int]:
+        """Launch forward + sample on forward_stream (pp_size=1 only)."""
+        num_cal_tokens = self.input_data.tokens_cpu.shape[0]
+        batch_size = len(self.input_data.seqs)
+        buf_idx = self._next_tokens_buf_idx
+        self._next_tokens_buf_idx = 1 - buf_idx
+        next_tokens_cpu = self._next_tokens_bufs[buf_idx]
+
+        with torch.cuda.stream(self.forward_stream):
+            future_indices = self.future_map.alloc_future_indices(batch_size)
+            future_slot_ids = future_indices.indices.cpu().tolist()
+
+            self.forward_stream.wait_stream(torch.cuda.current_stream())
+            self.future_map.resolve_future(
+                self.input_data.tokens[:num_cal_tokens]
+            )
+
+            num_decode_tokens = sum(
+                1 for s in self.input_data.seqs if s.computed_prompt
+            )
+            self._fixup_vl_decode_embeddings(num_decode_tokens)
+
+            num_cal_tokens = self._run_forward_on_stream(num_cal_tokens)
+
+            logits = self.model.compute_logits(
+                self.input_data, self.output_hidden_states[:num_cal_tokens]
+            )
+            self.input_data.prepare_sample()
+            next_tokens_gpu = None
+            if is_output_rank():
+                next_tokens_gpu = self.sampler.forward_gpu(logits, self.input_data)
+            if get_tp_size() > 1:
+                if next_tokens_gpu is None:
+                    next_tokens_gpu = torch.empty(
+                        batch_size,
+                        dtype=torch.long,
+                        device=self.input_data.tokens.device,
+                    )
+                dist.broadcast(
+                    next_tokens_gpu,
+                    src=get_output_rank(),
+                )
+            self.future_map.store_to_map(future_indices, next_tokens_gpu)
+            if is_output_rank():
+                with torch.cuda.stream(self.copy_stream):
+                    self.copy_stream.wait_stream(self.forward_stream)
+                    next_tokens_cpu[:batch_size].copy_(
+                        next_tokens_gpu, non_blocking=True
+                    )
+
+            self.overlap_runtime.input_consumed_event.record(self.forward_stream)
+
+        copy_done = torch.cuda.Event()
+        if is_output_rank():
+            copy_done.record(self.copy_stream)
+        else:
+            copy_done.record(self.forward_stream)
+        return copy_done, batch_size, future_slot_ids, buf_idx
+
+    @torch.inference_mode()
+    def step_collect_async(
+        self,
+        copy_done: torch.cuda.Event,
+        batch_size: int,
+        buf_idx: int,
+    ) -> Union[list[int], Tuple[torch.Tensor, torch.Tensor]]:
+        copy_done.synchronize()
+        if is_output_rank():
+            return self._next_tokens_bufs[buf_idx][:batch_size].tolist()
+        return None
