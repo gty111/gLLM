@@ -24,6 +24,7 @@ from sgl_kernel import (
     silu_and_mul as _sgl_silu_and_mul,
     gelu_and_mul as _sgl_gelu_and_mul,
     topk_softmax as _sgl_topk_softmax,
+    topk_sigmoid as _sgl_topk_sigmoid,
     merge_state_v2 as _sgl_merge_state_v2,
     sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8,
 )
@@ -249,6 +250,37 @@ def topk_softmax(
         topk_weights,
         topk_ids,
         gating_output,
+    )
+
+
+def topk_sigmoid(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Compute top-k sigmoid for MoE routing (DeepSeek-V3 noaux_tc style).
+
+    Internally applies sigmoid then adds correction_bias for ranking,
+    but returns the unbiased sigmoid value as the topk weight.
+    Has no num_experts limit (unlike moe_fused_gate's per-group constraint).
+    Suitable when there is no group hierarchy (or num_expert_group=topk_group=1).
+
+    Args:
+        topk_weights: [num_tokens, topk], float32, pre-allocated
+        topk_ids: [num_tokens, topk], int32, pre-allocated
+        gating_output: [num_tokens, num_experts], float32/16/bf16
+        renormalize: whether to renormalize topk weights
+        correction_bias: [num_experts], float32 (kernel requirement)
+    """
+    _sgl_topk_sigmoid(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        correction_bias,
     )
 
 

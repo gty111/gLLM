@@ -228,5 +228,11 @@ def cast_overflow_tensors(
     return tensors
 
 
-def unify_decode(tokenizer, token_ids):
-    return tokenizer.decode(token_ids)
+def unify_decode(tokenizer, token_ids, skip_special_tokens: bool = True):
+    """Decode token ids back to text.
+
+    By default special tokens (e.g. ``<|im_end|>``, ``<|endoftext|>``) are
+    skipped so that the user-visible chat output stays clean across all
+    chat-tuned models, without needing per-model stop-string lists.
+    """
+    return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)

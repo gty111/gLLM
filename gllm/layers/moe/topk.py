@@ -26,6 +26,52 @@ def topk_softmax(
     return topk_weights, topk_indices
 
 
+def fused_topk_sigmoid(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    e_score_correction_bias: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused sigmoid + biased topk via sgl_kernel.topk_sigmoid.
+
+    Used when no group hierarchy is applied (num_expert_group == topk_group == 1).
+    The kernel internally:
+      1. computes sigmoid(gating_output)
+      2. adds correction_bias for ranking
+      3. picks topk based on biased values
+      4. returns the unbiased sigmoid value as the weight (DeepSeek-V3 noaux_tc semantics)
+    routed_scaling_factor is applied here since the kernel doesn't accept it.
+    """
+    assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
+
+    M = gating_output.size(0)
+    topk_weights = torch.empty(
+        M, topk, dtype=torch.float32, device=hidden_states.device
+    )
+    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+
+    # sgl_kernel requires correction_bias to be float32.
+    bias = e_score_correction_bias
+    if bias.dtype != torch.float32:
+        bias = bias.to(torch.float32)
+
+    ops.topk_sigmoid(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        gating_output=gating_output,
+        renormalize=renormalize,
+        correction_bias=bias,
+    )
+
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+
+    return topk_weights, topk_ids
+
+
 def fused_grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -71,7 +117,19 @@ def grouped_topk(
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if num_expert_group <= 32 and topk <= 32 and e_score_correction_bias is not None:
+    # Fast path 1: sgl_kernel.moe_fused_gate
+    # Constraints: num_expert_group <= 32, topk <= 32,
+    # and per-group experts (num_experts / num_expert_group) <= 32.
+    num_experts = gating_output.size(-1)
+    per_group_experts = (
+        num_experts // num_expert_group if num_expert_group > 0 else num_experts
+    )
+    if (
+        num_expert_group <= 32
+        and topk <= 32
+        and per_group_experts <= 32
+        and e_score_correction_bias is not None
+    ):
         return fused_grouped_topk(
             hidden_states=hidden_states,
             gating_output=gating_output,
@@ -81,6 +139,25 @@ def grouped_topk(
             num_expert_group=num_expert_group,
             topk_group=topk_group,
             scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+    # Fast path 2: sgl_kernel.topk_sigmoid for the no-grouping case (e.g. Moonlight,
+    # which has n_group=1 with 64 experts, exceeding moe_fused_gate's per-group limit).
+    # When num_expert_group == topk_group == 1, no group filtering happens, so a flat
+    # topk over (sigmoid + bias) is mathematically equivalent.
+    if (
+        num_expert_group == 1
+        and topk_group == 1
+        and scoring_func == "sigmoid"
+        and e_score_correction_bias is not None
+    ):
+        return fused_topk_sigmoid(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            topk=topk,
+            renormalize=renormalize,
+            e_score_correction_bias=e_score_correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
 
