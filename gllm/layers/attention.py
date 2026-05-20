@@ -194,7 +194,11 @@ class MLAAttention:
         # is only one output tensor if `return_softmax_lse` is False.
         if return_softmax_lse:
             assert rest is not None
-            return attn_out, rest[0]
+            # sgl_kernel.flash_attn_varlen_func returns softmax_lse with shape
+            # (num_heads, total_seq_len), but sgl_kernel.merge_state_v2
+            # (used by merge_attn_states) expects (total_seq_len, num_heads).
+            softmax_lse = rest[0].transpose(0, 1).contiguous()
+            return attn_out, softmax_lse
         return attn_out
 
     def _run_prefill_context_chunk(

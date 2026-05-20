@@ -15,7 +15,5 @@ if __name__ == "__main__":
         pp_size=args.pp,
         tp_size=args.tp,
         master_port=args.master_port,
-        enable_cuda_graph=True,
-        max_cuda_graph_bs=1,
     )
     llm.chat()
