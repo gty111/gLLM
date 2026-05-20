@@ -8,7 +8,13 @@ import torch
 
 @dataclass
 class FutureIndices:
-    indices: torch.Tensor
+    # NOTE: ``indices`` is intentionally optional. Allocating a GPU tensor for
+    # the future slot ids forced a ``.cpu().tolist()`` on the calling stream,
+    # which inserted a hidden host-side sync on every batch. The slot ids are
+    # purely a CPU concept (used by the scheduler) and ``interval`` carries the
+    # information ``store_to_map`` and ``resolve_future`` actually need, so we
+    # avoid materializing the GPU tensor by default.
+    indices: Optional[torch.Tensor] = None
     interval: Optional[slice] = None
 
 
@@ -43,10 +49,9 @@ class FutureMap:
         self.future_ct = (cur + batch_size) % self.future_limit
         start = cur + 1
         end = cur + 1 + batch_size
-        indices = torch.arange(
-            start, end, dtype=torch.int64, device=self.device
-        )
-        return FutureIndices(indices=indices, interval=slice(start, end))
+        # ``store_to_map`` and ``resolve_future`` only need ``interval``;
+        # ``indices`` is lazily materialized on the rare paths that want it.
+        return FutureIndices(indices=None, interval=slice(start, end))
 
     def resolve_future(self, input_ids: torch.Tensor) -> None:
         input_ids[:] = torch.where(

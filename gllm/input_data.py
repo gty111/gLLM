@@ -139,44 +139,56 @@ class InputData:
         self.cal_input(seqs)
         self.copy_to_input_buffer()
 
-    def set_input_from_prebuilt(self, input_data):
-        common_attrs_copy = [
-            "seqs",
-            "tokens_cpu",
-            "positions_cpu",
-            "mrope_positions_cpu",
-            "slot_mapping_cpu",
-            "block_table_cpu",
-            "max_seq_len",
-            "seq_lens_cpu",
-            "max_query_len",
-            "query_start_loc_cpu",
-            "temperature",
-            "top_p",
-            "top_k",
-            "repetition_penalty",
-            "needs_repetition_penalty",
-        ]
-        mla_attrs_copy = [
-            "num_actual_tokens",
-            "num_decodes",
-            "num_decode_tokens",
-            "num_prefills",
-            "max_context_len",
-            "decode_seq_lens_cpu",
-            "prefill_max_query_len",
-            "prefill_query_start_loc_cpu",
-            "chunk_starts_cpu",
-            "chunk_seq_lens_cpu",
-            "cu_seq_lens_cpu",
-        ]
-        for attr in common_attrs_copy:
+    # Attributes copied verbatim from a prebuilt InputData.
+    _PREBUILT_COMMON_ATTRS = (
+        "seqs",
+        "tokens_cpu",
+        "positions_cpu",
+        "mrope_positions_cpu",
+        "slot_mapping_cpu",
+        "block_table_cpu",
+        "max_seq_len",
+        "seq_lens_cpu",
+        "max_query_len",
+        "query_start_loc_cpu",
+        "temperature",
+        "top_p",
+        "top_k",
+        "repetition_penalty",
+        "needs_repetition_penalty",
+    )
+    _PREBUILT_MLA_ATTRS = (
+        "num_actual_tokens",
+        "num_decodes",
+        "num_decode_tokens",
+        "num_prefills",
+        "max_context_len",
+        "decode_seq_lens_cpu",
+        "prefill_max_query_len",
+        "prefill_query_start_loc_cpu",
+        "chunk_starts_cpu",
+        "chunk_seq_lens_cpu",
+        "cu_seq_lens_cpu",
+    )
+
+    def set_input_from_prebuilt_cpu(self, input_data):
+        """CPU-only portion of ``set_input_from_prebuilt``.
+
+        Copies the prebuilt CPU attributes onto ``self`` without touching the
+        shared GPU input buffers. Callers that want to overlap CPU prep with
+        an in-flight GPU forward should pair this with a later
+        :meth:`copy_to_input_buffer` call once the previous forward has
+        released the input buffers (see ``OverlapModelRunner``).
+        """
+        for attr in self._PREBUILT_COMMON_ATTRS:
             setattr(self, attr, getattr(input_data, attr, None))
 
         if self.use_mla:
-            for attr in mla_attrs_copy:
+            for attr in self._PREBUILT_MLA_ATTRS:
                 setattr(self, attr, getattr(input_data, attr, None))
 
+    def set_input_from_prebuilt(self, input_data):
+        self.set_input_from_prebuilt_cpu(input_data)
         self.copy_to_input_buffer()
 
     def _cal_tokens(self, seqs: List[Sequence]):
