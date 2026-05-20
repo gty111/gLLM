@@ -292,8 +292,8 @@ class ModelRunner:
             in_decode = False
             if seq.seq_id not in self.embedding_cache:
                 mm_input: Dict = {}
-                image_grid_thw: torch.Tensor = None
-                video_grid_thw: torch.Tensor = None
+                image_grid_thw: Optional[torch.Tensor] = None
+                video_grid_thw: Optional[torch.Tensor] = None
                 if seq.mm_contents is not None:
                     if len(seq.mm_contents["image"]) != 0:
                         images = load_images(seq.mm_contents["image"])
@@ -314,11 +314,29 @@ class ModelRunner:
                         mm_input.update(videos_input)
                         video_grid_thw = videos_input["video_grid_thw"]
 
-                input_ids_cpu = torch.tensor(seq.token_ids)
-                placeholder_token_id = torch.tensor(
-                    self.model.get_mm_placeholder_token_ids()
+                # ``get_input_positions`` does per-element Python indexing on
+                # the grid tensors; if a fast image processor handed us CUDA
+                # tensors here, that loop would issue a D2H sync per element.
+                # Force CPU once, cheaply, so the CPU phase stays CPU-only.
+                if isinstance(image_grid_thw, torch.Tensor):
+                    image_grid_thw = image_grid_thw.cpu()
+                if isinstance(video_grid_thw, torch.Tensor):
+                    video_grid_thw = video_grid_thw.cpu()
+
+                # Explicitly pin these tensors to CPU. The repo sets the
+                # default device to CUDA via ``ModelLoader``, so a bare
+                # ``torch.tensor(...)`` would silently allocate on GPU and
+                # the ``torch.isin`` below would launch a kernel on the
+                # default stream -- defeating overlap with the previous
+                # batch's forward. Materialization to CUDA is deferred to
+                # ``_mm_prepare_gpu`` right before ``embed_input_ids``.
+                input_ids_cpu = torch.tensor(seq.token_ids, device="cpu")
+                placeholder_token_id_cpu = torch.tensor(
+                    self.model.get_mm_placeholder_token_ids(), device="cpu"
                 )
-                is_multimodal = torch.isin(input_ids_cpu, placeholder_token_id)
+                is_multimodal_cpu = torch.isin(
+                    input_ids_cpu, placeholder_token_id_cpu
+                )
                 prompt_positions, mrope_position_delta = (
                     MRotaryEmbedding.get_input_positions(
                         input_tokens=seq.token_ids,
@@ -335,13 +353,11 @@ class ModelRunner:
                     {
                         "kind": "uncached",
                         "seq": seq,
-                        "input_ids": input_ids_cpu,
-                        "is_multimodal": is_multimodal,
+                        "input_ids_cpu": input_ids_cpu,
+                        "is_multimodal_cpu": is_multimodal_cpu,
                         "mm_input": mm_input,
                         "prompt_positions": prompt_positions,
                         "mrope_position_delta": mrope_position_delta,
-                        "image_grid_thw": image_grid_thw,
-                        "video_grid_thw": video_grid_thw,
                     }
                 )
             else:
@@ -377,6 +393,7 @@ class ModelRunner:
         forward stream right before the model runs, so the placeholder content
         is irrelevant.
         """
+        device = self.input_hidden_states.device
         batch_embeddings: List[torch.Tensor] = []
         for work in ctx["prefill_works"]:
             seq = work["seq"]
@@ -385,18 +402,20 @@ class ModelRunner:
                 mm_input = work["mm_input"]
                 if mm_input:
                     mm_embeddings = self.model.embed_multimodal(**mm_input)
-                prompt_embeddings = self.model.embed_input_ids(
-                    work["input_ids"],
-                    mm_embeddings,
-                    work["is_multimodal"],
-                )
 
-                image_grid_thw = work["image_grid_thw"]
-                if image_grid_thw is not None:
-                    image_grid_thw = image_grid_thw.cpu()
-                video_grid_thw = work["video_grid_thw"]
-                if video_grid_thw is not None:
-                    video_grid_thw = video_grid_thw.cpu()
+                # Materialize CPU tensors built in ``_mm_prepare_cpu`` onto
+                # the model device for the embed kernels. Sources are small
+                # (one prompt's worth of ids) so a synchronous H2D is cheap
+                # and avoids the pageable-memory caveats of non_blocking.
+                input_ids = work["input_ids_cpu"].to(device, non_blocking=True)
+                is_multimodal = work["is_multimodal_cpu"].to(
+                    device, non_blocking=True
+                )
+                prompt_embeddings = self.model.embed_input_ids(
+                    input_ids,
+                    mm_embeddings,
+                    is_multimodal,
+                )
 
                 embedding_info = EmbeddingInfo(
                     prompt_embeddings,
