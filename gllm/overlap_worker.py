@@ -85,8 +85,16 @@ class OverlapWorker(Worker):
         return input_data
 
     def _launch_batch(self, input_data: InputData):
+        # Split input prep into a CPU phase (safe to run while the previous
+        # batch is still on the GPU) and a GPU/H2D phase (must wait until the
+        # previous forward has released the shared input buffers). The CPU
+        # phase covers attribute copies, multimodal position calc, and
+        # whatever image processing was deferred from the prefetch step;
+        # those several milliseconds of Python work now overlap with the
+        # tail of the previous forward instead of serializing behind it.
+        self.model_runner.prepare_input_cpu(input_data)
         self.model_runner.sync_before_next_prepare()
-        self.model_runner.prepare_input(input_data=input_data)
+        self.model_runner.prepare_input_gpu()
         return self.model_runner.run_batch_async()
 
     def _collect_batch(self, pending_entry, deferred_seqs=None):

@@ -250,99 +250,200 @@ class ModelRunner:
         return mm_contents if len(mm_contents["image"]) + len(mm_contents["video"]) != 0 else None
 
     @torch.inference_mode()
-    def mm_prepare_inputs(self, seqs: List[Sequence]):
-        # Calculate the embedding (on cuda) and positions (on cpu) of pic
-        batch_embeddings = []
-        batch_positions = []
+    def _mm_prepare_cpu(self, seqs: List[Sequence]) -> Dict:
+        """CPU phase of :meth:`mm_prepare_inputs`.
+
+        Computes mrope positions and collects per-seq prefill work to run in
+        :meth:`_mm_prepare_gpu`. Decode seqs (``seq.computed_prompt``) only
+        contribute positions and a token count: their embedding rows are
+        re-written in one fused call by
+        :meth:`OverlapModelRunner._fixup_vl_decode_embeddings` on the forward
+        stream, so we skip the per-seq ``embed_input_ids`` launch (and the
+        attendant ``aten::any`` / ``aten::clamp`` sync points) entirely.
+
+        Returning a context dict (instead of going straight to GPU work) lets
+        the overlap scheduler run this phase concurrently with the previous
+        batch's GPU forward.
+        """
+        batch_positions: List[torch.Tensor] = []
+        prefill_works: List[Dict] = []
+        num_decode_tokens = 0
+        in_decode = True
+
         for seq in seqs:
-            embedding = None
-            position = None
             if seq.computed_prompt:
+                # Decode token: positions only; embed is deferred to fixup.
+                # The scheduler places decode seqs before prefill seqs, so
+                # the contiguous decode block always sits at the front.
+                assert in_decode, (
+                    "scheduler invariant violated: decode seqs must precede "
+                    "prefill seqs within a batch"
+                )
                 embedding_info = self.embedding_cache[seq.seq_id]
-                to_compute = torch.tensor(seq.to_compute_tokens)
-                if (to_compute < 0).any():
-                    to_compute = to_compute.clamp(min=0)
-                embedding = self.model.embed_input_ids(to_compute)
                 position = MRotaryEmbedding.get_next_input_positions(
                     embedding_info.mrope_position_delta,
                     seq.computed_token_num,
                     seq.seq_len,
                 )
-                position = torch.tensor(position, device="cpu")
+                batch_positions.append(torch.tensor(position, device="cpu"))
+                num_decode_tokens += seq.to_compute_token_num
+                continue
+
+            in_decode = False
+            if seq.seq_id not in self.embedding_cache:
+                mm_input: Dict = {}
+                image_grid_thw: torch.Tensor = None
+                video_grid_thw: torch.Tensor = None
+                if seq.mm_contents is not None:
+                    if len(seq.mm_contents["image"]) != 0:
+                        images = load_images(seq.mm_contents["image"])
+                        images_input = self.image_processor(images=images)
+                        mm_input.update(images_input)
+                        image_grid_thw = images_input["image_grid_thw"]
+                    if len(seq.mm_contents["video"]) != 0:
+                        videos = []
+                        video_metadata = []
+                        for video_content in seq.mm_contents["video"]:
+                            video_data, metadata = load_video(video_content)
+                            videos.append(video_data)
+                            video_metadata.append(metadata)
+                        videos_input = self.video_processor(
+                            videos=videos,
+                            video_metadata=video_metadata,
+                        )
+                        mm_input.update(videos_input)
+                        video_grid_thw = videos_input["video_grid_thw"]
+
+                input_ids_cpu = torch.tensor(seq.token_ids)
+                placeholder_token_id = torch.tensor(
+                    self.model.get_mm_placeholder_token_ids()
+                )
+                is_multimodal = torch.isin(input_ids_cpu, placeholder_token_id)
+                prompt_positions, mrope_position_delta = (
+                    MRotaryEmbedding.get_input_positions(
+                        input_tokens=seq.token_ids,
+                        hf_config=self.model.config,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        second_per_grid_ts=None,
+                    )
+                )
+                batch_positions.append(
+                    prompt_positions[:, seq.computed_token_num : seq.seq_len]
+                )
+                prefill_works.append(
+                    {
+                        "kind": "uncached",
+                        "seq": seq,
+                        "input_ids": input_ids_cpu,
+                        "is_multimodal": is_multimodal,
+                        "mm_input": mm_input,
+                        "prompt_positions": prompt_positions,
+                        "mrope_position_delta": mrope_position_delta,
+                        "image_grid_thw": image_grid_thw,
+                        "video_grid_thw": video_grid_thw,
+                    }
+                )
             else:
-                embedding_info = None
-                if seq.seq_id not in self.embedding_cache:
-                    mm_embeddings = None
-                    image_grid_thw: torch.Tensor = None
-                    video_grid_thw: torch.Tensor = None
-                    if seq.mm_contents is not None:
-                        mm_input = {}
-                        if len(seq.mm_contents["image"]) != 0:
-                            images = load_images(seq.mm_contents["image"])
-                            images_input = self.image_processor(images=images)
-                            mm_input.update(images_input)
-                            image_grid_thw = images_input["image_grid_thw"]
-                        if len(seq.mm_contents["video"]) != 0:
-                            videos = []
-                            video_metadata = []
-                            for video_content in seq.mm_contents["video"]:
-                                video_data, metadata = load_video(video_content)
-                                videos.append(video_data)
-                                video_metadata.append(metadata)
-                            videos_input = self.video_processor(
-                                videos=videos,
-                                video_metadata=video_metadata,
-                            )
-                            mm_input.update(videos_input)
-                            video_grid_thw = videos_input["video_grid_thw"]
-                        mm_embeddings = self.model.embed_multimodal(
-                            **mm_input
-                        )
-                    
-                    input_ids = torch.tensor(seq.token_ids)
-                    placeholder_token_id = torch.tensor(self.model.get_mm_placeholder_token_ids())
-                    prompt_embeddings = self.model.embed_input_ids(
-                        input_ids, 
-                        mm_embeddings,
-                        torch.isin(input_ids, placeholder_token_id)
-                    )
-                    if image_grid_thw is not None:
-                        image_grid_thw = image_grid_thw.cpu()
-                    if video_grid_thw is not None:
-                        video_grid_thw = video_grid_thw.cpu()
-                    prompt_positions, mrope_position_delta = (
-                        MRotaryEmbedding.get_input_positions(
-                            input_tokens=seq.token_ids,
-                            hf_config=self.model.config,
-                            image_grid_thw=image_grid_thw,
-                            video_grid_thw=video_grid_thw,
-                            second_per_grid_ts=None,
-                        )
-                    )
-                    embedding_info = EmbeddingInfo(
-                        prompt_embeddings, prompt_positions, mrope_position_delta
-                    )
-                    self.embedding_cache[seq.seq_id] = embedding_info
-                    embedding = prompt_embeddings[
-                        seq.computed_token_num : seq.seq_len, :
-                    ]
-                    position = prompt_positions[:, seq.computed_token_num : seq.seq_len]
-                else:
-                    embedding_info = self.embedding_cache[seq.seq_id]
-                    embedding = embedding_info.embedding[
-                        seq.computed_token_num : seq.seq_len, :
-                    ]
-                    position = embedding_info.prompt_positions[
+                embedding_info = self.embedding_cache[seq.seq_id]
+                batch_positions.append(
+                    embedding_info.prompt_positions[
                         :, seq.computed_token_num : seq.seq_len
                     ]
-                if seq.seq_len == seq.prompt_len:
-                    # invalidate embedding_cache
-                    embedding_info.embedding = None
+                )
+                prefill_works.append(
+                    {
+                        "kind": "cached",
+                        "seq": seq,
+                        "embedding_info": embedding_info,
+                    }
+                )
+
+        mrope_positions = torch.concat(batch_positions, dim=1)
+        return {
+            "prefill_works": prefill_works,
+            "mrope_positions": mrope_positions,
+            "num_decode_tokens": num_decode_tokens,
+        }
+
+    @torch.inference_mode()
+    def _mm_prepare_gpu(self, ctx: Dict) -> Optional[torch.Tensor]:
+        """GPU phase of :meth:`mm_prepare_inputs`.
+
+        Runs each prefill seq's multimodal+text embed and produces a single
+        ``input_embeddings`` tensor laid out as ``[decode_rows, prefill_rows]``.
+        Decode rows are an uninitialized placeholder; they will be overwritten
+        by :meth:`OverlapModelRunner._fixup_vl_decode_embeddings` on the
+        forward stream right before the model runs, so the placeholder content
+        is irrelevant.
+        """
+        batch_embeddings: List[torch.Tensor] = []
+        for work in ctx["prefill_works"]:
+            seq = work["seq"]
+            if work["kind"] == "uncached":
+                mm_embeddings = None
+                mm_input = work["mm_input"]
+                if mm_input:
+                    mm_embeddings = self.model.embed_multimodal(**mm_input)
+                prompt_embeddings = self.model.embed_input_ids(
+                    work["input_ids"],
+                    mm_embeddings,
+                    work["is_multimodal"],
+                )
+
+                image_grid_thw = work["image_grid_thw"]
+                if image_grid_thw is not None:
+                    image_grid_thw = image_grid_thw.cpu()
+                video_grid_thw = work["video_grid_thw"]
+                if video_grid_thw is not None:
+                    video_grid_thw = video_grid_thw.cpu()
+
+                embedding_info = EmbeddingInfo(
+                    prompt_embeddings,
+                    work["prompt_positions"],
+                    work["mrope_position_delta"],
+                )
+                self.embedding_cache[seq.seq_id] = embedding_info
+                embedding = prompt_embeddings[
+                    seq.computed_token_num : seq.seq_len, :
+                ]
+            else:
+                embedding_info = work["embedding_info"]
+                embedding = embedding_info.embedding[
+                    seq.computed_token_num : seq.seq_len, :
+                ]
+
+            if seq.seq_len == seq.prompt_len:
+                # Prefill just finished; drop the cached embedding tensor to
+                # free memory. We still keep mrope_position_delta around for
+                # future decode-position calculations.
+                embedding_info.embedding = None
+
             batch_embeddings.append(embedding)
-            batch_positions.append(position)
-        input_embeddings = torch.concat(batch_embeddings)
-        positions = torch.concat(batch_positions, dim=1)
-        return input_embeddings, positions
+
+        num_decode_tokens = ctx["num_decode_tokens"]
+        if num_decode_tokens > 0:
+            # Placeholder rows; ``_fixup_vl_decode_embeddings`` re-embeds these
+            # token positions in a single fused launch on the forward stream
+            # after future-token resolution. ``empty`` is fine since the
+            # contents are dead-on-arrival.
+            placeholder = torch.empty(
+                (num_decode_tokens, self.hidden_size),
+                device=self.input_hidden_states.device,
+                dtype=self.input_hidden_states.dtype,
+            )
+            batch_embeddings.insert(0, placeholder)
+
+        if not batch_embeddings:
+            return None
+        return torch.concat(batch_embeddings)
+
+    @torch.inference_mode()
+    def mm_prepare_inputs(self, seqs: List[Sequence]):
+        """Single-shot wrapper kept for the non-overlap worker path."""
+        ctx = self._mm_prepare_cpu(seqs)
+        input_embeddings = self._mm_prepare_gpu(ctx)
+        return input_embeddings, ctx["mrope_positions"]
 
     def prepare_input_embeddings(self, hidden_states=None):
         if hidden_states is not None:
@@ -516,6 +617,9 @@ class OverlapModelRunner(ModelRunner):
             ),
         ]
         self._next_tokens_buf_idx = 0
+        # Holds the context produced by ``_mm_prepare_cpu`` between the CPU
+        # and GPU phases of input prep when the overlap worker drives us.
+        self._pending_mm_ctx: Optional[Dict] = None
         logger.info(
             "Overlap scheduling enabled: future_limit=%s tp_size=%s",
             self.future_map.future_limit,
@@ -524,6 +628,41 @@ class OverlapModelRunner(ModelRunner):
 
     def sync_before_next_prepare(self) -> None:
         self.overlap_runtime.input_consumed_event.synchronize()
+
+    def prepare_input_cpu(self, input_data: InputData) -> None:
+        """CPU-only portion of input prep.
+
+        Safe to invoke while the previous batch's forward is still consuming
+        the shared GPU input buffers. The pair :meth:`prepare_input_gpu` must
+        be called once :meth:`sync_before_next_prepare` has released those
+        buffers; only then is it sound to issue the H2D copies and write to
+        ``input_hidden_states``.
+        """
+        self.input_data.set_input_from_prebuilt_cpu(input_data)
+        if self.use_mm and is_first_pp_rank():
+            assert self._pending_mm_ctx is None, (
+                "prepare_input_cpu called twice without an intervening "
+                "prepare_input_gpu"
+            )
+            self._pending_mm_ctx = self._mm_prepare_cpu(self.input_data.seqs)
+        else:
+            self._pending_mm_ctx = None
+
+    def prepare_input_gpu(self) -> None:
+        """GPU/H2D portion of input prep.
+
+        Must run after :meth:`sync_before_next_prepare`. Performs the H2D
+        copies into the shared input buffers, runs the deferred multimodal
+        embedding work for any prefill seqs, and writes the merged embedding
+        tensor into ``input_hidden_states``.
+        """
+        self.input_data.copy_to_input_buffer()
+        if self._pending_mm_ctx is not None:
+            ctx = self._pending_mm_ctx
+            self._pending_mm_ctx = None
+            input_embeddings = self._mm_prepare_gpu(ctx)
+            self.input_data.set_mrope_position(ctx["mrope_positions"])
+            self.prepare_input_embeddings(input_embeddings)
 
     def _run_forward_on_stream(self, num_cal_tokens: int) -> int:
         if self.check_decode_batch():
@@ -561,11 +700,25 @@ class OverlapModelRunner(ModelRunner):
         self._next_tokens_buf_idx = 1 - buf_idx
         next_tokens_cpu = self._next_tokens_bufs[buf_idx]
 
-        with torch.cuda.stream(self.forward_stream):
-            future_indices = self.future_map.alloc_future_indices(batch_size)
-            future_slot_ids = future_indices.indices.cpu().tolist()
+        # ``future_slot_ids`` is purely a CPU concept (used by the scheduler
+        # for deferred output finalize). Derive it from the allocator's CPU
+        # state instead of materializing a GPU tensor and yanking it back
+        # via ``.cpu().tolist()`` -- that round-trip used to insert a hidden
+        # ``cudaStreamSynchronize`` on every batch.
+        future_indices = self.future_map.alloc_future_indices(batch_size)
+        future_slot_ids = list(
+            range(future_indices.interval.start, future_indices.interval.stop)
+        )
 
-            self.forward_stream.wait_stream(torch.cuda.current_stream())
+        # Capture the *outer* stream (default stream in the worker thread)
+        # so that ``forward_stream`` can correctly wait on H2D copies and
+        # multimodal embed work that ``prepare_input_gpu`` issued there.
+        # The previous code called ``wait_stream(torch.cuda.current_stream())``
+        # from *inside* the ``with cuda.stream(forward_stream)`` block, which
+        # resolved to a self-wait (no-op).
+        default_stream = torch.cuda.current_stream()
+        with torch.cuda.stream(self.forward_stream):
+            self.forward_stream.wait_stream(default_stream)
             self.future_map.resolve_future(
                 self.input_data.tokens[:num_cal_tokens]
             )
