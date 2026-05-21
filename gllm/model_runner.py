@@ -19,6 +19,7 @@ from gllm.async_utils import FutureMap, OverlapRuntime
 from gllm.dist_utils import (
     get_local_rank,
     get_output_rank,
+    get_tp_group,
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
@@ -511,7 +512,18 @@ class ModelRunner:
             )
 
     @torch.inference_mode()
-    def capture_graph(self):
+    def capture_graph(self, stream: Optional[torch.cuda.Stream] = None):
+        """Capture per-bucket decode CUDA graphs.
+
+        ``stream`` controls which CUDA stream the graph is captured on.
+        ``torch.cuda.graph`` otherwise allocates a brand-new private stream
+        each call, which is fine for kernels but interacts poorly with
+        captured NCCL ops if replay later happens on a *different* stream
+        (the symptom we hit in TP+overlap runs was gradual KV-cache drift
+        between TP ranks surfacing as repetition loops). Subclasses that
+        replay on a known stream (e.g. ``OverlapModelRunner.forward_stream``)
+        should pass that same stream here so capture and replay agree.
+        """
         iterator = self.capture_sizes
         if get_local_rank() == 0:
             logger.info(f"Capturing CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}")
@@ -523,7 +535,7 @@ class ModelRunner:
             if self.use_mm:
                 self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(cuda_graph=g, pool=memory_pool):
+            with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
                 self.forward()
             self.size_to_graph[size] = g
         if torch.distributed.is_initialized():
@@ -607,14 +619,34 @@ class OverlapModelRunner(ModelRunner):
     """ModelRunner with FutureMap-based overlap scheduling (TP, pp_size=1 only)."""
 
     def init(self, mp_load_progress=None):
-        super().init(mp_load_progress)
-        self.init_overlap()
-
-    def init_overlap(self, num_prefill_chunks: int = 256) -> None:
+        # Create the overlap CUDA streams BEFORE ``super().init()`` so that
+        # ``capture_graph`` (invoked from inside ``super().init()``) can use
+        # ``forward_stream`` as the capture stream. Capturing on the same
+        # stream that ``run_batch_async`` replays on keeps the NCCL kernels
+        # baked into the graph tied to a single CUDA stream across capture
+        # and replay -- mismatch had caused TP ranks to subtly disagree
+        # after many decode steps and surface as repetition loops in long
+        # generations.
         device = torch.device(f"cuda:{get_local_rank()}")
         self.overlap_runtime = OverlapRuntime(device)
         self.forward_stream = self.overlap_runtime.forward_stream
         self.copy_stream = self.overlap_runtime.copy_stream
+        super().init(mp_load_progress)
+        self._init_overlap_buffers()
+
+    def capture_graph(self, stream: Optional[torch.cuda.Stream] = None):
+        # Capture on ``forward_stream`` so capture stream == replay stream.
+        # NCCL kernels (e.g. ``embed_tokens`` all_reduce, layer all_reduces)
+        # baked into the graph stay tied to the same CUDA stream across
+        # capture and replay. Without this they were captured on a fresh
+        # private stream that ``torch.cuda.graph`` allocates by default,
+        # then replayed on ``forward_stream`` -- the resulting NCCL/stream
+        # mismatch was letting TP ranks subtly drift over many decode
+        # iterations and produce the long-generation repetition loops.
+        super().capture_graph(stream=self.forward_stream)
+
+    def _init_overlap_buffers(self, num_prefill_chunks: int = 256) -> None:
+        device = self.forward_stream.device
         self.future_map = FutureMap(
             max_running_requests=self.max_running_seqs,
             context_len=self.model_max_length,
@@ -789,9 +821,18 @@ class OverlapModelRunner(ModelRunner):
                         dtype=torch.long,
                         device=self.input_data.tokens.device,
                     )
+                # Use the TP group so that this broadcast goes through the
+                # same NCCL communicator as the model's all_reduces. Sharing
+                # one communicator means NCCL's per-communicator FIFO
+                # ordering implicitly serializes broadcast vs all_reduce
+                # within a rank, removing a class of cross-communicator
+                # ordering hazards that were occasionally letting TP ranks
+                # store stale tokens into ``token_ids_buf`` and surface as
+                # repetition loops in long generations.
                 dist.broadcast(
                     next_tokens_gpu,
                     src=get_output_rank(),
+                    group=get_tp_group(),
                 )
             self.future_map.store_to_map(future_indices, next_tokens_gpu)
             if is_output_rank():
