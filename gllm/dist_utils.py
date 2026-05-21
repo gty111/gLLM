@@ -251,7 +251,27 @@ def tensor_model_parallel_all_gather(input_: torch.Tensor, dim=-1) -> torch.Tens
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
-    """All-reduce the input tensor across model parallel group."""
+    """All-reduce ``input_`` across the TP group.
+
+    Fast path: when an NVLink-P2P-capable ``CustomAllreduce`` has been
+    initialised and the message fits its registered staging window, route
+    through ``sgl_kernel``'s two-shot AR kernel (~3-5x lower latency than
+    NCCL's RING_LL for the <1 MB / small-batch decode regime on H100).
+    The custom kernel is out-of-place so we copy back to keep the
+    in-place semantics callers rely on.
+
+    Fall back to ``dist.all_reduce`` otherwise (custom AR disabled, too
+    large a tensor, non-contiguous input, etc.).
+    """
+    # Import lazily to avoid a circular import at module init (dist_utils is
+    # imported by gllm.distributed.cuda_wrapper transitively via ``logger``).
+    from gllm.distributed import get_custom_allreduce
+
+    car = get_custom_allreduce()
+    if car is not None and car.should_custom_ar(input_):
+        out = car.all_reduce(input_)
+        input_.copy_(out)
+        return input_
     dist.all_reduce(input_, group=get_tp_group())
     return input_
 

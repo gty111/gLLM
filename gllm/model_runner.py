@@ -1,3 +1,4 @@
+from contextlib import nullcontext as _nullcontext
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -529,15 +530,29 @@ class ModelRunner:
             logger.info(f"Capturing CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}")
             iterator = tqdm(self.capture_sizes, desc="Capturing CUDA Graphs", ncols=100)
         memory_pool = torch.cuda.graph_pool_handle()
-        for size in iterator:
-            seqs = self.create_dummy_seqs(size)
-            self.input_data.cal_and_set_input(seqs=seqs)
-            if self.use_mm:
-                self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
-                self.forward()
-            self.size_to_graph[size] = g
+
+        # If the custom NVLink-P2P all-reduce is active, wrap the whole
+        # capture in its ``capture()`` context so that, after all buckets
+        # are captured, it broadcasts the per-rank IPC handles for the
+        # buffers that ended up baked into the graphs. Without this,
+        # graph replay on any rank-N>0 would try to dereference a local
+        # pointer baked at capture time on rank 0 and crash. With NCCL
+        # AR there's nothing to do (NCCL kernels handle their own IPC
+        # internally), so a missing/disabled custom AR is a no-op.
+        from gllm.distributed import get_custom_allreduce
+
+        car = get_custom_allreduce()
+        capture_ctx = car.capture() if car is not None else _nullcontext()
+        with capture_ctx:
+            for size in iterator:
+                seqs = self.create_dummy_seqs(size)
+                self.input_data.cal_and_set_input(seqs=seqs)
+                if self.use_mm:
+                    self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
+                    self.forward()
+                self.size_to_graph[size] = g
         if torch.distributed.is_initialized():
             torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 

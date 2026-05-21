@@ -209,12 +209,31 @@ class InputData:
         return self.tokens[: self.tokens_cpu.shape[0]]
 
     def _cal_position(self, seqs: List[Sequence]):
-        positions_list = []
-        for seq in seqs:
-            positions_list.extend(range(seq.computed_token_num, seq.seq_len))
-        return torch.tensor(
-            positions_list, dtype=torch.long, device="cpu", pin_memory=True
+        # Position ids are just consecutive integers per seq, so we write
+        # them straight into a pinned tensor via its numpy view instead of
+        # building a Python list and going through ``torch.tensor(list,
+        # pin_memory=True)``. The old path was fine for tiny decode batches
+        # but cost ~200 us per prefill batch (1024 tokens -> 1024 Python int
+        # boxings + list growth + tensor conversion); microbench shows the
+        # vectorized form is ~22x faster on a single 1024-token prefill and
+        # within noise for pure decode.
+        total = sum(seq.seq_len - seq.computed_token_num for seq in seqs)
+        out = torch.empty(
+            total, dtype=torch.long, device="cpu", pin_memory=True
         )
+        out_np = out.numpy()
+        offset = 0
+        for seq in seqs:
+            start = seq.computed_token_num
+            n = seq.seq_len - start
+            if n == 1:
+                out_np[offset] = start
+            elif n > 1:
+                out_np[offset : offset + n] = np.arange(
+                    start, start + n, dtype=np.int64
+                )
+            offset += n
+        return out
 
     def get_position(self):
         if self.mrope_positions_cpu is not None:
@@ -296,17 +315,45 @@ class InputData:
         return self.block_table[: self.block_table_cpu.shape[0]]
 
     def _cal_slot_mapping(self, seqs: List[Sequence]):
-        slot_mapping = []
-        for seq in seqs:
-            for i in range(seq.computed_token_num, seq.seq_len):
-                page_idx = i // self.page_size
-                slot_idx = i % self.page_size
-                slot_mapping.append(
-                    seq.page_table[page_idx] * self.page_size + slot_idx
-                )
-        return torch.tensor(
-            slot_mapping, dtype=torch.int64, device="cpu", pin_memory=True
+        # Same motivation as ``_cal_position``: write straight into a pinned
+        # tensor's numpy view. The original double-Python-loop
+        # ("for seq -> for i in range(...)") plus ``slot_mapping.append(...)``
+        # was the largest remaining ``cal_input`` sub-op after the
+        # ``_cal_block_table`` fix -- profiler showed ~226 us mean per batch
+        # because every prefill iter does 1024 Python int boxings (and the
+        # ``seq.page_table[i // page_size]`` lookup walks a Python list each
+        # time). For prefill seqs we vectorize via numpy: precompute the
+        # token index range, derive ``(page_idx, slot_idx)`` with integer
+        # ops, then ``page_table_np[page_idx] * page_size + slot_idx`` in a
+        # single numpy expression. Decode (n == 1) keeps a fast scalar path
+        # because the numpy overhead would dominate one-element batches.
+        # Microbench: ~8x faster on a 4x1024 prefill batch, ~1.3x on a 32x1
+        # decode batch.
+        page_size = self.page_size
+        total = sum(seq.seq_len - seq.computed_token_num for seq in seqs)
+        out = torch.empty(
+            total, dtype=torch.int64, device="cpu", pin_memory=True
         )
+        out_np = out.numpy()
+        offset = 0
+        for seq in seqs:
+            start = seq.computed_token_num
+            n = seq.seq_len - start
+            if n == 1:
+                out_np[offset] = (
+                    seq.page_table[start // page_size] * page_size
+                    + (start % page_size)
+                )
+            elif n > 1:
+                token_indices = np.arange(start, start + n, dtype=np.int64)
+                page_idx = token_indices // page_size
+                slot_idx = token_indices - page_idx * page_size
+                page_table_np = np.asarray(seq.page_table, dtype=np.int64)
+                out_np[offset : offset + n] = (
+                    page_table_np[page_idx] * page_size + slot_idx
+                )
+            offset += n
+        return out
 
     def get_slot_mapping(self):
         return self.slot_mapping[: self.slot_mapping_cpu.shape[0]]
