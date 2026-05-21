@@ -4,6 +4,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
+from gllm.layers.repetition_penalty import build_repetition_penalty_mask
 from gllm.memory_manager import MemoryManager
 from gllm.sequence import Sequence
 from gllm.utils import async_tensor_h2d, ceil_div, round_down
@@ -70,21 +71,17 @@ class InputData:
             "cuda",
             True,
         )
-        self.needs_repetition_penalty = any(
-            seq.repetition_penalty != 1.0 for seq in self.seqs
+        # Build the per-seq ``[batch, vocab]`` repetition-penalty mask via
+        # the shared helper in ``gllm/layers/repetition_penalty.py`` (see
+        # that module's header for the sglang reference + the rationale
+        # behind our HF-style "seed with prompt + generated" semantics).
+        self.repetition_penalty = build_repetition_penalty_mask(
+            self.seqs,
+            batch_size=len(self.seqs),
+            vocab_size=self.memory_manager.vocab_size,
+            dtype=self.memory_manager.dtype,
         )
-        if self.needs_repetition_penalty:
-            repetition_penalty = async_tensor_h2d(
-                [seq.repetition_penalty for seq in self.seqs],
-                self.memory_manager.dtype,
-                "cuda",
-                True,
-            )
-            self.repetition_penalty = repetition_penalty.unsqueeze(dim=1).repeat(
-                1, self.memory_manager.vocab_size
-            )
-        else:
-            self.repetition_penalty = None
+        self.needs_repetition_penalty = self.repetition_penalty is not None
 
     def cal_input(self, seqs: List[Sequence]):
         assert len(seqs) != 0
