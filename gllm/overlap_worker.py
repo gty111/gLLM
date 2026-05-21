@@ -85,20 +85,24 @@ class OverlapWorker(Worker):
         return input_data
 
     def _launch_batch(self, input_data: InputData):
-        # Split input prep into a CPU phase (safe to run while the previous
-        # batch is still on the GPU) and a GPU/H2D phase (must wait until the
-        # previous forward has released the shared input buffers). The CPU
-        # phase covers attribute copies, multimodal position calc, and
-        # whatever image processing was deferred from the prefetch step;
-        # those several milliseconds of Python work now overlap with the
-        # tail of the previous forward instead of serializing behind it.
+        # Pipelined input prep:
+        #   * ``prepare_input_cpu`` is pure CPU work and overlaps with the
+        #     previous batch's GPU forward.
+        #   * ``prepare_input_gpu`` enqueues H2D + (VL) embed work on the
+        #     overlap runtime's ``prep_stream``, which GPU-waits for the
+        #     previous batch's ``input_consumed_event``. There is no
+        #     host-side sync here -- the ordering is entirely expressed via
+        #     CUDA events, so the host thread races ahead and the GPU bubble
+        #     between back-to-back forwards collapses to the cross-stream
+        #     wait_event cost.
+        #   * ``run_batch_async`` then dispatches forward+sample on
+        #     ``forward_stream`` with a wait_event on ``input_ready_event``.
         self.model_runner.prepare_input_cpu(input_data)
-        self.model_runner.sync_before_next_prepare()
         self.model_runner.prepare_input_gpu()
         return self.model_runner.run_batch_async()
 
     def _collect_batch(self, pending_entry, deferred_seqs=None):
-        copy_done, batch_size, buf_idx = pending_entry
+        copy_done, batch_size, buf_idx, _input_data = pending_entry
         copy_done.synchronize()
         if is_output_rank():
             tokens = self.model_runner._next_tokens_bufs[buf_idx][
@@ -123,31 +127,53 @@ class OverlapWorker(Worker):
         pending_before = len(self._gpu_pending)
 
         if self._prefetched_input is not None:
-            copy_done, batch_size, future_slot_ids, buf_idx = self._launch_batch(
-                self._prefetched_input
-            )
+            # ``input_data`` is kept alive in ``_gpu_pending`` until the batch
+            # finishes on the GPU. Without this, the only Python reference to
+            # this batch's CPU input tensors (``tokens_cpu``, ``slot_mapping_cpu``
+            # etc.) lives on ``model_runner.input_data`` and would be
+            # overwritten by the *next* iteration's ``prepare_input_cpu`` --
+            # potentially while ``prep_stream`` is still DMA'ing from those
+            # buffers. Holding the original ``InputData`` here makes the
+            # cross-batch lifetime explicit and trivially correct.
+            input_data = self._prefetched_input
             self._prefetched_input = None
+            copy_done, batch_size, future_slot_ids, buf_idx = self._launch_batch(
+                input_data
+            )
             deferred = self.scheduler.process_output_deferred(future_slot_ids)
-            self._gpu_pending.append((copy_done, batch_size, buf_idx, deferred))
+            self._gpu_pending.append(
+                (copy_done, batch_size, buf_idx, deferred, input_data)
+            )
 
         if pending_before > 0:
-            copy_done, batch_size, buf_idx, deferred = self._gpu_pending.popleft()
-            self._collect_batch((copy_done, batch_size, buf_idx), deferred)
+            copy_done, batch_size, buf_idx, deferred, input_data = (
+                self._gpu_pending.popleft()
+            )
+            self._collect_batch(
+                (copy_done, batch_size, buf_idx, input_data), deferred
+            )
 
     def run_first_tp(self):
         """TP followers (pp_rank == 0 only)."""
         pending_before = len(self._gpu_pending)
 
         if pending_before > 0:
-            copy_done, batch_size, buf_idx, _deferred = self._gpu_pending.popleft()
-            self._collect_batch((copy_done, batch_size, buf_idx))
+            copy_done, batch_size, buf_idx, _deferred, input_data = (
+                self._gpu_pending.popleft()
+            )
+            self._collect_batch((copy_done, batch_size, buf_idx, input_data))
 
         next_input = self._recv_prefetched_input()
         if next_input is not None:
             copy_done, batch_size, _future_slot_ids, buf_idx = self._launch_batch(
                 next_input
             )
-            self._gpu_pending.append((copy_done, batch_size, buf_idx, None))
+            # Keep ``next_input`` alive in the pending queue (see comment in
+            # ``run_driver``) so its CPU input tensors outlive the prep_stream
+            # DMA on the follower path too.
+            self._gpu_pending.append(
+                (copy_done, batch_size, buf_idx, None, next_input)
+            )
 
 
 def run_overlap_worker(worker: OverlapWorker):
