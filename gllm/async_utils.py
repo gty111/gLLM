@@ -72,7 +72,24 @@ class FutureMap:
 
 
 class OverlapRuntime:
-    """CUDA streams used to overlap scheduling, forward, and D2H copies."""
+    """CUDA streams used to overlap scheduling, forward, and D2H copies.
+
+    Three streams form the GPU-side pipeline:
+
+    * ``prep_stream``    — H2D copies of input metadata + (for VL) multimodal
+                           embed work for the *next* batch. GPU-waits for the
+                           previous forward via ``input_consumed_event`` so it
+                           can be enqueued from the host without ever blocking.
+    * ``forward_stream`` — model forward + sample for the current batch.
+                           GPU-waits for ``prep_stream`` via
+                           ``input_ready_event``.
+    * ``copy_stream``    — D2H sample-id copy back to a pinned host buffer.
+
+    With this pipeline the host thread never calls ``cudaEventSynchronize``
+    between batches: every cross-stream dependency is expressed through events
+    that the GPU itself blocks on, so dispatch for batch N+1 can race ahead of
+    forward N as far as the schedule queue allows.
+    """
 
     def __init__(self, device: Union[torch.device, str]):
         self.device = (
@@ -80,4 +97,12 @@ class OverlapRuntime:
         )
         self.forward_stream = torch.cuda.Stream(device=self.device)
         self.copy_stream = torch.cuda.Stream(device=self.device)
+        self.prep_stream = torch.cuda.Stream(device=self.device)
+        # ``input_consumed_event``: signalled at the end of forward+sample on
+        # ``forward_stream``; the next batch's ``prep_stream`` waits on it
+        # before overwriting the shared input buffers.
         self.input_consumed_event = torch.cuda.Event()
+        # ``input_ready_event``: signalled by ``prep_stream`` after H2D and any
+        # VL embed work; ``forward_stream`` waits on it before reading the
+        # input buffers.
+        self.input_ready_event = torch.cuda.Event()

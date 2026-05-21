@@ -646,16 +646,24 @@ class OverlapModelRunner(ModelRunner):
         )
 
     def sync_before_next_prepare(self) -> None:
-        self.overlap_runtime.input_consumed_event.synchronize()
+        """Deprecated host-side barrier; kept for backward compatibility.
+
+        The fully-async overlap pipeline expresses the
+        "previous forward has released the input buffers" dependency on the
+        GPU side via ``input_consumed_event`` and ``prep_stream``, so callers
+        should no longer need this. The method is intentionally a no-op now;
+        we keep the symbol so that any external user gets a smooth migration.
+        """
+        return
 
     def prepare_input_cpu(self, input_data: InputData) -> None:
         """CPU-only portion of input prep.
 
         Safe to invoke while the previous batch's forward is still consuming
-        the shared GPU input buffers. The pair :meth:`prepare_input_gpu` must
-        be called once :meth:`sync_before_next_prepare` has released those
-        buffers; only then is it sound to issue the H2D copies and write to
-        ``input_hidden_states``.
+        the shared GPU input buffers — this only touches Python attributes
+        and CPU tensors. The companion :meth:`prepare_input_gpu` issues the
+        actual H2D and embed work on ``prep_stream``, which itself
+        GPU-waits for the previous forward via ``input_consumed_event``.
         """
         self.input_data.set_input_from_prebuilt_cpu(input_data)
         if self.use_mm and is_first_pp_rank():
@@ -668,20 +676,35 @@ class OverlapModelRunner(ModelRunner):
             self._pending_mm_ctx = None
 
     def prepare_input_gpu(self) -> None:
-        """GPU/H2D portion of input prep.
+        """GPU/H2D portion of input prep, fully async.
 
-        Must run after :meth:`sync_before_next_prepare`. Performs the H2D
-        copies into the shared input buffers, runs the deferred multimodal
-        embedding work for any prefill seqs, and writes the merged embedding
-        tensor into ``input_hidden_states``.
+        All work (H2D copies into the shared input buffers, deferred
+        multimodal embed for prefill seqs, scattering decode embeddings) is
+        enqueued on ``prep_stream``. ``prep_stream`` first GPU-waits on
+        ``input_consumed_event`` so the writes can't clobber input buffers
+        that the previous batch's forward is still reading. After the work
+        is queued we record ``input_ready_event`` so that
+        :meth:`run_batch_async` can have ``forward_stream`` GPU-wait on it.
+
+        The host thread never blocks here: the ``cudaEventSynchronize`` that
+        used to serialize batches has been replaced by GPU-side
+        ``cudaStreamWaitEvent`` and stream events.
         """
-        self.input_data.copy_to_input_buffer()
-        if self._pending_mm_ctx is not None:
-            ctx = self._pending_mm_ctx
-            self._pending_mm_ctx = None
-            input_embeddings = self._mm_prepare_gpu(ctx)
-            self.input_data.set_mrope_position(ctx["mrope_positions"])
-            self.prepare_input_embeddings(input_embeddings)
+        rt = self.overlap_runtime
+        # GPU-side wait: prep_stream blocks until the previous forward has
+        # finished reading the input buffers. ``wait_event`` on an unrecorded
+        # event is a no-op (CUDA semantics), so this is safe on the very
+        # first iteration.
+        rt.prep_stream.wait_event(rt.input_consumed_event)
+        with torch.cuda.stream(rt.prep_stream):
+            self.input_data.copy_to_input_buffer()
+            if self._pending_mm_ctx is not None:
+                ctx = self._pending_mm_ctx
+                self._pending_mm_ctx = None
+                input_embeddings = self._mm_prepare_gpu(ctx)
+                self.input_data.set_mrope_position(ctx["mrope_positions"])
+                self.prepare_input_embeddings(input_embeddings)
+            rt.input_ready_event.record(rt.prep_stream)
 
     def _run_forward_on_stream(self, num_cal_tokens: int) -> int:
         if self.check_decode_batch():
@@ -729,14 +752,17 @@ class OverlapModelRunner(ModelRunner):
             range(future_indices.interval.start, future_indices.interval.stop)
         )
 
-        # Capture the *outer* stream (default stream in the worker thread)
-        # so that ``forward_stream`` can correctly wait on H2D copies and
-        # multimodal embed work that ``prepare_input_gpu`` issued there.
-        # The previous code called ``wait_stream(torch.cuda.current_stream())``
-        # from *inside* the ``with cuda.stream(forward_stream)`` block, which
-        # resolved to a self-wait (no-op).
+        # ``prepare_input_gpu`` enqueued all H2D + (VL) embed work on
+        # ``prep_stream`` and recorded ``input_ready_event``. ``forward_stream``
+        # GPU-waits on that event before reading the shared input buffers, so
+        # the pipeline is fully async (no host-side ``cudaEventSynchronize``).
+        # We additionally wait_stream(default_stream) defensively in case any
+        # incidental work landed on the worker thread's default stream
+        # (e.g. user-issued ops outside the overlap path); that's a no-op in
+        # the steady state.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.forward_stream):
+            self.forward_stream.wait_event(self.overlap_runtime.input_ready_event)
             self.forward_stream.wait_stream(default_stream)
             self.future_map.resolve_future(
                 self.input_data.tokens[:num_cal_tokens]

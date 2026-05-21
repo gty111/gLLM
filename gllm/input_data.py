@@ -199,7 +199,14 @@ class InputData:
                 if seq.to_compute_tokens is None
                 else seq.to_compute_tokens
             )
-        return torch.tensor(tokens_list, dtype=torch.long, device="cpu")
+        # Pin the CPU staging buffer so the H2D into ``self.tokens`` issued
+        # from ``copy_to_input_buffer`` with ``non_blocking=True`` is truly
+        # async on the prep stream. Pageable sources cause CUDA to fall back
+        # to a synchronous staging copy, which would defeat the host/GPU
+        # overlap the rest of the pipeline relies on.
+        return torch.tensor(
+            tokens_list, dtype=torch.long, device="cpu", pin_memory=True
+        )
 
     def get_tokens(self):
         return self.tokens[: self.tokens_cpu.shape[0]]
@@ -208,7 +215,9 @@ class InputData:
         positions_list = []
         for seq in seqs:
             positions_list.extend(range(seq.computed_token_num, seq.seq_len))
-        return torch.tensor(positions_list, dtype=torch.long, device="cpu")
+        return torch.tensor(
+            positions_list, dtype=torch.long, device="cpu", pin_memory=True
+        )
 
     def get_position(self):
         if self.mrope_positions_cpu is not None:
@@ -234,9 +243,17 @@ class InputData:
 
     def _cal_query_start_loc(self, seqs: List[Sequence]):
         query_lens = [0] + [seq.to_compute_token_num for seq in seqs]
-        return max(query_lens), torch.from_numpy(np.cumsum(query_lens)).to(
-            device="cpu", dtype=torch.int32
+        cumsum = np.cumsum(query_lens, dtype=np.int32)
+        # Materialize into a fresh pinned tensor so downstream non_blocking
+        # H2D doesn't have to fall back to a synchronous staging copy.
+        # ``device="cpu"`` is required because ``ModelLoader`` sets the
+        # default torch device to CUDA, and ``pin_memory=True`` is only
+        # legal on dense CPU tensors.
+        out = torch.empty(
+            cumsum.shape[0], dtype=torch.int32, device="cpu", pin_memory=True
         )
+        out.copy_(torch.from_numpy(cumsum))
+        return max(query_lens), out
 
     def get_query_start_loc(self):
         return self.query_start_loc[: self.query_start_loc_cpu.shape[0]]
@@ -248,7 +265,12 @@ class InputData:
         )
         for idx, block_table in enumerate(block_tables_list):
             block_tables[idx, : len(block_table)] = block_table
-        return torch.from_numpy(block_tables)
+        # See ``_cal_query_start_loc`` for why ``device="cpu"`` is required.
+        out = torch.empty(
+            block_tables.shape, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        out.copy_(torch.from_numpy(block_tables))
+        return out
 
     def get_block_table(self):
         return self.block_table[: self.block_table_cpu.shape[0]]
@@ -262,7 +284,9 @@ class InputData:
                 slot_mapping.append(
                     seq.page_table[page_idx] * self.page_size + slot_idx
                 )
-        return torch.tensor(slot_mapping, dtype=torch.int64, device="cpu")
+        return torch.tensor(
+            slot_mapping, dtype=torch.int64, device="cpu", pin_memory=True
+        )
 
     def get_slot_mapping(self):
         return self.slot_mapping[: self.slot_mapping_cpu.shape[0]]
