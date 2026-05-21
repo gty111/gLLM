@@ -2,6 +2,7 @@ import torch
 from sgl_kernel import top_k_top_p_sampling_from_probs
 
 from gllm.input_data import InputData
+from gllm.layers.repetition_penalty import apply_scaling_penalties
 
 
 def _fused_top_k_top_p_sample(
@@ -25,7 +26,7 @@ class Sampler:
         flags = self._get_sampling_flags(input_data)
 
         if flags["need_repetition_penalty"]:
-            self._apply_repetition_penalty(logits, input_data)
+            apply_scaling_penalties(logits, input_data.repetition_penalty)
 
         if flags["is_all_greedy"]:
             if flags["need_temperature"]:
@@ -54,11 +55,3 @@ class Sampler:
                 for seq in seqs
             ),
         }
-
-    @staticmethod
-    def _apply_repetition_penalty(
-        logits: torch.Tensor, input_data: InputData
-    ) -> None:
-        penalty = input_data.repetition_penalty
-        logits.div_(torch.where(logits > 0, penalty, 1.0))
-        logits.mul_(torch.where(logits <= 0, 1.0, penalty))

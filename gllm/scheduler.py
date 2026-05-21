@@ -162,9 +162,16 @@ class Scheduler:
                 post_schedule_seq = copy.copy(seq)
                 # MM prefill may still need full prompt token_ids to
                 # build (or rebuild) cached multimodal embeddings/positions.
-                # Keep token_ids for unfinished MM prefills; drop otherwise to
-                # reduce IPC payload.
-                keep_full_token_ids = self.model_runner.use_mm and (not seq.computed_prompt)
+                # Sampling with ``repetition_penalty != 1.0`` also needs the
+                # full token history of the seq so that the per-vocab
+                # penalty mask in :meth:`InputData.prepare_sample` can mark
+                # exactly the tokens that have already appeared. Keep
+                # ``token_ids`` for these cases; drop otherwise to reduce
+                # IPC payload.
+                keep_full_token_ids = (
+                    (self.model_runner.use_mm and (not seq.computed_prompt))
+                    or seq.repetition_penalty != 1.0
+                )
                 post_schedule_seq.token_ids = seq.token_ids if keep_full_token_ids else None
                 if not keep_full_token_ids:
                     post_schedule_seq.to_compute_tokens = seq[
