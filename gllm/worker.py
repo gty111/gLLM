@@ -92,6 +92,24 @@ class Worker(TorchProfilerMixin):
 
         self.comm.init()
 
+        # Bring up the custom NVLink-P2P all-reduce path before the model
+        # runner builds CUDA graphs -- graph capture has to see the same
+        # AR implementation that replay will use, otherwise the captured
+        # NCCL kernel and the eager custom kernel disagree on streams /
+        # buffers and we get gradual KV drift between TP ranks (we hit
+        # this exact failure mode when overlap scheduling captured on the
+        # wrong stream; see ``OverlapModelRunner.capture_graph``).
+        if self.tp_size > 1:
+            from gllm.distributed import init_custom_allreduce
+            from gllm.dist_utils import get_tp_group
+
+            init_custom_allreduce(
+                device=torch.device(f"cuda:{self.local_rank}"),
+                group=get_tp_group(),
+                rank=self.tp_rank,
+                world_size=self.tp_size,
+            )
+
         self.model_runner.init(self.mp_load_progress)
         self.hidden_size = self.model_runner.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual
