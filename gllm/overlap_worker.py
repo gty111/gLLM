@@ -44,6 +44,22 @@ class OverlapWorker(Worker):
         if len(schedule_seqs) == 0:
             self._prefetched_input = None
             return
+        # Ship ``schedule_seqs`` to the TP followers (same PP stage) BEFORE
+        # building this batch's ``InputData`` locally. ``cal_input`` is pure
+        # numpy/torch CPU work (~ms-level for typical decode batches) that
+        # touches only read-only seq attributes, so it overlaps cleanly with
+        # the pickling + zmq send happening in the background sender thread
+        # and with the TP follower's own ``cal_input`` once it receives.
+        #
+        # Previously we sent *after* ``cal_input`` returned, which meant
+        # rank-1 started its CPU prep ~``cal_input`` later than rank-0 every
+        # batch. That lag propagated all the way to the first NCCL collective
+        # of each forward and surfaced as a huge stall on rank-0's first
+        # AllReduce per batch (profiler: rank-0 AR p99 ~4ms, mean 87us; rank-1
+        # AR p99 ~80us, mean 11us). Sending first collapses that lag and lets
+        # the two ranks enter every collective ~simultaneously.
+        if get_world_size() > 1:
+            self.comm.send_schedule_seqs(schedule_seqs, None, True)
         next_input = InputData(
             use_buffer=False,
             memory_manager=self.model_runner.memory_manager,
@@ -51,7 +67,11 @@ class OverlapWorker(Worker):
         )
         next_input.cal_input(schedule_seqs)
         if get_world_size() > 1:
-            self.comm.send_schedule_seqs(schedule_seqs, None, True)
+            # Second send carries ``mrope_positions_cpu``, which is only
+            # populated by ``cal_input`` (and only used by subsequent PP
+            # stages for multimodal models). With pp_size=1 the recipient
+            # list is empty, so this is a no-op; with pp_size>1 it must
+            # remain after ``cal_input``.
             self.comm.send_schedule_seqs(
                 schedule_seqs, next_input.mrope_positions_cpu, False
             )
