@@ -174,14 +174,27 @@ class OverlapWorker(Worker):
             )
 
     def run_first_tp(self):
-        """TP followers (pp_rank == 0 only)."""
-        pending_before = len(self._gpu_pending)
+        """TP followers (pp_rank == 0 only).
 
-        if pending_before > 0:
-            copy_done, batch_size, buf_idx, _deferred, input_data = (
-                self._gpu_pending.popleft()
-            )
-            self._collect_batch((copy_done, batch_size, buf_idx, input_data))
+        Ordering mirrors ``run_driver``: **launch first, collect last**.
+        The earlier version did the opposite (``_collect_batch`` then
+        ``_launch_batch``), which made rank-1 fully serial -- the CPU
+        sync inside ``copy_done.synchronize()`` for batch N would block
+        the host thread until batch N's forward+broadcast finished on
+        GPU before rank-1 even started receiving batch N+1's schedule.
+        Rank-0 meanwhile pipelined: it had already launched batch N+1
+        well before that sync. The result was that rank-1 entered every
+        forward ~2 ms after rank-0, and rank-0 spent that 2 ms spinning
+        inside the *first* AR kernel of each forward waiting for rank-1
+        to arrive. Profiler confirmed: position-0 AR mean was 1987 us,
+        position-1+ was 4-7 us; reordering collapses that to ~5 us flat
+        and shaves the bulk of the rank-0 AR p99 tail.
+
+        Queue semantics: we capture ``pending_before`` *before* the new
+        launch's ``append`` so the subsequent ``popleft`` still returns
+        the older batch (N), never the just-launched one (N+1).
+        """
+        pending_before = len(self._gpu_pending)
 
         next_input = self._recv_prefetched_input()
         if next_input is not None:
@@ -194,6 +207,12 @@ class OverlapWorker(Worker):
             self._gpu_pending.append(
                 (copy_done, batch_size, buf_idx, None, next_input)
             )
+
+        if pending_before > 0:
+            copy_done, batch_size, buf_idx, _deferred, input_data = (
+                self._gpu_pending.popleft()
+            )
+            self._collect_batch((copy_done, batch_size, buf_idx, input_data))
 
 
 def run_overlap_worker(worker: OverlapWorker):
