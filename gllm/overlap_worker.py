@@ -3,6 +3,7 @@
 from collections import deque
 from logger import logger
 
+from gllm.dist_schedule import SchedulePayload
 from gllm.dist_utils import (
     get_tp_size,
     get_world_size,
@@ -44,54 +45,54 @@ class OverlapWorker(Worker):
         if len(schedule_seqs) == 0:
             self._prefetched_input = None
             return
-        # Ship ``schedule_seqs`` to the TP followers (same PP stage) BEFORE
-        # building this batch's ``InputData`` locally. ``cal_input`` is pure
-        # numpy/torch CPU work (~ms-level for typical decode batches) that
-        # touches only read-only seq attributes, so it overlaps cleanly with
-        # the pickling + zmq send happening in the background sender thread
-        # and with the TP follower's own ``cal_input`` once it receives.
+        # Ship the delta-style :class:`SchedulePayload` to TP followers
+        # (same PP stage) BEFORE building this batch's ``InputData``
+        # locally. ``cal_input`` is pure numpy/torch CPU work that
+        # touches only read-only seq attributes, so it overlaps cleanly
+        # with the persistent zmq sender thread pickling the payload
+        # and with the TP follower's own ``cal_input`` once it
+        # receives. Sending first was critical for the previous fix
+        # (rank-1 入图同步, see tp2-perf-fix.md) -- the delta refactor
+        # cuts the wire payload by another ~30x (no more per-iter
+        # ``page_table`` / sampling-params / ``mm_contents`` re-send),
+        # which should shrink the residual position-0 AR stall further.
         #
-        # Previously we sent *after* ``cal_input`` returned, which meant
-        # rank-1 started its CPU prep ~``cal_input`` later than rank-0 every
-        # batch. That lag propagated all the way to the first NCCL collective
-        # of each forward and surfaced as a huge stall on rank-0's first
-        # AllReduce per batch (profiler: rank-0 AR p99 ~4ms, mean 87us; rank-1
-        # AR p99 ~80us, mean 11us). Sending first collapses that lag and lets
-        # the two ranks enter every collective ~simultaneously.
+        # pp_size > 1 is rejected at OverlapWorker.__init__ so we
+        # don't need a second send for PP-other here.
         if get_world_size() > 1:
-            self.comm.send_schedule_seqs(schedule_seqs, None, True)
+            payload = self._build_schedule_payload(schedule_seqs)
+            if payload is not None:
+                self.comm.send_schedule_payload(payload, is_first_pp=True)
         next_input = InputData(
             use_buffer=False,
             memory_manager=self.model_runner.memory_manager,
             max_seq_length=self.model_runner.model_max_length,
         )
         next_input.cal_input(schedule_seqs)
-        if get_world_size() > 1:
-            # Second send carries ``mrope_positions_cpu``, which is only
-            # populated by ``cal_input`` (and only used by subsequent PP
-            # stages for multimodal models). With pp_size=1 the recipient
-            # list is empty, so this is a no-op; with pp_size>1 it must
-            # remain after ``cal_input``.
-            self.comm.send_schedule_seqs(
-                schedule_seqs, next_input.mrope_positions_cpu, False
-            )
         self._prefetched_input = next_input
 
     def _recv_prefetched_input(self):
-        recv_data = self.comm.recv_schedule_seqs()
-        if recv_data is None:
+        payload = self.comm.recv_schedule_payload()
+        if payload is None:
             return None
-        if len(recv_data) == 3:
-            seqs, mrope_positions, cmd_code = recv_data
-            profile_session_dir = None
-        elif len(recv_data) == 4:
-            seqs, mrope_positions, cmd_code, profile_session_dir = recv_data
-        else:
-            raise ValueError(f"Unexpected schedule payload: {recv_data!r}")
 
-        if cmd_code != 0:
-            self._apply_control_cmd(cmd_code, profile_session_dir)
-        if len(seqs) == 0:
+        if payload.control_cmd != 0:
+            self._apply_control_cmd(payload.control_cmd, payload.control_data)
+
+        seqs = self.follower_store.apply_payload(payload)
+
+        # Same ordering rationale as ``Worker.recv_schedule_payload``:
+        # apply frees *after* materializing the batch. With overlap
+        # scheduling the freed seq cannot be in this batch (the
+        # scheduler removes it from ``seqs_to_decode`` /
+        # ``seqs_to_prefill`` before scheduling), so this is just
+        # defensive ordering for the edge case where a payload
+        # happens to free + reschedule the same id.
+        if payload.frees:
+            for sid in payload.frees:
+                self.model_runner.free_follower_state(sid)
+
+        if not seqs:
             return None
 
         input_data = InputData(
@@ -100,8 +101,8 @@ class OverlapWorker(Worker):
             max_seq_length=self.model_runner.model_max_length,
         )
         input_data.cal_input(seqs)
-        if mrope_positions is not None:
-            input_data.set_mrope_position(mrope_positions)
+        if payload.mrope_positions is not None:
+            input_data.set_mrope_position(payload.mrope_positions)
         return input_data
 
     def _launch_batch(self, input_data: InputData):

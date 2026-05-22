@@ -2,7 +2,7 @@ import copy
 import random
 import time
 from collections import deque
-from typing import List
+from typing import List, Optional
 
 from logger import logger
 
@@ -47,8 +47,23 @@ class Scheduler:
         self.abort_ids = set()
         # log
         self.log = True
+        # Seq-ids that finished / aborted since the last time we built a
+        # schedule payload for the followers. The worker drains this on
+        # every payload build (``Worker.consume_pending_follower_frees``)
+        # so the followers can drop their per-seq mirror + VL
+        # ``embedding_cache`` entry. We piggyback on the next schedule
+        # payload instead of opening a dedicated free socket; the worst
+        # case (no further schedules ever happen) leaks at most the
+        # currently-tracked seqs at process exit, which is fine.
+        self._pending_follower_frees: List[int] = []
         # schedule method
         self.schedule = self.dispatch_schedule_method()
+
+    def consume_pending_follower_frees(self) -> List[int]:
+        """Drain seq_ids accumulated since the last schedule payload."""
+        out = self._pending_follower_frees
+        self._pending_follower_frees = []
+        return out
 
     def dispatch_schedule_method(self):
         if self.schedule_method in ["split_pd", "chunked_prefill"]:
@@ -101,6 +116,12 @@ class Scheduler:
                 seq.append(next_tokens[idx])
             if seq.is_finish:
                 ipc_package.free_ids.append(seq.seq_id)
+                # Mirror the free to follower-side state cleanup. ``free_ids``
+                # in ``ipc_package`` goes to the *frontend* (so it can stop
+                # tracking the seq and emit the final response); followers
+                # need their own notification path because they hold the
+                # FollowerSeq mirror + VL ``embedding_cache`` row.
+                self._pending_follower_frees.append(seq.seq_id)
                 self.model_runner.free(seq)
             elif seq.computed_prompt:
                 self.seqs_to_decode.appendleft(seq)
@@ -117,6 +138,13 @@ class Scheduler:
             seq_to_preempt = self.seqs_to_decode.popleft()
             self.model_runner.free(seq_to_preempt)
             seq_to_preempt.preempt()
+            # Don't notify followers here: the seq is being re-queued as a
+            # waiting prefill and will appear in a future schedule batch.
+            # ``DriverPayloadBuilder`` detects the page_table shrink
+            # (len < last_pages_len) on that next iteration and emits a
+            # ``page_table_reset=[]`` in the SeqUpdate so the follower
+            # drops the stale page ids without us having to send an
+            # explicit free + re-register round trip.
             preempt_seqs.append(seq_to_preempt)
 
         self.seqs_to_prefill.extendleft(preempt_seqs)
@@ -140,6 +168,9 @@ class Scheduler:
             id = seq.seq_id
             if id in self.abort_ids:
                 ipc_package.free_ids.append(id)
+                # See ``process_output``: followers need their own free
+                # notification so they can drop the FollowerSeq mirror.
+                self._pending_follower_frees.append(id)
                 self.model_runner.free(seq)
                 seqs.remove(seq)
                 self.abort_ids.remove(id)
@@ -153,37 +184,24 @@ class Scheduler:
         else:
             return None
 
-    def post_schedule(self, schedule_seqs: List[Sequence]):
-        # We drop token_ids and extract to_compute_tokens here,
-        # since it is not fully used and may increase overhead of zmq.
-        post_schedule_seqs = []
-        for seq in schedule_seqs:
-            if seq.has_schedule:
-                post_schedule_seq = copy.copy(seq)
-                # MM prefill may still need full prompt token_ids to
-                # build (or rebuild) cached multimodal embeddings/positions.
-                # Sampling with ``repetition_penalty != 1.0`` also needs the
-                # full token history of the seq so that the per-vocab
-                # penalty mask in :meth:`InputData.prepare_sample` can mark
-                # exactly the tokens that have already appeared. Keep
-                # ``token_ids`` for these cases; drop otherwise to reduce
-                # IPC payload.
-                keep_full_token_ids = (
-                    (self.model_runner.use_mm and (not seq.computed_prompt))
-                    or seq.repetition_penalty != 1.0
-                )
-                post_schedule_seq.token_ids = seq.token_ids if keep_full_token_ids else None
-                if not keep_full_token_ids:
-                    post_schedule_seq.to_compute_tokens = seq[
-                        seq.computed_token_num : seq.seq_len
-                    ]
-                post_schedule_seqs.append(post_schedule_seq)
-            else:
-                post_schedule_seqs.append(seq)
-                seq.has_schedule = True
-        return post_schedule_seqs
-
     def schedule_once(self):
+        """Pick a batch from the queues; followers no longer get a Sequence list.
+
+        Previously this method returned a *deep-ish* copy of the batch's
+        ``Sequence`` objects (``post_schedule`` shallow-copied each seq and
+        stripped token_ids / extracted ``to_compute_tokens``) so that the
+        zmq sender thread could safely pickle them while the main thread
+        kept mutating the originals.
+
+        With the delta-broadcast (``gllm/dist_schedule.py``) the worker
+        snapshots whatever state the followers actually need into a
+        :class:`SchedulePayload` at send time, so we just hand back the
+        *real* ``Sequence`` objects -- no copy, no token_ids stripping,
+        no ``has_schedule`` toggling. The rank-0 paths that still read
+        from the returned list (``prepare_input`` for the local
+        ``InputData``, the deferred-output processing in
+        :class:`OverlapScheduler`) want the live ``Sequence`` anyway.
+        """
         if (
             len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0
             and len(self.batch_running) < self.pp_size
@@ -191,8 +209,7 @@ class Scheduler:
             schedule_seqs = self.schedule()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
-                post_schedule_seqs = self.post_schedule(schedule_seqs)
-                return post_schedule_seqs
+                return schedule_seqs
 
         return []
 
@@ -409,6 +426,11 @@ class OverlapScheduler(Scheduler):
             is_max_len = generated_len >= seq.output_len
             if seq.computed_prompt and (is_eos or is_max_len):
                 ipc_package.free_ids.append(seq.seq_id)
+                # Followers also need to drop this seq from their
+                # ``FollowerSeqStore`` (and the VL ``embedding_cache``).
+                # We piggyback on the next ``send_schedule_payload`` call;
+                # see ``Scheduler.consume_pending_follower_frees``.
+                self._pending_follower_frees.append(seq.seq_id)
                 seq._overlap_freed = True
                 self.model_runner.free(seq)
                 try:

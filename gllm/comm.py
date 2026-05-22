@@ -1,10 +1,11 @@
 import queue
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import zmq
 
+from gllm.dist_schedule import SchedulePayload
 from gllm.dist_utils import (
     get_output_rank,
     get_pp_size,
@@ -199,35 +200,58 @@ class zmqComm:
         self._senders[socket] = q
         return q
 
-    def send_schedule_seqs(
+    def send_schedule_payload(
         self,
-        seqs: List[Sequence],
-        pos: Optional[torch.Tensor],
+        payload: SchedulePayload,
         is_first_pp: bool,
-        control_cmd_code: int = 0,
     ):
+        """Fan out one :class:`SchedulePayload` to a follower group.
+
+        ``is_first_pp=True`` => TP followers sharing rank-0's PP stage.
+        ``is_first_pp=False`` => workers on subsequent PP stages.
+
+        The same payload bytes are pickled at most once per send
+        (zmq's ``send_pyobj`` does the work on the persistent sender
+        thread we set up in :meth:`_get_sender`). Empty payloads are
+        skipped on the sender side so an idle iteration costs zero
+        per-target work.
+        """
+        if payload.is_empty():
+            return
         if is_first_pp:
             schedule_sockets = self.schedule_first_pp_sockets
         else:
             schedule_sockets = self.schedule_other_sockets
         if not schedule_sockets:
             return
-        data = (seqs, pos, control_cmd_code)
         for socket in schedule_sockets:
-            self._get_sender(socket).put(data)
+            self._get_sender(socket).put(payload)
 
     def broadcast_control_cmd(
         self, control_cmd_code: int, profile_session_dir: Optional[str] = None
     ):
-        data = ([], None, control_cmd_code, profile_session_dir)
-        for socket in self.schedule_first_pp_sockets + self.schedule_other_sockets:
-            self._get_sender(socket).put(data)
+        """Ship an empty-schedule payload to every follower group.
 
-    def recv_schedule_seqs(self):
+        Used by the profiler-start/stop plumbing to piggyback a
+        ``control_cmd`` through the same socket the schedule loop
+        polls -- avoids a separate poller / distributed barrier.
+        """
+        payload = SchedulePayload(
+            control_cmd=control_cmd_code,
+            control_data=profile_session_dir,
+        )
+        for socket in self.schedule_first_pp_sockets + self.schedule_other_sockets:
+            self._get_sender(socket).put(payload)
+
+    def recv_schedule_payload(self) -> Optional[SchedulePayload]:
         if self.schedule_socket.poll(timeout=0) != 0:
-            return self.schedule_socket.recv_pyobj()
-        else:
-            return None
+            payload = self.schedule_socket.recv_pyobj()
+            assert isinstance(payload, SchedulePayload), (
+                f"unexpected schedule payload {type(payload).__name__!r}: "
+                "all schedule sends should go through send_schedule_payload"
+            )
+            return payload
+        return None
 
     def send_ipc_package(self, ipc_package):
         self.request_socket.send_pyobj(ipc_package)

@@ -627,7 +627,26 @@ class ModelRunner:
     def free(self, seq: Sequence):
         self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():
-            self.embedding_cache.pop(seq.seq_id)
+            self.embedding_cache.pop(seq.seq_id, None)
+
+    def free_follower_state(self, seq_id: int) -> None:
+        """Drop per-seq cache on a TP/PP follower; does **not** touch pages.
+
+        KV-page allocation is centralized on rank-0 (the only place that
+        runs the scheduler / memory manager), so followers must not
+        re-free pages -- doing so would push the page back into the
+        ID allocator while rank-0 still considers it allocated, and
+        the next ``pre_allocate_page`` would happily re-hand it to a
+        different seq mid-flight.
+
+        What followers *do* need to release on free is the
+        ``embedding_cache`` row (VL only, first PP rank only) -- the
+        existing code path never reached this because the follower
+        was stateless about seq lifetimes pre-refactor, which leaked
+        a multimodal-embedding tensor per finished VL request.
+        """
+        if self.use_mm and is_first_pp_rank():
+            self.embedding_cache.pop(seq_id, None)
 
 
 class OverlapModelRunner(ModelRunner):

@@ -77,11 +77,14 @@ def build_repetition_penalty_mask(
     * ``1.0`` everywhere else.
 
     Sequences that have ``repetition_penalty == 1.0`` contribute a row of
-    all ones, so multiplying through them is a no-op. Sequences that
-    came through ``Scheduler.post_schedule`` without ``token_ids`` (the
-    IPC payload-stripping path) are skipped gracefully; the scheduler is
-    responsible for keeping ``token_ids`` when ``repetition_penalty != 1.0``
-    so this guard is purely defensive.
+    all ones, so multiplying through them is a no-op. Sequences whose
+    ``token_ids`` mirror was elided on the follower (the delta-broadcast
+    path in ``gllm/dist_schedule.py`` sets
+    ``FollowerSeq.token_ids = None`` for seqs that don't need it for
+    rep-penalty or VL) are skipped gracefully -- a follower will never
+    reach this branch for a ``repetition_penalty != 1.0`` seq because
+    the driver sets ``needs_token_id_accumulation=True`` at registration
+    time. The guard is defensive.
     """
     if not any(getattr(seq, "repetition_penalty", 1.0) != 1.0 for seq in seqs):
         return None
