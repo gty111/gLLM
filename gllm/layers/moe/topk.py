@@ -8,10 +8,19 @@ from gllm import _custom_ops as ops
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
-    token_expert_indices: torch.Tensor,
+    token_expert_indices: Optional[torch.Tensor],
     gating_output: torch.Tensor,
     renormalize: bool,
 ) -> tuple[torch.Tensor, ...]:
+    """Compute top-k softmax (with optional renormalize) in one launch.
+
+    Renormalisation is forwarded to the kernel via the ``renormalize`` flag
+    on ``ops.topk_softmax`` so we don't append a follow-up
+    ``topk_weights / topk_weights.sum(...)`` (a reduce + elementwise) that
+    would silently fight with whatever the caller does after the fact.
+    Profile of Qwen3-VL-30B-A3B-Instruct TP=4 showed the pre-fix path
+    spending ~20 ms / 100 decode forwards on these two appended kernels.
+    """
     from gllm import _custom_ops as ops
 
     ops.topk_softmax(
@@ -19,10 +28,8 @@ def topk_softmax(
         topk_indices,
         token_expert_indices,  # kept for API compat, ignored by sgl_kernel
         gating_output,
+        renormalize,
     )
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
     return topk_weights, topk_indices
 
 
@@ -221,6 +228,24 @@ def fused_topk(
     topk: int,
     renormalize: bool,
 ):
+    """Pure-bf16 / fp16 top-k softmax for ungrouped MoE routers (e.g. Qwen3-MoE).
+
+    The previous implementation had three redundant kernels per MoE layer:
+      1. ``gating_output.float()`` -- pointless cast, the sgl-kernel
+         topk_softmax handles bf16/fp16 logits directly;
+      2. ``topk_weights / topk_weights.sum(dim=-1, keepdim=True)`` -- a
+         reduce + an elementwise division to renormalise top-k weights,
+         already supported in-kernel via ``renormalize=True``;
+      3. (gone with #2) the dead ``token_expert_indicies`` scratch buffer
+         that sgl-kernel doesn't consume.
+
+    With 48 MoE layers x 100 decode forwards that's ~15k saved kernel
+    launches per profile window on Qwen3-VL-30B-A3B-Instruct TP=4 (= less
+    rank-0 CPU pressure between AR ops, on top of the direct ~20 ms GPU
+    saving). SGLang's trace shows the same one-launch pattern --
+    ``topkGatingSoftmax<bf16, top_k=8, n_expert=128, ...>`` followed by no
+    Python-side post-processing.
+    """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
@@ -229,21 +254,14 @@ def fused_topk(
         M, topk, dtype=torch.float32, device=hidden_states.device
     )
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-    token_expert_indicies = torch.empty(
-        M, topk, dtype=torch.int32, device=hidden_states.device
-    )
 
     topk_softmax(
         topk_weights,
         topk_ids,
-        token_expert_indicies,
-        gating_output.float(),
+        None,  # token_expert_indices: kept in API for vLLM/HF compat, sgl-kernel ignores it
+        gating_output,
         renormalize,
     )
-    del token_expert_indicies
-
-    if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
 

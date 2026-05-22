@@ -237,19 +237,31 @@ def fused_add_rms_norm(
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    token_expert_indicies: torch.Tensor,
+    token_expert_indicies: Optional[torch.Tensor],
     gating_output: torch.Tensor,
+    renormalize: bool = False,
 ) -> None:
     """
     Compute top-k softmax for MoE routing.
 
-    Note: sgl_kernel.topk_softmax doesn't use token_expert_indicies.
-    The parameter is kept for API compatibility but ignored.
+    Note: ``sgl_kernel.topk_softmax`` doesn't use ``token_expert_indicies``;
+    the parameter is kept for API compatibility but ignored.
+
+    ``renormalize`` is plumbed through to the kernel so callers can fold the
+    "divide topk_weights by their sum" pass into the same launch instead of
+    chaining a ``topk_weights / topk_weights.sum(-1, keepdim=True)`` after
+    the kernel call (which costs an extra reduce + elementwise per MoE
+    layer; profile of Qwen3-VL-30B-A3B TP=4 H20-3e shows ~20 ms / 100
+    decode forwards spent on these two kernels plus their launch overhead).
+    The kernel also accepts bf16 / fp16 gating logits directly -- callers
+    should drop their pre-call ``.float()`` cast, which is another wasted
+    elementwise + ~6 MB scratch per layer.
     """
     _sgl_topk_softmax(
         topk_weights,
         topk_ids,
         gating_output,
+        renormalize,
     )
 
 

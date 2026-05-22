@@ -67,7 +67,22 @@ def moe_align_block_size(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
-    # torch.zeros fix for padding block
+    # ``torch.zeros`` (NOT ``torch.empty``) is required when EP is on.
+    # When ``expert_map is not None`` below, we do
+    # ``expert_ids = expert_map[expert_ids]`` -- a regular ``aten::index``
+    # gather that walks the full tensor including the trailing blocks
+    # past ``num_tokens_post_pad`` that ``sgl_moe_align_block_size``
+    # never writes. With ``torch.empty`` those blocks hold whatever bits
+    # the allocator handed us; if any happen to be outside
+    # ``[-num_experts-1, num_experts]`` the device-side bounds check in
+    # ``IndexKernel.cu:111`` fires
+    # (``Assertion -sizes[i] <= index && index < sizes[i] failed``),
+    # the GPU goes into an asserted state, and the *next* kernel
+    # (typically the q-norm RMSNorm a layer later) surfaces the failure
+    # asynchronously -- a very confusing crash path. Zero is a valid
+    # expert id, so ``torch.zeros`` keeps the gather in-bounds; the
+    # fused MoE kernel still ignores those padding blocks via
+    # ``num_tokens_post_padded``.
     expert_ids = torch.zeros(
         (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
     )
