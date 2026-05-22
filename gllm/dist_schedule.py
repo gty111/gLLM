@@ -391,18 +391,28 @@ class FollowerSeq:
         "_keeps_token_ids",
     )
 
-    def __init__(self, reg: SeqRegister):
+    def __init__(self, reg: SeqRegister, mm_needs_token_ids: bool = False):
         self.seq_id = reg.seq_id
         self.prompt_len = reg.prompt_len
         # Keep token_ids alive throughout the seq's lifetime when:
         #   * VL: ``_mm_prepare_cpu`` walks the prompt to build the
-        #     ``is_multimodal`` mask (uncached prefill path).
+        #     ``is_multimodal`` mask AND to compute MROPE positions on the
+        #     uncached prefill path. This is true for *every* prefill seq
+        #     in a VL model (even text-only ones with ``mm_contents=None``),
+        #     because ``MRotaryEmbedding.get_input_positions`` reads
+        #     ``seq.token_ids`` unconditionally. ``mm_needs_token_ids`` --
+        #     a per-engine flag set by the follower when the loaded model
+        #     uses multimodal embeddings -- forces ``_keeps_token_ids`` on
+        #     for these seqs; otherwise a text-only prompt to a VL model
+        #     would crash on the follower with ``torch.tensor(None)``.
         #   * repetition_penalty != 1.0: ``build_repetition_penalty_mask``
         #     scans the full token history on every decode.
         # Otherwise we can drop the prompt history after the first
         # prefill iteration to save memory + per-decode list grow cost.
         self._keeps_token_ids = (
-            reg.needs_token_id_accumulation or reg.mm_contents is not None
+            reg.needs_token_id_accumulation
+            or reg.mm_contents is not None
+            or mm_needs_token_ids
         )
         self.token_ids: Optional[List[int]] = (
             list(reg.prompt_token_ids) if self._keeps_token_ids else None
@@ -503,8 +513,18 @@ class FollowerSeqStore:
       tests, no impact on the hot path).
     """
 
-    def __init__(self):
+    def __init__(self, mm_needs_token_ids: bool = False):
+        # ``mm_needs_token_ids`` is a one-shot per-engine flag set by the
+        # worker when the loaded model is multimodal (``ModelRunner.use_mm``).
+        # Propagated to every :class:`FollowerSeq` so its ``_keeps_token_ids``
+        # gate stays on for text-only prompts to a VL model -- without this,
+        # ``_mm_prepare_cpu`` crashes on followers with
+        # ``RuntimeError: Could not infer dtype of NoneType`` when it does
+        # ``torch.tensor(seq.token_ids)`` on a seq whose follower mirror
+        # dropped the prompt history (because ``mm_contents`` is None and
+        # ``needs_token_id_accumulation`` is False).
         self._table: Dict[int, FollowerSeq] = {}
+        self._mm_needs_token_ids = mm_needs_token_ids
 
     def apply_payload(self, payload: SchedulePayload) -> List[FollowerSeq]:
         """Apply registers + updates, then free what's evicted.
@@ -520,7 +540,9 @@ class FollowerSeqStore:
             # register (e.g. after a state-sync recovery in a future
             # PD-disagg path), it would resend. Today this branch is
             # never hit under normal operation.
-            self._table[reg.seq_id] = FollowerSeq(reg)
+            self._table[reg.seq_id] = FollowerSeq(
+                reg, mm_needs_token_ids=self._mm_needs_token_ids
+            )
 
         seqs: List[FollowerSeq] = []
         for upd in payload.updates:
