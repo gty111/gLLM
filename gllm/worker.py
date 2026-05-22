@@ -136,7 +136,13 @@ class Worker(TorchProfilerMixin):
             # Per-rank state mirror. Replaces the stateless "rebuild
             # InputData from a freshly-pickled Sequence list every iter"
             # pattern with an incremental delta application.
-            self.follower_store = FollowerSeqStore()
+            # VL models need ``seq.token_ids`` on the follower for *every*
+            # prefill seq (even text-only ones) because ``_mm_prepare_cpu``'s
+            # ``MRotaryEmbedding.get_input_positions`` + ``torch.isin`` paths
+            # read it unconditionally; see :class:`FollowerSeq` docstring.
+            self.follower_store = FollowerSeqStore(
+                mm_needs_token_ids=self.model_runner.use_mm,
+            )
             # Input data for each rank except 0
             self.schedule_queue = deque()
 
