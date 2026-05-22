@@ -11,6 +11,11 @@ from .qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
 
+try:
+    from sgl_kernel import fused_qk_norm_rope as _sgl_fused_qk_norm_rope
+except ImportError:
+    _sgl_fused_qk_norm_rope = None
+
 
 class Qwen3Attention(Attention):
     def __init__(self, layer_id, config):
@@ -68,17 +73,61 @@ class Qwen3Attention(Attention):
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
 
+        # `sgl_kernel.fused_qk_norm_rope` fuses 2 x RMSNorm + RoPE into one
+        # kernel pass, eliminating 2 RMSNorm launches + the standalone RoPE
+        # kernel per layer. Constraints (mirrored from sgl Qwen3 path):
+        #   - vanilla RoPE only (MRoPE / YaRN / Llama3 scaling fall back),
+        #   - head_dim in {64, 128, 256} (kernel template constraint),
+        #   - dtype == bfloat16 (kernel only ships a bf16 specialization).
+        # Decided once at __init__ to keep `forward` branch-free.
+        self._use_fused_qk_norm_rope = (
+            _sgl_fused_qk_norm_rope is not None
+            and isinstance(self.rotary_emb, RotaryEmbedding)
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and self.head_dim in (64, 128, 256)
+            and rope_scaling is None
+        )
+
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(input_data.get_position(), q, k)
+        if self._use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            # Operates in-place on qkv; layout is [q | k | v] along the last
+            # dim, which matches QKVParallelLinear's output. The kernel
+            # computes inv_freq on-the-fly from `base` (no cos_sin cache
+            # lookup), so we skip materializing self.rotary_emb.cos_sin_cache.
+            positions = (
+                input_data.get_position()
+                .view(-1)
+                .to(dtype=torch.int32, device=qkv.device)
+                .contiguous()
+            )
+            _sgl_fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                float(self.rope_theta),
+                True,  # is_neox_style; Qwen3 RoPE is always NeoX-style.
+                positions,
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = self.q_norm(q_by_head)
+            q = q_by_head.view(q.shape)
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_by_head = self.k_norm(k_by_head)
+            k = k_by_head.view(k.shape)
+            q, k = self.rotary_emb(input_data.get_position(), q, k)
         attn_output = self.attn.forward(q, k, v, input_data)
         output = self.o_proj(attn_output)
         return output
