@@ -257,11 +257,20 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     initialised and the message fits its registered staging window, route
     through ``sgl_kernel``'s two-shot AR kernel (~3-5x lower latency than
     NCCL's RING_LL for the <1 MB / small-batch decode regime on H100).
-    The custom kernel is out-of-place so we copy back to keep the
-    in-place semantics callers rely on.
 
     Fall back to ``dist.all_reduce`` otherwise (custom AR disabled, too
     large a tensor, non-contiguous input, etc.).
+
+    Return semantics: callers must use the returned tensor; the custom-AR
+    path may return a buffer distinct from ``input_`` (out-of-place
+    kernel). Every existing call site already obeys this contract
+    (``output = tensor_model_parallel_all_reduce(...)``), so we deliberately
+    *do not* mirror the result back into ``input_``. The previous
+    ``input_.copy_(out)`` write-back was issuing one ``memcpy32_post`` per
+    AR (~31 ms / 1.7 s total GPU on a 60-prompt decode-heavy profile -- a
+    pure 2 % waste with no semantic benefit; SGLang doesn't do the copy
+    either, which is exactly the source of its memcpy32_post=0 in our
+    side-by-side trace comparison).
     """
     # Import lazily to avoid a circular import at module init (dist_utils is
     # imported by gllm.distributed.cuda_wrapper transitively via ``logger``).
@@ -269,9 +278,7 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 
     car = get_custom_allreduce()
     if car is not None and car.should_custom_ar(input_):
-        out = car.all_reduce(input_)
-        input_.copy_(out)
-        return input_
+        return car.all_reduce(input_)
     dist.all_reduce(input_, group=get_tp_group())
     return input_
 
