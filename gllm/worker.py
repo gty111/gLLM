@@ -1,20 +1,27 @@
 import logging
 import traceback
 from collections import deque
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
 from logger import logger
 
 from gllm.comm import IPCPackage, zmqComm
+from gllm.dist_schedule import (
+    DriverPayloadBuilder,
+    FollowerSeqStore,
+    SchedulePayload,
+)
 from gllm.dist_utils import (
     get_last_pp_rank,
     get_next_pp_rank,
     get_pp_size,
     get_rank,
+    get_tp_size,
     get_world_size,
     init_dist,
+    is_first_pp_rank,
     is_last_pp_rank,
     is_output_rank,
     recv_pp_data,
@@ -120,7 +127,16 @@ class Worker(TorchProfilerMixin):
                 self.model_runner,
                 self.schedule_method,
             )
+            # One builder per driver. Single shared instance covers both
+            # follower groups (TP-first-PP and PP-other) -- they receive
+            # the same logical schedule stream, so one set of cursors
+            # tracks both correctly. See ``gllm/dist_schedule.py``.
+            self.payload_builder = DriverPayloadBuilder()
         else:
+            # Per-rank state mirror. Replaces the stateless "rebuild
+            # InputData from a freshly-pickled Sequence list every iter"
+            # pattern with an incremental delta application.
+            self.follower_store = FollowerSeqStore()
             # Input data for each rank except 0
             self.schedule_queue = deque()
 
@@ -129,33 +145,46 @@ class Worker(TorchProfilerMixin):
         logger.info(f"Initialization complete")
 
     # driver worker => other workers
-    def recv_schedule_seqs(self):
-        recv_data = self.comm.recv_schedule_seqs()
-        if recv_data is not None:
-            profile_session_dir = None
-            cmd_code = 0
-            if len(recv_data) == 3:
-                seqs, mrope_positions, cmd_code = recv_data
-            elif len(recv_data) == 4:
-                seqs, mrope_positions, cmd_code, profile_session_dir = recv_data
-            else:
-                raise Exception(f"Fail to parse {recv_data = }")
+    def recv_schedule_payload(self) -> None:
+        """Poll for one :class:`SchedulePayload`, apply it, queue InputData.
 
-            if cmd_code != 0:
-                self._apply_control_cmd(cmd_code, profile_session_dir)
+        Non-blocking single recv. The follower-store apply is a few dict
+        ops + a list comprehension; the heavy work (``cal_input``)
+        happens here on the main thread, identical to the pre-refactor
+        path. We deliberately apply frees *after* materializing the
+        batch so a payload that frees a seq it also schedules (currently
+        impossible, defensively handled) does the right thing.
+        """
+        payload = self.comm.recv_schedule_payload()
+        if payload is None:
+            return
 
-            if len(seqs) == 0:
-                return
+        if payload.control_cmd != 0:
+            self._apply_control_cmd(payload.control_cmd, payload.control_data)
 
-            input_data = InputData(
-                use_buffer=False,
-                memory_manager=self.model_runner.memory_manager,
-                max_seq_length=self.model_runner.model_max_length,
-            )
-            input_data.cal_input(seqs)
-            if mrope_positions is not None:
-                input_data.set_mrope_position(mrope_positions)
-            self.schedule_queue.append(input_data)
+        seqs = self.follower_store.apply_payload(payload)
+
+        # Clean up follower-local caches (VL ``embedding_cache``) for
+        # seqs the driver just freed.  Important to do this *after*
+        # ``apply_payload`` so we use the same eviction order rank-0
+        # used (free-after-update => mirror is in the post-batch
+        # state).
+        if payload.frees:
+            for sid in payload.frees:
+                self.model_runner.free_follower_state(sid)
+
+        if not seqs:
+            return
+
+        input_data = InputData(
+            use_buffer=False,
+            memory_manager=self.model_runner.memory_manager,
+            max_seq_length=self.model_runner.model_max_length,
+        )
+        input_data.cal_input(seqs)
+        if payload.mrope_positions is not None:
+            input_data.set_mrope_position(payload.mrope_positions)
+        self.schedule_queue.append(input_data)
 
     def forward_pp(self):
         if len(self.schedule_queue) != 0:
@@ -220,18 +249,66 @@ class Worker(TorchProfilerMixin):
             if get_pp_size() != 1:
                 send_pp_data(output, get_next_pp_rank())
 
+    def _build_schedule_payload(
+        self,
+        schedule_seqs: List,
+    ) -> Optional[SchedulePayload]:
+        """Build the delta payload ONCE for this scheduling iteration.
+
+        We deliberately build a single payload object even when both
+        follower groups are present (pp_size > 1): ``DriverPayloadBuilder``
+        advances internal cursors (``_known``, ``_last_pages_len``) and
+        ``scheduler.consume_pending_follower_frees`` drains an accumulator.
+        A second build would falsely report "no new registers / no new
+        pages / no frees" to the PP-other group and they'd silently
+        diverge.
+
+        Returns ``None`` when distributed isn't initialized (single-rank).
+        Callers send to a follower group by passing the same payload to
+        :meth:`zmqComm.send_schedule_payload` (with the appropriate
+        ``is_first_pp`` flag) and optionally cloning with m-rope
+        positions for the PP-other path.
+        """
+        if get_world_size() <= 1:
+            return None
+        return self.payload_builder.build(
+            scheduled_seqs=schedule_seqs,
+            frees=self.scheduler.consume_pending_follower_frees(),
+            mrope_positions=None,
+            use_mm=self.model_runner.use_mm,
+        )
+
     def schedule_forward(self):
         schedule_seqs = self.scheduler.schedule_once()
         if len(schedule_seqs) != 0:
-            if get_world_size() > 1:
-                self.comm.send_schedule_seqs(schedule_seqs, None, True)
+            # Build payload up front (drains pending follower frees /
+            # advances register + page cursors exactly once) and ship
+            # to TP followers on rank-0's PP stage BEFORE local
+            # ``cal_input``, so their own ``cal_input`` overlaps with
+            # ours (see tp2-perf-fix.md "rank-1 入图同步" section).
+            payload = self._build_schedule_payload(schedule_seqs)
+            if payload is not None:
+                self.comm.send_schedule_payload(payload, is_first_pp=True)
             self.model_runner.prepare_input(schedule_seqs)
-            if get_world_size() > 1:
-                self.comm.send_schedule_seqs(
-                    schedule_seqs,
-                    self.model_runner.input_data.mrope_positions_cpu,
-                    False,
+            # Subsequent PP stages don't run ``_mm_prepare_cpu`` (only
+            # the first PP rank does), so we ship the m-rope positions
+            # we just built. ``dataclasses.replace`` shares the list
+            # fields with the first send -- safe because
+            # ``DriverPayloadBuilder.build`` already made fresh,
+            # never-again-mutated list snapshots, so the two sender
+            # threads can pickle concurrently. For pp_size=1
+            # ``schedule_other_sockets`` is empty and the second send
+            # is an inline no-op.
+            if payload is not None and get_pp_size() > 1:
+                import dataclasses
+
+                pp_payload = dataclasses.replace(
+                    payload,
+                    mrope_positions=(
+                        self.model_runner.input_data.mrope_positions_cpu
+                    ),
                 )
+                self.comm.send_schedule_payload(pp_payload, is_first_pp=False)
             output = self.model_runner.step_once()
 
             if not is_output_rank():
@@ -247,11 +324,11 @@ class Worker(TorchProfilerMixin):
         self.process_output()
 
     def run_first_tp(self):
-        self.recv_schedule_seqs()
+        self.recv_schedule_payload()
         self.forward_tp()
 
     def run_other(self):
-        self.recv_schedule_seqs()
+        self.recv_schedule_payload()
         self.forward_pp()
 
     def handle_keyboardInterrupt(self):
