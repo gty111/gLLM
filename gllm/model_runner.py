@@ -869,7 +869,17 @@ class OverlapModelRunner(ModelRunner):
                     group=get_tp_group(),
                 )
             self.future_map.store_to_map(future_indices, next_tokens_gpu)
-            if is_output_rank():
+            # Every PP-0 TP rank D2H-copies the broadcast tokens into
+            # its own pinned ``_next_tokens_bufs`` slot. Pre-refactor
+            # only ``output_rank`` did this because rank-0 was the
+            # sole consumer of the integer token list; with the
+            # column-driver design every TP rank's local scheduler
+            # needs to ``process_output_finalize`` against the same
+            # tokens, so we issue ``tp_size`` independent D2H copies
+            # off the same already-broadcast GPU tensor. The copies
+            # all run on the per-rank ``copy_stream`` (one per worker
+            # process), so there's no inter-rank serialization.
+            if get_tp_size() > 1 or is_output_rank():
                 with torch.cuda.stream(self.copy_stream):
                     self.copy_stream.wait_stream(self.forward_stream)
                     next_tokens_cpu[:batch_size].copy_(
@@ -879,7 +889,7 @@ class OverlapModelRunner(ModelRunner):
             self.overlap_runtime.input_consumed_event.record(self.forward_stream)
 
         copy_done = torch.cuda.Event()
-        if is_output_rank():
+        if get_tp_size() > 1 or is_output_rank():
             copy_done.record(self.copy_stream)
         else:
             copy_done.record(self.forward_stream)

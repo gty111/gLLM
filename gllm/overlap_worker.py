@@ -1,18 +1,54 @@
-"""Worker driver loops for overlap scheduling (TP only, pp_size must be 1)."""
+"""Worker driver loops for overlap scheduling (TP only, pp_size must be 1).
+
+Distributed scheduler design (v2)
+=================================
+
+Pre-refactor, only rank 0 (PP=0, TP=0) ran a scheduler. Every iteration
+it pickled a delta-style :class:`SchedulePayload` and pushed it over
+zmq to each TP follower (and PP-other rank). Profiling showed two
+expensive things on the critical path:
+
+* ``send_pyobj`` + ``poll`` skew of ~1.7 ms between rank 0 and the TP
+  followers, which inflated the *first* AR kernel of every forward to
+  ~2 ms while rank 0 spun on the followers.
+* ~50-200 us per-iter pickle + recv + ``apply_payload`` cost on the
+  followers, even after the delta refactor.
+
+The new design moves the scheduler onto **every PP-0 TP rank** (a
+"column driver"). Each column driver:
+
+1. Receives new front-end work (new requests, aborts, control commands)
+   via :meth:`zmqComm.broadcast_input_to_tp` -- a 1-element NCCL flag
+   broadcast on the TP group on every iter, with a follow-up
+   ``broadcast_object_list`` only when the flag indicates there is
+   something to send. Steady-state cost is ~5-10 us / iter.
+2. Runs the scheduler locally with the same inputs. Determinism is the
+   load-bearing invariant -- ``IDAllocator`` is FIFO-deque-backed and
+   the only stochastic call (``random.randint(0, pp_size-1)``)
+   collapses to ``0`` for ``pp_size == 1``, so all column drivers
+   produce identical schedules / page tables / free orders.
+3. Builds its own ``InputData`` and launches forward. Sampled tokens
+   are still NCCL-broadcast on the TP group inside ``run_batch_async``
+   (this part of the topology is unchanged), but every PP-0 TP rank
+   now D2H-copies the result so its local scheduler can finalize
+   independently.
+4. Only rank 0 forwards the resulting ``IPCPackage`` back to the
+   front-end via ``comm.send_output`` -- the others compute the same
+   one and discard it.
+
+Compatibility note: this module rejects ``pp_size > 1`` like before.
+The new design generalizes (each column driver would also push its
+own per-column ``SchedulePayload`` to its PP-other followers), but
+:class:`OverlapModelRunner` itself is single-stage; PP > 1 falls back
+to the (also-refactored) :class:`gllm.worker.Worker` path.
+"""
 
 from collections import deque
-from logger import logger
 
-from gllm.dist_schedule import SchedulePayload
-from gllm.dist_utils import (
-    get_tp_size,
-    get_world_size,
-    is_output_rank,
-)
 from gllm.input_data import InputData
 from gllm.model_runner import OverlapModelRunner
 from gllm.scheduler import OverlapScheduler
-from gllm.worker import Worker, run_worker
+from gllm.worker import Worker
 
 
 class OverlapWorker(Worker):
@@ -30,39 +66,59 @@ class OverlapWorker(Worker):
             )
 
     def init(self):
-        super().init()
-        if self.rank == 0:
-            self.scheduler = OverlapScheduler(
-                self.pp_size,
-                self.model_runner,
-                self.schedule_method,
-            )
+        Worker.init(self)
         self._prefetched_input = None
         self._gpu_pending = deque()
 
+    def _init_role_state(self):
+        """Override base setup: every PP=0 TP rank gets an OverlapScheduler.
+
+        ``pp_size == 1`` is a hard precondition (enforced in
+        ``__init__``), so every rank lands on the ``is_first_pp_rank``
+        branch -- no FollowerSeqStore / InputData queue is created.
+        We deliberately skip the :class:`DriverPayloadBuilder` setup
+        too: the per-column zmq fanout that the base path uses to ship
+        delta payloads to PP-other followers has nothing to do for
+        PP=1, and not building the payload also means we don't drain
+        ``scheduler.consume_pending_follower_frees``.
+        """
+        self.scheduler = OverlapScheduler(
+            self.pp_size,
+            self.model_runner,
+            self.schedule_method,
+        )
+
+    # ------------------------------------------------------------------
+    # Forward-pipeline helpers
+    # ------------------------------------------------------------------
+    #
+    # ``recv_ipc_package`` / ``check_abort_seqs`` / ``_translate_control_cmd``
+    # are inherited unchanged from :class:`Worker`. The new column-driver
+    # base class already runs them on every PP=0 TP rank with NCCL-style
+    # input broadcast, which is exactly what overlap mode needs.
+
     def _build_prefetched_input(self) -> None:
+        """Schedule the next batch locally; no inter-TP zmq send.
+
+        Pre-refactor we'd build a delta-style :class:`SchedulePayload`
+        and ship it to TP followers here so their ``cal_input``
+        overlapped with ours. With the column-driver design every TP
+        rank reaches this method on its own schedule loop, runs the
+        same deterministic scheduler against the same state, and
+        builds its own ``InputData`` -- so there's nothing to send.
+        """
+        # Drain the scheduler's pending-follower-frees accumulator
+        # every iter. Pre-refactor, ``Worker._build_schedule_payload``
+        # consumed it on the way to building the per-iter delta
+        # payload; the new design has no payload to build (PP=1, no
+        # followers), so the list would otherwise grow unbounded as
+        # seqs hit max_len / EOS. Cheap (a list = []) and keeps
+        # peak-memory predictable.
+        self.scheduler.consume_pending_follower_frees()
         schedule_seqs = self.scheduler.schedule_once()
         if len(schedule_seqs) == 0:
             self._prefetched_input = None
             return
-        # Ship the delta-style :class:`SchedulePayload` to TP followers
-        # (same PP stage) BEFORE building this batch's ``InputData``
-        # locally. ``cal_input`` is pure numpy/torch CPU work that
-        # touches only read-only seq attributes, so it overlaps cleanly
-        # with the persistent zmq sender thread pickling the payload
-        # and with the TP follower's own ``cal_input`` once it
-        # receives. Sending first was critical for the previous fix
-        # (rank-1 入图同步, see tp2-perf-fix.md) -- the delta refactor
-        # cuts the wire payload by another ~30x (no more per-iter
-        # ``page_table`` / sampling-params / ``mm_contents`` re-send),
-        # which should shrink the residual position-0 AR stall further.
-        #
-        # pp_size > 1 is rejected at OverlapWorker.__init__ so we
-        # don't need a second send for PP-other here.
-        if get_world_size() > 1:
-            payload = self._build_schedule_payload(schedule_seqs)
-            if payload is not None:
-                self.comm.send_schedule_payload(payload, is_first_pp=True)
         next_input = InputData(
             use_buffer=False,
             memory_manager=self.model_runner.memory_manager,
@@ -70,40 +126,6 @@ class OverlapWorker(Worker):
         )
         next_input.cal_input(schedule_seqs)
         self._prefetched_input = next_input
-
-    def _recv_prefetched_input(self):
-        payload = self.comm.recv_schedule_payload()
-        if payload is None:
-            return None
-
-        if payload.control_cmd != 0:
-            self._apply_control_cmd(payload.control_cmd, payload.control_data)
-
-        seqs = self.follower_store.apply_payload(payload)
-
-        # Same ordering rationale as ``Worker.recv_schedule_payload``:
-        # apply frees *after* materializing the batch. With overlap
-        # scheduling the freed seq cannot be in this batch (the
-        # scheduler removes it from ``seqs_to_decode`` /
-        # ``seqs_to_prefill`` before scheduling), so this is just
-        # defensive ordering for the edge case where a payload
-        # happens to free + reschedule the same id.
-        if payload.frees:
-            for sid in payload.frees:
-                self.model_runner.free_follower_state(sid)
-
-        if not seqs:
-            return None
-
-        input_data = InputData(
-            use_buffer=False,
-            memory_manager=self.model_runner.memory_manager,
-            max_seq_length=self.model_runner.model_max_length,
-        )
-        input_data.cal_input(seqs)
-        if payload.mrope_positions is not None:
-            input_data.set_mrope_position(payload.mrope_positions)
-        return input_data
 
     def _launch_batch(self, input_data: InputData):
         # Pipelined input prep:
@@ -122,40 +144,58 @@ class OverlapWorker(Worker):
         self.model_runner.prepare_input_gpu()
         return self.model_runner.run_batch_async()
 
-    def _collect_batch(self, pending_entry, deferred_seqs=None):
+    def _collect_batch(self, pending_entry, deferred_seqs):
+        """Wait for the batch's CPU buffer and finalize seq state.
+
+        Every PP-0 TP rank reads its own ``_next_tokens_bufs`` slot --
+        each rank does its own D2H copy from the broadcast tokens
+        tensor inside ``run_batch_async``. ``deferred_seqs`` is the
+        per-rank metadata produced by ``process_output_deferred`` and
+        is used by every rank to update its local Sequence state /
+        free pages. Only rank 0 sends the resulting ``IPCPackage`` to
+        the frontend.
+        """
         copy_done, batch_size, buf_idx, _input_data = pending_entry
         copy_done.synchronize()
-        if is_output_rank():
-            tokens = self.model_runner._next_tokens_bufs[buf_idx][
-                :batch_size
-            ].tolist()
-            if self.rank == 0:
-                self._finalize_deferred(deferred_seqs, tokens)
+        tokens = self.model_runner._next_tokens_bufs[buf_idx][
+            :batch_size
+        ].tolist()
+        self._finalize_deferred(deferred_seqs, tokens)
 
     def _finalize_deferred(self, deferred_seqs, tokens):
         if deferred_seqs is None or tokens is None:
             return
         ipc_package = self.scheduler.process_output_finalize(deferred_seqs, tokens)
-        if ipc_package is not None:
+        if ipc_package is not None and self.rank == 0:
             self.comm.send_output(ipc_package)
 
-    def run_driver(self):
-        """Rank-0 driver: schedule next batch while GPU runs the previous one."""
+    # ------------------------------------------------------------------
+    # Driver loop -- now identical for every PP-0 TP rank
+    # ------------------------------------------------------------------
+
+    def run_pp0(self):
+        """Per-iter loop run by every PP-0 TP rank under the new design.
+
+        Ordering is the same as the previous ``run_driver`` for
+        rank 0 -- launch first, collect later -- but every TP rank
+        executes it independently. Determinism + identical inputs
+        keeps every rank's queue / future-map / scheduler in lockstep
+        without any inter-TP zmq traffic on the critical path.
+        """
         self.check_abort_seqs()
         self.recv_ipc_package()
 
-        self._build_prefetched_input()
+        # Bootstrap on the first iter, otherwise this is a no-op
+        # (the previous iter's tail already built next-iter's input).
+        if self._prefetched_input is None:
+            self._build_prefetched_input()
+
         pending_before = len(self._gpu_pending)
 
         if self._prefetched_input is not None:
-            # ``input_data`` is kept alive in ``_gpu_pending`` until the batch
-            # finishes on the GPU. Without this, the only Python reference to
-            # this batch's CPU input tensors (``tokens_cpu``, ``slot_mapping_cpu``
-            # etc.) lives on ``model_runner.input_data`` and would be
-            # overwritten by the *next* iteration's ``prepare_input_cpu`` --
-            # potentially while ``prep_stream`` is still DMA'ing from those
-            # buffers. Holding the original ``InputData`` here makes the
-            # cross-batch lifetime explicit and trivially correct.
+            # Keep the InputData alive in ``_gpu_pending`` until the
+            # batch finishes -- ``prep_stream`` is still DMA'ing from
+            # its CPU tensors when we reach this line.
             input_data = self._prefetched_input
             self._prefetched_input = None
             copy_done, batch_size, future_slot_ids, buf_idx = self._launch_batch(
@@ -174,47 +214,21 @@ class OverlapWorker(Worker):
                 (copy_done, batch_size, buf_idx, input_data), deferred
             )
 
-    def run_first_tp(self):
-        """TP followers (pp_rank == 0 only).
-
-        Ordering mirrors ``run_driver``: **launch first, collect last**.
-        The earlier version did the opposite (``_collect_batch`` then
-        ``_launch_batch``), which made rank-1 fully serial -- the CPU
-        sync inside ``copy_done.synchronize()`` for batch N would block
-        the host thread until batch N's forward+broadcast finished on
-        GPU before rank-1 even started receiving batch N+1's schedule.
-        Rank-0 meanwhile pipelined: it had already launched batch N+1
-        well before that sync. The result was that rank-1 entered every
-        forward ~2 ms after rank-0, and rank-0 spent that 2 ms spinning
-        inside the *first* AR kernel of each forward waiting for rank-1
-        to arrive. Profiler confirmed: position-0 AR mean was 1987 us,
-        position-1+ was 4-7 us; reordering collapses that to ~5 us flat
-        and shaves the bulk of the rank-0 AR p99 tail.
-
-        Queue semantics: we capture ``pending_before`` *before* the new
-        launch's ``append`` so the subsequent ``popleft`` still returns
-        the older batch (N), never the just-launched one (N+1).
-        """
-        pending_before = len(self._gpu_pending)
-
-        next_input = self._recv_prefetched_input()
-        if next_input is not None:
-            copy_done, batch_size, _future_slot_ids, buf_idx = self._launch_batch(
-                next_input
-            )
-            # Keep ``next_input`` alive in the pending queue (see comment in
-            # ``run_driver``) so its CPU input tensors outlive the prep_stream
-            # DMA on the follower path too.
-            self._gpu_pending.append(
-                (copy_done, batch_size, buf_idx, None, next_input)
-            )
-
-        if pending_before > 0:
-            copy_done, batch_size, buf_idx, _deferred, input_data = (
-                self._gpu_pending.popleft()
-            )
-            self._collect_batch((copy_done, batch_size, buf_idx, input_data))
+        # Build + (no-op zmq send) the next iter AFTER finalize so
+        # any max_len/eos seqs from this iter are already freed when
+        # we reschedule.
+        self._build_prefetched_input()
 
 
 def run_overlap_worker(worker: OverlapWorker):
-    run_worker(worker)
+    """Tight per-iter loop for the overlap path (PP=1 only)."""
+    try:
+        worker.init()
+        # PP=1 means every rank in the world is on PP-0; the unified
+        # ``run_pp0`` body covers driver and follower alike.
+        while True:
+            worker.run_pp0()
+    except KeyboardInterrupt:
+        worker.handle_keyboardInterrupt()
+    except Exception as e:
+        worker.handle_exception(e)
