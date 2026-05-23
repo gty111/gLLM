@@ -446,6 +446,11 @@ class zmqComm:
         token broadcast already happens GPU-side inside
         :meth:`OverlapModelRunner.run_batch_async` on the same TP NCCL
         group, and every PP-0 TP rank D2H-copies it locally.
+
+        Returns ``None`` (on every TP rank in lockstep) when the source
+        rank had no tokens to broadcast this iter -- callers can then
+        use ``is not None`` to decide whether to enqueue, which keeps
+        "no message" distinct from a hypothetical empty token list.
         """
         if get_tp_size() <= 1:
             return next_tokens
@@ -467,7 +472,7 @@ class zmqComm:
         self._tp_bcast_flag_cpu.copy_(len_gpu, non_blocking=False)
         n = int(self._tp_bcast_flag_cpu.item())
         if n == 0:
-            return [] if get_rank() != src else (next_tokens or [])
+            return None
 
         # Phase 2: broadcast the int64 token tensor of length n.
         tok_tensor = torch.empty(n, dtype=torch.long, device=device)

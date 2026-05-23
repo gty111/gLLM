@@ -365,7 +365,7 @@ class Worker(TorchProfilerMixin):
         if get_tp_size() > 1:
             next_tokens = self.comm.broadcast_tokens_to_tp(next_tokens)
 
-        if next_tokens:
+        if next_tokens is not None:
             self.scheduler.add_next_tokens(next_tokens)
 
     def check_abort_seqs(self):
@@ -407,9 +407,16 @@ class Worker(TorchProfilerMixin):
         if len(schedule_seqs) == 0:
             return
         # Every PP-0 column driver builds its own per-column delta
-        # payload (cursors are per-rank). Ship to PP-other followers
-        # BEFORE local ``cal_input`` so their ``cal_input`` overlaps
-        # with ours.
+        # payload (cursors are per-rank). For ``pp_size > 1`` the
+        # payload also carries ``mrope_positions`` for VL models,
+        # which only get computed inside ``prepare_input``, so the
+        # send to PP-other followers must happen *after* local input
+        # prep. (Pre-refactor we used to do an extra "early send" to
+        # TP followers without ``mrope_positions`` so their
+        # ``cal_input`` could overlap with ours, but with the
+        # per-column scheduler design TP followers no longer exist.)
+        # For ``pp_size == 1`` ``send_schedule_payload`` is an inline
+        # no-op since this column has no PP-other followers.
         payload = self._build_schedule_payload(schedule_seqs)
         self.model_runner.prepare_input(schedule_seqs)
         if payload is not None and get_pp_size() > 1:
@@ -444,7 +451,8 @@ class Worker(TorchProfilerMixin):
                     next_tokens = self.comm.broadcast_tokens_to_tp(
                         next_tokens if is_output_rank() else None
                     )
-                self.scheduler.add_next_tokens(next_tokens)
+                if next_tokens is not None:
+                    self.scheduler.add_next_tokens(next_tokens)
             elif is_output_rank():
                 # PP>1: only output_rank's tokens flow back to
                 # rank 0 via the existing token zmq pair; the other
