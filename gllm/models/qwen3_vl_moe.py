@@ -86,46 +86,71 @@ class Qwen3MoeLLMForCausalLM(Qwen3MoeForCausalLM):
                 # checkpoint shape: (num_experts, hidden_size, 2 * inter_size)
                 # internal shape:   (local_num_experts, 2 * inter_size_per_partition, hidden_size)
                 w13_weight = get_tensor_from_dict(weights, k.replace("w13_weight", "gate_up_proj"))
-                for expert_idx in range(num_experts):
-                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
-                    if local_expert_idx == -1:
-                        continue
-                    # w13_weight[expert_idx]: (hidden_size, 2 * inter_size)
-                    if not is_use_ep() and get_tp_size() > 1:
-                        # column-parallel: slice along output dim (dim=1) per TP rank
-                        # gate and up are concatenated along dim=1, each of size inter_size
-                        inter_size = w13_weight.shape[-1] // 2
-                        size_partition = inter_size // get_tp_size()
-                        tp_rank = get_tp_rank()
-                        gate_slice = w13_weight[expert_idx][
-                            :, tp_rank * size_partition : (tp_rank + 1) * size_partition
-                        ]
-                        up_slice = w13_weight[expert_idx][
-                            :, inter_size + tp_rank * size_partition : inter_size + (tp_rank + 1) * size_partition
-                        ]
-                        v.data[local_expert_idx][:size_partition].copy_(gate_slice.permute(1, 0))
-                        v.data[local_expert_idx][size_partition:].copy_(up_slice.permute(1, 0))
-                    else:
+                if not is_use_ep() and get_tp_size() > 1:
+                    # Vectorized EP-off + TP>1 fast path. With EP off
+                    # ``expert_map`` is ``None`` and every global expert is
+                    # local, so the per-expert Python loop below was issuing
+                    # ``2 * num_experts`` non-contiguous CPU->GPU copies per
+                    # layer (256 ops/layer for the 128-expert Qwen3-VL-30B-A3B):
+                    # each ``w13_weight[e][:, partition_slice]`` view is
+                    # strided on dim=1 and the subsequent ``.permute(1, 0)``
+                    # makes it doubly non-contiguous, forcing PyTorch to
+                    # allocate a CPU staging buffer per slice. That pegged
+                    # the model load at ~4m23s vs ~13s for the EP-on path
+                    # (single contiguous expert + permute). Doing the slice
+                    # + permute once across the whole expert dim collapses
+                    # it to two bulk H2D copies (gate half, up half).
+                    inter_size = w13_weight.shape[-1] // 2
+                    size_partition = inter_size // get_tp_size()
+                    tp_rank = get_tp_rank()
+                    # w13_weight: (E, H, 2I) -> per-rank gate / up halves
+                    # (E, H, I_p), then permute(0, 2, 1) -> (E, I_p, H)
+                    # which matches v.data's [:size_partition, :] /
+                    # [size_partition:, :] slots.
+                    v.data[:, :size_partition, :].copy_(
+                        w13_weight[
+                            :, :, tp_rank * size_partition : (tp_rank + 1) * size_partition
+                        ].permute(0, 2, 1)
+                    )
+                    v.data[:, size_partition:, :].copy_(
+                        w13_weight[
+                            :,
+                            :,
+                            inter_size + tp_rank * size_partition : inter_size
+                            + (tp_rank + 1) * size_partition,
+                        ].permute(0, 2, 1)
+                    )
+                else:
+                    for expert_idx in range(num_experts):
+                        local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
+                        if local_expert_idx == -1:
+                            continue
+                        # w13_weight[expert_idx]: (hidden_size, 2 * inter_size)
                         v.data[local_expert_idx].copy_(w13_weight[expert_idx].permute(1, 0))
             elif k.find("w2_weight") != -1:  # expert
                 # checkpoint shape: (num_experts, inter_size, hidden_size)
                 # internal shape:   (local_num_experts, hidden_size, inter_size_per_partition)
                 w2_weight = get_tensor_from_dict(weights, k.replace("w2_weight", "down_proj"))
-                for expert_idx in range(num_experts):
-                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
-                    if local_expert_idx == -1:
-                        continue
-                    # w2_weight[expert_idx]: (inter_size, hidden_size)
-                    if not is_use_ep() and get_tp_size() > 1:
-                        # row-parallel: slice along input dim (dim=0) per TP rank
-                        inter_size = w2_weight.shape[1]
-                        size_partition = inter_size // get_tp_size()
-                        tp_rank = get_tp_rank()
-                        w2_slice = w2_weight[expert_idx][
-                            tp_rank * size_partition : (tp_rank + 1) * size_partition, :
-                        ]
-                        v.data[local_expert_idx].copy_(w2_slice.permute(1, 0))
-                    else:
+                if not is_use_ep() and get_tp_size() > 1:
+                    # Same vectorization story as w13 above: replace the
+                    # per-expert Python loop with one bulk slice + permute +
+                    # H2D copy across the whole expert dim.
+                    inter_size = w2_weight.shape[1]
+                    size_partition = inter_size // get_tp_size()
+                    tp_rank = get_tp_rank()
+                    # (E, I, H) -> dim=1 slice for this rank -> (E, I_p, H),
+                    # then permute(0, 2, 1) -> (E, H, I_p) matching v.data.
+                    v.data.copy_(
+                        w2_weight[
+                            :, tp_rank * size_partition : (tp_rank + 1) * size_partition, :
+                        ].permute(0, 2, 1)
+                    )
+                else:
+                    for expert_idx in range(num_experts):
+                        local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
+                        if local_expert_idx == -1:
+                            continue
+                        # w2_weight[expert_idx]: (inter_size, hidden_size)
                         v.data[local_expert_idx].copy_(w2_weight[expert_idx].permute(1, 0))
             elif k.find("gate_up_proj.weight") != -1:  # shared expert or dense layer
                 copy_gate_up_proj(
