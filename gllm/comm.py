@@ -114,15 +114,21 @@ class zmqComm:
         # the driver runs its own deterministic scheduler and only sends
         # ``SchedulePayload`` to *its own column's* PP-other ranks. New
         # requests / aborts / control commands arrive at rank 0 from the
-        # frontend and are NCCL-broadcast within the PP-0 TP group via
-        # :meth:`broadcast_input_to_tp` (no zmq fan-out between TP ranks).
+        # frontend and are fanned out to PP=0 TP peers via zmq PUSH/PULL
+        # (:meth:`broadcast_input_to_tp`). The earlier NCCL flag-broadcast
+        # implementation contended with the model's per-layer all-reduce
+        # for NVLink and inflated decode-AR tail latency by ~70 ms /
+        # decode-heavy profile; profile shows ~1 % of decode iters had
+        # a 5-9 ms NCCL-AR spike that disappears with the zmq path
+        # since zmq stays on the CPU and never touches NVLink.
         # Tokens still funnel through rank 0 (output_rank still uses a
         # single PULL into rank 0); rank 0 NCCL-broadcasts the result
         # within the PP-0 TP group via :meth:`broadcast_tokens_to_tp`.
         #
         # For PP=1 (overlap path) the per-column structure collapses
         # cleanly: ``schedule_other_sockets`` is empty, no tokens leg,
-        # and NCCL alone handles every cross-rank message.
+        # and the per-iter input zmq fan-out alone handles every
+        # cross-rank message.
         rank = get_rank()
         pp_rank = get_pp_rank()
         tp_rank = get_tp_rank()
@@ -153,6 +159,16 @@ class zmqComm:
         # the loop is empty, ``schedule_other_sockets`` stays an empty
         # list, and the schedule send paths short-circuit -- exactly
         # what we want for the overlap path.
+        #
+        # On top of the column-driver fan-out (rank 0 -> PP-other in
+        # the same column) we also need a *PP-0 TP fan-out* so that
+        # rank 0 can ship the front-end :class:`IPCPackage` to every
+        # peer column driver (PP=0 TP=k for k>0). That used to ride
+        # NCCL but now goes over zmq for the NVLink-contention reason
+        # documented above. ``_input_tp_sockets`` is the rank-0 send
+        # side; ``_input_tp_recv_socket`` is the per-peer recv side.
+        self._input_tp_sockets: List[zmq.Socket] = []
+        self._input_tp_recv_socket: Optional[zmq.Socket] = None
         if pp_rank == 0:
             self.schedule_other_sockets: List[zmq.Socket] = []
             if pp_size > 1:
@@ -178,6 +194,54 @@ class zmqComm:
                             zmq.PUSH,
                         )
                         self.schedule_other_sockets.append(socket)
+            # PP-0 TP fan-out (replaces the NCCL flag broadcast in
+            # :meth:`broadcast_input_to_tp`). For tp_size==1 the
+            # broadcast short-circuits and we never touch any of
+            # these sockets, so skip the setup entirely.
+            if tp_size > 1:
+                if rank == 0:
+                    for peer_tp in range(1, tp_size):
+                        peer_rank = peer_tp  # PP=0 TP=peer_tp == global rank peer_tp
+                        if self.launch_mode == "normal":
+                            socket = make_socket(
+                                self.ctx,
+                                f"{self.schedule_path}_tpinput_{peer_rank}",
+                                zmq.PUSH,
+                            )
+                        else:
+                            # Skip the world_size + token (==world_size)
+                            # offsets used above; +1 keeps a free slot
+                            # in case a future feature wants
+                            # port_base + world_size + 1 - peer_rank
+                            # encoded somewhere.
+                            port_each = (
+                                self.port_base + get_world_size() + 1 + peer_rank
+                            )
+                            send_obj_list([port_each], peer_rank)
+                            addr_each = [None]
+                            recv_obj_list(addr_each, peer_rank)
+                            socket = make_socket(
+                                self.ctx,
+                                f"tcp://{addr_each[0]}:{port_each}",
+                                zmq.PUSH,
+                            )
+                        self._input_tp_sockets.append(socket)
+                else:
+                    if self.launch_mode == "normal":
+                        self._input_tp_recv_socket = make_socket(
+                            self.ctx,
+                            f"{self.schedule_path}_tpinput_{rank}",
+                            zmq.PULL,
+                        )
+                    else:
+                        port_input = [None]
+                        recv_obj_list(port_input, 0)
+                        send_obj_list([self.host_addr], 0)
+                        self._input_tp_recv_socket = make_socket(
+                            self.ctx,
+                            f"tcp://{self.host_addr}:{port_input[0]}",
+                            zmq.PULL,
+                        )
         else:
             # PP-other rank: pull from its own column driver
             # (rank ``tp_rank`` on PP=0).
@@ -319,28 +383,36 @@ class zmqComm:
             self._get_sender(socket).put(payload)
 
     # ------------------------------------------------------------------
-    # NCCL-backed TP-group input broadcast (overlap-scheduling path)
+    # zmq-backed PP=0 TP-group input broadcast (column-driver path)
     # ------------------------------------------------------------------
     #
-    # The overlap path moves scheduling onto every PP0 TP rank, so each
-    # rank needs the exact same stream of front-end => worker messages
-    # (new requests, aborts, control commands). Rank-0 polls zmq, then
-    # publishes the aggregated :class:`IPCPackage` to its TP peers with
-    # the helpers below.
+    # Every PP=0 TP rank runs its own scheduler (column driver) and
+    # therefore needs the exact same stream of front-end => worker
+    # messages (new requests, aborts, control commands). Rank-0 polls
+    # the front-end zmq socket, aggregates whatever is waiting into a
+    # single :class:`IPCPackage`, and ships that to its peer column
+    # drivers via the dedicated zmq fan-out set up in :meth:`init`.
     #
-    # Determinism rule: every PP0 TP rank MUST call this every
-    # iteration in the same order; otherwise the NCCL broadcast group
-    # desyncs and the scheduler states fork. Skipping the call on
-    # "obviously empty" iters is therefore not allowed -- we fold the
-    # fast path *inside* the method (a single 1-element broadcast that
-    # signals whether the heavy ``broadcast_object_list`` follows).
+    # The earlier implementation used a NCCL ``broadcast`` on the
+    # dedicated IPC group ( ``_IPC_TP_GROUP`` ): cheap on average (~5
+    # us) but it shared NVLink with the model's per-layer all-reduce,
+    # which forced occasional 5-9 ms tail spikes when the broadcast
+    # collided with a forward-path AR. The zmq fan-out below stays on
+    # the CPU and never touches NVLink, eliminating that contention.
+    #
+    # Determinism rule (unchanged from the NCCL version): every PP=0
+    # TP rank MUST call this every iteration in the same order. Rank
+    # 0 sends EXACTLY ONE pyobj per iter (possibly ``None``); peers
+    # block-recv exactly once. Skipping the call would desync the
+    # column-driver schedulers across TP ranks.
 
     def _ensure_tp_broadcast_state(self) -> None:
-        """Lazy init of the per-iter scratch tensor used by the broadcast.
+        """Lazy init of state used by :meth:`broadcast_tokens_to_tp`.
 
-        The tensor lives on the worker's CUDA device (NCCL group is
-        device-bound); we keep one shared instance to avoid a fresh
-        allocation + .item() pinned-memory dance every iter.
+        ``broadcast_tokens_to_tp`` still rides NCCL (it's only used
+        on the PP>1 path with one call per iter, where forward-path
+        AR contention is irrelevant), so we keep the small CUDA
+        scratch tensors used by the length+payload protocol there.
         """
         if getattr(self, "_tp_bcast_flag_gpu", None) is None:
             self._tp_bcast_flag_gpu = torch.zeros(1, dtype=torch.long, device="cuda")
@@ -359,74 +431,45 @@ class zmqComm:
     def broadcast_input_to_tp(
         self, ipc_package: Optional["IPCPackage"]
     ) -> Optional["IPCPackage"]:
-        """Rank-0-driven broadcast of an :class:`IPCPackage` to TP peers.
+        """Rank-0-driven fan-out of an :class:`IPCPackage` to PP=0 TP peers.
 
-        Two-phase protocol:
-
-        1. **Header phase** -- a 1-element ``int64`` broadcast over the
-           TP NCCL group. ``0`` means "no payload follows", any other
-           value means "expect a ``broadcast_object_list``". This is
-           cheap (~5 us on H100 NVLink) and lets us skip the heavier
-           pickle path on iters with nothing new (the common steady
-           state).
-
-        2. **Payload phase** (only when header != 0) --
-           :func:`torch.distributed.broadcast_object_list` carries the
-           pickled ``IPCPackage`` over the same TP NCCL group. The
-           payload includes the (post-translation) control command
-           code + data, so every rank applies an identical command.
-
-        ``ipc_package`` is honored on rank-0 only; on other TP ranks it
-        is ignored (we always return what came over the wire).
+        Single-shot zmq PUSH/PULL: rank 0 ``send_pyobj`` once per
+        peer, every other PP=0 TP rank ``recv_pyobj``s exactly once.
+        ``ipc_package`` may be ``None`` -- that's the steady-state
+        decode case where the front-end has nothing pending; rank 0
+        still sends the ``None`` so peers stay in lockstep without
+        any per-iter NCCL traffic.
 
         Caller contract:
-        * Must be called on every PP0 TP rank every iteration in the
+        * Must be called on every PP=0 TP rank every iteration in the
           same order (lock-step with the schedule loop).
-        * Must NOT be called from PP-other ranks (their TP group lives
-          on a different PP stage; we only define the broadcast for
-          the first PP stage).
+        * Must NOT be called from PP-other ranks (their column gets
+          updates over :meth:`send_schedule_payload` instead).
+
+        See module-level comment above for why this no longer rides
+        NCCL.
         """
         if get_tp_size() <= 1:
             return ipc_package
 
-        self._ensure_tp_broadcast_state()
-        flag_gpu = self._tp_bcast_flag_gpu
-        src = self._tp_bcast_src_rank
-        # Use the dedicated IPC NCCL group (separate communicator) so
-        # the broadcast kernel doesn't queue behind the forward path's
-        # per-layer all_reduces -- which would otherwise force the
-        # .item() readback below to wait for the previous iter's
-        # entire forward to drain (we measured ~6 ms / iter on
-        # ``_TP_GROUP`` vs ~10-20 us on ``_IPC_TP_GROUP``).
-        tp_group = get_ipc_tp_group()
+        if get_rank() == 0:
+            # ``send_pyobj`` pickles + sends; we accept the per-peer
+            # pickle cost (3 pickles for tp_size=4) because pickling
+            # ``None`` or an empty IPCPackage is < 1 us each and the
+            # send itself is ~1 us over ipc://. zmq sockets are not
+            # thread-safe across threads, but each socket is only
+            # touched from the main worker thread here so the direct
+            # ``send_pyobj`` is safe (no need for the
+            # ``_get_sender`` background-thread pattern that the
+            # PP-other schedule fan-out uses).
+            for sock in self._input_tp_sockets:
+                sock.send_pyobj(ipc_package)
+            return ipc_package
 
-        if get_rank() == src:
-            # Caller is responsible for passing ``None`` when there's
-            # nothing to ship (the ``recv_ipc_package`` path collapses
-            # an "empty input + no log override" cum to ``None``
-            # before reaching us). This keeps log-only updates -- e.g.
-            # the per-iter ``log=True/False`` toggle -- on the wire.
-            flag_gpu.fill_(1 if ipc_package is not None else 0)
-        # Rank-0 fills, all ranks broadcast. Non-source ranks pass in
-        # whatever they have (they overwrite from the wire anyway).
-        dist.broadcast(flag_gpu, src=src, group=tp_group)
-        # Pinned readback => fast .item(). For the common header==0
-        # case this is the only sync we pay per iter on followers.
-        self._tp_bcast_flag_cpu.copy_(flag_gpu, non_blocking=False)
-        if int(self._tp_bcast_flag_cpu.item()) == 0:
-            return None
-
-        obj_list = [ipc_package if get_rank() == src else None]
-        # ``device`` must be a CUDA device for NCCL backend; otherwise
-        # PyTorch falls back to a temporary process group on CPU which
-        # serializes the broadcast onto the gloo store and hurts perf.
-        dist.broadcast_object_list(
-            obj_list,
-            src=src,
-            group=tp_group,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
-        return obj_list[0]
+        # PP=0 TP=k>0: blocking recv. Rank 0 sends every iter so this
+        # is bounded by zmq ipc round-trip latency (~1 us once the
+        # socket is warm).
+        return self._input_tp_recv_socket.recv_pyobj()
 
     def broadcast_tokens_to_tp(
         self, next_tokens: Optional[List[int]]
