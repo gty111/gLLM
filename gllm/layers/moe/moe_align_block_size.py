@@ -83,9 +83,20 @@ def moe_align_block_size(
     # expert id, so ``torch.zeros`` keeps the gather in-bounds; the
     # fused MoE kernel still ignores those padding blocks via
     # ``num_tokens_post_padded``.
-    expert_ids = torch.zeros(
-        (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
-    )
+    #
+    # When ``expert_map is None`` (EP-off) the trailing blocks are
+    # never read, so we can use the cheaper ``torch.empty`` and skip
+    # the ~9.5 K per-iter ``FillFunctor<int>`` launches that profile
+    # showed dominating the int-fill bucket on EP-off (~8 ms / 200
+    # decode forwards on Qwen3-VL-30B-A3B-Instruct TP=4 H20-3e).
+    if expert_map is None:
+        expert_ids = torch.empty(
+            (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+        )
+    else:
+        expert_ids = torch.zeros(
+            (max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device
+        )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
     ops.moe_align_block_size(

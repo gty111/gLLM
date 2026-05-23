@@ -16,6 +16,8 @@ try:
 except ImportError:
     _sgl_fused_qk_norm_rope = None
 
+from gllm.layers.ops.qk_norm import fused_qk_norm_inplace
+
 
 class Qwen3Attention(Attention):
     def __init__(self, layer_id, config):
@@ -121,12 +123,21 @@ class Qwen3Attention(Attention):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            q = q_by_head.view(q.shape)
-            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-            k = k_by_head.view(k.shape)
+            # Fused q/k RMS-norm in a single Triton launch. Operates
+            # in-place on the qkv slice (the kernel loads/stores along
+            # the contiguous head_dim axis and tolerates the qkv-row
+            # stride on the token axis, so no ``.contiguous()`` copy is
+            # needed). Profile of Qwen3-VL-30B-A3B-Instruct TP=4 on
+            # H20-3e: 36.6 ms (19303 RMSNorm calls @ 1.9 us) -> ~14 ms
+            # via the fused path, with the same numerics as the per-
+            # head RMSNorm pair.
+            fused_qk_norm_inplace(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+            )
             q, k = self.rotary_emb(input_data.get_position(), q, k)
         attn_output = self.attn.forward(q, k, v, input_data)
         output = self.o_proj(attn_output)
