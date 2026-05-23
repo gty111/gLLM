@@ -18,10 +18,13 @@ The new design moves the scheduler onto **every PP-0 TP rank** (a
 "column driver"). Each column driver:
 
 1. Receives new front-end work (new requests, aborts, control commands)
-   via :meth:`zmqComm.broadcast_input_to_tp` -- a 1-element NCCL flag
-   broadcast on the TP group on every iter, with a follow-up
-   ``broadcast_object_list`` only when the flag indicates there is
-   something to send. Steady-state cost is ~5-10 us / iter.
+   via :meth:`zmqComm.broadcast_input_to_tp` -- a single per-iter
+   pyobj fan-out from rank 0 to its PP=0 TP peers over ipc:// zmq
+   PUSH/PULL. Rank 0 sends ``None`` on the steady-state decode case
+   (which the receiver pickles into ~5 bytes) so peers stay
+   lock-stepped without any per-iter NCCL traffic. Steady-state cost
+   is ~1-3 us / iter and stays entirely on the CPU side, freeing
+   NVLink for the model's per-layer all-reduce.
 2. Runs the scheduler locally with the same inputs. Determinism is the
    load-bearing invariant -- ``IDAllocator`` is FIFO-deque-backed and
    the only stochastic call (``random.randint(0, pp_size-1)``)
@@ -94,8 +97,8 @@ class OverlapWorker(Worker):
     #
     # ``recv_ipc_package`` / ``check_abort_seqs`` / ``_translate_control_cmd``
     # are inherited unchanged from :class:`Worker`. The new column-driver
-    # base class already runs them on every PP=0 TP rank with NCCL-style
-    # input broadcast, which is exactly what overlap mode needs.
+    # base class already runs them on every PP=0 TP rank with the zmq
+    # input fan-out, which is exactly what overlap mode needs.
 
     def _build_prefetched_input(self) -> None:
         """Schedule the next batch locally; no inter-TP zmq send.

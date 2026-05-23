@@ -272,14 +272,17 @@ class Worker(TorchProfilerMixin):
     # ------------------------------------------------------------------
 
     def recv_ipc_package(self):
-        """Drain frontend zmq on rank 0, NCCL-broadcast within PP=0 TP group.
+        """Drain frontend zmq on rank 0, fan out to PP=0 TP peers.
 
         Every PP=0 TP rank invokes this each iter; only rank 0
         actually polls the frontend socket. The aggregated
         :class:`IPCPackage` (or ``None`` if nothing was waiting) is
-        broadcast over the TP NCCL group so every column driver
-        adds the same requests / aborts / control commands to its
-        local scheduler in lockstep.
+        shipped to peer column drivers over a CPU-side zmq fan-out
+        (see :meth:`zmqComm.broadcast_input_to_tp`) so every column
+        driver adds the same requests / aborts / control commands to
+        its local scheduler in lockstep, without consuming NVLink
+        bandwidth that would otherwise contend with the model's
+        per-layer all-reduce.
         """
         cum: Optional[IPCPackage] = None
         if self.rank == 0:
