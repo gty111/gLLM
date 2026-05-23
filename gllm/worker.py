@@ -1,3 +1,40 @@
+"""Per-rank worker driver loops (non-overlap path).
+
+Distributed scheduler design (v2)
+=================================
+
+Every PP=0 TP rank is now a *column driver*: it owns a real
+:class:`Scheduler`, NCCL-broadcasts new front-end work to its peers
+on the same PP stage, and only ships the resulting
+:class:`SchedulePayload` over zmq to *its own column's* PP-other
+followers (column ``k`` = ranks ``{k, tp_size+k, 2*tp_size+k, ...}``).
+
+The motivation is the same as the overlap path's: the old design
+had rank 0 as the sole scheduler and pushed a delta payload to every
+TP follower over zmq each iteration. That broadcast was the dominant
+source of inter-rank skew in TP=4 decode (~1.7 ms / iter on H100),
+and even after the delta refactor still ate 50-200 us of wire
+bookkeeping per iter. Moving the scheduler onto each column driver
+keeps determinism (FIFO IDAllocator + identical broadcast input)
+and removes both costs from the critical path.
+
+PP>1 specifics
+--------------
+
+* Tokens still flow ``output_rank -> rank 0`` over the existing single
+  PULL socket; rank 0 then NCCL-broadcasts the list to its PP=0 TP
+  peers via :meth:`zmqComm.broadcast_tokens_to_tp` so each column's
+  scheduler can ``add_next_tokens`` independently.
+* PP-other ranks (``pp_rank > 0``) keep the :class:`FollowerSeqStore`
+  mirror; they receive ``SchedulePayload`` deltas from their column's
+  PP=0 TP=k driver.
+* Sampling: every last-PP TP rank computes logits + samples in
+  :meth:`ModelRunner.step_once`, but only the ``output_rank`` token
+  list is shipped back. The other last-PP TP ranks do redundant
+  sampling work that the design tolerates (it was already this way
+  pre-refactor).
+"""
+
 import logging
 import traceback
 from collections import deque
@@ -16,8 +53,10 @@ from gllm.dist_schedule import (
 from gllm.dist_utils import (
     get_last_pp_rank,
     get_next_pp_rank,
+    get_pp_rank,
     get_pp_size,
     get_rank,
+    get_tp_rank,
     get_tp_size,
     get_world_size,
     init_dist,
@@ -38,7 +77,7 @@ class Worker(TorchProfilerMixin):
 
     def __init__(
         self,
-        model_runner: Union[ModelRunner,OverlapModelRunner],
+        model_runner: Union[ModelRunner, OverlapModelRunner],
         local_rank,
         pp_rank,
         tp_rank,
@@ -121,16 +160,35 @@ class Worker(TorchProfilerMixin):
         self.hidden_size = self.model_runner.hidden_size
         self.ret_residual = self.model_runner.model.ret_residual
 
-        if self.rank == 0:
+        self._init_role_state()
+
+        self.mp_alive[self.local_rank] = 1
+
+        logger.info(f"Initialization complete")
+
+    def _init_role_state(self):
+        """Build per-rank scheduler / follower-store state.
+
+        Every PP=0 TP rank gets a :class:`Scheduler` + a
+        :class:`DriverPayloadBuilder` (one builder per column; cursors
+        are independent of other columns'). PP-other ranks get a
+        :class:`FollowerSeqStore` mirroring their column's PP=0
+        driver, plus a queue of pre-built :class:`InputData`. The
+        old design constructed this only on rank 0 and relied on a
+        rank-0-centric zmq broadcast; the new column-driver design
+        means every PP=0 TP rank looks like rank 0 here, and PP-other
+        ranks pull from their column's driver instead of from rank 0.
+        """
+        if is_first_pp_rank():
             self.scheduler = Scheduler(
                 self.pp_size,
                 self.model_runner,
                 self.schedule_method,
             )
-            # One builder per driver. Single shared instance covers both
-            # follower groups (TP-first-PP and PP-other) -- they receive
-            # the same logical schedule stream, so one set of cursors
-            # tracks both correctly. See ``gllm/dist_schedule.py``.
+            # One DriverPayloadBuilder per column. We do NOT share a
+            # single builder across columns -- each column has its own
+            # zmq fanout and its own ``_pending_follower_frees``
+            # accumulator, so the cursors must be per-rank.
             self.payload_builder = DriverPayloadBuilder()
         else:
             # Per-rank state mirror. Replaces the stateless "rebuild
@@ -146,11 +204,10 @@ class Worker(TorchProfilerMixin):
             # Input data for each rank except 0
             self.schedule_queue = deque()
 
-        self.mp_alive[self.local_rank] = 1
+    # ------------------------------------------------------------------
+    # PP-other receive / forward (unchanged behaviour, sockets per-column)
+    # ------------------------------------------------------------------
 
-        logger.info(f"Initialization complete")
-
-    # driver worker => other workers
     def recv_schedule_payload(self) -> None:
         """Poll for one :class:`SchedulePayload`, apply it, queue InputData.
 
@@ -210,70 +267,131 @@ class Worker(TorchProfilerMixin):
             elif not is_last_pp_rank():
                 send_pp_data(output, get_next_pp_rank())
 
+    # ------------------------------------------------------------------
+    # PP=0 column driver: input distribution, scheduling, forward, output
+    # ------------------------------------------------------------------
+
     def recv_ipc_package(self):
-        # To avoid request accumulation, we fetch all packages in comm
-        cum_ipc_package = IPCPackage([])
-        while True:
-            ipc_package: Optional[IPCPackage] = self.comm.recv_ipc_package()
-            if ipc_package is not None:
-                cum_ipc_package.schedule_lists.extend(ipc_package.schedule_lists)
-                cum_ipc_package.abort_ids.extend(ipc_package.abort_ids)
+        """Drain frontend zmq on rank 0, NCCL-broadcast within PP=0 TP group.
+
+        Every PP=0 TP rank invokes this each iter; only rank 0
+        actually polls the frontend socket. The aggregated
+        :class:`IPCPackage` (or ``None`` if nothing was waiting) is
+        broadcast over the TP NCCL group so every column driver
+        adds the same requests / aborts / control commands to its
+        local scheduler in lockstep.
+        """
+        cum: Optional[IPCPackage] = None
+        if self.rank == 0:
+            cum = IPCPackage([])
+            saw_log_override = False
+            while True:
+                ipc_package = self.comm.recv_ipc_package()
+                if ipc_package is None:
+                    break
+                cum.schedule_lists.extend(ipc_package.schedule_lists)
+                cum.abort_ids.extend(ipc_package.abort_ids)
                 if ipc_package.log is not None:
-                    self.scheduler.set_log(ipc_package.log)
+                    cum.log = ipc_package.log
+                    saw_log_override = True
                 if ipc_package.control_cmd is not None:
-                    self.sync_control_cmd(ipc_package.control_cmd)
-            else:
-                break
-        if (
-            len(cum_ipc_package.schedule_lists) != 0
-            or len(cum_ipc_package.abort_ids) != 0
-        ):
-            self.scheduler.add_new_requests(cum_ipc_package.schedule_lists)
-            self.scheduler.add_abort_ids(cum_ipc_package.abort_ids)
+                    code, data = self._translate_control_cmd(
+                        ipc_package.control_cmd
+                    )
+                    if code != 0:
+                        cum.control_cmd_code = code
+                        cum.control_data = data
+            if not saw_log_override:
+                cum.log = None
+            if cum.is_input_empty() and cum.log is None:
+                cum = None
+
+        if get_tp_size() > 1:
+            cum = self.comm.broadcast_input_to_tp(cum)
+
+        if cum is None:
+            return
+
+        if cum.schedule_lists:
+            self.scheduler.add_new_requests(cum.schedule_lists)
+        if cum.abort_ids:
+            self.scheduler.add_abort_ids(cum.abort_ids)
+        if cum.log is not None:
+            self.scheduler.set_log(cum.log)
+        if cum.control_cmd_code != 0:
+            # Apply locally on this column driver, then forward to
+            # PP-other followers via the SchedulePayload mechanism so
+            # they enable / disable the profiler in the same iter.
+            self._apply_control_cmd(cum.control_cmd_code, cum.control_data)
+            if get_pp_size() > 1:
+                self.comm.broadcast_control_cmd(
+                    cum.control_cmd_code, cum.control_data
+                )
+
+    def _translate_control_cmd(self, control_cmd: str):
+        """rank-0-only string -> (code, data) translation for broadcast."""
+        if control_cmd == "start_profile":
+            import os
+            import time
+
+            start_ts = int(time.time())
+            profile_session_dir = os.path.join(
+                self.profile_output_dir,
+                f"trace_session_{start_ts}",
+            )
+            return 1, profile_session_dir
+        if control_cmd == "stop_profile":
+            return 2, None
+        return 0, None
 
     def recv_next_tokens(self):
-        if self.pp_size != 1:  # recv tokens from last rank
+        """Pull tokens off the output_rank => rank 0 socket and broadcast.
+
+        For PP=1 the broadcast is a no-op: the sample tokens are
+        already shared across the TP group inside ``run_batch_async``
+        / ``step_once`` (every TP rank runs the sampler with the same
+        all-reduced logits). For PP>1 only the ``output_rank`` (last
+        PP, TP=0) samples and ships the int list back to rank 0; we
+        then NCCL-fan it out to every PP=0 TP rank so each column
+        driver's scheduler can ``add_next_tokens`` independently.
+        """
+        if get_pp_size() == 1:
+            return
+
+        next_tokens: Optional[List[int]] = None
+        if self.rank == 0:
             next_tokens = self.comm.recv_tokens()
-            if next_tokens is not None:
-                self.scheduler.add_next_tokens(next_tokens)
+
+        if get_tp_size() > 1:
+            next_tokens = self.comm.broadcast_tokens_to_tp(next_tokens)
+
+        if next_tokens is not None:
+            self.scheduler.add_next_tokens(next_tokens)
 
     def check_abort_seqs(self):
+        """Process aborts on every column driver; only rank 0 replies."""
         ipc_package = self.scheduler.check_abort_seqs()
-        if ipc_package is not None:
+        if ipc_package is not None and self.rank == 0:
             self.comm.send_output(ipc_package)
 
     def process_output(self):
+        """Finalize this column's batch; only rank 0 replies to frontend."""
         ipc_package = self.scheduler.process_output()
-        if ipc_package is not None:
+        if ipc_package is not None and self.rank == 0:
             self.comm.send_output(ipc_package)
-
-    def forward_tp(self):
-        if len(self.schedule_queue) != 0:
-            input_data: InputData = self.schedule_queue.popleft()
-            self.model_runner.prepare_input(input_data=input_data)
-            output = self.model_runner.step_once()
-            if get_pp_size() != 1:
-                send_pp_data(output, get_next_pp_rank())
 
     def _build_schedule_payload(
         self,
         schedule_seqs: List,
     ) -> Optional[SchedulePayload]:
-        """Build the delta payload ONCE for this scheduling iteration.
+        """Build the per-column delta payload for this scheduling iteration.
 
-        We deliberately build a single payload object even when both
-        follower groups are present (pp_size > 1): ``DriverPayloadBuilder``
-        advances internal cursors (``_known``, ``_last_pages_len``) and
-        ``scheduler.consume_pending_follower_frees`` drains an accumulator.
-        A second build would falsely report "no new registers / no new
-        pages / no frees" to the PP-other group and they'd silently
-        diverge.
-
-        Returns ``None`` when distributed isn't initialized (single-rank).
-        Callers send to a follower group by passing the same payload to
-        :meth:`zmqComm.send_schedule_payload` (with the appropriate
-        ``is_first_pp`` flag) and optionally cloning with m-rope
-        positions for the PP-other path.
+        Each column driver maintains its own ``payload_builder``
+        cursors (``_known``, ``_last_pages_len``) and its scheduler's
+        ``_pending_follower_frees`` accumulator -- the column drivers
+        run identical schedules, but the payloads are still local
+        objects pickled by independent zmq sender threads. Returns
+        ``None`` for ``world_size == 1`` (single-rank shortcut).
         """
         if get_world_size() <= 1:
             return None
@@ -286,52 +404,75 @@ class Worker(TorchProfilerMixin):
 
     def schedule_forward(self):
         schedule_seqs = self.scheduler.schedule_once()
-        if len(schedule_seqs) != 0:
-            # Build payload up front (drains pending follower frees /
-            # advances register + page cursors exactly once) and ship
-            # to TP followers on rank-0's PP stage BEFORE local
-            # ``cal_input``, so their own ``cal_input`` overlaps with
-            # ours (see tp2-perf-fix.md "rank-1 入图同步" section).
-            payload = self._build_schedule_payload(schedule_seqs)
-            if payload is not None:
-                self.comm.send_schedule_payload(payload, is_first_pp=True)
-            self.model_runner.prepare_input(schedule_seqs)
-            # Subsequent PP stages don't run ``_mm_prepare_cpu`` (only
-            # the first PP rank does), so we ship the m-rope positions
-            # we just built. ``dataclasses.replace`` shares the list
-            # fields with the first send -- safe because
-            # ``DriverPayloadBuilder.build`` already made fresh,
-            # never-again-mutated list snapshots, so the two sender
-            # threads can pickle concurrently. For pp_size=1
-            # ``schedule_other_sockets`` is empty and the second send
-            # is an inline no-op.
-            if payload is not None and get_pp_size() > 1:
-                import dataclasses
+        if len(schedule_seqs) == 0:
+            return
+        # Every PP-0 column driver builds its own per-column delta
+        # payload (cursors are per-rank). For ``pp_size > 1`` the
+        # payload also carries ``mrope_positions`` for VL models,
+        # which only get computed inside ``prepare_input``, so the
+        # send to PP-other followers must happen *after* local input
+        # prep. (Pre-refactor we used to do an extra "early send" to
+        # TP followers without ``mrope_positions`` so their
+        # ``cal_input`` could overlap with ours, but with the
+        # per-column scheduler design TP followers no longer exist.)
+        # For ``pp_size == 1`` ``send_schedule_payload`` is an inline
+        # no-op since this column has no PP-other followers.
+        payload = self._build_schedule_payload(schedule_seqs)
+        self.model_runner.prepare_input(schedule_seqs)
+        if payload is not None and get_pp_size() > 1:
+            # Subsequent PP stages don't run ``_mm_prepare_cpu``,
+            # so we ship the m-rope positions we just built.
+            import dataclasses
 
-                pp_payload = dataclasses.replace(
-                    payload,
-                    mrope_positions=(
-                        self.model_runner.input_data.mrope_positions_cpu
-                    ),
-                )
-                self.comm.send_schedule_payload(pp_payload, is_first_pp=False)
-            output = self.model_runner.step_once()
+            pp_payload = dataclasses.replace(
+                payload,
+                mrope_positions=(
+                    self.model_runner.input_data.mrope_positions_cpu
+                ),
+            )
+            self.comm.send_schedule_payload(pp_payload)
+        output = self.model_runner.step_once()
 
-            if not is_output_rank():
-                send_pp_data(output, get_next_pp_rank())
-            else:
-                self.scheduler.add_next_tokens(output)
+        if is_last_pp_rank():
+            # ``step_once`` returns a List[int] of sampled tokens on
+            # every last-PP TP rank.
+            next_tokens = output
+            if get_pp_size() == 1:
+                # PP=1: every TP rank is also a column driver and
+                # needs these tokens for ``add_next_tokens``. Random
+                # samplers (top_k != 1, multinomial) are not
+                # guaranteed to produce TP-identical tokens, so we
+                # broadcast from output_rank within the TP group --
+                # OverlapModelRunner does this on the GPU side, but
+                # the eager non-overlap path doesn't, so we do it
+                # explicitly here. For greedy decoding the broadcast
+                # is harmless (~10us / iter).
+                if get_tp_size() > 1:
+                    next_tokens = self.comm.broadcast_tokens_to_tp(
+                        next_tokens if is_output_rank() else None
+                    )
+                if next_tokens is not None:
+                    self.scheduler.add_next_tokens(next_tokens)
+            elif is_output_rank():
+                # PP>1: only output_rank's tokens flow back to
+                # rank 0 via the existing token zmq pair; the other
+                # column drivers pick them up in next iter's
+                # ``recv_next_tokens`` (which NCCL-fans them out
+                # across the PP-0 TP group).
+                self.comm.send_tokens(next_tokens)
+            # last-PP TP>0 ranks for PP>1: discard ``next_tokens``;
+            # they don't drive a scheduler.
+        else:
+            # PP-0 / mid-PP ranks: send hidden states downstream.
+            send_pp_data(output, get_next_pp_rank())
 
-    def run_driver(self):
+    def run_pp0(self):
+        """Per-iter loop run by every PP=0 TP rank."""
         self.check_abort_seqs()
         self.recv_ipc_package()
         self.recv_next_tokens()
         self.schedule_forward()
         self.process_output()
-
-    def run_first_tp(self):
-        self.recv_schedule_payload()
-        self.forward_tp()
 
     def run_other(self):
         self.recv_schedule_payload()
@@ -355,10 +496,8 @@ def run_worker(worker: Worker):
     try:
         worker.init()
         while True:
-            if worker.rank == 0:
-                worker.run_driver()
-            elif worker.pp_rank == 0:
-                worker.run_first_tp()
+            if worker.pp_rank == 0:
+                worker.run_pp0()
             else:
                 worker.run_other()
     except KeyboardInterrupt as e:

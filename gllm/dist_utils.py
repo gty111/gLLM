@@ -41,6 +41,14 @@ _EP_SIZE = 1
 _WORLD_SIZE = 1
 _ASSIGNED_LAYERS = None
 _TP_GROUP = None
+# Dedicated TP communicator for the per-iter IPC broadcast (rank 0 ->
+# PP=0 TP peers). It covers the same ranks as ``_TP_GROUP`` but is a
+# *separate* NCCL communicator so its kernels don't queue behind the
+# forward path's all_reduces. Empirically, sharing a communicator
+# pushed each broadcast to ~6 ms (the .item() readback waited for the
+# previous iter's per-layer ARs to drain on the same NCCL stream); on
+# a dedicated group the same broadcast finishes in ~10-20 us.
+_IPC_TP_GROUP = None
 _USE_EP = True
 
 
@@ -120,16 +128,32 @@ def get_tp_group():
     return _TP_GROUP
 
 
+def get_ipc_tp_group():
+    """Process group used by :meth:`zmqComm.broadcast_input_to_tp`.
+
+    Same ranks as :func:`get_tp_group` but a different NCCL
+    communicator -- see ``_IPC_TP_GROUP`` for why this matters.
+    """
+    return _IPC_TP_GROUP
+
+
 def init_tp_group():
-    global _TP_GROUP
+    global _TP_GROUP, _IPC_TP_GROUP
     tp_groups = [
         list(range(_pp_rank * get_tp_size(), (_pp_rank + 1) * get_tp_size()))
         for _pp_rank in range(get_pp_size())
     ]
+    # Two passes so that ``dist.new_group`` is called the same number of
+    # times on every rank (it is collective). Order matters: forward AR
+    # uses _TP_GROUP, IPC broadcast uses _IPC_TP_GROUP.
     for tp_ranks in tp_groups:
         tp_group = dist.new_group(tp_ranks)
         if _RANK in tp_ranks:
             _TP_GROUP = tp_group
+    for tp_ranks in tp_groups:
+        ipc_group = dist.new_group(tp_ranks)
+        if _RANK in tp_ranks:
+            _IPC_TP_GROUP = ipc_group
 
 
 def init_dist(
