@@ -19,6 +19,7 @@ from sgl_kernel import (
     moe_align_block_size as _sgl_moe_align_block_size,
     moe_fused_gate as _sgl_moe_fused_gate,
     moe_sum as _sgl_moe_sum,
+    moe_sum_reduce as _sgl_moe_sum_reduce,
     rmsnorm as _sgl_rmsnorm,
     rotary_embedding as _sgl_rotary_embedding,
     silu_and_mul as _sgl_silu_and_mul,
@@ -297,8 +298,34 @@ def topk_sigmoid(
 
 
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
-    """Sum expert outputs: output += sum(input, dim=1)"""
-    _sgl_moe_sum(input, output)
+    """Sum expert outputs across topk dim: output = sum(input, dim=1).
+
+    sgl_kernel.moe_sum only ships specialized CUDA kernels for topk in
+    {2, 3, 4}; everything else (e.g. Qwen3-MoE / DeepSeek topk=8) falls
+    back to ``at::sum_out``, which on bf16 input launches a multi-kernel
+    chain (cast -> reduce -> cast). On Qwen3-VL-30B-A3B-Instruct prefill
+    that fallback was the dominant CPU-dispatch source of cross-rank
+    skew right before each ``cross_device_reduce_2stage`` call. Route
+    those non-specialized topk values through ``moe_sum_reduce``, which
+    has dedicated bf16/fp16 kernels for arbitrary topk in a single
+    launch.
+    """
+    topk = input.size(1)
+    if topk in (2, 3, 4):
+        _sgl_moe_sum(input, output)
+    else:
+        # routed_scaling_factor=1.0 -> plain sum (kernel computes
+        # ``out[t,d] = scale * sum_k(input[t,k,d])``).
+        _sgl_moe_sum_reduce(input, output, 1.0)
+
+
+def moe_sum_reduce(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    routed_scaling_factor: float = 1.0,
+):
+    """Fused sum + scale across the topk dim: output = scale * sum(input, dim=1)."""
+    _sgl_moe_sum_reduce(input, output, routed_scaling_factor)
 
 
 def moe_align_block_size(
