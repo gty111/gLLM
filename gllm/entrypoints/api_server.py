@@ -226,9 +226,17 @@ if __name__ == "__main__":
         "--tp", type=int, help="Number of tensor parallel degrees", default=1
     )
     parser.add_argument(
-        "--disable-ep",
-        help="Disable expert parallelism (EP is enable by default)",
+        "--enable-ep",
+        dest="enable_ep",
         action="store_true",
+        default=False,
+        help=(
+            "Enable expert parallelism. EP is OFF by default because for many "
+            "MoE configs (e.g. Qwen3-30B-A3B with num_experts=128, top_k=8 on "
+            "TP=4 / a single node) the EP path leaves each rank with only a "
+            "small slice of experts, so the per-expert GEMM is too thin to "
+            "saturate the SMs. Pass --enable-ep to opt into expert parallelism."
+        ),
     )
     parser.add_argument(
         "--assigned-layers",
@@ -318,7 +326,7 @@ if __name__ == "__main__":
         enable_prefix_caching=args.enable_prefix_caching,
         pp_size=args.pp,
         tp_size=args.tp,
-        use_ep=not args.disable_ep,
+        use_ep=args.enable_ep,
         assigned_layers=args.assigned_layers,
         schedule_method=args.schedule_method,
         overlap_scheduling=args.overlap_scheduling,

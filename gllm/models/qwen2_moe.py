@@ -9,8 +9,6 @@ from gllm.dist_utils import (
     get_ep_size,
     get_local_rank,
     get_tp_size,
-    is_use_ep,
-    resolve_ep_expert_idx,
     resolve_pp_layer_idx,
     tensor_model_parallel_all_reduce,
 )
@@ -29,6 +27,9 @@ from .weight_utils import (
     copy_qkv_proj,
     copy_single_proj_dim0,
     copy_single_proj_dim1,
+    load_fused_w13_per_expert,
+    load_w2_per_expert,
+    moe_expert_load_pool,
 )
 
 
@@ -171,76 +172,75 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
 
         _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), num_experts)
 
-        for k, v in parameters.items():
-            k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
-            if k.find("self_attn.qkv_proj") != -1:
-                head_dim_patch = (
-                    head_dim if k.find("scale") == -1 or k.find("weight") == -1 else 1
-                )
-                copy_qkv_proj(
-                    v.data,
-                    weights[k.replace("qkv_proj", "q_proj")],
-                    weights[k.replace("qkv_proj", "k_proj")],
-                    weights[k.replace("qkv_proj", "v_proj")],
-                    num_heads,
-                    num_kv_heads,
-                    head_dim_patch,
-                )
-            elif k.find("self_attn.fused_qkv_a_proj") != -1:  # Deepseek V3 Attention
-                copy_qkv_a_proj(
-                    v.data,
-                    weights[k.replace("fused_qkv_a_proj", "q_a_proj")],
-                    weights[k.replace("fused_qkv_a_proj", "kv_a_proj_with_mqa")],
-                )
-            elif k.find("w13_weight") != -1:  # expert
-                for expert_idx in range(num_experts):
-                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
-                    if local_expert_idx == -1:
-                        continue
+        with moe_expert_load_pool(num_experts) as expert_pool:
+            for k, v in parameters.items():
+                k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
+                if k.find("self_attn.qkv_proj") != -1:
+                    head_dim_patch = (
+                        head_dim if k.find("scale") == -1 or k.find("weight") == -1 else 1
+                    )
+                    copy_qkv_proj(
+                        v.data,
+                        weights[k.replace("qkv_proj", "q_proj")],
+                        weights[k.replace("qkv_proj", "k_proj")],
+                        weights[k.replace("qkv_proj", "v_proj")],
+                        num_heads,
+                        num_kv_heads,
+                        head_dim_patch,
+                    )
+                elif k.find("self_attn.fused_qkv_a_proj") != -1:  # Deepseek V3 Attention
+                    copy_qkv_a_proj(
+                        v.data,
+                        weights[k.replace("fused_qkv_a_proj", "q_a_proj")],
+                        weights[k.replace("fused_qkv_a_proj", "kv_a_proj_with_mqa")],
+                    )
+                elif k.find("w13_weight") != -1:  # expert
+                    load_fused_w13_per_expert(
+                        v.data,
+                        weights,
+                        key_for_gate=lambda i, k=k: k.replace(
+                            "w13_weight", f"{i}.gate_proj.weight"
+                        ),
+                        key_for_up=lambda i, k=k: k.replace(
+                            "w13_weight", f"{i}.up_proj.weight"
+                        ),
+                        expert_map=expert_map,
+                        num_experts=num_experts,
+                        pool=expert_pool,
+                    )
+                elif k.find("w2_weight") != -1:  # expert
+                    load_w2_per_expert(
+                        v.data,
+                        weights,
+                        key_for_down=lambda i, k=k: k.replace(
+                            "w2_weight", f"{i}.down_proj.weight"
+                        ),
+                        expert_map=expert_map,
+                        num_experts=num_experts,
+                        pool=expert_pool,
+                    )
+                elif k.find("gate_up_proj.weight") != -1:  # shared expert or dense layer
                     copy_gate_up_proj(
-                        v.data[local_expert_idx],
-                        weights[
-                            k.replace("w13_weight", f"{expert_idx}.gate_proj.weight")
-                        ],
-                        weights[
-                            k.replace("w13_weight", f"{expert_idx}.up_proj.weight")
-                        ],
-                        not is_use_ep(),
+                        v.data,
+                        weights[k.replace("gate_up_proj", "gate_proj")],
+                        weights[k.replace("gate_up_proj", "up_proj")],
                     )
-            elif k.find("w2_weight") != -1:  # expert
-                for expert_idx in range(num_experts):
-                    local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
-                    if local_expert_idx == -1:
-                        continue
-                    copy_single_proj_dim1(
-                        v.data[local_expert_idx],
-                        weights[
-                            k.replace("w2_weight", f"{expert_idx}.down_proj.weight")
-                        ],
-                        not is_use_ep(),
-                    )
-            elif k.find("gate_up_proj.weight") != -1:  # shared expert or dense layer
-                copy_gate_up_proj(
-                    v.data,
-                    weights[k.replace("gate_up_proj", "gate_proj")],
-                    weights[k.replace("gate_up_proj", "up_proj")],
-                )
-            elif k.find("down_proj.weight") != -1:  # shared expert or dense layer
-                copy_single_proj_dim1(v.data, weights[k])
-            elif k.find("self_attn.o_proj") != -1:
-                copy_single_proj_dim1(v.data, weights[k])
-            elif (
-                k.find("q_proj") != -1
-                or k.find("kv_b_proj") != -1
-                or k.find("q_b_proj") != -1
-            ):
-                # Deepseek V2/V3 Attention
-                copy_single_proj_dim0(v.data, weights[k])
-            elif k.find("embed_tokens") != -1 or k.find("lm_head") != -1:
-                copy_single_proj_dim0(v.data, weights[k])
-            else:
-                v.data.copy_(weights[k])
-            if mp_load_progress is not None:
-                mp_load_progress[get_local_rank() * 2 + 1] += 1
-            else:
-                pbar.update(1)
+                elif k.find("down_proj.weight") != -1:  # shared expert or dense layer
+                    copy_single_proj_dim1(v.data, weights[k])
+                elif k.find("self_attn.o_proj") != -1:
+                    copy_single_proj_dim1(v.data, weights[k])
+                elif (
+                    k.find("q_proj") != -1
+                    or k.find("kv_b_proj") != -1
+                    or k.find("q_b_proj") != -1
+                ):
+                    # Deepseek V2/V3 Attention
+                    copy_single_proj_dim0(v.data, weights[k])
+                elif k.find("embed_tokens") != -1 or k.find("lm_head") != -1:
+                    copy_single_proj_dim0(v.data, weights[k])
+                else:
+                    v.data.copy_(weights[k])
+                if mp_load_progress is not None:
+                    mp_load_progress[get_local_rank() * 2 + 1] += 1
+                else:
+                    pbar.update(1)
