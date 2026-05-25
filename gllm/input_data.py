@@ -119,7 +119,15 @@ class InputData:
         self.slot_mapping[: self.slot_mapping_cpu.shape[0]].copy_(
             self.slot_mapping_cpu, non_blocking=True
         )
-        self.block_table[: self.block_table_cpu.shape[0]].copy_(
+        # H2D only the columns we actually filled in ``_cal_block_table``
+        # (see its docstring for the bandwidth motivation). The persistent
+        # ``self.block_table`` device buffer keeps the full width so the
+        # captured-graph kernel signature is stable; only the bytes that are
+        # read by FlashAttention (the first ``max_blocks_used`` cols of each
+        # row, where ``max_blocks_used >= ceil(cache_seqlens[i]/page_size)``
+        # for every row in the current batch) get overwritten this step.
+        bs_, used_cols = self.block_table_cpu.shape
+        self.block_table[:bs_, :used_cols].copy_(
             self.block_table_cpu, non_blocking=True
         )
         self.seq_lens[: self.seq_lens_cpu.shape[0]].copy_(
@@ -299,8 +307,27 @@ class InputData:
         # ~3.2ms to <1ms. See ``_cal_query_start_loc`` for why
         # ``device="cpu"`` is required (default device is CUDA under
         # ``ModelLoader``).
+        #
+        # Width: only allocate / fill / H2D ``max_blocks_used`` columns
+        # instead of the full ``self.max_num_block`` (= ceil(model_max_length /
+        # page_size); e.g. 16384 for Qwen3-30B-A3B's 256K context). At bs=64
+        # that's 64 * 16384 * 4 = 4 MiB of int32 per forward, of which only
+        # the first ``ceil(max(seq_len)/page_size)`` columns are non-zero (the
+        # rest is dead padding). Torch-profiler tracing on Qwen3-30B-A3B
+        # TP=4 with conc=32 showed this single copy accounting for ~80 ms of
+        # ``Memcpy HtoD (Pinned -> Device)`` per 64-prompt run; SGLang at the
+        # same config does ~0 such copies. FlashAttention only reads up to
+        # ``cache_seqlens[i] / page_size`` columns per row in the persistent
+        # device-side ``block_table`` buffer, so leaving stale data beyond
+        # ``max_blocks_used`` is safe. ``copy_to_input_buffer`` H2Ds only
+        # ``[:bs, :max_blocks_used]`` to match; the kernel-facing
+        # ``get_block_table`` view stays wide so the captured CUDA graph
+        # signature is unaffected.
+        max_blocks_used = max((len(t) for t in block_tables_list), default=1)
+        if max_blocks_used == 0:
+            max_blocks_used = 1
         out = torch.empty(
-            (bs, self.max_num_block),
+            (bs, max_blocks_used),
             dtype=torch.int32,
             device="cpu",
             pin_memory=True,
