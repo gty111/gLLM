@@ -65,7 +65,7 @@ uv pip install -e .
 
 - For release:
 ```bash
-uv pip install gllm-rt==0.0.6.post1
+uv pip install "git+https://github.com/gty111/gLLM.git"
 ```
 
 ## Quickstart
