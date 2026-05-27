@@ -58,8 +58,7 @@ class SSMCacheConfig:
 
     def per_slot_bytes(self) -> int:
         """Memory footprint of a *single* pool slot, summed across all linear
-        layers, post TP sharding. Used by the KV budget calculation to
-        reserve space before page count is decided.
+        layers, post TP sharding. Used for SSM cache sizing logs.
         """
         conv_bytes = get_dtype_bytes(self.conv_state_dtype) * \
             self.conv_dim * (self.conv_kernel - 1)
@@ -325,14 +324,12 @@ class MemoryManager:
         return self.ssm_cache_config is not None
 
     def init(self, segment_cls=Segment, reserve_dummy_page: bool = False):
-        # Reserve the SSM banks *first* so the KV page count is computed
-        # against the genuinely remaining memory budget. Doing it in the
-        # other order silently over-subscribes the GPU and OOMs the first
-        # time a hybrid model fills its decode batch.
-        ssm_reserved_bytes = self._init_ssm_segment_if_needed()
+        # Allocate SSM pools before sizing the KV cache so ``mem_get_info``
+        # reflects the true post-SSM free memory. Do not subtract an estimated
+        # byte count again afterward -- the tensors are already on CUDA.
+        self._init_ssm_segment_if_needed()
 
         free_mem_size, _ = torch.cuda.mem_get_info()
-        free_mem_size = max(free_mem_size - ssm_reserved_bytes, 0)
         num_max_pages = free_mem_size // self.get_sizeof_KV_per_page()
         num_pages = int(num_max_pages * self.gpu_memory_util)
 
@@ -368,13 +365,10 @@ class MemoryManager:
         self.k_scale = torch.tensor(1.0, dtype=torch.float32)
         self.v_scale = self.k_scale
 
-    def _init_ssm_segment_if_needed(self) -> int:
-        """Allocate the SSM working+snapshot pools when the model needs them.
-        Returns the number of bytes consumed so the caller can subtract from
-        the KV budget.
-        """
+    def _init_ssm_segment_if_needed(self) -> None:
+        """Allocate the SSM working+snapshot pools when the model needs them."""
         if self.ssm_cache_config is None:
-            return 0
+            return
         cfg = self.ssm_cache_config
         self.ssm_segment = SSMSegment(
             cfg,
@@ -394,7 +388,6 @@ class MemoryManager:
             total / (1 << 30),
             cfg.num_layers,
         )
-        return total
 
     def get_sizeof_KV_per_page(self):  # Bytes
         if not self.use_mla:
