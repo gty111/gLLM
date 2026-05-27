@@ -364,11 +364,6 @@ class FollowerSeq:
       ``repetition_penalty == 1.0``). In that case
       ``_cal_tokens`` uses ``to_compute_tokens`` directly and
       ``_mm_prepare_cpu`` is never called for this seq.
-    * ``has_schedule`` is kept for compatibility with paths that read
-      it (``OverlapScheduler.process_output_finalize`` doesn't touch
-      followers, but ``Sequence``-typed code occasionally does). It's
-      always ``True`` on a follower -- by construction the seq must
-      have been scheduled at least once to land here.
     """
 
     __slots__ = (
@@ -387,7 +382,6 @@ class FollowerSeq:
         "finish_tokens",
         "ignore_eos",
         "output_len",
-        "has_schedule",
         "_keeps_token_ids",
     )
 
@@ -433,7 +427,6 @@ class FollowerSeq:
         self.finish_tokens = reg.finish_tokens
         self.ignore_eos = reg.ignore_eos
         self.output_len = reg.output_len
-        self.has_schedule = True
 
     # ---- duck-typed Sequence surface --------------------------------------
 

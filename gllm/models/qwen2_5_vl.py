@@ -706,7 +706,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             )
 
-        self.language_model = Qwen2ForCausalLM(config)
+        text_config = getattr(config, "text_config", config)
+        if text_config is not config:
+            if not hasattr(text_config, "tie_word_embeddings") and hasattr(
+                config, "tie_word_embeddings"
+            ):
+                text_config.tie_word_embeddings = config.tie_word_embeddings
+        self.language_model = Qwen2ForCausalLM(text_config)
 
         self.num_layers = self.language_model.num_layers
         self.num_kv_heads = self.language_model.num_kv_heads

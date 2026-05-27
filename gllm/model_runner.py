@@ -1,3 +1,5 @@
+import hashlib
+from collections import OrderedDict
 from contextlib import nullcontext as _nullcontext
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -40,6 +42,112 @@ class EmbeddingInfo:
     embedding: torch.Tensor = None
     prompt_positions: torch.Tensor = None
     mrope_position_delta: torch.Tensor = None
+    # Per-prompt deepstack residual (shape ``[L, N, hidden]``). Cached
+    # alongside ``embedding`` so chunked prefill / prefix-cache re-runs can
+    # re-slice it the same way ``embedding`` is sliced and feed the model
+    # buffer the chunk that matches ``hidden_states``. ``None`` for
+    # text-only prompts and for non-deepstack VL models.
+    deepstack_embedding: torch.Tensor = None
+
+
+# High-id offset for the synthetic ``pad_id``s spliced into the prefix-cache
+# key. The flag bit ``1 << 30`` keeps these well above any real vocab id (the
+# largest model in this repo, Qwen3.5, tops out around 250k) and below the
+# default ``int64`` tokenizer ceiling. The low 30 bits carry 30 bits of the
+# multimodal content hash so two distinct images produce different pad ids
+# with overwhelming probability.
+_MM_PAD_ID_BASE = 1 << 30
+_MM_PAD_ID_MASK = _MM_PAD_ID_BASE - 1
+
+
+def _mm_pad_id_from_hash(mm_hash: bytes) -> int:
+    return _MM_PAD_ID_BASE | (int.from_bytes(mm_hash[:4], "big") & _MM_PAD_ID_MASK)
+
+
+def _hash_tensor_bytes(*tensors: torch.Tensor) -> bytes:
+    """Stable digest over the concatenated raw bytes of one or more tensors.
+
+    Vision-tower inputs (pixel_values, grid_thw, timestamps, ...) are CPU-
+    side when this runs (forced by ``_mm_prepare_cpu``), so we can lift the
+    underlying storage directly without an extra D2H copy.
+    """
+    h = hashlib.sha256()
+    for t in tensors:
+        if t is None:
+            h.update(b"\x00")
+            continue
+        if t.device.type != "cpu":
+            t = t.detach().cpu()
+        t = t.contiguous()
+        # Mix dtype + shape so two tensors with identical bytes but
+        # different reinterpretations can't collide.
+        h.update(str(t.dtype).encode())
+        h.update(repr(tuple(t.shape)).encode())
+        h.update(memoryview(t.numpy().tobytes()))
+    return h.digest()
+
+
+class MultiModalEmbeddingCache:
+    """LRU cache over ``model.embed_multimodal(**mm_input)`` outputs.
+
+    Key is the prompt-level digest of all of a sequence's multimodal items
+    (concatenation of per-item sha256s, computed once in
+    :meth:`_mm_prepare_cpu`). Value is the per-item embedding tuple that
+    ``embed_multimodal`` returns — i.e. the same shape the model expects to
+    splice back into the input embeddings.
+
+    Eviction is byte-aware so a single huge ViT output can't squat on the
+    pool indefinitely; once the running total exceeds ``max_bytes`` we evict
+    LRU until back under the cap.
+    """
+
+    def __init__(self, max_entries: int = 64, max_mb: float = 256.0):
+        self._cache: "OrderedDict[bytes, tuple]" = OrderedDict()
+        self.max_entries = max_entries
+        self.max_bytes = int(max_mb * 1024 * 1024)
+        self._cur_bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    @staticmethod
+    def _size_of(value) -> int:
+        if value is None:
+            return 0
+        total = 0
+        for t in value:
+            if isinstance(t, torch.Tensor):
+                total += t.element_size() * t.numel()
+        return total
+
+    def get(self, key: Optional[bytes]):
+        if key is None:
+            return None
+        v = self._cache.get(key)
+        if v is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self._cache.move_to_end(key)
+        return v
+
+    def put(self, key: Optional[bytes], value) -> None:
+        if key is None or value is None:
+            return
+        sz = self._size_of(value)
+        if sz > self.max_bytes:
+            # Don't even try to cache something that wouldn't fit; the
+            # eviction loop would just thrash.
+            return
+        if key in self._cache:
+            self._cur_bytes -= self._size_of(self._cache[key])
+            self._cache.move_to_end(key)
+        self._cache[key] = value
+        self._cur_bytes += sz
+        # Evict by entry count first, then by byte budget.
+        while len(self._cache) > self.max_entries or self._cur_bytes > self.max_bytes:
+            _, evicted = self._cache.popitem(last=False)
+            self._cur_bytes -= self._size_of(evicted)
+
 
 class ModelRunner:
     def __init__(
@@ -69,11 +177,9 @@ class ModelRunner:
             else maxp + maxd
         )
         
-        self.max_running_seqs = (
-            maxp
-            if schedule_method in ["chunked_prefill", "split_pd"]
-            else maxd
-        )
+        # Concurrent decode slots (SSM working pool, input buffers, CUDA
+        # graph capture). Bounded by ``maxd`` for all schedule methods.
+        self.max_running_seqs = maxd
         
         self.model_path = model_path
         self.model_loader = ModelLoader(load_format, model_path, self.max_num_batched_tokens)
@@ -126,8 +232,31 @@ class ModelRunner:
         # embedding cache: seq_id => embedding
         self.embedding_cache: Dict[int, EmbeddingInfo] = {}
 
+        # Multimodal vision-tower output cache, keyed by the content hash of
+        # the prompt's MM items. Hits skip ``model.embed_multimodal``
+        # entirely. Independent of ``self.embedding_cache`` (which is per
+        # seq_id) so it survives across requests. Disabled cheaply when the
+        # model isn't multimodal: the put/get paths are guarded by
+        # ``self.use_mm`` callers.
+        self.mm_embed_cache = MultiModalEmbeddingCache(
+            max_entries=64, max_mb=256.0
+        )
+
         # cuda graph
         self.disable_cuda_graph = disable_cuda_graph
+        # ``max_cuda_graph_bs`` cannot exceed ``maxd`` — the runtime decode
+        # batch is hard-capped at ``maxd`` (scheduler) and several device
+        # buffers (e.g. ``InputData.block_table``, ``slot_mapping``) are
+        # sized at ``maxd`` rows. Capturing a larger graph would either
+        # overflow those buffers during capture or produce graphs that are
+        # never replayed at runtime. Clamp here so the user can keep the
+        # ``--max-cuda-graph-bs`` default without manually matching ``maxd``.
+        if max_cuda_graph_bs > maxd:
+            logger.warning(
+                f"max_cuda_graph_bs={max_cuda_graph_bs} exceeds maxd={maxd}; "
+                f"clamping to {maxd} (decode batch is bounded by maxd)."
+            )
+            max_cuda_graph_bs = maxd
         self.max_cuda_graph_bs = max_cuda_graph_bs
         self.size_to_graph: Dict[int, torch.cuda.CUDAGraph] = dict()
         # Use power-of-two bucket sizes to reduce the number of captured graphs.
@@ -173,15 +302,33 @@ class ModelRunner:
         memory_manager_cls = (
             PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         )
+        # Hybrid models (Qwen3.5 GDN) advertise a ready-to-use SSM cache
+        # config via ``model.ssm_cache_config``. ``num_layers`` for the KV
+        # path must then be the count of *full-attention* layers only.
+        ssm_cache_config = getattr(self.model, "ssm_cache_config", None)
+        kv_num_layers = getattr(self.model, "num_kv_layers", self.model.num_layers)
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util,
-            num_layers=self.model.num_layers,
+            num_layers=kv_num_layers,
             dtype=self.model_loader.dtype,
             page_size=self.page_size,
-            kv_head_num=self.model.num_kv_heads // get_tp_size(),
+            # ``num_kv_heads / tp_size`` rounded *up* to 1: when the model
+            # has fewer kv heads than TP ranks (Qwen3.5-MoE has 2 kv heads
+            # with TP=4) each kv head is broadcast across multiple ranks,
+            # and every rank still owns one effective slot of KV cache per
+            # token. Integer division would zero out the page size and the
+            # KV budget computation downstream.
+            kv_head_num=max(1, self.model.num_kv_heads // get_tp_size()),
             kv_head_dim=self.model.head_dim,
             vocab_size=self.model_loader.vocab_size,
             use_mla=self.model_loader.use_mla,
+            ssm_cache_config=ssm_cache_config,
+            max_working_ssm_slots=self.max_running_seqs if ssm_cache_config else 0,
+            max_snapshot_ssm_slots=(
+                4 * self.max_running_seqs
+                if ssm_cache_config and self.enable_prefix_caching
+                else 0
+            ),
         )
         # Input buffer
         self.input_data = InputData(
@@ -207,17 +354,27 @@ class ModelRunner:
     def encode(self, messages, chat: bool = False, has_mm: bool = False):
         if chat:
             if not self.use_mm or not has_mm:
-                return self.tokenizer.apply_chat_template(
+                out = self.tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
                     enable_thinking=self.use_thinking,
                 )
             else:
-                return self.processor.apply_chat_template(
+                out = self.processor.apply_chat_template(
                     messages, tokenize=True, add_generation_prompt=True
                 )[0]
         else:
-            return self.tokenizer.encode(messages)
+            out = self.tokenizer.encode(messages)
+        # transformers >= 5.x ``apply_chat_template`` returns a
+        # ``BatchEncoding`` (dict-like) when ``return_dict`` defaults to
+        # True; older versions returned a flat ``List[int]``. Normalize
+        # here so downstream code can always treat the result as a token
+        # id list.
+        if hasattr(out, "input_ids"):
+            out = out.input_ids
+        elif isinstance(out, dict) and "input_ids" in out:
+            out = out["input_ids"]
+        return out
 
     def decode(self, token_ids):
         return unify_decode(self.tokenizer, token_ids)
@@ -293,52 +450,46 @@ class ModelRunner:
 
             in_decode = False
             if seq.seq_id not in self.embedding_cache:
-                mm_input: Dict = {}
-                image_grid_thw: Optional[torch.Tensor] = None
-                video_grid_thw: Optional[torch.Tensor] = None
-                if seq.mm_contents is not None:
-                    if len(seq.mm_contents["image"]) != 0:
-                        images = load_images(seq.mm_contents["image"])
-                        images_input = self.image_processor(images=images)
-                        mm_input.update(images_input)
-                        image_grid_thw = images_input["image_grid_thw"]
-                    if len(seq.mm_contents["video"]) != 0:
-                        videos = []
-                        video_metadata = []
-                        for video_content in seq.mm_contents["video"]:
-                            video_data, metadata = load_video(video_content)
-                            videos.append(video_data)
-                            video_metadata.append(metadata)
-                        videos_input = self.video_processor(
-                            videos=videos,
-                            video_metadata=video_metadata,
+                # If the scheduler already ran ``_mm_precompute_hash`` for
+                # this seq (required for multimodal prefix-cache correctness
+                # -- see that method's docstring), reuse the cached
+                # image_processor output and is_multimodal mask. Otherwise
+                # build them now (text-only seqs, non-prefix-cache configs,
+                # and the never-cached scheduler in tests all land here).
+                pre = getattr(seq, "_mm_precomputed", None)
+                if pre is not None:
+                    mm_input = pre["mm_input"]
+                    image_grid_thw = pre["image_grid_thw"]
+                    video_grid_thw = pre["video_grid_thw"]
+                    input_ids_cpu = pre["input_ids_cpu"]
+                    is_multimodal_cpu = pre["is_multimodal_cpu"]
+                    mm_bundle_key = pre["mm_bundle_key"]
+                    # Single-use: drop the stash so a re-scheduled seq
+                    # (preempt + resume) doesn't accidentally read stale
+                    # tensors. The work it represents is now folded into
+                    # ``embedding_cache[seq.seq_id]`` below.
+                    seq._mm_precomputed = None
+                else:
+                    mm_input, image_grid_thw, video_grid_thw = (
+                        self._mm_run_processor(seq)
+                    )
+                    input_ids_cpu, is_multimodal_cpu = (
+                        self._mm_build_is_multimodal_cpu(seq)
+                    )
+                    mm_bundle_key, item_hashes = (
+                        self._build_mm_content_hashes(
+                            mm_input, image_grid_thw, video_grid_thw
                         )
-                        mm_input.update(videos_input)
-                        video_grid_thw = videos_input["video_grid_thw"]
+                    )
+                    if item_hashes:
+                        seq.hash_token_ids = self._splice_mm_pad_ids(
+                            seq.token_ids,
+                            is_multimodal_cpu,
+                            item_hashes,
+                        )
+                    else:
+                        seq.hash_token_ids = None
 
-                # ``get_input_positions`` does per-element Python indexing on
-                # the grid tensors; if a fast image processor handed us CUDA
-                # tensors here, that loop would issue a D2H sync per element.
-                # Force CPU once, cheaply, so the CPU phase stays CPU-only.
-                if isinstance(image_grid_thw, torch.Tensor):
-                    image_grid_thw = image_grid_thw.cpu()
-                if isinstance(video_grid_thw, torch.Tensor):
-                    video_grid_thw = video_grid_thw.cpu()
-
-                # Explicitly pin these tensors to CPU. The repo sets the
-                # default device to CUDA via ``ModelLoader``, so a bare
-                # ``torch.tensor(...)`` would silently allocate on GPU and
-                # the ``torch.isin`` below would launch a kernel on the
-                # default stream -- defeating overlap with the previous
-                # batch's forward. Materialization to CUDA is deferred to
-                # ``_mm_prepare_gpu`` right before ``embed_input_ids``.
-                input_ids_cpu = torch.tensor(seq.token_ids, device="cpu")
-                placeholder_token_id_cpu = torch.tensor(
-                    self.model.get_mm_placeholder_token_ids(), device="cpu"
-                )
-                is_multimodal_cpu = torch.isin(
-                    input_ids_cpu, placeholder_token_id_cpu
-                )
                 prompt_positions, mrope_position_delta = (
                     MRotaryEmbedding.get_input_positions(
                         input_tokens=seq.token_ids,
@@ -351,6 +502,7 @@ class ModelRunner:
                 batch_positions.append(
                     prompt_positions[:, seq.computed_token_num : seq.seq_len]
                 )
+
                 prefill_works.append(
                     {
                         "kind": "uncached",
@@ -360,6 +512,7 @@ class ModelRunner:
                         "mm_input": mm_input,
                         "prompt_positions": prompt_positions,
                         "mrope_position_delta": mrope_position_delta,
+                        "mm_bundle_key": mm_bundle_key,
                     }
                 )
             else:
@@ -384,6 +537,208 @@ class ModelRunner:
             "num_decode_tokens": num_decode_tokens,
         }
 
+    def _mm_run_processor(
+        self, seq: Sequence
+    ) -> Tuple[Dict, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Run image/video processors for ``seq.mm_contents``.
+
+        Returns ``(mm_input, image_grid_thw, video_grid_thw)``. The
+        grid tensors are forced to CPU because ``get_input_positions``
+        (and our content hashing) does per-element Python indexing on
+        them; leaving CUDA tensors there would trigger a D2H sync per
+        element and serialize the prepare-input stage against the
+        previous batch's forward.
+        """
+        mm_input: Dict = {}
+        image_grid_thw: Optional[torch.Tensor] = None
+        video_grid_thw: Optional[torch.Tensor] = None
+        if seq.mm_contents is not None:
+            if len(seq.mm_contents["image"]) != 0:
+                images = load_images(seq.mm_contents["image"])
+                images_input = self.image_processor(images=images)
+                mm_input.update(images_input)
+                image_grid_thw = images_input["image_grid_thw"]
+            if len(seq.mm_contents["video"]) != 0:
+                videos = []
+                video_metadata = []
+                for video_content in seq.mm_contents["video"]:
+                    video_data, metadata = load_video(video_content)
+                    videos.append(video_data)
+                    video_metadata.append(metadata)
+                videos_input = self.video_processor(
+                    videos=videos,
+                    video_metadata=video_metadata,
+                )
+                mm_input.update(videos_input)
+                video_grid_thw = videos_input["video_grid_thw"]
+        if isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = image_grid_thw.cpu()
+        if isinstance(video_grid_thw, torch.Tensor):
+            video_grid_thw = video_grid_thw.cpu()
+        return mm_input, image_grid_thw, video_grid_thw
+
+    def _mm_build_is_multimodal_cpu(
+        self, seq: Sequence
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build (input_ids_cpu, is_multimodal_cpu) for ``seq``.
+
+        Explicitly CPU-side: the repo sets the default device to CUDA
+        via ``ModelLoader``, so a bare ``torch.tensor(...)`` would
+        silently allocate on GPU and the ``torch.isin`` below would
+        launch a kernel on the default stream -- defeating overlap with
+        the previous batch's forward.
+        """
+        input_ids_cpu = torch.tensor(seq.token_ids, device="cpu")
+        placeholder_token_id_cpu = torch.tensor(
+            self.model.get_mm_placeholder_token_ids(), device="cpu"
+        )
+        is_multimodal_cpu = torch.isin(
+            input_ids_cpu, placeholder_token_id_cpu
+        )
+        return input_ids_cpu, is_multimodal_cpu
+
+    def _mm_precompute_hash(self, seq: Sequence) -> None:
+        """Pre-build ``seq.hash_token_ids`` before the scheduler's prefix
+        cache lookup, so distinct multimodal items don't collide on the
+        raw ``<|image_pad|>`` placeholder id.
+
+        The scheduler calls ``pre_allocate_computed_page`` for every new
+        seq *before* ``_mm_prepare_cpu`` runs. The default cache key
+        function ``_default_cache_key_fn`` reads ``seq.hash_token_ids``
+        if present and otherwise falls back to ``seq.token_ids``;
+        before this hook existed, that fallback meant every image-bearing
+        request used the same placeholder ids at the image span and the
+        second request would silently reuse the first request's KV
+        pages at the image positions -- producing answers about the
+        wrong image (the symptom that previously forced
+        ``--no-enable-prefix-caching`` for VL).
+
+        Side effects:
+            * ``seq.hash_token_ids`` is populated when the prompt has
+              at least one mm item, ``None`` otherwise.
+            * ``seq._mm_precomputed`` stashes the heavy outputs of the
+              image/video processor + the cpu masks so the later
+              ``_mm_prepare_cpu`` pass does not repeat the work.
+        """
+        if not self.use_mm:
+            return
+        if seq.mm_contents is None:
+            return
+        if seq.hash_token_ids is not None or getattr(
+            seq, "_mm_precomputed", None
+        ) is not None:
+            return  # already built (e.g. preemption + re-schedule).
+
+        mm_input, image_grid_thw, video_grid_thw = self._mm_run_processor(seq)
+        input_ids_cpu, is_multimodal_cpu = self._mm_build_is_multimodal_cpu(
+            seq
+        )
+        mm_bundle_key, item_hashes = self._build_mm_content_hashes(
+            mm_input, image_grid_thw, video_grid_thw
+        )
+        if item_hashes:
+            seq.hash_token_ids = self._splice_mm_pad_ids(
+                seq.token_ids, is_multimodal_cpu, item_hashes
+            )
+        else:
+            seq.hash_token_ids = None
+
+        seq._mm_precomputed = {
+            "mm_input": mm_input,
+            "image_grid_thw": image_grid_thw,
+            "video_grid_thw": video_grid_thw,
+            "input_ids_cpu": input_ids_cpu,
+            "is_multimodal_cpu": is_multimodal_cpu,
+            "mm_bundle_key": mm_bundle_key,
+        }
+
+    @staticmethod
+    def _build_mm_content_hashes(
+        mm_input: Dict,
+        image_grid_thw: Optional[torch.Tensor],
+        video_grid_thw: Optional[torch.Tensor],
+    ) -> Tuple[Optional[bytes], List[bytes]]:
+        """Hash each MM item's content, return (prompt-level key, per-item).
+
+        Per-item hash mixes pixel bytes + grid shape so two crops of the
+        same image with different processor settings still differ. The
+        prompt-level key is the concatenation of all per-item digests in
+        the order they appear in ``mm_input`` (image items, then video
+        items, mirroring :meth:`embed_multimodal`'s iteration). ``None`` is
+        returned when there's nothing multimodal in the prompt — that
+        signals downstream that the seq is text-only and falls back to the
+        cheap ``token_ids`` cache key.
+        """
+        item_hashes: List[bytes] = []
+
+        pixel_values = mm_input.get("pixel_values")
+        if pixel_values is not None and image_grid_thw is not None:
+            sizes = image_grid_thw.prod(dim=-1).tolist()
+            if isinstance(pixel_values, torch.Tensor):
+                chunks = pixel_values.split(sizes, dim=0)
+            else:
+                chunks = pixel_values
+            for chunk, thw in zip(chunks, image_grid_thw):
+                item_hashes.append(_hash_tensor_bytes(chunk, thw))
+
+        pixel_values_videos = mm_input.get("pixel_values_videos")
+        if pixel_values_videos is not None and video_grid_thw is not None:
+            sizes = video_grid_thw.prod(dim=-1).tolist()
+            if isinstance(pixel_values_videos, torch.Tensor):
+                chunks = pixel_values_videos.split(sizes, dim=0)
+            else:
+                chunks = pixel_values_videos
+            for chunk, thw in zip(chunks, video_grid_thw):
+                item_hashes.append(_hash_tensor_bytes(chunk, thw))
+
+        if not item_hashes:
+            return None, []
+        bundle = hashlib.sha256()
+        for h in item_hashes:
+            bundle.update(h)
+        return bundle.digest(), item_hashes
+
+    @staticmethod
+    def _splice_mm_pad_ids(
+        token_ids: List[int],
+        is_multimodal_cpu: torch.Tensor,
+        item_hashes: List[bytes],
+    ) -> List[int]:
+        """Return a copy of ``token_ids`` with placeholder spans rewritten.
+
+        Each contiguous run of multimodal placeholders is replaced by a
+        single ``pad_id`` derived from the next item's content hash, so the
+        downstream :class:`PrefixSegment` key naturally diverges between
+        prompts whose only difference is the image content. Mirrors
+        sglang's ``pad_input_tokens`` trick adapted to gllm's flat-page
+        cache layout.
+        """
+        mask = is_multimodal_cpu.tolist() if isinstance(is_multimodal_cpu, torch.Tensor) else list(is_multimodal_cpu)
+        out = list(token_ids)
+        n = len(out)
+        i = 0
+        item_idx = 0
+        while i < n:
+            if not mask[i]:
+                i += 1
+                continue
+            j = i
+            while j < n and mask[j]:
+                j += 1
+            # ``item_hashes`` exhaustion would mean the processor produced
+            # fewer MM items than there are placeholder spans, which
+            # indicates a tokenizer/processor mismatch. We leave excess
+            # spans untouched (falls back to the raw token id), which is
+            # the safe-but-conservative behavior — at worst it widens the
+            # cache hit set, never causing a false hit.
+            if item_idx < len(item_hashes):
+                pad_id = _mm_pad_id_from_hash(item_hashes[item_idx])
+                for k in range(i, j):
+                    out[k] = pad_id
+                item_idx += 1
+            i = j
+        return out
+
     @torch.inference_mode()
     def _mm_prepare_gpu(self, ctx: Dict) -> Optional[torch.Tensor]:
         """GPU phase of :meth:`mm_prepare_inputs`.
@@ -397,13 +752,30 @@ class ModelRunner:
         """
         device = self.input_hidden_states.device
         batch_embeddings: List[torch.Tensor] = []
+        # Per-chunk deepstack tensors aligned 1-1 with ``batch_embeddings``.
+        # ``None`` means "no deepstack contribution for this chunk" (decode
+        # rows, text-only prompts, non-deepstack VL models). A single
+        # buffer-write at the end of this method stitches the non-``None``
+        # chunks into the right rows of the model's deepstack buffer.
+        batch_deepstack: List[Optional[torch.Tensor]] = []
         for work in ctx["prefill_works"]:
             seq = work["seq"]
             if work["kind"] == "uncached":
                 mm_embeddings = None
                 mm_input = work["mm_input"]
                 if mm_input:
-                    mm_embeddings = self.model.embed_multimodal(**mm_input)
+                    # Skip the ViT encoder when this prompt's MM bundle is
+                    # already in the cache (e.g. identical-image rerun).
+                    # Cache stores the per-item embedding tuple verbatim;
+                    # downstream ``embed_input_ids`` is happy with cached
+                    # tensors since they live on the same device as the
+                    # encoder output.
+                    bundle_key = work.get("mm_bundle_key")
+                    mm_embeddings = self.mm_embed_cache.get(bundle_key)
+                    if mm_embeddings is None:
+                        mm_embeddings = self.model.embed_multimodal(**mm_input)
+                        if bundle_key is not None:
+                            self.mm_embed_cache.put(bundle_key, mm_embeddings)
 
                 # Materialize CPU tensors built in ``_mm_prepare_cpu`` onto
                 # the model device for the embed kernels. Sources are small
@@ -413,34 +785,60 @@ class ModelRunner:
                 is_multimodal = work["is_multimodal_cpu"].to(
                     device, non_blocking=True
                 )
-                prompt_embeddings = self.model.embed_input_ids(
+                embed_result = self.model.embed_input_ids(
                     input_ids,
                     mm_embeddings,
                     is_multimodal,
                 )
+                # ``embed_input_ids`` returns either a plain embedding
+                # tensor (non-deepstack models / text-only prompts that
+                # don't bother building the tuple) or
+                # ``(embedding, deepstack)``. Unify to a 2-tuple for the
+                # downstream layout code.
+                if isinstance(embed_result, tuple):
+                    prompt_embeddings, prompt_deepstack = embed_result
+                else:
+                    prompt_embeddings, prompt_deepstack = embed_result, None
 
                 embedding_info = EmbeddingInfo(
                     prompt_embeddings,
                     work["prompt_positions"],
                     work["mrope_position_delta"],
+                    deepstack_embedding=prompt_deepstack,
                 )
                 self.embedding_cache[seq.seq_id] = embedding_info
                 embedding = prompt_embeddings[
                     seq.computed_token_num : seq.seq_len, :
                 ]
+                deepstack_chunk = (
+                    prompt_deepstack[
+                        :, seq.computed_token_num : seq.seq_len, :
+                    ]
+                    if prompt_deepstack is not None
+                    else None
+                )
             else:
                 embedding_info = work["embedding_info"]
                 embedding = embedding_info.embedding[
                     seq.computed_token_num : seq.seq_len, :
                 ]
+                deepstack_chunk = (
+                    embedding_info.deepstack_embedding[
+                        :, seq.computed_token_num : seq.seq_len, :
+                    ]
+                    if embedding_info.deepstack_embedding is not None
+                    else None
+                )
 
             if seq.seq_len == seq.prompt_len:
-                # Prefill just finished; drop the cached embedding tensor to
-                # free memory. We still keep mrope_position_delta around for
-                # future decode-position calculations.
+                # Prefill just finished; drop the cached embedding tensors
+                # to free memory. We still keep mrope_position_delta around
+                # for future decode-position calculations.
                 embedding_info.embedding = None
+                embedding_info.deepstack_embedding = None
 
             batch_embeddings.append(embedding)
+            batch_deepstack.append(deepstack_chunk)
 
         num_decode_tokens = ctx["num_decode_tokens"]
         if num_decode_tokens > 0:
@@ -454,9 +852,38 @@ class ModelRunner:
                 dtype=self.input_hidden_states.dtype,
             )
             batch_embeddings.insert(0, placeholder)
+            # Decode rows must contribute zero deepstack residual (they
+            # represent already-prefilled tokens whose visual residuals
+            # are baked into the KV cache, not the input embedding).
+            batch_deepstack.insert(0, None)
 
         if not batch_embeddings:
             return None
+
+        # Stitch per-chunk deepstack tensors into the model's per-batch
+        # buffer at the offsets matching the final concatenated layout.
+        # This makes ``model._get_deepstack_input_embeds(num_tokens)``
+        # return rows aligned 1-1 with ``hidden_states`` regardless of
+        # prefix-cache hits or chunked prefill -- the deepstack residual
+        # for a token T at batch row R will land exactly at buffer row R.
+        if any(d is not None for d in batch_deepstack) and hasattr(
+            self.model, "_set_deepstack_input_embeds"
+        ):
+            total_tokens = sum(e.shape[0] for e in batch_embeddings)
+            # Zero positions that no chunk will write to (decode rows,
+            # text-only chunks). ``_clear_deepstack_input_embeds`` after
+            # the previous forward only zeroed up to that batch's row
+            # count, so anything beyond it could still hold stale values.
+            self.model._clear_deepstack_input_embeds(total_tokens)
+            offset = 0
+            for chunk, emb in zip(batch_deepstack, batch_embeddings):
+                n = emb.shape[0]
+                if chunk is not None:
+                    self.model._set_deepstack_input_embeds(
+                        chunk, offset=offset
+                    )
+                offset += n
+
         return torch.concat(batch_embeddings)
 
     @torch.inference_mode()
@@ -556,10 +983,39 @@ class ModelRunner:
         if torch.distributed.is_initialized():
             torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
+    def _fixup_vl_decode_embeddings(self, num_decode_tokens: int) -> None:
+        """Re-embed decode-token IDs into the front of ``input_hidden_states``.
+
+        ``_mm_prepare_gpu`` inserts an ``torch.empty()`` placeholder for the
+        decode rows of every VL batch and relies on this method to overwrite
+        those rows with the real text embeddings *before* the model forward
+        reads them. Both the no-overlap base path (:meth:`forward`) and the
+        overlap path (:meth:`OverlapModelRunner.run_batch_async`) must call
+        this; otherwise the model consumes uninitialized memory for every
+        decode token and silently produces garbage from the first decode
+        step onward.
+        """
+        if (
+            self.use_mm
+            and is_first_pp_rank()
+            and self.input_data.embedding_size > 0
+            and num_decode_tokens > 0
+        ):
+            decode_embeds = self.model.language_model.model.embed_tokens(
+                self.input_data.tokens[:num_decode_tokens]
+            )
+            self.input_hidden_states[:num_decode_tokens] = decode_embeds
+
     @torch.inference_mode()
     def forward(self):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if is_first_pp_rank() and self.use_mm:
+            # See ``_fixup_vl_decode_embeddings`` for why this is required
+            # without overlap scheduling.
+            num_decode_tokens = sum(
+                1 for s in self.input_data.seqs if s.computed_prompt
+            )
+            self._fixup_vl_decode_embeddings(num_decode_tokens)
             output = self.model(
                 self.input_data,
                 (
@@ -711,17 +1167,6 @@ class OverlapModelRunner(ModelRunner):
             get_tp_size(),
         )
 
-    def sync_before_next_prepare(self) -> None:
-        """Deprecated host-side barrier; kept for backward compatibility.
-
-        The fully-async overlap pipeline expresses the
-        "previous forward has released the input buffers" dependency on the
-        GPU side via ``input_consumed_event`` and ``prep_stream``, so callers
-        should no longer need this. The method is intentionally a no-op now;
-        we keep the symbol so that any external user gets a smooth migration.
-        """
-        return
-
     def prepare_input_cpu(self, input_data: InputData) -> None:
         """CPU-only portion of input prep.
 
@@ -786,18 +1231,6 @@ class OverlapModelRunner(ModelRunner):
         else:
             self.forward()
         return num_cal_tokens
-
-    def _fixup_vl_decode_embeddings(self, num_decode_tokens: int) -> None:
-        if (
-            self.use_mm
-            and is_first_pp_rank()
-            and self.input_data.embedding_size > 0
-            and num_decode_tokens > 0
-        ):
-            decode_embeds = self.model.language_model.model.embed_tokens(
-                self.input_data.tokens[:num_decode_tokens]
-            )
-            self.input_hidden_states[:num_decode_tokens] = decode_embeds
 
     @torch.inference_mode()
     def run_batch_async(self) -> Tuple[torch.cuda.Event, int, List[int], int]:

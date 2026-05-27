@@ -15,6 +15,13 @@ from gllm.utils import get_model_load_pbar, init_logger, random_uuid
 from gllm.worker import Worker, run_worker
 
 
+def _resolve_sampling_param(value, config_value, default):
+    """Caller override > generation config > hardcoded default."""
+    if value is not None:
+        return value
+    return default if config_value is None else config_value
+
+
 class LLM:
     def __init__(
         self,
@@ -325,15 +332,19 @@ class LLM:
         repetition_penalty=None,
         mm_contents=None,
     ):
-        temperature = (
-            self.generation_config.temperature if temperature is None else temperature
-        )
-        top_p = self.generation_config.top_p if top_p is None else top_p
+        # Models without a ``generation_config.json`` (e.g. Qwen3.5-0.8B)
+        # leave the HF ``GenerationConfig`` defaults as ``None``, which then
+        # crashes ``InputData.prepare_sample``'s ``async_tensor_h2d`` H2D
+        # copy. Fall back to neutral greedy defaults when both the caller
+        # and the model config leave the field unset.
+        gen = self.generation_config
+        temperature = _resolve_sampling_param(temperature, gen.temperature, 1.0)
+        top_p = _resolve_sampling_param(top_p, gen.top_p, 1.0)
+        # top_k=1 selects the greedy fast-path in ``Sampler``; do not inherit
+        # ``generation_config.top_k`` when the caller leaves it unset.
         top_k = 1 if top_k is None else top_k
-        repetition_penalty = (
-            self.generation_config.repetition_penalty
-            if repetition_penalty is None
-            else repetition_penalty
+        repetition_penalty = _resolve_sampling_param(
+            repetition_penalty, gen.repetition_penalty, 1.0
         )
         return Sequence(
             self.id_allocator.allocate(),

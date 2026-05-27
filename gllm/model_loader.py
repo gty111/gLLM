@@ -1,4 +1,5 @@
 import glob
+from typing import Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -14,10 +15,79 @@ from gllm.models.qwen2 import Qwen2ForCausalLM
 from gllm.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from gllm.models.qwen2_moe import Qwen2MoeForCausalLM
 from gllm.models.qwen3 import Qwen3ForCausalLM
+from gllm.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+from gllm.models.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from gllm.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from gllm.utils import get_lock
+
+
+def _is_quantized_param(param: torch.Tensor) -> bool:
+    """True for the per-tensor weight of a FP8 / INT8 quantized linear.
+
+    Identified by dtype rather than by name: gllm Linear classes register
+    the FP8 weight as ``self.weight`` and the per-block scale as
+    ``self.weight_scale_inv``. We key on the low-precision dtype directly
+    so the check is also robust to future int8 / int4 layouts that may
+    not carry a sibling ``_scale_inv``.
+    """
+    return param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8)
+
+
+def _validate_ignored_layers(model, quantization_config) -> None:
+    """Warn if any parameter in ``ignored_layers`` ended up quantized.
+
+    Naming is intentionally a best-effort suffix match: the checkpoint
+    typically writes entries like ``model.language_model.layers.0.mlp.gate``
+    while gllm's ``named_parameters()`` may emit
+    ``language_model.model.layers.0.mlp.gate.weight`` (PP / VL wrapping
+    can re-arrange the common ancestor). Stripping the trailing
+    ``.weight`` / ``.weight_scale_inv`` and doing an ``endswith`` against
+    each ignored entry catches every reasonable layout we ship without
+    requiring per-model prefix bookkeeping. False positives here are
+    cheap (a warning); false negatives would degrade accuracy silently,
+    which is exactly what we want to avoid.
+    """
+    ignored = quantization_config.get("ignored_layers") if isinstance(
+        quantization_config, dict
+    ) else getattr(quantization_config, "ignored_layers", None)
+    if not ignored:
+        return
+    # Strip the ``model.`` / ``model.language_model.`` style root prefixes
+    # so suffix-matching is robust to gllm's PP/VL parameter naming. Keep
+    # both the original and stripped variants — different checkpoints use
+    # different leading prefixes.
+    ignored_suffixes = []
+    for entry in ignored:
+        ignored_suffixes.append(entry)
+        for stripped_prefix in ("model.language_model.", "model.", "language_model."):
+            if entry.startswith(stripped_prefix):
+                ignored_suffixes.append(entry[len(stripped_prefix):])
+    ignored_suffixes = tuple(set(ignored_suffixes))
+
+    violations = []
+    for name, param in model.named_parameters():
+        if not _is_quantized_param(param):
+            continue
+        # Param names end in ``.weight`` (and sometimes ``.weight_scale_inv``
+        # for FP8 scales — but those have float32 dtype so the dtype filter
+        # above already excludes them). Strip the trailing dot-suffix once.
+        module_name = name.rsplit(".", 1)[0] if "." in name else name
+        if module_name.endswith(ignored_suffixes):
+            violations.append((name, str(param.dtype)))
+
+    if violations:
+        sample = ", ".join(f"{n} ({d})" for n, d in violations[:5])
+        more = f" (and {len(violations) - 5} more)" if len(violations) > 5 else ""
+        logger.warning(
+            f"quantization_config['ignored_layers'] contains {len(ignored)} "
+            f"entries but {len(violations)} matching parameters are still "
+            f"quantized: {sample}{more}. The model definition needs to "
+            "construct these layers without a ``quant_config`` (e.g. via "
+            "``ParallelLMHead`` or plain ``nn.Linear``) or route them to "
+            "a sub-config whose ``quantization_config`` is None."
+        )
 
 
 def get_attr_from_config(config, attr_name):
@@ -29,6 +99,111 @@ def get_attr_from_config(config, attr_name):
         return getattr(getattr(config, 'vision_config'), attr_name)
     else:
         raise KeyError(f"Failed to get attribute '{attr_name}' from config.")
+
+
+def propagate_tie_word_embeddings(
+    config,
+    propagate_to: Tuple[str, ...] = ("text_config",),
+) -> None:
+    """Align ``tie_word_embeddings`` between the top-level config and listed
+    nested sub-configs (default: ``text_config``).
+
+    Why this is necessary: HuggingFace's ``PretrainedConfig`` defaults
+    ``tie_word_embeddings`` to ``True``. For multimodal/VL configs the
+    top-level config carries the authoritative value (which matches the
+    checkpoint's actual ``lm_head.weight`` layout), but ``text_config`` is
+    instantiated separately and silently keeps the HF default ``True``.
+    VL wrappers (``Qwen2_5_VL``, ``Qwen3VL``, ``Qwen3VLMoe``, …) construct
+    their language sub-model from ``config.text_config``, so without this
+    propagation the LM ties ``lm_head`` to ``embed_tokens`` even when the
+    checkpoint ships a *separate* ``lm_head.weight`` (i.e. top-level
+    ``tie_word_embeddings: false``). The model loader then loads
+    ``embed_tokens`` into the tied weight and the real ``lm_head.weight``
+    in the checkpoint is silently ignored — predictions become garbage
+    (often deterministic-looking nonsense like ``.fetchone``) even though
+    every transformer layer is computed correctly.
+
+    Top-level wins: if the top-level has an explicit value (``True`` or
+    ``False``) it overwrites the sub-config's HF-default value. This is
+    safe because checkpoints store the LM-head layout decision exactly
+    once at the top level.
+
+    Mutates ``config`` in place. Safe to call repeatedly.
+    """
+    top = getattr(config, "tie_word_embeddings", None)
+    if top is None:
+        return
+    for name in propagate_to:
+        sub = getattr(config, name, None)
+        if sub is None:
+            continue
+        sub_val = getattr(sub, "tie_word_embeddings", None)
+        if sub_val != top:
+            sub.tie_word_embeddings = top
+
+
+def propagate_quantization_config(
+    config,
+    propagate_to: Tuple[str, ...] = ("text_config",),
+) -> None:
+    """Mirror ``quantization_config`` between the top-level :class:`PretrainedConfig`
+    and the listed nested sub-configs (default: only ``text_config``).
+
+    Why this is necessary: every VL wrapper in this repo (``Qwen2_5_VL``,
+    ``Qwen3VL``, ``Qwen3_5``, ``Qwen3VLMoe``, ``Qwen3_5MoeForConditionalGeneration``)
+    constructs its language sub-model from ``config.text_config``. But some
+    checkpoints (notably Qwen3.5-MoE-FP8) store the FP8 ``quantization_config``
+    only on the top-level config — the LM would then never observe the quant
+    field and would silently fall back to bf16 weights, doubling memory and
+    corrupting every FP8 matmul. The mirror also handles the reverse case
+    (checkpoint puts the field on a nested sub-config only) so the bare
+    ``getattr(config, 'quantization_config', None)`` further below in
+    :meth:`ModelLoader.load_config` always sees a non-None value when any
+    listed sub-config has one.
+
+    The default ``propagate_to=("text_config",)`` is intentionally
+    conservative: in the Qwen3.5-MoE-FP8 layout the vision tower stays in
+    bf16 and would not understand the FP8 ``weight_block_size`` directives,
+    so we must not silently force FP8 on it. A future fully-quantized VL
+    checkpoint (vision + language both quantized) should opt-in explicitly
+    via ``propagate_to=("text_config", "vision_config")`` — typically from
+    an architecture-specific branch in :meth:`ModelLoader.load_config`.
+
+    Explicit per-sub-config settings always win: this helper only fills
+    sub-configs whose ``quantization_config`` is currently ``None``. A
+    checkpoint that deliberately sets *different* quant configs on
+    different sub-configs (mixed-precision) is therefore preserved.
+
+    Mutates ``config`` in place. Safe to call repeatedly. No-op when
+    neither the top-level config nor any listed sub-config carries a
+    ``quantization_config``.
+    """
+    # Resolve "the" quant config: prefer the top-level field, else the first
+    # non-None field on a listed sub-config (reverse propagation so callers
+    # can read it back off the top-level config uniformly).
+    resolved = getattr(config, "quantization_config", None)
+    if resolved is None:
+        for name in propagate_to:
+            sub = getattr(config, name, None)
+            sub_quant = (
+                getattr(sub, "quantization_config", None) if sub is not None else None
+            )
+            if sub_quant is not None:
+                resolved = sub_quant
+                break
+    if resolved is None:
+        return
+
+    # Forward propagate: top-level -> each listed sub-config, but only when
+    # the sub-config doesn't already carry its own (explicit wins).
+    if getattr(config, "quantization_config", None) is None:
+        config.quantization_config = resolved
+    for name in propagate_to:
+        sub = getattr(config, name, None)
+        if sub is None:
+            continue
+        if getattr(sub, "quantization_config", None) is None:
+            sub.quantization_config = resolved
 
 
 class ModelLoader:
@@ -100,8 +275,21 @@ class ModelLoader:
         self.architecture = self.config.architectures[0]
         self.vocab_size = get_attr_from_config(self.config, "vocab_size")
         self.hidden_size = get_attr_from_config(self.config, "hidden_size")
+        # Mirror ``quantization_config`` across the top-level config and
+        # ``config.text_config`` so that VL wrappers — which pass
+        # ``text_config`` into the language sub-model — always observe the
+        # quant field. See :func:`propagate_quantization_config`.
+        propagate_quantization_config(self.config)
+        # Same problem for ``tie_word_embeddings``: VL configs often have
+        # top-level ``tie_word_embeddings: false`` (separate ``lm_head.weight``
+        # in the checkpoint) while ``text_config`` keeps HF's default ``True``,
+        # which would cause VL LMs to silently tie ``lm_head`` to ``embed_tokens``
+        # and ignore the real ``lm_head.weight``. See
+        # :func:`propagate_tie_word_embeddings`.
+        propagate_tie_word_embeddings(self.config)
         self.quantization_config = getattr(self.config, "quantization_config", None)
         self.config.use_mla = self.use_mla
+        self.config.use_hybrid_state = self.use_hybrid_state
         self.config.max_num_batched_tokens = self.max_num_batched_tokens
 
     @property
@@ -112,7 +300,17 @@ class ModelLoader:
     def use_mm(self):
         return self.architecture in ["Qwen2_5_VLForConditionalGeneration",
                                      "Qwen3VLForConditionalGeneration",
-                                     "Qwen3VLMoeForConditionalGeneration"]
+                                     "Qwen3VLMoeForConditionalGeneration",
+                                     "Qwen3_5ForConditionalGeneration",
+                                     "Qwen3_5MoeForConditionalGeneration"]
+
+    @property
+    def use_hybrid_state(self):
+        """Whether the model has linear-attention (Mamba/GDN) layers that need
+        a recurrent-state cache *in addition to* the regular KV cache.
+        """
+        return self.architecture in ["Qwen3_5ForConditionalGeneration",
+                                     "Qwen3_5MoeForConditionalGeneration"]
 
     def get_model_type(self):
         model_type = None
@@ -141,6 +339,10 @@ class ModelLoader:
             model_type = Qwen3VLForConditionalGeneration
         elif self.architecture == "Qwen3VLMoeForConditionalGeneration":
             model_type = Qwen3VLMoeForConditionalGeneration
+        elif self.architecture == "Qwen3_5ForConditionalGeneration":
+            model_type = Qwen3_5ForConditionalGeneration
+        elif self.architecture == "Qwen3_5MoeForConditionalGeneration":
+            model_type = Qwen3_5MoeForConditionalGeneration
         else:
             raise Exception(f"Unsupported model: {self.architecture}")
         return model_type
@@ -178,4 +380,19 @@ class ModelLoader:
         # Load weights from CPU memory to GPU memory
         if self.load_format == "auto":
             model.load_weights(self.weights, mp_load_progress)
+
+        # Best-effort validation that ``quantization_config["ignored_layers"]``
+        # is honored. gllm does not consume the field directly (no per-layer
+        # ``prefix`` plumbing through the Linear/MoE classes); instead every
+        # model is expected to either route ignored layers to a sub-config
+        # without ``quantization_config`` (e.g. the vision tower) or
+        # construct them as non-quantizable classes (``ParallelLMHead``,
+        # plain ``nn.Linear`` for MoE routers). This check catches future
+        # checkpoints whose ``ignored_layers`` list does not match the
+        # conventions baked into the model definitions, so a silent FP8 of
+        # an "ignored" layer surfaces as a clear warning at load time
+        # rather than mysterious downstream NaNs / garbage tokens.
+        if self.quantization_config is not None:
+            _validate_ignored_layers(model, self.quantization_config)
+
         return model

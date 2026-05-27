@@ -238,15 +238,11 @@ def fused_add_rms_norm(
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    token_expert_indicies: Optional[torch.Tensor],
     gating_output: torch.Tensor,
     renormalize: bool = False,
 ) -> None:
     """
     Compute top-k softmax for MoE routing.
-
-    Note: ``sgl_kernel.topk_softmax`` doesn't use ``token_expert_indicies``;
-    the parameter is kept for API compatibility but ignored.
 
     ``renormalize`` is plumbed through to the kernel so callers can fold the
     "divide topk_weights by their sum" pass into the same launch instead of

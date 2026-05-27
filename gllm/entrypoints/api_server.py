@@ -67,11 +67,23 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     token_ids = await make_async(llm.model_runner.encode)(
         request.messages, chat=True, has_mm=mm_contents is not None
     )
-    if llm.check_seq_length(token_ids, request.max_completion_tokens):
+    # OpenAI deprecated ``max_tokens`` for chat completions in favor of
+    # ``max_completion_tokens`` but most clients (including curl examples,
+    # the OpenAI Python SDK pre-1.40, and ``benchmark_serving.py``) still
+    # send the legacy field. Honour it as a fallback so the decode cap
+    # actually takes effect — otherwise a request without
+    # ``max_completion_tokens`` decodes until EOS / model_max_length,
+    # which on a broken model produces thousands of garbage tokens.
+    max_output_tokens = (
+        request.max_completion_tokens
+        if request.max_completion_tokens is not None
+        else request.max_tokens
+    )
+    if llm.check_seq_length(token_ids, max_output_tokens):
         stream = await llm.add_requests_async(
             raw_request,
             token_ids,
-            request.max_completion_tokens,
+            max_output_tokens,
             request.ignore_eos,
             request.temperature,
             request.top_p,
@@ -198,8 +210,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--enable-prefix-caching",
-        help="Enable KV cache reuse across requests",
-        action="store_true",
+        dest="enable_prefix_caching",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable KV cache reuse across requests (default: on)",
     )
     parser.add_argument(
         "--page-size", type=int, help="Number of tokens in a page", default=16

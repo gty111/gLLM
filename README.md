@@ -18,6 +18,7 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 Integrated with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **cuda graph**, **token throttling**, **pipeline parallelism**, **expert parallelism** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (supported in HuggingFace) inference. gLLM provides **equivalent or superior** offline/online inference speed compared to mainstream inference engines, with a **minimal** code base. You can also see gLLM as an LLM inference playground for experiments or academic research.
 
 *Latest News* :fire:
+- [2026/05/27]: Qwen3.5 is supported — dense & MoE, hybrid GDN + full attention, vision-language, and FP8 checkpoints :tada:
 - [2025/12/04]: Cuda graph is supported :tada:
 - [2025/11/19]: DeepSeek V3/R1 is supported :laughing:
 - [2025/09/19]: [DynaPipe](https://openreview.net/forum?id=D6w7wIN360) is accepted by NeurIPS'25. Congratulations :smiling_face_with_three_hearts:
@@ -162,7 +163,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 - Kimi Series: Moonlight, K2-Base, K2-Instruct
 - DeepSeek Series: DeepSeek R1, DeepSeek V3, DeepSeek V2
-- Qwen Series: Qwen3 VL, Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
+- Qwen Series: Qwen3.5, Qwen3 VL, Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
 - Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
 - ChatGLM Series: Glm4 and Chatglm3

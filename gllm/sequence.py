@@ -1,4 +1,4 @@
-from typing import List, Union
+from typing import List, Optional, Union
 
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -48,7 +48,17 @@ class Sequence:
         self.mm_contents = mm_contents
         # used to remove redundant token_ids
         self.to_compute_tokens = None
-        self.has_schedule = False
+        # SSM working-pool slot for hybrid (Mamba/GDN) models. ``None`` means
+        # either the model has no linear-attention layers or the scheduler
+        # has not yet allocated a slot for this seq. The slot lives for the
+        # whole lifetime of the request and is reset on preempt/free.
+        self.ssm_state_slot: Optional[int] = None
+        # Alternate "view" of ``token_ids`` used *only* for prefix-cache
+        # hashing. Multimodal pipelines splice content-derived ids into the
+        # placeholder positions here so that VL prompts with identical text
+        # but different images no longer collide in the cache. ``None``
+        # falls back to ``token_ids`` (text-only path).
+        self.hash_token_ids: Optional[List[int]] = None
 
     def __len__(self):
         return len(self.token_ids)
@@ -88,6 +98,11 @@ class Sequence:
     def preempt(self):
         self.computed_token_num = 0
         self.page_table = []
+        # SSM state is recurrent, so preempting (= recomputing from scratch)
+        # invalidates whatever was in the working slot. The actual slot is
+        # released by the scheduler via ``MemoryManager.free_ssm_slot`` so
+        # that ``SSMSegment.free_working`` can also zero the tensors.
+        self.ssm_state_slot = None
 
     @property
     def computed_prompt(self):

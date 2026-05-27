@@ -3,6 +3,38 @@ from typing import Union
 import torch
 from typing_extensions import TypeAlias
 
+
+def extract_rope_config(config, default_theta: float = 10000.0):
+    """Compatibility shim for ``transformers >= 5.0``.
+
+    Two relevant breaking changes vs ``< 5.0``:
+
+    1. ``config.rope_theta`` no longer exists as a top-level attribute on
+       most ``*Config`` classes (e.g. ``Qwen3Config``). Accessing it now
+       raises ``AttributeError``; the value lives inside ``rope_scaling``
+       as ``rope_scaling["rope_theta"]``.
+    2. ``config.rope_scaling`` is now auto-populated with a trivial
+       ``{"rope_theta": ..., "rope_type": "default"}`` dict even when the
+       model checkpoint did not configure any RoPE scaling (``< 5.0``
+       returned ``None`` in that case). Existing model loaders that did
+       ``if rope_scaling is None`` to decide between vanilla and
+       scaled/MRoPE no longer hit the vanilla branch.
+
+    Returns a ``(rope_theta, rope_scaling)`` tuple where ``rope_scaling``
+    is normalized back to ``None`` for the vanilla case so existing
+    branches keep working unchanged.
+    """
+    rope_scaling = getattr(config, "rope_scaling", None) or {}
+    rope_theta = rope_scaling.get("rope_theta")
+    if rope_theta is None:
+        rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_theta = default_theta
+    rope_type = rope_scaling.get("rope_type", "default")
+    if rope_type == "default" and "mrope_section" not in rope_scaling and "type" not in rope_scaling:
+        return rope_theta, None
+    return rope_theta, dict(rope_scaling)
+
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
     list["torch.Tensor"],

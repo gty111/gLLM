@@ -12,6 +12,7 @@ from gllm.dist_utils import (
     resolve_pp_layer_idx,
     tensor_model_parallel_all_reduce,
 )
+
 from gllm.input_data import InputData
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe import FusedMoE, determine_expert_map
@@ -51,13 +52,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
-            renormalize=config.norm_topk_prob,
+            renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
         )
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
 
         if getattr(config, "shared_expert_intermediate_size", 0) > 0:
             self.shared_expert = Qwen2MoeMLP(config, shared_expert=True)
+            # ``Qwen2MoeMLP.down_proj`` is a ``RowParallelLinear`` that
+            # all-reduces by default. We defer the all-reduce to this
+            # block's tail (after summing the FusedMoE and shared-expert
+            # contributions) so the shared output is not reduced twice
+            # under TP > 1 — without this each TP rank's shared
+            # contribution would be summed ``tp_size`` times in the final
+            # output.
+            if self.tp_size > 1:
+                self.shared_expert.down_proj.reduce_results = False
         else:
             self.shared_expert = None
         if hasattr(config, "shared_expert_intermediate_size"):
@@ -126,7 +136,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -136,8 +145,6 @@ class Qwen2MoeDecoderLayer(nn.Module):
             input_data=input_data,
             hidden_states=hidden_states,
         )
-
-        # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual

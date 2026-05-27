@@ -10,6 +10,7 @@ from gllm.modules.attention import Attention
 from .qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen2 import Qwen2Model
+from .utils import extract_rope_config
 
 try:
     from sgl_kernel import fused_qk_norm_rope as _sgl_fused_qk_norm_rope
@@ -29,7 +30,9 @@ class Qwen3Attention(Attention):
             head_dim,
         )
 
-        self.rope_theta = getattr(config, "rope_theta", 1000000)
+        self.rope_theta, _rope_scaling_normalized = extract_rope_config(
+            config, default_theta=1000000.0
+        )
         self.qkv_bias = getattr(config, "attention_bias", False)
 
         quant_config = getattr(config, "quantization_config", None)
@@ -50,7 +53,7 @@ class Qwen3Attention(Attention):
             quant_config=quant_config,
         )
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = _rope_scaling_normalized
         if rope_scaling is None:
             self.rotary_emb = RotaryEmbedding(
                 self.head_dim,

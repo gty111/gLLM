@@ -559,8 +559,46 @@ def apply_rotary_emb_dispatch(
     return apply_rotary_emb(x, cos, sin, interleaved=not is_neox_style)
 
 
+def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
+    """Interleave the per-axis (T/H/W) cos/sin halves into the layout expected
+    by interleaved MRoPE.
+
+    Input  ``x``: ``(3, num_tokens, half_rotary_dim)`` — dim 0 is T/H/W.
+    Output      ``(num_tokens, half_rotary_dim)`` where pair ``3*k`` comes
+                from T, ``3*k+1`` from H, ``3*k+2`` from W, padded with T
+                once a section is exhausted.
+
+    Mirrors :func:`sglang.srt.layers.rotary_embedding.mrope.apply_interleaved_rope`
+    so a checkpoint trained with ``mrope_interleaved=True`` (Qwen3.5,
+    Qwen3-VL "interleaved" variant) lands on the right per-pair frequency.
+    """
+    x_t = x[0].clone()
+    x_t[..., 1 : mrope_section[1] * 3 : 3] = x[1, ..., 1 : mrope_section[1] * 3 : 3]
+    x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
+    return x_t
+
+
 class MRotaryEmbedding(RotaryEmbedding):
-    """Rotary Embedding with Multimodal Sections."""
+    """Rotary Embedding with Multimodal Sections.
+
+    Supports two MRoPE layouts in addition to the standard non-interleaved
+    one used by Qwen2.5-VL / Qwen3-VL:
+
+    * ``mrope_interleaved=False`` (default) — sglang's ``apply_interleaved=False``
+      path. The cos/sin cache is laid out as ``[T-section | H-section | W-section]``
+      contiguously along the half-rotary-dim axis, and the Triton kernel
+      :func:`triton_mrope` masks per section.
+    * ``mrope_interleaved=True`` — Qwen3.5's layout. The per-axis cos/sin
+      arrays are interleaved every 3rd position via :func:`apply_interleaved_rope`
+      so that pair ``k`` reads from ``T`` if ``k % 3 == 0``, ``H`` if
+      ``k % 3 == 1``, ``W`` if ``k % 3 == 2``. After ``apply_interleaved_rope``
+      we fall through to the vanilla 2-D RoPE kernel — exactly the same code
+      path sglang takes.
+
+    Partial rotary is handled via ``rotary_dim < head_size`` (the trailing
+    ``head_size - rotary_dim`` dims are left as-is), which is the standard
+    encoding for ``partial_rotary_factor < 1.0``.
+    """
 
     def __init__(
         self,
@@ -570,6 +608,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         base: float,
         is_neox_style: bool,
         mrope_section: Optional[list[int]] = None,
+        mrope_interleaved: bool = False,
     ) -> None:
         # In Qwen2.5-VL, the maximum index value is related to the duration of
         # the input video. We enlarge max_position_embeddings to 4 times to get
@@ -580,6 +619,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
 
         self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
 
@@ -609,17 +649,24 @@ class MRotaryEmbedding(RotaryEmbedding):
         if positions.ndim == 2:
             assert self.mrope_section
 
-            q, k = triton_mrope(
-                query,
-                key,
-                cos,
-                sin,
-                self.mrope_section,
-                self.head_size,
-                self.rotary_dim,
-            )
-
-            return q.reshape(query_shape), k.reshape(key_shape)
+            if self.mrope_interleaved:
+                # Reduce the per-axis (T/H/W) cos/sin to a single per-token
+                # vector that already encodes the interleaved pair layout,
+                # then fall through to the vanilla rotary path. Same shape
+                # as the non-MRoPE branch below.
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                q, k = triton_mrope(
+                    query,
+                    key,
+                    cos,
+                    sin,
+                    self.mrope_section,
+                    self.head_size,
+                    self.rotary_dim,
+                )
+                return q.reshape(query_shape), k.reshape(key_shape)
 
         query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
