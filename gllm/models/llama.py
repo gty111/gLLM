@@ -15,6 +15,7 @@ from gllm.layers.rotary_embedding import (
 from gllm.modules.attention import Attention
 
 from .qwen2 import Qwen2ForCausalLM, Qwen2MLP, Qwen2Model
+from .utils import extract_rope_config
 
 
 class LlamaMLP(Qwen2MLP):
@@ -42,9 +43,9 @@ class LlamaAttention(Attention):
             self.total_num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.rope_theta = getattr(config, "rope_theta", 10000)
-
-        rope_scaling = config.rope_scaling
+        self.rope_theta, rope_scaling = extract_rope_config(
+            config, default_theta=10000.0
+        )
         if rope_scaling is not None:
             scaling_type = (
                 rope_scaling["type"]

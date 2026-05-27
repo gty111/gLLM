@@ -36,6 +36,54 @@ def copy_qkv_proj(dst_qkv, src_q, src_k, src_v, num_heads, num_kv_heads, head_di
     ]
 
 
+def copy_qkv_proj_gqa(
+    dst_qkv,
+    src_q,
+    src_k,
+    src_v,
+    num_q_rows_per_rank: int,
+    num_kv_heads_per_rank: int,
+    num_kv_head_replicas: int,
+    head_dim_or_blocks: int,
+):
+    """TP-rank-local copy of [Q | K | V] into ``dst_qkv``, with GQA-aware
+    broadcasting for ``num_kv_head_replicas > 1``.
+
+    When ``TP > total_num_kv_heads`` (the QKVParallelLinear layout used by
+    Qwen3.5-MoE with TP=4 + 2 kv heads), each kv head is replicated across
+    ``num_kv_head_replicas`` adjacent TP ranks. The checkpoint stores the
+    un-replicated tensor, so we map this rank back to its physical kv head
+    via ``tp_rank // num_kv_head_replicas`` and slice from there.
+
+    Args:
+        dst_qkv: this rank's fused ``qkv_proj.weight`` (or
+            ``weight_scale_inv``) parameter; shape ``[Q_p + K_p + V_p, ...]``
+            for the leading dim.
+        src_q, src_k, src_v: checkpoint tensors for ``q_proj`` / ``k_proj``
+            / ``v_proj`` (un-replicated).
+        num_q_rows_per_rank: per-rank q-row count. With ``attn_output_gate``
+            this is ``num_heads_per_rank * 2``.
+        num_kv_heads_per_rank: per-rank kv-head count, i.e.
+            ``max(1, total_kv // tp)``.
+        num_kv_head_replicas: how many TP ranks share the same kv head,
+            ``tp // total_kv`` (1 when no replication).
+        head_dim_or_blocks: ``head_dim`` for the weight tensor, or
+            ``head_dim // block_n`` for the FP8 ``weight_scale_inv`` tensor
+            (which has one row per ``block_n`` output rows of the weight).
+    """
+    tp_rank = get_tp_rank()
+    q_chunk = num_q_rows_per_rank * head_dim_or_blocks
+    dst_qkv[:q_chunk] = src_q[tp_rank * q_chunk : (tp_rank + 1) * q_chunk]
+    kv_chunk = num_kv_heads_per_rank * head_dim_or_blocks
+    kv_offset = (tp_rank // max(num_kv_head_replicas, 1)) * kv_chunk
+    dst_qkv[q_chunk : q_chunk + kv_chunk] = src_k[
+        kv_offset : kv_offset + kv_chunk
+    ]
+    dst_qkv[q_chunk + kv_chunk :] = src_v[
+        kv_offset : kv_offset + kv_chunk
+    ]
+
+
 def copy_qkv_a_proj(dst, q_a_proj, kv_a_proj_with_mqa):
     size_partition = q_a_proj.shape[0]
     dst[:size_partition] = q_a_proj
@@ -187,6 +235,12 @@ def load_fused_w13_per_expert(
         pool: optional pool from :func:`moe_expert_load_pool`. When provided
             the per-expert copies run concurrently; otherwise they run
             serially.
+
+    The per-expert checkpoint keys are looked up via
+    :func:`get_tensor_from_dict` so callers that own a top-level wrapper
+    (e.g. ``model.language_model.layers.X.mlp.experts.Y.gate_proj.weight``)
+    don't need to pre-rewrite the key path -- the lookup automatically
+    falls back through the ``language_model.`` and ``visual.`` alternates.
     """
     partition_tp = not is_use_ep()
 
@@ -196,8 +250,8 @@ def load_fused_w13_per_expert(
             return
         copy_gate_up_proj(
             dst[local_expert_idx],
-            weights[key_for_gate(expert_idx)],
-            weights[key_for_up(expert_idx)],
+            get_tensor_from_dict(weights, key_for_gate(expert_idx)),
+            get_tensor_from_dict(weights, key_for_up(expert_idx)),
             partition_tp,
         )
 
@@ -226,7 +280,7 @@ def load_w2_per_expert(
             return
         copy_single_proj_dim1(
             dst[local_expert_idx],
-            weights[key_for_down(expert_idx)],
+            get_tensor_from_dict(weights, key_for_down(expert_idx)),
             partition_tp,
         )
 

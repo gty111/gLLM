@@ -27,6 +27,7 @@ from gllm.modules.attention import Attention
 from gllm.utils import yarn_get_mscale
 
 from .qwen2_moe import Qwen2MoeForCausalLM
+from .utils import extract_rope_config
 
 
 class DeepseekV2MLP(nn.Module):
@@ -155,9 +156,10 @@ class DeepseekV2Attention(Attention):
             config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         )
         self.kv_lora_rank = config.kv_lora_rank
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.rope_theta, rope_scaling = extract_rope_config(
+            config, default_theta=10000.0
+        )
         self.max_poistion_embeddings = getattr(config, "max_position_embeddings", 8192)
-        rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is None:
             self.rope_scaling = {
                 "factor": 1.0,
@@ -295,9 +297,10 @@ class DeepseekV2MLAAttention(Attention):
             config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         )
         self.kv_lora_rank = config.kv_lora_rank
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.rope_theta, rope_scaling = extract_rope_config(
+            config, default_theta=10000.0
+        )
         self.max_poistion_embeddings = getattr(config, "max_position_embeddings", 8192)
-        rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is None:
             self.rope_scaling = {
                 "factor": 1.0,

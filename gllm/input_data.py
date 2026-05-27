@@ -23,6 +23,10 @@ class InputData:
         self.page_size = memory_manager.page_size
         self.max_num_block = (max_seq_length + self.page_size - 1) // self.page_size
         self.use_mla = memory_manager.use_mla
+        # Hybrid models (Qwen3.5 GDN / Mamba) expose a per-request SSM state
+        # slot in addition to their KV pages. ``use_ssm_cache`` mirrors how
+        # ``use_mla`` gates the alternate KV layout above.
+        self.use_ssm_cache = memory_manager.use_ssm_cache
         self.memory_manager: MemoryManager = memory_manager
         self.use_buffer = use_buffer
 
@@ -42,6 +46,32 @@ class InputData:
             )
             self.seq_lens = torch.zeros(max_running_seqs, dtype=torch.int32)
             self.query_start_loc = torch.zeros(max_running_seqs + 1, dtype=torch.int32)
+
+            if self.use_ssm_cache:
+                # Per-seq SSM working slot id, indexed by the row in the
+                # batch. The GDN kernels read this as their ``cache_indices``
+                # argument. Slot 0 is the CUDA-graph dummy slot, so padded
+                # decode rows go there harmlessly.
+                self.ssm_state_slot_per_seq = torch.zeros(
+                    max_running_seqs, dtype=torch.int32
+                )
+                # 1 for sequences whose prefix-state already lives in
+                # ``ssm_state[ssm_state_slot_per_seq[i]]`` (either chunked-
+                # prefill continuation or prefix-cache hit). Passed to the
+                # conv1d / chunk-GDN kernels as ``has_initial_state``.
+                self.has_initial_state_per_seq = torch.zeros(
+                    max_running_seqs, dtype=torch.bool
+                )
+                # Snapshot-pool slot id the GDN layer should write into AT
+                # END OF THIS FORWARD for each seq, or -1 to skip. Populated
+                # by ``_cal_ssm_metadata`` from ``PrefixSegment.
+                # page2ssm_snapshot`` whenever the seq's prefill ends
+                # exactly on a page boundary and that page owns a snapshot
+                # slot. Decode steps never snapshot — they would only
+                # produce duplicate states with the working slot.
+                self.ssm_snapshot_write_slot_per_seq = torch.full(
+                    (max_running_seqs,), -1, dtype=torch.int32
+                )
 
             if self.use_mla:
                 self.workspace = torch.empty(
@@ -97,8 +127,69 @@ class InputData:
         self.max_seq_len, self.seq_lens_cpu = self._cal_seq_lens(seqs)
         self.max_query_len, self.query_start_loc_cpu = self._cal_query_start_loc(seqs)
 
+        if self.use_ssm_cache:
+            self._cal_ssm_metadata(seqs)
+
         if self.use_mla:
             self._cal_mla_metadata(seqs)
+
+    def _cal_ssm_metadata(self, seqs: List[Sequence]):
+        """Build per-seq SSM slot id + initial-state flag + snapshot target.
+
+        * ``ssm_state_slot_per_seq[i]`` = ``seqs[i].ssm_state_slot`` (or 0 = the
+          dummy slot if the seq somehow has no slot yet, which should never
+          happen because the scheduler allocates one before this method is
+          called).
+        * ``has_initial_state_per_seq[i]`` = True when ``computed_token_num >
+          0``. This covers both chunked-prefill continuation and prefix-cache
+          hits where ``PrefixMemoryManager`` already copied the snapshot back
+          into the working slot.
+        * ``ssm_snapshot_write_slot_per_seq[i]`` = snapshot-pool slot id to
+          which the GDN layer should copy this seq's working state at the
+          end of this forward, or -1 if no snapshot is wanted. Populated
+          only for prefill rows whose chunk ends exactly on a page boundary
+          and whose ``PrefixSegment`` reserved a snapshot slot for that
+          page (i.e. enable_prefix_caching=True + the page is cacheable).
+        """
+        bs = len(seqs)
+        slots = np.empty(bs, dtype=np.int32)
+        has_init = np.empty(bs, dtype=np.bool_)
+        snap_targets = np.full(bs, -1, dtype=np.int32)
+
+        # Pull the snapshot pointer table once; ``PrefixSegment`` is the
+        # only Segment subclass that owns ``page2ssm_snapshot``. The
+        # ``segment`` attribute is created lazily by
+        # :meth:`MemoryManager.init`, so during the pre-init profile run
+        # we may not have it yet — fall back to ``None`` (no snapshots).
+        segment = getattr(self.memory_manager, "segment", None)
+        page2snap = getattr(segment, "page2ssm_snapshot", None) if segment is not None else None
+        page_size = self.memory_manager.page_size
+
+        for i, seq in enumerate(seqs):
+            slots[i] = seq.ssm_state_slot if seq.ssm_state_slot is not None else 0
+            has_init[i] = seq.computed_token_num > 0
+
+            # Snapshot timing: prefill chunk landing on a page boundary.
+            # Decode rows skip this branch since ``computed_prompt`` flips
+            # True before any decode token is emitted (see Sequence) and
+            # ``page2snap is None`` for non-prefix-cache runs.
+            if page2snap is None or seq.computed_prompt:
+                continue
+            end_tokens = seq.computed_token_num + seq.to_compute_token_num
+            if end_tokens == 0 or end_tokens % page_size != 0:
+                continue
+            page_idx = (end_tokens // page_size) - 1
+            if page_idx < 0 or page_idx >= len(seq.page_table):
+                continue
+            snap_slot = page2snap[seq.page_table[page_idx]]
+            if snap_slot is not None:
+                snap_targets[i] = snap_slot
+
+        self.ssm_state_slot_per_seq_cpu = torch.from_numpy(slots).pin_memory()
+        self.has_initial_state_per_seq_cpu = torch.from_numpy(has_init).pin_memory()
+        self.ssm_snapshot_write_slot_per_seq_cpu = (
+            torch.from_numpy(snap_targets).pin_memory()
+        )
 
     def copy_to_input_buffer(self):
         assert self.use_buffer
@@ -137,6 +228,18 @@ class InputData:
             self.query_start_loc_cpu, non_blocking=True
         )
 
+        if self.use_ssm_cache:
+            n_seqs = self.ssm_state_slot_per_seq_cpu.shape[0]
+            self.ssm_state_slot_per_seq[:n_seqs].copy_(
+                self.ssm_state_slot_per_seq_cpu, non_blocking=True
+            )
+            self.has_initial_state_per_seq[:n_seqs].copy_(
+                self.has_initial_state_per_seq_cpu, non_blocking=True
+            )
+            self.ssm_snapshot_write_slot_per_seq[:n_seqs].copy_(
+                self.ssm_snapshot_write_slot_per_seq_cpu, non_blocking=True
+            )
+
         if self.use_mla:
             self._set_mla_metadata()
 
@@ -161,6 +264,11 @@ class InputData:
         "top_k",
         "repetition_penalty",
         "needs_repetition_penalty",
+    )
+    _PREBUILT_SSM_ATTRS = (
+        "ssm_state_slot_per_seq_cpu",
+        "has_initial_state_per_seq_cpu",
+        "ssm_snapshot_write_slot_per_seq_cpu",
     )
     _PREBUILT_MLA_ATTRS = (
         "num_actual_tokens",
@@ -187,6 +295,10 @@ class InputData:
         """
         for attr in self._PREBUILT_COMMON_ATTRS:
             setattr(self, attr, getattr(input_data, attr, None))
+
+        if self.use_ssm_cache:
+            for attr in self._PREBUILT_SSM_ATTRS:
+                setattr(self, attr, getattr(input_data, attr, None))
 
         if self.use_mla:
             for attr in self._PREBUILT_MLA_ATTRS:
@@ -282,6 +394,30 @@ class InputData:
 
     def get_query_start_loc(self):
         return self.query_start_loc[: self.query_start_loc_cpu.shape[0]]
+
+    def get_ssm_state_slot_per_seq(self):
+        """Per-seq SSM working-slot ids (int32). Use as ``cache_indices``
+        for the conv1d/GDN kernels. Raises ``AttributeError`` if the model
+        does not use the SSM cache (programmer error: a layer should not
+        call this on a non-hybrid model)."""
+        return self.ssm_state_slot_per_seq[: self.ssm_state_slot_per_seq_cpu.shape[0]]
+
+    def get_has_initial_state_per_seq(self):
+        return self.has_initial_state_per_seq[: self.has_initial_state_per_seq_cpu.shape[0]]
+
+    def get_ssm_snapshot_write_slot_per_seq(self):
+        """Per-seq snapshot-pool slot id to write at end of forward (-1=skip).
+
+        Returns ``None`` when SSM cache is disabled or when there are no
+        rows to write (no enable_prefix_caching, no hybrid model). Layers
+        treat ``None`` as "no snapshotting to do".
+        """
+        if not self.use_ssm_cache:
+            return None
+        if not hasattr(self, "ssm_snapshot_write_slot_per_seq_cpu"):
+            return None
+        n = self.ssm_snapshot_write_slot_per_seq_cpu.shape[0]
+        return self.ssm_snapshot_write_slot_per_seq[:n]
 
     def _cal_block_table(self, seqs: List[Sequence]):
         block_tables_list = [seq.page_table for seq in seqs]
@@ -500,6 +636,18 @@ class InputData:
             # Pad decode_seq_lens for the dummy sequences so that MLA decode
             # kernels see a valid (non-zero) sequence length for every row.
             self.decode_seq_lens[len(self.seqs):len(self.seqs) + num_pad].fill_(1)
+
+        if self.use_ssm_cache:
+            # Padded rows write into the SSM dummy slot (slot 0) and report
+            # ``has_initial_state=False`` so the GDN kernels treat them as a
+            # fresh prefill that quietly writes scratch into a slot nobody
+            # else reads.
+            self.ssm_state_slot_per_seq[len(self.seqs):len(self.seqs) + num_pad].fill_(0)
+            self.has_initial_state_per_seq[len(self.seqs):len(self.seqs) + num_pad].fill_(False)
+            # Padded rows must never trigger a snapshot copy: -1 = skip.
+            self.ssm_snapshot_write_slot_per_seq[
+                len(self.seqs) : len(self.seqs) + num_pad
+            ].fill_(-1)
 
         return num_real_tokens
 

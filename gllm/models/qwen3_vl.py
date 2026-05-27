@@ -486,7 +486,19 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def __init__(self, config, language_model_type=Qwen3LLMForCausalLM):
         super().__init__()
-        quant_config = getattr(config, "quant_config", None)
+        # Read the vision tower's quant config from ``vision_config`` only.
+        # The top-level ``config.quantization_config`` is *not* used as a
+        # fallback on purpose: today's quantized VL checkpoints (e.g.
+        # Qwen3.5-MoE-FP8) put the FP8 field at the top level but ship a
+        # bf16 vision tower, so a top-level fallback would force FP8 init
+        # on a tower that has no FP8 scale tensors and crash weight load.
+        # A future fully-quantized VL checkpoint should opt-in by calling
+        # ``propagate_quantization_config(config, propagate_to=("text_config", "vision_config"))``
+        # in the model loader, which fills ``vision_config.quantization_config``
+        # and lets this read pick it up naturally. Mixed-precision (text
+        # FP8 + vision INT4, etc.) is also supported because the propagate
+        # helper never overwrites an explicit per-sub-config setting.
+        quant_config = getattr(config.vision_config, "quantization_config", None)
 
         self.config = config
 
@@ -549,16 +561,42 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             for idx in range(self.deepstack_num_level)
         }
 
-    def _set_deepstack_input_embeds(self, deepstack_input_embeds: torch.Tensor) -> None:
+    def _set_deepstack_input_embeds(
+        self,
+        deepstack_input_embeds: torch.Tensor,
+        offset: int = 0,
+    ) -> None:
+        """Write a chunk of deepstack residuals into the per-batch buffer.
+
+        ``deepstack_input_embeds`` is ``[L, N, hidden]`` and is copied into
+        rows ``[offset : offset + N]`` of the buffer (one row per token
+        in the *final batch layout*, i.e. ``hidden_states.size(0)``).
+
+        With prefix caching + chunked prefill, a single forward batch can
+        contain ``[decode_rows ‖ seq1_chunk ‖ seq2_chunk ‖ ...]`` where
+        each prefill seq only contributes the un-cached tail of its
+        prompt. The deepstack buffer must mirror that layout exactly,
+        otherwise rows produced by the embed-time vision merger get added
+        to the wrong tokens at every ``deepstack_visual_indexes`` layer
+        and the LM output degrades (silently — embed_tokens still
+        works, but the residual stream picks up bogus per-token visual
+        deltas). The caller (model runner) is responsible for zeroing
+        positions that no chunk will write to (decode rows, text-only
+        prefill chunks); see ``_clear_deepstack_input_embeds``.
+        """
         if not getattr(self, "deepstack_input_embeds", None):
             return
 
-        # set deepstack_input_embeds to buffer
         num_tokens = deepstack_input_embeds.size(1)
-        if num_tokens > self.deepstack_input_embeds[0].size(0):
+        end = offset + num_tokens
+        cur_len = self.deepstack_input_embeds[0].size(0)
+        if end > cur_len:
+            # Grow to at least ``end`` rows. We don't preserve the existing
+            # contents because the runner zeros the buffer before writing
+            # chunks anyway; a fresh ``zeros`` is cheaper than a copy.
             self.deepstack_input_embeds = [
                 torch.zeros(
-                    num_tokens,
+                    end,
                     self.config.text_config.hidden_size,
                     device=self.deepstack_input_embeds[0].device,
                     dtype=self.deepstack_input_embeds[0].dtype,
@@ -566,7 +604,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 for _ in range(self.deepstack_num_level)
             ]
         for idx in range(self.deepstack_num_level):
-            self.deepstack_input_embeds[idx][:num_tokens].copy_(
+            self.deepstack_input_embeds[idx][offset:end].copy_(
                 deepstack_input_embeds[idx]
             )
 
@@ -772,7 +810,28 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         is_multimodal: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return ``(inputs_embeds, deepstack_input_embeds_or_None)``.
+
+        ``deepstack_input_embeds`` is the full-prompt per-token deepstack
+        residual ``[deepstack_num_level, N, hidden]`` produced from the
+        ViT's multiscale features. Previously this was eagerly copied into
+        a shared model buffer here, but with prefix caching the caller
+        only feeds the *un-cached* tail (``prompt_embeddings[computed:seq_len]``)
+        to the model -- the eagerly-written buffer (sized to the full prompt
+        and starting at row 0) then mis-aligns with hidden_states by exactly
+        the prefix-hit length, and ``Qwen3LLMModel.forward`` adds the wrong
+        deepstack delta to every multimodal layer until the issue manifests
+        as garbage output (this was the root cause of the multimodal
+        prefix-cache regression that previously forced
+        ``--no-enable-prefix-caching``).
+
+        We now return the tensor to the caller, which slices it the same
+        way it slices ``inputs_embeds``, concatenates across the batch's
+        decode + per-seq prefill chunks, and writes the final layout into
+        the buffer via :meth:`_set_deepstack_input_embeds`. Text-only
+        prompts and non-deepstack models return ``None`` here.
+        """
         inputs_embeds = self._embed_text_input_ids(
             input_ids,
             self.language_model.embed_input_ids,
@@ -780,7 +839,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         )
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
+            return inputs_embeds, None
 
         if self.use_deepstack:
             (
@@ -800,10 +859,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             is_multimodal=is_multimodal,
         )
 
-        if deepstack_input_embeds is not None:
-            self._set_deepstack_input_embeds(deepstack_input_embeds)
-
-        return inputs_embeds
+        return inputs_embeds, deepstack_input_embeds
 
     def forward(
         self,

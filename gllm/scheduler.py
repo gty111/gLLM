@@ -196,11 +196,11 @@ class Scheduler:
         With the delta-broadcast (``gllm/dist_schedule.py``) the worker
         snapshots whatever state the followers actually need into a
         :class:`SchedulePayload` at send time, so we just hand back the
-        *real* ``Sequence`` objects -- no copy, no token_ids stripping,
-        no ``has_schedule`` toggling. The rank-0 paths that still read
-        from the returned list (``prepare_input`` for the local
-        ``InputData``, the deferred-output processing in
-        :class:`OverlapScheduler`) want the live ``Sequence`` anyway.
+        *real* ``Sequence`` objects -- no copy, no token_ids stripping.
+        The rank-0 paths that still read from the returned list
+        (``prepare_input`` for the local ``InputData``, the
+        deferred-output processing in :class:`OverlapScheduler`) want
+        the live ``Sequence`` anyway.
         """
         if (
             len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0
@@ -230,13 +230,65 @@ class Scheduler:
         prefill_batch: List[Sequence] = []
         unfinish_prefill_seqs = deque()
         prefill_batched_token_nums = 0
+        # Hybrid models (Qwen3.5 GDN) cap concurrency at the SSM working
+        # pool size; admitting more requests would assertion-crash inside
+        # ``IDAllocator.allocate``. ``ssm_segment`` is None for plain
+        # softmax-attn models, in which case the slot check below is a
+        # no-op.
+        ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
         while len(self.seqs_to_prefill) != 0 and prefill_token_budget != 0:
             seq = self.seqs_to_prefill.popleft()
+            # If this seq hasn't taken a working slot yet AND the pool is
+            # exhausted, put the request back on the wait queue and stop
+            # admitting fresh prefills this round. In-flight prefill seqs
+            # (those whose chunk continues this round) keep their slot.
+            if (
+                ssm_seg is not None
+                and seq.ssm_state_slot is None
+                and ssm_seg.num_free_working() == 0
+            ):
+                self.seqs_to_prefill.appendleft(seq)
+                break
             if (
                 isinstance(self.memory_manager, PrefixMemoryManager)
                 and seq.computed_token_num == 0
             ):
+                # For multimodal seqs the cache key MUST be built from
+                # content-derived pad ids before the lookup, otherwise
+                # two requests with different images but the same raw
+                # ``<|image_pad|>`` placeholders collide and the second
+                # request reuses the first's KV at the image span. This
+                # used to surface as "second image gets described as the
+                # first" and forced ``--no-enable-prefix-caching`` for
+                # VL deployments. ``_mm_precompute_hash`` is a no-op for
+                # text-only seqs and for non-VL models, and stashes the
+                # heavy image_processor output on the seq so the later
+                # ``_mm_prepare_cpu`` pass doesn't redo the work.
+                self.model_runner._mm_precompute_hash(seq)
                 self.memory_manager.pre_allocate_computed_page([seq])
+                # Full prompt cache hit (every page-aligned prefix matched).
+                # ``pre_allocate_computed_page`` would have bumped
+                # ``computed_token_num`` all the way up to ``len(seq)``,
+                # leaving zero tokens to forward. That short-circuits the
+                # batch builder into producing an empty ``tokens_cpu`` and
+                # crashing ``compute_logits`` on a size-0 hidden tensor.
+                # The KV cache only stores K/V, not the last-token hidden
+                # state we need to sample from, so we still have to run a
+                # 1-token forward. Roll back one token: keep all N cached
+                # pages in ``page_table`` (their KV is correct -- the
+                # prefix-cache hash match guarantees the last token is
+                # identical to the cached prompt), and let the loop below
+                # set ``to_compute_token_num = 1``. The 1-token forward is
+                # computationally a decode step; the idempotent K/V write
+                # to the last slot of the cached page is harmless.
+                if seq.computed_token_num >= len(seq):
+                    seq.computed_token_num = len(seq) - 1
+            # Hybrid models: every seq needs a per-request SSM working slot
+            # for the whole duration of the request (allocated lazily on
+            # the first schedule, freed when ``model_runner.free(seq)`` is
+            # called from ``process_output`` / ``check_abort_seqs`` /
+            # ``check_preempt``). No-op for non-hybrid models.
+            self.memory_manager.allocate_ssm_slot(seq)
             if len(seq) - seq.computed_token_num <= prefill_token_budget:
                 seq.to_compute_token_num = len(seq) - seq.computed_token_num
                 prefill_batched_token_nums += seq.to_compute_token_num

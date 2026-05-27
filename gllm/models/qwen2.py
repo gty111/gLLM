@@ -24,6 +24,7 @@ from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEm
 from gllm.modules.attention import Attention
 from gllm.utils import get_model_load_pbar
 
+from .utils import extract_rope_config
 from .weight_utils import (
     copy_gate_up_proj,
     copy_qkv_proj,
@@ -65,7 +66,9 @@ class Qwen2Attention(Attention):
             config.num_attention_heads, config.num_key_value_heads, config.hidden_size
         )
 
-        self.rope_theta = getattr(config, "rope_theta", 10000)
+        self.rope_theta, _rope_scaling_normalized = extract_rope_config(
+            config, default_theta=10000.0
+        )
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         quant_config = getattr(config, "quantization_config", None)
 
@@ -84,7 +87,7 @@ class Qwen2Attention(Attention):
             bias=False,
             quant_config=quant_config,
         )
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_scaling = _rope_scaling_normalized
         if rope_scaling is None:
             self.rotary_emb = RotaryEmbedding(
                 self.head_dim,
