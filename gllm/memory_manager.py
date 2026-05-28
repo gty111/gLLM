@@ -474,19 +474,79 @@ class MemoryManager:
 # ---------------------------------------------------------------------------
 
 
-def _default_cache_key_fn(seq: Sequence, n_tokens: int):
-    """Default per-page cache key: tuple of the first ``n_tokens`` token ids.
+# 64-bit nonzero seed for the chained prefix hash. Mixing a constant in
+# at chain start prevents the empty-prefix case from collapsing to 0
+# (which is the sentinel ``page2hash`` uses for "no hash registered").
+_PREFIX_HASH_SEED = 0x9E3779B97F4A7C15
+_PREFIX_CANARY_LEN = 8
 
-    The optional ``hash_token_ids`` on the sequence overrides ``token_ids``
-    when present. This is how Phase G.2 disambiguates multimodal prompts
-    that share placeholder token ids but reference different images: the
-    MM pipeline pre-renders ``hash_token_ids`` with content-derived
-    ``pad_id``s so the cache key naturally diverges across distinct images.
+
+def _hash_source(seq: Sequence) -> List[int]:
+    """Pick the token list used for prefix-cache hashing.
+
+    ``hash_token_ids`` (set by the multimodal pipeline) wins over the raw
+    ``token_ids`` so two VL prompts with the same ``<|image_pad|>``
+    placeholders but distinct images do not collide.
     """
-    src = seq.hash_token_ids if getattr(seq, "hash_token_ids", None) is not None else seq.token_ids
-    # Tuple-of-int is hashable; the segment also stores the first few ids
-    # verbatim for a collision-safety canary on lookup.
-    return tuple(src[:n_tokens])
+    hi = getattr(seq, "hash_token_ids", None)
+    return hi if hi is not None else seq.token_ids
+
+
+def _maybe_invalidate_seq_hash_cache(seq: Sequence, src: List[int]) -> None:
+    """Drop the per-seq incremental hash cache if its source list changed.
+
+    The hash source is normally stable for the lifetime of a request --
+    text-only seqs use ``token_ids`` (decode only appends past the cached
+    page boundaries) and VL seqs set ``hash_token_ids`` once before the
+    first ``pre_allocate_computed_page``. The check below is a cheap
+    safety net for the edge case where the MM pipeline rewrites
+    ``hash_token_ids`` after some pages have already been hashed.
+    """
+    ref = seq._hash_source_ref
+    if ref is None or ref != id(src):
+        seq._page_hashes = []
+        seq._canary_cache = None
+        seq._hash_source_ref = id(src)
+
+
+def _ensure_page_hash(seq: Sequence, page_size: int, page_idx: int) -> int:
+    """Return the chained hash for the first ``(page_idx+1)*page_size`` tokens.
+
+    Each new page mixes the previous chain hash with the tuple of token
+    ids in this page, so extending the chain by one page costs O(page_size)
+    instead of O(prefix_len). The chained hash is reproducible across
+    requests: any two seqs sharing identical first ``k*page_size`` tokens
+    produce identical ``_page_hashes[k-1]``.
+    """
+    src = _hash_source(seq)
+    _maybe_invalidate_seq_hash_cache(seq, src)
+    cache = seq._page_hashes
+    if page_idx < len(cache):
+        return cache[page_idx]
+    while len(cache) <= page_idx:
+        i = len(cache)
+        prev = cache[i - 1] if i > 0 else _PREFIX_HASH_SEED
+        page_tokens = tuple(src[i * page_size:(i + 1) * page_size])
+        cache.append(hash((prev, page_tokens)))
+    return cache[page_idx]
+
+
+def _ensure_canary(seq: Sequence) -> tuple:
+    """Return the first ``_PREFIX_CANARY_LEN`` ids as a tuple, cached on ``seq``.
+
+    Used as a hash-collision sanity check on lookups. Mirrors the original
+    ``key[:8]`` canary semantics, which were the first 8 ids of the
+    *prefix tuple* (and therefore identical for every page boundary of a
+    single seq), but built without rebuilding the full prefix tuple each
+    call.
+    """
+    src = _hash_source(seq)
+    _maybe_invalidate_seq_hash_cache(seq, src)
+    c = seq._canary_cache
+    if c is None:
+        c = tuple(src[:_PREFIX_CANARY_LEN])
+        seq._canary_cache = c
+    return c
 
 
 class PrefixMemoryManager(MemoryManager):
