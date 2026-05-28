@@ -393,7 +393,14 @@ class InputData:
         return max(query_lens), out
 
     def get_query_start_loc(self):
-        return self.query_start_loc[: self.query_start_loc_cpu.shape[0]]
+        view = self.query_start_loc[: self.query_start_loc_cpu.shape[0]]
+        # Attach a pinned-CPU mirror so downstream kernels (e.g. fla's
+        # ``prepare_chunk_indices``) can do the integer index math on the host
+        # without a ``cudaStreamSynchronize``. The mirror always lags the GPU
+        # tensor by 0 steps because they were filled in the same prepare-input
+        # phase from the same source values.
+        view._cpu_view = self.query_start_loc_cpu
+        return view
 
     def get_ssm_state_slot_per_seq(self):
         """Per-seq SSM working-slot ids (int32). Use as ``cache_indices``
