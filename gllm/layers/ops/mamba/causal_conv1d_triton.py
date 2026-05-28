@@ -499,11 +499,24 @@ def causal_conv1d_fn(
         assert (dim, width) == weight.shape
         assert is_channel_last, "Need to run in channel-last layout"
 
+    # Pre-compute ``max_seq_len`` once outside the grid lambda. Python's
+    # builtin ``max(tensor)`` iterates element-wise and triggers ``__bool__``
+    # on every comparison -- on a CPU int tensor of length B that's still
+    # ~B C/Python round-trips per launch, and profiling showed this dominated
+    # CPU time on long-prefill workloads (5k+ ``aten::item`` calls per run).
+    # ``Tensor.amax().item()`` reduces to a single C++ kernel + one host
+    # readback.
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        max_seq_len_int = int(seq_lens_cpu.amax().item())
+        batch_size_int = seq_lens_cpu.numel()
+    else:
+        max_seq_len_int = max(seq_lens_cpu)
+        batch_size_int = len(seq_lens_cpu)
+
     def grid(META):
-        max_seq_len = max(seq_lens_cpu)
         return (
-            len(seq_lens_cpu),  # batch_size
-            (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
+            batch_size_int,
+            (max_seq_len_int + META["BLOCK_M"] - 1) // META["BLOCK_M"],
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
