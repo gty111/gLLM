@@ -552,24 +552,22 @@ def _ensure_canary(seq: Sequence) -> tuple:
 class PrefixMemoryManager(MemoryManager):
     """KV-page-granular prefix cache with optional SSM snapshot integration.
 
-    The cache key is computed via a pluggable ``key_fn`` (default = token-id
-    prefix; overridable to splice multimodal content hashes into the key).
-    When the underlying ``MemoryManager`` was constructed with an SSM cache
-    config, every cached page also carries an optional SSM snapshot slot
-    that holds the conv+temporal state captured at that page boundary by
-    the GDN layer. A cache hit copies the snapshot back into the requesting
-    sequence's working slot before the new forward runs.
+    The cache key is the chained per-page hash built lazily on each
+    ``Sequence`` via ``_ensure_page_hash``: extending the chain by one page
+    is O(page_size) instead of O(prefix_len), which keeps long-context
+    prefill from spending most of its CPU in tuple/hash construction.
+    Multimodal disambiguation is preserved because the hash chain reads
+    from ``hash_token_ids`` (set by the MM pipeline) when present, falling
+    back to ``token_ids`` otherwise. When the underlying ``MemoryManager``
+    was constructed with an SSM cache config, every cached page also
+    carries an optional SSM snapshot slot that holds the conv+temporal
+    state captured at that page boundary by the GDN layer. A cache hit
+    copies the snapshot back into the requesting sequence's working slot
+    before the new forward runs.
     """
-
-    def __init__(self, *args, key_fn=_default_cache_key_fn, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._key_fn = key_fn
 
     def init(self, reserve_dummy_page: bool = False):
         super().init(segment_cls=PrefixSegment, reserve_dummy_page=reserve_dummy_page)
-        # Stash the configured key function on the segment so it can be used
-        # without round-tripping through the manager every call.
-        self.segment.key_fn = self._key_fn
         self.segment.ssm_segment = self.ssm_segment
 
         # Cache-hit-rate stats.
@@ -676,12 +674,11 @@ class PrefixSegment(Segment):
     """Paged KV segment with hash-keyed prefix cache and optional SSM
     snapshot pointers.
 
-    The cache key for a page is produced by ``self.key_fn(seq, n_tokens)``
-    (injected by :class:`PrefixMemoryManager` at ``init`` time). For pure
-    token-id models that returns the standard prefix tuple; for VL the
-    sequence's ``hash_token_ids`` view picks up unique content-derived ids
-    spliced into the placeholder positions, so identical-text+different-
-    image prompts no longer collide.
+    The cache key for a page is produced by the module-level
+    ``_ensure_page_hash(seq, page_size, page_idx)`` which incrementally
+    chains a per-page hash on the ``Sequence`` itself; for VL the
+    sequence's ``hash_token_ids`` view feeds the chain so identical-text +
+    different-image prompts no longer collide.
 
     Collision safety: ``hash2page`` maps Python's tuple-hash to a page; on
     lookup we additionally compare the canary (first 8 ids of the cached
@@ -697,14 +694,8 @@ class PrefixSegment(Segment):
     the requesting sequence's working slot.
     """
 
-    # These get set by :class:`PrefixMemoryManager.init`.
-    key_fn = staticmethod(_default_cache_key_fn)
+    # Set by :class:`PrefixMemoryManager.init`.
     ssm_segment: Optional[SSMSegment] = None
-
-    # Tunable: how many leading ids to keep in the canary. Big enough to
-    # make accidental collisions astronomically unlikely while still cheap
-    # to compare on every lookup.
-    _CANARY_LEN = 8
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -712,31 +703,23 @@ class PrefixSegment(Segment):
         self.page_ref_num = [0 for _ in range(self.num_pages)]
         self.page2hash: List[int] = [0 for _ in range(self.num_pages)]
         # Canary stored per physical page; tuples are kept short
-        # (``_CANARY_LEN``) to avoid blowing up memory at large num_pages.
+        # (``_PREFIX_CANARY_LEN``) to avoid blowing up memory at large num_pages.
         self.page2canary: List[Optional[tuple]] = [None for _ in range(self.num_pages)]
         # SSM snapshot slot id per physical page; ``None`` if no snapshot
         # was captured (e.g. when the SSM cache is disabled or the boundary
         # never had a chance to snapshot during prefill).
         self.page2ssm_snapshot: List[Optional[int]] = [None for _ in range(self.num_pages)]
 
-    # --- helpers ------------------------------------------------------------
-
-    def _canary(self, key: tuple) -> tuple:
-        return key[: self._CANARY_LEN]
-
-    def _key_for(self, seq: Sequence, n_tokens: int) -> tuple:
-        return self.key_fn(seq, n_tokens)
-
     # --- public API ---------------------------------------------------------
 
     def update(self, seq: Sequence, n_tokens: int, page_num: int) -> None:
         """Register a hash for ``page_num`` after its KV was filled in decode."""
-        key = self._key_for(seq, n_tokens)
-        page_hash = hash(key)
+        page_idx = n_tokens // self.page_size - 1
+        page_hash = _ensure_page_hash(seq, self.page_size, page_idx)
         if page_hash not in self.hash2page:
             self.page2hash[page_num] = page_hash
             self.hash2page[page_hash] = page_num
-            self.page2canary[page_num] = self._canary(key)
+            self.page2canary[page_num] = _ensure_canary(seq)
 
     def has_computed(self, seq: Sequence, n_tokens: int) -> Optional[int]:
         """Look up a cached page. Returns the page id or ``None`` on miss.
@@ -744,12 +727,12 @@ class PrefixSegment(Segment):
         Performs a canary equality check so two distinct prefixes that happen
         to share a Python ``hash()`` value never silently alias.
         """
-        key = self._key_for(seq, n_tokens)
-        page_hash = hash(key)
+        page_idx = n_tokens // self.page_size - 1
+        page_hash = _ensure_page_hash(seq, self.page_size, page_idx)
         page_num = self.hash2page.get(page_hash)
         if page_num is None:
             return None
-        if self.page2canary[page_num] != self._canary(key):
+        if self.page2canary[page_num] != _ensure_canary(seq):
             # Hash collision; treat as miss and let the caller allocate a
             # fresh page. We deliberately do not evict the cached page here
             # because the *other* prefix is the legitimate owner.
@@ -773,9 +756,9 @@ class PrefixSegment(Segment):
         page_hash = None
         key_canary: Optional[tuple] = None
         if seq is not None and n_tokens is not None:
-            key = self._key_for(seq, n_tokens)
-            page_hash = hash(key)
-            key_canary = self._canary(key)
+            page_idx = n_tokens // self.page_size - 1
+            page_hash = _ensure_page_hash(seq, self.page_size, page_idx)
+            key_canary = _ensure_canary(seq)
 
         page_num = self.id_allocator.allocate()
         # Re-mint: drop any prior hash entries that pointed at this physical
