@@ -312,13 +312,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         seg = input_data.memory_manager.ssm_segment
         if seg.conv_state_snap is None:
             return
-        # ``snap_targets`` and ``src_slots`` both have shape ``[num_seqs]``
-        # (no padding here — the InputData pads to ``num_real_seqs +
-        # num_pad`` and we mask -1 out below). Run the mask on-device so
-        # there's no CPU sync.
-        valid_mask = snap_targets >= 0
-        if not bool(valid_mask.any()):
-            return
+        # Host-side early-exit: the original ``bool(valid_mask.any())`` check
+        # forced one ``cudaStreamSynchronize`` per linear-attn layer per
+        # prefill step (18 layers × 32 prefill steps in the 16k/c8 profile
+        # contributed ~1.2s of host wait). The CPU mirror
+        # ``ssm_snapshot_write_slot_per_seq_cpu`` is already populated in
+        # ``InputData`` and lags the GPU tensor by 0 steps, so we can decide
+        # whether any target is non-negative without touching the GPU stream.
+        snap_cpu = getattr(
+            input_data, "ssm_snapshot_write_slot_per_seq_cpu", None
+        )
+        if snap_cpu is not None:
+            if int(snap_cpu.amax()) < 0:
+                return
+            valid_mask = snap_targets >= 0
+        else:
+            valid_mask = snap_targets >= 0
+            if not bool(valid_mask.any()):
+                return
         src_slots = input_data.get_ssm_state_slot_per_seq()
         valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(-1)
         src_idx = src_slots.index_select(0, valid_idx).to(torch.long)
