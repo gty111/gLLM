@@ -281,6 +281,14 @@ class Scheduler:
                 # set ``to_compute_token_num = 1``. The 1-token forward is
                 # computationally a decode step; the idempotent K/V write
                 # to the last slot of the cached page is harmless.
+                #
+                # NOTE: this single-token rollback is only correct for full
+                # attention. Hybrid/linear-attention (GDN) models cannot
+                # re-consume an already-absorbed token in their stateful
+                # recurrence, so ``restore_ssm_snapshot_on_hit`` has already
+                # rolled a whole page back for them above -- by here their
+                # ``computed_token_num`` is strictly ``< len(seq)`` and this
+                # branch is a no-op.
                 if seq.computed_token_num >= len(seq):
                     seq.computed_token_num = len(seq) - 1
             # Hybrid models: every seq needs a per-request SSM working slot

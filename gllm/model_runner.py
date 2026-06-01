@@ -1122,6 +1122,14 @@ class OverlapModelRunner(ModelRunner):
         self.forward_stream = self.overlap_runtime.forward_stream
         self.copy_stream = self.overlap_runtime.copy_stream
         super().init(mp_load_progress)
+        # Route hybrid (GDN/Mamba) prefix-cache snapshot restores onto
+        # ``forward_stream``. The snapshot WRITE runs inside the forward on
+        # this stream; the restore is issued later from the scheduler on the
+        # CPU thread (otherwise the default stream), so without sharing a
+        # stream the restore could read a snapshot the in-flight forward has
+        # not finished writing. Same-stream FIFO ordering closes that race.
+        if getattr(self.memory_manager, "ssm_segment", None) is not None:
+            self.memory_manager.ssm_segment.restore_stream = self.forward_stream
         self._init_overlap_buffers()
 
     def capture_graph(self, stream: Optional[torch.cuda.Stream] = None):

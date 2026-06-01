@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -138,6 +138,18 @@ class SSMSegment:
         self.dummy_working_slot: int = 0
         self.dummy_snapshot_slot: int = 0
 
+        # Optional CUDA stream that ``copy_state`` (the prefix-cache restore)
+        # must run on. Under overlap scheduling the snapshot WRITE happens
+        # inside the model forward on ``forward_stream``, while the restore is
+        # issued from the scheduler on the CPU thread (default stream). With no
+        # shared stream the restore could read a snapshot the in-flight forward
+        # has not finished writing. ``OverlapModelRunner`` sets this to
+        # ``forward_stream`` so the restore is FIFO-ordered after the forward's
+        # snapshot write (it is always enqueued after the forward launch).
+        # ``None`` (non-overlap) keeps the restore on the single default stream,
+        # where it is already serialized with the forward.
+        self.restore_stream: Optional["torch.cuda.Stream"] = None
+
     # --- working pool ---------------------------------------------------
 
     def allocate_working(self) -> int:
@@ -201,9 +213,22 @@ class SSMSegment:
         dst_conv, dst_temp = self._pool(dst_kind)
         if src_conv is None or dst_conv is None:
             return
-        for layer_id in range(self.cfg.num_layers):
-            dst_conv[layer_id][dst_slot].copy_(src_conv[layer_id][src_slot])
-            dst_temp[layer_id][dst_slot].copy_(src_temp[layer_id][src_slot])
+
+        def _do_copies():
+            for layer_id in range(self.cfg.num_layers):
+                dst_conv[layer_id][dst_slot].copy_(src_conv[layer_id][src_slot])
+                dst_temp[layer_id][dst_slot].copy_(src_temp[layer_id][src_slot])
+
+        # Pin the copies to ``restore_stream`` when set (overlap scheduling) so
+        # a restore that reads a snapshot written by the in-flight forward is
+        # ordered after that write. The restore is always enqueued after the
+        # forward launch on the CPU thread, so same-stream FIFO is sufficient
+        # -- no explicit event needed. ``None`` -> current (default) stream.
+        if self.restore_stream is not None:
+            with torch.cuda.stream(self.restore_stream):
+                _do_copies()
+        else:
+            _do_copies()
 
     def _pool(self, kind: str):
         if kind == "working":
@@ -318,6 +343,7 @@ class MemoryManager:
         self.max_snapshot_ssm_slots = max_snapshot_ssm_slots
         # Populated by :meth:`init`; ``None`` when the model is not hybrid.
         self.ssm_segment: Optional[SSMSegment] = None
+        self.segment: Union[Segment, PrefixSegment] = None
 
     @property
     def use_ssm_cache(self) -> bool:
@@ -620,49 +646,63 @@ class PrefixMemoryManager(MemoryManager):
         for seq in seqs:
             if seq.computed_token_num == 0:
                 continue
-            # Deepest cached page = last entry in ``page_table`` after
-            # ``pre_allocate_computed_page`` populated it from hits.
-            last_hit_page = seq.page_table[-1]
-            snap_slot = self.segment.page2ssm_snapshot[last_hit_page]
-            if snap_slot is None:
-                # Cached KV exists but no SSM snapshot for that boundary
-                # (e.g. the page boundary fell mid-FLA-chunk and was never
-                # snapshotted). In that case we cannot honor the SSM-cache
-                # hit without redoing the GDN compute; the safe fallback is
-                # to drop the KV hit too so attention sees the full prefix
-                # and starts from h_0=0. We do this by rolling back the
-                # logical state to before the SSM-less hit.
-                self._rollback_to_last_ssm_hit(seq)
-                continue
-            # Make sure the seq has a working slot to receive the snapshot.
-            self.allocate_ssm_slot(seq)
-            self.ssm_segment.copy_state(
-                "snapshot", snap_slot, "working", seq.ssm_state_slot
-            )
+            # Full prefix hit on a page-aligned prompt: every token is cached
+            # so ``computed_token_num == len(seq)``. ``schedule_prefill_batch``
+            # would otherwise roll a SINGLE token back to leave something to
+            # forward for the sampling logits. That 1-token rollback is only
+            # safe for full attention, whose per-token KV rewrite is
+            # idempotent. The GDN recurrence is stateful: the deepest snapshot
+            # is ``h_N`` (the recurrent state AFTER consuming all ``N`` tokens),
+            # and re-running the last token on top of it folds that token into
+            # the recurrence a SECOND time -> corrupted state -> wrong output.
+            # We therefore roll a whole page back here so the final page is
+            # recomputed as an ordinary prefill continuation seeded from the
+            # previous boundary snapshot ``h_{N-page_size}`` (or from
+            # ``h_0 = 0`` when the prompt is a single page). After this the
+            # generic 1-token rollback in the scheduler is a no-op because
+            # ``computed_token_num < len(seq)``.
+            if seq.computed_token_num >= len(seq):
+                seq.computed_token_num -= self.page_size
+                self.num_hit_pages -= 1
+            # ``computed_token_num`` is now a multiple of ``page_size`` = the
+            # cached-prefix length whose recurrent state we want to reuse.
+            # Restore from the deepest page boundary at/below it that carries a
+            # *filled* snapshot, peeling off (logically) any tail pages whose
+            # snapshot was never written -- the boundary fell mid-FLA-chunk, or
+            # the slot was only reserved.
+            #
+            # Crucially we NEVER free/pop the cached KV pages here. They stay in
+            # ``page_table`` and are simply recomputed in place by the upcoming
+            # forward (the prompt tokens are identical on a prefix-cache hit, so
+            # the full-attention KV rewrite is idempotent). Freeing a page would
+            # return its physical id to the allocator, and a sibling request in
+            # the same batch that also hit that page would then have it
+            # re-handed out by ``pre_allocate_page`` -> silent KV corruption.
+            while seq.computed_token_num > 0:
+                boundary_page = seq.page_table[
+                    seq.computed_token_num // self.page_size - 1
+                ]
+                snap_slot = self._valid_snapshot_slot(boundary_page)
+                if snap_slot is not None:
+                    # Make sure the seq has a working slot to receive the state.
+                    self.allocate_ssm_slot(seq)
+                    self.ssm_segment.copy_state(
+                        "snapshot", snap_slot, "working", seq.ssm_state_slot
+                    )
+                    break
+                seq.computed_token_num -= self.page_size
+                self.num_hit_pages -= 1
+            # If the loop drained ``computed_token_num`` to 0 there is no usable
+            # boundary anywhere: the scheduler allocates a fresh (zeroed)
+            # working slot and the seq recomputes the whole prompt from h_0 = 0.
 
-    def _rollback_to_last_ssm_hit(self, seq: Sequence) -> None:
-        """Drop tail KV hits that have no matching SSM snapshot."""
-        # Walk back from the deepest hit until we find a page that *does*
-        # have a snapshot (or until we hit page 0 = no hit at all). KV
-        # pages that we drop here are still ref-counted by the segment, so
-        # we have to release them.
-        while seq.page_table:
-            last_page = seq.page_table[-1]
-            if self.segment.page2ssm_snapshot[last_page] is not None:
-                # Found a usable boundary; restore SSM from it.
-                self.allocate_ssm_slot(seq)
-                self.ssm_segment.copy_state(
-                    "snapshot",
-                    self.segment.page2ssm_snapshot[last_page],
-                    "working",
-                    seq.ssm_state_slot,
-                )
-                return
-            self.segment.free(seq.page_table.pop())
-            seq.computed_token_num -= self.page_size
-            self.num_hit_pages -= 1
-        # No usable boundary anywhere; computed_token_num is now 0 and the
-        # sequence will be processed as a fresh prefill from h_0 = 0.
+    def _valid_snapshot_slot(self, page_num: int) -> Optional[int]:
+        """Return the snapshot slot for ``page_num`` only if it was actually
+        *written* (filled), else ``None``. A reserved-but-unfilled slot holds
+        zeros and must never be restored onto a non-empty prefix."""
+        if not self.segment.page2ssm_snapshot_valid[page_num]:
+            return None
+        return self.segment.page2ssm_snapshot[page_num]
 
     def get_cache_hit_rate(self):
         if self.num_allocated_pages == 0:
@@ -709,6 +749,16 @@ class PrefixSegment(Segment):
         # was captured (e.g. when the SSM cache is disabled or the boundary
         # never had a chance to snapshot during prefill).
         self.page2ssm_snapshot: List[Optional[int]] = [None for _ in range(self.num_pages)]
+        # Whether the reserved snapshot slot actually holds a *written*
+        # recurrent state yet. A slot is reserved at ``allocate`` time for
+        # every cacheable page, but the GDN layer only writes the snapshot
+        # for the page boundary on which a prefill chunk *ends* (see
+        # ``InputData._cal_ssm_metadata``). Interior boundaries crossed inside
+        # a single chunk keep their reserved-but-zeroed slot, so a hit there
+        # must NOT restore it (restoring zeros == h_0 grafted onto a non-zero
+        # prefix -> garbage). ``page2ssm_snapshot_valid`` separates "reserved"
+        # from "filled" so the restore/rollback paths only trust real states.
+        self.page2ssm_snapshot_valid: List[bool] = [False for _ in range(self.num_pages)]
 
     # --- public API ---------------------------------------------------------
 
@@ -779,10 +829,13 @@ class PrefixSegment(Segment):
             # cannot honor the SSM half).
             if self.ssm_segment is not None:
                 self.page2ssm_snapshot[page_num] = self.ssm_segment.allocate_snapshot()
+                # Freshly reserved slot holds no written state yet.
+                self.page2ssm_snapshot_valid[page_num] = False
         else:
             self.page2hash[page_num] = 0
             self.page2canary[page_num] = None
             self.page2ssm_snapshot[page_num] = None
+            self.page2ssm_snapshot_valid[page_num] = False
 
         self.page_ref_num[page_num] += 1
         return page_num
@@ -808,3 +861,4 @@ class PrefixSegment(Segment):
         if snap_slot is not None:
             self.ssm_segment.free_snapshot(snap_slot)
             self.page2ssm_snapshot[page_num] = None
+        self.page2ssm_snapshot_valid[page_num] = False

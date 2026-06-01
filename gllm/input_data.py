@@ -181,9 +181,19 @@ class InputData:
             page_idx = (end_tokens // page_size) - 1
             if page_idx < 0 or page_idx >= len(seq.page_table):
                 continue
-            snap_slot = page2snap[seq.page_table[page_idx]]
+            page_num = seq.page_table[page_idx]
+            snap_slot = page2snap[page_num]
             if snap_slot is not None:
                 snap_targets[i] = snap_slot
+                # This forward WILL write the recurrent state for ``page_num``
+                # into ``snap_slot`` (see ``Qwen3_5GatedDeltaNet.
+                # _maybe_snapshot_state``). Mark the boundary as carrying a
+                # real snapshot so later prefix-cache hits may restore it.
+                # CPU bookkeeping is safe even under overlap scheduling: every
+                # SSM read/write is serialized on the GPU stream, so the
+                # restore copy for any future request is necessarily enqueued
+                # after this write completes.
+                segment.page2ssm_snapshot_valid[page_num] = True
 
         self.ssm_state_slot_per_seq_cpu = torch.from_numpy(slots).pin_memory()
         self.has_initial_state_per_seq_cpu = torch.from_numpy(has_init).pin_memory()

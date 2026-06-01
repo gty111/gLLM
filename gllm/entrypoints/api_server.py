@@ -263,7 +263,7 @@ if __name__ == "__main__":
         "--maxd",
         type=int,
         help="Maximum decode token count per batch (Token Throttling)",
-        default=2048,
+        default=512,
     )
     parser.add_argument(
         "--maxp",
