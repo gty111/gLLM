@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -318,6 +318,7 @@ class MemoryManager:
         self.max_snapshot_ssm_slots = max_snapshot_ssm_slots
         # Populated by :meth:`init`; ``None`` when the model is not hybrid.
         self.ssm_segment: Optional[SSMSegment] = None
+        self.segment: Union[Segment, PrefixSegment] = None
 
     @property
     def use_ssm_cache(self) -> bool:
@@ -620,18 +621,41 @@ class PrefixMemoryManager(MemoryManager):
         for seq in seqs:
             if seq.computed_token_num == 0:
                 continue
+            # Full prefix hit on a page-aligned prompt: every token is cached
+            # so ``computed_token_num == len(seq)``. ``schedule_prefill_batch``
+            # would otherwise roll a SINGLE token back to leave something to
+            # forward for the sampling logits. That 1-token rollback is only
+            # safe for full attention, whose per-token KV rewrite is
+            # idempotent. The GDN recurrence is stateful: the deepest snapshot
+            # is ``h_N`` (the recurrent state AFTER consuming all ``N`` tokens),
+            # and re-running the last token on top of it folds that token into
+            # the recurrence a SECOND time -> corrupted state -> wrong output.
+            # We therefore roll a whole page back here so the final page is
+            # recomputed as an ordinary prefill continuation seeded from the
+            # previous boundary snapshot ``h_{N-page_size}`` (or from
+            # ``h_0 = 0`` when the prompt is a single page). After this the
+            # generic 1-token rollback in the scheduler is a no-op because
+            # ``computed_token_num < len(seq)``.
+            if seq.computed_token_num >= len(seq):
+                self.segment.free(seq.page_table.pop())
+                seq.computed_token_num -= self.page_size
+                self.num_hit_pages -= 1
+                if seq.computed_token_num == 0 or not seq.page_table:
+                    # Nothing left to restore; the scheduler allocates a fresh
+                    # (zeroed) working slot and the seq recomputes from h_0 = 0.
+                    continue
             # Deepest cached page = last entry in ``page_table`` after
             # ``pre_allocate_computed_page`` populated it from hits.
             last_hit_page = seq.page_table[-1]
-            snap_slot = self.segment.page2ssm_snapshot[last_hit_page]
+            snap_slot = self._valid_snapshot_slot(last_hit_page)
             if snap_slot is None:
-                # Cached KV exists but no SSM snapshot for that boundary
-                # (e.g. the page boundary fell mid-FLA-chunk and was never
-                # snapshotted). In that case we cannot honor the SSM-cache
-                # hit without redoing the GDN compute; the safe fallback is
-                # to drop the KV hit too so attention sees the full prefix
-                # and starts from h_0=0. We do this by rolling back the
-                # logical state to before the SSM-less hit.
+                # Cached KV exists but no *filled* SSM snapshot for that
+                # boundary -- either the boundary fell mid-FLA-chunk and was
+                # never written, or its slot was only reserved. We cannot
+                # honor the SSM-cache hit without redoing the GDN compute, so
+                # the safe fallback is to drop the KV hit too: roll the logical
+                # state back to the deepest boundary that *does* have a real
+                # snapshot (or to h_0=0 if none).
                 self._rollback_to_last_ssm_hit(seq)
                 continue
             # Make sure the seq has a working slot to receive the snapshot.
@@ -640,20 +664,29 @@ class PrefixMemoryManager(MemoryManager):
                 "snapshot", snap_slot, "working", seq.ssm_state_slot
             )
 
+    def _valid_snapshot_slot(self, page_num: int) -> Optional[int]:
+        """Return the snapshot slot for ``page_num`` only if it was actually
+        *written* (filled), else ``None``. A reserved-but-unfilled slot holds
+        zeros and must never be restored onto a non-empty prefix."""
+        if not self.segment.page2ssm_snapshot_valid[page_num]:
+            return None
+        return self.segment.page2ssm_snapshot[page_num]
+
     def _rollback_to_last_ssm_hit(self, seq: Sequence) -> None:
-        """Drop tail KV hits that have no matching SSM snapshot."""
-        # Walk back from the deepest hit until we find a page that *does*
-        # have a snapshot (or until we hit page 0 = no hit at all). KV
-        # pages that we drop here are still ref-counted by the segment, so
+        """Drop tail KV hits that have no *filled* SSM snapshot."""
+        # Walk back from the deepest hit until we find a page that has a real
+        # (written) snapshot (or until ``page_table`` is empty = no hit at
+        # all). KV pages we drop here are still ref-counted by the segment, so
         # we have to release them.
         while seq.page_table:
             last_page = seq.page_table[-1]
-            if self.segment.page2ssm_snapshot[last_page] is not None:
+            snap_slot = self._valid_snapshot_slot(last_page)
+            if snap_slot is not None:
                 # Found a usable boundary; restore SSM from it.
                 self.allocate_ssm_slot(seq)
                 self.ssm_segment.copy_state(
                     "snapshot",
-                    self.segment.page2ssm_snapshot[last_page],
+                    snap_slot,
                     "working",
                     seq.ssm_state_slot,
                 )
@@ -709,6 +742,16 @@ class PrefixSegment(Segment):
         # was captured (e.g. when the SSM cache is disabled or the boundary
         # never had a chance to snapshot during prefill).
         self.page2ssm_snapshot: List[Optional[int]] = [None for _ in range(self.num_pages)]
+        # Whether the reserved snapshot slot actually holds a *written*
+        # recurrent state yet. A slot is reserved at ``allocate`` time for
+        # every cacheable page, but the GDN layer only writes the snapshot
+        # for the page boundary on which a prefill chunk *ends* (see
+        # ``InputData._cal_ssm_metadata``). Interior boundaries crossed inside
+        # a single chunk keep their reserved-but-zeroed slot, so a hit there
+        # must NOT restore it (restoring zeros == h_0 grafted onto a non-zero
+        # prefix -> garbage). ``page2ssm_snapshot_valid`` separates "reserved"
+        # from "filled" so the restore/rollback paths only trust real states.
+        self.page2ssm_snapshot_valid: List[bool] = [False for _ in range(self.num_pages)]
 
     # --- public API ---------------------------------------------------------
 
@@ -779,10 +822,13 @@ class PrefixSegment(Segment):
             # cannot honor the SSM half).
             if self.ssm_segment is not None:
                 self.page2ssm_snapshot[page_num] = self.ssm_segment.allocate_snapshot()
+                # Freshly reserved slot holds no written state yet.
+                self.page2ssm_snapshot_valid[page_num] = False
         else:
             self.page2hash[page_num] = 0
             self.page2canary[page_num] = None
             self.page2ssm_snapshot[page_num] = None
+            self.page2ssm_snapshot_valid[page_num] = False
 
         self.page_ref_num[page_num] += 1
         return page_num
@@ -808,3 +854,4 @@ class PrefixSegment(Segment):
         if snap_slot is not None:
             self.ssm_segment.free_snapshot(snap_slot)
             self.page2ssm_snapshot[page_num] = None
+        self.page2ssm_snapshot_valid[page_num] = False

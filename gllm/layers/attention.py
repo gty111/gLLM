@@ -74,8 +74,11 @@ class FlashAttention:
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, input_data: InputData
     ):
-        # profile run
-        if not hasattr(input_data.memory_manager, "segment"):
+        # profile run: the KV segment is only built in ``MemoryManager.init``
+        # (after the profiling forward). Guard on ``is None`` rather than
+        # ``hasattr`` so the check still fires now that ``segment`` is declared
+        # as a ``None`` attribute in ``MemoryManager.__init__``.
+        if getattr(input_data.memory_manager, "segment", None) is None:
             return q
 
         q = q.view(-1, self.num_heads, self.head_dim)
@@ -439,8 +442,9 @@ class MLAAttention:
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
 
-        # profile run
-        if not hasattr(input_data.memory_manager, "segment"):
+        # profile run (see FlashAttention.forward): guard on ``is None`` so the
+        # check survives ``segment`` being a declared ``None`` attribute.
+        if getattr(input_data.memory_manager, "segment", None) is None:
             self.process_weights()
             return output
 

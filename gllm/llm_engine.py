@@ -35,7 +35,15 @@ class LLM:
         load_format: str = "auto",
         gpu_memory_util=0.9,
         page_size=16,
-        maxd=2048,
+        # ``maxd`` caps the number of concurrently running (decode) sequences,
+        # which also sizes ``max_running_seqs`` and -- for hybrid GDN/Mamba
+        # models -- the SSM working pool (``maxd`` slots) plus the prefix-cache
+        # snapshot pool (``4*maxd`` slots, each holding the full per-layer
+        # recurrent state). The previous default of 2048 made those pools tens
+        # of GiB on linear-attention models and OOM'd before the KV cache was
+        # even allocated. 256 matches the common ``max_num_seqs`` default and
+        # keeps the pools to a sane size; override for very high concurrency.
+        maxd=256,
         maxp=2048,
         minp=32,
         iterp=8,
