@@ -226,9 +226,60 @@ class Scheduler:
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
 
+    def _rewind_full_hit_for_ssm(self, seq: Sequence) -> None:
+        """Rewind a full prefix-cache hit to a safe SSM snapshot boundary.
+
+        For full-attention-only models we can roll back a full hit by one token
+        and re-run that token to recover the last hidden state used for
+        sampling. Hybrid SSM models cannot do that safely: the recurrent state
+        restored on hit is already the state *after* the full prompt, so
+        re-running one more token would advance the recurrence one extra step.
+
+        Instead, rewind ``computed_token_num`` to the nearest page boundary <=
+        ``prompt_len - 1`` that has an SSM snapshot, restore that snapshot into
+        the working slot, and let prefill recompute the tail.
+        """
+        ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
+        if ssm_seg is None:
+            return
+
+        segment = getattr(self.memory_manager, "segment", None)
+        page2snap = getattr(segment, "page2ssm_snapshot", None)
+        if page2snap is None:
+            return
+
+        prompt_len = len(seq)
+        target_boundary = (max(prompt_len - 1, 0) // self.page_size) * self.page_size
+
+        # Walk backward in page units until we find a boundary with a snapshot.
+        while target_boundary > 0:
+            page_idx = target_boundary // self.page_size - 1
+            if 0 <= page_idx < len(seq.page_table):
+                page_num = seq.page_table[page_idx]
+                snap_slot = page2snap[page_num]
+                if snap_slot is not None:
+                    self.memory_manager.allocate_ssm_slot(seq)
+                    ssm_seg.copy_state(
+                        "snapshot",
+                        snap_slot,
+                        "working",
+                        seq.ssm_state_slot,
+                    )
+                    seq.computed_token_num = target_boundary
+                    return
+            target_boundary -= self.page_size
+
+        # No usable boundary snapshot; recompute prompt from h_0.
+        self.memory_manager.free_ssm_slot(seq)
+        seq.computed_token_num = 0
+
     def schedule_prefill_batch(self, prefill_token_budget):
         prefill_batch: List[Sequence] = []
         unfinish_prefill_seqs = deque()
+        # Encoder-disaggregation overlap (design §6.2): seqs whose next chunk is
+        # entirely blocked behind a not-yet-ready image span are parked here and
+        # re-queued after this round (no slot/page allocation, no ordering loss).
+        deferred_disagg_seqs: List[Sequence] = []
         prefill_batched_token_nums = 0
         # Hybrid models (Qwen3.5 GDN) cap concurrency at the SSM working
         # pool size; admitting more requests would assertion-crash inside
@@ -285,20 +336,36 @@ class Scheduler:
                 # NOTE: this single-token rollback is only correct for full
                 # attention. Hybrid/linear-attention (GDN) models cannot
                 # re-consume an already-absorbed token in their stateful
-                # recurrence, so ``restore_ssm_snapshot_on_hit`` has already
-                # rolled a whole page back for them above -- by here their
-                # ``computed_token_num`` is strictly ``< len(seq)`` and this
-                # branch is a no-op.
+                # recurrence, so a page-boundary rewind + tail recompute
+                # (``_rewind_full_hit_for_ssm``) is used for them instead.
                 if seq.computed_token_num >= len(seq):
-                    seq.computed_token_num = len(seq) - 1
+                    if getattr(self.memory_manager, "ssm_segment", None) is not None:
+                        self._rewind_full_hit_for_ssm(seq)
+                    else:
+                        seq.computed_token_num = len(seq) - 1
+            # Encoder-disaggregation overlap gate B (design §6.2): a disagg seq
+            # may only prefill up to the first image span whose embedding hasn't
+            # landed yet (positions are known -- gate A -- but the visual data
+            # isn't visible). ``disagg_prefill_limit`` returns ``None`` for
+            # monolith / non-disagg seqs (no cap) and is evaluated *after* the
+            # prefix-cache pre-allocate above so cache-hit spans don't block.
+            gate_limit = self.model_runner.disagg_prefill_limit(seq)
+            if gate_limit is not None and gate_limit <= seq.computed_token_num:
+                # Nothing prefillable this round; park and re-queue. No SSM slot
+                # / page allocation so freeing stays simple if it never runs.
+                deferred_disagg_seqs.append(seq)
+                continue
+            prefill_avail = len(seq) - seq.computed_token_num
+            if gate_limit is not None:
+                prefill_avail = min(prefill_avail, gate_limit - seq.computed_token_num)
             # Hybrid models: every seq needs a per-request SSM working slot
             # for the whole duration of the request (allocated lazily on
             # the first schedule, freed when ``model_runner.free(seq)`` is
             # called from ``process_output`` / ``check_abort_seqs`` /
             # ``check_preempt``). No-op for non-hybrid models.
             self.memory_manager.allocate_ssm_slot(seq)
-            if len(seq) - seq.computed_token_num <= prefill_token_budget:
-                seq.to_compute_token_num = len(seq) - seq.computed_token_num
+            if prefill_avail <= prefill_token_budget:
+                seq.to_compute_token_num = prefill_avail
                 prefill_batched_token_nums += seq.to_compute_token_num
                 prefill_token_budget -= seq.to_compute_token_num
             else:
@@ -313,6 +380,10 @@ class Scheduler:
                 unfinish_prefill_seqs.appendleft(seq_new)
 
         self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
+        # Re-queue gate-B-blocked disagg seqs (preserving their relative order)
+        # for a future round once their embeddings land.
+        for seq in reversed(deferred_disagg_seqs):
+            self.seqs_to_prefill.appendleft(seq)
         return prefill_batch, prefill_batched_token_nums
 
     def schedule_decode_batch(self, decode_token_budget):

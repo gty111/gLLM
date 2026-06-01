@@ -1,0 +1,460 @@
+"""Dynamic discovery for encoder disaggregation (design §7.3).
+
+The Encoder and LM servers are fully decoupled processes: neither knows the
+other's address at launch. They find each other through a shared *registry*
+(the ``--discovery-endpoint``) onto which each ``publish``-es its own NIXL agent
+metadata + ZMQ control address + a ``processor_config_hash``, and from which
+each ``watch``-es the peer role. Watch events (ADD / UPDATE / REMOVE) drive the
+runtime NIXL handshake and teardown, so:
+
+  * either side may start first (publish + watch are symmetric);
+  * killing an encoder lets its lease expire -> peers get REMOVE and drop it;
+  * a restarted encoder re-publishes -> peers get ADD and reconnect;
+  * a processor-config mismatch is rejected at connect time (§5.4.4).
+
+This module provides the ``Discovery`` abstraction and two backends:
+
+  * :class:`NetworkDiscovery` (**default**) -- talks to a standalone
+    :class:`DiscoveryServer` over ZMQ DEALER/ROUTER (TCP). Pure network, no
+    shared filesystem. This is the etcd stand-in for single-/cross-node bring
+    up without an etcd dependency.
+  * :class:`FileDiscovery` -- a shared-directory fallback (mtime lease), kept
+    behind the same interface for offline/no-network debugging.
+
+Lease semantics: a publisher renews every ``ttl_ms/3``; a member whose lease is
+not renewed within ``ttl_ms`` is reaped and surfaces as a REMOVE on the next
+``poll_events``.
+"""
+
+from __future__ import annotations
+
+import base64
+import glob
+import json
+import os
+import socket
+import threading
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+import zmq
+from logger import logger
+
+
+# ----------------------------------------------------------------------------
+# Events + peer payload
+# ----------------------------------------------------------------------------
+@dataclass
+class Event:
+    """A change observed by ``poll_events`` for a watched role."""
+
+    kind: str  # "ADD" | "UPDATE" | "REMOVE"
+    identity: str
+    payload: dict
+
+
+def make_payload(
+    *,
+    role: str,
+    agent_name: str,
+    nixl_meta: bytes,
+    zmq_addr: str,
+    feat_dim: int = 0,
+    processor_config_hash: str = "",
+    extra: Optional[dict] = None,
+) -> dict:
+    """Build the discovery payload dict published for a role member."""
+    return {
+        "role": role,
+        "agent_name": agent_name,
+        "nixl_meta_b64": base64.b64encode(nixl_meta).decode(),
+        "zmq_addr": zmq_addr,
+        "feat_dim": int(feat_dim),
+        "processor_config_hash": processor_config_hash,
+        "extra": extra or {},
+    }
+
+
+def payload_nixl_meta(payload: dict) -> bytes:
+    return base64.b64decode(payload["nixl_meta_b64"])
+
+
+def _now_ms() -> float:
+    return time.monotonic() * 1000.0
+
+
+def _normalize_tcp(endpoint: str) -> str:
+    """Accept ``host:port`` or ``tcp://host:port`` and return a ZMQ tcp URL."""
+    if "://" in endpoint:
+        return endpoint
+    return f"tcp://{endpoint}"
+
+
+def _endpoint_host(endpoint: str) -> str:
+    """Extract the host part from ``host:port`` / ``tcp://host:port``."""
+    hostport = _normalize_tcp(endpoint).split("://", 1)[-1]
+    return hostport.rsplit(":", 1)[0] if ":" in hostport else hostport
+
+
+def resolve_advertise_host(advertise: Optional[str], reference_endpoint: str = "") -> str:
+    """Resolve the address peers should connect back to (multi-node safe).
+
+    A peer publishes a ZMQ control address built from this host; cross-node
+    peers must therefore receive a *routable* IP, never ``127.0.0.1``. When
+    ``advertise`` is ``"auto"`` / empty we detect the local egress IP toward the
+    discovery server's host (the interface on the same network the registry is
+    reached on), so the advertised address is reachable by every other member.
+    A literal value is returned as-is (operator override). Falls back to
+    loopback only if detection fails (single-node dev).
+    """
+    if advertise and advertise != "auto":
+        return advertise
+    target = _endpoint_host(reference_endpoint) or "8.8.8.8"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # No packets are sent for a UDP "connect"; it just selects the egress
+        # interface whose source IP we then read back.
+        s.connect((target, 9))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+# ----------------------------------------------------------------------------
+# Registry server (standalone process; etcd stand-in)
+# ----------------------------------------------------------------------------
+class DiscoveryServer:
+    """In-memory, lease-based registry served over a ZMQ ROUTER socket.
+
+    Single-threaded request loop; every op is idempotent so DEALER clients can
+    safely resend on timeout. State is ``identity -> {role, payload,
+    expire_at}``; expired members are reaped lazily on ``list`` + periodically.
+    """
+
+    def __init__(self, bind: str, *, ctx: Optional[zmq.Context] = None):
+        self.bind_url = _normalize_tcp(bind)
+        self.ctx = ctx or zmq.Context.instance()
+        self.sock = self.ctx.socket(zmq.ROUTER)
+        self.sock.bind(self.bind_url)
+        self._members: Dict[str, dict] = {}
+        self._stop = False
+
+    def _reap(self) -> None:
+        now = _now_ms()
+        dead = [i for i, m in self._members.items() if m["expire_at"] < now]
+        for i in dead:
+            m = self._members.pop(i)
+            logger.info(f"[discovery-server] lease expired: {m['role']}/{i}")
+
+    def _handle(self, msg: dict) -> dict:
+        op = msg.get("op")
+        if op == "register":
+            self._members[msg["identity"]] = {
+                "role": msg["role"],
+                "payload": msg["payload"],
+                "expire_at": _now_ms() + float(msg.get("ttl_ms", 10000)),
+            }
+            logger.info(
+                f"[discovery-server] register {msg['role']}/{msg['identity']}"
+            )
+            return {"ok": True}
+        if op == "renew":
+            m = self._members.get(msg["identity"])
+            if m is None:
+                return {"ok": True, "known": False}
+            m["expire_at"] = _now_ms() + float(msg.get("ttl_ms", 10000))
+            return {"ok": True, "known": True}
+        if op == "revoke":
+            m = self._members.pop(msg["identity"], None)
+            if m is not None:
+                logger.info(
+                    f"[discovery-server] revoke {m['role']}/{msg['identity']}"
+                )
+            return {"ok": True}
+        if op == "list":
+            self._reap()
+            role = msg.get("role")
+            members = [
+                {"identity": i, "payload": m["payload"]}
+                for i, m in self._members.items()
+                if role is None or m["role"] == role
+            ]
+            return {"ok": True, "members": members}
+        return {"ok": False, "error": f"unknown op {op!r}"}
+
+    def serve_forever(self) -> None:
+        poller = zmq.Poller()
+        poller.register(self.sock, zmq.POLLIN)
+        logger.info(f"[discovery-server] serving at {self.bind_url}")
+        last_reap = _now_ms()
+        while not self._stop:
+            socks = dict(poller.poll(timeout=1000))
+            if self.sock in socks:
+                while True:
+                    try:
+                        frames = self.sock.recv_multipart(flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                    sender, raw = frames[0], frames[-1]
+                    try:
+                        reply = self._handle(json.loads(raw.decode()))
+                    except Exception as e:  # pragma: no cover - guard
+                        reply = {"ok": False, "error": str(e)}
+                    self.sock.send_multipart([sender, json.dumps(reply).encode()])
+            if _now_ms() - last_reap > 2000:
+                self._reap()
+                last_reap = _now_ms()
+
+    def stop(self) -> None:
+        self._stop = True
+
+
+# ----------------------------------------------------------------------------
+# Network client
+# ----------------------------------------------------------------------------
+class NetworkDiscovery:
+    """Client to a :class:`DiscoveryServer`. Publish + heartbeat + watch."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        ttl_ms: int = 10000,
+        rpc_timeout_ms: int = 3000,
+        ctx: Optional[zmq.Context] = None,
+    ):
+        self.endpoint = _normalize_tcp(endpoint)
+        self.ttl_ms = ttl_ms
+        self.rpc_timeout_ms = rpc_timeout_ms
+        self.ctx = ctx or zmq.Context.instance()
+        self._ctrl_lock = threading.Lock()
+        self._ctrl = self._new_sock()
+        self._identity: Optional[str] = None
+        self._role: Optional[str] = None
+        self._payload: Optional[dict] = None
+        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_stop = threading.Event()
+        # role -> {identity: payload} snapshot for event diffing.
+        self._seen: Dict[str, Dict[str, dict]] = {}
+
+    # -- low level ----------------------------------------------------------
+    def _new_sock(self) -> zmq.Socket:
+        s = self.ctx.socket(zmq.DEALER)
+        s.setsockopt(zmq.LINGER, 0)
+        s.connect(self.endpoint)
+        return s
+
+    def _do_rpc(self, sock: zmq.Socket, msg: dict, retries: int = 5):
+        """Send ``msg`` and await a reply, reopening the socket on timeout.
+
+        Returns ``(sock, reply)`` because the socket may be replaced. All ops
+        are idempotent, so a resend after timeout is safe.
+        """
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        for _ in range(retries):
+            sock.send(json.dumps(msg).encode())
+            if dict(poller.poll(timeout=self.rpc_timeout_ms)).get(sock):
+                return sock, json.loads(sock.recv().decode())
+            # Timed out: drop the stuck socket and retry on a fresh one.
+            poller.unregister(sock)
+            sock.close(0)
+            sock = self._new_sock()
+            poller.register(sock, zmq.POLLIN)
+        raise TimeoutError(
+            f"discovery RPC '{msg.get('op')}' timed out against {self.endpoint}"
+        )
+
+    def _ctrl_rpc(self, msg: dict) -> dict:
+        with self._ctrl_lock:
+            self._ctrl, reply = self._do_rpc(self._ctrl, msg)
+            return reply
+
+    # -- publish / heartbeat ------------------------------------------------
+    def publish(
+        self, role: str, identity: str, payload: dict, ttl_ms: Optional[int] = None
+    ) -> None:
+        ttl = int(ttl_ms or self.ttl_ms)
+        self._role, self._identity, self._payload = role, identity, payload
+        self._ctrl_rpc(
+            {
+                "op": "register",
+                "role": role,
+                "identity": identity,
+                "payload": payload,
+                "ttl_ms": ttl,
+            }
+        )
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat, args=(ttl,), name="disc-heartbeat", daemon=True
+        )
+        self._hb_thread.start()
+        logger.info(
+            f"[discovery] published {role}/{identity} -> {self.endpoint} (ttl={ttl}ms)"
+        )
+
+    def _heartbeat(self, ttl_ms: int) -> None:
+        sock = self._new_sock()
+        interval = max(0.5, ttl_ms / 3000.0)
+        while not self._hb_stop.wait(interval):
+            try:
+                sock, reply = self._do_rpc(
+                    sock, {"op": "renew", "identity": self._identity, "ttl_ms": ttl_ms}
+                )
+                if reply and not reply.get("known", True):
+                    # Registry restarted / lease lost -> re-register ourselves.
+                    sock, _ = self._do_rpc(
+                        sock,
+                        {
+                            "op": "register",
+                            "role": self._role,
+                            "identity": self._identity,
+                            "payload": self._payload,
+                            "ttl_ms": ttl_ms,
+                        },
+                    )
+            except Exception as e:  # pragma: no cover - operational
+                logger.warning(f"[discovery] heartbeat renew failed: {e}")
+        sock.close(0)
+
+    # -- watch --------------------------------------------------------------
+    def list(self, role: str) -> List[dict]:
+        reply = self._ctrl_rpc({"op": "list", "role": role})
+        return reply.get("members", [])
+
+    def poll_events(self, role: str) -> List[Event]:
+        members = {m["identity"]: m["payload"] for m in self.list(role)}
+        prev = self._seen.get(role, {})
+        events: List[Event] = []
+        for ident, payload in members.items():
+            if ident not in prev:
+                events.append(Event("ADD", ident, payload))
+            elif payload != prev[ident]:
+                events.append(Event("UPDATE", ident, payload))
+        for ident, payload in prev.items():
+            if ident not in members:
+                events.append(Event("REMOVE", ident, payload))
+        self._seen[role] = members
+        return events
+
+    # -- teardown -----------------------------------------------------------
+    def revoke(self) -> None:
+        self._hb_stop.set()
+        if self._identity is not None:
+            try:
+                self._ctrl_rpc({"op": "revoke", "identity": self._identity})
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self.revoke()
+        with self._ctrl_lock:
+            try:
+                self._ctrl.close(0)
+            except Exception:
+                pass
+
+
+# ----------------------------------------------------------------------------
+# File client (shared-directory fallback, same interface)
+# ----------------------------------------------------------------------------
+class FileDiscovery:
+    """Shared-directory registry with mtime leases (no network).
+
+    Members write ``<role>.<identity>.json`` and refresh its mtime as a
+    heartbeat; readers treat files whose mtime is older than ``ttl_ms`` as
+    expired. Kept behind the same interface as :class:`NetworkDiscovery` for
+    offline debugging; not the default.
+    """
+
+    def __init__(self, directory: str, *, ttl_ms: int = 10000):
+        self.directory = directory
+        self.ttl_ms = ttl_ms
+        os.makedirs(directory, exist_ok=True)
+        self._identity: Optional[str] = None
+        self._path: Optional[str] = None
+        self._hb_thread: Optional[threading.Thread] = None
+        self._hb_stop = threading.Event()
+        self._seen: Dict[str, Dict[str, dict]] = {}
+
+    def _member_path(self, role: str, identity: str) -> str:
+        safe = identity.replace("/", "_")
+        return os.path.join(self.directory, f"{role}.{safe}.json")
+
+    def publish(
+        self, role: str, identity: str, payload: dict, ttl_ms: Optional[int] = None
+    ) -> None:
+        self._identity = identity
+        self._path = self._member_path(role, identity)
+        tmp = f"{self._path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"identity": identity, "payload": payload}, f)
+        os.replace(tmp, self._path)
+        interval = max(0.5, (ttl_ms or self.ttl_ms) / 3000.0)
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat, args=(interval,), daemon=True
+        )
+        self._hb_thread.start()
+
+    def _heartbeat(self, interval: float) -> None:
+        while not self._hb_stop.wait(interval):
+            try:
+                if self._path and os.path.exists(self._path):
+                    os.utime(self._path, None)
+            except OSError:
+                pass
+
+    def list(self, role: str) -> List[dict]:
+        out: List[dict] = []
+        now = time.time()
+        for p in glob.glob(os.path.join(self.directory, f"{role}.*.json")):
+            try:
+                if (now - os.path.getmtime(p)) * 1000.0 > self.ttl_ms:
+                    continue
+                with open(p) as f:
+                    rec = json.load(f)
+                out.append(rec)
+            except (OSError, json.JSONDecodeError):
+                continue
+        return out
+
+    def poll_events(self, role: str) -> List[Event]:
+        members = {m["identity"]: m["payload"] for m in self.list(role)}
+        prev = self._seen.get(role, {})
+        events: List[Event] = []
+        for ident, payload in members.items():
+            if ident not in prev:
+                events.append(Event("ADD", ident, payload))
+            elif payload != prev[ident]:
+                events.append(Event("UPDATE", ident, payload))
+        for ident, payload in prev.items():
+            if ident not in members:
+                events.append(Event("REMOVE", ident, payload))
+        self._seen[role] = members
+        return events
+
+    def revoke(self) -> None:
+        self._hb_stop.set()
+        if self._path and os.path.exists(self._path):
+            try:
+                os.remove(self._path)
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        self.revoke()
+
+
+# ----------------------------------------------------------------------------
+# Factory
+# ----------------------------------------------------------------------------
+def make_discovery(mode: str, endpoint: str, *, ttl_ms: int = 10000):
+    """Construct a discovery client for ``mode`` ('network' | 'file')."""
+    if mode == "network":
+        return NetworkDiscovery(endpoint, ttl_ms=ttl_ms)
+    if mode == "file":
+        return FileDiscovery(endpoint, ttl_ms=ttl_ms)
+    raise ValueError(f"unsupported discovery mode {mode!r} (use 'network' or 'file')")

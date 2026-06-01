@@ -71,6 +71,7 @@ class PipeAsyncLLM(LLM):
         top_k: float,
         repetition_penalty: float,
         mm_contents=None,
+        mm_items=None,
     ):
         seq = self.allocate_seq(
             token_ids,
@@ -81,6 +82,7 @@ class PipeAsyncLLM(LLM):
             top_k,
             repetition_penalty,
             mm_contents,
+            mm_items,
         )
         stream = AsyncStream(raw_request)
         assert seq.seq_id not in self.async_streams

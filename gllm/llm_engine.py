@@ -339,6 +339,7 @@ class LLM:
         top_k=None,
         repetition_penalty=None,
         mm_contents=None,
+        mm_items=None,
     ):
         # Models without a ``generation_config.json`` (e.g. Qwen3.5-0.8B)
         # leave the HF ``GenerationConfig`` defaults as ``None``, which then
@@ -354,7 +355,7 @@ class LLM:
         repetition_penalty = _resolve_sampling_param(
             repetition_penalty, gen.repetition_penalty, 1.0
         )
-        return Sequence(
+        seq = Sequence(
             self.id_allocator.allocate(),
             token_ids,
             self.finish_tokens,
@@ -366,6 +367,11 @@ class LLM:
             repetition_penalty,
             mm_contents,
         )
+        # Encoder-disaggregation: the ordered raw mm items the encoder will
+        # process. Present only on the disaggregated LM frontend; ``None`` for
+        # text and for the monolith path.
+        seq.mm_items = mm_items
+        return seq
 
     def free_finish_ids(self, finish_ids: List[int]):
         for id in finish_ids:

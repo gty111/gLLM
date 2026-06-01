@@ -187,6 +187,7 @@ class OverlapWorker(Worker):
         """
         self.check_abort_seqs()
         self.recv_ipc_package()
+        self._disagg_poll()
 
         # Bootstrap on the first iter, otherwise this is a no-op
         # (the previous iter's tail already built next-iter's input).

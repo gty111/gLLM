@@ -36,6 +36,7 @@ PP>1 specifics
 """
 
 import logging
+import os
 import traceback
 from collections import deque
 from typing import List, Optional, Union
@@ -107,6 +108,10 @@ class Worker(TorchProfilerMixin):
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
         self.use_mla = model_runner.model_loader.use_mla
+        # Encoder-disaggregation LM-side manager (slot pool + per-item
+        # aggregator). Built lazily on the PP0 driver in :meth:`init` when
+        # ``GLLM_DISAGG_LM=1``; ``None`` on every other rank / the monolith.
+        self._disagg = None
         self.init_profiler_state()
 
     def init_logger(self):
@@ -162,9 +167,74 @@ class Worker(TorchProfilerMixin):
 
         self._init_role_state()
 
+        self._maybe_init_disagg()
+
         self.mp_alive[self.local_rank] = 1
 
         logger.info(f"Initialization complete")
+
+    def _maybe_init_disagg(self):
+        """Bring up the LM-side disagg manager on the PP0 driver only.
+
+        Gated by ``GLLM_DISAGG_LM=1`` (set by ``lm_server``). The slot pool +
+        NIXL endpoint + encoder ZMQ channels live on the single PP0 TP=0 rank;
+        TP>1 fan-out is Phase 5, so we assert tp_size==1 here.
+        """
+        if os.environ.get("GLLM_DISAGG_LM") != "1":
+            return
+        if not (is_first_pp_rank() and self.tp_rank == 0):
+            return
+        if self.tp_size != 1:
+            raise NotImplementedError(
+                "encoder disaggregation currently requires tp_size=1 on the LM"
+            )
+        from gllm.disagg.lm_manager import LMDisaggManager
+
+        discovery_endpoint = os.environ["GLLM_DISAGG_DIR"]
+        self._disagg = LMDisaggManager(
+            self.model_runner,
+            lm_id=os.environ.get("GLLM_DISAGG_LM_ID", f"lm{self.rank}"),
+            discovery_endpoint=discovery_endpoint,
+            discovery_mode=os.environ.get("GLLM_DISAGG_MODE", "network"),
+            processor_config_hash=os.environ.get("GLLM_DISAGG_PROC_HASH", ""),
+            advertise_host=os.environ.get("GLLM_DISAGG_HOST", "127.0.0.1"),
+            meta_bind=os.environ.get("GLLM_DISAGG_META_BIND", "tcp://0.0.0.0:0"),
+            num_slots=int(os.environ.get("GLLM_DISAGG_NUM_SLOTS", "32")),
+            max_vis_tokens=int(
+                os.environ.get("GLLM_DISAGG_MAX_VIS_TOKENS", "16384")
+            ),
+            encoder_dp=int(os.environ.get("GLLM_DISAGG_ENCODER_DP", "1")),
+        )
+        self._disagg.setup()
+
+    def _admit_requests(self, seqs):
+        """Route new front-end seqs: disagg mm seqs -> manager, else scheduler.
+
+        A disaggregated multimodal request carries ``seq.mm_items`` (the raw
+        per-item content the encoder needs) and a *skeleton* token-id list. It
+        must not enter the scheduler until its visual embeddings have arrived,
+        so it is handed to the disagg manager; everything else (text, and the
+        monolith path) goes straight to the scheduler.
+        """
+        if self._disagg is None:
+            self.scheduler.add_new_requests(seqs)
+            return
+        direct = []
+        for seq in seqs:
+            if getattr(seq, "mm_items", None):
+                self._disagg.submit(seq)
+            else:
+                direct.append(seq)
+        if direct:
+            self.scheduler.add_new_requests(direct)
+
+    def _disagg_poll(self):
+        """Promote disagg seqs whose embeddings have fully landed."""
+        if self._disagg is None:
+            return
+        ready = self._disagg.poll()
+        if ready:
+            self.scheduler.add_new_requests(ready)
 
     def _init_role_state(self):
         """Build per-rank scheduler / follower-store state.
@@ -316,7 +386,7 @@ class Worker(TorchProfilerMixin):
             return
 
         if cum.schedule_lists:
-            self.scheduler.add_new_requests(cum.schedule_lists)
+            self._admit_requests(cum.schedule_lists)
         if cum.abort_ids:
             self.scheduler.add_abort_ids(cum.abort_ids)
         if cum.log is not None:
@@ -473,6 +543,7 @@ class Worker(TorchProfilerMixin):
         """Per-iter loop run by every PP=0 TP rank."""
         self.check_abort_seqs()
         self.recv_ipc_package()
+        self._disagg_poll()
         self.recv_next_tokens()
         self.schedule_forward()
         self.process_output()

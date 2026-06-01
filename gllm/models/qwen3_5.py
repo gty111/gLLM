@@ -1130,6 +1130,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     def __init__(self, config):
         super().__init__(config, language_model_type=Qwen3_5ForCausalLM)
+        # Encoder-disaggregation encoder process: no language model at all.
+        if getattr(self, "skip_language", False) or self.language_model is None:
+            self.ssm_cache_config = None
+            self.num_kv_layers = 0
+            self.num_ssm_layers = 0
+            return
         # Expose ssm_cache_config and num_kv_layers at top-level so that
         # ``ModelRunner.init`` (which reads ``self.model``) finds them
         # without having to peek into ``self.language_model``.
@@ -1140,9 +1146,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def load_weights(self, weights, mp_load_progress=None):
         # Language model load is delegated; it walks ``self.language_model``'s
         # named_parameters() and slices each tensor for the current TP rank.
-        self.language_model.load_weights(weights, mp_load_progress)
+        if not getattr(self, "skip_language", False) and self.language_model is not None:
+            self.language_model.load_weights(weights, mp_load_progress)
 
         if not is_first_pp_rank():
+            return
+
+        # Encoder-disaggregation LM node skips the vision tower entirely.
+        if getattr(self, "skip_visual", False) or self.visual is None:
             return
 
         # Visual tower load: same pattern as ``Qwen3VLForConditionalGeneration``.

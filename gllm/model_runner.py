@@ -48,6 +48,48 @@ class EmbeddingInfo:
     # buffer the chunk that matches ``hidden_states``. ``None`` for
     # text-only prompts and for non-deepstack VL models.
     deepstack_embedding: torch.Tensor = None
+    # Encoder-disaggregation overlap (design §6.2): for a seq whose visual
+    # embeddings are still arriving, ``embedding`` only covers the span-aligned
+    # *ready prefix* ``[0, coverage_len)``. When the scheduler later advances
+    # past ``coverage_len`` (more items became ready), the embed is rebuilt
+    # over the larger prefix. ``None`` => full-prompt embedding (monolith and
+    # fully-ready disagg seqs), i.e. no coverage limit.
+    coverage_len: Optional[int] = None
+
+
+@dataclass
+class DisaggSeqState:
+    """Per-seq encoder-disaggregation overlap state (design §6.2).
+
+    Owned by the :class:`ModelRunner` (keyed by ``seq_id``) so it is immune to
+    the scheduler's chunked-prefill ``deepcopy`` of the :class:`Sequence`. The
+    LM disagg manager fills ``item_embed[i]`` (and flips ``item_ready[i]``) as
+    each item's visual embedding lands over NIXL; the scheduler reads
+    ``item_ready`` for the two-layer prefill gate and the model runner reads
+    ``item_embed`` to embed the ready prefix.
+
+    Items are stored in **image-then-video order** (the order
+    ``model.embed_multimodal`` returns its tuple in, which is what the merge
+    expects). Each carries its ``[span_start, span_end)`` in the *expanded*
+    token sequence so gate B and the ready-prefix embed can be computed.
+    """
+
+    num_items: int
+    item_span: List[Tuple[int, int]]          # ordered: (start, end) in tokens
+    item_modality: List[str]
+    item_ready: List[bool]
+    item_embed: List[Optional[torch.Tensor]]  # ordered, filled on NIXL notif
+    image_grid_thw: Optional[torch.Tensor]
+    video_grid_thw: Optional[torch.Tensor]
+    input_ids_cpu: torch.Tensor               # full expanded prompt ids (cpu)
+    is_multimodal_cpu: torch.Tensor           # full mask (cpu)
+    prompt_positions: torch.Tensor            # full-prompt mrope positions
+    mrope_position_delta: torch.Tensor
+    prompt_len: int
+
+    @property
+    def all_ready(self) -> bool:
+        return all(self.item_ready)
 
 
 # High-id offset for the synthetic ``pad_id``s spliced into the prefix-cache
@@ -85,6 +127,30 @@ def _hash_tensor_bytes(*tensors: torch.Tensor) -> bytes:
         h.update(repr(tuple(t.shape)).encode())
         h.update(memoryview(t.numpy().tobytes()))
     return h.digest()
+
+
+def _build_item_content_hash(
+    pixel_values: torch.Tensor,
+    grid_thw: torch.Tensor,
+) -> bytes:
+    """Per-item content hash, byte-identical to the monolith's i-th item hash.
+
+    The monolith (:meth:`ModelRunner._build_mm_content_hashes`) computes each
+    item's digest as ``_hash_tensor_bytes(pixel_chunk_i, image_grid_thw[i])``
+    where ``pixel_chunk_i`` is this item's slice of the concatenated
+    ``pixel_values`` and ``image_grid_thw[i]`` is the 1-D ``[3]`` grid row.
+
+    The encoder runs the processor on a *single* image, so its ``pixel_values``
+    already equals ``pixel_chunk_i`` and its ``grid_thw`` is ``[1, 3]``; we take
+    row 0 to match the monolith's 1-D grid tensor exactly. This determinism is
+    what lets the LM's prefix-cache pad ids agree across the two paths
+    (design §5.4.4).
+    """
+    if isinstance(grid_thw, torch.Tensor) and grid_thw.ndim == 2:
+        thw = grid_thw[0]
+    else:
+        thw = grid_thw
+    return _hash_tensor_bytes(pixel_values, thw)
 
 
 class MultiModalEmbeddingCache:
@@ -231,6 +297,12 @@ class ModelRunner:
 
         # embedding cache: seq_id => embedding
         self.embedding_cache: Dict[int, EmbeddingInfo] = {}
+
+        # Encoder-disaggregation overlap (design §6.2): seq_id => per-item
+        # readiness + embeddings for seqs admitted before all their visual
+        # embeddings arrived. Populated by the LM disagg manager; consumed by
+        # the scheduler (gate B) and the embed path. Empty for the monolith.
+        self.disagg_embeds: Dict[int, DisaggSeqState] = {}
 
         # Multimodal vision-tower output cache, keyed by the content hash of
         # the prompt's MM items. Hits skip ``model.embed_multimodal``
@@ -408,6 +480,47 @@ class ModelRunner:
                     mm_contents["video"].append(data)
         return mm_contents if len(mm_contents["image"]) + len(mm_contents["video"]) != 0 else None
 
+    def extract_mm_items_ordered(self, messages: Dict):
+        """Return the mm items as an ordered ``[(modality, content), ...]`` list.
+
+        Encoder disaggregation needs the items in *prompt order* (matching the
+        skeleton's sentinel order) so the LM can pair the i-th sentinel with the
+        i-th encoder job. Call *after* :meth:`extract_modify_mm`, which has
+        already normalized ``image_url``/``video_url`` -> ``image``/``video``.
+        """
+        items = []
+        for message in messages:
+            contents = message["content"]
+            if type(contents) != list:
+                continue
+            for content in contents:
+                if content["type"] == "image":
+                    items.append(("image", content["image"]))
+                elif content["type"] == "video":
+                    items.append(("video", content["video"]))
+        return items
+
+    def encode_skeleton(self, messages):
+        """Text-only tokenization with one sentinel per mm item (design §5.4).
+
+        Used by the disaggregated LM frontend instead of the multimodal
+        ``processor.apply_chat_template``: no pixels are opened or processed
+        here, and each image/video collapses to a single placeholder id that
+        the LM PP0 later expands to ``N_vis_i`` tokens. Returns the skeleton
+        token-id list.
+        """
+        from gllm.mm_common import tokenize_text_only
+
+        cfg = self.model_loader.config
+        skel = tokenize_text_only(
+            self.tokenizer,
+            messages,
+            image_token_id=int(cfg.image_token_id),
+            video_token_id=int(cfg.video_token_id),
+            add_generation_prompt=True,
+        )
+        return skel.token_ids
+
     @torch.inference_mode()
     def _mm_prepare_cpu(self, seqs: List[Sequence]) -> Dict:
         """CPU phase of :meth:`mm_prepare_inputs`.
@@ -449,6 +562,17 @@ class ModelRunner:
                 continue
 
             in_decode = False
+            if seq.seq_id in self.disagg_embeds:
+                # Encoder-disaggregation overlap (design §6.2): this seq was
+                # admitted before all its visual embeddings landed. Embed only
+                # the span-aligned *ready prefix*; rebuild when more items land.
+                self._mm_disagg_collect(
+                    seq,
+                    self.disagg_embeds[seq.seq_id],
+                    prefill_works,
+                    batch_positions,
+                )
+                continue
             if seq.seq_id not in self.embedding_cache:
                 # If the scheduler already ran ``_mm_precompute_hash`` for
                 # this seq (required for multimodal prefix-cache correctness
@@ -464,12 +588,19 @@ class ModelRunner:
                     input_ids_cpu = pre["input_ids_cpu"]
                     is_multimodal_cpu = pre["is_multimodal_cpu"]
                     mm_bundle_key = pre["mm_bundle_key"]
+                    # Encoder-disaggregation (design §5.3): the per-item visual
+                    # embeddings were produced on the encoder and NIXL-written
+                    # into the LM slot pool, then cloned into this tuple by the
+                    # LM disagg manager. When present, ``_mm_prepare_gpu`` uses
+                    # them verbatim instead of running the (absent) local ViT.
+                    mm_embeddings = pre.get("mm_embeddings")
                     # Single-use: drop the stash so a re-scheduled seq
                     # (preempt + resume) doesn't accidentally read stale
                     # tensors. The work it represents is now folded into
                     # ``embedding_cache[seq.seq_id]`` below.
                     seq._mm_precomputed = None
                 else:
+                    mm_embeddings = None
                     mm_input, image_grid_thw, video_grid_thw = (
                         self._mm_run_processor(seq)
                     )
@@ -510,6 +641,7 @@ class ModelRunner:
                         "input_ids_cpu": input_ids_cpu,
                         "is_multimodal_cpu": is_multimodal_cpu,
                         "mm_input": mm_input,
+                        "mm_embeddings": mm_embeddings,
                         "prompt_positions": prompt_positions,
                         "mrope_position_delta": mrope_position_delta,
                         "mm_bundle_key": mm_bundle_key,
@@ -536,6 +668,71 @@ class ModelRunner:
             "mrope_positions": mrope_positions,
             "num_decode_tokens": num_decode_tokens,
         }
+
+    @staticmethod
+    def _disagg_ready_len(st: "DisaggSeqState") -> int:
+        """Length of the span-aligned ready prefix ``[0, ready_len)``.
+
+        Stops at the first *not-yet-ready* image span start (in token order),
+        regardless of whether a later item happens to be ready: a prefix that
+        spanned an unready item would have more ``is_multimodal`` positions
+        than gathered embeddings and the merge would misalign.
+        """
+        rl = st.prompt_len
+        for i in range(st.num_items):
+            if not st.item_ready[i]:
+                rl = min(rl, st.item_span[i][0])
+        return rl
+
+    def _mm_disagg_collect(
+        self,
+        seq: Sequence,
+        st: "DisaggSeqState",
+        prefill_works: List[Dict],
+        batch_positions: List[torch.Tensor],
+    ) -> None:
+        """Build the prefill work for an overlap disagg seq (design §6.2).
+
+        Positions come from the full-prompt mrope grid (all grids known once
+        meta arrived). The embedding covers the ready prefix; it is rebuilt
+        (kind ``uncached``) whenever the scheduler advances past the cached
+        ``coverage_len`` because more items became ready, otherwise the cached
+        prefix is re-sliced (kind ``cached``).
+        """
+        batch_positions.append(
+            st.prompt_positions[:, seq.computed_token_num : seq.seq_len]
+        )
+        info = self.embedding_cache.get(seq.seq_id)
+        need_build = info is None or (
+            info.coverage_len is not None and seq.seq_len > info.coverage_len
+        )
+        if not need_build:
+            prefill_works.append(
+                {"kind": "cached", "seq": seq, "embedding_info": info}
+            )
+            return
+        ready_len = self._disagg_ready_len(st)
+        # Gather the ready-prefix items in token-span order so the concatenated
+        # embeddings line up 1-1 with the ``is_multimodal`` True positions.
+        ready_items = [
+            i for i in range(st.num_items) if st.item_span[i][1] <= ready_len
+        ]
+        ready_items.sort(key=lambda i: st.item_span[i][0])
+        ready_embeds = tuple(st.item_embed[i] for i in ready_items)
+        prefill_works.append(
+            {
+                "kind": "uncached",
+                "seq": seq,
+                "input_ids_cpu": st.input_ids_cpu[:ready_len],
+                "is_multimodal_cpu": st.is_multimodal_cpu[:ready_len],
+                "mm_input": {},
+                "mm_embeddings": ready_embeds if ready_embeds else None,
+                "prompt_positions": st.prompt_positions,
+                "mrope_position_delta": st.mrope_position_delta,
+                "mm_bundle_key": None,
+                "coverage_len": ready_len,
+            }
+        )
 
     def _mm_run_processor(
         self, seq: Sequence
@@ -761,9 +958,12 @@ class ModelRunner:
         for work in ctx["prefill_works"]:
             seq = work["seq"]
             if work["kind"] == "uncached":
-                mm_embeddings = None
+                # Encoder-disaggregation: embeddings already arrived over NIXL
+                # and were cloned into this tuple, so skip the local ViT (the
+                # LM node has no vision tower). ``None`` -> monolith path.
+                mm_embeddings = work.get("mm_embeddings")
                 mm_input = work["mm_input"]
-                if mm_input:
+                if mm_embeddings is None and mm_input:
                     # Skip the ViT encoder when this prompt's MM bundle is
                     # already in the cache (e.g. identical-image rerun).
                     # Cache stores the per-item embedding tuple verbatim;
@@ -805,6 +1005,7 @@ class ModelRunner:
                     work["prompt_positions"],
                     work["mrope_position_delta"],
                     deepstack_embedding=prompt_deepstack,
+                    coverage_len=work.get("coverage_len"),
                 )
                 self.embedding_cache[seq.seq_id] = embedding_info
                 embedding = prompt_embeddings[
@@ -836,6 +1037,9 @@ class ModelRunner:
                 # for future decode-position calculations.
                 embedding_info.embedding = None
                 embedding_info.deepstack_embedding = None
+                # Encoder-disaggregation: the per-item visual embeddings are now
+                # baked into the KV cache, so the (cloned) gate-B copies can go.
+                self.disagg_embeds.pop(seq.seq_id, None)
 
             batch_embeddings.append(embedding)
             batch_deepstack.append(deepstack_chunk)
@@ -1080,10 +1284,53 @@ class ModelRunner:
             self.output_residual[:num_cal_tokens],
         )
 
+    # ------------------------------------------------------------------
+    # Encoder-disaggregation overlap (design §6.2)
+    # ------------------------------------------------------------------
+
+    def disagg_register(self, seq_id: int, state: DisaggSeqState) -> None:
+        """Register a disagg seq for overlapped, readiness-gated prefill.
+
+        Called by the LM disagg manager once *all* per-item ``MmItemMeta`` have
+        arrived (positions/hashes determined; gate A satisfied) but before the
+        visual embeddings have necessarily landed. The embeddings are filled in
+        progressively via :meth:`disagg_set_embedding`.
+        """
+        self.disagg_embeds[seq_id] = state
+
+    def disagg_set_embedding(
+        self, seq_id: int, ordered_idx: int, embed: torch.Tensor
+    ) -> None:
+        """Record one item's visual embedding (NIXL write completed)."""
+        st = self.disagg_embeds.get(seq_id)
+        if st is None:
+            return
+        st.item_embed[ordered_idx] = embed
+        st.item_ready[ordered_idx] = True
+
+    def disagg_prefill_limit(self, seq: Sequence) -> Optional[int]:
+        """Gate-B upper bound (design §6.2): the largest token position this
+        seq may prefill up to this round = the start of the first image span
+        whose embedding hasn't landed yet (or ``prompt_len`` if all ready).
+        ``None`` for non-disagg seqs (no cap).
+
+        This deliberately matches :meth:`_disagg_ready_len` (the embed coverage)
+        so the scheduler never advances ``computed_token_num`` past the embed
+        coverage -- even when a prefix-cache hit would otherwise jump the cursor
+        over an item whose embedding is still in flight. Such a (rare) seq waits
+        for the embedding to land, then proceeds; the encoder's own embed cache
+        keeps that wait short for repeated content.
+        """
+        st = self.disagg_embeds.get(seq.seq_id)
+        if st is None:
+            return None
+        return self._disagg_ready_len(st)
+
     def free(self, seq: Sequence):
         self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq.seq_id, None)
+            self.disagg_embeds.pop(seq.seq_id, None)
 
     def free_follower_state(self, seq_id: int) -> None:
         """Drop per-seq cache on a TP/PP follower; does **not** touch pages.
@@ -1103,6 +1350,7 @@ class ModelRunner:
         """
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq_id, None)
+            self.disagg_embeds.pop(seq_id, None)
 
 
 class OverlapModelRunner(ModelRunner):

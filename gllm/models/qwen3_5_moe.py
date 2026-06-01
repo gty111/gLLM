@@ -331,6 +331,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # which only carry the quant config at the top level — without it
         # the language sub-model would silently fall back to bf16.
         super().__init__(config, language_model_type=Qwen3_5MoeLLMForCausalLM)
+        # Encoder-disaggregation encoder process: no language model at all.
+        if getattr(self, "skip_language", False) or self.language_model is None:
+            self.ssm_cache_config = None
+            self.num_kv_layers = 0
+            self.num_ssm_layers = 0
+            return
         self.ssm_cache_config = self.language_model.ssm_cache_config
         self.num_kv_layers = self.language_model.num_kv_layers
         self.num_ssm_layers = self.language_model.num_ssm_layers
@@ -343,9 +349,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         not implemented); only ``model.*``, ``lm_head``, and ``visual.*``
         tensors are loaded.
         """
-        self.language_model.load_weights(weights, mp_load_progress)
+        if not getattr(self, "skip_language", False) and self.language_model is not None:
+            self.language_model.load_weights(weights, mp_load_progress)
 
         if not is_first_pp_rank():
+            return
+
+        # Encoder-disaggregation LM node skips the vision tower entirely.
+        if getattr(self, "skip_visual", False) or self.visual is None:
             return
 
         parameters = dict(self.visual.named_parameters())

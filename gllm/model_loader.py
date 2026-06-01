@@ -1,4 +1,5 @@
 import glob
+import os
 from typing import Tuple
 
 import torch
@@ -291,6 +292,20 @@ class ModelLoader:
         self.config.use_mla = self.use_mla
         self.config.use_hybrid_state = self.use_hybrid_state
         self.config.max_num_batched_tokens = self.max_num_batched_tokens
+        # Encoder-disaggregation role flag (docs/encoder_disaggregation_design.md
+        # §4.3 / §7.2.1). The LM node sets ``GLLM_SKIP_VISUAL=1`` so the VL
+        # wrapper does not construct / load the vision tower; the visual
+        # embeddings instead arrive over NIXL from the encoder process. Read
+        # from the environment so the monolith path stays untouched and we
+        # avoid threading a flag through LLM -> ModelRunner -> ModelLoader.
+        self.config.skip_visual = bool(
+            int(os.environ.get("GLLM_SKIP_VISUAL", "0"))
+        )
+        # Complementary flag for the encoder process: construct ONLY the
+        # vision tower (no language model, KV cache, scheduler, or sampler).
+        self.config.skip_language = bool(
+            int(os.environ.get("GLLM_SKIP_LANGUAGE", "0"))
+        )
 
     @property
     def use_mla(self):
