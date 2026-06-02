@@ -35,9 +35,9 @@ multi-image, high resolution) or when you want to scale the ViT across extra
 GPUs independently of the LM. It is *not* worth it for text-only or
 vision-light workloads.
 
-> Reference (Qwen3.5-35B-A3B-FP8, random 4–8 images @720p, 4 GPUs): vs a
-> monolithic TP4 server, **E3LM1** (3 encoders + 1 LM) gave −38% median TTFT
-> and +24% total throughput. See section 10.
+> Reference (Qwen3.5-35B-A3B-FP8, random 4–8 images @1080p): at an **equal GPU
+> budget**, disaggregation cut median TTFT by −28% (E1LM1, 2 GPUs) up to −50%
+> (E3LM1, 4 GPUs) and raised total throughput +32% to +49%. See section 10.
 
 ---
 
@@ -282,21 +282,42 @@ can reach ~39 GB on a single TP1 GPU and OOM on top of the weights.
 
 ## 10. Performance reference
 
-Model `Qwen3.5-35B-A3B-FP8`, workload = random 4–8 images @720p
-(`sglang.bench_serving` image dataset, 64 prompts, concurrency 16), both sides
-4 GPUs, `--disable-cuda-graph`, prefix caching on:
+Model `Qwen3.5-35B-A3B-FP8`, workload = random 4–8 images @1080p
+(`sglang.bench_serving` image dataset, 64 prompts, concurrency 16, out-len 128),
+**equal 2-GPU budget per side**, `--disable-cuda-graph`, prefix caching on:
 
-| Metric | Monolith TP4 | E3LM1 (disagg) |
+| Metric | Monolith TP2 | E1LM1 (disagg) |
 |--------|--------------|----------------|
-| TTFT median (ms) | 3211 | **1986** |
-| TPOT median (ms) | 118.3 | **100.8** |
-| Total throughput (tok/s) | 4786 | **5924** |
-| E2E mean (ms) | 18390 | **14817** |
-| Bench duration (s) | 74.1 | **59.9** |
+| TTFT median (ms) | 5445 | **3938** |
+| TTFT mean (ms) | 6235 | **4687** |
+| TPOT median (ms) | 169.0 | **113.5** |
+| Total throughput (tok/s) | 5457 | **7180** |
+| E2E mean (ms) | 27296 | **19136** |
+| Bench duration (s) | 110.2 | **83.8** |
 
-Layout: monolith = TP4 (ViT + LM share 4 GPUs); disagg = LM TP1 on 1 GPU + 3
-vision-only encoders on 3 *distinct* GPUs. The higher the visual share, the
-larger the win.
+Layout: monolith = TP2 (ViT + LM share 2 GPUs); disagg = LM TP1 on 1 GPU + 1
+vision-only encoder on a 2nd GPU. Even at this minimal 1:1 split, moving vision
+off the LM's critical path gives **−28% median TTFT** and **+32% throughput**.
+Adding encoders scales the win: with 3 encoders + 1 LM vs an equal-budget TP4
+monolith, the same 1080p workload reaches −50% TTFT / +49% throughput (the more
+GPUs spent on parallel ViT, the shorter the encode wall).
+
+### Intra-request overlap (`GLLM_DISAGG_OVERLAP`)
+
+The E1LM1 config above is **encoder-bound** (one encoder serializes every ViT),
+which is exactly where intra-request overlap (section 6) helps. Same workload:
+
+| Metric | `OVERLAP=0` | `OVERLAP=1` (default) |
+|--------|-------------|------------------------|
+| TTFT median (ms) | 5015 | **3938** |
+| TTFT mean (ms) | 5435 | **4687** |
+| Total throughput (tok/s) | 6808 | **7180** |
+
+Admitting on Gate A and overlapping prefill with the encoder's remaining ViTs
+cuts median TTFT **−21%**. With several encoders the encode wall is short and
+parallel, so embeddings are essentially all present by admission and overlap has
+little left to hide (within noise) — it matters most when encode is the
+bottleneck.
 
 ---
 

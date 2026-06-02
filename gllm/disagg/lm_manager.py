@@ -51,6 +51,11 @@ class _PendingItem:
     slot_id: int
     meta: Optional[MmItemMeta] = None
     embedding_ready: bool = False
+    # Diagnostic timing (monotonic seconds): when this item's meta (gate A) and
+    # embedding notif (gate B) landed at the LM. Used to measure the per-request
+    # encode/transfer window that intra-request overlap can hide.
+    t_meta: float = 0.0
+    t_emb: float = 0.0
     # Set once the embedding has been cloned out of the slot pool into the
     # model runner's ``disagg_embeds`` and the slot returned to the free list.
     slot_freed: bool = False
@@ -465,6 +470,7 @@ class LMDisaggManager:
                 )
             return
         item.meta = meta
+        item.t_meta = time.monotonic()
 
     def _drain_notifs(self) -> None:
         notifs = self.nixl.poll_notifs()
@@ -485,6 +491,7 @@ class LMDisaggManager:
                     # slot-free guard in _flush_ready_clones prevents re-cloning.
                     continue
                 item.embedding_ready = True
+                item.t_emb = time.monotonic()
                 touched.add(seq_id)
         # Clone freshly-landed embeddings into the model runner (gate B). For a
         # seq not yet admitted (meta still incomplete) the clones are deferred
@@ -586,9 +593,21 @@ class LMDisaggManager:
             if ps.admitted and ps.all_embeddings_ready:
                 # All embeddings cloned out + slots freed; the seq now lives
                 # entirely in the scheduler / model runner.
+                _tm = [it.t_meta for it in ps.items if it.t_meta]
+                _te = [it.t_emb for it in ps.items if it.t_emb]
+                if _tm and _te:
+                    # gate A complete = last meta; gate B complete = last emb.
+                    _win_ms = (max(_te) - max(_tm)) * 1e3
+                    _spread_ms = (max(_te) - min(_te)) * 1e3
+                    _diag = (
+                        f"; gateA->gateB window {_win_ms:+.1f}ms, "
+                        f"emb spread {_spread_ms:.1f}ms"
+                    )
+                else:
+                    _diag = ""
                 logger.info(
                     f"[lm-disagg {self.lm_id}] seq={seq_id} all {ps.num_items} "
-                    f"embeddings landed; releasing tracking"
+                    f"embeddings landed; releasing tracking{_diag}"
                 )
                 del self._pending[seq_id]
                 freed_any = True

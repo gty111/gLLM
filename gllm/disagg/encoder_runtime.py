@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 import pickle
 import time
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import zmq
@@ -192,9 +192,19 @@ class EncoderRuntime:
         self.lm_zmq_addr = None
 
     # ------------------------------------------------------------------
+    # Per-item processing is split into two phases so a *batch* of drained
+    # jobs can emit ALL their metadata (gate A) before ANY ViT runs (design
+    # §6.2). Metadata only needs the cheap CPU processor (grid_thw -> num_tokens
+    # + content_hash), so completing gate A for the whole batch up front lets
+    # the LM start prefilling the ready prefix while the (heavy, serialized)
+    # ViTs for the remaining items are still running -- widening the
+    # encode/prefill overlap window from "one ViT" to the full encode spread.
     @torch.inference_mode()
-    def _handle_job(self, job: EncoderJob) -> None:
-        # 1) CPU processor: pixels + grid + token count + content hash.
+    def _prepare_job(self, job: EncoderJob) -> dict:
+        """Phase A: CPU processor + send :class:`MmItemMeta` (gate A).
+
+        Returns the state needed by :meth:`_encode_and_write` (phase B).
+        """
         mm_input, grid_thw = self.engine.run_processor(job.content, job.modality)
         num_tokens = self.engine.num_vis_tokens(grid_thw)
         chash = self.engine.content_hash(mm_input, grid_thw)
@@ -210,7 +220,6 @@ class EncoderRuntime:
                 f"{self.max_vis_tokens}; raise --max-vis-tokens"
             )
 
-        # 2) Meta first (before the ViT) so PP0 can expand token-ids early.
         meta = MmItemMeta(
             seq_id=job.seq_id,
             item_idx=job.item_idx,
@@ -222,9 +231,21 @@ class EncoderRuntime:
             slot_id=job.slot_id,
         )
         self.meta_sock.send(pickle.dumps(meta))
+        return {
+            "job": job,
+            "mm_input": mm_input,
+            "chash": chash,
+            "num_tokens": num_tokens,
+        }
 
-        # 3) ViT (with per-replica dedup cache), then stage into the send buf.
-        vis = self.engine.encode(mm_input, chash)  # [num_tokens, feat_dim]
+    @torch.inference_mode()
+    def _encode_and_write(self, prep: dict) -> None:
+        """Phase B: ViT (with dedup cache) -> staging buffer -> NIXL WRITE."""
+        job: EncoderJob = prep["job"]
+        num_tokens: int = prep["num_tokens"]
+
+        # ViT (with per-replica dedup cache), then stage into the send buf.
+        vis = self.engine.encode(prep["mm_input"], prep["chash"])  # [N, feat_dim]
         assert vis.shape[0] == num_tokens, (
             f"ViT rows {vis.shape[0]} != predicted {num_tokens}"
         )
@@ -234,9 +255,9 @@ class EncoderRuntime:
         src = self.send_buf[:num_tokens]
         src.copy_(vis.to(self.send_buf.dtype))
 
-        # 4) NIXL WRITE into the LM's reserved slot, sub-sized to the actual
-        # item, with the data-ready notif. Retried with a re-handshake on
-        # transient transport failure (design §5.5).
+        # NIXL WRITE into the LM's reserved slot, sub-sized to the actual item,
+        # with the data-ready notif. Retried with a re-handshake on transient
+        # transport failure (design §5.5).
         nbytes = num_tokens * self.feat_dim * self.send_buf.element_size()
         remote = job.remote_slot.with_offset(0, nbytes)
         self._write_with_retry(src, remote, job)
@@ -298,6 +319,9 @@ class EncoderRuntime:
             socks = dict(poller.poll(timeout=1000))
             if self.job_sock not in socks:
                 continue
+            # Drain every currently-available job into one batch so we can run
+            # the cheap CPU/meta phase for ALL of them before any heavy ViT.
+            batch: List[EncoderJob] = []
             while True:
                 try:
                     raw = self.job_sock.recv(flags=zmq.NOBLOCK)
@@ -318,8 +342,25 @@ class EncoderRuntime:
                         f"item={job.item_idx}: no LM connected"
                     )
                     continue
+                batch.append(job)
+
+            # Phase A: processor + emit meta (gate A) for the whole batch first.
+            preps: List[dict] = []
+            for job in batch:
                 try:
-                    self._handle_job(job)
+                    preps.append(self._prepare_job(job))
+                except Exception as e:  # pragma: no cover - operational guard
+                    logger.error(
+                        f"[encoder {self.encoder_id}] job seq={job.seq_id} "
+                        f"item={job.item_idx} dropped in prepare: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
+            # Phase B: ViT + NIXL write (gate B), serialized (shared send buf).
+            for prep in preps:
+                job = prep["job"]
+                try:
+                    self._encode_and_write(prep)
                 except Exception as e:  # pragma: no cover - operational guard
                     # Drop this item but KEEP serving: one bad item (e.g. a
                     # dead transport to the LM) must not take the whole replica
