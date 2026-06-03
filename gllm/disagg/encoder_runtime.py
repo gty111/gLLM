@@ -254,6 +254,15 @@ class EncoderRuntime:
         )
         src = self.send_buf[:num_tokens]
         src.copy_(vis.to(self.send_buf.dtype))
+        # The NIXL WRITE below is a UCX RDMA read of ``src`` issued OUTSIDE the
+        # CUDA stream (``agent.transfer`` reads the raw device pointer), so it
+        # does not honor stream ordering against the async ``copy_`` above.
+        # Without this barrier the transport can ship stale/partial send-buffer
+        # bytes whenever writes are issued back-to-back (batched phase B / high
+        # concurrency) -- landing the WRONG image's embedding in the LM slot
+        # (cross-request visual contamination). Make the copy fully visible to
+        # the transport before launching the transfer.
+        torch.cuda.synchronize()
 
         # NIXL WRITE into the LM's reserved slot, sub-sized to the actual item,
         # with the data-ready notif. Retried with a re-handshake on transient
