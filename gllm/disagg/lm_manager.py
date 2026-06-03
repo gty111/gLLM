@@ -96,6 +96,12 @@ class _PendingSeq:
     # of :class:`DisaggSeqState`), fixed at admission.
     admitted: bool = False
     ordered: Optional[List[_PendingItem]] = None
+    # Number of image/video sentinels in the skeleton ``seq.token_ids``. The
+    # i-th sentinel pairs with ``items[i]``; admission expands each sentinel to
+    # its item's ``num_tokens``. Recorded at dispatch so admission can verify
+    # the item list matches the skeleton (guards against a sentinel/item count
+    # skew, which would otherwise IndexError in ``_admit_meta_complete``).
+    n_sentinels: int = 0
 
     @property
     def num_items(self) -> int:
@@ -103,7 +109,13 @@ class _PendingSeq:
 
     @property
     def meta_complete(self) -> bool:
-        return all(it.meta is not None for it in self.items)
+        # Gate A is met only when every skeleton sentinel has a paired item AND
+        # every item carries its meta. The count guard prevents admitting (and
+        # then crashing in ``_admit_meta_complete``) on a sentinel/item skew.
+        return (
+            len(self.items) == self.n_sentinels
+            and all(it.meta is not None for it in self.items)
+        )
 
     @property
     def all_embeddings_ready(self) -> bool:
@@ -406,7 +418,25 @@ class LMDisaggManager:
                 )
                 self._send_job(seq.seq_id, item)  # per-item round-robin
                 pend_items.append(item)
-            ps = _PendingSeq(seq=seq, items=pend_items, dispatched=True)
+            n_sentinels = sum(
+                1
+                for tid in seq.token_ids
+                if tid == self.image_token_id or tid == self.video_token_id
+            )
+            if n_sentinels != k:
+                # Skeleton sentinels must equal the mm-item count (they come
+                # from the same messages). A skew means encode_skeleton and
+                # extract_mm_items_ordered disagreed -- admission would later
+                # IndexError; ``meta_complete`` stays False so the seq stalls
+                # out via the watchdog into a client retry instead.
+                logger.error(
+                    f"[lm-disagg {self.lm_id}] seq={seq.seq_id} sentinel/item "
+                    f"skew: skeleton has {n_sentinels} image/video sentinels "
+                    f"but {k} mm items; seq will not be admitted (client retry)"
+                )
+            ps = _PendingSeq(
+                seq=seq, items=pend_items, dispatched=True, n_sentinels=n_sentinels
+            )
             self._pending[seq.seq_id] = ps
             routing = ", ".join(
                 f"item{it.item_idx}->{it.encoder_identity}" for it in pend_items
@@ -567,6 +597,22 @@ class LMDisaggManager:
                         f"(slot {item.slot_id} reused)"
                     )
 
+    def _abort_pending(self, seq_id: int) -> None:
+        """Drop a pending seq and reclaim its NIXL slots (admission failure).
+
+        The seq was never handed to the scheduler, so reclaiming the reserved
+        slots and removing it from ``_pending`` is sufficient; the client request
+        times out and retries. Freed slots may unblock queued admissions.
+        """
+        ps = self._pending.pop(seq_id, None)
+        if ps is None:
+            return
+        for it in ps.items:
+            if not it.slot_freed:
+                self._free_slots.append(it.slot_id)
+                it.slot_freed = True
+        self._try_dispatch()
+
     def poll(self) -> List[object]:
         self._drain_discovery()
         self._try_dispatch()
@@ -588,7 +634,19 @@ class LMDisaggManager:
                     f"embeddings arrived {_arrived}/{ps.num_items} at admit; "
                     f"overlap={'on' if self.overlap else 'off'})"
                 )
-                self._admit_meta_complete(ps)  # sets ps.admitted
+                try:
+                    self._admit_meta_complete(ps)  # sets ps.admitted
+                except Exception:
+                    # A single malformed seq must never take down the PP0 poll
+                    # loop (and with it every other in-flight request). Log,
+                    # reclaim its resources, and let the client time out/retry.
+                    logger.exception(
+                        f"[lm-disagg {self.lm_id}] admit failed for seq={seq_id} "
+                        f"(n_sentinels={ps.n_sentinels}, items={len(ps.items)}, "
+                        f"skeleton_len={len(ps.seq.token_ids)}); aborting seq"
+                    )
+                    self._abort_pending(seq_id)
+                    continue
                 admitted.append(ps.seq)
             if ps.admitted and ps.all_embeddings_ready:
                 # All embeddings cloned out + slots freed; the seq now lives
