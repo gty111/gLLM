@@ -235,6 +235,8 @@ class ModelRunner:
         model_max_length: int,
         mm_processor_min_pixels: int = None,
         mm_processor_max_pixels: int = None,
+        skip_visual: bool = False,
+        skip_language: bool = False,
     ):
         
         self.max_num_batched_tokens = (
@@ -248,7 +250,13 @@ class ModelRunner:
         self.max_running_seqs = maxd
         
         self.model_path = model_path
-        self.model_loader = ModelLoader(load_format, model_path, self.max_num_batched_tokens)
+        self.model_loader = ModelLoader(
+            load_format,
+            model_path,
+            self.max_num_batched_tokens,
+            skip_visual=skip_visual,
+            skip_language=skip_language,
+        )
         self.enable_prefix_caching = enable_prefix_caching
         self.use_thinking = use_thinking
         self.gpu_memory_util = gpu_memory_util

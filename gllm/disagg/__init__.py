@@ -16,6 +16,16 @@ unchanged and the result is byte-identical with the monolith. Intra-request
 encode/prefill overlap (two-layer gating) is layered on in Phase 6.
 """
 
-from gllm.disagg.protocol import EncoderJob, MmItemMeta
-
 __all__ = ["EncoderJob", "MmItemMeta"]
+
+
+def __getattr__(name):
+    # Lazy re-export so that importing a lightweight submodule (e.g.
+    # ``gllm.disagg.config``) from the monolith path does not eagerly import
+    # ``protocol`` -> ``gllm.transfer.nixl_transfer`` and pull NIXL into a
+    # process that never disaggregates.
+    if name in __all__:
+        from gllm.disagg.protocol import EncoderJob, MmItemMeta
+
+        return {"EncoderJob": EncoderJob, "MmItemMeta": MmItemMeta}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -17,7 +17,6 @@ exact processor + content-hash helpers from :mod:`gllm.model_runner`.
 
 from __future__ import annotations
 
-import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -45,13 +44,18 @@ class EncoderEngine:
         mm_embed_cache_mb: float = 256.0,
         max_num_batched_tokens: int = 8192,
     ):
-        # Tell the model loader to construct ONLY the vision tower. Set before
-        # ModelLoader reads the config so ``config.skip_language`` is picked up.
-        os.environ["GLLM_SKIP_LANGUAGE"] = "1"
-        os.environ.setdefault("GLLM_SKIP_VISUAL", "0")
-
         self.model_path = model_path
-        self.model_loader = ModelLoader(load_format, model_path, max_num_batched_tokens)
+        # Construct ONLY the vision tower: ``skip_language=True`` so the loader
+        # builds no language model / KV cache / scheduler / sampler, and
+        # ``skip_visual=False`` so the tower itself is loaded. Passed explicitly
+        # (see gllm.disagg.config.DisaggConfig) instead of via env.
+        self.model_loader = ModelLoader(
+            load_format,
+            model_path,
+            max_num_batched_tokens,
+            skip_visual=False,
+            skip_language=True,
+        )
         assert self.model_loader.use_mm, (
             f"{model_path} is not a multimodal model; nothing for the encoder "
             "to do"

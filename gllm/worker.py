@@ -92,6 +92,7 @@ class Worker(TorchProfilerMixin):
         mp_load_progress,
         assigned_layers,
         schedule_method,
+        disagg_config=None,
     ):
         self.model_runner = model_runner
         self.local_rank = local_rank
@@ -108,9 +109,14 @@ class Worker(TorchProfilerMixin):
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
         self.use_mla = model_runner.model_loader.use_mla
+        # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig),
+        # pickled here from the parent across the spawn boundary; ``None`` on the
+        # monolith path.
+        self.disagg_config = disagg_config
         # Encoder-disaggregation LM-side manager (slot pool + per-item
         # aggregator). Built lazily on the PP0 driver in :meth:`init` when
-        # ``GLLM_DISAGG_LM=1``; ``None`` on every other rank / the monolith.
+        # ``disagg_config.is_lm`` is set; ``None`` on every other rank / the
+        # monolith.
         self._disagg = None
         self.init_profiler_state()
 
@@ -176,11 +182,13 @@ class Worker(TorchProfilerMixin):
     def _maybe_init_disagg(self):
         """Bring up the LM-side disagg manager on the PP0 driver only.
 
-        Gated by ``GLLM_DISAGG_LM=1`` (set by ``lm_server``). The slot pool +
-        NIXL endpoint + encoder ZMQ channels live on the single PP0 TP=0 rank;
-        TP>1 fan-out is Phase 5, so we assert tp_size==1 here.
+        Gated by ``disagg_config.is_lm`` (the entrypoint builds the config; see
+        ``gllm.disagg.config.DisaggConfig``). The slot pool + NIXL endpoint +
+        encoder ZMQ channels live on the single PP0 TP=0 rank; TP>1 fan-out is
+        Phase 5, so we assert tp_size==1 here.
         """
-        if os.environ.get("GLLM_DISAGG_LM") != "1":
+        cfg = self.disagg_config
+        if cfg is None or not cfg.is_lm:
             return
         if not (is_first_pp_rank() and self.tp_rank == 0):
             return
@@ -190,20 +198,24 @@ class Worker(TorchProfilerMixin):
             )
         from gllm.disagg.lm_manager import LMDisaggManager
 
-        discovery_endpoint = os.environ["GLLM_DISAGG_DIR"]
+        # Only forward optional sizing knobs when set so the LMDisaggManager
+        # defaults (num_slots=32, max_vis_tokens=16384) stay the single source
+        # of truth.
+        optional = {}
+        if cfg.num_slots is not None:
+            optional["num_slots"] = cfg.num_slots
+        if cfg.max_vis_tokens is not None:
+            optional["max_vis_tokens"] = cfg.max_vis_tokens
         self._disagg = LMDisaggManager(
             self.model_runner,
-            lm_id=os.environ.get("GLLM_DISAGG_LM_ID", f"lm{self.rank}"),
-            discovery_endpoint=discovery_endpoint,
-            processor_config_hash=os.environ.get("GLLM_DISAGG_PROC_HASH", ""),
-            advertise_host=os.environ.get("GLLM_DISAGG_HOST", "127.0.0.1"),
-            meta_bind=os.environ.get("GLLM_DISAGG_META_BIND", "tcp://0.0.0.0:0"),
-            num_slots=int(os.environ.get("GLLM_DISAGG_NUM_SLOTS", "32")),
-            max_vis_tokens=int(
-                os.environ.get("GLLM_DISAGG_MAX_VIS_TOKENS", "16384")
-            ),
-            encoder_dp=int(os.environ.get("GLLM_DISAGG_ENCODER_DP", "1")),
-            nixl_backend=os.environ.get("GLLM_DISAGG_NIXL_BACKEND", "UCX"),
+            lm_id=cfg.lm_id if cfg.lm_id is not None else f"lm{self.rank}",
+            discovery_endpoint=cfg.discovery_endpoint,
+            processor_config_hash=cfg.processor_config_hash,
+            advertise_host=cfg.advertise_host,
+            meta_bind=cfg.meta_bind,
+            encoder_dp=cfg.encoder_dp,
+            nixl_backend=cfg.nixl_backend,
+            **optional,
         )
         self._disagg.setup()
 

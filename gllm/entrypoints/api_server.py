@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import os
 import traceback
 from http import HTTPStatus
 
@@ -70,7 +69,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # the encoder via the LM PP0 worker. The LM never opens pixels and never
     # carries ``mm_contents``. Falls back to the monolith processor path for
     # text requests and when disaggregation is off.
-    disagg = os.environ.get("GLLM_DISAGG_LM") == "1"
+    disagg = getattr(llm, "is_disagg_lm", False)
     mm_items = None
     if disagg and mm_contents is not None:
         mm_items = await make_async(llm.model_runner.extract_mm_items_ordered)(

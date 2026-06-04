@@ -72,8 +72,9 @@ def default_encoder_id(gpu: int) -> str:
 def main():
     args = build_arg_parser().parse_args()
 
-    os.environ["GLLM_SKIP_LANGUAGE"] = "1"
-    os.environ["GLLM_SKIP_VISUAL"] = "0"
+    # The vision-only role flags (skip_language=True / skip_visual=False) are
+    # passed explicitly to the model loader inside EncoderEngine; see
+    # gllm.disagg.config.DisaggConfig.
 
     # Pin this process to its single physical GPU by selecting the device
     # directly (design §3.2 mutual-exclusion invariant). We do this instead of

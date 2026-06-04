@@ -110,15 +110,15 @@ def main():
 
     # Pin the LM to its single physical GPU before any CUDA init (design §3.2).
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.lm_gpu)
-    if args.skip_visual:
-        os.environ["GLLM_SKIP_VISUAL"] = "1"
-    os.environ.setdefault("GLLM_SKIP_LANGUAGE", "0")
 
-    # Encoder-disaggregation: enable the LM-side manager (slot pool + per-item
-    # aggregator) + the skeleton frontend path when a discovery endpoint is
-    # wired AND the vision tower is skipped. Without a discovery endpoint this
-    # entrypoint is a plain text-only LM (Phase 1). These env vars are inherited
-    # by the spawned worker subprocesses.
+    from gllm.disagg.config import DisaggConfig
+
+    # Encoder-disaggregation config, threaded explicitly into the engine /
+    # worker (no GLLM_DISAGG_* / GLLM_SKIP_* env). The LM-side manager (slot
+    # pool + per-item aggregator) + the skeleton frontend path are enabled when
+    # a discovery endpoint is wired AND the vision tower is skipped. Without a
+    # discovery endpoint this entrypoint is a plain text-only LM (Phase 1).
+    disagg_config = DisaggConfig(skip_visual=bool(args.skip_visual))
     if args.skip_visual and args.discovery_endpoint:
         from gllm.disagg.discovery import resolve_advertise_host
         from gllm.mm_common import processor_config_hash
@@ -126,19 +126,16 @@ def main():
         advertise_host = resolve_advertise_host(
             args.nixl_advertise_host, args.discovery_endpoint
         )
-        os.environ["GLLM_DISAGG_LM"] = "1"
-        os.environ["GLLM_DISAGG_DIR"] = args.discovery_endpoint
-        os.environ["GLLM_DISAGG_PROC_HASH"] = processor_config_hash(args.model_path)
-        os.environ["GLLM_DISAGG_HOST"] = advertise_host
-        os.environ["GLLM_DISAGG_META_BIND"] = f"tcp://0.0.0.0:{int(args.meta_port)}"
-        os.environ["GLLM_DISAGG_NIXL_BACKEND"] = args.nixl_backend
-        if args.mm_recv_slots is not None:
-            os.environ["GLLM_DISAGG_NUM_SLOTS"] = str(args.mm_recv_slots)
-        if args.mm_max_vis_tokens is not None:
-            os.environ["GLLM_DISAGG_MAX_VIS_TOKENS"] = str(args.mm_max_vis_tokens)
-        os.environ["GLLM_DISAGG_ENCODER_DP"] = str(max(1, args.encoder_dp))
+        disagg_config.is_lm = True
+        disagg_config.discovery_endpoint = args.discovery_endpoint
+        disagg_config.processor_config_hash = processor_config_hash(args.model_path)
+        disagg_config.advertise_host = advertise_host
+        disagg_config.meta_bind = f"tcp://0.0.0.0:{int(args.meta_port)}"
+        disagg_config.nixl_backend = args.nixl_backend
+        disagg_config.num_slots = args.mm_recv_slots
+        disagg_config.max_vis_tokens = args.mm_max_vis_tokens
+        disagg_config.encoder_dp = max(1, args.encoder_dp)
 
-    # Import after env is set so the model loader sees GLLM_SKIP_VISUAL.
     import gllm.entrypoints.api_server as api
     from gllm.async_llm_engine import PipeAsyncLLM
 
@@ -171,6 +168,7 @@ def main():
         model_max_length=args.model_max_length,
         mm_processor_min_pixels=args.mm_processor_min_pixels,
         mm_processor_max_pixels=args.mm_processor_max_pixels,
+        disagg_config=disagg_config,
     )
 
     asyncio.run(api.run_server(args))
