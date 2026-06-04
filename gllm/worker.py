@@ -195,7 +195,6 @@ class Worker(TorchProfilerMixin):
             self.model_runner,
             lm_id=os.environ.get("GLLM_DISAGG_LM_ID", f"lm{self.rank}"),
             discovery_endpoint=discovery_endpoint,
-            discovery_mode=os.environ.get("GLLM_DISAGG_MODE", "network"),
             processor_config_hash=os.environ.get("GLLM_DISAGG_PROC_HASH", ""),
             advertise_host=os.environ.get("GLLM_DISAGG_HOST", "127.0.0.1"),
             meta_bind=os.environ.get("GLLM_DISAGG_META_BIND", "tcp://0.0.0.0:0"),
@@ -204,6 +203,7 @@ class Worker(TorchProfilerMixin):
                 os.environ.get("GLLM_DISAGG_MAX_VIS_TOKENS", "16384")
             ),
             encoder_dp=int(os.environ.get("GLLM_DISAGG_ENCODER_DP", "1")),
+            nixl_backend=os.environ.get("GLLM_DISAGG_NIXL_BACKEND", "UCX"),
         )
         self._disagg.setup()
 

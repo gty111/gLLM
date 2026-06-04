@@ -10,8 +10,7 @@ machinery. Startup is fully decoupled from the LM server (design §7.3).
 
     python -m gllm.entrypoints.encoder_server \
         --model-path /path/to/Qwen3.5-VL --encoder-gpu 2 \
-        --service-name dev --discovery-mode file \
-        --discovery-endpoint /tmp/gllm-disc
+        --service-name dev --discovery-endpoint 127.0.0.1:9500
 """
 
 import argparse
@@ -26,22 +25,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--load-format", choices=["auto", "dummy"], default="auto")
     # This process owns exactly one GPU (design §3.2 / §7.2.2).
     p.add_argument("--encoder-gpu", type=int, default=0)
-    # Self endpoints; peers discover these via the registry, never hard-coded.
-    # Port 0 = ephemeral (default; fine same-host / multi-replica). For a
-    # firewalled cross-machine deploy, pin a fixed port (e.g. 0.0.0.0:9100) so a
-    # static ingress rule can be written; the advertised host is --advertise-host.
+    # ZMQ job-intake endpoint; peers discover this via the registry, never
+    # hard-coded. Port 0 = ephemeral (default; fine same-host / multi-replica).
+    # For a firewalled cross-machine deploy, pin a fixed port (e.g.
+    # 0.0.0.0:9100) so a static ingress rule can be written; the advertised
+    # host is --advertise-host. (The NIXL data-plane endpoint is auto-negotiated
+    # via metadata, so it needs no fixed listen port.)
     p.add_argument("--zmq-listen", type=str, default="0.0.0.0:0")
-    p.add_argument("--nixl-listen", type=str, default="0.0.0.0:9101")
     # Service-group membership + discovery (design §7.3).
     p.add_argument("--service-name", type=str, default="gllm-lm-prod")
     p.add_argument(
         "--discovery-endpoint",
         type=str,
         default=None,
-        help="network mode: registry HOST:PORT; file mode: shared directory",
-    )
-    p.add_argument(
-        "--discovery-mode", choices=["network", "file"], default="network"
+        help="discovery registry HOST:PORT (run discovery_server there)",
     )
     p.add_argument("--encoder-id", type=str, default=None)
     p.add_argument("--mm-embed-cache-size", type=float, default=256.0,
@@ -99,7 +96,7 @@ def main():
     encoder_id = args.encoder_id or default_encoder_id(args.encoder_gpu)
     logger.info(
         f"Starting encoder_server id={encoder_id} gpu={args.encoder_gpu} "
-        f"service={args.service_name} discovery={args.discovery_mode}"
+        f"service={args.service_name} discovery={args.discovery_endpoint}"
     )
 
     engine = EncoderEngine(
@@ -114,7 +111,7 @@ def main():
     if not args.discovery_endpoint:
         raise SystemExit(
             "--discovery-endpoint is required to connect the encoder to an LM "
-            "node (network mode: registry HOST:PORT; file mode: a directory)"
+            "node (discovery registry HOST:PORT)"
         )
 
     from gllm.disagg.discovery import resolve_advertise_host
@@ -133,7 +130,6 @@ def main():
         engine,
         encoder_id=encoder_id,
         discovery_endpoint=args.discovery_endpoint,
-        discovery_mode=args.discovery_mode,
         processor_config_hash=processor_config_hash(args.model_path),
         advertise_host=advertise_host,
         # Honor the configured host:port (port 0 -> ephemeral). A fixed port is

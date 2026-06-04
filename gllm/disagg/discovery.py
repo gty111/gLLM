@@ -12,14 +12,10 @@ runtime NIXL handshake and teardown, so:
   * a restarted encoder re-publishes -> peers get ADD and reconnect;
   * a processor-config mismatch is rejected at connect time (§5.4.4).
 
-This module provides the ``Discovery`` abstraction and two backends:
-
-  * :class:`NetworkDiscovery` (**default**) -- talks to a standalone
-    :class:`DiscoveryServer` over ZMQ DEALER/ROUTER (TCP). Pure network, no
-    shared filesystem. This is the etcd stand-in for single-/cross-node bring
-    up without an etcd dependency.
-  * :class:`FileDiscovery` -- a shared-directory fallback (mtime lease), kept
-    behind the same interface for offline/no-network debugging.
+Discovery is network-only: :class:`NetworkDiscovery` talks to a standalone
+:class:`DiscoveryServer` over ZMQ DEALER/ROUTER (TCP). Pure network, no shared
+filesystem. This is the etcd stand-in for single-/cross-node bring up without an
+etcd dependency.
 
 Lease semantics: a publisher renews every ``ttl_ms/3``; a member whose lease is
 not renewed within ``ttl_ms`` is reaped and surfaces as a REMOVE on the next
@@ -29,9 +25,7 @@ not renewed within ``ttl_ms`` is reaped and surfaces as a REMOVE on the next
 from __future__ import annotations
 
 import base64
-import glob
 import json
-import os
 import socket
 import threading
 import time
@@ -92,9 +86,17 @@ def _normalize_tcp(endpoint: str) -> str:
 
 
 def _endpoint_host(endpoint: str) -> str:
-    """Extract the host part from ``host:port`` / ``tcp://host:port``."""
+    """Extract the host part from ``host:port`` / ``tcp://host:port``.
+
+    Returns ``""`` for a malformed/empty endpoint so callers fall back to
+    public-IP egress detection instead of treating a bogus string as a host
+    that fails to connect and collapses to loopback.
+    """
     hostport = _normalize_tcp(endpoint).split("://", 1)[-1]
-    return hostport.rsplit(":", 1)[0] if ":" in hostport else hostport
+    host = hostport.rsplit(":", 1)[0] if ":" in hostport else hostport
+    if not host or "/" in host:
+        return ""
+    return host
 
 
 def resolve_advertise_host(advertise: Optional[str], reference_endpoint: str = "") -> str:
@@ -359,102 +361,8 @@ class NetworkDiscovery:
 
 
 # ----------------------------------------------------------------------------
-# File client (shared-directory fallback, same interface)
-# ----------------------------------------------------------------------------
-class FileDiscovery:
-    """Shared-directory registry with mtime leases (no network).
-
-    Members write ``<role>.<identity>.json`` and refresh its mtime as a
-    heartbeat; readers treat files whose mtime is older than ``ttl_ms`` as
-    expired. Kept behind the same interface as :class:`NetworkDiscovery` for
-    offline debugging; not the default.
-    """
-
-    def __init__(self, directory: str, *, ttl_ms: int = 10000):
-        self.directory = directory
-        self.ttl_ms = ttl_ms
-        os.makedirs(directory, exist_ok=True)
-        self._identity: Optional[str] = None
-        self._path: Optional[str] = None
-        self._hb_thread: Optional[threading.Thread] = None
-        self._hb_stop = threading.Event()
-        self._seen: Dict[str, Dict[str, dict]] = {}
-
-    def _member_path(self, role: str, identity: str) -> str:
-        safe = identity.replace("/", "_")
-        return os.path.join(self.directory, f"{role}.{safe}.json")
-
-    def publish(
-        self, role: str, identity: str, payload: dict, ttl_ms: Optional[int] = None
-    ) -> None:
-        self._identity = identity
-        self._path = self._member_path(role, identity)
-        tmp = f"{self._path}.{os.getpid()}.tmp"
-        with open(tmp, "w") as f:
-            json.dump({"identity": identity, "payload": payload}, f)
-        os.replace(tmp, self._path)
-        interval = max(0.5, (ttl_ms or self.ttl_ms) / 3000.0)
-        self._hb_thread = threading.Thread(
-            target=self._heartbeat, args=(interval,), daemon=True
-        )
-        self._hb_thread.start()
-
-    def _heartbeat(self, interval: float) -> None:
-        while not self._hb_stop.wait(interval):
-            try:
-                if self._path and os.path.exists(self._path):
-                    os.utime(self._path, None)
-            except OSError:
-                pass
-
-    def list(self, role: str) -> List[dict]:
-        out: List[dict] = []
-        now = time.time()
-        for p in glob.glob(os.path.join(self.directory, f"{role}.*.json")):
-            try:
-                if (now - os.path.getmtime(p)) * 1000.0 > self.ttl_ms:
-                    continue
-                with open(p) as f:
-                    rec = json.load(f)
-                out.append(rec)
-            except (OSError, json.JSONDecodeError):
-                continue
-        return out
-
-    def poll_events(self, role: str) -> List[Event]:
-        members = {m["identity"]: m["payload"] for m in self.list(role)}
-        prev = self._seen.get(role, {})
-        events: List[Event] = []
-        for ident, payload in members.items():
-            if ident not in prev:
-                events.append(Event("ADD", ident, payload))
-            elif payload != prev[ident]:
-                events.append(Event("UPDATE", ident, payload))
-        for ident, payload in prev.items():
-            if ident not in members:
-                events.append(Event("REMOVE", ident, payload))
-        self._seen[role] = members
-        return events
-
-    def revoke(self) -> None:
-        self._hb_stop.set()
-        if self._path and os.path.exists(self._path):
-            try:
-                os.remove(self._path)
-            except OSError:
-                pass
-
-    def close(self) -> None:
-        self.revoke()
-
-
-# ----------------------------------------------------------------------------
 # Factory
 # ----------------------------------------------------------------------------
-def make_discovery(mode: str, endpoint: str, *, ttl_ms: int = 10000):
-    """Construct a discovery client for ``mode`` ('network' | 'file')."""
-    if mode == "network":
-        return NetworkDiscovery(endpoint, ttl_ms=ttl_ms)
-    if mode == "file":
-        return FileDiscovery(endpoint, ttl_ms=ttl_ms)
-    raise ValueError(f"unsupported discovery mode {mode!r} (use 'network' or 'file')")
+def make_discovery(endpoint: str, *, ttl_ms: int = 10000) -> NetworkDiscovery:
+    """Construct the (network) discovery client for ``endpoint`` (HOST:PORT)."""
+    return NetworkDiscovery(endpoint, ttl_ms=ttl_ms)

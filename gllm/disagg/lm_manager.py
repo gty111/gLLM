@@ -124,7 +124,6 @@ class LMDisaggManager:
         lm_id: str,
         discovery_endpoint: str,
         *,
-        discovery_mode: str = "network",
         processor_config_hash: str = "",
         advertise_host: str = "127.0.0.1",
         meta_bind: str = "tcp://0.0.0.0:0",
@@ -136,7 +135,6 @@ class LMDisaggManager:
         self.mr = model_runner
         self.lm_id = lm_id
         self.discovery_endpoint = discovery_endpoint
-        self.discovery_mode = discovery_mode
         self.processor_config_hash = processor_config_hash
         self.advertise_host = advertise_host
         self.meta_bind = meta_bind
@@ -238,7 +236,7 @@ class LMDisaggManager:
         # Publish self + watch encoders. We do NOT block on encoders: text-only
         # requests serve immediately, and mm requests queue in the admission
         # queue until a replica connects (any start order, design §7.3.4).
-        self.disc = make_discovery(self.discovery_mode, self.discovery_endpoint)
+        self.disc = make_discovery(self.discovery_endpoint)
         self.disc.publish(
             "lm",
             self.lm_id,
@@ -254,7 +252,7 @@ class LMDisaggManager:
         logger.info(
             f"[lm-disagg {self.lm_id}] meta intake at {self.meta_addr}; slot pool "
             f"{self.num_slots}x{self.max_vis_tokens}x{self.feat_dim} ({self.dtype}); "
-            f"watching encoders via {self.discovery_mode}:{self.discovery_endpoint}"
+            f"watching encoders via {self.discovery_endpoint}"
         )
         self._drain_discovery(force=True)
 
@@ -475,6 +473,17 @@ class LMDisaggManager:
         if ps is None:
             self._orphan_meta.append(meta)
             return
+        # Defensive bounds check: a buggy/corrupted encoder peer could send an
+        # item_idx outside this seq's skeleton-ordered items. Drop it rather
+        # than let an IndexError tear down the shared PP0 disagg loop and stall
+        # every other in-flight request.
+        if not 0 <= meta.item_idx < len(ps.items):
+            logger.error(
+                f"[lm-disagg {self.lm_id}] dropping meta with out-of-range "
+                f"item_idx={meta.item_idx} for seq={meta.seq_id} "
+                f"(have {len(ps.items)} items)"
+            )
+            return
         item = ps.items[meta.item_idx]
         if item.meta is not None:
             # Idempotent (design §5.5.3): a re-dispatched (or duplicated) job
@@ -507,6 +516,11 @@ class LMDisaggManager:
                 seq_id, item_idx = parsed
                 ps = self._pending.get(seq_id)
                 if ps is None:
+                    continue
+                # Ignore stray/malformed notifs whose item_idx is out of range
+                # for this seq instead of crashing the poll loop (mirrors the
+                # bounds guard in _apply_meta).
+                if not 0 <= item_idx < len(ps.items):
                     continue
                 item = ps.items[item_idx]
                 if item.embedding_ready:

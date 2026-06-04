@@ -28,7 +28,11 @@ class EncoderJob:
     """
 
     seq_id: int
-    item_idx: int  # global item index within the request (image items, then video)
+    # Item index in *prompt order* (matching the skeleton sentinel order):
+    # ``LMDisaggManager._try_dispatch`` assigns it by ``enumerate(mm_items)``,
+    # so it pairs the i-th sentinel with the i-th encoder job regardless of
+    # modality interleaving.
+    item_idx: int
     modality: str  # "image" | "video"
     content: object
     remote_slot: RemoteRegion
@@ -68,12 +72,17 @@ def emb_notif(seq_id: int, item_idx: int) -> bytes:
 
 
 def parse_emb_notif(msg: bytes) -> Optional[Tuple[int, int]]:
-    """Inverse of :func:`emb_notif`; returns ``None`` for unrelated notifs."""
+    """Inverse of :func:`emb_notif`; returns ``None`` for unrelated notifs.
+
+    Must never raise: a malformed/stray notification (wrong field count,
+    non-integer ids, bad encoding) is treated as non-fatal and returns
+    ``None`` so the LM disagg poll loop keeps running instead of crashing.
+    """
     try:
         s = msg.decode()
-    except Exception:
+        if not s.startswith("emb:"):
+            return None
+        _, sid, iid = s.split(":")
+        return int(sid), int(iid)
+    except (UnicodeDecodeError, ValueError):
         return None
-    if not s.startswith("emb:"):
-        return None
-    _, sid, iid = s.split(":")
-    return int(sid), int(iid)

@@ -119,9 +119,9 @@ python -m gllm.entrypoints.encoder_server \
     --discovery-endpoint $DISC &
 ```
 
-That's it. Everything else uses defaults: `--discovery-mode network`,
-advertise host = `auto`, control-plane ports = ephemeral, prefix caching on,
-`--gpu-memory-util 0.9`, `--schedule-method chunked_prefill`, `--encoder-dp 1`.
+That's it. Everything else uses defaults: advertise host = `auto`,
+control-plane ports = ephemeral, prefix caching on, `--gpu-memory-util 0.9`,
+`--schedule-method chunked_prefill`, `--encoder-dp 1`.
 
 Readiness:
 
@@ -168,7 +168,6 @@ You normally only need `--model-path`, the GPU index, the LM `--port`, and
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--discovery-mode` | `network` | `network` (ZMQ registry) or `file` (shared dir). |
 | `--encoder-dp` (LM) | `1` | Number of encoder replicas to wait for before dispatching. |
 | `--gpu-memory-util` | `0.9` | Memory fraction. |
 | `--maxd` (LM) | `512` | Max concurrent decode slots. **Drives SSM cache size for hybrid models — see section 8.** |
@@ -183,7 +182,7 @@ You normally only need `--model-path`, the GPU index, the LM `--port`, and
 |------|---------|---------|
 | `--nixl-advertise-host` (LM) / `--advertise-host` (encoder) | `auto` | Address peers use to connect back. `auto` detects the egress IP; use an explicit IP for cross-machine, or `127.0.0.1` to force loopback. |
 | `--meta-port` (LM) | `0` (ephemeral) | Fixed port for the per-item meta intake (pin it behind a firewall). |
-| `--nixl-listen` (LM `0.0.0.0:9001`, encoder `0.0.0.0:9101`) | fixed | NIXL endpoint. **Multiple encoders on the same host must use different ports.** |
+| `--nixl-backend` (LM / encoder) | `UCX` | NIXL transport backend. The data-plane endpoint is auto-negotiated via the exchanged metadata, so there is no port to configure (UCX picks ephemeral ports; same-host encoders need no distinct NIXL port). |
 | `--zmq-listen` (encoder) | `0.0.0.0:0` | Job control-plane port (ephemeral by default). |
 | `--max-vis-tokens` (encoder) | `16384` | Upper bound on N_vis per item; sizes the send buffer. |
 | `--mm-embed-cache-size` (encoder) | `256` (MB) | Per-replica content_hash→embedding dedup cache. |
@@ -222,8 +221,9 @@ the two-plane design and is not gated by `GLLM_DISAGG_OVERLAP`.
 
 ## 7. Multiple encoders (DP, e.g. E3LM1)
 
-3 encoders + 1 LM. The only extras vs the quick start are `--encoder-dp 3` on
-the LM and a **distinct `--nixl-listen` port per same-host encoder**.
+3 encoders + 1 LM. The only extra vs the quick start is `--encoder-dp 3` on the
+LM. Same-host encoders need no distinct NIXL port (UCX auto-negotiates the
+data-plane endpoint); the ZMQ job intake defaults to an ephemeral port too.
 
 ```bash
 MODEL=/path/to/Qwen3.5-35B-A3B-FP8
@@ -238,7 +238,7 @@ python -m gllm.entrypoints.lm_server \
 for g in 5 6 7; do
   python -m gllm.entrypoints.encoder_server \
       --model-path $MODEL --encoder-gpu $g \
-      --discovery-endpoint $DISC --nixl-listen 0.0.0.0:910$((g-4)) &
+      --discovery-endpoint $DISC &
 done
 ```
 
@@ -356,7 +356,6 @@ Expect `ALL GOOD: True` (`disagg == monolith: True`, no SVG).
 | `Address already in use` (fixed port) | A leftover worker still holds the port. Same fix as above. |
 | Encoder is up but `live encoders` stays 0 | Processor/config hash mismatch (LM and encoder must use the same model dir / processor settings), or wrong discovery endpoint. |
 | `NIXL_ERR_REMOTE_DISCONNECT` | Cross-NUMA UCX wireup. Put LM and encoder on GPUs in the same NUMA domain, or set UCX env vars. |
-| Multiple same-host encoders won't start | `--nixl-listen` port collision. Give each replica a different port. |
 | Requests hang in the queue | No live encoder at that moment. Once an encoder connects, the watchdog re-dispatches in-flight items. |
 
 ---

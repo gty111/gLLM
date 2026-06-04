@@ -480,7 +480,7 @@ class ModelRunner:
                     mm_contents["video"].append(data)
         return mm_contents if len(mm_contents["image"]) + len(mm_contents["video"]) != 0 else None
 
-    def extract_mm_items_ordered(self, messages: Dict):
+    def extract_mm_items_ordered(self, messages: List[Dict]):
         """Return the mm items as an ordered ``[(modality, content), ...]`` list.
 
         Encoder disaggregation needs the items in *prompt order* (matching the

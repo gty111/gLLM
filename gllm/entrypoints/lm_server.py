@@ -9,7 +9,7 @@ and discovery are layered on in Phases 3-5.
 
     python -m gllm.entrypoints.lm_server \
         --model-path /path/to/Qwen3.5-VL --lm-gpu 0 --port 8000 \
-        --service-name dev --discovery-mode file --discovery-endpoint /tmp/gllm-disc
+        --service-name dev --discovery-endpoint 127.0.0.1:9500
 """
 
 import argparse
@@ -38,8 +38,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--master-addr", type=str, default="0.0.0.0")
     p.add_argument("--master-port", type=str, default="8001")
     p.add_argument("--zmq-port-base", type=int, default=8002)
-    # NIXL receive endpoint (PP0). Used from Phase 3b.
-    p.add_argument("--nixl-listen", type=str, default="0.0.0.0:9001")
+    # NIXL transport backend (PP0 receive side). The data-plane endpoint is
+    # auto-negotiated via the metadata exchanged over the ZMQ control plane, so
+    # there is no fixed listen port to configure here.
     p.add_argument("--nixl-backend", choices=["UCX"], default="UCX")
     p.add_argument(
         "--meta-port",
@@ -72,10 +73,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--discovery-endpoint",
         type=str,
         default=None,
-        help="network mode: registry HOST:PORT; file mode: shared directory",
-    )
-    p.add_argument(
-        "--discovery-mode", choices=["network", "file"], default="network"
+        help="discovery registry HOST:PORT (run discovery_server there)",
     )
     # --- Runtime (mirror api_server defaults) ---
     p.add_argument("--gpu-memory-util", type=float, default=0.9)
@@ -130,18 +128,15 @@ def main():
         )
         os.environ["GLLM_DISAGG_LM"] = "1"
         os.environ["GLLM_DISAGG_DIR"] = args.discovery_endpoint
-        os.environ["GLLM_DISAGG_MODE"] = args.discovery_mode
         os.environ["GLLM_DISAGG_PROC_HASH"] = processor_config_hash(args.model_path)
         os.environ["GLLM_DISAGG_HOST"] = advertise_host
         os.environ["GLLM_DISAGG_META_BIND"] = f"tcp://0.0.0.0:{int(args.meta_port)}"
+        os.environ["GLLM_DISAGG_NIXL_BACKEND"] = args.nixl_backend
         if args.mm_recv_slots is not None:
             os.environ["GLLM_DISAGG_NUM_SLOTS"] = str(args.mm_recv_slots)
         if args.mm_max_vis_tokens is not None:
             os.environ["GLLM_DISAGG_MAX_VIS_TOKENS"] = str(args.mm_max_vis_tokens)
         os.environ["GLLM_DISAGG_ENCODER_DP"] = str(max(1, args.encoder_dp))
-        # network mode is pure-network; only file mode needs a shared directory.
-        if args.discovery_mode == "file":
-            os.makedirs(args.discovery_endpoint, exist_ok=True)
 
     # Import after env is set so the model loader sees GLLM_SKIP_VISUAL.
     import gllm.entrypoints.api_server as api

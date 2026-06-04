@@ -44,7 +44,6 @@ class EncoderRuntime:
         encoder_id: str,
         discovery_endpoint: str,
         *,
-        discovery_mode: str = "network",
         processor_config_hash: str = "",
         advertise_host: str = "127.0.0.1",
         job_bind: str = "tcp://0.0.0.0:0",
@@ -54,7 +53,6 @@ class EncoderRuntime:
         self.engine = engine
         self.encoder_id = encoder_id
         self.discovery_endpoint = discovery_endpoint
-        self.discovery_mode = discovery_mode
         self.processor_config_hash = processor_config_hash
         self.advertise_host = advertise_host
         self.job_bind = job_bind
@@ -121,7 +119,7 @@ class EncoderRuntime:
         # Publish self into the registry + start watching for the LM. We do NOT
         # block here: the LM may come up later (any start order, design §7.3.4).
         # The serve loop drains discovery events and (re)connects dynamically.
-        self.disc = make_discovery(self.discovery_mode, self.discovery_endpoint)
+        self.disc = make_discovery(self.discovery_endpoint)
         self.disc.publish(
             "encoder",
             self.encoder_id,
@@ -136,7 +134,7 @@ class EncoderRuntime:
         )
         logger.info(
             f"[encoder {self.encoder_id}] job intake at {job_addr}; "
-            f"watching for LM via {self.discovery_mode}:{self.discovery_endpoint}"
+            f"watching for LM via {self.discovery_endpoint}"
         )
         self._drain_discovery()
 
