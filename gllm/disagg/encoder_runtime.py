@@ -208,7 +208,7 @@ class EncoderRuntime:
         mm_input, grid_thw = self.engine.run_processor(job.content, job.modality)
         num_tokens = self.engine.num_vis_tokens(grid_thw)
         chash = self.engine.content_hash(mm_input, grid_thw)
-        logger.info(
+        logger.debug(
             f"[encoder {self.encoder_id}] handling seq={job.seq_id} "
             f"item={job.item_idx} modality={job.modality} "
             f"slot={job.slot_id} num_tokens={num_tokens}"

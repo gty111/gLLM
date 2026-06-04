@@ -51,11 +51,6 @@ class _PendingItem:
     slot_id: int
     meta: Optional[MmItemMeta] = None
     embedding_ready: bool = False
-    # Diagnostic timing (monotonic seconds): when this item's meta (gate A) and
-    # embedding notif (gate B) landed at the LM. Used to measure the per-request
-    # encode/transfer window that intra-request overlap can hide.
-    t_meta: float = 0.0
-    t_emb: float = 0.0
     # Set once the embedding has been cloned out of the slot pool into the
     # model runner's ``disagg_embeds`` and the slot returned to the free list.
     slot_freed: bool = False
@@ -342,7 +337,7 @@ class LMDisaggManager:
     def submit(self, seq) -> None:
         """Queue a disaggregated mm seq (``seq.mm_items`` set) for dispatch."""
         self._admission_q.append(seq)
-        logger.info(
+        logger.debug(
             f"[lm-disagg {self.lm_id}] submit seq={seq.seq_id} "
             f"items={len(seq.mm_items)} (live encoders={len(self._encoders)}, "
             f"free slots={len(self._free_slots)})"
@@ -441,7 +436,7 @@ class LMDisaggManager:
             routing = ", ".join(
                 f"item{it.item_idx}->{it.encoder_identity}" for it in pend_items
             )
-            logger.info(
+            logger.debug(
                 f"[lm-disagg {self.lm_id}] dispatched seq={seq.seq_id} K={k} "
                 f"slots={[it.slot_id for it in pend_items]} "
                 f"routing=[{routing}] across {len(self._encoders)} encoder(s)"
@@ -500,7 +495,6 @@ class LMDisaggManager:
                 )
             return
         item.meta = meta
-        item.t_meta = time.monotonic()
 
     def _drain_notifs(self) -> None:
         notifs = self.nixl.poll_notifs()
@@ -521,7 +515,6 @@ class LMDisaggManager:
                     # slot-free guard in _flush_ready_clones prevents re-cloning.
                     continue
                 item.embedding_ready = True
-                item.t_emb = time.monotonic()
                 touched.add(seq_id)
         # Clone freshly-landed embeddings into the model runner (gate B). For a
         # seq not yet admitted (meta still incomplete) the clones are deferred
@@ -628,7 +621,7 @@ class LMDisaggManager:
             )
             if not ps.admitted and admit_ready:
                 _arrived = sum(1 for it in ps.items if it.embedding_ready)
-                logger.info(
+                logger.debug(
                     f"[lm-disagg {self.lm_id}] admit seq={seq_id} "
                     f"(meta complete for {ps.num_items} items; "
                     f"embeddings arrived {_arrived}/{ps.num_items} at admit; "
@@ -651,21 +644,9 @@ class LMDisaggManager:
             if ps.admitted and ps.all_embeddings_ready:
                 # All embeddings cloned out + slots freed; the seq now lives
                 # entirely in the scheduler / model runner.
-                _tm = [it.t_meta for it in ps.items if it.t_meta]
-                _te = [it.t_emb for it in ps.items if it.t_emb]
-                if _tm and _te:
-                    # gate A complete = last meta; gate B complete = last emb.
-                    _win_ms = (max(_te) - max(_tm)) * 1e3
-                    _spread_ms = (max(_te) - min(_te)) * 1e3
-                    _diag = (
-                        f"; gateA->gateB window {_win_ms:+.1f}ms, "
-                        f"emb spread {_spread_ms:.1f}ms"
-                    )
-                else:
-                    _diag = ""
-                logger.info(
+                logger.debug(
                     f"[lm-disagg {self.lm_id}] seq={seq_id} all {ps.num_items} "
-                    f"embeddings landed; releasing tracking{_diag}"
+                    f"embeddings landed; releasing tracking"
                 )
                 del self._pending[seq_id]
                 freed_any = True

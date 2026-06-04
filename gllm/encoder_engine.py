@@ -18,7 +18,7 @@ exact processor + content-hash helpers from :mod:`gllm.model_runner`.
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from logger import logger

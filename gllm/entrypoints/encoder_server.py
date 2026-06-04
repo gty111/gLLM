@@ -18,7 +18,6 @@ import argparse
 import os
 import signal
 import sys
-import time
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
