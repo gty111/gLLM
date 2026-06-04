@@ -226,53 +226,6 @@ class Scheduler:
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
 
-    def _rewind_full_hit_for_ssm(self, seq: Sequence) -> None:
-        """Rewind a full prefix-cache hit to a safe SSM snapshot boundary.
-
-        For full-attention-only models we can roll back a full hit by one token
-        and re-run that token to recover the last hidden state used for
-        sampling. Hybrid SSM models cannot do that safely: the recurrent state
-        restored on hit is already the state *after* the full prompt, so
-        re-running one more token would advance the recurrence one extra step.
-
-        Instead, rewind ``computed_token_num`` to the nearest page boundary <=
-        ``prompt_len - 1`` that has an SSM snapshot, restore that snapshot into
-        the working slot, and let prefill recompute the tail.
-        """
-        ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
-        if ssm_seg is None:
-            return
-
-        segment = getattr(self.memory_manager, "segment", None)
-        page2snap = getattr(segment, "page2ssm_snapshot", None)
-        if page2snap is None:
-            return
-
-        prompt_len = len(seq)
-        target_boundary = (max(prompt_len - 1, 0) // self.page_size) * self.page_size
-
-        # Walk backward in page units until we find a boundary with a snapshot.
-        while target_boundary > 0:
-            page_idx = target_boundary // self.page_size - 1
-            if 0 <= page_idx < len(seq.page_table):
-                page_num = seq.page_table[page_idx]
-                snap_slot = page2snap[page_num]
-                if snap_slot is not None:
-                    self.memory_manager.allocate_ssm_slot(seq)
-                    ssm_seg.copy_state(
-                        "snapshot",
-                        snap_slot,
-                        "working",
-                        seq.ssm_state_slot,
-                    )
-                    seq.computed_token_num = target_boundary
-                    return
-            target_boundary -= self.page_size
-
-        # No usable boundary snapshot; recompute prompt from h_0.
-        self.memory_manager.free_ssm_slot(seq)
-        seq.computed_token_num = 0
-
     def schedule_prefill_batch(self, prefill_token_budget):
         prefill_batch: List[Sequence] = []
         unfinish_prefill_seqs = deque()
@@ -317,32 +270,8 @@ class Scheduler:
                 # ``_mm_prepare_cpu`` pass doesn't redo the work.
                 self.model_runner._mm_precompute_hash(seq)
                 self.memory_manager.pre_allocate_computed_page([seq])
-                # Full prompt cache hit (every page-aligned prefix matched).
-                # ``pre_allocate_computed_page`` would have bumped
-                # ``computed_token_num`` all the way up to ``len(seq)``,
-                # leaving zero tokens to forward. That short-circuits the
-                # batch builder into producing an empty ``tokens_cpu`` and
-                # crashing ``compute_logits`` on a size-0 hidden tensor.
-                # The KV cache only stores K/V, not the last-token hidden
-                # state we need to sample from, so we still have to run a
-                # 1-token forward. Roll back one token: keep all N cached
-                # pages in ``page_table`` (their KV is correct -- the
-                # prefix-cache hash match guarantees the last token is
-                # identical to the cached prompt), and let the loop below
-                # set ``to_compute_token_num = 1``. The 1-token forward is
-                # computationally a decode step; the idempotent K/V write
-                # to the last slot of the cached page is harmless.
-                #
-                # NOTE: this single-token rollback is only correct for full
-                # attention. Hybrid/linear-attention (GDN) models cannot
-                # re-consume an already-absorbed token in their stateful
-                # recurrence, so a page-boundary rewind + tail recompute
-                # (``_rewind_full_hit_for_ssm``) is used for them instead.
-                if seq.computed_token_num >= len(seq):
-                    if getattr(self.memory_manager, "ssm_segment", None) is not None:
-                        self._rewind_full_hit_for_ssm(seq)
-                    else:
-                        seq.computed_token_num = len(seq) - 1
+                # Full/partial hit post-processing (rollback + hybrid SSM
+                # snapshot restore) lives in PrefixMemoryManager.
             # Encoder-disaggregation overlap gate B (design §6.2): a disagg seq
             # may only prefill up to the first image span whose embedding hasn't
             # landed yet (positions are known -- gate A -- but the visual data

@@ -617,10 +617,65 @@ class PrefixMemoryManager(MemoryManager):
                         break
                 else:
                     break
-        # For hybrid models: restore SSM state from the snapshot of the
-        # deepest hit page. Pure-text models skip this branch since
-        # ``ssm_segment`` is ``None``.
-        self.restore_ssm_snapshot_on_hit(seqs)
+        for seq in seqs:
+            self._finalize_prefix_cache_hit(seq)
+
+    def _finalize_prefix_cache_hit(self, seq: Sequence) -> None:
+        """Post-process a prefix-cache lookup so forward work remains on the prompt.
+
+        After a **full** hit (``computed_token_num == len(seq)``) every prompt
+        token is marked computed and the batch builder would schedule zero
+        tokens -- ``compute_logits`` then sees an empty hidden tensor. We must
+        leave at least one token to forward so the last hidden state is
+        available for the first decode sample:
+
+        * **Full-attention**: roll back 1 token. Re-running it is safe (KV
+          rewrite is idempotent).
+        * **Hybrid SSM (GDN)**: roll back one *page*, restore the recurrent
+          state from the previous boundary snapshot, and recompute the tail.
+          A 1-token rollback would apply the last token's recurrence twice
+          and corrupt SSM state.
+
+        On **partial** hits hybrid models still copy the deepest hit snapshot
+        into the working slot; full-attention models need no change.
+        """
+        if seq.computed_token_num == 0:
+            return
+
+        is_hybrid = self.ssm_segment is not None
+        full_hit = seq.computed_token_num >= len(seq)
+
+        if is_hybrid:
+            if full_hit:
+                seq.computed_token_num -= self.page_size
+                self.num_hit_pages -= 1
+            self._restore_ssm_working_state(seq)
+        elif full_hit:
+            seq.computed_token_num = len(seq) - 1
+
+    def _restore_ssm_working_state(self, seq: Sequence) -> None:
+        """Copy the deepest *filled* SSM snapshot at/below ``computed_token_num``.
+
+        Cached KV pages stay in ``page_table`` and are recomputed in place by
+        the upcoming forward (idempotent for full-attention KV). We never
+        free/pop pages here -- a sibling request in the same batch may share
+        them.
+        """
+        while seq.computed_token_num > 0:
+            boundary_page = seq.page_table[
+                seq.computed_token_num // self.page_size - 1
+            ]
+            snap_slot = self._valid_snapshot_slot(boundary_page)
+            if snap_slot is not None:
+                self.allocate_ssm_slot(seq)
+                self.ssm_segment.copy_state(
+                    "snapshot", snap_slot, "working", seq.ssm_state_slot
+                )
+                return
+            seq.computed_token_num -= self.page_size
+            self.num_hit_pages -= 1
+        # No usable boundary snapshot: scheduler allocates a fresh (zeroed)
+        # working slot and the seq recomputes the whole prompt from h_0.
 
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
@@ -639,62 +694,6 @@ class PrefixMemoryManager(MemoryManager):
                 else:
                     page_num = self.segment.allocate()
                 seq.page_table.append(page_num)
-
-    def restore_ssm_snapshot_on_hit(self, seqs: List[Sequence]):
-        if self.ssm_segment is None:
-            return
-        for seq in seqs:
-            if seq.computed_token_num == 0:
-                continue
-            # Full prefix hit on a page-aligned prompt: every token is cached
-            # so ``computed_token_num == len(seq)``. ``schedule_prefill_batch``
-            # would otherwise roll a SINGLE token back to leave something to
-            # forward for the sampling logits. That 1-token rollback is only
-            # safe for full attention, whose per-token KV rewrite is
-            # idempotent. The GDN recurrence is stateful: the deepest snapshot
-            # is ``h_N`` (the recurrent state AFTER consuming all ``N`` tokens),
-            # and re-running the last token on top of it folds that token into
-            # the recurrence a SECOND time -> corrupted state -> wrong output.
-            # We therefore roll a whole page back here so the final page is
-            # recomputed as an ordinary prefill continuation seeded from the
-            # previous boundary snapshot ``h_{N-page_size}`` (or from
-            # ``h_0 = 0`` when the prompt is a single page). After this the
-            # generic 1-token rollback in the scheduler is a no-op because
-            # ``computed_token_num < len(seq)``.
-            if seq.computed_token_num >= len(seq):
-                seq.computed_token_num -= self.page_size
-                self.num_hit_pages -= 1
-            # ``computed_token_num`` is now a multiple of ``page_size`` = the
-            # cached-prefix length whose recurrent state we want to reuse.
-            # Restore from the deepest page boundary at/below it that carries a
-            # *filled* snapshot, peeling off (logically) any tail pages whose
-            # snapshot was never written -- the boundary fell mid-FLA-chunk, or
-            # the slot was only reserved.
-            #
-            # Crucially we NEVER free/pop the cached KV pages here. They stay in
-            # ``page_table`` and are simply recomputed in place by the upcoming
-            # forward (the prompt tokens are identical on a prefix-cache hit, so
-            # the full-attention KV rewrite is idempotent). Freeing a page would
-            # return its physical id to the allocator, and a sibling request in
-            # the same batch that also hit that page would then have it
-            # re-handed out by ``pre_allocate_page`` -> silent KV corruption.
-            while seq.computed_token_num > 0:
-                boundary_page = seq.page_table[
-                    seq.computed_token_num // self.page_size - 1
-                ]
-                snap_slot = self._valid_snapshot_slot(boundary_page)
-                if snap_slot is not None:
-                    # Make sure the seq has a working slot to receive the state.
-                    self.allocate_ssm_slot(seq)
-                    self.ssm_segment.copy_state(
-                        "snapshot", snap_slot, "working", seq.ssm_state_slot
-                    )
-                    break
-                seq.computed_token_num -= self.page_size
-                self.num_hit_pages -= 1
-            # If the loop drained ``computed_token_num`` to 0 there is no usable
-            # boundary anywhere: the scheduler allocates a fresh (zeroed)
-            # working slot and the seq recomputes the whole prompt from h_0 = 0.
 
     def _valid_snapshot_slot(self, page_num: int) -> Optional[int]:
         """Return the snapshot slot for ``page_num`` only if it was actually
