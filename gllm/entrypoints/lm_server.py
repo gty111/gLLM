@@ -34,7 +34,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # --- Network / GPU ---
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--lm-gpu", type=int, default=0)
+    p.add_argument(
+        "--lm-gpu",
+        type=str,
+        default="0",
+        help="Physical GPU(s) for the LM. A single ordinal (e.g. '0') for "
+        "tp_size=1, or a comma-separated list (e.g. '0,1') whose length equals "
+        "--tp for tensor parallelism.",
+    )
+    p.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        help="LM tensor-parallel size. The full visual embedding is "
+        "multi-written by the encoder into every TP rank's slot pool; "
+        "pp_size stays 1.",
+    )
     p.add_argument("--master-addr", type=str, default="0.0.0.0")
     p.add_argument("--master-port", type=str, default="8001")
     p.add_argument("--zmq-port-base", type=int, default=8002)
@@ -108,8 +123,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main():
     args = build_arg_parser().parse_args()
 
-    # Pin the LM to its single physical GPU before any CUDA init (design §3.2).
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.lm_gpu)
+    # Pin the LM to its physical GPU(s) before any CUDA init (design §3.2). For
+    # tp_size>1 the visible-device list length must match --tp (the spawned
+    # workers use local ranks 0..tp-1 as cuda:0..tp-1 within this mask).
+    lm_gpus = [g.strip() for g in str(args.lm_gpu).split(",") if g.strip() != ""]
+    if len(lm_gpus) != args.tp:
+        raise SystemExit(
+            f"--lm-gpu lists {len(lm_gpus)} GPU(s) ({args.lm_gpu!r}) but --tp={args.tp}; "
+            f"pass exactly {args.tp} comma-separated ordinal(s)."
+        )
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(lm_gpus)
 
     from gllm.disagg.config import DisaggConfig
 
@@ -157,7 +180,7 @@ def main():
         kvthresh=args.kvthresh,
         enable_prefix_caching=args.enable_prefix_caching,
         pp_size=1,
-        tp_size=1,
+        tp_size=args.tp,
         use_ep=False,
         assigned_layers=None,
         schedule_method=args.schedule_method,

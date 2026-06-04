@@ -3,13 +3,15 @@
 Drives a :class:`gllm.encoder_engine.EncoderEngine` from the disaggregation
 control plane (design §4.2 / §5):
 
-    for each EncoderJob(seq, item, modality, content, remote_slot):
+    for each EncoderJob(seq, item, modality, content, remote_slots):
         mm_input, grid = processor(content)            # CPU pixel IO
-        push MmItemMeta(num_tokens, grid, hash) -----> LM PP0  (before ViT!)
+        push MmItemMeta(num_tokens, grid, hash) -----> LM TP0  (before ViT!)
         vis = ViT(mm_input)                            # GPU [N_vis, feat_dim]
         send_buf[:N_vis].copy_(vis)
-        nixl.write(send_buf[:N_vis] -> remote_slot, notif="emb:seq:item")
-        nixl.wait(handle)                              # reuse send_buf safely
+        for r in remote_slots:                         # one per LM TP rank
+            nixl.write(send_buf[:N_vis] -> r)          # multi-write, no notif
+        wait(all handles)                              # reuse send_buf safely
+        nixl.notify(TP0, "emb:seq:item")               # single ready signal
 
 Sending the meta *before* the ViT is the whole point of the per-item channel:
 it lets the LM expand its skeleton token-ids and build the prefix-cache key
@@ -31,7 +33,12 @@ import torch
 import zmq
 from logger import logger
 
-from gllm.disagg.discovery import make_discovery, make_payload, payload_nixl_meta
+from gllm.disagg.discovery import (
+    make_discovery,
+    make_payload,
+    payload_agent_names,
+    payload_nixl_metas,
+)
 from gllm.disagg.protocol import EncoderJob, MmItemMeta, emb_notif
 from gllm.encoder_engine import EncoderEngine
 from gllm.transfer.nixl_transfer import NixlEndpoint
@@ -80,9 +87,12 @@ class EncoderRuntime:
         self.send_buf: Optional[torch.Tensor] = None
         self.send_reg = None
         self.disc = None
-        # Current LM connection (single LM in Phase 4; keyed by discovery id).
+        # Current LM connection (single LM node, but one NIXL agent per LM TP
+        # rank under tensor parallelism). ``lm_agent_names`` is rank order
+        # (index 0 == TP0, the meta + notification target); ``lm_zmq_addr`` is
+        # the single TP0 meta intake.
         self.lm_identity: Optional[str] = None
-        self.lm_agent_name: Optional[str] = None
+        self.lm_agent_names: List[str] = []
         self.lm_zmq_addr: Optional[str] = None
         self.lm_payload: Optional[dict] = None  # last LM payload (for re-handshake)
         # NIXL write resilience (design §5.5): retry a failed write with a
@@ -164,7 +174,12 @@ class EncoderRuntime:
             self._disconnect_lm(identity, keep_quiet=True)
         self.lm_identity = identity
         self.lm_payload = payload
-        self.lm_agent_name = self.nixl.connect(payload_nixl_meta(payload))
+        # Connect to every LM TP rank's NIXL agent (rank order); the embedding
+        # is multi-written into all of them. ``add_remote_agent`` order matches
+        # the slot-region order packed into each EncoderJob.
+        self.lm_agent_names = [
+            self.nixl.connect(meta) for meta in payload_nixl_metas(payload)
+        ]
         if self.meta_sock is not None:
             self.meta_sock.close(0)
         self.meta_sock = self.zmq_ctx.socket(zmq.PUSH)
@@ -172,21 +187,22 @@ class EncoderRuntime:
         self.lm_zmq_addr = payload["zmq_addr"]
         logger.info(
             f"[encoder {self.encoder_id}] connected to LM {identity} "
-            f"agent={self.lm_agent_name} meta={self.lm_zmq_addr}"
+            f"agents={self.lm_agent_names} (tp={len(self.lm_agent_names)}) "
+            f"meta={self.lm_zmq_addr}"
         )
 
     def _disconnect_lm(self, identity: str, *, keep_quiet: bool = False) -> None:
         if self.lm_identity != identity:
             return
-        if self.lm_agent_name is not None:
-            self.nixl.disconnect(self.lm_agent_name)
+        for name in self.lm_agent_names:
+            self.nixl.disconnect(name)
         if self.meta_sock is not None:
             self.meta_sock.close(0)
             self.meta_sock = None
         if not keep_quiet:
             logger.info(f"[encoder {self.encoder_id}] LM {identity} left; idle")
         self.lm_identity = None
-        self.lm_agent_name = None
+        self.lm_agent_names = []
         self.lm_zmq_addr = None
 
     # ------------------------------------------------------------------
@@ -262,21 +278,38 @@ class EncoderRuntime:
         # the transport before launching the transfer.
         torch.cuda.synchronize()
 
-        # NIXL WRITE into the LM's reserved slot, sub-sized to the actual item,
-        # with the data-ready notif. Retried with a re-handshake on transient
+        # NIXL multi-WRITE: the full (un-sharded) embedding lands in every LM TP
+        # rank's reserved slot, sub-sized to the actual item. A single notif is
+        # sent to TP0 *after* all writes complete, so TP0's ready gate means
+        # "every rank's write landed". Retried with a re-handshake on transient
         # transport failure (design §5.5).
         nbytes = num_tokens * self.feat_dim * self.send_buf.element_size()
-        remote = job.remote_slot.with_offset(0, nbytes)
-        self._write_with_retry(src, remote, job)
+        remotes = [rs.with_offset(0, nbytes) for rs in job.remote_slots]
+        self._write_with_retry(src, remotes, job)
 
-    def _write_with_retry(self, src, remote, job: EncoderJob) -> None:
+    def _write_with_retry(self, src, remotes, job: EncoderJob) -> None:
         notif = emb_notif(job.seq_id, job.item_idx)
+        # TP0 is the single notification target (rank 0 in the agent list / the
+        # owner of the first slot region).
+        notif_target = (
+            job.lm_agent_names[0]
+            if job.lm_agent_names
+            else remotes[0].agent_name
+        )
         last_err: Optional[BaseException] = None
         for attempt in range(1, self.write_max_attempts + 1):
             try:
-                handle = self.nixl.write(src, remote, notif_msg=notif)
-                self.nixl.wait(handle)
-                self.nixl.release(handle)
+                # Write the full embedding into each LM TP rank's slot
+                # (sequentially: one in-flight transfer at a time keeps the
+                # shared send buffer race-free, same invariant as the single
+                # write). No per-write notif -- a single notif is sent to TP0
+                # only after every rank's write has landed, so TP0's ready gate
+                # means "all ranks done".
+                for remote in remotes:
+                    handle = self.nixl.write(src, remote, notif_msg=b"")
+                    self.nixl.wait(handle)
+                    self.nixl.release(handle)
+                self.nixl.notify(notif_target, notif)
                 return
             except Exception as e:  # transport hiccup: re-handshake + retry
                 last_err = e
@@ -308,10 +341,10 @@ class EncoderRuntime:
     def _ensure_lm(self, attempts: int = 50, sleep_s: float = 0.1) -> bool:
         """Block briefly until the LM is connected (it must be, to dispatch)."""
         for _ in range(attempts):
-            if self.meta_sock is not None and self.lm_agent_name is not None:
+            if self.meta_sock is not None and self.lm_agent_names:
                 return True
             self._drain_discovery()
-            if self.meta_sock is not None and self.lm_agent_name is not None:
+            if self.meta_sock is not None and self.lm_agent_names:
                 return True
             time.sleep(sleep_s)
         return False

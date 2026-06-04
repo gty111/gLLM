@@ -51,18 +51,43 @@ class Event:
 def make_payload(
     *,
     role: str,
-    agent_name: str,
-    nixl_meta: bytes,
+    agent_name: Optional[str] = None,
+    nixl_meta: Optional[bytes] = None,
     zmq_addr: str,
     feat_dim: int = 0,
     processor_config_hash: str = "",
     extra: Optional[dict] = None,
+    agent_names: Optional[List[str]] = None,
+    nixl_metas: Optional[List[bytes]] = None,
 ) -> dict:
-    """Build the discovery payload dict published for a role member."""
+    """Build the discovery payload dict published for a role member.
+
+    A single NIXL agent (the common case: encoder, or a ``tp_size==1`` LM) is
+    published via ``agent_name`` + ``nixl_meta``. An LM with ``tp_size>1``
+    publishes *one agent per TP rank* via ``agent_names`` + ``nixl_metas`` (rank
+    order; index 0 == TP0). Both forms are always emitted (the single-agent keys
+    mirror element 0) so a peer can read either ``payload_nixl_meta`` (first
+    agent) or ``payload_nixl_metas`` (all agents) regardless of how it was
+    built. ``zmq_addr`` is always the single control endpoint (TP0 for an LM).
+    """
+    if nixl_metas is None:
+        assert nixl_meta is not None, "make_payload needs nixl_meta or nixl_metas"
+        nixl_metas = [nixl_meta]
+    if agent_names is None:
+        assert agent_name is not None, "make_payload needs agent_name or agent_names"
+        agent_names = [agent_name]
+    assert len(agent_names) == len(nixl_metas), (
+        f"agent_names ({len(agent_names)}) != nixl_metas ({len(nixl_metas)})"
+    )
+    metas_b64 = [base64.b64encode(m).decode() for m in nixl_metas]
     return {
         "role": role,
-        "agent_name": agent_name,
-        "nixl_meta_b64": base64.b64encode(nixl_meta).decode(),
+        # Single-agent (back-compat) view == element 0.
+        "agent_name": agent_names[0],
+        "nixl_meta_b64": metas_b64[0],
+        # Multi-agent (TP) view: one NIXL agent meta per LM TP rank.
+        "agent_names": list(agent_names),
+        "nixl_metas_b64": metas_b64,
         "zmq_addr": zmq_addr,
         "feat_dim": int(feat_dim),
         "processor_config_hash": processor_config_hash,
@@ -72,6 +97,22 @@ def make_payload(
 
 def payload_nixl_meta(payload: dict) -> bytes:
     return base64.b64decode(payload["nixl_meta_b64"])
+
+
+def payload_nixl_metas(payload: dict) -> List[bytes]:
+    """All per-rank NIXL agent metas (falls back to the single-agent key)."""
+    metas_b64 = payload.get("nixl_metas_b64")
+    if metas_b64 is None:
+        return [base64.b64decode(payload["nixl_meta_b64"])]
+    return [base64.b64decode(m) for m in metas_b64]
+
+
+def payload_agent_names(payload: dict) -> List[str]:
+    """All per-rank NIXL agent names (falls back to the single-agent key)."""
+    names = payload.get("agent_names")
+    if names is None:
+        return [payload["agent_name"]]
+    return list(names)
 
 
 def _now_ms() -> float:

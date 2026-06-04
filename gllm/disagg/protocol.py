@@ -10,8 +10,8 @@ each other's heavy modules.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
 from gllm.transfer.nixl_transfer import RemoteRegion
 
@@ -22,25 +22,37 @@ class EncoderJob:
 
     ``content`` is the *raw* mm reference (image URL / path / base64 / video
     ref) exactly as the OpenAI request carried it -- the encoder owns all pixel
-    IO + processing (design §3.1). ``remote_slot`` is the pre-registered NIXL
-    region the encoder must WRITE the embedding into; ``slot_id`` is echoed back
-    in the notification so the LM can match the write to the reservation.
+    IO + processing (design §3.1).
+
+    Under LM tensor parallelism the *same* visual embedding is needed (full,
+    un-sharded) on every LM TP rank, so the embedding is multi-written: one
+    NIXL region per LM TP rank in ``remote_slots`` (rank order; index 0 == TP0),
+    all sharing the same ``slot_id``. The encoder writes all of them and then
+    sends a *single* notification to TP0 (``lm_agent_names[0]``), so TP0's
+    embedding-ready gate implicitly means "every rank's write landed". For
+    ``tp_size == 1`` both lists have length one and this reduces to the original
+    single-write path.
     """
 
     seq_id: int
     # Item index in *prompt order* (matching the skeleton sentinel order):
-    # ``LMDisaggManager._try_dispatch`` assigns it by ``enumerate(mm_items)``,
+    # ``DisaggCoordinator._try_dispatch`` assigns it by ``enumerate(mm_items)``,
     # so it pairs the i-th sentinel with the i-th encoder job regardless of
     # modality interleaving.
     item_idx: int
     modality: str  # "image" | "video"
     content: object
-    remote_slot: RemoteRegion
-    slot_id: int
-    # LM meta-channel + NIXL agent so a freshly discovered encoder can reply
-    # without a separate registry round-trip (design §5.2 / §7.3).
+    # One pre-registered NIXL slot region per LM TP rank (rank order). The
+    # encoder WRITEs the embedding into each; ``slot_id`` (identical across
+    # ranks) is echoed back in the notification so the LM can match the write to
+    # the reservation.
+    remote_slots: List[RemoteRegion] = field(default_factory=list)
+    slot_id: int = -1
+    # LM meta-channel (TP0) + per-rank NIXL agent names so a freshly discovered
+    # encoder can reply without a separate registry round-trip (design §5.2 /
+    # §7.3). ``lm_agent_names[0]`` is TP0 and is the single notification target.
     lm_meta_addr: str = ""
-    lm_agent_name: str = ""
+    lm_agent_names: List[str] = field(default_factory=list)
 
 
 @dataclass

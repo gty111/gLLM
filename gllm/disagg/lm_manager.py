@@ -1,29 +1,37 @@
-"""LM PP0 side of encoder disaggregation: slot pool + per-item aggregator.
+"""LM-side encoder disaggregation: per-rank receiver + TP0 coordinator.
 
-Lives in the LM PP0 worker process (one per LM node; TP>1 is Phase 5). It:
+Native LM tensor parallelism (``tp_size >= 1``, ``pp_size == 1``) is supported by
+splitting the old monolithic manager into two roles (design: "control
+centralized, data multi-write"):
 
-1. Owns the **NIXL receive slot pool** -- a single persistent registered GPU
-   tensor ``[num_slots, max_vis_tokens, feat_dim]`` carved into per-item slots
-   the encoder WRITEs into (design §5.3).
-2. **Dispatches** one :class:`EncoderJob` per mm item to the encoder over ZMQ,
-   handing it the reserved slot's :class:`RemoteRegion`.
-3. **Aggregates** the per-item control plane: :class:`MmItemMeta` (ZMQ) gives
-   ``num_tokens``/``grid``/``content_hash`` so the skeleton token-ids can be
-   expanded and the prefix-cache key built; the NIXL notification gives the
-   "embedding bytes landed" gate (design §5.4 / §6.2).
-4. **Admits** a request to the scheduler as soon as *all* per-item meta have
-   arrived (design §6.2 gate A: token positions + prefix-cache hashes are then
-   determined). The expanded ``token_ids``/``hash_token_ids``/grids/mrope are
-   built and a :class:`DisaggSeqState` is registered in the model runner with
-   per-item readiness + (initially empty) embeddings.
-5. As each item's NIXL write lands, the embedding is cloned out of the slot
-   pool into ``model_runner.disagg_embeds`` and ``embedding_ready[i]`` is set
-   (design §6.2 gate B). The scheduler prefills the text prefix + already-ready
-   image spans while later items' ViT is still in flight -- intra-request
-   encode/prefill overlap. The slot is returned to the free pool per item.
+* :class:`DisaggReceiver` -- one per **every PP0 TP rank**. Owns that rank's
+  NIXL receive slot pool (a persistent registered GPU tensor
+  ``[num_slots, max_vis_tokens, feat_dim]``). The encoder multi-writes the
+  *full* (un-sharded) visual embedding into every rank's pool; the receiver
+  just clones a ready slot into ``model_runner.disagg_embeds`` on command.
+  No ZMQ / discovery / dispatch logic.
 
-Output stays byte-identical to the monolith: the only change vs. Phase 3b is
-*when* prefill is allowed to advance, not *what* is computed.
+* :class:`DisaggCoordinator` -- **TP0 only**. Owns the control plane: the
+  :class:`MmItemMeta` ZMQ intake, encoder discovery + NIXL handshake, per-item
+  :class:`EncoderJob` dispatch (carrying one slot region per LM TP rank),
+  meta/notification aggregation, the re-dispatch watchdog, and slot
+  reservation. It is the single authority that decides *when* a seq is admitted
+  and *when* each embedding is ready, emitting those decisions as a
+  :class:`DisaggEvents` stream once per iteration.
+
+Determinism (column-driver model): the coordinator runs only on TP0 (== rank
+0), and its per-iteration :class:`DisaggEvents` are fanned out to every PP0 TP
+rank alongside the normal ``broadcast_input_to_tp`` input. Each rank applies the
+*same* events in the *same* iteration -- ``ADMIT`` rebuilds the expanded
+``Sequence`` into the scheduler, ``EMB_READY`` clones the embedding from that
+rank's *own* slot pool -- so every column's scheduler / model runner stays in
+lockstep. The encoder writes all N rank pools then sends a *single*
+notification to TP0, so TP0's embedding-ready gate implies "every rank's write
+landed".
+
+Output stays byte-identical to the monolith (and to the original ``tp_size==1``
+disagg): the only change vs. the monolith is *when* prefill is allowed to
+advance, not *what* is computed.
 """
 
 from __future__ import annotations
@@ -31,8 +39,8 @@ from __future__ import annotations
 import os
 import pickle
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from logger import logger
@@ -51,12 +59,13 @@ class _PendingItem:
     slot_id: int
     meta: Optional[MmItemMeta] = None
     embedding_ready: bool = False
-    # Set once the embedding has been cloned out of the slot pool into the
-    # model runner's ``disagg_embeds`` and the slot returned to the free list.
+    # Set once the EMB_READY event for this item has been emitted (its slot
+    # returned to the free list). The actual clone out of the slot pool happens
+    # per-rank when the event is applied; the coordinator only tracks emission.
     slot_freed: bool = False
     # Phase 8 failure handling (design §5.5.2): the raw item content is retained
-    # so the PP0 watchdog can RE-DISPATCH the EncoderJob to another replica if
-    # the original encoder crashes / goes silent. Dropped once the item is done.
+    # so the watchdog can RE-DISPATCH the EncoderJob to another replica if the
+    # original encoder crashes / goes silent. Dropped once the item is done.
     content: object = None
     encoder_identity: Optional[str] = None  # replica it was last sent to
     dispatched_at: float = 0.0              # monotonic time of last (re)dispatch
@@ -84,11 +93,11 @@ class _PendingSeq:
     seq: object
     items: List[_PendingItem]
     dispatched: bool = False
-    # Phase 6 overlap: a seq is *admitted* to the scheduler once all per-item
-    # meta arrive (positions/hashes determined; gate A); its embeddings then
-    # stream in progressively (gate B). ``ordered`` is the image-then-video
-    # ordering of ``items`` (== ``embed_multimodal`` tuple order and the order
-    # of :class:`DisaggSeqState`), fixed at admission.
+    # A seq is *admitted* once all per-item meta arrive (positions/hashes
+    # determined; gate A); its embeddings then stream in progressively (gate B).
+    # ``ordered`` is the image-then-video ordering of ``items`` (== the
+    # ``embed_multimodal`` tuple order and the order of :class:`DisaggSeqState`),
+    # fixed at admission.
     admitted: bool = False
     ordered: Optional[List[_PendingItem]] = None
     # Number of image/video sentinels in the skeleton ``seq.token_ids``. The
@@ -117,54 +126,55 @@ class _PendingSeq:
         return all(it.embedding_ready for it in self.items)
 
 
-class LMDisaggManager:
+@dataclass
+class DisaggEvents:
+    """Per-iteration disagg control decisions, generated authoritatively on TP0.
+
+    Fanned out to every PP0 TP rank (riding the normal ``broadcast_input_to_tp``
+    input) so each column applies the identical decisions in the identical
+    iteration -- the basis of column-driver determinism under TP>1.
+    """
+
+    # (expanded ``Sequence``, freshly-built :class:`DisaggSeqState`):
+    # register the state + add the seq to the scheduler.
+    admits: List[Tuple[object, DisaggSeqState]] = field(default_factory=list)
+    # (seq_id, ordered_idx, slot_id, num_tokens): clone the embedding from this
+    # rank's *own* slot pool into ``model_runner.disagg_embeds``.
+    emb_ready: List[Tuple[int, int, int, int]] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.admits or self.emb_ready)
+
+
+class DisaggReceiver:
+    """Per-PP0-TP-rank NIXL receive endpoint + slot pool (data plane).
+
+    One per LM TP rank. The encoder multi-writes the full visual embedding into
+    every rank's pool; only TP0 receives the completion notification (handled by
+    :class:`DisaggCoordinator`). A receiver carries no control logic -- it
+    registers memory, exposes per-slot :class:`RemoteRegion` descriptors, and
+    clones ready slots into the model runner when the coordinator's fanned-out
+    ``EMB_READY`` events say so.
+    """
+
     def __init__(
         self,
         model_runner: ModelRunner,
-        lm_id: str,
-        discovery_endpoint: str,
         *,
-        processor_config_hash: str = "",
-        advertise_host: str = "127.0.0.1",
-        meta_bind: str = "tcp://0.0.0.0:0",
-        num_slots: int = 32,
-        max_vis_tokens: int = 16384,
+        lm_id: str,
+        tp_rank: int,
+        num_slots: int,
+        max_vis_tokens: int,
         nixl_backend: str = "UCX",
-        encoder_dp: int = 1,
     ):
         self.mr = model_runner
         self.lm_id = lm_id
-        self.discovery_endpoint = discovery_endpoint
-        self.processor_config_hash = processor_config_hash
-        self.advertise_host = advertise_host
-        self.meta_bind = meta_bind
+        self.tp_rank = tp_rank
         self.num_slots = num_slots
         self.max_vis_tokens = max_vis_tokens
         self.nixl_backend = nixl_backend
-        self.encoder_dp = max(1, int(encoder_dp))
-        # Phase 6 intra-request encode/prefill overlap (design §6.2). When on
-        # (default), a seq is admitted as soon as all meta arrive and prefill
-        # advances per-item under the two-layer gate. When off, admission waits
-        # for *all* embeddings (Phase 3b timing) -> single-chunk prefill, which
-        # is byte-identical to the unchunked monolith (used as a determinism
-        # baseline, since chunked prefill is not itself bit-exact w.r.t. chunk
-        # boundaries in this engine).
-        self.overlap = os.environ.get("GLLM_DISAGG_OVERLAP", "1") != "0"
-        # Phase 8 watchdog (design §5.5.2, §8 row 8): an in-flight item whose
-        # encoder has gone silent (no meta/embedding within the timeout) or whose
-        # encoder left the pool (orphaned) is re-dispatched to a live replica,
-        # reusing the same slot (idempotent overwrite, §5.5.3). After
-        # ``max_redispatch_attempts`` we stop retrying that item.
-        self.redispatch_timeout_s = float(
-            os.environ.get("GLLM_DISAGG_REDISPATCH_TIMEOUT_S", "20.0")
-        )
-        self.max_redispatch_attempts = int(
-            os.environ.get("GLLM_DISAGG_MAX_REDISPATCH", "5")
-        )
 
         cfg = self.mr.model.config
-        self.image_token_id = int(cfg.image_token_id)
-        self.video_token_id = int(cfg.video_token_id)
         self.feat_dim = int(
             cfg.vision_config.out_hidden_size
             * (1 + len(getattr(cfg.vision_config, "deepstack_visual_indexes", [])))
@@ -172,53 +182,22 @@ class LMDisaggManager:
         self.dtype = self.mr.model_loader.dtype
         self.device = next(self.mr.model.parameters()).device
 
-        # ZMQ / NIXL state (built in setup()).
-        import zmq
-
-        self._zmq = zmq
-        self.zmq_ctx = None
-        self.meta_sock = None  # PULL: MmItemMeta in
         self.nixl: Optional[NixlEndpoint] = None
-        self.meta_addr: str = ""
-
-        # Discovery + dynamic encoder registry (identity -> _EncoderConn).
-        self.disc = None
-        self._encoders: Dict[str, _EncoderConn] = {}
-        self._rr_encoder_idx = 0
-        # The PP0 overlap loop spins at full rate when idle; throttle the
-        # (networked) discovery poll so it doesn't flood the registry with
-        # thousands of list RPCs/sec. 200ms is well within connect latency SLO.
-        self._disc_poll_interval_s = 0.2
-        self._last_disc_poll = 0.0
-
-        # Slot pool.
         self.slot_pool: Optional[torch.Tensor] = None
         self.slot_reg = None
         self.pool_region: Optional[RemoteRegion] = None
         self.slot_stride_bytes = 0
-        self._free_slots: List[int] = []
-
-        # Bookkeeping.
-        self._pending: Dict[int, _PendingSeq] = {}  # seq_id -> _PendingSeq
-        self._admission_q: List[object] = []  # seqs waiting for free slots
-        # meta/notif that arrived before the seq was registered (rare race).
-        self._orphan_meta: List[MmItemMeta] = []
 
     # ------------------------------------------------------------------
     def setup(self) -> None:
-        self.zmq_ctx = self._zmq.Context.instance()
-        self.meta_sock = self.zmq_ctx.socket(self._zmq.PULL)
-        self.meta_sock.bind(self.meta_bind)
-        bound = self.meta_sock.getsockopt(self._zmq.LAST_ENDPOINT).decode()
-        port = bound.rsplit(":", 1)[-1]
-        self.meta_addr = f"tcp://{self.advertise_host}:{port}"
-
+        # One NIXL agent per LM TP rank (distinct names so the encoder can add
+        # all of them as remote agents and write each independently).
         self.nixl = NixlEndpoint(
-            name=f"lm-{self.lm_id}", backends=(self.nixl_backend,)
+            name=f"lm-{self.lm_id}-tp{self.tp_rank}", backends=(self.nixl_backend,)
         )
-        # Zero-init (not ``empty``): a slot is read only after its NIXL write
-        # notif, but zero-init makes any accidental early read fail loudly
-        # (all-zero embedding) instead of leaking uninitialized garbage.
+        # Zero-init (not ``empty``): a slot is read only after its NIXL write,
+        # but zero-init makes any accidental early read fail loudly (all-zero
+        # embedding) instead of leaking uninitialized garbage.
         self.slot_pool = torch.zeros(
             (self.num_slots, self.max_vis_tokens, self.feat_dim),
             dtype=self.dtype,
@@ -231,28 +210,177 @@ class LMDisaggManager:
         self.slot_stride_bytes = (
             self.max_vis_tokens * self.feat_dim * self.slot_pool.element_size()
         )
-        self._free_slots = list(range(self.num_slots))
+        logger.info(
+            f"[lm-disagg {self.lm_id} tp{self.tp_rank}] receiver up: slot pool "
+            f"{self.num_slots}x{self.max_vis_tokens}x{self.feat_dim} "
+            f"({self.dtype}) agent={self.nixl.name}"
+        )
 
-        # Publish self + watch encoders. We do NOT block on encoders: text-only
-        # requests serve immediately, and mm requests queue in the admission
-        # queue until a replica connects (any start order, design §7.3.4).
+    def slot_region(self, slot_id: int) -> RemoteRegion:
+        return self.pool_region.with_offset(
+            slot_id * self.slot_stride_bytes, self.slot_stride_bytes
+        )
+
+    def handshake(self) -> dict:
+        """Per-rank NIXL handshake info gathered to TP0 during setup."""
+        return {
+            "agent_name": self.nixl.name,
+            "nixl_meta": self.nixl.local_meta(),
+            "region": self.pool_region,
+        }
+
+    def sync(self) -> None:
+        """Make landed NIXL writes visible to subsequent clones.
+
+        The NIXL notification only signals the WRITE completed; this device must
+        be synchronized before reading so the written bytes are visible to the
+        clone (mirrors ``tests/test_nixl_transfer.py``'s post-notif sync). One
+        sync per batch of clones is sufficient.
+        """
+        torch.cuda.synchronize(self.device)
+
+    @torch.inference_mode()
+    def clone_slot(self, slot_id: int, num_tokens: int) -> torch.Tensor:
+        """Clone one item's embedding out of the local slot pool. Call
+        :meth:`sync` once before a batch of clones."""
+        return self.slot_pool[slot_id, :num_tokens, :].clone()
+
+
+class DisaggCoordinator:
+    """TP0-only control plane for encoder disaggregation.
+
+    Owns ZMQ meta intake, encoder discovery + NIXL handshake, per-item
+    :class:`EncoderJob` dispatch (one slot region per LM TP rank), aggregation,
+    the re-dispatch watchdog, and slot reservation. Produces a per-iteration
+    :class:`DisaggEvents` stream; it never mutates the model runner directly --
+    the events are applied uniformly by every column (including TP0) so all
+    ranks stay deterministic.
+
+    The NIXL endpoint used to connect to encoders and to receive completion
+    notifications is **TP0's own** :class:`DisaggReceiver` endpoint (the encoder
+    only notifies TP0). The slot regions for the *other* ranks are gathered into
+    ``rank_handshakes`` at setup and packed into each :class:`EncoderJob`.
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        recv: DisaggReceiver,
+        *,
+        rank_handshakes: List[dict],
+        lm_id: str,
+        discovery_endpoint: str,
+        processor_config_hash: str = "",
+        advertise_host: str = "127.0.0.1",
+        meta_bind: str = "tcp://0.0.0.0:0",
+        num_slots: int = 32,
+        nixl_backend: str = "UCX",
+        encoder_dp: int = 1,
+    ):
+        self.mr = model_runner
+        self.recv = recv  # TP0 receiver: owns the NIXL endpoint + notifs
+        self.lm_id = lm_id
+        self.discovery_endpoint = discovery_endpoint
+        self.processor_config_hash = processor_config_hash
+        self.advertise_host = advertise_host
+        self.meta_bind = meta_bind
+        self.num_slots = num_slots
+        self.nixl_backend = nixl_backend
+        self.encoder_dp = max(1, int(encoder_dp))
+
+        # Per-rank NIXL slot-pool regions (rank order; index 0 == TP0) gathered
+        # at setup; one EncoderJob carries one sub-region per rank.
+        self.rank_regions: List[RemoteRegion] = [h["region"] for h in rank_handshakes]
+        self.rank_agent_names: List[str] = [h["agent_name"] for h in rank_handshakes]
+        self.rank_metas: List[bytes] = [h["nixl_meta"] for h in rank_handshakes]
+        self.num_ranks = len(rank_handshakes)
+        self.slot_stride_bytes = recv.slot_stride_bytes
+
+        # Phase 6 intra-request encode/prefill overlap (design §6.2). When on
+        # (default), a seq is admitted as soon as all meta arrive and prefill
+        # advances per-item under the two-layer gate. When off, admission waits
+        # for *all* embeddings (Phase 3b timing) -> single-chunk prefill, which
+        # is byte-identical to the unchunked monolith (used as a determinism
+        # baseline).
+        self.overlap = os.environ.get("GLLM_DISAGG_OVERLAP", "1") != "0"
+        # Phase 8 watchdog (design §5.5.2): an in-flight item whose encoder has
+        # gone silent or left the pool is re-dispatched to a live replica,
+        # reusing the same slot (idempotent overwrite). After
+        # ``max_redispatch_attempts`` we stop retrying that item.
+        self.redispatch_timeout_s = float(
+            os.environ.get("GLLM_DISAGG_REDISPATCH_TIMEOUT_S", "20.0")
+        )
+        self.max_redispatch_attempts = int(
+            os.environ.get("GLLM_DISAGG_MAX_REDISPATCH", "5")
+        )
+
+        cfg = self.mr.model.config
+        self.image_token_id = int(cfg.image_token_id)
+        self.video_token_id = int(cfg.video_token_id)
+        self.feat_dim = recv.feat_dim
+
+        # ZMQ state (built in setup()).
+        import zmq
+
+        self._zmq = zmq
+        self.zmq_ctx = None
+        self.meta_sock = None  # PULL: MmItemMeta in
+        self.meta_addr: str = ""
+
+        # Discovery + dynamic encoder registry (identity -> _EncoderConn).
+        self.disc = None
+        self._encoders: Dict[str, _EncoderConn] = {}
+        self._rr_encoder_idx = 0
+        # The PP0 overlap loop spins at full rate when idle; throttle the
+        # (networked) discovery poll so it doesn't flood the registry.
+        self._disc_poll_interval_s = 0.2
+        self._last_disc_poll = 0.0
+
+        # Slot pool reservation (shared layout across all ranks -- a slot_id
+        # names the same byte range in every rank's pool).
+        self._free_slots: List[int] = list(range(self.num_slots))
+
+        # Bookkeeping.
+        self._pending: Dict[int, _PendingSeq] = {}  # seq_id -> _PendingSeq
+        self._admission_q: List[object] = []  # seqs waiting for free slots
+        # meta/notif that arrived before the seq was registered (rare race).
+        self._orphan_meta: List[MmItemMeta] = []
+
+    @property
+    def nixl(self) -> NixlEndpoint:
+        return self.recv.nixl
+
+    # ------------------------------------------------------------------
+    def setup(self) -> None:
+        self.zmq_ctx = self._zmq.Context.instance()
+        self.meta_sock = self.zmq_ctx.socket(self._zmq.PULL)
+        self.meta_sock.bind(self.meta_bind)
+        bound = self.meta_sock.getsockopt(self._zmq.LAST_ENDPOINT).decode()
+        port = bound.rsplit(":", 1)[-1]
+        self.meta_addr = f"tcp://{self.advertise_host}:{port}"
+
+        # Publish self (all rank agent metas + the single TP0 meta intake) +
+        # watch encoders. We do NOT block on encoders: text-only requests serve
+        # immediately, and mm requests queue in the admission queue until a
+        # replica connects (any start order, design §7.3.4).
         self.disc = make_discovery(self.discovery_endpoint)
         self.disc.publish(
             "lm",
             self.lm_id,
             make_payload(
                 role="lm",
-                agent_name=self.nixl.name,
-                nixl_meta=self.nixl.local_meta(),
+                agent_names=self.rank_agent_names,
+                nixl_metas=self.rank_metas,
                 zmq_addr=self.meta_addr,
                 feat_dim=self.feat_dim,
                 processor_config_hash=self.processor_config_hash,
             ),
         )
         logger.info(
-            f"[lm-disagg {self.lm_id}] meta intake at {self.meta_addr}; slot pool "
-            f"{self.num_slots}x{self.max_vis_tokens}x{self.feat_dim} ({self.dtype}); "
-            f"watching encoders via {self.discovery_endpoint}"
+            f"[lm-disagg {self.lm_id}] coordinator up: meta intake at "
+            f"{self.meta_addr}; {self.num_ranks} TP rank slot pool(s) "
+            f"(agents={self.rank_agent_names}); watching encoders via "
+            f"{self.discovery_endpoint}"
         )
         self._drain_discovery(force=True)
 
@@ -289,6 +417,9 @@ class LMDisaggManager:
             return
         if reconnect and identity in self._encoders:
             self._disconnect_encoder(identity, keep_quiet=True)
+        # TP0 connects to the encoder so it can receive the single completion
+        # notification (the other ranks are write-only targets and never add the
+        # encoder as a remote agent).
         agent = self.nixl.connect(payload_nixl_meta(payload))
         sock = self.zmq_ctx.socket(self._zmq.PUSH)
         sock.connect(payload["zmq_addr"])
@@ -314,8 +445,7 @@ class LMDisaggManager:
             pass
         self.nixl.disconnect(conn.agent_name)
         # Phase 8 (design §5.5.2): orphan any in-flight item routed to the
-        # departed replica so the watchdog re-dispatches it immediately (rather
-        # than waiting out the full timeout) once another replica is live.
+        # departed replica so the watchdog re-dispatches it immediately.
         orphaned = 0
         for ps in self._pending.values():
             for item in ps.items:
@@ -341,10 +471,11 @@ class LMDisaggManager:
             f"free slots={len(self._free_slots)})"
         )
 
-    def _slot_region(self, slot_id: int) -> RemoteRegion:
-        return self.pool_region.with_offset(
-            slot_id * self.slot_stride_bytes, self.slot_stride_bytes
-        )
+    def _slot_regions(self, slot_id: int) -> List[RemoteRegion]:
+        """One full-slot region per LM TP rank (the encoder sub-sizes each to
+        the actual item with ``with_offset(0, nbytes)``)."""
+        off = slot_id * self.slot_stride_bytes
+        return [r.with_offset(off, self.slot_stride_bytes) for r in self.rank_regions]
 
     def _pick_encoder(self, avoid: Optional[str] = None) -> Optional[_EncoderConn]:
         """Round-robin a live encoder, preferring one other than ``avoid``."""
@@ -364,9 +495,9 @@ class LMDisaggManager:
     ) -> bool:
         """Send (or re-send) the EncoderJob for ``item`` to a live encoder.
 
-        Re-dispatch reuses the same ``slot_id`` (same registered NIXL region):
-        the encoder overwrites it idempotently (design §5.5.3). Returns False if
-        no encoder is currently live (caller retries on a later poll)."""
+        Re-dispatch reuses the same ``slot_id`` (same registered NIXL regions):
+        the encoder overwrites them idempotently (design §5.5.3). Returns False
+        if no encoder is currently live (caller retries on a later poll)."""
         conn = self._pick_encoder(avoid=avoid)
         if conn is None:
             return False
@@ -375,10 +506,10 @@ class LMDisaggManager:
             item_idx=item.item_idx,
             modality=item.modality,
             content=item.content,
-            remote_slot=self._slot_region(item.slot_id),
+            remote_slots=self._slot_regions(item.slot_id),
             slot_id=item.slot_id,
             lm_meta_addr=self.meta_addr,
-            lm_agent_name=self.nixl.name,
+            lm_agent_names=list(self.rank_agent_names),
         )
         conn.job_sock.send(pickle.dumps(job))
         item.encoder_identity = conn.identity
@@ -440,8 +571,8 @@ class LMDisaggManager:
                 f"routing=[{routing}] across {len(self._encoders)} encoder(s)"
             )
             # Drop the raw mm payload off the *sequence* now that it's on its way:
-            # the LM/KV path never holds pixels (design §3.1 / §4.4). The manager
-            # keeps a transient per-item copy only for re-dispatch resilience.
+            # the LM/KV path never holds pixels (design §3.1 / §4.4). The
+            # coordinator keeps a transient per-item copy only for re-dispatch.
             seq.mm_items = None
             seq.mm_contents = None
             self._apply_orphans(ps)
@@ -475,8 +606,7 @@ class LMDisaggManager:
             return
         # Defensive bounds check: a buggy/corrupted encoder peer could send an
         # item_idx outside this seq's skeleton-ordered items. Drop it rather
-        # than let an IndexError tear down the shared PP0 disagg loop and stall
-        # every other in-flight request.
+        # than let an IndexError tear down the shared PP0 disagg loop.
         if not 0 <= meta.item_idx < len(ps.items):
             logger.error(
                 f"[lm-disagg {self.lm_id}] dropping meta with out-of-range "
@@ -506,8 +636,14 @@ class LMDisaggManager:
         item.meta = meta
 
     def _drain_notifs(self) -> None:
+        """Mark items whose (single, TP0) completion notification has arrived.
+
+        The encoder multi-writes every rank's slot pool and then sends ONE notif
+        to TP0, so receipt here implies *all* ranks' writes have landed. The
+        actual clone into each rank's model runner happens when the resulting
+        ``EMB_READY`` event is applied (per rank, from its own pool).
+        """
         notifs = self.nixl.poll_notifs()
-        touched: set = set()
         for _agent, msgs in notifs.items():
             for msg in msgs:
                 parsed = parse_emb_notif(msg)
@@ -517,54 +653,19 @@ class LMDisaggManager:
                 ps = self._pending.get(seq_id)
                 if ps is None:
                     continue
-                # Ignore stray/malformed notifs whose item_idx is out of range
-                # for this seq instead of crashing the poll loop (mirrors the
-                # bounds guard in _apply_meta).
+                # Ignore stray/malformed notifs whose item_idx is out of range.
                 if not 0 <= item_idx < len(ps.items):
                     continue
                 item = ps.items[item_idx]
                 if item.embedding_ready:
                     # Idempotent: duplicate notification from a re-dispatched (or
-                    # zombie) write. The first one already marked it ready; the
-                    # slot-free guard in _flush_ready_clones prevents re-cloning.
+                    # zombie) write. The emit guard (``slot_freed``) prevents a
+                    # second EMB_READY event.
                     continue
                 item.embedding_ready = True
-                touched.add(seq_id)
-        # Clone freshly-landed embeddings into the model runner (gate B). For a
-        # seq not yet admitted (meta still incomplete) the clones are deferred
-        # to ``_admit_meta_complete``; the slots stay reserved until then.
-        for seq_id in touched:
-            self._flush_ready_clones(self._pending[seq_id])
-
-    @torch.inference_mode()
-    def _flush_ready_clones(self, ps: _PendingSeq) -> None:
-        """Clone ready item embeddings slot-pool -> ``disagg_embeds`` (gate B).
-
-        Only runs for admitted seqs (``disagg_embeds`` row exists). The NIXL
-        notification only signals the WRITE completed; we must synchronize this
-        device before reading so the written bytes are visible to the clone
-        (mirrors ``tests/test_nixl_transfer.py``'s post-notif sync). One sync
-        per batch of clones is sufficient.
-        """
-        if not ps.admitted or ps.ordered is None:
-            return
-        todo = [
-            (o, it)
-            for o, it in enumerate(ps.ordered)
-            if it.embedding_ready and not it.slot_freed
-        ]
-        if not todo:
-            return
-        torch.cuda.synchronize(self.device)
-        for o, it in todo:
-            emb = self.slot_pool[it.slot_id, : it.meta.num_tokens, :].clone()
-            self.mr.disagg_set_embedding(ps.seq.seq_id, o, emb)
-            self._free_slots.append(it.slot_id)
-            it.slot_freed = True
-            it.content = None  # done: drop retained payload (no re-dispatch)
 
     # ------------------------------------------------------------------
-    # Poll: admit meta-complete seqs; reap fully-embedded ones
+    # Poll: admit meta-complete seqs; emit ready embeddings; reap done ones
     # ------------------------------------------------------------------
     def _check_watchdog(self) -> None:
         """Re-dispatch in-flight items whose encoder crashed/went silent.
@@ -572,8 +673,7 @@ class LMDisaggManager:
         Triggers (design §5.5.2): the item's encoder left the pool (orphaned,
         ``encoder_identity is None``) or no meta/embedding landed within
         ``redispatch_timeout_s``. Re-dispatch reuses the same slot and avoids the
-        suspect replica when another is available. Items not yet ``done`` and not
-        yet exhausted are retried; the slot stays reserved throughout."""
+        suspect replica when another is available."""
         if not self._encoders:
             return  # nowhere to re-dispatch to; hold until a replica appears
         now = time.monotonic()
@@ -620,14 +720,15 @@ class LMDisaggManager:
                 it.slot_freed = True
         self._try_dispatch()
 
-    def poll(self) -> List[object]:
+    def poll(self) -> DisaggEvents:
+        """Drive the control plane one step; return this iteration's events."""
+        events = DisaggEvents()
         self._drain_discovery()
         self._try_dispatch()
         self._drain_meta()
         self._drain_notifs()
         self._check_watchdog()
 
-        admitted: List[object] = []
         freed_any = False
         for seq_id, ps in list(self._pending.items()):
             admit_ready = ps.meta_complete and (
@@ -642,7 +743,7 @@ class LMDisaggManager:
                     f"overlap={'on' if self.overlap else 'off'})"
                 )
                 try:
-                    self._admit_meta_complete(ps)  # sets ps.admitted
+                    self._admit_meta_complete(ps, events)  # sets ps.admitted
                 except Exception:
                     # A single malformed seq must never take down the PP0 poll
                     # loop (and with it every other in-flight request). Log,
@@ -654,26 +755,42 @@ class LMDisaggManager:
                     )
                     self._abort_pending(seq_id)
                     continue
-                admitted.append(ps.seq)
-            if ps.admitted and ps.all_embeddings_ready:
-                # All embeddings cloned out + slots freed; the seq now lives
-                # entirely in the scheduler / model runner.
+            if ps.admitted:
+                # Emit EMB_READY for items whose write has landed but whose event
+                # hasn't been generated yet (covers both notif-arrival and the
+                # overlap-off case where all embeddings landed before admit).
+                self._emit_ready(ps, events)
+            if ps.admitted and all(it.slot_freed for it in ps.items):
+                # All embeddings emitted + slots freed; the seq now lives
+                # entirely in the scheduler / model runner of every column.
                 logger.debug(
                     f"[lm-disagg {self.lm_id}] seq={seq_id} all {ps.num_items} "
-                    f"embeddings landed; releasing tracking"
+                    f"embeddings emitted; releasing tracking"
                 )
                 del self._pending[seq_id]
                 freed_any = True
-        if admitted or freed_any:
+        if events.admits or freed_any:
             # Freed slots may unblock queued admissions.
             self._try_dispatch()
-        return admitted
+        return events
+
+    def _emit_ready(self, ps: _PendingSeq, events: DisaggEvents) -> None:
+        """Emit EMB_READY events for newly-landed item embeddings (gate B)."""
+        if ps.ordered is None:
+            return
+        for o, it in enumerate(ps.ordered):
+            if not it.embedding_ready or it.slot_freed:
+                continue
+            events.emb_ready.append((ps.seq.seq_id, o, it.slot_id, it.meta.num_tokens))
+            self._free_slots.append(it.slot_id)
+            it.slot_freed = True
+            it.content = None  # done: drop retained payload (no re-dispatch)
 
     # ------------------------------------------------------------------
-    # Admit: build expanded token-ids + grids + register gate state (== monolith)
+    # Admit: build expanded token-ids + grids + DisaggSeqState (== monolith)
     # ------------------------------------------------------------------
     @torch.inference_mode()
-    def _admit_meta_complete(self, ps: _PendingSeq) -> None:
+    def _admit_meta_complete(self, ps: _PendingSeq, events: DisaggEvents) -> None:
         seq = ps.seq
         items = ps.items  # token order
 
@@ -744,30 +861,29 @@ class LMDisaggManager:
         seq.cur_length = seq.prompt_len
         seq._mm_precomputed = None
 
-        # 7) Register gate state (ordered = image-then-video). Spans for ordered
-        #    items map back through their token-order ``item_idx``.
+        # 7) Build the gate state (ordered = image-then-video). Spans for ordered
+        #    items map back through their token-order ``item_idx``. Emit an ADMIT
+        #    event; every column registers its own copy + adds the seq to its
+        #    scheduler (the broadcast pickles a fresh state per rank).
         prompt_len = len(expanded)
-        self.mr.disagg_register(
-            seq.seq_id,
-            DisaggSeqState(
-                num_items=len(ordered),
-                item_span=[token_span[it.item_idx] for it in ordered],
-                item_modality=[it.modality for it in ordered],
-                item_ready=[False] * len(ordered),
-                item_embed=[None] * len(ordered),
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                input_ids_cpu=input_ids_cpu,
-                is_multimodal_cpu=is_multimodal_cpu,
-                prompt_positions=prompt_positions,
-                mrope_position_delta=mrope_position_delta,
-                prompt_len=prompt_len,
-            ),
+        state = DisaggSeqState(
+            num_items=len(ordered),
+            item_span=[token_span[it.item_idx] for it in ordered],
+            item_modality=[it.modality for it in ordered],
+            item_ready=[False] * len(ordered),
+            item_embed=[None] * len(ordered),
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            input_ids_cpu=input_ids_cpu,
+            is_multimodal_cpu=is_multimodal_cpu,
+            prompt_positions=prompt_positions,
+            mrope_position_delta=mrope_position_delta,
+            prompt_len=prompt_len,
         )
 
-        # 8) Mark admitted *before* flushing so the clone path (gated on
-        #    ``ps.admitted``) runs for embeddings that landed before admission
-        #    -- critical when admission waits for all embeddings (overlap off),
-        #    where no further notif would re-trigger the flush.
+        # 8) Mark admitted *before* emitting ready so the emit path runs for
+        #    embeddings that landed before admission -- critical when admission
+        #    waits for all embeddings (overlap off), where no further notif would
+        #    re-trigger the emit.
         ps.admitted = True
-        self._flush_ready_clones(ps)
+        events.admits.append((seq, state))
