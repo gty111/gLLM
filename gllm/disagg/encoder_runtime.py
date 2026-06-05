@@ -151,7 +151,17 @@ class EncoderRuntime:
     # ------------------------------------------------------------------
     def _drain_discovery(self) -> None:
         """Apply ADD/UPDATE/REMOVE for the LM peer (single LM in Phase 4)."""
-        for ev in self.disc.poll_events("lm"):
+        try:
+            evs = self.disc.poll_events("lm")
+        except Exception as e:
+            # A transient registry stall must not kill the encoder serve loop;
+            # skip this poll and retry on the next iteration.
+            logger.warning(
+                f"[encoder {self.encoder_id}] discovery poll failed "
+                f"({type(e).__name__}: {e}); retrying next iteration"
+            )
+            return
+        for ev in evs:
             if ev.kind in ("ADD", "UPDATE"):
                 self._connect_lm(ev.identity, ev.payload, reconnect=ev.kind == "UPDATE")
             elif ev.kind == "REMOVE":

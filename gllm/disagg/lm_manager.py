@@ -141,9 +141,16 @@ class DisaggEvents:
     # (seq_id, ordered_idx, slot_id, num_tokens): clone the embedding from this
     # rank's *own* slot pool into ``model_runner.disagg_embeds``.
     emb_ready: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    # seq_ids to abort: an *already-admitted* seq whose encode failed
+    # unrecoverably (watchdog gave up). Fanned out so every column drops it from
+    # its scheduler in the same iteration (model_runner.free reclaims the page /
+    # SSM slot + disagg state); the coordinator separately reclaims its NIXL
+    # slots. Pre-admission give-ups never reach a scheduler, so they are not
+    # listed here -- only the coordinator-side slot reclamation runs for them.
+    aborts: List[int] = field(default_factory=list)
 
     def __bool__(self) -> bool:
-        return bool(self.admits or self.emb_ready)
+        return bool(self.admits or self.emb_ready or self.aborts)
 
 
 class DisaggReceiver:
@@ -345,6 +352,10 @@ class DisaggCoordinator:
         self._admission_q: List[object] = []  # seqs waiting for free slots
         # meta/notif that arrived before the seq was registered (rare race).
         self._orphan_meta: List[MmItemMeta] = []
+        # Hard cap on the orphan buffer so stale metas (e.g. for aborted seqs
+        # that never dispatch) can't accumulate without bound. Generously sized
+        # vs. the slot pool; oldest is evicted FIFO past this.
+        self._max_orphan_meta = max(256, self.num_slots * 8)
 
     @property
     def nixl(self) -> NixlEndpoint:
@@ -394,7 +405,17 @@ class DisaggCoordinator:
         if not force and (now - self._last_disc_poll) < self._disc_poll_interval_s:
             return
         self._last_disc_poll = now
-        for ev in self.disc.poll_events("encoder"):
+        try:
+            evs = self.disc.poll_events("encoder")
+        except Exception as e:
+            # A transient registry stall (RPC timeout) must not tear down the
+            # shared PP0 disagg loop; skip this poll and retry next iteration.
+            logger.warning(
+                f"[lm-disagg {self.lm_id}] discovery poll failed "
+                f"({type(e).__name__}: {e}); retrying next iteration"
+            )
+            return
+        for ev in evs:
             if ev.kind in ("ADD", "UPDATE"):
                 self._connect_encoder(
                     ev.identity, ev.payload, reconnect=ev.kind == "UPDATE"
@@ -602,7 +623,18 @@ class DisaggCoordinator:
     def _apply_meta(self, meta: MmItemMeta) -> None:
         ps = self._pending.get(meta.seq_id)
         if ps is None:
+            # Meta that arrived before its seq was registered (rare race) -- or
+            # for a seq that was aborted/never dispatched. Keep a bounded FIFO so
+            # a steady trickle of stale metas can't grow unbounded over a long
+            # uptime; the matching seq (if any) is dispatched within a few polls.
             self._orphan_meta.append(meta)
+            if len(self._orphan_meta) > self._max_orphan_meta:
+                dropped = self._orphan_meta.pop(0)
+                logger.warning(
+                    f"[lm-disagg {self.lm_id}] orphan-meta buffer full "
+                    f"({self._max_orphan_meta}); dropping oldest "
+                    f"(seq={dropped.seq_id} item={dropped.item_idx})"
+                )
             return
         # Defensive bounds check: a buggy/corrupted encoder peer could send an
         # item_idx outside this seq's skeleton-ordered items. Drop it rather
@@ -667,16 +699,23 @@ class DisaggCoordinator:
     # ------------------------------------------------------------------
     # Poll: admit meta-complete seqs; emit ready embeddings; reap done ones
     # ------------------------------------------------------------------
-    def _check_watchdog(self) -> None:
+    def _check_watchdog(self, events: DisaggEvents) -> None:
         """Re-dispatch in-flight items whose encoder crashed/went silent.
 
         Triggers (design §5.5.2): the item's encoder left the pool (orphaned,
         ``encoder_identity is None``) or no meta/embedding landed within
         ``redispatch_timeout_s``. Re-dispatch reuses the same slot and avoids the
-        suspect replica when another is available."""
+        suspect replica when another is available.
+
+        An item that exhausts ``max_redispatch_attempts`` is *unrecoverable*: its
+        whole seq is aborted so the reserved NIXL slots (and, if admitted, the
+        scheduler page / SSM slot) are reclaimed instead of being leaked forever
+        -- otherwise one bad item would permanently shrink the slot pool and
+        eventually wedge all mm traffic. The client request fails (-> retry)."""
         if not self._encoders:
             return  # nowhere to re-dispatch to; hold until a replica appears
         now = time.monotonic()
+        give_up_seqs: List[int] = []
         for seq_id, ps in self._pending.items():
             for item in ps.items:
                 if item.done:
@@ -691,9 +730,10 @@ class DisaggCoordinator:
                         logger.error(
                             f"[lm-disagg {self.lm_id}] seq={seq_id} "
                             f"item={item.item_idx} unrecoverable after "
-                            f"{item.attempts} dispatch attempts; giving up "
-                            f"(request will time out -> client retry)"
+                            f"{item.attempts} dispatch attempts; aborting seq "
+                            f"(reclaiming slots; request -> client retry)"
                         )
+                        give_up_seqs.append(seq_id)
                     continue
                 reason = "orphaned" if orphaned else "timeout"
                 if self._send_job(seq_id, item, avoid=item.encoder_identity):
@@ -703,13 +743,26 @@ class DisaggCoordinator:
                         f"{item.attempts}) -> {item.encoder_identity} "
                         f"(slot {item.slot_id} reused)"
                     )
+        # Reclaim outside the iteration (``_abort_pending`` mutates ``_pending``).
+        # ``give_up_seqs`` is de-duped: multiple failed items in one seq abort it
+        # once (the second pop is a no-op).
+        for seq_id in dict.fromkeys(give_up_seqs):
+            self._abort_pending(seq_id, events)
 
-    def _abort_pending(self, seq_id: int) -> None:
-        """Drop a pending seq and reclaim its NIXL slots (admission failure).
+    def _abort_pending(
+        self, seq_id: int, events: Optional[DisaggEvents] = None
+    ) -> None:
+        """Drop a pending seq, reclaim its NIXL slots, and (if it was already
+        admitted) fan out a scheduler abort.
 
-        The seq was never handed to the scheduler, so reclaiming the reserved
-        slots and removing it from ``_pending`` is sufficient; the client request
-        times out and retries. Freed slots may unblock queued admissions.
+        Used by three paths: admission failure (never admitted -> slot
+        reclamation only), the watchdog give-up (may be admitted -> also abort
+        in every column's scheduler), and an external client abort
+        (:meth:`abort`). An *admitted* seq lives in every column's scheduler, so
+        its page / SSM slot / disagg state are reclaimed by the fanned-out
+        ``events.aborts`` (each rank's ``add_abort_ids`` -> ``model_runner.free``);
+        the NIXL receive slots are reclaimed here on TP0. Freed slots may unblock
+        queued admissions. Idempotent.
         """
         ps = self._pending.pop(seq_id, None)
         if ps is None:
@@ -718,7 +771,24 @@ class DisaggCoordinator:
             if not it.slot_freed:
                 self._free_slots.append(it.slot_id)
                 it.slot_freed = True
+        if ps.admitted and events is not None:
+            events.aborts.append(seq_id)
         self._try_dispatch()
+
+    def abort(self, seq_ids) -> None:
+        """Reclaim coordinator-held NIXL slots for externally aborted seqs.
+
+        Called on TP0 from the worker when client aborts arrive (e.g. request
+        cancelled / disconnected). The scheduler-side teardown for *admitted*
+        seqs is already handled by the worker's own ``add_abort_ids`` fan-out, so
+        this only reclaims the reserved receive slots + drops coordinator
+        tracking for seqs still pending here. No-op for unknown ids.
+        """
+        for seq_id in seq_ids:
+            if seq_id in self._pending:
+                # No events: admitted seqs are torn down in the scheduler by the
+                # worker's existing abort_ids path; we only free NIXL slots.
+                self._abort_pending(seq_id)
 
     def poll(self) -> DisaggEvents:
         """Drive the control plane one step; return this iteration's events."""
@@ -727,7 +797,7 @@ class DisaggCoordinator:
         self._try_dispatch()
         self._drain_meta()
         self._drain_notifs()
-        self._check_watchdog()
+        self._check_watchdog(events)
 
         freed_any = False
         for seq_id, ps in list(self._pending.items()):
@@ -753,7 +823,7 @@ class DisaggCoordinator:
                         f"(n_sentinels={ps.n_sentinels}, items={len(ps.items)}, "
                         f"skeleton_len={len(ps.seq.token_ids)}); aborting seq"
                     )
-                    self._abort_pending(seq_id)
+                    self._abort_pending(seq_id, events)
                     continue
             if ps.admitted:
                 # Emit EMB_READY for items whose write has landed but whose event

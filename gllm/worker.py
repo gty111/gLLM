@@ -296,6 +296,12 @@ class Worker(TorchProfilerMixin):
             for seq_id, ordered_idx, slot_id, num_tokens in events.emb_ready:
                 emb = self._disagg_recv.clone_slot(slot_id, num_tokens)
                 self.model_runner.disagg_set_embedding(seq_id, ordered_idx, emb)
+        if events.aborts:
+            # An admitted seq whose encode failed unrecoverably (coordinator
+            # watchdog gave up). Drop it from every column's scheduler in this
+            # same iteration; ``check_abort_seqs`` -> ``model_runner.free``
+            # reclaims its page / SSM slot + disagg state on each rank.
+            self.scheduler.add_abort_ids(events.aborts)
 
     def _init_role_state(self):
         """Build per-rank scheduler / follower-store state.
@@ -473,6 +479,11 @@ class Worker(TorchProfilerMixin):
             self._apply_disagg_events(cum.disagg_events)
         if cum.abort_ids:
             self.scheduler.add_abort_ids(cum.abort_ids)
+            # TP0 also reclaims any coordinator-held NIXL receive slots for
+            # aborted seqs still pending pre-admission (the scheduler-side
+            # teardown above already covers admitted seqs on every column).
+            if self._disagg_coord is not None:
+                self._disagg_coord.abort(cum.abort_ids)
         if cum.log is not None:
             self.scheduler.set_log(cum.log)
         if cum.control_cmd_code != 0:
