@@ -141,6 +141,19 @@ def get_tensor_from_dict(weights, k):
         raise KeyError(f"Fail to extract {k} from weights")
 
 
+def has_tensor_in_dict(weights, k) -> bool:
+    """Non-raising existence check mirroring :func:`get_tensor_from_dict`.
+
+    Used to probe which MoE checkpoint layout a key is stored in (per-expert
+    vs stacked) without triggering the verbose KeyError path.
+    """
+    return (
+        k in weights
+        or k.replace('model', 'model.language_model') in weights
+        or k.replace('visual', 'model.visual') in weights
+    )
+
+
 # ---------------------------------------------------------------------------
 # MoE expert-weight loaders
 # ---------------------------------------------------------------------------
@@ -367,6 +380,89 @@ def load_w2_stacked(
         if local_expert_idx == -1:
             return
         dst[local_expert_idx].copy_(w2_weight[expert_idx].permute(1, 0))
+
+    _iter_experts(num_experts, _one, pool)
+
+
+# ---------------------------------------------------------------------------
+# Stacked layout, "natural" (out, in) convention.
+#
+# Some checkpoints (e.g. Qwen3.5-MoE bf16) pre-stack the experts AND store each
+# projection in its natural ``(out_features, in_features)`` Linear layout --
+# unlike :func:`load_fused_w13_stacked` / :func:`load_w2_stacked` above, which
+# expect the transposed ``(in, out)`` convention used by Qwen3-VL-MoE. The
+# natural layout already matches the target FusedMoE param shape, so no permute
+# is needed -- only a TP slice along the intermediate dim.
+#
+#   gate_up : checkpoint ``(E, 2I, H)`` (rows [0,I)=gate, [I,2I)=up)
+#             target     ``(local_E, 2 * I_p, H)``
+#   down    : checkpoint ``(E, H, I)``
+#             target     ``(local_E, H, I_p)``
+# ---------------------------------------------------------------------------
+
+
+def load_fused_w13_stacked_natural(
+    dst,
+    w13_weight,
+    expert_map,
+    num_experts: int,
+    pool: Optional[ThreadPoolExecutor] = None,
+):
+    """Load fused ``w13_weight`` from a stacked ``(E, 2I, H)`` checkpoint.
+
+    Gate and up are concatenated along dim 1 (rows); ``H`` is the last dim --
+    already the target param layout, so TP only slices the per-half
+    intermediate dim (no permute). See module note above for shapes.
+    """
+    if not is_use_ep() and get_tp_size() > 1:
+        inter = w13_weight.shape[1] // 2  # 2I -> I
+        size_p = inter // get_tp_size()
+        tp_rank = get_tp_rank()
+        # gate half -> dst rows [0, I_p); up half -> dst rows [I_p, 2 I_p).
+        dst[:, :size_p, :].copy_(
+            w13_weight[:, tp_rank * size_p : (tp_rank + 1) * size_p, :]
+        )
+        dst[:, size_p:, :].copy_(
+            w13_weight[
+                :, inter + tp_rank * size_p : inter + (tp_rank + 1) * size_p, :
+            ]
+        )
+        return
+
+    def _one(expert_idx: int):
+        local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
+        if local_expert_idx == -1:
+            return
+        # EP-on (full intermediate per rank) or TP==1: copy the slot verbatim.
+        dst[local_expert_idx].copy_(w13_weight[expert_idx])
+
+    _iter_experts(num_experts, _one, pool)
+
+
+def load_w2_stacked_natural(
+    dst,
+    w2_weight,
+    expert_map,
+    num_experts: int,
+    pool: Optional[ThreadPoolExecutor] = None,
+):
+    """Load ``w2_weight`` (down) from a stacked ``(E, H, I)`` checkpoint.
+
+    Natural ``(out=H, in=I)`` layout -> target ``(local_E, H, I_p)``;
+    RowParallel slices the input dim ``I`` (last dim), no permute.
+    """
+    if not is_use_ep() and get_tp_size() > 1:
+        inter = w2_weight.shape[2]  # I
+        size_p = inter // get_tp_size()
+        tp_rank = get_tp_rank()
+        dst.copy_(w2_weight[:, :, tp_rank * size_p : (tp_rank + 1) * size_p])
+        return
+
+    def _one(expert_idx: int):
+        local_expert_idx = resolve_ep_expert_idx(expert_idx, expert_map)
+        if local_expert_idx == -1:
+            return
+        dst[local_expert_idx].copy_(w2_weight[expert_idx])
 
     _iter_experts(num_experts, _one, pool)
 

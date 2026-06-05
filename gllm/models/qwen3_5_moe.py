@@ -57,8 +57,11 @@ from gllm.models.weight_utils import (
     copy_single_proj_dim0,
     copy_single_proj_dim1,
     get_tensor_from_dict,
+    has_tensor_in_dict,
     load_fused_w13_per_expert,
+    load_fused_w13_stacked_natural,
     load_w2_per_expert,
+    load_w2_stacked_natural,
     moe_expert_load_pool,
 )
 from gllm.utils import get_model_load_pbar
@@ -240,19 +243,32 @@ class Qwen3_5MoeLLMForCausalLM(Qwen3_5ForCausalLM):
                         "w13_weight_scale_inv" if is_scale else "w13_weight",
                         "",
                     )
-                    load_fused_w13_per_expert(
-                        v.data,
-                        weights,
-                        key_for_gate=lambda i, base=base, s=suffix: (
-                            f"{base}{i}.gate_proj.{s}"
-                        ),
-                        key_for_up=lambda i, base=base, s=suffix: (
-                            f"{base}{i}.up_proj.{s}"
-                        ),
-                        expert_map=expert_map,
-                        num_experts=num_experts,
-                        pool=pool,
-                    )
+                    # Stacked checkpoint (e.g. Qwen3.5-MoE bf16): a single
+                    # ``experts.gate_up_proj`` tensor (E, 2I, H) instead of
+                    # per-expert ``experts.{i}.gate_proj``. Detect + dispatch.
+                    stacked_key = f"{base}gate_up_proj"
+                    if not is_scale and has_tensor_in_dict(weights, stacked_key):
+                        load_fused_w13_stacked_natural(
+                            v.data,
+                            get_tensor_from_dict(weights, stacked_key),
+                            expert_map=expert_map,
+                            num_experts=num_experts,
+                            pool=pool,
+                        )
+                    else:
+                        load_fused_w13_per_expert(
+                            v.data,
+                            weights,
+                            key_for_gate=lambda i, base=base, s=suffix: (
+                                f"{base}{i}.gate_proj.{s}"
+                            ),
+                            key_for_up=lambda i, base=base, s=suffix: (
+                                f"{base}{i}.up_proj.{s}"
+                            ),
+                            expert_map=expert_map,
+                            num_experts=num_experts,
+                            pool=pool,
+                        )
                 elif k.find("mlp.experts.w2_weight") != -1:
                     is_scale = k.endswith("weight_scale_inv")
                     suffix = "weight_scale_inv" if is_scale else "weight"
@@ -260,16 +276,27 @@ class Qwen3_5MoeLLMForCausalLM(Qwen3_5ForCausalLM):
                         "w2_weight_scale_inv" if is_scale else "w2_weight",
                         "",
                     )
-                    load_w2_per_expert(
-                        v.data,
-                        weights,
-                        key_for_down=lambda i, base=base, s=suffix: (
-                            f"{base}{i}.down_proj.{s}"
-                        ),
-                        expert_map=expert_map,
-                        num_experts=num_experts,
-                        pool=pool,
-                    )
+                    # Stacked checkpoint: single ``experts.down_proj`` (E, H, I).
+                    stacked_key = f"{base}down_proj"
+                    if not is_scale and has_tensor_in_dict(weights, stacked_key):
+                        load_w2_stacked_natural(
+                            v.data,
+                            get_tensor_from_dict(weights, stacked_key),
+                            expert_map=expert_map,
+                            num_experts=num_experts,
+                            pool=pool,
+                        )
+                    else:
+                        load_w2_per_expert(
+                            v.data,
+                            weights,
+                            key_for_down=lambda i, base=base, s=suffix: (
+                                f"{base}{i}.down_proj.{s}"
+                            ),
+                            expert_map=expert_map,
+                            num_experts=num_experts,
+                            pool=pool,
+                        )
                 elif k.find("gate_up_proj") != -1:
                     # Shared expert (the only ``gate_up_proj`` path left
                     # outside the FusedMoE experts) or any other dense
