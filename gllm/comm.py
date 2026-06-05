@@ -47,6 +47,11 @@ class IPCPackage:
         # code/data pair survives the broadcast.
         self.control_cmd_code = 0
         self.control_data = None
+        # Encoder-disaggregation control events (gllm.disagg.lm_manager.
+        # DisaggEvents) generated authoritatively on TP0 and fanned out with the
+        # input so every PP=0 TP rank admits / advances disagg seqs in the same
+        # iteration. ``None`` on every non-disagg iteration / the monolith.
+        self.disagg_events = None
         # worker => front-end
         self.free_ids = []  # seq_ids to free
         self.act_schedule_ids = []

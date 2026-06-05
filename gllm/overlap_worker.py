@@ -186,6 +186,8 @@ class OverlapWorker(Worker):
         without any inter-TP zmq traffic on the critical path.
         """
         self.check_abort_seqs()
+        # ``recv_ipc_package`` also drives the disagg coordinator (TP0) and
+        # applies its fanned-out ADMIT / EMB_READY events on every column.
         self.recv_ipc_package()
 
         # Bootstrap on the first iter, otherwise this is a no-op

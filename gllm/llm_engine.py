@@ -61,10 +61,22 @@ class LLM:
         model_max_length=8192,
         mm_processor_min_pixels=None,
         mm_processor_max_pixels=None,
+        disagg_config=None,
     ):
         init_logger()
         self.model_path = model_path
         self.load_format = load_format
+        # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig) or
+        # None for the monolith. The role flags feed the model loader (parent
+        # process); the whole object is forwarded to the spawned worker for the
+        # LM-side manager. ``is_disagg_lm`` is the request-time gate read by the
+        # api server (replaces the old GLLM_DISAGG_LM env read).
+        self.disagg_config = disagg_config
+        self.is_disagg_lm = bool(disagg_config is not None and disagg_config.is_lm)
+        skip_visual = disagg_config.skip_visual if disagg_config is not None else False
+        skip_language = (
+            disagg_config.skip_language if disagg_config is not None else False
+        )
         if overlap_scheduling and pp_size > 1:
             logger.warning(
                 "overlap_scheduling is not supported with pp_size>1; disabling overlap"
@@ -89,6 +101,8 @@ class LLM:
             model_max_length=model_max_length,
             mm_processor_min_pixels=mm_processor_min_pixels,
             mm_processor_max_pixels=mm_processor_max_pixels,
+            skip_visual=skip_visual,
+            skip_language=skip_language,
         )
         self.pp_size = pp_size
         self.tp_size = tp_size
@@ -220,6 +234,7 @@ class LLM:
             self.mp_load_progress,
             self.assigned_layers,
             self.schedule_method,
+            self.disagg_config,
         )
         process = self.ctx.Process(
             target=run_target,
@@ -339,6 +354,7 @@ class LLM:
         top_k=None,
         repetition_penalty=None,
         mm_contents=None,
+        mm_items=None,
     ):
         # Models without a ``generation_config.json`` (e.g. Qwen3.5-0.8B)
         # leave the HF ``GenerationConfig`` defaults as ``None``, which then
@@ -354,7 +370,7 @@ class LLM:
         repetition_penalty = _resolve_sampling_param(
             repetition_penalty, gen.repetition_penalty, 1.0
         )
-        return Sequence(
+        seq = Sequence(
             self.id_allocator.allocate(),
             token_ids,
             self.finish_tokens,
@@ -366,6 +382,11 @@ class LLM:
             repetition_penalty,
             mm_contents,
         )
+        # Encoder-disaggregation: the ordered raw mm items the encoder will
+        # process. Present only on the disaggregated LM frontend; ``None`` for
+        # text and for the monolith path.
+        seq.mm_items = mm_items
+        return seq
 
     def free_finish_ids(self, finish_ids: List[int]):
         for id in finish_ids:

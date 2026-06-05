@@ -511,11 +511,23 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.visual_dim = config.vision_config.out_hidden_size
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
-        self.visual = Qwen3_VisionTransformer(
-            config.vision_config,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            quant_config=quant_config,
-        )
+        # Encoder-disaggregation: the LM node does not own the vision tower
+        # (the visual embeddings arrive over NIXL from a separate encoder
+        # process; see docs/encoder_disaggregation_design.md §4.3). We still
+        # keep ``visual_dim`` / ``multiscale_dim`` / ``deepstack_*`` above and
+        # the deepstack buffers below because ``embed_input_ids`` /
+        # ``_compute_deepstack_embeds`` only need those config scalars, never
+        # the vision weights. ``self.visual = None`` saves the tower's memory
+        # and weight load on the LM side.
+        self.skip_visual = getattr(config, "skip_visual", False)
+        if self.skip_visual:
+            self.visual = None
+        else:
+            self.visual = Qwen3_VisionTransformer(
+                config.vision_config,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                quant_config=quant_config,
+            )
 
         # register buffer for deepstack
         if self.use_deepstack:
@@ -526,6 +538,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 )
                 for _ in range(self.deepstack_num_level)
             ]
+
+        # Encoder-disaggregation: the encoder process owns ONLY the vision
+        # tower and never runs the language model (no KV cache / scheduler /
+        # sampler). ``skip_language`` lets it construct just ``self.visual``
+        # and reuse the exact ``embed_multimodal`` path so its ViT output is
+        # numerically identical to the monolith's.
+        self.skip_language = getattr(config, "skip_language", False)
+        if self.skip_language:
+            self.language_model = None
+            self.num_layers = 0
+            self.num_kv_heads = 0
+            self.head_dim = 0
+            self.ret_residual = False
+            return
 
         self.language_model = language_model_type(
             config.text_config,
@@ -903,10 +929,32 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(input_data, hidden_states)
 
+    def embed_multimodal_single(self, **mm_input) -> torch.Tensor:
+        """Encode exactly one mm item and return its raw visual embedding.
+
+        Thin wrapper over :meth:`embed_multimodal` for the per-item encoder
+        path (design §4.2.1): ``mm_input`` carries a single image/video item
+        (``pixel_values`` + ``image_grid_thw`` for one item, or the video
+        equivalents). Returns the ``[N_vis_i, visual_dim * (1 + L)]`` tensor
+        that is the i-th element of the monolith's ``embed_multimodal`` tuple.
+        """
+        out = self.embed_multimodal(**mm_input)
+        assert out is not None and len(out) == 1, (
+            f"embed_multimodal_single expected exactly one item, got "
+            f"{0 if out is None else len(out)}"
+        )
+        return out[0]
+
     def load_weights(self, weights, mp_load_progress=None):
-        self.language_model.load_weights(weights, mp_load_progress)
+        if not getattr(self, "skip_language", False) and self.language_model is not None:
+            self.language_model.load_weights(weights, mp_load_progress)
 
         if not is_first_pp_rank():
+            return
+
+        # Encoder-disaggregation LM node: vision weights live in the encoder
+        # process, so there is nothing to load here.
+        if getattr(self, "skip_visual", False) or self.visual is None:
             return
 
         parameters = dict(self.visual.named_parameters())

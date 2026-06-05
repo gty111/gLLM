@@ -207,9 +207,21 @@ def propagate_quantization_config(
 
 
 class ModelLoader:
-    def __init__(self, load_format, model_path, max_num_batched_tokens):
+    def __init__(
+        self,
+        load_format,
+        model_path,
+        max_num_batched_tokens,
+        skip_visual: bool = False,
+        skip_language: bool = False,
+    ):
         self.model_path = model_path
         self.max_num_batched_tokens = max_num_batched_tokens
+        # Encoder-disaggregation role flags, threaded explicitly from the
+        # entrypoint (gllm.disagg.config.DisaggConfig) rather than read from the
+        # environment. Set before ``load_config`` stamps them onto ``self.config``.
+        self.skip_visual = skip_visual
+        self.skip_language = skip_language
         self.load_config()
         self.load_format = load_format
 
@@ -291,6 +303,16 @@ class ModelLoader:
         self.config.use_mla = self.use_mla
         self.config.use_hybrid_state = self.use_hybrid_state
         self.config.max_num_batched_tokens = self.max_num_batched_tokens
+        # Encoder-disaggregation role flags (docs/encoder_disaggregation_design.md
+        # §4.3 / §7.2.1). The LM node passes ``skip_visual=True`` so the VL
+        # wrapper does not construct / load the vision tower; the visual
+        # embeddings instead arrive over NIXL from the encoder process. The
+        # encoder passes ``skip_language=True`` to build ONLY the vision tower
+        # (no language model, KV cache, scheduler, or sampler). Both default to
+        # False so the monolith path is unaffected. See
+        # ``gllm.disagg.config.DisaggConfig``.
+        self.config.skip_visual = self.skip_visual
+        self.config.skip_language = self.skip_language
 
     @property
     def use_mla(self):

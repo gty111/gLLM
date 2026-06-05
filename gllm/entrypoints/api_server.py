@@ -64,9 +64,25 @@ async def show_available_models():
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     mm_contents = await make_async(llm.model_runner.extract_modify_mm)(request.messages)
-    token_ids = await make_async(llm.model_runner.encode)(
-        request.messages, chat=True, has_mm=mm_contents is not None
-    )
+    # Encoder-disaggregation frontend (design §3.1 / §5.4): tokenize the *text
+    # only* into a skeleton (one sentinel per item) and ship the raw items to
+    # the encoder via the LM PP0 worker. The LM never opens pixels and never
+    # carries ``mm_contents``. Falls back to the monolith processor path for
+    # text requests and when disaggregation is off.
+    disagg = getattr(llm, "is_disagg_lm", False)
+    mm_items = None
+    if disagg and mm_contents is not None:
+        mm_items = await make_async(llm.model_runner.extract_mm_items_ordered)(
+            request.messages
+        )
+        token_ids = await make_async(llm.model_runner.encode_skeleton)(
+            request.messages
+        )
+        mm_contents = None  # LM holds no pixels; embeddings arrive over NIXL
+    else:
+        token_ids = await make_async(llm.model_runner.encode)(
+            request.messages, chat=True, has_mm=mm_contents is not None
+        )
     # OpenAI deprecated ``max_tokens`` for chat completions in favor of
     # ``max_completion_tokens`` but most clients (including curl examples,
     # the OpenAI Python SDK pre-1.40, and ``benchmark_serving.py``) still
@@ -90,6 +106,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             request.top_k,
             request.repetition_penalty,
             mm_contents,
+            mm_items,
         )
     else:
         return ErrorResponse(

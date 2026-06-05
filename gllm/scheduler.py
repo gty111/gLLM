@@ -229,6 +229,10 @@ class Scheduler:
     def schedule_prefill_batch(self, prefill_token_budget):
         prefill_batch: List[Sequence] = []
         unfinish_prefill_seqs = deque()
+        # Encoder-disaggregation overlap (design §6.2): seqs whose next chunk is
+        # entirely blocked behind a not-yet-ready image span are parked here and
+        # re-queued after this round (no slot/page allocation, no ordering loss).
+        deferred_disagg_seqs: List[Sequence] = []
         prefill_batched_token_nums = 0
         # Hybrid models (Qwen3.5 GDN) cap concurrency at the SSM working
         # pool size; admitting more requests would assertion-crash inside
@@ -266,39 +270,31 @@ class Scheduler:
                 # ``_mm_prepare_cpu`` pass doesn't redo the work.
                 self.model_runner._mm_precompute_hash(seq)
                 self.memory_manager.pre_allocate_computed_page([seq])
-                # Full prompt cache hit (every page-aligned prefix matched).
-                # ``pre_allocate_computed_page`` would have bumped
-                # ``computed_token_num`` all the way up to ``len(seq)``,
-                # leaving zero tokens to forward. That short-circuits the
-                # batch builder into producing an empty ``tokens_cpu`` and
-                # crashing ``compute_logits`` on a size-0 hidden tensor.
-                # The KV cache only stores K/V, not the last-token hidden
-                # state we need to sample from, so we still have to run a
-                # 1-token forward. Roll back one token: keep all N cached
-                # pages in ``page_table`` (their KV is correct -- the
-                # prefix-cache hash match guarantees the last token is
-                # identical to the cached prompt), and let the loop below
-                # set ``to_compute_token_num = 1``. The 1-token forward is
-                # computationally a decode step; the idempotent K/V write
-                # to the last slot of the cached page is harmless.
-                #
-                # NOTE: this single-token rollback is only correct for full
-                # attention. Hybrid/linear-attention (GDN) models cannot
-                # re-consume an already-absorbed token in their stateful
-                # recurrence, so ``restore_ssm_snapshot_on_hit`` has already
-                # rolled a whole page back for them above -- by here their
-                # ``computed_token_num`` is strictly ``< len(seq)`` and this
-                # branch is a no-op.
-                if seq.computed_token_num >= len(seq):
-                    seq.computed_token_num = len(seq) - 1
+                # Full/partial hit post-processing (rollback + hybrid SSM
+                # snapshot restore) lives in PrefixMemoryManager.
+            # Encoder-disaggregation overlap gate B (design §6.2): a disagg seq
+            # may only prefill up to the first image span whose embedding hasn't
+            # landed yet (positions are known -- gate A -- but the visual data
+            # isn't visible). ``disagg_prefill_limit`` returns ``None`` for
+            # monolith / non-disagg seqs (no cap) and is evaluated *after* the
+            # prefix-cache pre-allocate above so cache-hit spans don't block.
+            gate_limit = self.model_runner.disagg_prefill_limit(seq)
+            if gate_limit is not None and gate_limit <= seq.computed_token_num:
+                # Nothing prefillable this round; park and re-queue. No SSM slot
+                # / page allocation so freeing stays simple if it never runs.
+                deferred_disagg_seqs.append(seq)
+                continue
+            prefill_avail = len(seq) - seq.computed_token_num
+            if gate_limit is not None:
+                prefill_avail = min(prefill_avail, gate_limit - seq.computed_token_num)
             # Hybrid models: every seq needs a per-request SSM working slot
             # for the whole duration of the request (allocated lazily on
             # the first schedule, freed when ``model_runner.free(seq)`` is
             # called from ``process_output`` / ``check_abort_seqs`` /
             # ``check_preempt``). No-op for non-hybrid models.
             self.memory_manager.allocate_ssm_slot(seq)
-            if len(seq) - seq.computed_token_num <= prefill_token_budget:
-                seq.to_compute_token_num = len(seq) - seq.computed_token_num
+            if prefill_avail <= prefill_token_budget:
+                seq.to_compute_token_num = prefill_avail
                 prefill_batched_token_nums += seq.to_compute_token_num
                 prefill_token_budget -= seq.to_compute_token_num
             else:
@@ -313,6 +309,10 @@ class Scheduler:
                 unfinish_prefill_seqs.appendleft(seq_new)
 
         self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
+        # Re-queue gate-B-blocked disagg seqs (preserving their relative order)
+        # for a future round once their embeddings land.
+        for seq in reversed(deferred_disagg_seqs):
+            self.seqs_to_prefill.appendleft(seq)
         return prefill_batch, prefill_batched_token_nums
 
     def schedule_decode_batch(self, decode_token_budget):

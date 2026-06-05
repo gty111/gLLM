@@ -36,6 +36,7 @@ PP>1 specifics
 """
 
 import logging
+import os
 import traceback
 from collections import deque
 from typing import List, Optional, Union
@@ -91,6 +92,7 @@ class Worker(TorchProfilerMixin):
         mp_load_progress,
         assigned_layers,
         schedule_method,
+        disagg_config=None,
     ):
         self.model_runner = model_runner
         self.local_rank = local_rank
@@ -107,6 +109,19 @@ class Worker(TorchProfilerMixin):
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
         self.use_mla = model_runner.model_loader.use_mla
+        # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig),
+        # pickled here from the parent across the spawn boundary; ``None`` on the
+        # monolith path.
+        self.disagg_config = disagg_config
+        # Encoder-disaggregation LM-side state, built lazily in :meth:`init` when
+        # ``disagg_config.is_lm`` is set. ``_disagg_recv`` (the per-rank NIXL
+        # slot pool) lives on *every* PP0 TP rank; ``_disagg_coord`` (the TP0
+        # control plane) lives only on TP0 (== rank 0). ``_is_disagg_lm`` is the
+        # cheap per-iter routing flag (true on every column). All ``None`` /
+        # False on the monolith.
+        self._disagg_recv = None
+        self._disagg_coord = None
+        self._is_disagg_lm = False
         self.init_profiler_state()
 
     def init_logger(self):
@@ -162,9 +177,131 @@ class Worker(TorchProfilerMixin):
 
         self._init_role_state()
 
+        self._maybe_init_disagg()
+
         self.mp_alive[self.local_rank] = 1
 
         logger.info(f"Initialization complete")
+
+    def _maybe_init_disagg(self):
+        """Bring up the LM-side disagg state on every PP0 TP rank.
+
+        Gated by ``disagg_config.is_lm`` (the entrypoint builds the config; see
+        ``gllm.disagg.config.DisaggConfig``). Each PP0 TP rank builds a
+        :class:`DisaggReceiver` (its own NIXL slot pool); the per-rank NIXL
+        handshakes are gathered to TP0, which additionally builds the
+        :class:`DisaggCoordinator` (control plane). TP>1 is supported natively:
+        the encoder multi-writes the full embedding into every rank's pool and
+        the coordinator fans its decisions out as per-iter events (see
+        :meth:`recv_ipc_package`).
+        """
+        cfg = self.disagg_config
+        if cfg is None or not cfg.is_lm:
+            return
+        if not is_first_pp_rank():
+            return
+        from gllm.disagg.lm_manager import DisaggCoordinator, DisaggReceiver
+
+        self._is_disagg_lm = True
+        lm_id = cfg.lm_id if cfg.lm_id is not None else "lm0"
+
+        # LMDisaggManager defaults (num_slots=32, max_vis_tokens=16384) stay the
+        # single source of truth when the operator didn't pin them.
+        num_slots = cfg.num_slots if cfg.num_slots is not None else 32
+        max_vis_tokens = cfg.max_vis_tokens if cfg.max_vis_tokens is not None else 16384
+
+        recv = DisaggReceiver(
+            self.model_runner,
+            lm_id=lm_id,
+            tp_rank=self.tp_rank,
+            num_slots=num_slots,
+            max_vis_tokens=max_vis_tokens,
+            nixl_backend=cfg.nixl_backend,
+        )
+        recv.setup()
+        self._disagg_recv = recv
+
+        # Gather every PP0 TP rank's NIXL handshake (agent meta + slot-pool
+        # region) to TP0 so the coordinator can pack one slot region per rank
+        # into each EncoderJob and publish all agent metas to discovery. This is
+        # a one-time, non-hot-path all-gather over the TP group.
+        handshake = recv.handshake()
+        if self.tp_size > 1:
+            from gllm.dist_utils import get_tp_group
+
+            gathered: List[Optional[dict]] = [None] * self.tp_size
+            dist.all_gather_object(gathered, handshake, group=get_tp_group())
+            rank_handshakes = [gathered[r] for r in range(self.tp_size)]
+        else:
+            rank_handshakes = [handshake]
+
+        if self.tp_rank == 0:
+            self._disagg_coord = DisaggCoordinator(
+                self.model_runner,
+                recv,
+                rank_handshakes=rank_handshakes,
+                lm_id=lm_id,
+                discovery_endpoint=cfg.discovery_endpoint,
+                processor_config_hash=cfg.processor_config_hash,
+                advertise_host=cfg.advertise_host,
+                meta_bind=cfg.meta_bind,
+                num_slots=num_slots,
+                nixl_backend=cfg.nixl_backend,
+                encoder_dp=cfg.encoder_dp,
+            )
+            self._disagg_coord.setup()
+
+    def _admit_requests(self, seqs):
+        """Route new front-end seqs: disagg mm seqs -> coordinator, else scheduler.
+
+        A disaggregated multimodal request carries ``seq.mm_items`` (the raw
+        per-item content the encoder needs) and a *skeleton* token-id list. It
+        must not enter the scheduler until its visual embeddings have arrived.
+        On TP0 it is handed to the coordinator; on the other TP ranks it is
+        simply dropped -- the expanded, ready seq arrives later as a fanned-out
+        ADMIT event (see :meth:`_apply_disagg_events`). Everything else (text,
+        and the monolith path) goes straight to the scheduler on every column.
+        """
+        if not self._is_disagg_lm:
+            self.scheduler.add_new_requests(seqs)
+            return
+        direct = []
+        for seq in seqs:
+            if getattr(seq, "mm_items", None):
+                if self._disagg_coord is not None:
+                    self._disagg_coord.submit(seq)
+                # non-TP0: drop; the expanded seq returns via an ADMIT event.
+            else:
+                direct.append(seq)
+        if direct:
+            self.scheduler.add_new_requests(direct)
+
+    def _apply_disagg_events(self, events) -> None:
+        """Apply one iteration's fanned-out disagg events on this column.
+
+        Runs identically on every PP0 TP rank (TP0 applies the authoritative
+        objects it built; peers apply their freshly-pickled copies). ``ADMIT``
+        registers the gate state + adds the expanded seq to this column's
+        scheduler; ``EMB_READY`` clones the embedding out of *this rank's* local
+        slot pool. Keeping both on the same fanned-out stream guarantees every
+        column mutates its scheduler / model runner in lockstep.
+        """
+        if not events:
+            return
+        for seq, state in events.admits:
+            self.model_runner.disagg_register(seq.seq_id, state)
+            self.scheduler.add_new_requests([seq])
+        if events.emb_ready:
+            self._disagg_recv.sync()
+            for seq_id, ordered_idx, slot_id, num_tokens in events.emb_ready:
+                emb = self._disagg_recv.clone_slot(slot_id, num_tokens)
+                self.model_runner.disagg_set_embedding(seq_id, ordered_idx, emb)
+        if events.aborts:
+            # An admitted seq whose encode failed unrecoverably (coordinator
+            # watchdog gave up). Drop it from every column's scheduler in this
+            # same iteration; ``check_abort_seqs`` -> ``model_runner.free``
+            # reclaims its page / SSM slot + disagg state on each rank.
+            self.scheduler.add_abort_ids(events.aborts)
 
     def _init_role_state(self):
         """Build per-rank scheduler / follower-store state.
@@ -306,7 +443,28 @@ class Worker(TorchProfilerMixin):
                         cum.control_data = data
             if not saw_log_override:
                 cum.log = None
-            if cum.is_input_empty() and cum.log is None:
+
+        # TP0 control plane: drive the disagg coordinator (discovery / meta /
+        # notif / dispatch / watchdog) once per iter and attach the resulting
+        # ADMIT / EMB_READY events to the package so they fan out with the input
+        # and every column applies them in this same iteration. Must run before
+        # the empty-elision (events alone are enough to keep ``cum`` alive) and
+        # before the broadcast so peers receive them.
+        if self.rank == 0 and self._disagg_coord is not None:
+            events = self._disagg_coord.poll()
+            if events:
+                if cum is None:
+                    cum = IPCPackage([])
+                    cum.log = None
+                cum.disagg_events = events
+
+        if self.rank == 0:
+            if (
+                cum is not None
+                and cum.is_input_empty()
+                and cum.log is None
+                and cum.disagg_events is None
+            ):
                 cum = None
 
         if get_tp_size() > 1:
@@ -316,9 +474,16 @@ class Worker(TorchProfilerMixin):
             return
 
         if cum.schedule_lists:
-            self.scheduler.add_new_requests(cum.schedule_lists)
+            self._admit_requests(cum.schedule_lists)
+        if cum.disagg_events is not None:
+            self._apply_disagg_events(cum.disagg_events)
         if cum.abort_ids:
             self.scheduler.add_abort_ids(cum.abort_ids)
+            # TP0 also reclaims any coordinator-held NIXL receive slots for
+            # aborted seqs still pending pre-admission (the scheduler-side
+            # teardown above already covers admitted seqs on every column).
+            if self._disagg_coord is not None:
+                self._disagg_coord.abort(cum.abort_ids)
         if cum.log is not None:
             self.scheduler.set_log(cum.log)
         if cum.control_cmd_code != 0:
@@ -472,6 +637,8 @@ class Worker(TorchProfilerMixin):
     def run_pp0(self):
         """Per-iter loop run by every PP=0 TP rank."""
         self.check_abort_seqs()
+        # ``recv_ipc_package`` also drives the disagg coordinator (TP0) and
+        # applies its fanned-out ADMIT / EMB_READY events on every column.
         self.recv_ipc_package()
         self.recv_next_tokens()
         self.schedule_forward()

@@ -700,11 +700,28 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
         self.config = config
 
-        if is_first_pp_rank():
+        # Encoder-disaggregation: the LM node skips the vision tower (visual
+        # embeddings arrive over NIXL from a separate encoder process); the
+        # encoder node skips the language model. See
+        # docs/encoder_disaggregation_design.md §4.3. Qwen2.5-VL has no
+        # deepstack, so the per-item embedding is plain ``[N_vis, visual_dim]``.
+        self.skip_visual = getattr(config, "skip_visual", False)
+        if self.skip_visual or not is_first_pp_rank():
+            self.visual = None
+        else:
             self.visual = Qwen2_5_VisionTransformer(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             )
+
+        self.skip_language = getattr(config, "skip_language", False)
+        if self.skip_language:
+            self.language_model = None
+            self.num_layers = 0
+            self.num_kv_heads = 0
+            self.head_dim = 0
+            self.ret_residual = False
+            return
 
         text_config = getattr(config, "text_config", config)
         if text_config is not config:
@@ -916,7 +933,23 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 video_embeddings = self._process_video_input(multimodal_input)
                 multimodal_embeddings += video_embeddings
         return multimodal_embeddings
-    
+
+    def embed_multimodal_single(self, **mm_input) -> torch.Tensor:
+        """Encode exactly one mm item and return its raw visual embedding.
+
+        Thin wrapper over :meth:`embed_multimodal` for the per-item encoder
+        path (encoder disaggregation, design §4.2.1): ``mm_input`` carries a
+        single image/video item. Returns the ``[N_vis_i, visual_dim]`` tensor
+        that is the i-th element of the monolith's ``embed_multimodal`` tuple,
+        so the encoder output is numerically identical to the monolith.
+        """
+        out = self.embed_multimodal(**mm_input)
+        assert out is not None and len(out) == 1, (
+            f"embed_multimodal_single expected exactly one item, got "
+            f"{0 if out is None else len(out)}"
+        )
+        return out[0]
+
     def get_mm_placeholder_token_ids(self):
         return [self.config.image_token_id, self.config.video_token_id]
     
@@ -974,9 +1007,14 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         return self.language_model.compute_logits(input_data, hidden_states)
 
     def load_weights(self, weights, mp_load_progress=None):
-        self.language_model.load_weights(weights, mp_load_progress)
+        if not getattr(self, "skip_language", False) and self.language_model is not None:
+            self.language_model.load_weights(weights, mp_load_progress)
 
         if not is_first_pp_rank():
+            return
+
+        # Encoder-disaggregation LM node skips the vision tower entirely.
+        if getattr(self, "skip_visual", False) or self.visual is None:
             return
 
         parameters = dict(self.visual.named_parameters())
