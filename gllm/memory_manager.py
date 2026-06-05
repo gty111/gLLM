@@ -341,6 +341,12 @@ class MemoryManager:
         self.ssm_cache_config = ssm_cache_config
         self.max_working_ssm_slots = max_working_ssm_slots
         self.max_snapshot_ssm_slots = max_snapshot_ssm_slots
+        # Upper bound on the share of util-scaled free memory the SSM pools may
+        # occupy before the KV cache is sized. The snapshot pool (best-effort)
+        # is clamped to fit; the working pool (mandatory) is always honored.
+        # TODO: replace with a derived formula based on per_slot_bytes vs
+        #       kv_bytes_per_page so the split is model-aware.
+        self.ssm_pool_budget_frac: float = 0.5
         # Populated by :meth:`init`; ``None`` when the model is not hybrid.
         self.ssm_segment: Optional[SSMSegment] = None
         self.segment: Union[Segment, PrefixSegment] = None
@@ -392,16 +398,74 @@ class MemoryManager:
         self.v_scale = self.k_scale
 
     def _init_ssm_segment_if_needed(self) -> None:
-        """Allocate the SSM working+snapshot pools when the model needs them."""
+        """Allocate the SSM working+snapshot pools when the model needs them.
+
+        For hybrid GDN/Mamba models each pool slot holds the full per-layer
+        recurrent state, so the requested pools (``maxd`` working +
+        ``4*maxd`` snapshot) can be tens of GB and -- allocated eagerly before
+        the KV cache is sized -- exhaust the device and OOM right here. To make
+        startup robust we size the pools against the *currently free* memory:
+
+        * the **working pool** (one slot per concurrently-running seq) is
+          mandatory for correctness and always allocated; if even it cannot
+          fit we raise a clear, actionable error instead of a bare CUDA OOM;
+        * the **snapshot pool** (best-effort prefix-cache state reuse) is
+          clamped so the total SSM footprint stays within
+          ``ssm_pool_budget_frac`` of the util-scaled free memory, leaving the
+          remainder for the KV cache. When memory is ample the full requested
+          snapshot pool is honored (behavior unchanged); when tight it shrinks,
+          down to 0 (SSM prefix caching disabled) before anything OOMs.
+        """
         if self.ssm_cache_config is None:
             return
         cfg = self.ssm_cache_config
+        per_slot = cfg.per_slot_bytes()
+
+        free_mem, _ = torch.cuda.mem_get_info()
+        budget = int(free_mem * self.gpu_memory_util * self.ssm_pool_budget_frac)
+
+        # +1 mirrors SSMSegment's reserved CUDA-graph dummy slot in each pool.
+        working_slots = self.max_working_ssm_slots
+        working_bytes = (working_slots + 1) * per_slot
+        if working_bytes >= free_mem:
+            raise RuntimeError(
+                f"SSM working pool needs {working_bytes / (1 << 30):.1f} GB "
+                f"({working_slots} slots x {per_slot / (1 << 20):.1f} MB) but only "
+                f"{free_mem / (1 << 30):.1f} GB is free after loading weights. "
+                f"Lower --maxd (currently {working_slots}) or use more "
+                f"tensor-parallel GPUs (--tp) to shrink the per-rank state."
+            )
+
+        requested_snapshot = self.max_snapshot_ssm_slots
+        affordable_snapshot = max(0, (budget - working_bytes) // per_slot - 1)
+        snapshot_slots = min(requested_snapshot, int(affordable_snapshot))
+
+        # Keep every TP rank's pool layout identical (state is sharded, not
+        # replicated, but the slot *count* must match across ranks); free
+        # memory can differ slightly per rank, so agree on the minimum.
+        if dist.is_initialized():
+            gathered = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered, snapshot_slots)
+            snapshot_slots = min(gathered)
+
+        if snapshot_slots < requested_snapshot:
+            logger.warning(
+                "SSM snapshot pool clamped %d -> %d slots to fit the memory "
+                "budget (%.1f GB free, %.0f%% util, %.0f%% SSM share); prefix-cache "
+                "state reuse is %s. Lower --maxd or raise --tp for the full pool.",
+                requested_snapshot,
+                snapshot_slots,
+                free_mem / (1 << 30),
+                self.gpu_memory_util * 100,
+                self.ssm_pool_budget_frac * 100,
+                "reduced" if snapshot_slots > 0 else "disabled",
+            )
+
         self.ssm_segment = SSMSegment(
             cfg,
-            working_pool_size=self.max_working_ssm_slots,
-            snapshot_pool_size=self.max_snapshot_ssm_slots,
+            working_pool_size=working_slots,
+            snapshot_pool_size=snapshot_slots,
         )
-        per_slot = cfg.per_slot_bytes()
         total = per_slot * (
             self.ssm_segment.working_pool_size + self.ssm_segment.snapshot_pool_size
         )
