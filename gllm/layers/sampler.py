@@ -29,8 +29,8 @@ class Sampler:
             apply_scaling_penalties(logits, input_data.repetition_penalty)
 
         if flags["is_all_greedy"]:
-            if flags["need_temperature"]:
-                logits.div_(input_data.temperature.unsqueeze(1))
+            # argmax is invariant to positive temperature scaling, so the
+            # full-vocab div_ would be wasted work here -- skip it.
             return torch.argmax(logits, dim=-1)
 
         if flags["need_temperature"]:
