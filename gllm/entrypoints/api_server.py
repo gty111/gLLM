@@ -201,9 +201,10 @@ if __name__ == "__main__":
         default="auto",
     )
     parser.add_argument(
-        "--disable-thinking",
-        help="Disable thinking in inference models",
-        action="store_true",
+        "--enable-thinking",
+        help="Enable thinking in inference models (off by default)",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument(
         "--model-max-length",
@@ -361,7 +362,7 @@ if __name__ == "__main__":
         assigned_layers=args.assigned_layers,
         schedule_method=args.schedule_method,
         overlap_scheduling=args.overlap_scheduling,
-        use_thinking=not args.disable_thinking,
+        use_thinking=args.enable_thinking,
         disable_cuda_graph=args.disable_cuda_graph,
         max_cuda_graph_bs=args.max_cuda_graph_bs,
         model_max_length=args.model_max_length,

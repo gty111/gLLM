@@ -5,9 +5,11 @@ import torch
 import torch.distributed as dist
 from logger import logger
 
+from collections import deque
+
 from gllm.id_allocator import IDAllocator
 from gllm.sequence import Sequence
-from gllm.utils import get_dtype_bytes
+from gllm.utils import async_tensor_h2d, get_dtype_bytes
 
 
 @dataclass
@@ -308,6 +310,7 @@ class MemoryManager:
         ssm_cache_config: Optional[SSMCacheConfig] = None,
         max_working_ssm_slots: int = 0,
         max_snapshot_ssm_slots: int = 0,
+        max_running_seqs: int = 256,
     ):
         """
         Args:
@@ -350,6 +353,21 @@ class MemoryManager:
         # Populated by :meth:`init`; ``None`` when the model is not hybrid.
         self.ssm_segment: Optional[SSMSegment] = None
         self.segment: Union[Segment, PrefixSegment] = None
+
+        # --- Persistent repetition-penalty mask pool --------------------
+        # Lazily allocated on the first batch that actually uses a non-1.0
+        # ``repetition_penalty`` (so workloads that never set one pay nothing,
+        # not even GPU memory). ``_rep_pool`` is a ``[num_slots + 1, vocab]``
+        # tensor: row 0 is an immutable all-ones sentinel reused for every
+        # seq with ``repetition_penalty == 1.0`` (multiplying through it is a
+        # no-op), rows ``1..num_slots`` are per-seq persistent rows. Each seq
+        # incrementally scatters only its newly generated token(s) into its
+        # row, and the per-step ``[batch, vocab]`` mask is a single
+        # ``index_select`` gather over the slot ids -- O(batch) work per step
+        # instead of the previous O(sum(len(token_ids))) full rebuild.
+        self.max_running_seqs = max_running_seqs
+        self._rep_pool: Optional[torch.Tensor] = None
+        self._rep_free_slots: Optional[deque] = None
 
     @property
     def use_ssm_cache(self) -> bool:
@@ -530,6 +548,114 @@ class MemoryManager:
         for page_num in seq.page_table:
             self.segment.free(page_num)
         self.free_ssm_slot(seq)
+        self.free_rep_slot(seq)
+
+    # --- Repetition-penalty mask pool lifecycle ---------------------------
+
+    def _ensure_rep_pool(self) -> None:
+        if self._rep_pool is not None:
+            return
+        num_slots = max(self.max_running_seqs, 1)
+        # +1 for the row-0 all-ones sentinel.
+        self._rep_pool = torch.ones(
+            (num_slots + 1, self.vocab_size), dtype=self.dtype, device="cuda"
+        )
+        self._rep_free_slots = deque(range(1, num_slots + 1))
+
+    def _grow_rep_pool(self, extra: int) -> None:
+        """Append ``extra`` fresh all-ones rows to the pool.
+
+        Concurrent decode is normally bounded by ``max_running_seqs`` (the
+        scheduler caps each batch at that many rows), so this is a rare
+        safety valve rather than a steady-state path.
+        """
+        old_rows = self._rep_pool.shape[0]
+        new_rows = torch.ones(
+            (extra, self.vocab_size), dtype=self.dtype, device="cuda"
+        )
+        self._rep_pool = torch.cat([self._rep_pool, new_rows], dim=0)
+        self._rep_free_slots.extend(range(old_rows, old_rows + extra))
+
+    def free_rep_slot(self, seq: Sequence) -> None:
+        if seq.rep_slot is None:
+            return
+        # Lazy reset: the row is re-filled with ones when the slot is handed
+        # to the next seq (see ``build_repetition_penalty_mask``), so we only
+        # need to return the id and clear the per-seq bookkeeping here.
+        if self._rep_free_slots is not None:
+            self._rep_free_slots.append(seq.rep_slot)
+        seq.rep_slot = None
+        seq.rep_filled = 0
+
+    def build_repetition_penalty_mask(self, seqs: List[Sequence]):
+        """Return a ``[batch, vocab]`` scaling-penalty mask, or ``None``.
+
+        Incremental + persistent: every seq with ``repetition_penalty != 1.0``
+        owns a pool row that is updated with only its newly appended tokens
+        each step; the batch mask is gathered from those rows in one op.
+        Mirrors the semantics of the old from-scratch builder (penalty value
+        at already-seen token positions, 1.0 elsewhere).
+        """
+        active = [
+            seq
+            for seq in seqs
+            if getattr(seq, "repetition_penalty", 1.0) != 1.0
+            and seq.token_ids is not None
+        ]
+        if not active:
+            return None
+
+        self._ensure_rep_pool()
+
+        # 1) Allocate slots for new seqs and collect the (slot, token) pairs
+        #    that still need scattering -- only the suffix of token_ids that
+        #    has not been seen yet (one token per decode step in steady state).
+        new_slots: List[int] = []
+        new_tokens: List[int] = []
+        new_pens: List[float] = []
+        reset_slots: List[int] = []
+        for seq in active:
+            if seq.rep_slot is None:
+                if not self._rep_free_slots:
+                    self._grow_rep_pool(self.max_running_seqs)
+                seq.rep_slot = self._rep_free_slots.popleft()
+                # Reset a (possibly reused) row back to the all-ones baseline
+                # (done in bulk below, after ``_grow_rep_pool`` may have
+                # rebuilt ``self._rep_pool`` via torch.cat).
+                reset_slots.append(seq.rep_slot)
+                seq.rep_filled = 0
+            n_total = len(seq.token_ids)
+            if n_total > seq.rep_filled:
+                suffix = seq.token_ids[seq.rep_filled :]
+                new_slots.extend([seq.rep_slot] * len(suffix))
+                new_tokens.extend(suffix)
+                new_pens.extend([seq.repetition_penalty] * len(suffix))
+                seq.rep_filled = n_total
+
+        # ``self._rep_pool`` is only stable to capture *after* the allocation
+        # loop, since ``_grow_rep_pool`` may have replaced it via torch.cat.
+        pool = self._rep_pool
+        if reset_slots:
+            pool[reset_slots] = 1.0
+        if new_slots:
+            slot_t = async_tensor_h2d(new_slots, torch.long, "cuda", True)
+            token_t = async_tensor_h2d(new_tokens, torch.long, "cuda", True)
+            pen_t = async_tensor_h2d(new_pens, self.dtype, "cuda", True)
+            pool[slot_t, token_t] = pen_t
+
+        # 2) Gather the per-batch rows in a single op. Seqs with penalty 1.0
+        #    (or no slot) map to the row-0 all-ones sentinel.
+        batch_slots = [
+            seq.rep_slot
+            if (
+                getattr(seq, "repetition_penalty", 1.0) != 1.0
+                and seq.rep_slot is not None
+            )
+            else 0
+            for seq in seqs
+        ]
+        batch_slots_t = async_tensor_h2d(batch_slots, torch.long, "cuda", True)
+        return pool.index_select(0, batch_slots_t)
 
     # --- SSM working slot lifecycle ---------------------------------------
     #

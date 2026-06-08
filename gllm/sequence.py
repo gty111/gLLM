@@ -53,6 +53,14 @@ class Sequence:
         # has not yet allocated a slot for this seq. The slot lives for the
         # whole lifetime of the request and is reset on preempt/free.
         self.ssm_state_slot: Optional[int] = None
+        # Persistent per-seq slot in the repetition-penalty mask pool
+        # (``MemoryManager._rep_pool``). ``None`` means no slot yet / the seq
+        # has ``repetition_penalty == 1.0`` and needs none. ``rep_filled`` is
+        # the number of ``token_ids`` already scattered into that pool row, so
+        # each decode step only scatters the newly appended token(s) instead
+        # of rebuilding the seq's whole history. Reset on free/preempt.
+        self.rep_slot: Optional[int] = None
+        self.rep_filled: int = 0
         # Alternate "view" of ``token_ids`` used *only* for prefix-cache
         # hashing. Multimodal pipelines splice content-derived ids into the
         # placeholder positions here so that VL prompts with identical text
