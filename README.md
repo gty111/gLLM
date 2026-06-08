@@ -76,13 +76,6 @@ python examples/batch_inference.py --model $MODEL \
     --gpu-memory-util $GPU_MEMORY_UTIL
 ```
 
-### Offline Benchmark
-```bash
-python benchmarks/benchmark_throughput.py --model $MODEL \
-    --dataset $SHAREGPT_PATH --num-prompt $NUM_PROMPT --backend gllm \
-    --gpu-memory-util $GPU_MEMORY_UTIL
-```
-
 ### Launch OpenAI-Compatible Server (Intra-node)
 
 ```bash
