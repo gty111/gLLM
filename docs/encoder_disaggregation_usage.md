@@ -191,7 +191,7 @@ You normally only need `--model-path`, the GPU index, the LM `--port`, and
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `GLLM_DISAGG_OVERLAP` | `1` | **Intra-request** encode/prefill overlap (see below). |
+| `GLLM_DISAGG_OVERLAP` | `0` | **Intra-request** encode/prefill overlap (see below). |
 | `GLLM_DISAGG_REDISPATCH_TIMEOUT_S` | `20.0` | Re-dispatch in-flight jobs after this timeout (watchdog). |
 | `GLLM_DISAGG_MAX_REDISPATCH` | `5` | Max re-dispatch attempts per item. |
 | `GLLM_ENC_FAIL_FIRST_N` | `0` | **Test only:** make an encoder drop its first N jobs to exercise re-dispatch. |
@@ -210,8 +210,8 @@ between requests. The LM tracks two gates per request:
 
 | Value | Behavior | Trade-off |
 |-------|----------|-----------|
-| `1` (default) | Admit as soon as **Gate A** is met. The request starts prefilling its text and already-arrived images immediately, and progressively fills in the remaining image spans (Gate B) as their embeddings arrive — overlapping LM prefill with ongoing ViT encode/transfer for the *same* request. | Best when encoding is on the critical path. Prefill runs in multiple chunks, so output is subject to the engine's normal chunked-prefill bf16 rounding (not bit-exact vs an unchunked run). |
-| `0` | Wait until **Gate A and Gate B** are both met (all embeddings landed) before admitting, then prefill the whole prompt in one chunk. | Determinism baseline: byte-identical to the unchunked monolith. TTFT no worse than `1` when encoders keep up; higher when the LM would otherwise sit idle waiting on a request's last image. |
+| `0` (default) | Wait until **Gate A and Gate B** are both met (all embeddings landed) before admitting, then prefill the whole prompt in one chunk. | Determinism baseline: byte-identical to the unchunked monolith. TTFT no worse than `1` when encoders keep up; higher when the LM would otherwise sit idle waiting on a request's last image. |
+| `1` | Admit as soon as **Gate A** is met. The request starts prefilling its text and already-arrived images immediately, and progressively fills in the remaining image spans (Gate B) as their embeddings arrive — overlapping LM prefill with ongoing ViT encode/transfer for the *same* request. | Best when encoding is on the critical path. Prefill runs in multiple chunks, so output is subject to the engine's normal chunked-prefill bf16 rounding (not bit-exact vs an unchunked run). |
 
 Note: regardless of this flag, the LM can still prefill/decode request A while
 the encoders work on request B — that cross-request pipelining is inherent to
@@ -307,8 +307,8 @@ GPUs spent on parallel ViT, the shorter the encode wall).
 The E1LM1 config above is **encoder-bound** (one encoder serializes every ViT),
 which is exactly where intra-request overlap (section 6) helps. Same workload:
 
-| Metric | `OVERLAP=0` | `OVERLAP=1` (default) |
-|--------|-------------|------------------------|
+| Metric | `OVERLAP=0` (default) | `OVERLAP=1` |
+|--------|----------------------|--------------|
 | TTFT median (ms) | 5015 | **3938** |
 | TTFT mean (ms) | 5435 | **4687** |
 | Total throughput (tok/s) | 6808 | **7180** |
