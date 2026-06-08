@@ -37,12 +37,14 @@ if __name__ == "__main__":
             prompt = completion["conversations"][0]["value"]
             answer = completion["conversations"][1]["value"]
             tokens_each = llm.model_runner.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}], add_generation_prompt=True
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                return_dict=False,
             )
             input_len = len(tokens_each)
             output_len = len(
                 llm.model_runner.tokenizer.apply_chat_template(
-                    [{"role": "assistant", "content": answer}]
+                    [{"role": "assistant", "content": answer}], return_dict=False
                 )
             )
             if input_len > 1024 or input_len + output_len > 2048:

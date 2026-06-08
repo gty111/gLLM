@@ -226,7 +226,7 @@ class Scheduler:
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
 
-    def schedule_prefill_batch(self, prefill_token_budget):
+    def schedule_prefill_batch(self, prefill_token_budget, max_seqs=None):
         prefill_batch: List[Sequence] = []
         unfinish_prefill_seqs = deque()
         # Encoder-disaggregation overlap (design §6.2): seqs whose next chunk is
@@ -240,7 +240,17 @@ class Scheduler:
         # softmax-attn models, in which case the slot check below is a
         # no-op.
         ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
-        while len(self.seqs_to_prefill) != 0 and prefill_token_budget != 0:
+        # Cap the number of prefill seqs so the *combined* batch
+        # (decode + prefill) never exceeds ``max_running_seqs`` rows, which
+        # is what the device input buffers (block_table / seq_lens / ...) are
+        # sized for. Without this, a tiny model with a huge KV cache admits
+        # enough short prompts that ``decode + prefill`` overflows the buffer
+        # and ``copy_to_input_buffer`` crashes on a row-count mismatch.
+        while (
+            len(self.seqs_to_prefill) != 0
+            and prefill_token_budget != 0
+            and (max_seqs is None or len(prefill_batch) < max_seqs)
+        ):
             seq = self.seqs_to_prefill.popleft()
             # If this seq hasn't taken a working slot yet AND the pool is
             # exhausted, put the request back on the wait queue and stop
@@ -355,7 +365,7 @@ class Scheduler:
         )
 
         prefill_batch, prefill_batched_token_nums = self.schedule_prefill_batch(
-            num_tokens_budget
+            num_tokens_budget, max_seqs=self.maxd - len(decode_batch)
         )
 
         if self.log and time.time() - self.log_time > 1:
@@ -404,13 +414,19 @@ class Scheduler:
             prefill_token_budget = min(self.maxp, prefill_token_budget)
 
         prefill_batch, prefill_batched_token_nums = self.schedule_prefill_batch(
-            prefill_token_budget
+            prefill_token_budget, max_seqs=self.maxd
         )
 
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
         decode_token_budget = self.get_balanced_decode_token_budget(
             num_total_decode_seqs
+        )
+        # Keep the combined batch within ``max_running_seqs`` rows (see
+        # schedule_prefill_batch); prefill is scheduled first here, so the
+        # decode half takes whatever row capacity is left.
+        decode_token_budget = min(
+            decode_token_budget, self.maxd - len(prefill_batch)
         )
 
         decode_batch = self.schedule_decode_batch(decode_token_budget)
