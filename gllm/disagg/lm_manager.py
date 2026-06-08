@@ -303,13 +303,13 @@ class DisaggCoordinator:
         self.num_ranks = len(rank_handshakes)
         self.slot_stride_bytes = recv.slot_stride_bytes
 
-        # Phase 6 intra-request encode/prefill overlap (design §6.2). When on
-        # (default), a seq is admitted as soon as all meta arrive and prefill
-        # advances per-item under the two-layer gate. When off, admission waits
+        # Phase 6 intra-request encode/prefill overlap (design §6.2). When on,
+        # a seq is admitted as soon as all meta arrive and prefill advances
+        # per-item under the two-layer gate. When off (default), admission waits
         # for *all* embeddings (Phase 3b timing) -> single-chunk prefill, which
         # is byte-identical to the unchunked monolith (used as a determinism
-        # baseline).
-        self.overlap = os.environ.get("GLLM_DISAGG_OVERLAP", "1") != "0"
+        # baseline). Set GLLM_DISAGG_OVERLAP=1 to enable overlap.
+        self.overlap = os.environ.get("GLLM_DISAGG_OVERLAP", "0") != "0"
         # Phase 8 watchdog (design §5.5.2): an in-flight item whose encoder has
         # gone silent or left the pool is re-dispatched to a live replica,
         # reusing the same slot (idempotent overwrite). After
