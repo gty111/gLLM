@@ -48,7 +48,6 @@ gLLM is an efficient and versatile inference engine for distributed LLM serving.
 - **High-performance execution**: continuous batching, paged attention, chunked prefill, prefix caching, and cuda graph.
 - **Balanced scheduling**: token throttling for smoother pipeline utilization across prefill and decode (see below).
 - **Versatile serving**: offline batch inference, online serving, and interactive chat.
-- **Minimal codebase**: equivalent or superior speed to mainstream engines, while staying easy to read, hack, and extend.
 
 ## Installation
 
