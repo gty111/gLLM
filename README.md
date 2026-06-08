@@ -1,9 +1,9 @@
 <p align="center">
-    <img src=doc/pic/gLLM.svg height=600>
+    <img src=docs/pic/gLLM.svg height=600>
 </p>
 
 <h4 align="center">
-Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Token Throttling
+An Efficient and Versatile Inference Engine for Distributed LLM Serving
 </h4>
 
 
@@ -11,14 +11,17 @@ Global Balanced Pipeline Parallelism System for Distributed LLM Serving with Tok
 
 ## What is gLLM?
 
-<p align="center">
-<img src=doc/pic/overview.svg width=500>
-</p>
-
-Integrated with features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **cuda graph**, **token throttling**, **pipeline parallelism**, **expert parallelism** and **tensor parallelism**, gLLM provides basic functionality (**offline/online inference and interactive chat**) to deploy distributed LLMs (supported in HuggingFace) inference. gLLM provides **equivalent or superior** offline/online inference speed compared to mainstream inference engines, with a **minimal** code base. You can also see gLLM as an LLM inference playground for experiments or academic research.
+gLLM is an efficient and versatile inference engine for distributed LLM serving. It supports a wide range of models (**dense**, **MoE**, **multimodal/vision-language**, and **hybrid-attention** architectures from HuggingFace) and deployment scenarios (**offline/online inference and interactive chat**). Under the hood, gLLM integrates features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **cuda graph**, **token throttling**, **pipeline parallelism**, **expert parallelism** and **tensor parallelism**, delivering **equivalent or superior** inference speed compared to mainstream inference engines while keeping a **minimal** code base. You can also see gLLM as an LLM inference playground for experiments or academic research.
 
 *Latest News* :fire:
-- [2026/05/27]: Qwen3.5 is supported — dense & MoE, hybrid GDN + full attention, vision-language, and FP8 checkpoints :tada:
+- [2026/06/08]: Qwen3.6 day-1 support — it shares the same architecture as Qwen3.5, so it works out of the box :tada:
+- [2026/06/05]: [Encoder disaggregation](docs/encoder_disaggregation_usage.md) is supported, decoupling the multimodal encoder from the LLM for better resource utilization :rocket:
+- [2026/05/27]: Qwen3.5 is supported — dense, MoE, VL, and FP8 :tada:
+
+
+<details>
+<summary>Previous News</summary>
+
 - [2025/12/04]: Cuda graph is supported :tada:
 - [2025/11/19]: DeepSeek V3/R1 is supported :laughing:
 - [2025/09/19]: [DynaPipe](https://openreview.net/forum?id=D6w7wIN360) is accepted by NeurIPS'25. Congratulations :smiling_face_with_three_hearts:
@@ -31,10 +34,6 @@ Integrated with features like **continuous batching**, **paged attention**, **ch
 - [2025/05/05]: MoE architecture is supported. Try Qwen2/3 MoE models :star_struck:
 - [2025/04/29]: Qwen3 day 1 support. Come and try Qwen3 :tada:
 - [2025/04/27]: gLLM is open sourced :earth_asia:
-
-<details>
-<summary>Previous News</summary>
-
 - [2025/04/27]: We support multi-node deployments. You can serve your model across different machines :blush:
 - [2025/04/21]: We release our paper on [arXiv:2504.14775](https://arxiv.org/abs/2504.14775) :partying_face:
 - [2025/03/15]: Chunked prefill has been integrated. You can input any length of text you want :hugs:
@@ -43,19 +42,14 @@ Integrated with features like **continuous batching**, **paged attention**, **ch
 
 </details>
 
-## Token Throttling
+## Key Features
 
-### Prefill Token Throttling
-<p align="center">
-<img src=doc/pic/prefill_throttling.svg >
-</p>
-
----
-
-### Decode Token Throttling
-<p align="center">
-<img src=doc/pic/decode_throttling.svg >
-</p>
+- **Broad model support**: dense, MoE, multimodal/vision-language, and hybrid-attention architectures from HuggingFace, including FP8 checkpoints.
+- **Flexible parallelism**: pipeline, tensor, and expert parallelism that can be freely combined for single- or multi-node deployments.
+- **High-performance execution**: continuous batching, paged attention, chunked prefill, prefix caching, and cuda graph.
+- **Balanced scheduling**: token throttling for smoother pipeline utilization across prefill and decode (see below).
+- **Versatile serving**: offline batch inference, online serving, and interactive chat.
+- **Minimal codebase**: equivalent or superior speed to mainstream engines, while staying easy to read, hack, and extend.
 
 ## Installation
 
@@ -133,26 +127,6 @@ python examples/client.py --port $PORT
 python examples/chat_client.py --port $PORT
 ```
 
-### Online Benchmark
-```bash
-# Launch server first
-python benchmarks/benchmark_serving.py --backend $BACKEND --model $MODEL \
-        --dataset-name $DATASET_NAME --dataset-path $DATASET_PATH \
-        --num-prompts $NUM_PROMPTS --port $PORT --trust-remote-code \
-        --request-rate $REQUEST_RATE
-```
-
-### Online Prefix Benchmark
-```bash
-# Launch server first
-python benchmarks/benchmark_prefix_serving.py \
-        --trust-remote-code --backend $BACKEND --dataset $SHAREGPT_PATH \
-        --model $MODEL --num-max-users $NUM_USERS \
-        --num-min-rounds $NUM_MIN_ROUNDS \
-        --num-max-rounds $NUM_MAX_ROUNDS \
-        --port $PORT
-```
-
 ### Evaluate Output Quality
 ```bash
 # Launch server first
@@ -163,7 +137,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 - Kimi Series: Moonlight, K2-Base, K2-Instruct
 - DeepSeek Series: DeepSeek R1, DeepSeek V3, DeepSeek V2
-- Qwen Series: Qwen3.5, Qwen3 VL, Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
+- Qwen Series: Qwen3.6, Qwen3.5, Qwen3 VL, Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
 - Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
 - Mixtral Series: Mixtral-8x7B, Mixtral-8x22B
 - ChatGLM Series: Glm4 and Chatglm3
