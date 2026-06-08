@@ -4,7 +4,6 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from gllm.layers.repetition_penalty import build_repetition_penalty_mask
 from gllm.memory_manager import MemoryManager
 from gllm.sequence import Sequence
 from gllm.utils import async_tensor_h2d, ceil_div, round_down
@@ -101,15 +100,12 @@ class InputData:
             "cuda",
             True,
         )
-        # Build the per-seq ``[batch, vocab]`` repetition-penalty mask via
-        # the shared helper in ``gllm/layers/repetition_penalty.py`` (see
-        # that module's header for the sglang reference + the rationale
-        # behind our HF-style "seed with prompt + generated" semantics).
-        self.repetition_penalty = build_repetition_penalty_mask(
-            self.seqs,
-            batch_size=len(self.seqs),
-            vocab_size=self.memory_manager.vocab_size,
-            dtype=self.memory_manager.dtype,
+        # Build the per-seq ``[batch, vocab]`` repetition-penalty mask via the
+        # persistent, incrementally-updated pool on the memory manager (see
+        # ``MemoryManager.build_repetition_penalty_mask`` -- O(batch) per step
+        # instead of rebuilding each seq's whole token history every step).
+        self.repetition_penalty = self.memory_manager.build_repetition_penalty_mask(
+            self.seqs
         )
         self.needs_repetition_penalty = self.repetition_penalty is not None
 

@@ -409,6 +409,7 @@ class ModelRunner:
                 if ssm_cache_config and self.enable_prefix_caching
                 else 0
             ),
+            max_running_seqs=self.max_running_seqs,
         )
         # Input buffer
         self.input_data = InputData(

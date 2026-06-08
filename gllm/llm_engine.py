@@ -55,7 +55,7 @@ class LLM:
         assigned_layers=None,
         schedule_method="chunked_prefill",
         overlap_scheduling=True,
-        use_thinking=True,
+        use_thinking=False,
         disable_cuda_graph=False,
         max_cuda_graph_bs=512,
         model_max_length=8192,

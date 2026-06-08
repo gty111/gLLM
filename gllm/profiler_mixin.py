@@ -66,6 +66,24 @@ class TorchProfilerMixin:
         with open(trace_path, "rb") as src, gzip.open(trace_gz_path, "wb") as dst:
             shutil.copyfileobj(src, dst)
         os.remove(trace_path)
+        # Also dump a human-readable ``key_averages`` summary next to the
+        # trace so bottlenecks can be inspected without parsing the (often
+        # hundreds of MB) chrome trace. Best-effort: never let summary
+        # generation break the trace export above.
+        try:
+            summary_path = os.path.join(
+                output_dir,
+                f"summary_rank{self.rank}_{self.profile_start_ts}.txt",
+            )
+            ka = self.profiler.key_averages()
+            with open(summary_path, "w") as f:
+                f.write("== sorted by self_cuda_time_total ==\n")
+                f.write(ka.table(sort_by="self_cuda_time_total", row_limit=40))
+                f.write("\n\n== sorted by self_cpu_time_total ==\n")
+                f.write(ka.table(sort_by="self_cpu_time_total", row_limit=40))
+            logger.info(f"Torch profiler summary saved to {summary_path}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to write profiler summary: {e}")
         self.profiler = None
         self.profile_start_ts = None
         self.profile_session_dir = None
