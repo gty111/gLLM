@@ -41,9 +41,9 @@ class LLM:
         # snapshot pool (``4*maxd`` slots, each holding the full per-layer
         # recurrent state). The previous default of 2048 made those pools tens
         # of GiB on linear-attention models and OOM'd before the KV cache was
-        # even allocated. 256 matches the common ``max_num_seqs`` default and
-        # keeps the pools to a sane size; override for very high concurrency.
-        maxd=256,
+        # even allocated. 512 matches the api/lm server ``--maxd`` default;
+        # lower it if the SSM/snapshot pools are too large for a given model.
+        maxd=512,
         maxp=2048,
         minp=32,
         iterp=8,
@@ -57,7 +57,7 @@ class LLM:
         overlap_scheduling=True,
         use_thinking=True,
         disable_cuda_graph=False,
-        max_cuda_graph_bs=32,
+        max_cuda_graph_bs=512,
         model_max_length=8192,
         mm_processor_min_pixels=None,
         mm_processor_max_pixels=None,
