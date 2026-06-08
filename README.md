@@ -64,6 +64,14 @@ uv pip install "git+https://github.com/gty111/gLLM.git"
 
 ## Quickstart
 
+
+### Launch OpenAI-Compatible Server (Intra-node)
+
+```bash
+# To see the description of args, run 'python -m gllm.entrypoints.api_server -h'
+python -m gllm.entrypoints.api_server --model-path $MODEL_PATH
+```
+
 ### Interactive Offline Chat
 ```bash
 python examples/chat.py --model $MODEL_PATH
@@ -74,14 +82,6 @@ python examples/chat.py --model $MODEL_PATH
 python examples/batch_inference.py --model $MODEL \
     --share-gpt-path $SHARE_GPT_PATH --num-prompt $NUM_PROMPT \
     --gpu-memory-util $GPU_MEMORY_UTIL
-```
-
-### Launch OpenAI-Compatible Server (Intra-node)
-
-```bash
-# To see the description of args, run 'python -m gllm.entrypoints.api_server -h'
-python -m gllm.entrypoints.api_server --port $PORT --model-path $MODEL_PATH \
-    --enable-prefix-caching --pp $PP --tp $TP
 ```
 
 ### Launch OpenAI-Compatible Server (Multi-node)
