@@ -136,7 +136,8 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 ## Supported Quantization Methods
 
-- fp8
+- fp8 (E4M3 W8A8; block-wise or per-tensor weight scales, dynamic/static activation; linear + MoE; requires device capability >= 8.9)
+- int4 (compressed-tensors pack-quantized, routed-expert MoE)
 
 ## Roadmap
 
