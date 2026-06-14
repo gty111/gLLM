@@ -1,5 +1,6 @@
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
 
 import torch.multiprocessing as mp
@@ -194,16 +195,34 @@ class LLM:
         logger.info(
             f"Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size}"
         )
+        # Build every worker process object first (cheap), then fire all the
+        # ``process.start()`` calls concurrently. For the spawn start method
+        # ``start()`` blocks the parent while it pickles the worker and writes
+        # the bootstrap pipe, so launching serially makes the parent pay that
+        # cost N times in sequence. The processes themselves are independent,
+        # so starting them from a thread pool overlaps the per-worker spawn
+        # latency. The expensive work (NCCL rendezvous, weight load, CUDA graph
+        # capture) already runs concurrently inside the children.
         self.process_list = []
         for local_rank, rank in enumerate(self.act_worker_ranks):
             pp_rank = rank // self.tp_size
             tp_rank = rank % self.tp_size
-            self.start_worker(local_rank, pp_rank, tp_rank)
+            self.build_worker(local_rank, pp_rank, tp_rank)
+
+        if self.num_workers == 1:
+            self.process_list[0].start()
+        else:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+                futures = [pool.submit(p.start) for p in self.process_list]
+                for f in futures:
+                    # Re-raise any spawn failure in the parent instead of
+                    # silently leaving a half-launched fleet.
+                    f.result()
 
         if self.load_format == "auto":
             self.load_progress()
 
-    def start_worker(self, local_rank, pp_rank, tp_rank):
+    def build_worker(self, local_rank, pp_rank, tp_rank):
         if self.overlap_scheduling:
             worker_cls = OverlapWorker
             run_target = run_overlap_worker
@@ -242,7 +261,7 @@ class LLM:
             daemon=True,
         )
         self.process_list.append(process)
-        process.start()
+        return process
 
     def load_progress(self):
         total_weights = 0

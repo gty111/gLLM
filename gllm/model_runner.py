@@ -275,8 +275,23 @@ class ModelRunner:
         self.use_mm = self.model_loader.use_mm
         self.use_mla = self.model_loader.use_mla
         self.hidden_size = self.model_loader.hidden_size
+        # Kimi-K2.5 is multimodal but its DeepSeek-V3 language backbone uses
+        # ordinary 1-D RoPE, NOT the 3-D mrope that the Qwen-VL family uses.
+        # ``uses_mrope`` gates the 3-row position machinery so Kimi flows
+        # through the multimodal *embedding-merge* path while keeping plain
+        # 1-D positions.
+        self.is_kimi_mm = (
+            self.model_loader.architecture == "KimiK25ForConditionalGeneration"
+        )
+        self.uses_mrope = self.use_mm and not self.is_kimi_mm
 
-        if self.use_mm:
+        if self.use_mm and self.is_kimi_mm:
+            self.processor = AutoProcessor.from_pretrained(
+                model_path, trust_remote_code=True, use_fast=True
+            )
+            self.image_processor = None
+            self.video_processor = None
+        elif self.use_mm:
             self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
             self.image_processor = self.processor.image_processor
             self.video_processor = self.processor.video_processor
@@ -435,11 +450,38 @@ class ModelRunner:
     def encode(self, messages, chat: bool = False, has_mm: bool = False):
         if chat:
             if not self.use_mm or not has_mm:
+                # Different chat templates gate "thinking" mode via different
+                # variable names: Qwen3/3.5 read ``enable_thinking`` while
+                # Kimi-K2.5 reads ``thinking`` (rendering ``<think></think>``
+                # when false vs an open ``<think>`` when true). Jinja silently
+                # ignores undefined template variables, so passing both keeps
+                # every model honoring ``use_thinking`` without per-model
+                # branching.
                 out = self.tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
                     enable_thinking=self.use_thinking,
+                    thinking=self.use_thinking,
                 )
+            elif self.is_kimi_mm:
+                # Kimi's chat template renders one ``<|media_pad|>`` per image
+                # and its processor does NOT expand it (unlike Qwen-VL). Render
+                # the text, tokenize, then splice each placeholder into N copies
+                # so the downstream ``is_multimodal`` mask has exactly one True
+                # per produced image embedding. ``N`` comes from the processor's
+                # own token calculator, guaranteeing it matches the grid the
+                # vision tower will emit.
+                out = self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    enable_thinking=self.use_thinking,
+                    thinking=self.use_thinking,
+                    tokenize=False,
+                )
+                if isinstance(out, (list, tuple)):
+                    out = out[0]
+                ids = self.tokenizer.encode(out)
+                return self._kimi_expand_mm_placeholders(ids, messages)
             else:
                 out = self.processor.apply_chat_template(
                     messages, tokenize=True, add_generation_prompt=True
@@ -455,6 +497,80 @@ class ModelRunner:
             out = out.input_ids
         elif isinstance(out, dict) and "input_ids" in out:
             out = out["input_ids"]
+        elif isinstance(out, str):
+            # Some custom tokenizers (e.g. Kimi-K2.5's tiktoken-based
+            # ``TikTokenTokenizer``) default ``apply_chat_template`` to
+            # ``tokenize=False`` and hand back the *rendered prompt string*
+            # rather than token ids. Encode it here so the chat path yields
+            # ids like every other model. The rendered string already
+            # carries the chat special tokens, so a plain ``encode`` round
+            # -trips to the same ids as ``tokenize=True``.
+            out = self.tokenizer.encode(out)
+        return out
+
+    def _kimi_expand_mm_placeholders(
+        self, token_ids: List[int], messages: List[Dict]
+    ) -> List[int]:
+        """Expand each single ``<|media_pad|>`` id into ``N`` copies.
+
+        Kimi's chat template emits exactly one placeholder id per image while
+        the vision tower produces ``N = (h//ps//mk) * (w//ps//mk)`` tokens for
+        that image (temporal pool collapses frames to 1 for stills). gLLM's
+        embedding merge replaces placeholders 1-to-1 with image embeddings, so
+        the prompt must carry ``N`` placeholders per image. We get ``N`` from
+        the processor's own ``media_tokens_calculator`` so it always matches
+        the grid the tower will compute.
+
+        Images are consumed in prompt order, matching ``embed_multimodal`` /
+        ``extract_modify_mm`` iteration (images first, then videos).
+        """
+        pad_id = self.model_loader.config.media_placeholder_token_id
+        media_proc = self.processor.media_processor
+
+        # Gather per-image token counts in prompt order.
+        from transformers.image_utils import load_image as _hf_load_image
+
+        counts: List[int] = []
+        for message in messages:
+            contents = message.get("content")
+            if not isinstance(contents, list):
+                continue
+            for content in contents:
+                if not isinstance(content, dict):
+                    continue
+                ctype = content.get("type")
+                if ctype in ("image", "image_url"):
+                    img_ref = content.get("image")
+                    if img_ref is None:
+                        data = content.get("image_url")
+                        img_ref = data["url"] if isinstance(data, dict) else data
+                    pil = _hf_load_image(img_ref)
+                    n = media_proc.media_tokens_calculator(
+                        {"type": "image", "image": pil}
+                    )
+                    counts.append(int(n))
+
+        if not counts:
+            return token_ids
+
+        out: List[int] = []
+        idx = 0
+        for tid in token_ids:
+            if tid == pad_id:
+                if idx >= len(counts):
+                    raise ValueError(
+                        "Kimi placeholder/image count mismatch: more "
+                        "<|media_pad|> tokens than images"
+                    )
+                out.extend([pad_id] * counts[idx])
+                idx += 1
+            else:
+                out.append(tid)
+        if idx != len(counts):
+            raise ValueError(
+                f"Kimi placeholder/image count mismatch: expanded {idx} "
+                f"placeholders but prompt has {len(counts)} images"
+            )
         return out
 
     def decode(self, token_ids):
@@ -561,12 +677,24 @@ class ModelRunner:
                     "prefill seqs within a batch"
                 )
                 embedding_info = self.embedding_cache[seq.seq_id]
-                position = MRotaryEmbedding.get_next_input_positions(
-                    embedding_info.mrope_position_delta,
-                    seq.computed_token_num,
-                    seq.seq_len,
-                )
-                batch_positions.append(torch.tensor(position, device="cpu"))
+                if self.uses_mrope:
+                    position = MRotaryEmbedding.get_next_input_positions(
+                        embedding_info.mrope_position_delta,
+                        seq.computed_token_num,
+                        seq.seq_len,
+                    )
+                    batch_positions.append(torch.tensor(position, device="cpu"))
+                else:
+                    # Kimi: plain 1-D positions. These are discarded by the
+                    # caller (``set_mrope_position`` is skipped for Kimi; the
+                    # real positions come from ``cal_and_set_input``), but we
+                    # still append a correctly-shaped tensor to keep the
+                    # downstream ``torch.concat`` happy.
+                    batch_positions.append(
+                        torch.arange(
+                            seq.computed_token_num, seq.seq_len, device="cpu"
+                        )
+                    )
                 num_decode_tokens += seq.to_compute_token_num
                 continue
 
@@ -630,18 +758,30 @@ class ModelRunner:
                     else:
                         seq.hash_token_ids = None
 
-                prompt_positions, mrope_position_delta = (
-                    MRotaryEmbedding.get_input_positions(
-                        input_tokens=seq.token_ids,
-                        hf_config=self.model.config,
-                        image_grid_thw=image_grid_thw,
-                        video_grid_thw=video_grid_thw,
-                        second_per_grid_ts=None,
+                if self.uses_mrope:
+                    prompt_positions, mrope_position_delta = (
+                        MRotaryEmbedding.get_input_positions(
+                            input_tokens=seq.token_ids,
+                            hf_config=self.model.config,
+                            image_grid_thw=image_grid_thw,
+                            video_grid_thw=video_grid_thw,
+                            second_per_grid_ts=None,
+                        )
                     )
-                )
-                batch_positions.append(
-                    prompt_positions[:, seq.computed_token_num : seq.seq_len]
-                )
+                    batch_positions.append(
+                        prompt_positions[:, seq.computed_token_num : seq.seq_len]
+                    )
+                else:
+                    # Kimi: plain 1-D positions over the full prompt. Stored in
+                    # EmbeddingInfo so decode can extrapolate; ``mrope_position
+                    # _delta`` is unused (decode uses ``torch.arange``).
+                    prompt_positions = torch.arange(
+                        len(seq.token_ids), device="cpu"
+                    )
+                    mrope_position_delta = None
+                    batch_positions.append(
+                        prompt_positions[seq.computed_token_num : seq.seq_len]
+                    )
 
                 prefill_works.append(
                     {
@@ -658,11 +798,18 @@ class ModelRunner:
                 )
             else:
                 embedding_info = self.embedding_cache[seq.seq_id]
-                batch_positions.append(
-                    embedding_info.prompt_positions[
-                        :, seq.computed_token_num : seq.seq_len
-                    ]
-                )
+                if self.uses_mrope:
+                    batch_positions.append(
+                        embedding_info.prompt_positions[
+                            :, seq.computed_token_num : seq.seq_len
+                        ]
+                    )
+                else:
+                    batch_positions.append(
+                        embedding_info.prompt_positions[
+                            seq.computed_token_num : seq.seq_len
+                        ]
+                    )
                 prefill_works.append(
                     {
                         "kind": "cached",
@@ -671,7 +818,16 @@ class ModelRunner:
                     }
                 )
 
-        mrope_positions = torch.concat(batch_positions, dim=1)
+        # Qwen-VL packs positions as (3, N) and concatenates on the token axis
+        # (dim=1); Kimi uses 1-D positions (dim=0). Kimi's result is discarded
+        # by callers (``set_mrope_position`` is skipped) but we still build a
+        # well-formed tensor.
+        if self.uses_mrope:
+            mrope_positions = torch.concat(batch_positions, dim=1)
+        elif batch_positions:
+            mrope_positions = torch.concat(batch_positions, dim=0)
+        else:
+            mrope_positions = None
         return {
             "prefill_works": prefill_works,
             "mrope_positions": mrope_positions,
@@ -758,6 +914,8 @@ class ModelRunner:
         mm_input: Dict = {}
         image_grid_thw: Optional[torch.Tensor] = None
         video_grid_thw: Optional[torch.Tensor] = None
+        if seq.mm_contents is not None and self.is_kimi_mm:
+            return self._mm_run_processor_kimi(seq)
         if seq.mm_contents is not None:
             if len(seq.mm_contents["image"]) != 0:
                 images = load_images(seq.mm_contents["image"])
@@ -782,6 +940,47 @@ class ModelRunner:
         if isinstance(video_grid_thw, torch.Tensor):
             video_grid_thw = video_grid_thw.cpu()
         return mm_input, image_grid_thw, video_grid_thw
+
+    def _mm_run_processor_kimi(
+        self, seq: Sequence
+    ) -> Tuple[Dict, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Kimi-K2.5 image preprocessing.
+
+        ``KimiK25VisionProcessor.preprocess`` takes a list of media dicts and
+        returns ``pixel_values`` (already patchified, shape
+        ``[sum(t*h*w), 3, ps, ps]``) plus ``grid_thws`` (``[num_images, 3]``).
+        We surface ``grid_thws`` *also* as ``image_grid_thw`` so the generic
+        content-hashing path (``prod(dim=-1)`` + ``split``) works unchanged,
+        while keeping ``grid_thws`` in ``mm_input`` for ``embed_multimodal``.
+        Kimi video chunking is not wired here yet (text+image path only).
+        """
+        from PIL import Image as _PILImage
+        from transformers.image_utils import load_image as _hf_load_image
+
+        mm_input: Dict = {}
+        image_grid_thw: Optional[torch.Tensor] = None
+        if len(seq.mm_contents["image"]) != 0:
+            medias = []
+            for img_ref in seq.mm_contents["image"]:
+                pil = (
+                    img_ref
+                    if isinstance(img_ref, _PILImage.Image)
+                    else _hf_load_image(img_ref)
+                )
+                medias.append({"type": "image", "image": pil})
+            preprocessed = self.processor.media_processor.preprocess(
+                medias, return_tensors="pt"
+            )
+            mm_input["pixel_values"] = preprocessed["pixel_values"]
+            mm_input["grid_thws"] = preprocessed["grid_thws"]
+            image_grid_thw = preprocessed["grid_thws"]
+        if len(seq.mm_contents["video"]) != 0:
+            raise NotImplementedError(
+                "Kimi-K2.5 video input is not supported in gLLM yet."
+            )
+        if isinstance(image_grid_thw, torch.Tensor):
+            image_grid_thw = image_grid_thw.cpu()
+        return mm_input, image_grid_thw, None
 
     def _mm_build_is_multimodal_cpu(
         self, seq: Sequence
@@ -1122,7 +1321,10 @@ class ModelRunner:
             input_embeddings, mrope_positions = self.mm_prepare_inputs(
                 self.input_data.seqs
             )
-            self.input_data.set_mrope_position(mrope_positions)
+            # Kimi keeps the plain 1-D positions set by ``cal_and_set_input``
+            # above; only the Qwen-VL family overrides with 3-D mrope.
+            if self.uses_mrope:
+                self.input_data.set_mrope_position(mrope_positions)
             self.prepare_input_embeddings(input_embeddings)
 
     def create_dummy_seqs(self, size):
@@ -1139,7 +1341,7 @@ class ModelRunner:
         seqs = self.create_dummy_seqs(self.max_running_seqs)
         self.input_data.cal_and_set_input(seqs)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
-        if self.use_mm:
+        if self.uses_mrope:
             self.input_data.set_mrope_position(
                 torch.zeros((3, num_cal_tokens), device="cpu")
             )
@@ -1187,7 +1389,7 @@ class ModelRunner:
             for size in iterator:
                 seqs = self.create_dummy_seqs(size)
                 self.input_data.cal_and_set_input(seqs=seqs)
-                if self.use_mm:
+                if self.uses_mrope:
                     self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
@@ -1478,7 +1680,10 @@ class OverlapModelRunner(ModelRunner):
                 ctx = self._pending_mm_ctx
                 self._pending_mm_ctx = None
                 input_embeddings = self._mm_prepare_gpu(ctx)
-                self.input_data.set_mrope_position(ctx["mrope_positions"])
+                # Kimi uses plain 1-D positions (already copied into the input
+                # buffer above); only Qwen-VL overrides with 3-D mrope.
+                if self.uses_mrope:
+                    self.input_data.set_mrope_position(ctx["mrope_positions"])
                 self.prepare_input_embeddings(input_embeddings)
             rt.input_ready_event.record(rt.prep_stream)
 

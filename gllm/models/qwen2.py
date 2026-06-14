@@ -4,11 +4,9 @@ import torch
 from torch import nn
 
 from gllm.dist_utils import (
-    get_local_rank,
     get_pp_layers,
     is_first_pp_rank,
     is_last_pp_rank,
-    resolve_pp_layer_idx,
 )
 from gllm.input_data import InputData
 from gllm.layers.activation import SiluAndMul
@@ -22,15 +20,17 @@ from gllm.layers.linear import (
 from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from gllm.modules.attention import Attention
-from gllm.utils import get_model_load_pbar
 
 from .utils import extract_rope_config
-from .weight_utils import (
-    copy_gate_up_proj,
-    copy_qkv_proj,
-    copy_single_proj_dim0,
-    copy_single_proj_dim1,
-    get_tensor_from_dict,
+from .weight_loader import (
+    LoadContext,
+    WeightRule,
+    contains,
+    h_gate_up,
+    h_proj_dim0,
+    h_proj_dim1,
+    h_qkv_proj,
+    run_weight_loader,
 )
 
 
@@ -213,52 +213,48 @@ class Qwen2ForCausalLM(nn.Module):
         idx_list = input_data.get_query_start_loc() - 1
         return self.lm_head(hidden_states[idx_list[1:]])
 
-    def load_weights(self, weights, mp_load_progress=None):
-        parameters = dict(self.named_parameters())
-        if mp_load_progress is not None:
-            mp_load_progress[get_local_rank() * 2] = len(parameters)
-            mp_load_progress[get_local_rank() * 2 + 1] = 0
-        else:
-            pbar = get_model_load_pbar(len(parameters))
+    def weight_rules(self):
+        """Ordered ``(match, handler)`` table for this rank's parameters.
 
+        Subclasses compose ``super().weight_rules() + [...]`` (or override) to
+        add architecture-specific rules. First match wins, mirroring the old
+        ``if/elif`` priority.
+        """
+        return [
+            WeightRule(contains("self_attn.qkv_proj"), h_qkv_proj, "qkv_proj"),
+            WeightRule(contains("self_attn.o_proj"), h_proj_dim1, "o_proj"),
+            WeightRule(contains("gate_up_proj"), h_gate_up, "gate_up_proj"),
+            WeightRule(contains("down_proj"), h_proj_dim1, "down_proj"),
+            WeightRule(
+                contains("embed_tokens", "lm_head"), h_proj_dim0, "embed_lm_head"
+            ),
+        ]
+
+    def _make_load_context(self, weights):
+        """Build the :class:`LoadContext` shared with every handler.
+
+        Reads attention head geometry off layer 0. Dense models leave the MoE
+        fields (``expert_map`` / ``num_experts`` / ``pool``) at their ``None``
+        defaults; MoE subclasses populate them in their override.
+        """
         attn = self.model.layers[0].self_attn
-        num_heads = attn.num_heads
-        num_kv_heads = attn.num_kv_heads
-        head_dim = attn.head_dim
+        return LoadContext(
+            weights=weights,
+            num_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            head_dim=attn.head_dim,
+        )
 
-        for k, v in parameters.items():
-            k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
-            if k.find("self_attn.qkv_proj") != -1:
-                head_dim_patch = (
-                    head_dim if k.find("scale") == -1 or k.find("weight") == -1 else 1
-                )
-                copy_qkv_proj(
-                    v.data,
-                    get_tensor_from_dict(weights, k.replace("qkv_proj", "q_proj")),
-                    get_tensor_from_dict(weights, k.replace("qkv_proj", "k_proj")),
-                    get_tensor_from_dict(weights, k.replace("qkv_proj", "v_proj")),
-                    num_heads,
-                    num_kv_heads,
-                    head_dim_patch,
-                )
-            elif k.find("self_attn.o_proj") != -1:
-                copy_single_proj_dim1(v.data, get_tensor_from_dict(weights, k))
-            elif k.find("gate_up_proj") != -1:
-                copy_gate_up_proj(
-                    v.data,
-                    get_tensor_from_dict(weights, k.replace("gate_up_proj", "gate_proj")),
-                    get_tensor_from_dict(weights, k.replace("gate_up_proj", "up_proj")),
-                )
-            elif k.find("down_proj") != -1:
-                copy_single_proj_dim1(v.data, get_tensor_from_dict(weights, k))
-            elif k.find("embed_tokens") != -1 or k.find("lm_head") != -1:
-                copy_single_proj_dim0(v.data, get_tensor_from_dict(weights, k))
-            else:
-                v.data.copy_(get_tensor_from_dict(weights, k))
-            if mp_load_progress is not None:
-                mp_load_progress[get_local_rank() * 2 + 1] += 1
-            else:
-                pbar.update(1)
-                
+    def load_weights(self, weights, mp_load_progress=None):
+        run_weight_loader(
+            self,
+            weights,
+            self.weight_rules(),
+            mp_load_progress,
+            pp_idx_offset=2,
+            start_layer=self.model.start_layer,
+            ctx=self._make_load_context(weights),
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
