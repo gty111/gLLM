@@ -1040,4 +1040,3 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             ),
             WeightRule(contains("merger.mlp"), hv_merger_mlp, "v_merger"),
         ]
-
