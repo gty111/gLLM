@@ -7,6 +7,140 @@ from gllm.models.kimi_k25_vision import KimiPatchMerger, KimiVisionTower
 from gllm.models.utils import _merge_multimodal_embeddings
 
 
+def build_kimi_input_ids(text, messages, processor, tokenizer, pad_id):
+    """Render Kimi's chat prompt to token ids with multimodal placeholders
+    expanded to the exact per-item embedding counts.
+
+    Two transforms, in order:
+
+    1. **Video text expansion.** The chat template renders a literal
+       ``<|kimi_k25_video_placeholder|>`` per video. Each video is decoded and
+       split into temporal chunks; the placeholder is replaced (in text, before
+       tokenizing) by the concatenation of per-chunk prompts
+       ``{ts}<|media_begin|>video<|media_content|><|media_pad|><|media_end|>``.
+       Mirrors the reference ``KimiK25Processor.update_raw_text``.
+
+    2. **``<|media_pad|>`` expansion.** Images render a single ``<|media_pad|>``
+       inline; each video chunk also carries one. gLLM's embedding merge
+       replaces placeholders 1-to-1 with vision embeddings, so each single
+       ``pad_id`` is blown up to ``N = (h//ps//mk) * (w//ps//mk)`` copies
+       (temporal pooling collapses frames, so chunk token count depends only on
+       spatial grid). ``N`` comes from the processor's own
+       ``media_tokens_calculator`` so it always matches the tower's grid.
+
+    **Ordering contract.** gLLM produces vision embeddings images-first then
+    videos (see ``_mm_run_processor_kimi`` / ``embed_multimodal``) and scatters
+    them into ``<|media_pad|>`` positions left-to-right. So the placeholders
+    must appear in that same order: all image pads, then all video-chunk pads.
+    A prompt that places a video *before* an image is rejected rather than
+    silently mismatched.
+
+    Args:
+        text: rendered chat prompt string (``tokenize=False``).
+        messages: chat messages, walked in order to recover media + sizes.
+        processor: ``KimiK25Processor`` (``media_processor`` exposes
+            ``media_tokens_calculator`` + ``media_proc_cfg``).
+        tokenizer: the text tokenizer.
+        pad_id: ``media_placeholder_token_id``.
+    """
+    from transformers.image_utils import load_image as _hf_load_image
+
+    from gllm.models.kimi_k25_vision import split_video_chunks
+
+    media_proc = processor.media_processor
+    video_placeholder = getattr(
+        processor, "video_placeholder", "<|kimi_k25_video_placeholder|>"
+    )
+
+    # Walk messages in prompt order, recording each media item's type and,
+    # for the eventual ``<|media_pad|>`` expansion, its per-placeholder token
+    # count. Enforce images-before-videos so embedding order == pad order.
+    image_counts = []
+    video_chunk_counts = []  # flattened across videos, in order
+    video_prompts = []  # one concatenated chunk-prompt string per video
+    seen_video = False
+    for message in messages:
+        contents = message.get("content")
+        if not isinstance(contents, list):
+            continue
+        for content in contents:
+            if not isinstance(content, dict):
+                continue
+            ctype = content.get("type")
+            if ctype in ("image", "image_url"):
+                if seen_video:
+                    raise NotImplementedError(
+                        "Kimi-K2.5: an image after a video in the same prompt "
+                        "is not supported (vision embeddings are produced "
+                        "images-first); put all images before videos."
+                    )
+                img_ref = content.get("image")
+                if img_ref is None:
+                    data = content.get("image_url")
+                    img_ref = data["url"] if isinstance(data, dict) else data
+                pil = _hf_load_image(img_ref)
+                image_counts.append(
+                    int(media_proc.media_tokens_calculator(
+                        {"type": "image", "image": pil}
+                    ))
+                )
+            elif ctype in ("video", "video_url"):
+                seen_video = True
+                vid_ref = content.get("video")
+                if vid_ref is None:
+                    data = content.get("video_url")
+                    vid_ref = data["url"] if isinstance(data, dict) else data
+                chunks = split_video_chunks(vid_ref, media_proc.media_proc_cfg)
+                parts = []
+                for ch in chunks:
+                    parts.append(ch["prompt"])
+                    n = int(media_proc.media_tokens_calculator(ch))
+                    video_chunk_counts.append(n)
+                video_prompts.append("".join(parts))
+
+    # Transform 1: splice each video placeholder with its chunk prompts.
+    if video_prompts:
+        cnt = text.count(video_placeholder)
+        if cnt != len(video_prompts):
+            raise ValueError(
+                f"Kimi video placeholder mismatch: template rendered {cnt} "
+                f"'{video_placeholder}' but found {len(video_prompts)} videos"
+            )
+        segments = text.split(video_placeholder)
+        text = "".join(
+            seg + (video_prompts[i] if i < len(video_prompts) else "")
+            for i, seg in enumerate(segments)
+        )
+
+    token_ids = tokenizer.encode(text)
+
+    # Transform 2: expand each single pad_id to its per-item token count,
+    # images-first then video chunks (== left-to-right pad order in text).
+    counts = image_counts + video_chunk_counts
+    if not counts:
+        return token_ids
+
+    out = []
+    idx = 0
+    for tid in token_ids:
+        if tid == pad_id:
+            if idx >= len(counts):
+                raise ValueError(
+                    "Kimi placeholder/media count mismatch: more "
+                    "<|media_pad|> tokens than media items"
+                )
+            out.extend([pad_id] * counts[idx])
+            idx += 1
+        else:
+            out.append(tid)
+    if idx != len(counts):
+        raise ValueError(
+            f"Kimi placeholder/media count mismatch: expanded {idx} "
+            f"placeholders but prompt has {len(counts)} media items"
+        )
+    return out
+
+
 class KimiK25ForConditionalGeneration(nn.Module):
     """Kimi-K2.5 multimodal runtime: MoonViT3d vision tower + PatchMerger
     projector on top of a DeepSeek-V3 language backbone.
@@ -18,10 +152,12 @@ class KimiK25ForConditionalGeneration(nn.Module):
     ``media_placeholder_token_id``).
 
     Note on placeholder expansion: Kimi's chat template emits a *single*
-    ``<|media_pad|>`` per image and its HF processor does NOT pre-expand it
-    to N tokens (unlike Qwen-VL). gLLM's merge requires the placeholder run
-    to already be N tokens long, so ``ModelRunner`` expands it before the
-    ``is_multimodal`` mask is built (see ``_mm_expand_kimi_placeholders``).
+    ``<|media_pad|>`` per image (and a ``<|kimi_k25_video_placeholder|>`` per
+    video) and its HF processor does NOT pre-expand them to N tokens (unlike
+    Qwen-VL). gLLM's merge requires each placeholder run to already be N tokens
+    long, so the encode path calls :func:`build_kimi_input_ids` to splice video
+    placeholders into per-chunk prompts and expand every ``<|media_pad|>`` to
+    its exact embedding count before the ``is_multimodal`` mask is built.
     """
 
     def __init__(self, config):

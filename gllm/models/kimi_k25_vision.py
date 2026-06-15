@@ -21,15 +21,23 @@ Design choices vs. the Qwen-VL towers already in gLLM:
 The math (patch embed conv, learnable-2D-interpolated + sincos-temporal
 positional embedding, 2D rotary embedding, varlen flash attention, 2x2 spatial
 merge + temporal-mean pooling) is copied line-for-line from the reference.
+
+This module also hosts the video decoding + chunking helper
+(:func:`split_video_chunks`): the reference uses ``mecord.VideoReader`` (absent
+here), so it is re-implemented on PyAV with byte-identical sampling/chunking so
+the downstream pixel + token math matches the reference. A video chunk is just
+a multi-frame (T<=4) image item that the tower temporally pools.
 """
 
 import math
+from datetime import datetime, timezone
 from typing import List
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +111,12 @@ class Learnable2DInterpPosEmbDivided(nn.Module):
             if t == 1:
                 pos_emb_3d = pos_emb_2d
             else:
-                pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + self.time_weight[0:t]
+                # ``time_weight`` is a non-persistent buffer built from numpy on
+                # CPU; ``torch.from_numpy`` ignores the default device and
+                # buffer moves aren't guaranteed in every load path, so align it
+                # to the spatial-embedding device/dtype before adding.
+                tw = self.time_weight[0:t].to(pos_emb_2d.device, pos_emb_2d.dtype)
+                pos_emb_3d = pos_emb_2d.unsqueeze(0).repeat(t, 1, 1) + tw
             pos_embs.append(pos_emb_3d.reshape(-1, pos_emb_3d.shape[-1]))
         return x + torch.cat(pos_embs).to(x.dtype)
 
@@ -359,3 +372,104 @@ class KimiPatchMerger(nn.Module):
         return [
             self.proj(self.pre_norm(item).view(item.shape[0], -1)) for item in x
         ]
+
+
+# ---------------------------------------------------------------------------
+# Video decoding + chunking
+#
+# The HF reference (``kimi_k25_vision_processing.py``) decodes video with
+# ``mecord.VideoReader``, which is not available here. Re-implemented on PyAV
+# (``av``) with byte-identical sampling/chunking:
+#   1. Read total frame count + average fps.
+#   2. Sample ``round(num_frames * sample_fps / fps)`` frames uniformly.
+#   3. Group into chunks of ``temporal_merge_kernel_size`` (=4).
+#   4. Each chunk carries a timestamp prompt and a list of PIL frames (T<=4).
+# ---------------------------------------------------------------------------
+def _timestamp_as_str(timestamp: float, mode: str = "hh:mm:ss.fff") -> str:
+    """Mirror reference ``timestamp_as_str``."""
+    if mode == "hh:mm:ss.fff":
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime(
+            "%H:%M:%S"
+        ) + f".{int((timestamp % 1) * 1000):03d}"
+    elif mode == "mm:ss.fff":
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime(
+            "%M:%S"
+        ) + f".{int((timestamp % 1) * 1000):03d}"
+    elif mode == "mm:ss":
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%M:%S")
+    raise ValueError(f"Invalid timestamp mode: {mode}")
+
+
+def _decode_all_frames(video_ref):
+    """Return (list[PIL.Image] of all frames in order, avg_fps).
+
+    ``video_ref`` may be a path, raw bytes, or a ``data:video/...;base64,`` URL.
+    PyAV decodes the full stream; videos handed to a VLM are short clips, so
+    materializing every frame is acceptable and keeps frame indexing identical
+    to the reference (which indexes into the decoded frame list).
+    """
+    import base64
+    import io
+
+    import av
+
+    if isinstance(video_ref, str) and video_ref.startswith("data:"):
+        video_ref = base64.b64decode(video_ref.split(",", 1)[1])
+
+    if isinstance(video_ref, (bytes, bytearray)):
+        container = av.open(io.BytesIO(bytes(video_ref)))
+    else:
+        container = av.open(video_ref)
+
+    try:
+        stream = container.streams.video[0]
+        avg_fps = float(stream.average_rate) if stream.average_rate else 0.0
+        frames: List[Image.Image] = []
+        for frame in container.decode(video=0):
+            frames.append(frame.to_image().convert("RGB"))
+    finally:
+        container.close()
+
+    if not frames:
+        raise ValueError("video has no decodable frames")
+    if avg_fps <= 0:
+        avg_fps = float(len(frames))  # 1s fallback so sampling stays sane
+    return frames, avg_fps
+
+
+def split_video_chunks(video_ref, media_proc_cfg) -> List[dict]:
+    """Decode + sample + chunk a video. Returns a list of chunk dicts:
+    ``{"type": "video_chunk", "video_chunk": [PIL,...], "prompt": str}``.
+
+    Reproduces reference ``KimiK25VisionProcessor.split_video_chunks``.
+    """
+    sample_fps_cfg = media_proc_cfg["sample_fps"]
+    tmk = media_proc_cfg["temporal_merge_kernel_size"]
+    ts_mode = media_proc_cfg["timestamp_mode"]
+
+    all_frames, avg_fps = _decode_all_frames(video_ref)
+    num_frames = len(all_frames)
+
+    sample_fps = min(sample_fps_cfg, avg_fps)
+    sampled_nframes = max(round(num_frames * sample_fps / avg_fps), 1)
+    frame_inds = (
+        np.linspace(0, num_frames - 1, sampled_nframes).round().astype(int).tolist()
+    )
+
+    chunks: List[dict] = []
+    for i in range(0, len(frame_inds), tmk):
+        group = frame_inds[i : i + tmk]
+        start_time = frame_inds[i] / float(avg_fps)
+        ts_text = _timestamp_as_str(start_time, ts_mode)
+        prompt = (
+            f"{ts_text}<|media_begin|>video<|media_content|>"
+            f"<|media_pad|><|media_end|>"
+        )
+        chunks.append(
+            {
+                "type": "video_chunk",
+                "video_chunk": [all_frames[j] for j in group],
+                "prompt": prompt,
+            }
+        )
+    return chunks

@@ -465,12 +465,14 @@ class ModelRunner:
                 )
             elif self.is_kimi_mm:
                 # Kimi's chat template renders one ``<|media_pad|>`` per image
-                # and its processor does NOT expand it (unlike Qwen-VL). Render
-                # the text, tokenize, then splice each placeholder into N copies
-                # so the downstream ``is_multimodal`` mask has exactly one True
-                # per produced image embedding. ``N`` comes from the processor's
-                # own token calculator, guaranteeing it matches the grid the
-                # vision tower will emit.
+                # and a ``<|kimi_k25_video_placeholder|>`` per video, neither of
+                # which its processor expands (unlike Qwen-VL). Render the text,
+                # then ``build_kimi_input_ids`` splices video placeholders into
+                # per-chunk prompts and expands every ``<|media_pad|>`` to the
+                # exact per-item embedding count, so the downstream
+                # ``is_multimodal`` mask has one True per produced vision
+                # embedding. Counts come from the processor's own calculator,
+                # guaranteeing they match the grids the vision tower will emit.
                 out = self.tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
@@ -480,8 +482,15 @@ class ModelRunner:
                 )
                 if isinstance(out, (list, tuple)):
                     out = out[0]
-                ids = self.tokenizer.encode(out)
-                return self._kimi_expand_mm_placeholders(ids, messages)
+                from gllm.models.kimi_k25 import build_kimi_input_ids
+
+                return build_kimi_input_ids(
+                    out,
+                    messages,
+                    self.processor,
+                    self.tokenizer,
+                    self.model_loader.config.media_placeholder_token_id,
+                )
             else:
                 out = self.processor.apply_chat_template(
                     messages, tokenize=True, add_generation_prompt=True
@@ -506,71 +515,6 @@ class ModelRunner:
             # carries the chat special tokens, so a plain ``encode`` round
             # -trips to the same ids as ``tokenize=True``.
             out = self.tokenizer.encode(out)
-        return out
-
-    def _kimi_expand_mm_placeholders(
-        self, token_ids: List[int], messages: List[Dict]
-    ) -> List[int]:
-        """Expand each single ``<|media_pad|>`` id into ``N`` copies.
-
-        Kimi's chat template emits exactly one placeholder id per image while
-        the vision tower produces ``N = (h//ps//mk) * (w//ps//mk)`` tokens for
-        that image (temporal pool collapses frames to 1 for stills). gLLM's
-        embedding merge replaces placeholders 1-to-1 with image embeddings, so
-        the prompt must carry ``N`` placeholders per image. We get ``N`` from
-        the processor's own ``media_tokens_calculator`` so it always matches
-        the grid the tower will compute.
-
-        Images are consumed in prompt order, matching ``embed_multimodal`` /
-        ``extract_modify_mm`` iteration (images first, then videos).
-        """
-        pad_id = self.model_loader.config.media_placeholder_token_id
-        media_proc = self.processor.media_processor
-
-        # Gather per-image token counts in prompt order.
-        from transformers.image_utils import load_image as _hf_load_image
-
-        counts: List[int] = []
-        for message in messages:
-            contents = message.get("content")
-            if not isinstance(contents, list):
-                continue
-            for content in contents:
-                if not isinstance(content, dict):
-                    continue
-                ctype = content.get("type")
-                if ctype in ("image", "image_url"):
-                    img_ref = content.get("image")
-                    if img_ref is None:
-                        data = content.get("image_url")
-                        img_ref = data["url"] if isinstance(data, dict) else data
-                    pil = _hf_load_image(img_ref)
-                    n = media_proc.media_tokens_calculator(
-                        {"type": "image", "image": pil}
-                    )
-                    counts.append(int(n))
-
-        if not counts:
-            return token_ids
-
-        out: List[int] = []
-        idx = 0
-        for tid in token_ids:
-            if tid == pad_id:
-                if idx >= len(counts):
-                    raise ValueError(
-                        "Kimi placeholder/image count mismatch: more "
-                        "<|media_pad|> tokens than images"
-                    )
-                out.extend([pad_id] * counts[idx])
-                idx += 1
-            else:
-                out.append(tid)
-        if idx != len(counts):
-            raise ValueError(
-                f"Kimi placeholder/image count mismatch: expanded {idx} "
-                f"placeholders but prompt has {len(counts)} images"
-            )
         return out
 
     def decode(self, token_ids):
@@ -944,40 +888,46 @@ class ModelRunner:
     def _mm_run_processor_kimi(
         self, seq: Sequence
     ) -> Tuple[Dict, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Kimi-K2.5 image preprocessing.
+        """Kimi-K2.5 image + video preprocessing.
 
-        ``KimiK25VisionProcessor.preprocess`` takes a list of media dicts and
-        returns ``pixel_values`` (already patchified, shape
-        ``[sum(t*h*w), 3, ps, ps]``) plus ``grid_thws`` (``[num_images, 3]``).
-        We surface ``grid_thws`` *also* as ``image_grid_thw`` so the generic
-        content-hashing path (``prod(dim=-1)`` + ``split``) works unchanged,
-        while keeping ``grid_thws`` in ``mm_input`` for ``embed_multimodal``.
-        Kimi video chunking is not wired here yet (text+image path only).
+        ``KimiK25VisionProcessor.preprocess`` takes a list of media dicts
+        (``{"type":"image",...}`` or ``{"type":"video_chunk",...}``) and returns
+        ``pixel_values`` (patchified, ``[sum(t*h*w), 3, ps, ps]``) plus
+        ``grid_thws`` (``[num_items, 3]``; video chunks have ``t>1``). We build
+        one combined media list in embed order -- all images first, then every
+        video's temporal chunks -- matching ``build_kimi_input_ids``'s
+        placeholder order and ``embed_multimodal``'s iteration. ``grid_thws`` is
+        surfaced as ``image_grid_thw`` so the generic content-hashing path
+        (``prod(dim=-1)`` + ``split``) covers every item, while ``grid_thws``
+        stays in ``mm_input`` for ``embed_multimodal``.
         """
         from PIL import Image as _PILImage
         from transformers.image_utils import load_image as _hf_load_image
 
+        from gllm.models.kimi_k25_vision import split_video_chunks
+
+        medias = []
+        for img_ref in seq.mm_contents["image"]:
+            pil = (
+                img_ref
+                if isinstance(img_ref, _PILImage.Image)
+                else _hf_load_image(img_ref)
+            )
+            medias.append({"type": "image", "image": pil})
+        cfg = self.processor.media_processor.media_proc_cfg
+        for vid_ref in seq.mm_contents["video"]:
+            for chunk in split_video_chunks(vid_ref, cfg):
+                medias.append(chunk)
+
         mm_input: Dict = {}
         image_grid_thw: Optional[torch.Tensor] = None
-        if len(seq.mm_contents["image"]) != 0:
-            medias = []
-            for img_ref in seq.mm_contents["image"]:
-                pil = (
-                    img_ref
-                    if isinstance(img_ref, _PILImage.Image)
-                    else _hf_load_image(img_ref)
-                )
-                medias.append({"type": "image", "image": pil})
+        if medias:
             preprocessed = self.processor.media_processor.preprocess(
                 medias, return_tensors="pt"
             )
             mm_input["pixel_values"] = preprocessed["pixel_values"]
             mm_input["grid_thws"] = preprocessed["grid_thws"]
             image_grid_thw = preprocessed["grid_thws"]
-        if len(seq.mm_contents["video"]) != 0:
-            raise NotImplementedError(
-                "Kimi-K2.5 video input is not supported in gLLM yet."
-            )
         if isinstance(image_grid_thw, torch.Tensor):
             image_grid_thw = image_grid_thw.cpu()
         return mm_input, image_grid_thw, None
