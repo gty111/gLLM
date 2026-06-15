@@ -63,6 +63,7 @@ class LLM:
         mm_processor_min_pixels=None,
         mm_processor_max_pixels=None,
         disagg_config=None,
+        mla_decode_backend="flashmla",
     ):
         init_logger()
         self.model_path = model_path
@@ -104,6 +105,7 @@ class LLM:
             mm_processor_max_pixels=mm_processor_max_pixels,
             skip_visual=skip_visual,
             skip_language=skip_language,
+            mla_decode_backend=mla_decode_backend,
         )
         self.pp_size = pp_size
         self.tp_size = tp_size
