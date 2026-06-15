@@ -162,6 +162,7 @@ async def query_one(
     max_tokens: int,
     max_pixels: int,
     timeout_s: int,
+    no_thinking: bool = False,
 ) -> dict:
     # build_messages does CPU-bound work (PIL resize + JPEG + base64). Run it
     # in a worker thread so it doesn't block the event loop and starve other
@@ -175,6 +176,14 @@ async def query_one(
         "max_tokens": max_tokens,
         "temperature": 0.0,
     }
+    if no_thinking:
+        # Kimi-K2.5's chat template gates its reasoning block on a ``thinking``
+        # variable; vllm exposes per-request template vars via
+        # ``chat_template_kwargs``. Disabling it makes the model answer
+        # directly (matching a server launched with thinking off), so the
+        # ``max_tokens`` budget isn't consumed by an unfinished reasoning
+        # trace that never reaches the final "Answer: X".
+        payload["chat_template_kwargs"] = {"thinking": False}
     start = time.time()
     try:
         async with session.post(
@@ -251,25 +260,50 @@ async def run(args):
                 )
             return Dataset.from_file(str(cand[-1]))
 
-    if os.environ.get("HF_HUB_OFFLINE") or os.environ.get(
-        "HF_DATASETS_OFFLINE"
-    ):
-        # Offline: skip the hub-only descriptor lookup and use the
-        # canonical subject list (matches the 30 cached configs).
-        names = _MMMU_SUBJECTS
+    if args.data_dir:
+        # Local parquet mode: load each ``<Subject>/validation.parquet`` from a
+        # directory (e.g. downloaded via hf-mirror). Bypasses the hub entirely
+        # -- ``datasets.Dataset.from_parquet`` decodes the embedded images.
+        from datasets import Dataset
+        from pathlib import Path as _Path
+
+        names = []
+        samples = []
+        for sub in sorted(_Path(args.data_dir).iterdir()):
+            pq = sub / "validation.parquet"
+            if not pq.exists():
+                continue
+            names.append(sub.name)
+            ds = Dataset.from_parquet(str(pq))
+            for ex in ds:
+                samples.append(ex)
+        if args.limit > 0:
+            samples = samples[: args.limit]
+        print(
+            f"Loaded {len(samples)} MMMU validation samples across "
+            f"{len(names)} subjects (local parquet).",
+            flush=True,
+        )
     else:
-        try:
-            names = get_dataset_config_names("MMMU/MMMU")
-        except Exception:
+        if os.environ.get("HF_HUB_OFFLINE") or os.environ.get(
+            "HF_DATASETS_OFFLINE"
+        ):
+            # Offline: skip the hub-only descriptor lookup and use the
+            # canonical subject list (matches the 30 cached configs).
             names = _MMMU_SUBJECTS
-    samples = []
-    for n in names:
-        ds = _load_one(n)
-        for ex in ds:
-            samples.append(ex)
-    if args.limit > 0:
-        samples = samples[: args.limit]
-    print(f"Loaded {len(samples)} MMMU validation samples across {len(names)} subjects.", flush=True)
+        else:
+            try:
+                names = get_dataset_config_names("MMMU/MMMU")
+            except Exception:
+                names = _MMMU_SUBJECTS
+        samples = []
+        for n in names:
+            ds = _load_one(n)
+            for ex in ds:
+                samples.append(ex)
+        if args.limit > 0:
+            samples = samples[: args.limit]
+        print(f"Loaded {len(samples)} MMMU validation samples across {len(names)} subjects.", flush=True)
 
     timeout = aiohttp.ClientTimeout(total=args.timeout)
     out_path = Path(args.out)
@@ -294,6 +328,7 @@ async def run(args):
                         args.max_tokens,
                         args.max_pixels,
                         args.timeout,
+                        args.no_thinking,
                     )
                 except Exception as exc:
                     # Don't let one broken sample (bad image, unparseable
@@ -380,6 +415,19 @@ def main():
     parser.add_argument("--limit", type=int, default=0,
                         help="0 = all samples; otherwise take the first N (after subject ordering)")
     parser.add_argument("--out", default="benchmarks/results/mmmu_run.jsonl")
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Load MMMU from a local dir of <Subject>/validation.parquet files "
+        "instead of the HF hub (offline).",
+    )
+    parser.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="Send chat_template_kwargs={'thinking': False} so reasoning models "
+        "(e.g. Kimi-K2.5 on vllm) answer directly instead of emitting a long "
+        "reasoning trace that gets truncated by --max-tokens.",
+    )
     args = parser.parse_args()
     asyncio.run(run(args))
 

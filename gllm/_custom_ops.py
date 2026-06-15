@@ -27,7 +27,9 @@ from sgl_kernel import (
     topk_softmax as _sgl_topk_softmax,
     topk_sigmoid as _sgl_topk_sigmoid,
     merge_state_v2 as _sgl_merge_state_v2,
+    moe_wna16_marlin_gemm as _sgl_moe_wna16_marlin_gemm,
     sgl_per_token_quant_fp8 as _sgl_per_token_quant_fp8,
+    gptq_marlin_repack as _sgl_gptq_marlin_repack,
 )
 
 # Custom Triton kernels
@@ -386,6 +388,82 @@ def grouped_topk(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
+
+
+def gptq_marlin_repack(
+    b_q_weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    num_bits: int,
+) -> torch.Tensor:
+    """Repack packed-quant weights into Marlin layout."""
+    return _sgl_gptq_marlin_repack(
+        b_q_weight,
+        perm,
+        size_k,
+        size_n,
+        num_bits,
+    )
+
+
+def moe_wna16_marlin_gemm(
+    a: torch.Tensor,
+    c_or_none: Optional[torch.Tensor],
+    b_q_weight: torch.Tensor,
+    b_bias_or_none: Optional[torch.Tensor],
+    b_scales: torch.Tensor,
+    global_scale_or_none: Optional[torch.Tensor],
+    b_zeros_or_none: Optional[torch.Tensor],
+    g_idx_or_none: Optional[torch.Tensor],
+    perm_or_none: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    moe_block_size: int,
+    top_k: int,
+    mul_topk_weights: bool,
+    is_ep: bool,
+    b_q_type_id: int,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    is_k_full: bool,
+    use_atomic_add: bool,
+    use_fp32_reduce: bool,
+    is_zp_float: bool,
+) -> torch.Tensor:
+    """Invoke sgl-kernel int4/int8 Marlin fused-MoE GEMM."""
+    return _sgl_moe_wna16_marlin_gemm(
+        a,
+        c_or_none,
+        b_q_weight,
+        b_bias_or_none,
+        b_scales,
+        global_scale_or_none,
+        b_zeros_or_none,
+        g_idx_or_none,
+        perm_or_none,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        is_ep,
+        b_q_type_id,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    )
 
 
 # =============================================================================

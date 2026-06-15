@@ -557,5 +557,3 @@ def run_vision_loader(
                 break
         else:
             hv_default(ctx, k, v.data)
-
-

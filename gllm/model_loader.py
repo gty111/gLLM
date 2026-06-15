@@ -1,4 +1,6 @@
 import glob
+import os
+import re
 from typing import Tuple
 
 import torch
@@ -7,8 +9,11 @@ from logger import logger
 from safetensors import safe_open
 from transformers import AutoConfig, GenerationConfig
 
+from gllm.dist_utils import get_ep_rank, get_ep_size, is_use_ep
+
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
+from gllm.models.kimi_k25 import KimiK25ForConditionalGeneration
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.mixtral import MixtralForCausalLM
 from gllm.models.qwen2 import Qwen2ForCausalLM
@@ -227,11 +232,84 @@ class ModelLoader:
 
     def load_safetensors(self, path):
         weights_path = glob.glob(f"{path}/*.safetensors")
+        skip = self._make_expert_skip_predicate()
+        n_skipped = 0
         for weight_path in weights_path:
             with safe_open(weight_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
+                    if skip is not None and skip(k):
+                        # EP shard: this rank does not own this routed expert,
+                        # so don't even materialize it from the (slow, shared)
+                        # filesystem. See _make_expert_skip_predicate.
+                        n_skipped += 1
+                        continue
                     self.weights[k] = f.get_tensor(k)
+        if n_skipped:
+            logger.info(
+                f"EP rank {get_ep_rank()}/{get_ep_size()}: skipped reading "
+                f"{n_skipped} non-local routed-expert tensors"
+            )
         return len(self.weights) != 0
+
+    def _make_expert_skip_predicate(self):
+        """Return ``predicate(key) -> bool`` that is True for routed-expert
+        weights NOT owned by this EP rank, else ``None`` when no skipping
+        applies.
+
+        Under expert parallelism each rank only needs its slice of the routed
+        experts, but the routed-expert tensors dominate the checkpoint size
+        (e.g. Kimi-K2.5: 384 experts x 60 layers of int4 weights). Reading the
+        full checkpoint on every rank multiplies the load over a shared /
+        network filesystem by ``ep_size`` and serializes on its bandwidth.
+        Skipping the ``ep_size - 1`` / ``ep_size`` fraction this rank will
+        never use cuts per-rank disk reads proportionally.
+
+        Returns ``None`` (no skipping) when EP is off, so the pure-TP path --
+        where every rank slices *within* each expert and therefore needs all
+        of them -- is unchanged.
+        """
+        if not is_use_ep():
+            return None
+
+        ep_size = get_ep_size()
+        ep_rank = get_ep_rank()
+        if ep_size <= 1:
+            return None
+
+        num_experts = self._get_num_routed_experts()
+        if not num_experts:
+            return None
+
+        # Mirror determine_expert_map's contiguous block assignment: each
+        # non-last rank owns ``num_experts // ep_size`` experts; the last rank
+        # takes the remainder.
+        per_rank = num_experts // ep_size
+        start = ep_rank * per_rank
+        end = num_experts if ep_rank == ep_size - 1 else start + per_rank
+
+        expert_re = re.compile(r"\.experts\.(\d+)\.")
+
+        def skip(key: str) -> bool:
+            m = expert_re.search(key)
+            if m is None:
+                return False  # not a routed-expert tensor -> always needed
+            idx = int(m.group(1))
+            return not (start <= idx < end)
+
+        return skip
+
+    def _get_num_routed_experts(self):
+        """Number of routed experts, looking through ``text_config`` for VL
+        wrappers (Kimi-K2.5). Returns ``None`` when the model is not MoE."""
+        for cfg in (self.config, getattr(self.config, "text_config", None)):
+            if cfg is None:
+                continue
+            for attr in ("n_routed_experts", "num_experts"):
+                val = getattr(cfg, attr, None)
+                if val:
+                    return int(val)
+        return None
+
 
     def load_bin(self, path):
         weights_path = glob.glob(f"{path}/*.bin")
@@ -272,6 +350,16 @@ class ModelLoader:
         raise Exception(f"Failed to load {self.model_path} from local or huggingface!")
 
     def load_config(self):
+        # Some environments mount the default HF cache path as read-only.
+        # Remote-code loading needs a writable module cache.
+        if os.getenv("HF_HOME") is None and os.getenv("TRANSFORMERS_CACHE") is None:
+            fallback_hf_home = "/tmp/gllm_hf_cache"
+            try:
+                os.makedirs(fallback_hf_home, exist_ok=True)
+                os.environ.setdefault("HF_HOME", fallback_hf_home)
+            except Exception:
+                pass
+
         self.config = AutoConfig.from_pretrained(
             self.model_path, trust_remote_code=True
         )
@@ -299,6 +387,8 @@ class ModelLoader:
         # and ignore the real ``lm_head.weight``. See
         # :func:`propagate_tie_word_embeddings`.
         propagate_tie_word_embeddings(self.config)
+        if self.architecture == "KimiK25ForConditionalGeneration":
+            self._normalize_kimi_quant_config()
         self.quantization_config = getattr(self.config, "quantization_config", None)
         self.config.use_mla = self.use_mla
         self.config.use_hybrid_state = self.use_hybrid_state
@@ -316,7 +406,11 @@ class ModelLoader:
 
     @property
     def use_mla(self):
-        return self.architecture in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]
+        return self.architecture in [
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "KimiK25ForConditionalGeneration",
+        ]
 
     @property
     def use_mm(self):
@@ -324,7 +418,8 @@ class ModelLoader:
                                      "Qwen3VLForConditionalGeneration",
                                      "Qwen3VLMoeForConditionalGeneration",
                                      "Qwen3_5ForConditionalGeneration",
-                                     "Qwen3_5MoeForConditionalGeneration"]
+                                     "Qwen3_5MoeForConditionalGeneration",
+                                     "KimiK25ForConditionalGeneration"]
 
     @property
     def use_hybrid_state(self):
@@ -365,9 +460,66 @@ class ModelLoader:
             model_type = Qwen3_5ForConditionalGeneration
         elif self.architecture == "Qwen3_5MoeForConditionalGeneration":
             model_type = Qwen3_5MoeForConditionalGeneration
+        elif self.architecture == "KimiK25ForConditionalGeneration":
+            model_type = KimiK25ForConditionalGeneration
         else:
             raise Exception(f"Unsupported model: {self.architecture}")
         return model_type
+
+    def _normalize_kimi_quant_config(self):
+        """Translate Kimi's compressed-tensors config into gLLM's int4-MoE hint.
+
+        Kimi-K2.5 checkpoints quantize routed experts with compressed-tensors
+        ``pack-quantized`` int4, while dense/shared layers remain bf16.
+        gLLM does not consume compressed-tensors metadata directly, so we
+        normalize it to ``text_config.moe_quantization_config`` and clear the
+        dense-layer ``quantization_config``.
+        """
+        text_cfg = getattr(self.config, "text_config", None)
+        if text_cfg is None:
+            return
+
+        raw_qcfg = getattr(text_cfg, "quantization_config", None)
+        if not isinstance(raw_qcfg, dict):
+            return
+        if raw_qcfg.get("quant_method") != "compressed-tensors":
+            return
+
+        num_bits = 4
+        group_size = 32
+        cfg_groups = raw_qcfg.get("config_groups") or {}
+        for _, group in cfg_groups.items():
+            w_cfg = (group or {}).get("weights") or {}
+            if "num_bits" in w_cfg:
+                num_bits = int(w_cfg["num_bits"])
+            if "group_size" in w_cfg:
+                group_size = int(w_cfg["group_size"])
+            break
+
+        if num_bits != 4:
+            raise ValueError(
+                f"Kimi int4 path only supports num_bits=4, got {num_bits}."
+            )
+
+        text_cfg.moe_quantization_config = {
+            "quant_method": "int4_moe",
+            "num_bits": 4,
+            "group_size": group_size,
+            "symmetric": True,
+        }
+        # Dense + shared layers stay bf16.
+        text_cfg.quantization_config = None
+        # Prevent global quant checks from treating the whole model as dense-quantized.
+        self.config.quantization_config = None
+
+        # ``self.quantization_config`` is cleared above, so the model summary
+        # log in ``load_model`` would otherwise report this checkpoint as
+        # unquantized. Stash a human-readable descriptor of what was actually
+        # normalized so that log can surface it.
+        self.moe_quant_method_log = (
+            f"routed-expert int{num_bits} (group_size={group_size}), "
+            "dense/shared bf16"
+        )
 
     def load_model(self, mp_load_progress=None):
         model_type = self.get_model_type()
@@ -393,6 +545,12 @@ class ModelLoader:
             if self.quantization_config
             else ""
         )
+        # Checkpoints whose compressed-tensors config was normalized into a
+        # MoE-only quant hint (e.g. Kimi-K2.5) have ``self.quantization_config``
+        # cleared, so surface the stashed descriptor here instead.
+        moe_quant_log = getattr(self, "moe_quant_method_log", None)
+        if not quant_method_log and moe_quant_log:
+            quant_method_log = f", Quant method: {moe_quant_log}"
         logger.info(
             f"Model architecture: {self.architecture}, "
             f"Default dtype: {self.dtype}{quant_method_log}, "

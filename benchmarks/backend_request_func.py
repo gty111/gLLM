@@ -319,6 +319,14 @@ async def async_request_openai_chat_completions(
             "max_completion_tokens": request_func_input.output_len,
             "stream": True,
         }
+        # Optional: disable a reasoning model's thinking block (e.g. Kimi-K2.5),
+        # gated by env so the dataclass / callers stay untouched. The template
+        # var name differs per model; send both so it works regardless.
+        if os.environ.get("EVAL_NO_THINKING") == "1":
+            payload["chat_template_kwargs"] = {
+                "thinking": False,
+                "enable_thinking": False,
+            }
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
