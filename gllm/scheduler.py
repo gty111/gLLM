@@ -7,7 +7,7 @@ from typing import List, Optional
 from logger import logger
 
 from gllm.comm import IPCPackage
-from gllm.dist_utils import get_world_size
+from gllm.dist_utils import get_rank, get_world_size
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
@@ -156,10 +156,17 @@ class Scheduler:
         ):
             self.log_num_preempt_seqs = self.num_preempt_seqs
             self.delta_log_num_preempt_seqs *= 2
-            logger.warning(
-                f"#Preempted seqs: {self.num_preempt_seqs}, "
-                "Try increase --kvthresh or the performance is poor!"
-            )
+            # Every TP/PP rank runs an identical scheduler, so restrict the
+            # warning to global rank 0 to avoid N duplicate lines per event.
+            if get_rank() == 0:
+                # Round down to the nearest 10 so the count reads as a clean
+                # milestone (e.g. 150) instead of the raw value (e.g. 152) the
+                # batch happened to overshoot the doubling threshold by.
+                rounded = int(self.num_preempt_seqs) // 10 * 10
+                logger.warning(
+                    f"#Preempted seqs: >={rounded}, "
+                    "Try increase --kvthresh or the performance is poor!"
+                )
 
     def check_abort_seqs_list(self, seqs: deque, ipc_package: IPCPackage):
         for seq in list(seqs):
@@ -368,7 +375,10 @@ class Scheduler:
             num_tokens_budget, max_seqs=self.maxd - len(decode_batch)
         )
 
-        if self.log and time.time() - self.log_time > 1:
+        # Every TP/PP rank runs an identical copy of the scheduler, so logging
+        # the batch stats on all of them floods the console with N duplicate
+        # lines per tick. Restrict to global rank 0.
+        if self.log and get_rank() == 0 and time.time() - self.log_time > 1:
             self.log_time = time.time()
             log_info = (
                 "#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%"
@@ -431,7 +441,10 @@ class Scheduler:
 
         decode_batch = self.schedule_decode_batch(decode_token_budget)
 
-        if self.log and time.time() - self.log_time > 1:
+        # Every TP/PP rank runs an identical copy of the scheduler, so logging
+        # the batch stats on all of them floods the console with N duplicate
+        # lines per tick. Restrict to global rank 0.
+        if self.log and get_rank() == 0 and time.time() - self.log_time > 1:
             self.log_time = time.time()
             log_info = (
                 "#wait: %4d/%8d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%"
