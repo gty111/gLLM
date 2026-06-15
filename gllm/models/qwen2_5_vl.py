@@ -28,11 +28,15 @@ from gllm.utils import cast_overflow_tensors
 from gllm.layers.rotary_embedding import apply_rotary_emb
 
 from .qwen2 import Qwen2ForCausalLM
-from .weight_utils import (
-    copy_gate_up_proj,
-    copy_qkv_proj,
-    copy_single_proj_dim0,
-    copy_single_proj_dim1,
+from .weight_loader import (
+    LoadContext,
+    WeightRule,
+    contains,
+    hv_gate_up,
+    hv_merger_mlp,
+    hv_proj_dim1,
+    hv_qkv_fused_split,
+    run_vision_loader,
 )
 
 
@@ -1017,34 +1021,23 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         if getattr(self, "skip_visual", False) or self.visual is None:
             return
 
-        parameters = dict(self.visual.named_parameters())
+        ctx = LoadContext(
+            weights=weights,
+            num_heads=self.visual.num_heads // get_tp_size(),
+            head_dim=self.visual.hidden_size // self.visual.num_heads,
+            extra={"prefix": "visual."},
+        )
+        run_vision_loader(self.visual, weights, self._vision_rules(), ctx)
 
-        num_heads = self.visual.num_heads // get_tp_size()
-        head_dim = self.visual.hidden_size // self.visual.num_heads
+    def _vision_rules(self):
+        return [
+            WeightRule(contains("gate_up_proj"), hv_gate_up, "v_gate_up"),
+            WeightRule(contains("attn.qkv"), hv_qkv_fused_split, "v_qkv"),
+            WeightRule(
+                contains("attn.proj.weight", "down_proj.weight"),
+                hv_proj_dim1,
+                "v_proj_dim1",
+            ),
+            WeightRule(contains("merger.mlp"), hv_merger_mlp, "v_merger"),
+        ]
 
-        for k, v in parameters.items():
-            if k.find("gate_up_proj") != -1:
-                src_gate = weights[f"visual.{k.replace('gate_up_proj', 'gate_proj')}"]
-                src_up = weights[f"visual.{k.replace('gate_up_proj', 'up_proj')}"]
-                copy_gate_up_proj(v.data, src_gate, src_up)
-            elif k.find("attn.qkv") != -1:
-                src_qkv = weights[f"visual.{k}"]
-                size_partition = src_qkv.shape[0] // 3
-                src_q, src_k, src_v = src_qkv.split(
-                    [size_partition, size_partition, size_partition], dim=0
-                )
-                copy_qkv_proj(
-                    v.data, src_q, src_k, src_v, num_heads, num_heads, head_dim
-                )
-            elif k.find("attn.proj.weight") != -1 or k.find("down_proj.weight") != -1:
-                copy_single_proj_dim1(v.data, weights[f"visual.{k}"])
-            elif k.find("merger.mlp") != -1:
-                src_data = weights[f"visual.{k}"]
-                if k.find("0") != -1:
-                    copy_single_proj_dim0(v.data, src_data)
-                elif k.find("2.weight") != -1:
-                    copy_single_proj_dim1(v.data, src_data)
-                else:
-                    v.data.copy_(src_data)
-            else:
-                v.data.copy_(weights[f"visual.{k}"])

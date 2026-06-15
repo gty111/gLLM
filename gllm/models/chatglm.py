@@ -4,12 +4,10 @@ import torch
 from torch import nn
 
 from gllm.dist_utils import (
-    get_local_rank,
     get_pp_layers,
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
-    resolve_pp_layer_idx,
 )
 from gllm.input_data import InputData
 from gllm.layers.activation import SiluAndMul
@@ -23,13 +21,16 @@ from gllm.layers.linear import (
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from gllm.modules.attention import Attention
-from gllm.utils import get_model_load_pbar
 
-from .weight_utils import (
-    copy_gate_up_proj,
-    copy_qkv_proj,
-    copy_single_proj_dim0,
-    copy_single_proj_dim1,
+from .weight_loader import (
+    LoadContext,
+    WeightRule,
+    contains,
+    h_chatglm_gate_up,
+    h_chatglm_qkv,
+    h_proj_dim0,
+    h_proj_dim1,
+    run_weight_loader,
 )
 
 
@@ -247,56 +248,50 @@ class ChatGLMForCausalLM(nn.Module):
         idx_list = input_data.get_query_start_loc() - 1
         return self.lm_head(hidden_states[idx_list[1:]])
 
-    def load_weights(self, weights, mp_load_progress):
-        parameters = dict(self.named_parameters())
-        if mp_load_progress is not None:
-            mp_load_progress[get_local_rank() * 2] = len(parameters)
-            mp_load_progress[get_local_rank() * 2 + 1] = 0
-        else:
-            pbar = get_model_load_pbar(len(parameters))
+    def _chatglm_rules(self):
+        return [
+            WeightRule(
+                contains("dense_h_to_4h.weight"), h_chatglm_gate_up, "h_to_4h"
+            ),
+            WeightRule(contains("dense_4h_to_h.weight"), h_proj_dim1, "4h_to_h"),
+            WeightRule(contains("query_key_value"), h_chatglm_qkv, "qkv"),
+            WeightRule(contains("dense.weight"), h_proj_dim1, "dense"),
+            WeightRule(
+                contains("embedding", "output_layer"), h_proj_dim0, "embed_out"
+            ),
+        ]
 
+    def load_weights(self, weights, mp_load_progress=None):
         attn = self.transformer.encoder.layers[0].self_attention
-        num_heads = attn.num_heads
-        num_kv_heads = attn.num_kv_heads
-        head_dim = attn.head_dim
-
-        intermediate_size = self.config.ffn_hidden_size
-
-        q_index = num_heads * head_dim * get_tp_size()
-        k_index = (num_heads + num_kv_heads) * head_dim * get_tp_size()
-
-        for k, v in parameters.items():
-            k = resolve_pp_layer_idx(k, 3, self.transformer.encoder.start_layer)
-            if "embedding" in k:
-                k = k.replace("embedding", "embedding.word_embeddings")
-
-            weight = weights[k]
-            if "dense_h_to_4h.weight" in k:
-                copy_gate_up_proj(
-                    v.data, weight[:intermediate_size], weight[intermediate_size:]
-                )
-            elif "dense_4h_to_h.weight" in k:
-                copy_single_proj_dim1(v.data, weight)
-            elif "query_key_value" in k:
-                copy_qkv_proj(
-                    v.data,
-                    weight[:q_index],
-                    weight[q_index:k_index],
-                    weight[k_index:],
-                    num_heads,
-                    num_kv_heads,
-                    head_dim,
-                )
-            elif "dense.weight" in k:
-                copy_single_proj_dim1(v.data, weight)
-            elif "embedding" in k or "output_layer" in k:
-                copy_single_proj_dim0(v.data, weight)
-            else:
-                v.data.copy_(weight)
-            if mp_load_progress is not None:
-                mp_load_progress[get_local_rank() * 2 + 1] += 1
-            else:
-                pbar.update(1)
+        q_index = attn.num_heads * attn.head_dim * get_tp_size()
+        k_index = (attn.num_heads + attn.num_kv_heads) * attn.head_dim * get_tp_size()
+        ctx = LoadContext(
+            weights=weights,
+            num_heads=attn.num_heads,
+            num_kv_heads=attn.num_kv_heads,
+            head_dim=attn.head_dim,
+            extra={
+                "q_index": q_index,
+                "k_index": k_index,
+                "intermediate_size": self.config.ffn_hidden_size,
+            },
+        )
+        # ChatGLM names its embedding ``embedding.weight`` in the module tree
+        # but ``embedding.word_embeddings.weight`` in the checkpoint.
+        run_weight_loader(
+            self,
+            weights,
+            self._chatglm_rules(),
+            mp_load_progress,
+            pp_idx_offset=3,
+            start_layer=self.transformer.encoder.start_layer,
+            ctx=ctx,
+            src_key_fn=lambda k: (
+                k.replace("embedding", "embedding.word_embeddings")
+                if "embedding" in k
+                else k
+            ),
+        )
 
     def process_response(self, output, history):
         content = ""

@@ -36,11 +36,9 @@ from torch import nn
 from gllm.dist_utils import (
     get_ep_rank,
     get_ep_size,
-    get_local_rank,
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
-    resolve_pp_layer_idx,
 )
 from gllm.input_data import InputData
 from gllm.layers.moe import determine_expert_map
@@ -51,20 +49,23 @@ from gllm.models.qwen3_5 import (
     _load_gdn_layer_weights,
 )
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from gllm.models.weight_utils import (
-    copy_gate_up_proj,
-    copy_qkv_proj_gqa,
-    copy_single_proj_dim0,
-    copy_single_proj_dim1,
-    get_tensor_from_dict,
-    has_tensor_in_dict,
-    load_fused_w13_per_expert,
-    load_fused_w13_stacked_natural,
-    load_w2_per_expert,
-    load_w2_stacked_natural,
-    moe_expert_load_pool,
+from gllm.models.weight_loader import (
+    LoadContext,
+    WeightRule,
+    contains,
+    h_gate_up,
+    h_proj_dim0,
+    h_proj_dim1,
+    h_qkv_proj_gqa,
+    h_w13_hybrid,
+    h_w2_hybrid,
+    hv_proj_dim0,
+    hv_proj_dim1,
+    hv_qkv_fused_split,
+    make_gdn_pre_pass,
+    run_vision_loader,
+    run_weight_loader,
 )
-from gllm.utils import get_model_load_pbar
 
 
 class Qwen3_5MoeLLMModel(Qwen3_5Model):
@@ -94,245 +95,64 @@ class Qwen3_5MoeLLMForCausalLM(Qwen3_5ForCausalLM):
     def __init__(self, config):
         super().__init__(config, model_type=Qwen3_5MoeLLMModel)
 
-    def load_weights(self, weights, mp_load_progress=None):
-        """Load weights into this rank's parameters.
-
-        Three logical groups:
-
-        1. **GDN layers** are fused at load time
-           (``_load_gdn_layer_weights``); we record every parameter the
-           helper fills so we can skip them in the per-parameter loop.
-        2. **MoE experts** are loaded per-expert with a thread pool because
-           every checkpoint key is a different mmap'd tensor and the
-           per-tensor H2D latency dominates without parallelism. Both
-           ``w*_weight`` and (when FP8) ``w*_weight_scale_inv`` follow the
-           same per-expert key formatting.
-        3. **Everything else** runs in the standard per-parameter loop;
-           the ``qkv_proj`` path uses :func:`copy_qkv_proj_gqa` because the
-           Qwen3.5-MoE TP=4 config replicates the 2 kv heads across pairs
-           of TP ranks, and the FP8 scale needs ``head_dim // block_n``
-           rather than 1 row per head when ``head_dim > block_n``.
-        """
-        parameters = dict(self.named_parameters())
-        if mp_load_progress is not None:
-            mp_load_progress[get_local_rank() * 2] = len(parameters)
-            mp_load_progress[get_local_rank() * 2 + 1] = 0
-            update = lambda: mp_load_progress.__setitem__(
-                get_local_rank() * 2 + 1,
-                mp_load_progress[get_local_rank() * 2 + 1] + 1,
-            )
-        else:
-            pbar = get_model_load_pbar(len(parameters))
-            update = lambda: pbar.update(1)
-
-        # ---- Pass 1: GDN fusion -------------------------------------------
-        gdn_filled: set = set()
-        gdn_subs = [
-            "conv1d.weight",
-            "in_proj_qkvz.weight",
-            "in_proj_qkvz.weight_scale_inv",
-            "in_proj_ba.weight",
-            "A_log",
-            "dt_bias",
-            "norm.weight",
-            "out_proj.weight",
-            "out_proj.weight_scale_inv",
-        ]
-        for local_idx, layer in enumerate(self.model.layers):
-            if layer.linear_attn is None:
-                continue
-            global_idx = local_idx + self.start_layer
-            prefix = f"model.layers.{global_idx}.linear_attn"
-            _load_gdn_layer_weights(layer.linear_attn, prefix, weights)
-            for sub in gdn_subs:
-                local_key = f"model.layers.{local_idx}.linear_attn.{sub}"
-                if local_key in parameters:
-                    gdn_filled.add(local_key)
-                    update()
-
-        # ---- attention bookkeeping ----------------------------------------
-        attn_ref = None
-        for layer in self.model.layers:
-            if layer.self_attn is not None:
-                attn_ref = layer.self_attn
-                break
-        assert attn_ref is not None, "Qwen3.5-MoE expects ≥1 full-attn layer"
-
-        num_q_heads_per_rank = attn_ref.num_heads
-        num_kv_heads_per_rank = attn_ref.num_kv_heads
-        head_dim_local = attn_ref.head_dim
-        # ``total_num_kv_heads / tp_size`` rounded toward zero; ``QKVParallel``
-        # sets ``num_kv_head_replicas = tp / total_kv`` whenever total_kv < tp.
+    def _make_load_context(self, weights):
+        ctx = super()._make_load_context(weights)
+        attn = ctx.extra.get("_attn_ref")
+        assert attn is not None, "Qwen3.5-MoE expects >=1 full-attn layer"
         tp_size = get_tp_size()
-        if attn_ref.total_num_kv_heads >= tp_size:
+        if attn.total_num_kv_heads >= tp_size:
             num_kv_head_replicas = 1
         else:
-            num_kv_head_replicas = tp_size // attn_ref.total_num_kv_heads
-
-        # FP8 block_n for the qkv_proj's weight_scale_inv slicing. Falls back
-        # to ``head_dim_local`` when the linear isn't FP8 (so the scale path
-        # is never taken).
+            num_kv_head_replicas = tp_size // attn.total_num_kv_heads
         qkv_block_n = (
-            attn_ref.qkv_proj.weight_block_size[0]
-            if hasattr(attn_ref.qkv_proj, "weight_block_size")
+            attn.qkv_proj.weight_block_size[0]
+            if hasattr(attn.qkv_proj, "weight_block_size")
             else None
         )
+        ctx.extra["num_kv_head_replicas"] = num_kv_head_replicas
+        ctx.extra["qkv_block_n"] = qkv_block_n
 
-        num_q_rows_per_rank = num_q_heads_per_rank * (
-            2 if attn_ref.attn_output_gate else 1
-        )
-
-        # ---- MoE expert metadata ------------------------------------------
         num_experts = getattr(self.config, "num_experts", 0)
         if num_experts <= 0:
             raise ValueError(
                 "Qwen3_5MoeLLMForCausalLM expects ``num_experts > 0``; got "
                 f"{num_experts}. Use Qwen3_5ForCausalLM for the dense variant."
             )
-        _, expert_map = determine_expert_map(
+        ctx.num_experts = num_experts
+        _, ctx.expert_map = determine_expert_map(
             get_ep_size(), get_ep_rank(), num_experts
         )
+        return ctx
 
-        with moe_expert_load_pool(num_experts) as pool:
-            for k, v in parameters.items():
-                if k in gdn_filled:
-                    continue
-                k_remote = resolve_pp_layer_idx(k, 2, self.model.start_layer)
+    def weight_rules(self):
+        # GQA/FP8-aware qkv + hybrid (stacked-or-per-expert, FP8-aware) experts,
+        # then the dense rules for o_proj / shared-expert gate_up / down /
+        # embed. Router (``mlp.gate.weight``), ``shared_expert_gate`` and
+        # q_norm/k_norm fall through to the default verbatim copy.
+        return [
+            WeightRule(contains("self_attn.qkv_proj"), h_qkv_proj_gqa, "qkv_proj"),
+            WeightRule(contains("mlp.experts.w13_weight"), h_w13_hybrid, "w13_expert"),
+            WeightRule(contains("mlp.experts.w2_weight"), h_w2_hybrid, "w2_expert"),
+            WeightRule(contains("self_attn.o_proj"), h_proj_dim1, "o_proj"),
+            WeightRule(contains("gate_up_proj"), h_gate_up, "gate_up_proj"),
+            WeightRule(contains("down_proj"), h_proj_dim1, "down_proj"),
+            WeightRule(
+                contains("embed_tokens", "lm_head"), h_proj_dim0, "embed_lm_head"
+            ),
+        ]
 
-                if k.find("self_attn.qkv_proj") != -1:
-                    is_scale = k.endswith("weight_scale_inv")
-                    if is_scale:
-                        # FP8 block-quant scale: one row per ``block_n``
-                        # output rows of the weight. ``head_dim_or_blocks``
-                        # = ``head_dim // block_n`` so the per-component
-                        # offsets in copy_qkv_proj_gqa land on the right
-                        # scale rows. With head_dim=256 and block_n=128
-                        # this is 2, not 1 (which would be the head_dim=128
-                        # case the original Qwen2 loader was written for).
-                        head_dim_or_blocks = head_dim_local // qkv_block_n
-                    else:
-                        head_dim_or_blocks = head_dim_local
-                    copy_qkv_proj_gqa(
-                        v.data,
-                        get_tensor_from_dict(
-                            weights, k_remote.replace("qkv_proj", "q_proj")
-                        ),
-                        get_tensor_from_dict(
-                            weights, k_remote.replace("qkv_proj", "k_proj")
-                        ),
-                        get_tensor_from_dict(
-                            weights, k_remote.replace("qkv_proj", "v_proj")
-                        ),
-                        num_q_rows_per_rank,
-                        num_kv_heads_per_rank,
-                        num_kv_head_replicas,
-                        head_dim_or_blocks,
-                    )
-                elif k.find("self_attn.o_proj") != -1:
-                    copy_single_proj_dim1(
-                        v.data, get_tensor_from_dict(weights, k_remote)
-                    )
-                elif k.find("mlp.experts.w13_weight") != -1:
-                    # FusedMoE param shape (local_E, 2*I_p, H) or
-                    # (local_E, 2*I_p_blocks, H_blocks) for the FP8 scale.
-                    # The per-expert checkpoint keys differ only in the
-                    # final suffix (``.weight`` vs ``.weight_scale_inv``).
-                    is_scale = k.endswith("weight_scale_inv")
-                    suffix = "weight_scale_inv" if is_scale else "weight"
-                    base = k_remote.replace(
-                        "w13_weight_scale_inv" if is_scale else "w13_weight",
-                        "",
-                    )
-                    # Stacked checkpoint (e.g. Qwen3.5-MoE bf16): a single
-                    # ``experts.gate_up_proj`` tensor (E, 2I, H) instead of
-                    # per-expert ``experts.{i}.gate_proj``. Detect + dispatch.
-                    stacked_key = f"{base}gate_up_proj"
-                    if not is_scale and has_tensor_in_dict(weights, stacked_key):
-                        load_fused_w13_stacked_natural(
-                            v.data,
-                            get_tensor_from_dict(weights, stacked_key),
-                            expert_map=expert_map,
-                            num_experts=num_experts,
-                            pool=pool,
-                        )
-                    else:
-                        load_fused_w13_per_expert(
-                            v.data,
-                            weights,
-                            key_for_gate=lambda i, base=base, s=suffix: (
-                                f"{base}{i}.gate_proj.{s}"
-                            ),
-                            key_for_up=lambda i, base=base, s=suffix: (
-                                f"{base}{i}.up_proj.{s}"
-                            ),
-                            expert_map=expert_map,
-                            num_experts=num_experts,
-                            pool=pool,
-                        )
-                elif k.find("mlp.experts.w2_weight") != -1:
-                    is_scale = k.endswith("weight_scale_inv")
-                    suffix = "weight_scale_inv" if is_scale else "weight"
-                    base = k_remote.replace(
-                        "w2_weight_scale_inv" if is_scale else "w2_weight",
-                        "",
-                    )
-                    # Stacked checkpoint: single ``experts.down_proj`` (E, H, I).
-                    stacked_key = f"{base}down_proj"
-                    if not is_scale and has_tensor_in_dict(weights, stacked_key):
-                        load_w2_stacked_natural(
-                            v.data,
-                            get_tensor_from_dict(weights, stacked_key),
-                            expert_map=expert_map,
-                            num_experts=num_experts,
-                            pool=pool,
-                        )
-                    else:
-                        load_w2_per_expert(
-                            v.data,
-                            weights,
-                            key_for_down=lambda i, base=base, s=suffix: (
-                                f"{base}{i}.down_proj.{s}"
-                            ),
-                            expert_map=expert_map,
-                            num_experts=num_experts,
-                            pool=pool,
-                        )
-                elif k.find("gate_up_proj") != -1:
-                    # Shared expert (the only ``gate_up_proj`` path left
-                    # outside the FusedMoE experts) or any other dense
-                    # gate_up_proj if a layer falls into ``mlp_only_layers``.
-                    copy_gate_up_proj(
-                        v.data,
-                        get_tensor_from_dict(
-                            weights, k_remote.replace("gate_up_proj", "gate_proj")
-                        ),
-                        get_tensor_from_dict(
-                            weights, k_remote.replace("gate_up_proj", "up_proj")
-                        ),
-                    )
-                elif k.find("down_proj") != -1:
-                    # Shared expert down_proj or dense down_proj (RowParallel).
-                    copy_single_proj_dim1(
-                        v.data, get_tensor_from_dict(weights, k_remote)
-                    )
-                elif k.find("mlp.gate.weight") != -1:
-                    # Router: ``nn.Linear(hidden, num_experts)`` with no TP.
-                    v.data.copy_(get_tensor_from_dict(weights, k_remote))
-                elif k.find("shared_expert_gate") != -1:
-                    # 1-D scalar gate per token (``Linear(hidden, 1)``).
-                    v.data.copy_(get_tensor_from_dict(weights, k_remote))
-                elif k.find("embed_tokens") != -1 or k.find("lm_head") != -1:
-                    copy_single_proj_dim0(
-                        v.data, get_tensor_from_dict(weights, k_remote)
-                    )
-                elif (
-                    k.find("self_attn.q_norm") != -1
-                    or k.find("self_attn.k_norm") != -1
-                ):
-                    v.data.copy_(get_tensor_from_dict(weights, k_remote))
-                else:
-                    v.data.copy_(get_tensor_from_dict(weights, k_remote))
-                update()
+    def load_weights(self, weights, mp_load_progress=None):
+        run_weight_loader(
+            self,
+            weights,
+            self.weight_rules(),
+            mp_load_progress,
+            pp_idx_offset=2,
+            start_layer=self.start_layer,
+            ctx=self._make_load_context(weights),
+            pre_passes=[make_gdn_pre_pass(self.GDN_SUBS, _load_gdn_layer_weights)],
+        )
+
 
 
 # ---------------------------------------------------------------------------
@@ -386,32 +206,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if getattr(self, "skip_visual", False) or self.visual is None:
             return
 
-        parameters = dict(self.visual.named_parameters())
-        num_heads = self.visual.num_heads // get_tp_size()
-        head_dim = self.visual.hidden_size // self.visual.num_heads
-        for k, v in parameters.items():
-            if k.find("attn.qkv") != -1:
-                src_qkv = get_tensor_from_dict(weights, f"visual.{k}")
-                size_partition = src_qkv.shape[0] // 3
-                src_q, src_k, src_v = src_qkv.split(
-                    [size_partition, size_partition, size_partition], dim=0
-                )
-                # Vision tower stays in bf16 so the dense per-head loader
-                # is the right tool (no FP8 scale tensors to copy here).
-                from gllm.models.weight_utils import copy_qkv_proj
-                copy_qkv_proj(
-                    v.data, src_q, src_k, src_v, num_heads, num_heads, head_dim
-                )
-            elif (
-                k.find("attn.proj.weight") != -1
-                or k.find("linear_fc2.weight") != -1
-            ):
-                copy_single_proj_dim1(
-                    v.data, get_tensor_from_dict(weights, f"visual.{k}")
-                )
-            elif k.find("linear_fc1") != -1:
-                copy_single_proj_dim0(
-                    v.data, get_tensor_from_dict(weights, f"visual.{k}")
-                )
-            else:
-                v.data.copy_(get_tensor_from_dict(weights, f"visual.{k}"))
+        ctx = LoadContext(
+            weights=weights,
+            num_heads=self.visual.num_heads // get_tp_size(),
+            head_dim=self.visual.hidden_size // self.visual.num_heads,
+            extra={"prefix": "visual."},
+        )
+        rules = [
+            WeightRule(contains("attn.qkv"), hv_qkv_fused_split, "v_qkv"),
+            WeightRule(
+                contains("attn.proj.weight", "linear_fc2.weight"),
+                hv_proj_dim1,
+                "v_proj_dim1",
+            ),
+            WeightRule(contains("linear_fc1"), hv_proj_dim0, "v_fc1"),
+        ]
+        run_vision_loader(self.visual, weights, rules, ctx)

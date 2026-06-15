@@ -9,9 +9,15 @@ from functools import partial, lru_cache
 from gllm.input_data import InputData
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead
 from gllm.models.utils import _merge_multimodal_embeddings
-from gllm.models.weight_utils import (
-    copy_qkv_proj, copy_single_proj_dim0, 
-    copy_single_proj_dim1, get_tensor_from_dict)
+from gllm.models.weight_loader import (
+    LoadContext,
+    WeightRule,
+    contains,
+    hv_proj_dim0,
+    hv_proj_dim1,
+    hv_qkv_fused_split,
+    run_vision_loader,
+)
 from gllm.layers.linear import ColumnParallelLinear, RowParallelLinear
 from gllm.dist_utils import get_tp_size, is_first_pp_rank, is_last_pp_rank
 
@@ -957,25 +963,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if getattr(self, "skip_visual", False) or self.visual is None:
             return
 
-        parameters = dict(self.visual.named_parameters())
+        ctx = LoadContext(
+            weights=weights,
+            num_heads=self.visual.num_heads // get_tp_size(),
+            head_dim=self.visual.hidden_size // self.visual.num_heads,
+            extra={"prefix": "visual."},
+        )
+        run_vision_loader(self.visual, weights, self._vision_rules(), ctx)
 
-        num_heads = self.visual.num_heads // get_tp_size()
-        head_dim = self.visual.hidden_size // self.visual.num_heads
-
-        for k, v in parameters.items():
-            if k.find("attn.qkv") != -1:
-                src_qkv = get_tensor_from_dict(weights, f"visual.{k}")
-                size_partition = src_qkv.shape[0] // 3
-                src_q, src_k, src_v = src_qkv.split(
-                    [size_partition, size_partition, size_partition], dim=0
-                )
-                copy_qkv_proj(
-                    v.data, src_q, src_k, src_v, num_heads, num_heads, head_dim
-                )
-            elif k.find("attn.proj.weight") != -1 or k.find("linear_fc2.weight") != -1:
-                copy_single_proj_dim1(v.data, get_tensor_from_dict(weights, f"visual.{k}"))
-            elif k.find("linear_fc1") != -1:
-                src_data = get_tensor_from_dict(weights, f"visual.{k}")
-                copy_single_proj_dim0(v.data, src_data)
-            else:
-                v.data.copy_(get_tensor_from_dict(weights, f"visual.{k}"))
+    def _vision_rules(self):
+        return [
+            WeightRule(contains("attn.qkv"), hv_qkv_fused_split, "v_qkv"),
+            WeightRule(
+                contains("attn.proj.weight", "linear_fc2.weight"),
+                hv_proj_dim1,
+                "v_proj_dim1",
+            ),
+            WeightRule(contains("linear_fc1"), hv_proj_dim0, "v_fc1"),
+        ]
