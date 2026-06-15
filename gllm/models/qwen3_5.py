@@ -81,11 +81,25 @@ from gllm.memory_manager import SSMCacheConfig
 from gllm.models.qwen2 import Qwen2MLP
 from gllm.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from gllm.models.weight_utils import (
-    copy_gate_up_proj,
     copy_qkv_proj,
     copy_single_proj_dim0,
     copy_single_proj_dim1,
     get_tensor_from_dict,
+)
+from gllm.models.weight_loader import (
+    LoadContext,
+    WeightRule,
+    contains,
+    h_gate_up,
+    h_proj_dim0,
+    h_proj_dim1,
+    h_qkv_proj_gated,
+    hv_proj_dim0,
+    hv_proj_dim1,
+    hv_qkv_fused_split,
+    make_gdn_pre_pass,
+    run_vision_loader,
+    run_weight_loader,
 )
 from gllm.utils import get_model_load_pbar
 
@@ -997,118 +1011,73 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     # ----- weight loading --------------------------------------------------
 
-    def load_weights(self, weights, mp_load_progress=None):
-        """Walk ``self.named_parameters()`` and pull each from the
-        checkpoint.
+    # Sub-keys of a GDN block filled en bloc by ``_load_gdn_layer_weights``
+    # (and thus skipped in the per-parameter loop). Includes both bf16 and FP8
+    # (``*_scale_inv``) variants; absent ones are ignored by the pre-pass.
+    GDN_SUBS = (
+        "conv1d.weight",
+        "in_proj_qkvz.weight",
+        "in_proj_qkvz.weight_scale_inv",
+        "in_proj_ba.weight",
+        "A_log",
+        "dt_bias",
+        "norm.weight",
+        "out_proj.weight",
+        "out_proj.weight_scale_inv",
+    )
 
-        We special-case the GDN block because the checkpoint stores it as
-        four split projections (``in_proj_qkv``, ``in_proj_z``, ``in_proj_b``,
-        ``in_proj_a``) but the runtime fuses them into ``in_proj_qkvz`` and
-        ``in_proj_ba``. The dispatch happens at ``layer.linear_attn``
-        granularity so we touch a layer's GDN weights once and then continue
-        to the next parameter that isn't part of it.
-        """
-        parameters = dict(self.named_parameters())
-        if mp_load_progress is not None:
-            mp_load_progress[get_local_rank() * 2] = len(parameters)
-            mp_load_progress[get_local_rank() * 2 + 1] = 0
-            update = lambda: mp_load_progress.__setitem__(
-                get_local_rank() * 2 + 1,
-                mp_load_progress[get_local_rank() * 2 + 1] + 1,
-            )
-        else:
-            pbar = get_model_load_pbar(len(parameters))
-            update = lambda: pbar.update(1)
-
-        # First pass: handle GDN layers en bloc, recording which destination
-        # parameters were filled so we can skip them in the per-param loop.
-        gdn_filled: set = set()
-        for local_idx, layer in enumerate(self.model.layers):
-            if layer.linear_attn is None:
-                continue
-            global_idx = local_idx + self.start_layer
-            prefix = f"model.layers.{global_idx}.linear_attn"
-            _load_gdn_layer_weights(layer.linear_attn, prefix, weights)
-            for sub in (
-                "conv1d.weight",
-                "in_proj_qkvz.weight",
-                "in_proj_ba.weight",
-                "A_log",
-                "dt_bias",
-                "norm.weight",
-                "out_proj.weight",
-            ):
-                local_key = f"model.layers.{local_idx}.linear_attn.{sub}"
-                gdn_filled.add(local_key)
-                update()
-
-        # Pass 2: the rest of the parameters.
-        attn_ref = None
+    def _attn_ref(self):
         for layer in self.model.layers:
             if layer.self_attn is not None:
-                attn_ref = layer.self_attn
-                break
+                return layer.self_attn
+        return None
 
-        num_q_heads = attn_ref.num_heads if attn_ref is not None else 0
-        num_kv_heads_local = attn_ref.num_kv_heads if attn_ref is not None else 0
-        head_dim_local = attn_ref.head_dim if attn_ref is not None else self.head_dim
+    def _make_load_context(self, weights):
+        attn = self._attn_ref()
+        num_q_heads = attn.num_heads if attn is not None else 0
+        num_kv_heads = attn.num_kv_heads if attn is not None else 0
+        head_dim = attn.head_dim if attn is not None else self.head_dim
+        num_q_rows = num_q_heads * (
+            2 if (attn is not None and attn.attn_output_gate) else 1
+        )
+        return LoadContext(
+            weights=weights,
+            num_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            extra={"num_q_rows": num_q_rows, "_attn_ref": attn},
+        )
 
-        for k, v in parameters.items():
-            if k in gdn_filled:
-                continue
-            k_remote = resolve_pp_layer_idx(k, 2, self.model.start_layer)
+    def weight_rules(self):
+        return [
+            WeightRule(
+                contains("self_attn.qkv_proj"), h_qkv_proj_gated, "qkv_proj"
+            ),
+            WeightRule(contains("self_attn.o_proj"), h_proj_dim1, "o_proj"),
+            WeightRule(contains("gate_up_proj"), h_gate_up, "gate_up_proj"),
+            WeightRule(contains("down_proj"), h_proj_dim1, "down_proj"),
+            WeightRule(
+                contains("embed_tokens", "lm_head"), h_proj_dim0, "embed_lm_head"
+            ),
+        ]
 
-            if attn_ref is not None and k.find("self_attn.qkv_proj") != -1:
-                head_dim_patch = (
-                    head_dim_local
-                    if k.find("scale") == -1 or k.find("weight") == -1
-                    else 1
-                )
-                num_q_rows = num_q_heads * (
-                    2 if attn_ref.attn_output_gate else 1
-                )
-                copy_qkv_proj(
-                    v.data,
-                    get_tensor_from_dict(
-                        weights, k_remote.replace("qkv_proj", "q_proj")
-                    ),
-                    get_tensor_from_dict(
-                        weights, k_remote.replace("qkv_proj", "k_proj")
-                    ),
-                    get_tensor_from_dict(
-                        weights, k_remote.replace("qkv_proj", "v_proj")
-                    ),
-                    num_q_rows,
-                    num_kv_heads_local,
-                    head_dim_patch,
-                )
-            elif k.find("self_attn.o_proj") != -1:
-                copy_single_proj_dim1(
-                    v.data, get_tensor_from_dict(weights, k_remote)
-                )
-            elif k.find("gate_up_proj") != -1:
-                copy_gate_up_proj(
-                    v.data,
-                    get_tensor_from_dict(
-                        weights, k_remote.replace("gate_up_proj", "gate_proj")
-                    ),
-                    get_tensor_from_dict(
-                        weights, k_remote.replace("gate_up_proj", "up_proj")
-                    ),
-                )
-            elif k.find("down_proj") != -1:
-                copy_single_proj_dim1(
-                    v.data, get_tensor_from_dict(weights, k_remote)
-                )
-            elif k.find("embed_tokens") != -1 or k.find("lm_head") != -1:
-                copy_single_proj_dim0(
-                    v.data, get_tensor_from_dict(weights, k_remote)
-                )
-            elif k.find("self_attn.q_norm") != -1 or k.find("self_attn.k_norm") != -1:
-                v.data.copy_(get_tensor_from_dict(weights, k_remote))
-            else:
-                v.data.copy_(get_tensor_from_dict(weights, k_remote))
-            update()
+    def load_weights(self, weights, mp_load_progress=None):
+        ctx = self._make_load_context(weights)
+        # qkv rule only fires when a full-attention layer exists; if none,
+        # ``num_q_rows`` is 0 and no qkv_proj parameters are present anyway.
+        rules = self.weight_rules()
+        if ctx.extra.get("_attn_ref") is None:
+            rules = [r for r in rules if r.name != "qkv_proj"]
+        run_weight_loader(
+            self,
+            weights,
+            rules,
+            mp_load_progress,
+            pp_idx_offset=2,
+            start_layer=self.start_layer,
+            ctx=ctx,
+            pre_passes=[make_gdn_pre_pass(self.GDN_SUBS, _load_gdn_layer_weights)],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1157,32 +1126,19 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return
 
         # Visual tower load: same pattern as ``Qwen3VLForConditionalGeneration``.
-        parameters = dict(self.visual.named_parameters())
-        num_heads = self.visual.num_heads // get_tp_size()
-        head_dim = self.visual.hidden_size // self.visual.num_heads
-        for k, v in parameters.items():
-            if k.find("attn.qkv") != -1:
-                src_qkv = get_tensor_from_dict(weights, f"visual.{k}")
-                size_partition = src_qkv.shape[0] // 3
-                src_q, src_k, src_v = src_qkv.split(
-                    [size_partition, size_partition, size_partition], dim=0
-                )
-                copy_qkv_proj(
-                    v.data, src_q, src_k, src_v, num_heads, num_heads, head_dim
-                )
-            elif (
-                k.find("attn.proj.weight") != -1
-                or k.find("linear_fc2.weight") != -1
-            ):
-                # Row-parallel projections: shard along dim 1 (input dim).
-                # Match the suffix ``.weight`` explicitly so biases (1-D)
-                # take the default fall-through copy. Mirrors qwen3_vl.
-                copy_single_proj_dim1(
-                    v.data, get_tensor_from_dict(weights, f"visual.{k}")
-                )
-            elif k.find("linear_fc1") != -1:
-                copy_single_proj_dim0(
-                    v.data, get_tensor_from_dict(weights, f"visual.{k}")
-                )
-            else:
-                v.data.copy_(get_tensor_from_dict(weights, f"visual.{k}"))
+        ctx = LoadContext(
+            weights=weights,
+            num_heads=self.visual.num_heads // get_tp_size(),
+            head_dim=self.visual.hidden_size // self.visual.num_heads,
+            extra={"prefix": "visual."},
+        )
+        rules = [
+            WeightRule(contains("attn.qkv"), hv_qkv_fused_split, "v_qkv"),
+            WeightRule(
+                contains("attn.proj.weight", "linear_fc2.weight"),
+                hv_proj_dim1,
+                "v_proj_dim1",
+            ),
+            WeightRule(contains("linear_fc1"), hv_proj_dim0, "v_fc1"),
+        ]
+        run_vision_loader(self.visual, weights, rules, ctx)

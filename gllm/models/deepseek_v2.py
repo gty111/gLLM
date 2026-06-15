@@ -26,8 +26,17 @@ from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from gllm.modules.attention import Attention
 from gllm.utils import yarn_get_mscale
 
+from .qwen2 import Qwen2ForCausalLM
 from .qwen2_moe import Qwen2MoeForCausalLM
 from .utils import extract_rope_config
+from .weight_loader import (
+    WeightRule,
+    contains,
+    h_proj_dim0,
+    h_qkv_a_proj,
+    make_w13_loader,
+    make_w2_loader,
+)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -63,7 +72,8 @@ class DeepseekV2MOE(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        quant_config = getattr(config, "quantization_config", None)
+        dense_quant_config = getattr(config, "quantization_config", None)
+        moe_quant_config = getattr(config, "moe_quantization_config", dense_quant_config)
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts: int = config.n_shared_experts
         self.gate = ReplicatedLinear(
@@ -90,7 +100,7 @@ class DeepseekV2MOE(nn.Module):
             topk_group=config.topk_group,
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
-            quant_config=quant_config,
+            quant_config=moe_quant_config,
         )
 
         if config.n_shared_experts is not None:
@@ -99,7 +109,7 @@ class DeepseekV2MOE(nn.Module):
                 config.hidden_size,
                 intermediate_size,
                 reduce_results=False,
-                quant_config=quant_config,
+                quant_config=dense_quant_config,
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -551,3 +561,85 @@ class DeepseekV2ForCausalLM(Qwen2MoeForCausalLM):
             self.head_dim = attn.qk_head_dim
         else:
             self.head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+
+    def attn_weight_rules(self):
+        """MLA attention rules (DeepSeek-V2/V3, Kimi).
+
+        Replaces the dense ``self_attn.qkv_proj`` rule:
+
+        * ``fused_qkv_a_proj`` — MLA fuses ``q_a_proj`` ++ ``kv_a_proj_with_mqa``
+          (only present when ``q_lora_rank`` is set / ``use_mla``).
+        * ``q_proj`` / ``q_b_proj`` / ``kv_b_proj`` are column-parallel
+          (output-dim sliced) -> ``h_proj_dim0``.
+        * ``o_proj`` stays row-parallel (``h_proj_dim1``) via the base rules.
+        """
+        return [
+            WeightRule(
+                contains("self_attn.fused_qkv_a_proj"), h_qkv_a_proj, "mla_qkv_a"
+            ),
+            WeightRule(
+                contains("q_proj", "kv_b_proj", "q_b_proj"), h_proj_dim0, "mla_q_kv_b"
+            ),
+        ]
+
+    def _is_int4_moe(self):
+        """True when routed experts are compressed-tensors int4 (e.g. Kimi).
+
+        The model loader normalizes such checkpoints to
+        ``moe_quantization_config = {"quant_method": "int4_moe", ...}`` on the
+        (text) config the language model is built from.
+        """
+        qc = getattr(self.config, "moe_quantization_config", None)
+        return isinstance(qc, dict) and qc.get("quant_method") == "int4_moe"
+
+    def expert_weight_rules(self):
+        """Routed-expert rules. For int4 checkpoints the packed/scale tensors
+        (``w13_weight_packed`` / ``w13_weight_scale`` / ``w2_weight_packed`` /
+        ``w2_weight_scale``) must be matched *before* the generic
+        ``w13_weight`` / ``w2_weight`` rules, since ``"w13_weight" in
+        "w13_weight_packed"`` is True.
+        """
+        if not self._is_int4_moe():
+            return super().expert_weight_rules()
+
+        return [
+            WeightRule(
+                contains("w13_weight_packed"),
+                make_w13_loader(
+                    "w13_weight_packed",
+                    "gate_proj.weight_packed",
+                    "up_proj.weight_packed",
+                ),
+                "int4_w13_packed",
+            ),
+            WeightRule(
+                contains("w13_weight_scale"),
+                make_w13_loader(
+                    "w13_weight_scale",
+                    "gate_proj.weight_scale",
+                    "up_proj.weight_scale",
+                ),
+                "int4_w13_scale",
+            ),
+            WeightRule(
+                contains("w2_weight_packed"),
+                make_w2_loader("w2_weight_packed", "down_proj.weight_packed"),
+                "int4_w2_packed",
+            ),
+            WeightRule(
+                contains("w2_weight_scale"),
+                make_w2_loader("w2_weight_scale", "down_proj.weight_scale"),
+                "int4_w2_scale",
+            ),
+        ] + super().expert_weight_rules()
+
+    def weight_rules(self):
+        # MLA attn rules + expert rules + dense base rules. The MLA rules are
+        # placed before the base ``self_attn.qkv_proj`` rule (which DeepSeek
+        # never has) so the column-parallel q/kv_b projections dispatch
+        # correctly instead of falling through to a generic copy.
+        return (
+            self.attn_weight_rules()
+            + self.expert_weight_rules()
+            + Qwen2ForCausalLM.weight_rules(self)
+        )

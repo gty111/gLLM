@@ -7,30 +7,23 @@ from torch import nn
 from gllm.dist_utils import (
     get_ep_rank,
     get_ep_size,
-    get_local_rank,
     get_tp_size,
-    resolve_pp_layer_idx,
     tensor_model_parallel_all_reduce,
 )
 
 from gllm.input_data import InputData
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe import FusedMoE, determine_expert_map
-from gllm.utils import get_model_load_pbar
 
 from .qwen2 import Qwen2Attention as Qwen2MoeAttention
 from .qwen2 import Qwen2ForCausalLM
 from .qwen2 import Qwen2MLP as Qwen2MoeMLP
 from .qwen2 import Qwen2Model
-from .weight_utils import (
-    copy_gate_up_proj,
-    copy_qkv_a_proj,
-    copy_qkv_proj,
-    copy_single_proj_dim0,
-    copy_single_proj_dim1,
-    load_fused_w13_per_expert,
-    load_w2_per_expert,
-    moe_expert_load_pool,
+from .weight_loader import (
+    WeightRule,
+    contains,
+    make_w13_loader,
+    make_w2_loader,
 )
 
 
@@ -159,95 +152,45 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
     def __init__(self, config, model_type=Qwen2MoeModel):
         super().__init__(config, model_type)
 
-    def load_weights(self, weights, mp_load_progress=None):
-        parameters = dict(self.named_parameters())
-        if mp_load_progress is not None:
-            mp_load_progress[get_local_rank() * 2] = len(parameters)
-            mp_load_progress[get_local_rank() * 2 + 1] = 0
-        else:
-            pbar = get_model_load_pbar(len(parameters))
-
-        attn = self.model.layers[0].self_attn
-        num_heads = attn.num_heads
-        num_kv_heads = attn.num_kv_heads
-        head_dim = attn.head_dim
-
-        num_experts = getattr(
+    def _resolve_num_experts(self):
+        n = getattr(
             self.config, "num_experts", getattr(self.config, "n_routed_experts", None)
         )
-        assert num_experts is not None
+        assert n is not None
+        return n
 
-        _, expert_map = determine_expert_map(get_ep_size(), get_ep_rank(), num_experts)
+    def _make_load_context(self, weights):
+        ctx = super()._make_load_context(weights)
+        ctx.num_experts = self._resolve_num_experts()
+        _, ctx.expert_map = determine_expert_map(
+            get_ep_size(), get_ep_rank(), ctx.num_experts
+        )
+        return ctx
 
-        with moe_expert_load_pool(num_experts) as expert_pool:
-            for k, v in parameters.items():
-                k = resolve_pp_layer_idx(k, 2, self.model.start_layer)
-                if k.find("self_attn.qkv_proj") != -1:
-                    head_dim_patch = (
-                        head_dim if k.find("scale") == -1 or k.find("weight") == -1 else 1
-                    )
-                    copy_qkv_proj(
-                        v.data,
-                        weights[k.replace("qkv_proj", "q_proj")],
-                        weights[k.replace("qkv_proj", "k_proj")],
-                        weights[k.replace("qkv_proj", "v_proj")],
-                        num_heads,
-                        num_kv_heads,
-                        head_dim_patch,
-                    )
-                elif k.find("self_attn.fused_qkv_a_proj") != -1:  # Deepseek V3 Attention
-                    copy_qkv_a_proj(
-                        v.data,
-                        weights[k.replace("fused_qkv_a_proj", "q_a_proj")],
-                        weights[k.replace("fused_qkv_a_proj", "kv_a_proj_with_mqa")],
-                    )
-                elif k.find("w13_weight") != -1:  # expert
-                    load_fused_w13_per_expert(
-                        v.data,
-                        weights,
-                        key_for_gate=lambda i, k=k: k.replace(
-                            "w13_weight", f"{i}.gate_proj.weight"
-                        ),
-                        key_for_up=lambda i, k=k: k.replace(
-                            "w13_weight", f"{i}.up_proj.weight"
-                        ),
-                        expert_map=expert_map,
-                        num_experts=num_experts,
-                        pool=expert_pool,
-                    )
-                elif k.find("w2_weight") != -1:  # expert
-                    load_w2_per_expert(
-                        v.data,
-                        weights,
-                        key_for_down=lambda i, k=k: k.replace(
-                            "w2_weight", f"{i}.down_proj.weight"
-                        ),
-                        expert_map=expert_map,
-                        num_experts=num_experts,
-                        pool=expert_pool,
-                    )
-                elif k.find("gate_up_proj.weight") != -1:  # shared expert or dense layer
-                    copy_gate_up_proj(
-                        v.data,
-                        weights[k.replace("gate_up_proj", "gate_proj")],
-                        weights[k.replace("gate_up_proj", "up_proj")],
-                    )
-                elif k.find("down_proj.weight") != -1:  # shared expert or dense layer
-                    copy_single_proj_dim1(v.data, weights[k])
-                elif k.find("self_attn.o_proj") != -1:
-                    copy_single_proj_dim1(v.data, weights[k])
-                elif (
-                    k.find("q_proj") != -1
-                    or k.find("kv_b_proj") != -1
-                    or k.find("q_b_proj") != -1
-                ):
-                    # Deepseek V2/V3 Attention
-                    copy_single_proj_dim0(v.data, weights[k])
-                elif k.find("embed_tokens") != -1 or k.find("lm_head") != -1:
-                    copy_single_proj_dim0(v.data, weights[k])
-                else:
-                    v.data.copy_(weights[k])
-                if mp_load_progress is not None:
-                    mp_load_progress[get_local_rank() * 2 + 1] += 1
-                else:
-                    pbar.update(1)
+    def expert_weight_rules(self):
+        """Routed-expert rules for the standard ``gate_proj``/``up_proj``/
+        ``down_proj`` per-expert checkpoint layout (Qwen2/3-MoE, DeepSeek bf16).
+
+        Subclasses with other expert key conventions (Mixtral's ``w1``/``w3``/
+        ``w2``, int4 packed) override or extend this.
+        """
+        return [
+            WeightRule(
+                contains("w13_weight"),
+                make_w13_loader("w13_weight", "gate_proj.weight", "up_proj.weight"),
+                "w13_expert",
+            ),
+            WeightRule(
+                contains("w2_weight"),
+                make_w2_loader("w2_weight", "down_proj.weight"),
+                "w2_expert",
+            ),
+        ]
+
+    def weight_rules(self):
+        # Expert rules first; their FusedMoE param names (``w13_weight`` /
+        # ``w2_weight``) are disjoint from the dense base patterns, so order
+        # between the two groups is not load-bearing, but keeping experts up
+        # front documents that the MoE block is the specialization.
+        return self.expert_weight_rules() + super().weight_rules()
+
