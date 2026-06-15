@@ -237,6 +237,18 @@ if __name__ == "__main__":
         "--page-size", type=int, help="Number of tokens in a page", default=16
     )
     parser.add_argument(
+        "--mla-decode-backend",
+        type=str,
+        choices=["flashmla", "triton"],
+        default="flashmla",
+        help=(
+            "MLA decode attention backend. 'flashmla' (default) uses the "
+            "DeepSeek FlashMLA kernel (auto-bumps page_size to 64; falls back "
+            "to Triton if unavailable); 'triton' uses the in-tree Triton "
+            "kernel. Only affects MLA models (e.g. DeepSeek)."
+        ),
+    )
+    parser.add_argument(
         "--disable-cuda-graph",
         help="Enable full cuda graph for decode batch",
         action="store_true",
@@ -368,6 +380,7 @@ if __name__ == "__main__":
         model_max_length=args.model_max_length,
         mm_processor_min_pixels=args.mm_processor_min_pixels,
         mm_processor_max_pixels=args.mm_processor_max_pixels,
+        mla_decode_backend=args.mla_decode_backend,
     )
 
     if args.launch_mode != "slave":
