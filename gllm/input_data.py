@@ -722,6 +722,11 @@ class InputData:
 class MLACommonDecodeMetadata:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
+    # Lazily populated by the FlashMLA decode backend with the tuple
+    # (tile_scheduler_metadata, num_splits) returned by ``get_mla_metadata``.
+    # It only depends on ``seq_lens`` + head count, so it is computed once per
+    # step and shared across all MLA layers. ``None`` for the Triton backend.
+    flashmla_meta: Optional[tuple] = None
 
 
 @dataclass

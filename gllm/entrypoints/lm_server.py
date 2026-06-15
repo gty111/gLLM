@@ -95,6 +95,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # --- Runtime (mirror api_server defaults) ---
     p.add_argument("--gpu-memory-util", type=float, default=0.9)
     p.add_argument("--page-size", type=int, default=16)
+    p.add_argument(
+        "--mla-decode-backend",
+        type=str,
+        choices=["flashmla", "triton"],
+        default="flashmla",
+        help=(
+            "MLA decode attention backend. 'flashmla' (default) auto-bumps "
+            "page_size to 64 and falls back to Triton if unavailable."
+        ),
+    )
     p.add_argument("--disable-cuda-graph", action="store_true")
     p.add_argument("--max-cuda-graph-bs", type=int, default=512)
     p.add_argument(
@@ -194,6 +204,7 @@ def main():
         mm_processor_min_pixels=args.mm_processor_min_pixels,
         mm_processor_max_pixels=args.mm_processor_max_pixels,
         disagg_config=disagg_config,
+        mla_decode_backend=args.mla_decode_backend,
     )
 
     asyncio.run(api.run_server(args))

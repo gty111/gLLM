@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from logger import logger
 
 from gllm import _custom_ops as ops
 from gllm.input_data import InputData, MLACommonMetadata, MLACommonPrefillMetadata
@@ -8,6 +9,23 @@ from gllm.layers.linear import ColumnParallelLinear, LinearBase
 from gllm.layers.ops.merge_attn_states import merge_attn_states
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
+
+# FlashMLA (DeepSeek SM90 MLA decode kernel) is optional: the extension only
+# loads on Hopper with a recent CUDA driver. Import lazily so the default
+# Triton decode backend keeps working when it is unavailable.
+try:
+    from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+    _FLASHMLA_AVAILABLE = True
+    _FLASHMLA_IMPORT_ERROR: Optional[Exception] = None
+except Exception as _e:  # pragma: no cover - depends on hardware / build
+    flash_mla_with_kvcache = None
+    get_mla_metadata = None
+    _FLASHMLA_AVAILABLE = False
+    _FLASHMLA_IMPORT_ERROR = _e
+
+# FlashMLA only supports a KV page/block size of 64.
+_FLASHMLA_PAGE_SIZE = 64
 
 
 def _flash_attn_paged_varlen(
@@ -122,6 +140,10 @@ class MLAAttention:
         qk_head_dim: int,
         v_head_dim: int,
         kv_b_proj: ColumnParallelLinear,
+        # Decode backend is selected by the upper layer (ModelRunner) and
+        # threaded down through the model config; see ``_resolve_decode_backend``.
+        decode_backend: str = "triton",
+        page_size: Optional[int] = None,
     ):
         self.scale = scale
         self.layer_id = layer_id
@@ -145,6 +167,44 @@ class MLAAttention:
         self.W_UK_T = None
 
         self.kv_cache_dtype = "auto"
+
+        self.decode_backend = self._resolve_decode_backend(decode_backend, page_size)
+
+    def _resolve_decode_backend(
+        self, requested: str, page_size: Optional[int]
+    ) -> str:
+        """Pick the decode backend, auto-falling back to Triton when FlashMLA
+        cannot run on this build/hardware.
+
+        The choice is made by the upper layer (default "flashmla"), but the
+        final availability check has to happen here in the worker process where
+        CUDA and the ``sgl_kernel`` extension are actually loaded. "triton" is
+        always valid; "flashmla" requires the extension and ``page_size == 64``.
+        """
+        requested = (requested or "triton").lower()
+        if requested not in ("triton", "flashmla"):
+            raise ValueError(
+                "mla_decode_backend must be 'triton' or 'flashmla', "
+                f"got {requested!r}."
+            )
+        if requested == "triton":
+            return "triton"
+
+        reason = None
+        if not _FLASHMLA_AVAILABLE:
+            reason = f"sgl_kernel.flash_mla unavailable ({_FLASHMLA_IMPORT_ERROR})"
+        elif page_size is not None and page_size != _FLASHMLA_PAGE_SIZE:
+            reason = (
+                f"page_size={page_size} != required {_FLASHMLA_PAGE_SIZE}"
+            )
+        if reason is not None:
+            logger.warning(
+                "MLA decode backend 'flashmla' is unavailable (%s); "
+                "falling back to 'triton'.",
+                reason,
+            )
+            return "triton"
+        return "flashmla"
 
     def process_weights(self):
         def get_and_maybe_dequant_weights(layer: LinearBase):
@@ -375,7 +435,86 @@ class MLAAttention:
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.decode_backend == "flashmla":
+            return self._forward_decode_flashmla(
+                q, kv_c_and_k_pe_cache, attn_metadata
+            )
+        return self._forward_decode_triton(q, kv_c_and_k_pe_cache, attn_metadata)
+
+    def _forward_decode_flashmla(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert kv_c_and_k_pe_cache.numel() > 0
+        assert attn_metadata.decode is not None
+
+        if self.kv_cache_dtype.startswith("fp8"):
+            raise NotImplementedError(
+                "FP8 KV cache is not yet supported by the gLLM FlashMLA "
+                "decode backend."
+            )
+
+        if type(q) is tuple:
+            q = torch.cat(q, dim=-1)
+        assert isinstance(q, torch.Tensor)
+
+        # FlashMLA expects q as (batch, q_len, num_heads, head_dim). Decode
+        # always has q_len == 1 here (one query token per sequence).
+        q = q.unsqueeze(1)
+        q_len = q.shape[1]
+
+        decode_meta = attn_metadata.decode
+
+        # FlashMLA only supports a KV page/block size of 64.
+        page_size = kv_c_and_k_pe_cache.shape[1]
+        assert page_size == _FLASHMLA_PAGE_SIZE, (
+            "FlashMLA decode backend requires page_size == "
+            f"{_FLASHMLA_PAGE_SIZE}, got {page_size}. Launch with "
+            f"--page-size {_FLASHMLA_PAGE_SIZE}."
+        )
+
+        # The tile-scheduler metadata only depends on cache_seqlens and the
+        # head count, so it is identical for every MLA layer within a single
+        # forward step. Compute it once and cache it on the shared decode
+        # metadata object to avoid a redundant kernel launch per layer.
+        flashmla_meta = decode_meta.flashmla_meta
+        if flashmla_meta is None:
+            # num_q_tokens_per_head_k = q_len * num_heads_q // num_heads_k,
+            # with num_heads_k == 1 (MQA over the latent).
+            num_q_tokens_per_head_k = q_len * self.num_heads
+            flashmla_meta = get_mla_metadata(
+                decode_meta.seq_lens,
+                num_q_tokens_per_head_k,
+                1,  # num_heads_k: MQA over the compressed latent
+            )
+            decode_meta.flashmla_meta = flashmla_meta
+        tile_scheduler_metadata, num_splits = flashmla_meta
+
+        o, lse = flash_mla_with_kvcache(
+            q=q,
+            k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # add head dim of 1
+            block_table=decode_meta.block_table,
+            cache_seqlens=decode_meta.seq_lens,
+            head_dim_v=self.kv_lora_rank,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            softmax_scale=self.scale,
+            causal=True,
+        )
+
+        # o:   (B, q_len=1, num_heads, kv_lora_rank) -> (B, num_heads, L)
+        # lse: (B, num_heads, q_len=1)               -> (B, num_heads)
+        return o.squeeze(1), lse.squeeze(-1)
+
+    def _forward_decode_triton(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 

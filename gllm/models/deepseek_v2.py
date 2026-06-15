@@ -397,6 +397,8 @@ class DeepseekV2MLAAttention(Attention):
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             kv_b_proj=self.kv_b_proj,
+            decode_backend=getattr(config, "mla_decode_backend", "triton"),
+            page_size=getattr(config, "page_size", None),
         )
 
     def forward(
