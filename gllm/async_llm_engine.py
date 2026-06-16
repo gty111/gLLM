@@ -10,10 +10,15 @@ from gllm.utils import make_async
 
 class AsyncStream:
 
-    def __init__(self, raw_request: Request):
+    def __init__(self, raw_request: Request, seq=None):
         self._queue: asyncio.Queue = asyncio.Queue()
         self._finished = False
         self._raw_request = raw_request
+        # The owning Sequence, kept so response builders can report accurate
+        # token usage (prompt_len / generated count) and finish_reason once the
+        # stream drains. The engine appends generated ids to this same object,
+        # so it holds the final counts by the time the stream finishes.
+        self.seq = seq
 
     def put(self, item: str):
         if self._finished:
@@ -84,7 +89,7 @@ class PipeAsyncLLM(LLM):
             mm_contents,
             mm_items,
         )
-        stream = AsyncStream(raw_request)
+        stream = AsyncStream(raw_request, seq=seq)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
         await make_async(self.add_requests)(requests=[seq])
