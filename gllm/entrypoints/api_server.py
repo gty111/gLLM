@@ -55,7 +55,8 @@ async def server_info():
 @router.get("/v1/models")
 async def show_available_models():
     models = ModelList(
-        data=[ModelCard(id=llm.model_path, root=llm.model_path, 
+        data=[ModelCard(id=llm.model_path, root=llm.model_path,
+                        max_model_len=llm.model_max_length,
                         permission=[ModelPermission()])]
     )
     return JSONResponse(content=models.model_dump())
