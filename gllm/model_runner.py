@@ -500,6 +500,7 @@ class ModelRunner:
                     add_generation_prompt=True,
                     enable_thinking=self.use_thinking,
                     thinking=self.use_thinking,
+                    tokenize=True,
                 )
             elif self.is_kimi_mm:
                 # Kimi's chat template renders one ``<|media_pad|>`` per image
@@ -544,15 +545,6 @@ class ModelRunner:
             out = out.input_ids
         elif isinstance(out, dict) and "input_ids" in out:
             out = out["input_ids"]
-        elif isinstance(out, str):
-            # Some custom tokenizers (e.g. Kimi-K2.5's tiktoken-based
-            # ``TikTokenTokenizer``) default ``apply_chat_template`` to
-            # ``tokenize=False`` and hand back the *rendered prompt string*
-            # rather than token ids. Encode it here so the chat path yields
-            # ids like every other model. The rendered string already
-            # carries the chat special tokens, so a plain ``encode`` round
-            # -trips to the same ids as ``tokenize=True``.
-            out = self.tokenizer.encode(out)
         return out
 
     def decode(self, token_ids):
