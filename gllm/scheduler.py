@@ -511,7 +511,7 @@ class OverlapScheduler(Scheduler):
                 ipc_package.next_tokens.append(real_token)
 
             is_eos = not seq.ignore_eos and real_token in seq.finish_tokens
-            generated_len = placeholder_pos + 1 - seq.prompt_len
+            generated_len = placeholder_pos + 1 - seq.raw_prompt_len
             is_max_len = generated_len >= seq.output_len
             if seq.computed_prompt and (is_eos or is_max_len):
                 ipc_package.free_ids.append(seq.seq_id)

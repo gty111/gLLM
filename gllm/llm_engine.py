@@ -445,8 +445,8 @@ class LLM:
             pbar.update(num_finish_seqs)
 
         for seq in seqs:
-            seq.prompt = self.model_runner.decode(seq[: seq.prompt_len])
-            seq.output = self.model_runner.decode(seq[seq.prompt_len :])
+            seq.prompt = self.model_runner.decode(seq[: seq.raw_prompt_len])
+            seq.output = self.model_runner.decode(seq[seq.raw_prompt_len :])
 
         return seqs
 
@@ -491,7 +491,7 @@ class LLM:
                 )
             print("\n")
 
-            output_text = self.model_runner.decode(seq[seq.prompt_len :])
+            output_text = self.model_runner.decode(seq[seq.raw_prompt_len :])
 
             if architecture == "ChatGLMModel" and hasattr(
                 self.model_runner.tokenizer, "build_chat_input"
