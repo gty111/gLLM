@@ -226,9 +226,10 @@ class ModelRunner:
         use_thinking: bool,
         maxp,
         maxd,
-        kvthresh,
         minp,
         iterp,
+        init_new_token_ratio,
+        min_new_token_ratio,
         schedule_method: str,
         disable_cuda_graph: bool,
         max_cuda_graph_bs: int,
@@ -267,9 +268,14 @@ class ModelRunner:
         )
         self.maxp = maxp
         self.maxd = maxd
-        self.kvthresh = kvthresh
         self.minp = minp
         self.iterp = iterp
+        # Adaptive KV-cache admission control (see Scheduler). ``init`` is the
+        # starting/relaxed-ceiling fraction of remaining output we reserve for
+        # running decodes; ``min`` is the floor the ratio decays toward when
+        # the system is stable.
+        self.init_new_token_ratio = init_new_token_ratio
+        self.min_new_token_ratio = min_new_token_ratio
         self.schedule_method = schedule_method
         self.sampler = Sampler()
 

@@ -24,10 +24,25 @@ class Scheduler:
         self.minp = model_runner.minp
         self.iterp = model_runner.iterp
         self.page_size = model_runner.page_size
-        self.kvthresh = model_runner.kvthresh
-        self.num_kvthresh_pages = int(
-            self.kvthresh * self.memory_manager.get_num_free_pages()
-        )
+
+        # --- Adaptive KV-cache admission control (SGLang-style) ---
+        # We no longer hold back a *static* page reserve (the old ``kvthresh``).
+        # Instead, before admitting prefill we reserve enough pages for the
+        # *projected growth* of the in-flight decode batch, and we adapt how
+        # conservative that projection is from observed preemptions.
+        #
+        # ``new_token_ratio`` is the fraction of each running seq's *remaining*
+        # output length we assume it will still generate before finishing. It
+        # rises on a preemption event (be conservative -> admit less prefill)
+        # and decays back every tick (relax -> admit more prefill when stable).
+        self.init_new_token_ratio = model_runner.init_new_token_ratio
+        self.min_new_token_ratio = model_runner.min_new_token_ratio
+        self.new_token_ratio = self.init_new_token_ratio
+        self.new_token_ratio_step = 0.05  # bump up on a preemption event
+        self.new_token_ratio_decay = 0.002  # relax per schedule tick
+        # Hard floor so prefill never drains the free list to literally empty
+        # (page allocation within a batch is slightly bursty).
+        self.min_reserve_pages = max(1, self.pp_size)
 
         # seqs to schedule
         self.seqs_to_prefill: deque[Sequence] = deque()
@@ -82,6 +97,62 @@ class Scheduler:
         )
         return num_decode_seqs
 
+    def _seq_reserve_pages(self, seq, ratio):
+        """How many *more* KV pages a single decode seq will likely need.
+
+        Estimated as ``ratio * remaining_output`` tokens (the adaptive
+        ``new_token_ratio`` discounts the worst case), minus whatever still
+        fits in the seq's current partially-filled tail page, rounded up to
+        whole pages. Returns 0 for seqs that are still prefilling or already
+        past their output budget.
+        """
+        if not seq.computed_prompt:
+            return 0
+        remaining = seq.output_len - (len(seq) - seq.raw_prompt_len)
+        if remaining <= 0:
+            return 0
+        est_tokens = int(ratio * remaining)
+        tail_slack = len(seq.page_table) * self.page_size - len(seq)
+        extra = est_tokens - max(0, tail_slack)
+        if extra <= 0:
+            return 0
+        return (extra + self.page_size - 1) // self.page_size
+
+    def _decode_reserve_pages(self):
+        """Pages to hold back from prefill for the in-flight decode batch.
+
+        SGLang-style admission control: a running decode seq keeps emitting
+        tokens until it finishes, crossing a new KV page every ``page_size``
+        steps. If prefill is allowed to consume the whole free pool, those
+        running seqs starve mid-generation and get preempted -- exactly the
+        thrash we want to avoid. So we estimate, per running decode seq, how
+        many *more* pages it will need (scaled by the adaptive
+        ``new_token_ratio``) and keep that many free. A new prefill is only
+        admitted into whatever headroom is left over.
+
+        The running decode population is split across two places at schedule
+        time: ``seqs_to_decode`` (waiting for the next decode step) and
+        ``batch_running`` (already dispatched, in-flight on the PP pipeline /
+        overlap stream). We count both -- deduping by ``seq_id`` since the two
+        never legitimately overlap but timing edges shouldn't double-count --
+        so the reserve reflects the full population even when PP > 1.
+        """
+        ratio = self.new_token_ratio
+        reserve = 0
+        seen = set()
+        for seq in self.seqs_to_decode:
+            if seq.seq_id in seen:
+                continue
+            seen.add(seq.seq_id)
+            reserve += self._seq_reserve_pages(seq, ratio)
+        for batch in self.batch_running:
+            for seq in batch:
+                if seq.seq_id in seen:
+                    continue
+                seen.add(seq.seq_id)
+                reserve += self._seq_reserve_pages(seq, ratio)
+        return max(self.min_reserve_pages, reserve)
+
     def update_num_wait_tokens(self):
         self.num_wait_tokens = sum(
             len(i) - i.computed_token_num for i in self.seqs_to_prefill
@@ -130,12 +201,24 @@ class Scheduler:
         return ipc_package
 
     def check_preempt(self, num_tokens_to_allocate):
-        preempt_seqs = []
-        while (
-            self.get_num_free_pages() < num_tokens_to_allocate
-            and len(self.seqs_to_decode) != 0
+        if (
+            self.get_num_free_pages() >= num_tokens_to_allocate
+            or len(self.seqs_to_decode) == 0
         ):
-            seq_to_preempt = self.seqs_to_decode.popleft()
+            return
+
+        # Victim selection (SGLang-style retract): evict the largest-footprint
+        # decode seqs first so each preemption reclaims the most pages -> fewer
+        # preemptions -> less recompute churn. Only pay the O(n log n) sort on
+        # the rare ticks where we actually have to preempt.
+        victims = sorted(
+            self.seqs_to_decode, key=lambda s: len(s.page_table), reverse=True
+        )
+        preempt_seqs = []
+        for seq_to_preempt in victims:
+            if self.get_num_free_pages() >= num_tokens_to_allocate:
+                break
+            self.seqs_to_decode.remove(seq_to_preempt)
             self.model_runner.free(seq_to_preempt)
             seq_to_preempt.preempt()
             # Don't notify followers here: the seq is being re-queued as a
@@ -147,7 +230,18 @@ class Scheduler:
             # explicit free + re-register round trip.
             preempt_seqs.append(seq_to_preempt)
 
+        # Re-queue preempted seqs at the FRONT of the wait queue so they resume
+        # ahead of brand-new requests (they've already done work). The adaptive
+        # reserve -- not queue position -- is what stops them from being
+        # instantly re-admitted and preempted again.
         self.seqs_to_prefill.extendleft(preempt_seqs)
+
+        if preempt_seqs:
+            # Change 2: a preemption means we under-reserved. Bump the ratio so
+            # the next prefill admission backs off (decayed back when stable).
+            self.new_token_ratio = min(
+                1.0, self.new_token_ratio + self.new_token_ratio_step
+            )
 
         self.num_preempt_seqs += len(preempt_seqs)
         if (
@@ -164,8 +258,8 @@ class Scheduler:
                 # batch happened to overshoot the doubling threshold by.
                 rounded = int(self.num_preempt_seqs) // 10 * 10
                 logger.warning(
-                    f"#Preempted seqs: >={rounded}, "
-                    "Try increase --kvthresh or the performance is poor!"
+                    f"#Preempted seqs: >={rounded}; KV cache under pressure "
+                    "(reduce --maxd or request output lengths if this persists)."
                 )
 
     def check_abort_seqs_list(self, seqs: deque, ipc_package: IPCPackage):
@@ -233,7 +327,9 @@ class Scheduler:
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
 
-    def schedule_prefill_batch(self, prefill_token_budget, max_seqs=None):
+    def schedule_prefill_batch(
+        self, prefill_token_budget, max_seqs=None, reserve_pages=0
+    ):
         prefill_batch: List[Sequence] = []
         unfinish_prefill_seqs = deque()
         # Encoder-disaggregation overlap (design §6.2): seqs whose next chunk is
@@ -312,12 +408,34 @@ class Scheduler:
             self.memory_manager.allocate_ssm_slot(seq)
             if prefill_avail <= prefill_token_budget:
                 seq.to_compute_token_num = prefill_avail
-                prefill_batched_token_nums += seq.to_compute_token_num
-                prefill_token_budget -= seq.to_compute_token_num
             else:
-                prefill_batched_token_nums += prefill_token_budget
                 seq.to_compute_token_num = prefill_token_budget
-                prefill_token_budget = 0
+            # Page guard: the prefill ``token`` budget only accounts for the
+            # *uncached tail* a seq computes this step, but ``pre_allocate_page``
+            # below grabs a KV page for every NEW page boundary the seq crosses
+            # -- and with prefix caching the seq already grabbed its whole cached
+            # prefix in ``pre_allocate_computed_page`` above (pages that cost
+            # zero compute tokens). So a high cache-hit-rate workload can pass
+            # the token-budget check while collectively demanding far more pages
+            # than exist, and ``IDAllocator.allocate`` then asserts on an empty
+            # free list mid-batch. Stop admitting before that happens: compute
+            # the pages this seq still needs and re-queue it (unmodified) when
+            # the free pool -- minus the decode reserve -- can't cover them.
+            pages_have = len(seq.page_table)
+            pages_needed_total = (
+                seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1
+            ) // self.page_size
+            pages_to_alloc = max(0, pages_needed_total - pages_have)
+            if pages_to_alloc > self.get_num_free_pages() - reserve_pages:
+                # Undo the per-step bookkeeping and park this seq for a later
+                # round. Its cached-prefix pages stay in ``page_table`` (a
+                # sibling in this batch may share them); they are reclaimed
+                # normally when the seq eventually runs or is freed.
+                seq.to_compute_token_num = 0
+                self.seqs_to_prefill.appendleft(seq)
+                break
+            prefill_batched_token_nums += seq.to_compute_token_num
+            prefill_token_budget -= seq.to_compute_token_num
             self.memory_manager.pre_allocate_page([seq])
             prefill_batch.append(seq)
             if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
@@ -348,6 +466,11 @@ class Scheduler:
     def chunked_prefill(self):
         num_tokens_budget = self.maxp
 
+        # Pages to keep free for the in-flight decode batch's projected growth
+        # (computed over the full running decode population before we pop any
+        # of it into this tick's decode batch).
+        reserve_pages = self._decode_reserve_pages()
+
         # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
         decode_token_budget = self.get_balanced_decode_token_budget(
@@ -355,25 +478,44 @@ class Scheduler:
         )
         decode_token_budget = min(decode_token_budget, num_tokens_budget)
 
-        if self.schedule_method == "split_pd" and (
+        # split_pd prioritizes draining the prefill queue: when prefills are
+        # waiting and we still hold the decode reserve, skip decode this tick.
+        prefer_prefill = self.schedule_method == "split_pd" and (
             len(self.seqs_to_prefill) != 0
-            and self.get_num_free_pages() >= self.num_kvthresh_pages
-        ):
+            and self.get_num_free_pages() >= reserve_pages
+        )
+        if prefer_prefill:
             decode_token_budget = 0
 
         decode_batch = self.schedule_decode_batch(decode_token_budget)
         num_tokens_budget -= len(decode_batch)
 
-        # prefill
+        # prefill: only admit into the page headroom left *after* reserving for
+        # the in-flight decode batch's projected growth (anti-preemption).
         num_tokens_budget = min(
             num_tokens_budget,
-            self.page_size
-            * max(self.get_num_free_pages() - self.num_kvthresh_pages, 0),
+            self.page_size * max(self.get_num_free_pages() - reserve_pages, 0),
         )
 
         prefill_batch, prefill_batched_token_nums = self.schedule_prefill_batch(
-            num_tokens_budget, max_seqs=self.maxd - len(decode_batch)
+            num_tokens_budget,
+            max_seqs=self.maxd - len(decode_batch),
+            reserve_pages=reserve_pages,
         )
+
+        # Deadlock guard: in split_pd we zeroed the decode budget to favor
+        # prefill, but the free headroom (free - reserve) may be too small to
+        # actually admit the next waiting seq's pages. That leaves *both* halves
+        # empty -> the engine emits no batch and stalls forever ("decode stuck
+        # at 0" while prefill piles up). If that happens, run the decode pass we
+        # skipped so running seqs keep generating (and freeing pages), which in
+        # turn unblocks prefill on a later tick.
+        if prefer_prefill and not prefill_batch and not decode_batch:
+            fallback_budget = min(
+                self.get_balanced_decode_token_budget(num_total_decode_seqs),
+                self.maxp,
+            )
+            decode_batch = self.schedule_decode_batch(fallback_budget)
 
         # Every TP/PP rank runs an identical copy of the scheduler, so logging
         # the batch stats on all of them floods the console with N duplicate
@@ -397,19 +539,32 @@ class Scheduler:
                 logger.info(log_info)
             else:
                 logger.info(log_info)
+        # Change 2: relax the reserve a touch each tick; preemptions push it
+        # back up. Keeps us from being permanently over-conservative.
+        self.new_token_ratio = max(
+            self.min_new_token_ratio,
+            self.new_token_ratio - self.new_token_ratio_decay,
+        )
         # first decode, then prefill
         return decode_batch + prefill_batch
 
     def token_throttling(self):
+        # Pages to keep free for the in-flight decode batch (anti-preemption).
+        reserve_pages = self._decode_reserve_pages()
         # prefill
         prefill_token_budget = self.page_size * max(
-            self.get_num_free_pages() - self.num_kvthresh_pages, 0
+            self.get_num_free_pages() - reserve_pages, 0
         )
         if get_world_size() > 1 and prefill_token_budget != 0:
             self.update_num_wait_tokens()
             free_ratio = self.memory_manager.get_memory_free()
-            # free_ratio in [kvthresh,1] | prefill_ratio in [0,1]
-            prefill_ratio = (free_ratio - self.kvthresh) / (1 - self.kvthresh)
+            # Fraction of the cache held back for in-flight decode growth
+            # (replaces the old static kvthresh in the ramp formula).
+            reserve_ratio = min(
+                0.99, reserve_pages / max(1, self.memory_manager.num_pages)
+            )
+            # free_ratio in [reserve_ratio,1] | prefill_ratio in [0,1]
+            prefill_ratio = (free_ratio - reserve_ratio) / (1 - reserve_ratio)
             prefill_ratio = max(prefill_ratio, 0)
             prefill_token_budget = min(
                 round(prefill_ratio * self.maxp), prefill_token_budget
@@ -424,7 +579,7 @@ class Scheduler:
             prefill_token_budget = min(self.maxp, prefill_token_budget)
 
         prefill_batch, prefill_batched_token_nums = self.schedule_prefill_batch(
-            prefill_token_budget, max_seqs=self.maxd
+            prefill_token_budget, max_seqs=self.maxd, reserve_pages=reserve_pages
         )
 
         # decode
@@ -464,6 +619,11 @@ class Scheduler:
                 logger.info(log_info)
             else:
                 logger.info(log_info)
+        # Change 2: relax the reserve a touch each tick (see chunked_prefill).
+        self.new_token_ratio = max(
+            self.min_new_token_ratio,
+            self.new_token_ratio - self.new_token_ratio_decay,
+        )
         # first decode, then prefill
         return decode_batch + prefill_batch
 

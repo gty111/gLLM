@@ -121,7 +121,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--maxp", type=int, default=8192)
     p.add_argument("--minp", type=int, default=32)
     p.add_argument("--iterp", type=int, default=8)
-    p.add_argument("--kvthresh", type=float, default=0.05)
+    p.add_argument("--init-new-token-ratio", type=float, default=0.7)
+    p.add_argument("--min-new-token-ratio", type=float, default=0.1)
     p.add_argument(
         "--schedule-method",
         choices=["split_pd", "chunked_prefill", "token_throttling"],
@@ -189,7 +190,8 @@ def main():
         maxp=args.maxp,
         minp=args.minp,
         iterp=args.iterp,
-        kvthresh=args.kvthresh,
+        init_new_token_ratio=args.init_new_token_ratio,
+        min_new_token_ratio=args.min_new_token_ratio,
         enable_prefix_caching=args.enable_prefix_caching,
         pp_size=1,
         tp_size=args.tp,
