@@ -1373,6 +1373,21 @@ class ModelRunner:
             return None
         return self._disagg_ready_len(st)
 
+    def register_decode_page_hash(self, seq: Sequence, pos: int) -> None:
+        """Register the prefix-cache page hash for a decode boundary the seq
+        just completed with a *real* (finalized) token at ``seq.token_ids[pos]``.
+
+        Called from the scheduler's output-finalization hooks
+        (``Scheduler.process_output`` after appending the real token, and
+        ``OverlapScheduler.process_output_finalize`` after overwriting the
+        placeholder). Keeping the trigger here -- rather than inside
+        ``MemoryManager.pre_allocate_page`` -- guarantees the hash is only ever
+        computed over real tokens, never an unfinalized overlap placeholder
+        (see ``docs/prefix_cache_overlap_poisoning.md``). No-op for caches
+        without prefix support.
+        """
+        self.memory_manager.register_decode_boundary(seq, pos)
+
     def free(self, seq: Sequence):
         self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():

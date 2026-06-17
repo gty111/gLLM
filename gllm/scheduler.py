@@ -185,6 +185,11 @@ class Scheduler:
                 ipc_package.act_schedule_ids.append(seq.seq_id)
                 ipc_package.next_tokens.append(next_tokens[idx])
                 seq.append(next_tokens[idx])
+                # The token is real (non-overlap appends immediately), so it is
+                # safe to register the prefix-cache hash for any page boundary
+                # it just completed. Driven from here -- not pre_allocate_page --
+                # so a placeholder id can never be hashed (see model_runner).
+                self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
             if seq.is_finish:
                 ipc_package.free_ids.append(seq.seq_id)
                 # Mirror the free to follower-side state cleanup. ``free_ids``
@@ -665,6 +670,13 @@ class OverlapScheduler(Scheduler):
 
             real_token = next_tokens[batch_idx]
             seq.token_ids[placeholder_pos] = real_token
+
+            # Now that the placeholder holds the real sampled token, register
+            # the prefix-cache hash for any page boundary it completed. Decode
+            # boundary registration lives only here / in process_output (never
+            # in pre_allocate_page) so it is always computed over real tokens
+            # (see docs/prefix_cache_overlap_poisoning.md).
+            self.model_runner.register_decode_page_hash(seq, placeholder_pos)
 
             if seq.computed_prompt:
                 ipc_package.act_schedule_ids.append(seq.seq_id)
