@@ -237,6 +237,18 @@ class DeepseekV2Attention(Attention):
             for k, v in self.rope_scaling.items()
             if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
         }
+        # DeepSeek/Kimi YaRN: the cos/sin amplitude is the ratio
+        # ``yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor,
+        # mscale_all_dim)`` (see YaRNScalingRotaryEmbedding). The softmax
+        # ``self.scaling`` above already carries ``mscale_all_dim``'s term, so
+        # the rope must use the ratio form -- not the generic single-term
+        # ``yarn_get_mscale(factor)`` -- otherwise the RoPE-part attention
+        # score is doubled.
+        if self.rope_scaling:
+            extra_kwargs["mscale"] = float(self.rope_scaling.get("mscale", 1))
+            extra_kwargs["mscale_all_dim"] = float(
+                self.rope_scaling.get("mscale_all_dim", 0)
+            )
 
         self.rotary_emb = YaRNScalingRotaryEmbedding(
             self.qk_rope_head_dim,
@@ -381,6 +393,18 @@ class DeepseekV2MLAAttention(Attention):
             for k, v in self.rope_scaling.items()
             if k in ("extrapolation_factor", "attn_factor", "beta_fast", "beta_slow")
         }
+        # DeepSeek/Kimi YaRN: the cos/sin amplitude is the ratio
+        # ``yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor,
+        # mscale_all_dim)`` (see YaRNScalingRotaryEmbedding). The softmax
+        # ``self.scaling`` above already carries ``mscale_all_dim``'s term, so
+        # the rope must use the ratio form -- not the generic single-term
+        # ``yarn_get_mscale(factor)`` -- otherwise the RoPE-part attention
+        # score is doubled.
+        if self.rope_scaling:
+            extra_kwargs["mscale"] = float(self.rope_scaling.get("mscale", 1))
+            extra_kwargs["mscale_all_dim"] = float(
+                self.rope_scaling.get("mscale_all_dim", 0)
+            )
 
         self.rotary_emb = YaRNScalingRotaryEmbedding(
             self.qk_rope_head_dim,

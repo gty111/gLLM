@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from sgl_kernel.scalar_type import scalar_types
 
 from gllm.dist_utils import (
     get_ep_rank,
@@ -9,6 +10,8 @@ from gllm.dist_utils import (
     is_use_ep,
     tensor_model_parallel_all_reduce,
 )
+from gllm import _custom_ops as ops
+from gllm.layers.moe.moe_align_block_size import moe_align_block_size
 from gllm.layers.moe.fused_moe_triton.fused_moe import fused_experts
 from gllm.layers.moe.topk import select_experts
 from gllm.utils import set_weight_attrs
@@ -194,6 +197,355 @@ class Fp8MoEMethod(FusedMoEMethod):
         )
 
 
+def _get_scale_perms():
+    scale_perm = []
+    for i in range(8):
+        scale_perm.extend([i + 8 * j for j in range(8)])
+    scale_perm_single = []
+    for i in range(4):
+        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    return scale_perm, scale_perm_single
+
+
+def _marlin_permute_scales(
+    s: torch.Tensor,
+    size_k: int,
+    size_n: int,
+    group_size: int,
+) -> torch.Tensor:
+    scale_perm, scale_perm_single = _get_scale_perms()
+    if group_size < size_k and group_size != -1:
+        s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
+    else:
+        s = s.reshape((-1, len(scale_perm_single)))[:, scale_perm_single]
+    s = s.reshape((-1, size_n)).contiguous()
+    return s
+
+
+class Int4MarlinMoEMethod(FusedMoEMethod):
+    """INT4 routed-expert MoE via sgl-kernel marlin fused gemm.
+
+    Expected checkpoint format per expert:
+    - gate/up/down ``weight_packed``: int32 packed (8x int4 per int32)
+    - gate/up/down ``weight_scale``: bf16 group scales (group_size=32)
+    """
+
+    def __init__(self, quant_config):
+        super().__init__()
+        self.quant_config = quant_config
+        self.num_bits = int(self.quant_config.get("num_bits", 4))
+        if self.num_bits != 4:
+            raise ValueError(f"int4_moe only supports 4 bits, got {self.num_bits}")
+        self.pack_factor = 32 // self.num_bits
+        self.group_size = int(self.quant_config.get("group_size", 32))
+        self.quant_type_id = scalar_types.uint4b8.id
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        # Pre-repack layout (matches checkpoint names):
+        # w13: [E, 2I, H/8], w2: [E, H, I/8]
+        if hidden_size % self.pack_factor != 0:
+            raise ValueError(
+                f"hidden_size={hidden_size} must be divisible by pack_factor={self.pack_factor}"
+            )
+        if intermediate_size_per_partition % self.pack_factor != 0:
+            raise ValueError(
+                "intermediate_size_per_partition must be divisible by "
+                f"pack_factor={self.pack_factor}, got {intermediate_size_per_partition}"
+            )
+        if hidden_size % self.group_size != 0:
+            raise ValueError(
+                f"hidden_size={hidden_size} must be divisible by group_size={self.group_size}"
+            )
+        if intermediate_size_per_partition % self.group_size != 0:
+            raise ValueError(
+                "intermediate_size_per_partition must be divisible by "
+                f"group_size={self.group_size}, got {intermediate_size_per_partition}"
+            )
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_packed", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_packed", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        layer.register_buffer(
+            "workspace",
+            torch.zeros(1, dtype=torch.int32),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "w13_g_idx",
+            torch.empty((num_experts, 0), dtype=torch.int32),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "w2_g_idx",
+            torch.empty((num_experts, 0), dtype=torch.int32),
+            persistent=False,
+        )
+        layer._int4_marlin_ready = False
+
+    @staticmethod
+    def _pick_block_size_m(num_tokens: int, num_experts: int, topk: int) -> int:
+        block_size_m = 64
+        for cand in (8, 16, 32, 48, 64):
+            if num_tokens * topk / num_experts / cand < 0.9:
+                block_size_m = cand
+                break
+        return block_size_m
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_int4_marlin_ready", False):
+            return
+
+        num_experts = layer.w13_weight_packed.shape[0]
+        device = layer.w13_weight_packed.device
+        perm = torch.empty(0, dtype=torch.int, device=device)
+
+        marlin_w13 = []
+        marlin_w2 = []
+        marlin_s13 = []
+        marlin_s2 = []
+
+        for e in range(num_experts):
+            w13_e = layer.w13_weight_packed[e]
+            two_i = w13_e.shape[0]
+            i = two_i // 2
+            h = w13_e.shape[1] * self.pack_factor
+
+            gate_q = w13_e[:i].T.contiguous()
+            up_q = w13_e[i:].T.contiguous()
+            gate_rep = ops.gptq_marlin_repack(
+                b_q_weight=gate_q,
+                perm=perm,
+                size_k=h,
+                size_n=i,
+                num_bits=self.num_bits,
+            )
+            up_rep = ops.gptq_marlin_repack(
+                b_q_weight=up_q,
+                perm=perm,
+                size_k=h,
+                size_n=i,
+                num_bits=self.num_bits,
+            )
+            marlin_w13.append(torch.cat([gate_rep, up_rep], dim=1).contiguous())
+
+            s13_e = layer.w13_weight_scale[e].T.contiguous()
+            marlin_s13.append(
+                _marlin_permute_scales(s13_e, size_k=h, size_n=two_i, group_size=self.group_size)
+            )
+
+            w2_e = layer.w2_weight_packed[e]
+            h2 = w2_e.shape[0]
+            i2 = w2_e.shape[1] * self.pack_factor
+            w2_q = w2_e.T.contiguous()
+            w2_rep = ops.gptq_marlin_repack(
+                b_q_weight=w2_q,
+                perm=perm,
+                size_k=i2,
+                size_n=h2,
+                num_bits=self.num_bits,
+            )
+            marlin_w2.append(w2_rep)
+
+            s2_e = layer.w2_weight_scale[e].T.contiguous()
+            marlin_s2.append(
+                _marlin_permute_scales(s2_e, size_k=i2, size_n=h2, group_size=self.group_size)
+            )
+
+        layer.w13_weight_packed.data = torch.stack(marlin_w13, dim=0).contiguous()
+        layer.w2_weight_packed.data = torch.stack(marlin_w2, dim=0).contiguous()
+        layer.w13_weight_scale.data = torch.stack(marlin_s13, dim=0).contiguous()
+        layer.w2_weight_scale.data = torch.stack(marlin_s2, dim=0).contiguous()
+
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        layer.workspace = torch.zeros(sms * 4, dtype=torch.int32, device=device)
+        layer._int4_marlin_ready = True
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if activation != "silu":
+            raise ValueError(f"int4_moe only supports silu activation, got {activation}")
+
+        self.process_weights_after_loading(layer)
+
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
+
+        m, hidden = x.shape
+        if global_num_experts == -1:
+            global_num_experts = layer.w13_weight_packed.shape[0]
+        block_size_m = self._pick_block_size_m(
+            m,
+            max(global_num_experts, 1),
+            top_k,
+        )
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+        )
+
+        inter_size = layer.w2_weight_packed.shape[1] * 16
+        gate_up = torch.empty(
+            (m * top_k, 2 * inter_size),
+            dtype=x.dtype,
+            device=x.device,
+        )
+
+        gate_up = ops.moe_wna16_marlin_gemm(
+            a=x,
+            c_or_none=gate_up,
+            b_q_weight=layer.w13_weight_packed,
+            b_bias_or_none=None,
+            b_scales=layer.w13_weight_scale,
+            global_scale_or_none=None,
+            b_zeros_or_none=None,
+            g_idx_or_none=layer.w13_g_idx,
+            perm_or_none=None,
+            workspace=layer.workspace,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            topk_weights=topk_weights,
+            moe_block_size=block_size_m,
+            top_k=top_k,
+            mul_topk_weights=apply_router_weight_on_input,
+            is_ep=expert_map is not None,
+            b_q_type_id=self.quant_type_id,
+            size_m=m,
+            size_n=2 * inter_size,
+            size_k=hidden,
+            is_k_full=True,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )
+
+        act = torch.empty((m * top_k, inter_size), dtype=x.dtype, device=x.device)
+        ops.silu_and_mul(act, gate_up.view(-1, 2 * inter_size))
+
+        # Under EP each rank only owns a slice of experts, so the Marlin GEMM
+        # writes output rows only for token-blocks routed to local experts and
+        # leaves the rest untouched. ``moe_sum`` below then sums ``top_k`` rows
+        # per token, so any non-local row must be a hard zero rather than the
+        # uninitialized contents of ``torch.empty``. Mirror SGLang's reference
+        # (``intermediate_cache3.zero_()`` when ``expert_map is not None``).
+        if expert_map is not None:
+            down = torch.zeros((m * top_k, hidden), dtype=x.dtype, device=x.device)
+        else:
+            down = torch.empty((m * top_k, hidden), dtype=x.dtype, device=x.device)
+        down = ops.moe_wna16_marlin_gemm(
+            a=act,
+            c_or_none=down,
+            b_q_weight=layer.w2_weight_packed,
+            b_bias_or_none=None,
+            b_scales=layer.w2_weight_scale,
+            global_scale_or_none=None,
+            b_zeros_or_none=None,
+            g_idx_or_none=layer.w2_g_idx,
+            perm_or_none=None,
+            workspace=layer.workspace,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            topk_weights=topk_weights,
+            moe_block_size=block_size_m,
+            top_k=1,
+            mul_topk_weights=not apply_router_weight_on_input,
+            is_ep=expert_map is not None,
+            b_q_type_id=self.quant_type_id,
+            size_m=m * top_k,
+            size_n=hidden,
+            size_k=inter_size,
+            is_k_full=True,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )
+
+        out = torch.empty_like(x)
+        ops.moe_sum(down.view(m, top_k, hidden), out)
+        return out
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -293,6 +645,8 @@ class FusedMoE(torch.nn.Module):
         elif self.quant_config["quant_method"] == "fp8":
             assert "weight_block_size" in self.quant_config
             return Fp8MoEMethod(self.quant_config)
+        elif self.quant_config["quant_method"] == "int4_moe":
+            return Int4MarlinMoEMethod(self.quant_config)
         else:
             raise Exception(
                 f"gLLM do not support quant_method {self.quant_config['quant_method']}"

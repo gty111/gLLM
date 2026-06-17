@@ -14,6 +14,7 @@ An Efficient and Versatile Inference Engine for Distributed LLM Serving
 gLLM is an efficient and versatile inference engine for distributed LLM serving. It supports a wide range of models (**dense**, **MoE**, **multimodal/vision-language**, and **hybrid-attention** architectures from HuggingFace) and deployment scenarios (**offline/online inference and interactive chat**). Under the hood, gLLM integrates features like **continuous batching**, **paged attention**, **chunked prefill**, **prefix caching**, **cuda graph**, **token throttling**, **pipeline parallelism**, **expert parallelism** and **tensor parallelism**, delivering **equivalent or superior** inference speed compared to mainstream inference engines while keeping a **minimal** code base. You can also see gLLM as an LLM inference playground for experiments or academic research.
 
 *Latest News* :fire:
+- [2026/06/15]: Kimi K2.5, K2.6 and K2.7-Code are supported — including vision (image + video) input :tada:
 - [2026/06/05]: [Encoder disaggregation](docs/encoder_disaggregation_usage.md) is supported, decoupling the multimodal encoder from the LLM for better resource utilization :rocket:
 - [2026/05/27]: Qwen3.5/3.6 is supported — dense, MoE, VL, and FP8 :tada:
 
@@ -126,7 +127,7 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 ## Supported Models
 
-- Kimi Series: Moonlight, K2-Base, K2-Instruct
+- Kimi Series: K2.7-Code, K2.6, K2.5, K2-Instruct, K2-Base, Moonlight
 - DeepSeek Series: DeepSeek R1, DeepSeek V3, DeepSeek V2
 - Qwen Series: Qwen3.6, Qwen3.5, Qwen3 VL, Qwen3, Qwen2.5 VL, Qwen2.5, Qwen2
 - Llama Series: Llama3.2, Llama3.1, Llama3, Llama2 and deepseek-coder
@@ -135,7 +136,8 @@ python benchmarks/evaluate_MMLU_pro.py --model $MODEL
 
 ## Supported Quantization Methods
 
-- fp8
+- fp8 (E4M3 W8A8; block-wise or per-tensor weight scales, dynamic/static activation; linear + MoE; requires device capability >= 8.9)
+- int4 (compressed-tensors pack-quantized, routed-expert MoE)
 
 ## Roadmap
 

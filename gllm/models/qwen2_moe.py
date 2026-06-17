@@ -193,4 +193,3 @@ class Qwen2MoeForCausalLM(Qwen2ForCausalLM):
         # between the two groups is not load-bearing, but keeping experts up
         # front documents that the MoE block is the specialization.
         return self.expert_weight_rules() + super().weight_rules()
-
