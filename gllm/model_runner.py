@@ -650,8 +650,11 @@ class ModelRunner:
                     "scheduler invariant violated: decode seqs must precede "
                     "prefill seqs within a batch"
                 )
-                embedding_info = self.embedding_cache[seq.seq_id]
                 if self.uses_mrope:
+                    # mrope (Qwen-VL): decode positions are extrapolated from
+                    # the prefill-time ``mrope_position_delta`` stashed in the
+                    # embedding cache, so the entry must exist here.
+                    embedding_info = self.embedding_cache[seq.seq_id]
                     position = MRotaryEmbedding.get_next_input_positions(
                         embedding_info.mrope_position_delta,
                         seq.computed_token_num,
@@ -663,7 +666,12 @@ class ModelRunner:
                     # caller (``set_mrope_position`` is skipped for Kimi; the
                     # real positions come from ``cal_and_set_input``), but we
                     # still append a correctly-shaped tensor to keep the
-                    # downstream ``torch.concat`` happy.
+                    # downstream ``torch.concat`` happy. We deliberately do NOT
+                    # read ``embedding_cache`` here: a Kimi decode seq does not
+                    # need its prefill embedding (positions are a plain
+                    # ``arange`` and the row is re-embedded by the decode fixup),
+                    # and a text-only prompt may never have created an entry --
+                    # touching it would raise ``KeyError`` and crash the engine.
                     batch_positions.append(
                         torch.arange(
                             seq.computed_token_num, seq.seq_len, device="cpu"
