@@ -226,9 +226,10 @@ class ModelRunner:
         use_thinking: bool,
         maxp,
         maxd,
-        kvthresh,
         minp,
         iterp,
+        init_new_token_ratio,
+        min_new_token_ratio,
         schedule_method: str,
         disable_cuda_graph: bool,
         max_cuda_graph_bs: int,
@@ -267,9 +268,14 @@ class ModelRunner:
         )
         self.maxp = maxp
         self.maxd = maxd
-        self.kvthresh = kvthresh
         self.minp = minp
         self.iterp = iterp
+        # Adaptive KV-cache admission control (see Scheduler). ``init`` is the
+        # starting/relaxed-ceiling fraction of remaining output we reserve for
+        # running decodes; ``min`` is the floor the ratio decays toward when
+        # the system is stable.
+        self.init_new_token_ratio = init_new_token_ratio
+        self.min_new_token_ratio = min_new_token_ratio
         self.schedule_method = schedule_method
         self.sampler = Sampler()
 
@@ -1366,6 +1372,21 @@ class ModelRunner:
         if st is None:
             return None
         return self._disagg_ready_len(st)
+
+    def register_decode_page_hash(self, seq: Sequence, pos: int) -> None:
+        """Register the prefix-cache page hash for a decode boundary the seq
+        just completed with a *real* (finalized) token at ``seq.token_ids[pos]``.
+
+        Called from the scheduler's output-finalization hooks
+        (``Scheduler.process_output`` after appending the real token, and
+        ``OverlapScheduler.process_output_finalize`` after overwriting the
+        placeholder). Keeping the trigger here -- rather than inside
+        ``MemoryManager.pre_allocate_page`` -- guarantees the hash is only ever
+        computed over real tokens, never an unfinalized overlap placeholder
+        (see ``docs/prefix_cache_overlap_poisoning.md``). No-op for caches
+        without prefix support.
+        """
+        self.memory_manager.register_decode_boundary(seq, pos)
 
     def free(self, seq: Sequence):
         self.memory_manager.free(seq)

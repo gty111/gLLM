@@ -315,10 +315,18 @@ if __name__ == "__main__":
         default=8,
     )
     parser.add_argument(
-        "--kvthresh",
+        "--init-new-token-ratio",
         type=float,
-        help="KV cache threshold for prefill operations (Token Throttling)",
-        default=0.05,
+        help="Initial/ceiling fraction of remaining output length reserved for "
+        "in-flight decodes (adaptive KV admission control)",
+        default=0.7,
+    )
+    parser.add_argument(
+        "--min-new-token-ratio",
+        type=float,
+        help="Floor the new-token-ratio decays toward when the system is stable "
+        "(adaptive KV admission control)",
+        default=0.1,
     )
     parser.add_argument(
         "--schedule-method",
@@ -367,7 +375,8 @@ if __name__ == "__main__":
         maxp=args.maxp,
         minp=args.minp,
         iterp=args.iterp,
-        kvthresh=args.kvthresh,
+        init_new_token_ratio=args.init_new_token_ratio,
+        min_new_token_ratio=args.min_new_token_ratio,
         enable_prefix_caching=args.enable_prefix_caching,
         pp_size=args.pp,
         tp_size=args.tp,

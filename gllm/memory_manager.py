@@ -544,6 +544,10 @@ class MemoryManager:
             for _ in range(num_page):
                 seq.page_table.append(self.segment.allocate())
 
+    def register_decode_boundary(self, seq: Sequence, pos: int) -> None:
+        """No-op without a prefix cache; overridden by ``PrefixMemoryManager``."""
+        return
+
     def free(self, seq: Sequence):
         for page_num in seq.page_table:
             self.segment.free(page_num)
@@ -867,13 +871,33 @@ class PrefixMemoryManager(MemoryManager):
         # No usable boundary snapshot: scheduler allocates a fresh (zeroed)
         # working slot and the seq recomputes the whole prompt from h_0.
 
+    def register_decode_boundary(self, seq: Sequence, pos: int) -> None:
+        """Register the prefix-cache hash for the page completed by the real
+        token now at ``seq.token_ids[pos]`` (no-op unless ``pos`` lands on a
+        page boundary).
+
+        This is the decode-stage counterpart to the prefill-time cacheable
+        ``allocate(seq, n_tokens)``. It is intentionally **decoupled from
+        page allocation** (``pre_allocate_page``) and driven instead from the
+        scheduler's output-finalization hooks (``process_output`` /
+        ``process_output_finalize`` via ``ModelRunner.register_decode_page_hash``)
+        so it only ever runs once ``token_ids[pos]`` holds the *real* sampled
+        token. Under overlap scheduling the freshly scheduled decode token is a
+        negative placeholder until finalized; registering at allocation time
+        would hash the placeholder id and poison the cache (see
+        ``docs/prefix_cache_overlap_poisoning.md``).
+        """
+        n = pos + 1
+        if n % self.page_size != 0:
+            return
+        page_idx = n // self.page_size - 1
+        # The seq may have been preempted (page_table reset to []) between the
+        # forward that filled this page and finalize; only register a live page.
+        if 0 <= page_idx < len(seq.page_table):
+            self.segment.update(seq, n, seq.page_table[page_idx])
+
     def pre_allocate_page(self, seqs: List[Sequence]):
         for seq in seqs:
-            # Update hash of the newly-generated page boundary in decode
-            # stage. Same logic as the original implementation, just using
-            # the configured key function.
-            if seq.computed_prompt and len(seq) % self.page_size == 0:
-                self.segment.update(seq, len(seq), seq.page_table[-1])
             len_page_table = len(seq.page_table)
             num_page = (
                 seq.seq_len + self.page_size - 1
