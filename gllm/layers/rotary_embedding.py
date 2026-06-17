@@ -323,14 +323,40 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         attn_factor: float = 1,
         beta_fast: int = 32,
         beta_slow: int = 1,
+        mscale: Optional[float] = None,
+        mscale_all_dim: Optional[float] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
-        # Get n-d magnitude scaling corrected for interpolation
-        self.mscale = float(yarn_get_mscale(self.scaling_factor) * attn_factor)
+        # Get n-d magnitude scaling corrected for interpolation.
+        #
+        # Two YaRN conventions for the cos/sin amplitude (``mscale``):
+        #
+        # * Generic YaRN (Qwen et al.): a single ``yarn_get_mscale(factor)``
+        #   term, baked into cos/sin AND nowhere else.
+        # * DeepSeek-V2/V3 / Kimi YaRN: the amplitude is the *ratio*
+        #   ``yarn_get_mscale(factor, mscale) / yarn_get_mscale(factor,
+        #   mscale_all_dim)``. The attention softmax scale separately carries
+        #   ``yarn_get_mscale(factor, mscale_all_dim) ** 2`` (applied by the
+        #   model). When ``mscale == mscale_all_dim`` the cos/sin ratio is 1.0,
+        #   so ALL of the YaRN magnitude correction flows through the softmax
+        #   scale -- baking ``yarn_get_mscale(factor)`` into cos/sin as well
+        #   would double the RoPE-part attention score (it enters q_pe and
+        #   k_pe, i.e. squared) and over-weight positional information.
+        #
+        # Pass ``mscale`` + ``mscale_all_dim`` to select the DeepSeek ratio
+        # form; leave them ``None`` for the generic single-term form.
+        if mscale is not None and mscale_all_dim is not None:
+            self.mscale = float(
+                yarn_get_mscale(self.scaling_factor, float(mscale))
+                / yarn_get_mscale(self.scaling_factor, float(mscale_all_dim))
+                * attn_factor
+            )
+        else:
+            self.mscale = float(yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style
         )
