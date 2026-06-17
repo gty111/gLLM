@@ -148,7 +148,17 @@ async def evaluate(subjects):
     print("assigned subjects", subjects)
     category_record = {"total": {"#correct": 0, "#wrong": 0}}
 
-    print(f"Sending requests ...")
+    # Cap in-flight requests so we don't dump all 1400 prompts onto the server
+    # at once. A bounded client-side concurrency keeps the engine's running set
+    # small enough that its KV cache / scheduler stays in a healthy regime
+    # (no page-exhaustion throttling) and makes the run reproducible.
+    sem = asyncio.Semaphore(args.concurrency)
+
+    async def bounded_request(each):
+        async with sem:
+            return await single_request(api_url, each, dev_df, pbar)
+
+    print(f"Sending requests (concurrency={args.concurrency}) ...")
     pbar = tqdm()
     tasks = []
     test_data_total = []
@@ -156,7 +166,7 @@ async def evaluate(subjects):
         test_data = test_df[subject][: args.num_per_sub]
         test_data_total.extend(test_data)
         for each in test_data:
-            tasks.append(single_request(api_url, each, dev_df, pbar))
+            tasks.append(bounded_request(each))
     pbar.total = len(tasks)
     completions = await asyncio.gather(*tasks)
     pbar.close()
@@ -214,6 +224,12 @@ if __name__ == "__main__":
     parser.add_argument("--output-len", type=int, default=1024)
     parser.add_argument("--num-per-sub", type=int, default=100)
     parser.add_argument("--num-shots", type=int, default=5)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=128,
+        help="Max number of in-flight requests sent to the server at once.",
+    )
     parser.add_argument(
         "--data-path",
         type=str,
