@@ -23,6 +23,10 @@ class RequestFuncInput:
     model: str
     best_of: int = 1
     use_beam_search: bool = False
+    # Disable a reasoning model's thinking block (e.g. Kimi-K2.5) for chat
+    # requests by sending ``chat_template_kwargs={"thinking"/"enable_thinking":
+    # False}``. Set this from a ``--no-thinking`` CLI flag in the caller.
+    no_thinking: bool = False
 
 
 @dataclass
@@ -320,9 +324,10 @@ async def async_request_openai_chat_completions(
             "stream": True,
         }
         # Optional: disable a reasoning model's thinking block (e.g. Kimi-K2.5),
-        # gated by env so the dataclass / callers stay untouched. The template
-        # var name differs per model; send both so it works regardless.
-        if os.environ.get("EVAL_NO_THINKING") == "1":
+        # controlled by the ``no_thinking`` request field (set from a
+        # ``--no-thinking`` CLI flag). The template var name differs per model,
+        # so send both so it works regardless.
+        if request_func_input.no_thinking:
             payload["chat_template_kwargs"] = {
                 "thinking": False,
                 "enable_thinking": False,

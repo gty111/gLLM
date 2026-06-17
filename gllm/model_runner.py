@@ -223,7 +223,6 @@ class ModelRunner:
         gpu_memory_util: float,
         page_size: int,
         enable_prefix_caching: bool,
-        use_thinking: bool,
         maxp,
         maxd,
         minp,
@@ -260,7 +259,6 @@ class ModelRunner:
             skip_language=skip_language,
         )
         self.enable_prefix_caching = enable_prefix_caching
-        self.use_thinking = use_thinking
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size
         self.tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = (
@@ -491,22 +489,29 @@ class ModelRunner:
         if not self.disable_cuda_graph:
             self.capture_graph()
 
-    def encode(self, messages, chat: bool = False, has_mm: bool = False):
+    def encode(
+        self,
+        messages,
+        chat: bool = False,
+        has_mm: bool = False,
+        chat_template_kwargs: Optional[Dict] = None,
+    ):
+        # Per-request chat-template variables (e.g. ``{"thinking": False}`` /
+        # ``{"enable_thinking": False}``) forwarded straight from the request's
+        # ``chat_template_kwargs``. Different chat templates gate "thinking"
+        # mode via different variable names (Qwen3/3.5 read ``enable_thinking``,
+        # Kimi-K2.5 reads ``thinking``); Jinja silently ignores undefined
+        # template variables, so a client can send both. When omitted, the
+        # model's own chat-template default applies (there is no server-wide
+        # thinking flag anymore).
+        template_kwargs = dict(chat_template_kwargs or {})
         if chat:
             if not self.use_mm or not has_mm:
-                # Different chat templates gate "thinking" mode via different
-                # variable names: Qwen3/3.5 read ``enable_thinking`` while
-                # Kimi-K2.5 reads ``thinking`` (rendering ``<think></think>``
-                # when false vs an open ``<think>`` when true). Jinja silently
-                # ignores undefined template variables, so passing both keeps
-                # every model honoring ``use_thinking`` without per-model
-                # branching.
                 out = self.tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
-                    enable_thinking=self.use_thinking,
-                    thinking=self.use_thinking,
                     tokenize=True,
+                    **template_kwargs,
                 )
             elif self.is_kimi_mm:
                 # Kimi's chat template renders one ``<|media_pad|>`` per image
@@ -521,9 +526,8 @@ class ModelRunner:
                 out = self.tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
-                    enable_thinking=self.use_thinking,
-                    thinking=self.use_thinking,
                     tokenize=False,
+                    **template_kwargs,
                 )
                 if isinstance(out, (list, tuple)):
                     out = out[0]
@@ -538,7 +542,10 @@ class ModelRunner:
                 )
             else:
                 out = self.processor.apply_chat_template(
-                    messages, tokenize=True, add_generation_prompt=True
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    **template_kwargs,
                 )[0]
         else:
             out = self.tokenizer.encode(messages)
@@ -605,14 +612,15 @@ class ModelRunner:
                     items.append(("video", content["video"]))
         return items
 
-    def encode_skeleton(self, messages):
+    def encode_skeleton(self, messages, chat_template_kwargs: Optional[Dict] = None):
         """Text-only tokenization with one sentinel per mm item (design §5.4).
 
         Used by the disaggregated LM frontend instead of the multimodal
         ``processor.apply_chat_template``: no pixels are opened or processed
         here, and each image/video collapses to a single placeholder id that
         the LM PP0 later expands to ``N_vis_i`` tokens. Returns the skeleton
-        token-id list.
+        token-id list. ``chat_template_kwargs`` carries per-request chat-template
+        variables (e.g. ``{"thinking": False}``) straight from the request.
         """
         from gllm.mm_common import tokenize_text_only
 
@@ -623,6 +631,7 @@ class ModelRunner:
             image_token_id=int(cfg.image_token_id),
             video_token_id=int(cfg.video_token_id),
             add_generation_prompt=True,
+            chat_template_kwargs=chat_template_kwargs,
         )
         return skel.token_ids
 
