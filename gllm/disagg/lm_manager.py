@@ -927,6 +927,9 @@ class DisaggCoordinator:
         #    fixed); embeddings are NOT on the seq -- they live in the model
         #    runner's disagg_embeds (immune to chunked-prefill deepcopy).
         seq.token_ids = expanded
+        # VL placeholder expansion redefines the *original* prompt, so reset
+        # both the raw length and the dynamic prefill boundary together.
+        seq.raw_prompt_len = len(expanded)
         seq.prompt_len = len(expanded)
         seq.cur_length = seq.prompt_len
         seq._mm_precomputed = None

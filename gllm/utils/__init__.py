@@ -247,7 +247,7 @@ def get_finish_reason(seq) -> Optional[str]:
     """
     if seq is None or not seq.token_ids:
         return None
-    generated = len(seq.token_ids) - seq.prompt_len
+    generated = len(seq.token_ids) - seq.raw_prompt_len
     if not seq.ignore_eos and seq.token_ids[-1] in seq.finish_tokens:
         return "stop"
     if generated >= seq.output_len:
@@ -263,8 +263,8 @@ def build_usage(seq):
 
     if seq is None:
         return UsageInfo()
-    prompt_tokens = seq.prompt_len
-    completion_tokens = max(0, len(seq.token_ids) - seq.prompt_len)
+    prompt_tokens = seq.raw_prompt_len
+    completion_tokens = max(0, len(seq.token_ids) - seq.raw_prompt_len)
     return UsageInfo(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,

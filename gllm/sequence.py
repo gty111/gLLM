@@ -21,6 +21,14 @@ class Sequence:
     ):
         self.seq_id = seq_id
         self.token_ids: List[int] = token_ids
+        # ``raw_prompt_len`` is the *original* prompt length, fixed for the
+        # whole lifetime of the request. ``prompt_len`` is the dynamic prefill
+        # boundary used to distinguish prefill vs decode (see
+        # ``computed_prompt``); it starts equal to ``raw_prompt_len`` but is
+        # bumped to ``len(token_ids)`` on preempt because the already-generated
+        # tokens must be re-prefilled from scratch. Always use
+        # ``raw_prompt_len`` for output-length / usage accounting.
+        self.raw_prompt_len = len(token_ids)
         self.prompt_len = len(token_ids)
         self.page_table = []
         self.prompt = ""
@@ -113,11 +121,17 @@ class Sequence:
     def is_finish(self):
         return self.computed_prompt and (
             (not self.ignore_eos and self[-1] in self.finish_tokens)
-            or len(self) - self.prompt_len >= self.output_len
+            or len(self) - self.raw_prompt_len >= self.output_len
         )
 
     def preempt(self):
         self.computed_token_num = 0
+        # Preemption recomputes the seq from scratch, so every token currently
+        # in ``token_ids`` (original prompt + already-generated tokens) must be
+        # re-prefilled. Bump the prefill boundary accordingly so
+        # ``computed_prompt`` correctly reports prefill (not decode) until the
+        # recompute catches up. ``raw_prompt_len`` stays untouched.
+        self.prompt_len = len(self.token_ids)
         self.page_table = []
         # SSM state is recurrent, so preempting (= recomputing from scratch)
         # invalidates whatever was in the working slot. The actual slot is
