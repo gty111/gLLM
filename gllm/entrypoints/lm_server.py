@@ -23,9 +23,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-path", required=True, type=str)
     p.add_argument("--load-format", choices=["auto", "dummy"], default="auto")
     p.add_argument("--model-max-length", type=int, default=None)
-    p.add_argument(
-        "--enable-thinking", action=argparse.BooleanOptionalAction, default=False
-    )
     # The defining flag of the LM node. On by default for this entrypoint.
     p.add_argument(
         "--skip-visual",
@@ -199,7 +196,6 @@ def main():
         assigned_layers=None,
         schedule_method=args.schedule_method,
         overlap_scheduling=args.overlap_scheduling,
-        use_thinking=args.enable_thinking,
         disable_cuda_graph=args.disable_cuda_graph,
         max_cuda_graph_bs=args.max_cuda_graph_bs,
         model_max_length=args.model_max_length,

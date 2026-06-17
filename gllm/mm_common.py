@@ -82,7 +82,7 @@ def tokenize_text_only(
     image_token_id: int,
     video_token_id: int,
     add_generation_prompt: bool = True,
-    enable_thinking: Optional[bool] = None,
+    chat_template_kwargs: Optional[dict] = None,
 ) -> MmSkeleton:
     """Tokenize ``messages`` with the *text* chat template (no image expansion).
 
@@ -91,14 +91,13 @@ def tokenize_text_only(
     single placeholder token per image/video reference and never opens or
     processes the pixels. Returns the skeleton + per-item sentinel positions.
 
-    ``enable_thinking`` is only forwarded when not ``None``. For multimodal
-    prompts leave it ``None`` so the output matches the monolith's mm template
-    (which passes no thinking flag); for pure-text prompts the caller may pass
-    the server's ``use_thinking`` to match the monolith text path.
+    ``chat_template_kwargs`` are per-request chat-template variables (e.g.
+    ``{"thinking": False}`` / ``{"enable_thinking": False}``) forwarded as-is.
+    Leave it ``None`` to match the monolith's default template rendering.
     """
     kwargs = dict(tokenize=True, add_generation_prompt=add_generation_prompt)
-    if enable_thinking is not None:
-        kwargs["enable_thinking"] = enable_thinking
+    if chat_template_kwargs:
+        kwargs.update(chat_template_kwargs)
     out = tokenizer.apply_chat_template(messages, **kwargs)
     if hasattr(out, "input_ids"):
         token_ids = out.input_ids

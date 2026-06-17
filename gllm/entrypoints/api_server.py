@@ -77,12 +77,15 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             request.messages
         )
         token_ids = await make_async(llm.model_runner.encode_skeleton)(
-            request.messages
+            request.messages, chat_template_kwargs=request.chat_template_kwargs
         )
         mm_contents = None  # LM holds no pixels; embeddings arrive over NIXL
     else:
         token_ids = await make_async(llm.model_runner.encode)(
-            request.messages, chat=True, has_mm=mm_contents is not None
+            request.messages,
+            chat=True,
+            has_mm=mm_contents is not None,
+            chat_template_kwargs=request.chat_template_kwargs,
         )
     # OpenAI deprecated ``max_tokens`` for chat completions in favor of
     # ``max_completion_tokens`` but most clients (including curl examples,
@@ -200,12 +203,6 @@ if __name__ == "__main__":
         choices=["auto", "dummy"],
         help="auto: actually load model weights; dummy: initialize the model with random values",
         default="auto",
-    )
-    parser.add_argument(
-        "--enable-thinking",
-        help="Enable thinking in inference models (off by default)",
-        action=argparse.BooleanOptionalAction,
-        default=False,
     )
     parser.add_argument(
         "--model-max-length",
@@ -384,7 +381,6 @@ if __name__ == "__main__":
         assigned_layers=args.assigned_layers,
         schedule_method=args.schedule_method,
         overlap_scheduling=args.overlap_scheduling,
-        use_thinking=args.enable_thinking,
         disable_cuda_graph=args.disable_cuda_graph,
         max_cuda_graph_bs=args.max_cuda_graph_bs,
         model_max_length=args.model_max_length,

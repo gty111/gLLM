@@ -134,6 +134,7 @@ def single_request(api_url, single_question, cot_examples_dict, pbar):
         prompt_len=len(prompt),
         output_len=args.output_len,
         model=args.model,
+        no_thinking=args.no_thinking,
     )
     return async_request_openai_chat_completions(
         request_func_input=request_func_input, pbar=pbar
@@ -237,6 +238,13 @@ if __name__ == "__main__":
         help="Local MMLU-Pro path for offline runs: either a directory with "
         "test-*.parquet / validation-*.parquet, or any path/name accepted by "
         "datasets.load_dataset. Empty = stream TIGER-Lab/MMLU-Pro from the Hub.",
+    )
+    parser.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="Send chat_template_kwargs={'thinking'/'enable_thinking': False} so "
+        "reasoning models (e.g. Kimi-K2.5) answer directly instead of emitting a "
+        "long reasoning trace that gets truncated by --output-len.",
     )
     assigned_subjects = []
     args = parser.parse_args()
