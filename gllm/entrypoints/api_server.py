@@ -26,11 +26,16 @@ from gllm.entrypoints.serving_completions import (
     completion_generator,
     completion_stream_generator,
 )
+from gllm.entrypoints.tool_parsers import get_tool_parser
 from gllm.utils import make_async
 
 router = APIRouter()
 
 llm: PipeAsyncLLM = None
+# Resolved once at startup (see ``run`` / ``__main__``): turns model-native
+# tool-call markup into structured ``tool_calls``. ``None`` => model has no
+# known tool-call format, raw text passes through as content.
+tool_parser = None
 
 
 @router.get("/health")
@@ -86,6 +91,14 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             chat=True,
             has_mm=mm_contents is not None,
             chat_template_kwargs=request.chat_template_kwargs,
+            # Serialize the pydantic tool schemas to plain dicts; the chat
+            # templates (and Kimi's ``encode_tools_to_typescript_style``)
+            # expect JSON-like dicts, not pydantic models.
+            tools=(
+                [t.model_dump(exclude_none=True) for t in request.tools]
+                if request.tools
+                else None
+            ),
         )
     # OpenAI deprecated ``max_tokens`` for chat completions in favor of
     # ``max_completion_tokens`` but most clients (including curl examples,
@@ -119,10 +132,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             code=HTTPStatus.BAD_REQUEST.value,
         )
     if request.stream:
-        generator = chat_completion_stream_generator(stream, request)
+        generator = chat_completion_stream_generator(stream, request, tool_parser)
         return StreamingResponse(content=generator, media_type="text/event-stream")
     else:
-        generator = await chat_completion_generator(stream, request)
+        generator = await chat_completion_generator(stream, request, tool_parser)
         return JSONResponse(content=generator.model_dump())
 
 
@@ -355,6 +368,15 @@ if __name__ == "__main__":
         help="Maximum pixels for multimodal processor",
         default=None,
     )
+    parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=["kimi", "qwen"],
+        help="Parser for model-native tool-call output -> structured "
+        "tool_calls. Default: auto-detect from model architecture; pass a "
+        "name to override.",
+    )
     args = parser.parse_args()
 
     llm = PipeAsyncLLM(
@@ -388,6 +410,25 @@ if __name__ == "__main__":
         mm_processor_max_pixels=args.mm_processor_max_pixels,
         mla_decode_backend=args.mla_decode_backend,
     )
+
+    # Resolve the tool-call parser once: explicit ``--tool-call-parser`` wins,
+    # else auto-detect from the model architecture. ``None`` (unknown model)
+    # leaves tool-call markup in ``content`` unparsed.
+    architecture = getattr(
+        getattr(getattr(llm, "model_runner", None), "model_loader", None),
+        "architecture",
+        None,
+    )
+    tool_parser = get_tool_parser(
+        architecture=architecture, name=args.tool_call_parser
+    )
+    if args.tool_call_parser or tool_parser is not None:
+        logger.info(
+            "Tool-call parser: %s (arch=%s, --tool-call-parser=%s)",
+            tool_parser.name if tool_parser else "none",
+            architecture,
+            args.tool_call_parser,
+        )
 
     if args.launch_mode != "slave":
         asyncio.run(run_server(args))
