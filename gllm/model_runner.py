@@ -495,6 +495,7 @@ class ModelRunner:
         chat: bool = False,
         has_mm: bool = False,
         chat_template_kwargs: Optional[Dict] = None,
+        tools: Optional[list] = None,
     ):
         # Per-request chat-template variables (e.g. ``{"thinking": False}`` /
         # ``{"enable_thinking": False}``) forwarded straight from the request's
@@ -504,7 +505,14 @@ class ModelRunner:
         # template variables, so a client can send both. When omitted, the
         # model's own chat-template default applies (there is no server-wide
         # thinking flag anymore).
+        #
+        # ``tools`` (the request's OpenAI-style function schemas) are forwarded
+        # so the chat template renders the model's tool-declaration block (e.g.
+        # Kimi's ``<|im_system|>tool_declare<|im_middle|>...``). Without this the
+        # model never learns the tools exist and answers as if it had none.
         template_kwargs = dict(chat_template_kwargs or {})
+        if tools:
+            template_kwargs["tools"] = tools
         if chat:
             if not self.use_mm or not has_mm:
                 out = self.tokenizer.apply_chat_template(

@@ -693,10 +693,25 @@ class ChatCompletionResponse(OpenAIBaseModel):
     usage: UsageInfo
 
 
+class DeltaFunctionCall(OpenAIBaseModel):
+    # All optional: a streaming chunk may carry just the name (first chunk of a
+    # call) or just an ``arguments`` fragment (subsequent chunks).
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+
+class DeltaToolCall(OpenAIBaseModel):
+    # ``index`` ties argument fragments across chunks to the same tool call.
+    index: int
+    id: Optional[str] = None
+    type: Optional[Literal["function"]] = None
+    function: Optional[DeltaFunctionCall] = None
+
+
 class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
-    tool_calls: List[ToolCall] = Field(default_factory=list)
+    tool_calls: List[DeltaToolCall] = Field(default_factory=list)
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
