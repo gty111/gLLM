@@ -1348,7 +1348,15 @@ class ModelRunner:
         return seqs
 
     @torch.inference_mode()
-    def profile_run(self):
+    def profile_run(self, stream: Optional[torch.cuda.Stream] = None):
+        """Run one dummy forward at max batch size.
+
+        Used both for startup memory profiling (``stream=None``, runs on the
+        current stream) and as the pre-capture warmup in :meth:`capture_graph`
+        (``stream`` set to the capture stream so cuBLAS allocates its per-stream
+        workspace there *before* graph capture begins; the run is synchronized
+        on return so all that lazy init has completed).
+        """
         seqs = self.create_dummy_seqs(self.max_running_seqs)
         self.input_data.cal_and_set_input(seqs)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
@@ -1356,14 +1364,25 @@ class ModelRunner:
             self.input_data.set_mrope_position(
                 torch.zeros((3, num_cal_tokens), device="cpu")
             )
-        if is_first_pp_rank():
-            self.model(self.input_data)
+        stream_ctx = (
+            torch.cuda.stream(stream) if stream is not None else _nullcontext()
+        )
+        with stream_ctx:
+            if is_first_pp_rank():
+                self.model(self.input_data)
+            else:
+                self.model(
+                    self.input_data,
+                    self.input_hidden_states[:num_cal_tokens],
+                    self.input_residual[:num_cal_tokens],
+                )
+        # Wait for the dummy forward to finish before returning so all lazy
+        # init has completed (required by the capture-stream warmup) and the
+        # startup memory profile reflects the real peak.
+        if stream is not None:
+            stream.synchronize()
         else:
-            self.model(
-                self.input_data,
-                self.input_hidden_states[:num_cal_tokens],
-                self.input_residual[:num_cal_tokens],
-            )
+            torch.cuda.synchronize()
 
     @torch.inference_mode()
     def capture_graph(self, stream: Optional[torch.cuda.Stream] = None):
@@ -1395,6 +1414,15 @@ class ModelRunner:
         from gllm.distributed import get_custom_allreduce
 
         car = get_custom_allreduce()
+
+        # Warm up lazy cuBLAS/Triton init on the capture stream. cuBLAS creates
+        # its handle and per-stream workspace on first use; if that happens
+        # mid-capture the implicit cudaMalloc is illegal and aborts the capture
+        # (cudaErrorStreamCaptureInvalidated). The startup profile_run doesn't
+        # survive the intervening memory_manager.init (~30 GB KV/SSM alloc), so
+        # re-run it on the capture stream to force + sync that init first.
+        self.profile_run(stream=stream)
+
         capture_ctx = car.capture() if car is not None else _nullcontext()
         with capture_ctx:
             for size in iterator:
