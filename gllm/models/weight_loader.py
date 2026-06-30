@@ -436,18 +436,35 @@ def h_qkv_proj_gqa(ctx: LoadContext, k: str, p: torch.Tensor) -> None:
 
 def h_qkv_proj_gated(ctx: LoadContext, k: str, p: torch.Tensor) -> None:
     """Fused QKV where q rows may be doubled by ``attn_output_gate`` (Qwen3.5
-    dense). ``ctx.extra['num_q_rows']`` is the per-rank q-row count; the FP8
-    ``weight_scale_inv`` collapses ``head_dim`` to 1 like :func:`h_qkv_proj`.
+    dense).
+
+    ``ctx.extra['num_q_rows']`` is the per-rank q-row count (in head units,
+    already doubled for the gate). For the plain weight tensor each head spans
+    ``head_dim`` rows. For an FP8 ``weight_scale_inv`` tensor the rows are
+    block-quantized, so each head spans ``head_dim // block_n`` scale rows;
+    we derive that per-head stride from the source shape instead of hardcoding
+    it (the old code collapsed it to ``1``, which corrupted the K/V offsets and
+    crashed on block-quantized checkpoints such as Qwen3.5-27B-FP8).
     """
-    head_dim_patch = (
-        ctx.head_dim if (k.find("scale") == -1 or k.find("weight") == -1) else 1
-    )
     w = ctx.weights
+    src_q = get_tensor_from_dict(w, k.replace("qkv_proj", "q_proj"))
+    src_k = get_tensor_from_dict(w, k.replace("qkv_proj", "k_proj"))
+    src_v = get_tensor_from_dict(w, k.replace("qkv_proj", "v_proj"))
+
+    if k.endswith("weight_scale_inv"):
+        # Per-head scale-row stride = (head_dim // block_n). ``num_q_rows``
+        # counts the q+gate head-row groups, so dividing the q-scale row count
+        # by it recovers the stride without needing block_n explicitly.
+        num_q_rows = ctx.extra["num_q_rows"]
+        head_dim_patch = src_q.shape[0] // num_q_rows
+    else:
+        head_dim_patch = ctx.head_dim
+
     copy_qkv_proj(
         p,
-        get_tensor_from_dict(w, k.replace("qkv_proj", "q_proj")),
-        get_tensor_from_dict(w, k.replace("qkv_proj", "k_proj")),
-        get_tensor_from_dict(w, k.replace("qkv_proj", "v_proj")),
+        src_q,
+        src_k,
+        src_v,
         ctx.extra["num_q_rows"],
         ctx.num_kv_heads,
         head_dim_patch,
