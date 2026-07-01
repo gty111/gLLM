@@ -124,9 +124,19 @@ def flashinfer_swapab_available() -> bool:
     return True
 
 
-def _flashinfer_shape_supported(N: int, K: int) -> bool:
-    # fp8_blockscale_gemm_sm90 (DeepGEMM backend) requires N%64==0 and K%128==0.
-    return N % 64 == 0 and K % 128 == 0
+def _flashinfer_shape_supported(
+    N: int, K: int, block_n: int, block_k: int, weight_scale: torch.Tensor
+) -> bool:
+    # fp8_blockscale_gemm_sm90 hardcodes 128x128 block quantization: it quantizes
+    # the BF16 activation at group=128 internally and expects per-block weight
+    # scales laid out as (ceil(N/128), ceil(K/128)). Reject any other block
+    # geometry or a mismatched scale tensor so we never feed the kernel a layout
+    # it will silently misinterpret (wrong results) instead of the intended GEMM.
+    if block_n != 128 or block_k != 128:
+        return False
+    if N % 64 != 0 or K % 128 != 0:
+        return False
+    return tuple(weight_scale.shape) == (cdiv(N, 128), cdiv(K, 128))
 
 
 def validate_fp8_block_shape(
@@ -194,7 +204,7 @@ def fp8LinearMethod(
     if (
         M < _FLASHINFER_SWAPAB_MAX_M
         and input.dtype == torch.bfloat16
-        and _flashinfer_shape_supported(N, K)
+        and _flashinfer_shape_supported(N, K, block_n, block_k, weight_scale)
         and flashinfer_swapab_available()
     ):
         output = _flashinfer_blockscale_gemm()(
@@ -204,9 +214,9 @@ def fp8LinearMethod(
         q_input, x_scale = per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=False
         )
-        if deepgemm_available() and _deepgemm_shape_supported(
+        if _deepgemm_shape_supported(
             N, K, block_n, block_k, input.dtype
-        ):
+        ) and deepgemm_available():
             output = w8a8_block_fp8_matmul_deepgemm(
                 q_input, weight, x_scale, weight_scale, block_size, input.dtype
             )
