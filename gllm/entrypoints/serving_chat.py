@@ -27,7 +27,7 @@ async def chat_completion_generator(
     content = full_text
     tool_calls = []
     if tool_parser is not None and request.tools:
-        parsed_content, tool_calls = tool_parser.parse(full_text)
+        parsed_content, tool_calls = tool_parser.parse(full_text, request.tools)
         content = parsed_content if parsed_content is not None else ""
 
     choice_data = ChatCompletionResponseChoice(
@@ -59,7 +59,7 @@ async def chat_completion_stream_generator(
     # emits content fragments + tool-call name/argument fragments (tied by
     # ``index``), mirroring vLLM / SGLang. Otherwise stream raw text deltas.
     streaming = tool_parser is not None and bool(request.tools)
-    sp = tool_parser.stream_parser() if streaming else None
+    sp = tool_parser.stream_parser(request.tools) if streaming else None
     full_text = ""
 
     async for text in stream:
