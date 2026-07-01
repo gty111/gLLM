@@ -14,3 +14,5 @@ pillow
 einops # qwen2_5_vl
 av # video
 sgl-kernel==0.3.21
+flashinfer-python==0.6.12 # Hopper FP8 block-scale GEMM with auto-swapAB (fast decode)
+flashinfer-cubin==0.6.12 # prebuilt cubins for flashinfer (avoids first-run JIT)
