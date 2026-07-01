@@ -1423,6 +1423,30 @@ class ModelRunner:
         # re-run it on the capture stream to force + sync that init first.
         self.profile_run(stream=stream)
 
+        # Some FP8 backends (DeepGEMM, and FlashInfer's swapAB for M<32) JIT-
+        # compile a distinct kernel per decode M-bucket on first use. That
+        # compilation issues an implicit cudaMalloc, which is illegal mid-capture
+        # and aborts the graph with cudaErrorStreamCaptureInvalidated. Run one
+        # eager forward per bucket (outside the capture context) so every such
+        # kernel is compiled *before* we capture it.
+        try:
+            from gllm.layers.quantization.fp8 import (
+                deepgemm_available,
+                flashinfer_swapab_available,
+            )
+
+            warmup_per_bucket = deepgemm_available() or flashinfer_swapab_available()
+        except Exception:  # noqa: BLE001
+            warmup_per_bucket = False
+        if warmup_per_bucket:
+            for size in self.capture_sizes:
+                seqs = self.create_dummy_seqs(size)
+                self.input_data.cal_and_set_input(seqs=seqs)
+                if self.uses_mrope:
+                    self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
+                self.forward()
+            torch.cuda.synchronize()
+
         capture_ctx = car.capture() if car is not None else _nullcontext()
         with capture_ctx:
             for size in iterator:

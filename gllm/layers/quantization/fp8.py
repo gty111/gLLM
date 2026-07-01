@@ -1,3 +1,4 @@
+import functools
 from typing import Optional
 
 import torch
@@ -7,6 +8,125 @@ import triton.language as tl
 from gllm import _custom_ops as ops
 from gllm.dist_utils import get_tp_size
 from gllm.utils import cdiv
+from logger import logger
+
+@functools.lru_cache(maxsize=1)
+def _sgl_group_quant_fp8():
+    """Return the sgl-kernel fused per-token-group FP8 quant op, or ``None``.
+
+    The Triton ``_per_token_group_quant_fp8`` launches one program per token and
+    is dominated by launch overhead at decode batch sizes (thousands of tiny
+    calls). sgl-kernel ships a compiled CUDA kernel (the same one vLLM/SGLang
+    use) that is markedly cheaper per launch; resolved once, lazily, and falls
+    back to Triton when sgl-kernel is unavailable.
+    """
+    try:
+        from sgl_kernel import sgl_per_token_group_quant_fp8
+
+        return sgl_per_token_group_quant_fp8
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"sgl-kernel FP8 quant unavailable, using Triton: {e}")
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def deepgemm_available() -> bool:
+    """Whether the DeepGEMM block-FP8 GEMM backend can be used on this device.
+
+    DeepGEMM ships hand-tuned Hopper (SM90+) FP8 kernels that are markedly
+    faster than the Triton ``_w8a8_block_fp8_matmul`` fallback. Availability is
+    resolved once, lazily (on the first FP8 linear call, i.e. during warmup,
+    never during CUDA-graph capture), and includes a tiny self-test GEMM so a
+    broken JIT toolchain degrades gracefully to Triton instead of crashing on
+    the first real matmul.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability()[0] < 9:
+        return False
+    try:
+        import deep_gemm  # noqa: F401
+
+        a = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+        aq, as_ = per_token_group_quant_fp8(a, 128, column_major_scales=False)
+        wq = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        ws = torch.ones(1, 1, device="cuda", dtype=torch.float32)
+        c = torch.empty(128, 128, device="cuda", dtype=torch.bfloat16)
+        deep_gemm.fp8_gemm_nt((aq, as_), (wq, ws), c)
+        torch.cuda.synchronize()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"DeepGEMM FP8 backend unavailable, falling back to Triton: {e}")
+        return False
+    logger.info("DeepGEMM FP8 GEMM backend enabled (Hopper block-scale kernels).")
+    return True
+
+
+def _deepgemm_shape_supported(
+    N: int, K: int, block_n: int, block_k: int, output_dtype: torch.dtype
+) -> bool:
+    # DeepGEMM's block-scale nt kernel requires bf16 output and N/K aligned to
+    # the quantization block; anything else stays on the Triton path.
+    return output_dtype == torch.bfloat16 and N % block_n == 0 and K % block_k == 0
+
+
+# Only small-M (decode) matmuls benefit from FlashInfer's swapAB kernel; vLLM
+# gates on the same M<32 threshold, and there it is a *correctness* requirement
+# too (the swapAB path loses accuracy at M>=32), not merely a perf choice.
+_FLASHINFER_SWAPAB_MAX_M = 32
+
+
+@functools.lru_cache(maxsize=1)
+def _flashinfer_blockscale_gemm():
+    """Return FlashInfer's ``fp8_blockscale_gemm_sm90`` op, or ``None``."""
+    try:
+        from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+        return fp8_blockscale_gemm_sm90
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"FlashInfer swapAB FP8 GEMM unavailable: {e}")
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def flashinfer_swapab_available() -> bool:
+    """Whether FlashInfer's Hopper swapAB FP8 block-scale GEMM can be used.
+
+    ``fp8_blockscale_gemm_sm90`` takes a *BF16* activation and fuses the
+    per-token FP8 quantization with a swapAB GEMM that is ~2x faster than
+    DeepGEMM's 1d2d kernel for skinny-M (decode) shapes. It is Hopper-only and
+    JIT-compiled on first use (needs ninja + nvcc + CUDA_HOME), so availability
+    is resolved once, lazily, with a self-test that degrades gracefully to the
+    DeepGEMM/Triton path when the JIT toolchain is missing.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability() != (9, 0):
+        return False
+    fi_gemm = _flashinfer_blockscale_gemm()
+    if fi_gemm is None:
+        return False
+    try:
+        a = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        ws = torch.ones(1, 2, device="cuda", dtype=torch.float32)
+        fi_gemm(a, w, None, ws, out_dtype=torch.bfloat16)
+        torch.cuda.synchronize()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"FlashInfer swapAB self-test failed, using DeepGEMM/Triton: {e}"
+        )
+        return False
+    logger.info("FlashInfer swapAB FP8 GEMM enabled for decode (M<32).")
+    return True
+
+
+def _flashinfer_shape_supported(N: int, K: int) -> bool:
+    # fp8_blockscale_gemm_sm90 (DeepGEMM backend) requires N%64==0 and K%128==0.
+    return N % 64 == 0 and K % 128 == 0
 
 
 def validate_fp8_block_shape(
@@ -64,17 +184,65 @@ def fp8LinearMethod(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=False
-    )
+    N, K = weight.shape
+    block_n, block_k = block_size[0], block_size[1]
+    M = input_2d.shape[0]
 
-    output = w8a8_block_fp8_matmul(
-        q_input, weight, x_scale, weight_scale, block_size, input.dtype
-    )
+    # Decode (small M): FlashInfer's swapAB kernel takes the BF16 activation
+    # directly and fuses quantization + GEMM, ~2x faster than DeepGEMM's 1d2d.
+    # Restricted to M<32 (perf *and* accuracy: swapAB degrades at larger M).
+    if (
+        M < _FLASHINFER_SWAPAB_MAX_M
+        and input.dtype == torch.bfloat16
+        and _flashinfer_shape_supported(N, K)
+        and flashinfer_swapab_available()
+    ):
+        output = _flashinfer_blockscale_gemm()(
+            input_2d, weight, None, weight_scale, out_dtype=torch.bfloat16
+        )
+    else:
+        q_input, x_scale = per_token_group_quant_fp8(
+            input_2d, block_size[1], column_major_scales=False
+        )
+        if deepgemm_available() and _deepgemm_shape_supported(
+            N, K, block_n, block_k, input.dtype
+        ):
+            output = w8a8_block_fp8_matmul_deepgemm(
+                q_input, weight, x_scale, weight_scale, block_size, input.dtype
+            )
+        else:
+            output = w8a8_block_fp8_matmul(
+                q_input, weight, x_scale, weight_scale, block_size, input.dtype
+            )
 
     if bias is not None:
         output = output + bias
     return output.to(dtype=input.dtype).view(*output_shape)
+
+
+def w8a8_block_fp8_matmul_deepgemm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Block-wise FP8 matmul via DeepGEMM's Hopper kernels (``C = A @ B^T``).
+
+    Drop-in replacement for :func:`w8a8_block_fp8_matmul` with identical
+    inputs: ``A`` (M, K) fp8 activations with per-token-group row-major scales
+    ``As`` (M, K/block_k), and ``B`` (N, K) fp8 weights with per-block scales
+    ``Bs`` (N/block_n, K/block_k). DeepGEMM re-lays-out the scales into its
+    required TMA/UE8M0 form internally, so the raw scales are passed as-is.
+    """
+    import deep_gemm
+
+    assert output_dtype == torch.bfloat16, "DeepGEMM only outputs bfloat16"
+    N = B.shape[0]
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    deep_gemm.fp8_gemm_nt((A, As), (B, Bs), C.view(-1, N))
+    return C
 
 
 def w8a8_block_fp8_matmul(
@@ -503,6 +671,29 @@ def per_token_group_quant_fp8(
     x_q = out_q
     if x_q is None:
         x_q = torch.empty_like(x, device=x.device, dtype=dtype)
+
+    # Fast path: fused CUDA kernel from sgl-kernel. Only the row-major scale
+    # layout is a drop-in match for the Triton kernel below, which is exactly
+    # what every gLLM caller uses; anything else falls through to Triton.
+    sgl_quant = _sgl_group_quant_fp8()
+    if (
+        sgl_quant is not None
+        and not column_major_scales
+        and dtype == torch.float8_e4m3fn
+        and x.is_contiguous()
+    ):
+        x_s = torch.empty(
+            x.shape[:-1] + (x.shape[-1] // group_size,),
+            device=x.device,
+            dtype=torch.float32,
+        )
+        if x.shape[0] > 0:
+            # enable_v2=False keeps the call self-contained: the sgl-kernel
+            # wrapper otherwise imports sglang just to read an env var.
+            sgl_quant(
+                x, x_q, x_s, group_size, eps, fp8_min, fp8_max, enable_v2=False
+            )
+        return x_q, x_s
 
     M = x.numel() // group_size
     N = group_size
