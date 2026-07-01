@@ -1,7 +1,8 @@
 import glob
 import os
 import re
-from typing import Tuple
+import threading
+from typing import Dict, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -26,6 +27,86 @@ from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from gllm.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from gllm.utils import get_lock
+
+
+class _SafeOpenPool:
+    """Thread-safe cache of ``safe_open`` handles, one per (thread, file).
+
+    The MoE expert loader (:func:`moe_expert_load_pool`) fetches tensors
+    concurrently, and a single ``safe_open`` handle is not safe to call
+    ``get_tensor`` on from multiple threads. Handing each thread its own handle
+    per file keeps concurrent reads independent (safetensors releases the GIL
+    during the copy) while opening every file at most once per worker thread.
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+
+    def get(self, path: str):
+        cache = getattr(self._local, "handles", None)
+        if cache is None:
+            cache = {}
+            self._local.handles = cache
+        f = cache.get(path)
+        if f is None:
+            f = safe_open(path, framework="pt", device="cpu")
+            cache[path] = f
+        return f
+
+    def close(self) -> None:
+        cache = getattr(self._local, "handles", None)
+        if cache:
+            cache.clear()
+
+
+class LazySafetensors:
+    """On-demand, dict-compatible view over a set of ``.safetensors`` shards.
+
+    Instead of materializing the whole checkpoint into a ``{key: tensor}`` dict
+    up front (which, without EP, means every TP rank holds the full model in
+    CPU memory before the GPU copy even starts), this builds only a
+    ``exposed_key -> (file, checkpoint_key)`` index from the shard *headers* and
+    reads each tensor lazily on first ``__getitem__``. The weight-loading path
+    only ever touches ``weights`` via ``weights[k]`` / ``k in weights`` /
+    iteration, so this is a drop-in replacement for the eager dict.
+
+    Peak CPU memory drops from the full checkpoint to roughly the handful of
+    tensors in flight; with EP the per-rank index is already pruned to the
+    experts this rank owns, so those shards are never even read.
+    """
+
+    def __init__(self, index: Dict[str, Tuple[str, str]], pool: _SafeOpenPool = None):
+        # index: exposed_key -> (shard_path, checkpoint_key).
+        self._index = index
+        self._pool = pool or _SafeOpenPool()
+
+    def __contains__(self, k: str) -> bool:
+        return k in self._index
+
+    def __iter__(self):
+        return iter(self._index)
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def keys(self):
+        return self._index.keys()
+
+    def __getitem__(self, k: str) -> torch.Tensor:
+        try:
+            path, ckpt_key = self._index[k]
+        except KeyError:
+            raise KeyError(k)
+        return self._pool.get(path).get_tensor(ckpt_key)
+
+    def items(self):
+        # Lazy: materializes one tensor at a time as the caller iterates. Kept
+        # for dict-compatibility; hot paths must not iterate all values.
+        for k in self._index:
+            yield k, self[k]
+
+    def close(self) -> None:
+        self._pool.close()
 
 
 def _is_quantized_param(param: torch.Tensor) -> bool:
@@ -232,24 +313,33 @@ class ModelLoader:
 
     def load_safetensors(self, path):
         weights_path = glob.glob(f"{path}/*.safetensors")
+        if not weights_path:
+            return False
         skip = self._make_expert_skip_predicate()
+        # Build only a key -> (shard, key) index from the shard headers; tensors
+        # are read lazily on demand (see LazySafetensors). This avoids loading
+        # the entire checkpoint into CPU memory before the GPU copy starts.
+        index: Dict[str, Tuple[str, str]] = {}
         n_skipped = 0
         for weight_path in weights_path:
             with safe_open(weight_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
                     if skip is not None and skip(k):
                         # EP shard: this rank does not own this routed expert,
-                        # so don't even materialize it from the (slow, shared)
-                        # filesystem. See _make_expert_skip_predicate.
+                        # so don't even index it -- the (slow, shared) shard is
+                        # never read. See _make_expert_skip_predicate.
                         n_skipped += 1
                         continue
-                    self.weights[k] = f.get_tensor(k)
+                    index[k] = (weight_path, k)
         if n_skipped:
             logger.info(
-                f"EP rank {get_ep_rank()}/{get_ep_size()}: skipped reading "
+                f"EP rank {get_ep_rank()}/{get_ep_size()}: skipped indexing "
                 f"{n_skipped} non-local routed-expert tensors"
             )
-        return len(self.weights) != 0
+        if not index:
+            return False
+        self.weights = LazySafetensors(index)
+        return True
 
     def _make_expert_skip_predicate(self):
         """Return ``predicate(key) -> bool`` that is True for routed-expert
@@ -560,6 +650,10 @@ class ModelLoader:
         # Load weights from CPU memory to GPU memory
         if self.load_format == "auto":
             model.load_weights(self.weights, mp_load_progress)
+            # Release lazily-opened safetensors handles / mmaps now that every
+            # parameter has been copied to the GPU.
+            if isinstance(self.weights, LazySafetensors):
+                self.weights.close()
 
         # Best-effort validation that ``quantization_config["ignored_layers"]``
         # is honored. gllm does not consume the field directly (no per-layer
