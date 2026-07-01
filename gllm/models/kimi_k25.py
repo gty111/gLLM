@@ -278,17 +278,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
         return self.language_model.compute_logits(input_data, hidden_states)
 
     def load_weights(self, weights, mp_load_progress=None):
-        # 1) Language model: keys are prefixed ``language_model.``.
+        # 1) Language model: the checkpoint namespaces the DeepSeek backbone
+        # under ``language_model.``, but ``get_tensor_from_dict`` /
+        # ``has_tensor_in_dict`` resolve that prefix on lookup, so the full
+        # (lazy) view is handed through as-is -- mirroring the Qwen-VL wrappers.
+        # A language-only checkpoint (keys already un-prefixed) still matches
+        # via the plain-key candidate.
         if not self.skip_language and self.language_model is not None:
-            language_weights = {}
-            prefix = "language_model."
-            for key, value in weights.items():
-                if key.startswith(prefix):
-                    language_weights[key[len(prefix) :]] = value
-            if not language_weights:
-                # Fallback for already-stripped language-only checkpoints.
-                language_weights = weights
-            self.language_model.load_weights(language_weights, mp_load_progress)
+            self.language_model.load_weights(weights, mp_load_progress)
 
         if not is_first_pp_rank():
             return

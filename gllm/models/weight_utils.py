@@ -125,20 +125,44 @@ def copy_single_proj_dim0(dst, src):
     )
     
 
+def _checkpoint_key_candidates(k):
+    """Ordered checkpoint-key candidates for a model-parameter key ``k``.
+
+    A single place that bridges the naming gaps between gLLM's parameter names
+    and the various checkpoint layouts we load, so that
+    :func:`get_tensor_from_dict` and :func:`has_tensor_in_dict` can never drift:
+
+    * ``model.language_model.`` / ``model.visual.`` — the Qwen-VL wrappers embed
+      their language / vision sub-trees under a shared ``model.`` root, so a
+      backbone lookup of ``model.<x>`` maps to ``model.language_model.<x>``.
+    * ``language_model.`` prefix — Kimi-K2.5 reuses a standalone DeepSeek
+      backbone (params named ``model.<x>`` / ``lm_head.<x>``) but namespaces the
+      whole language checkpoint under ``language_model.`` and hands the LM the
+      *full* multimodal view. Prepending ``language_model.`` recovers the key
+      without the caller having to pre-strip the prefix.
+
+    Candidates are matched first-hit in order, so the plain key wins for pure
+    text checkpoints and the existing Qwen-VL rewrites are unchanged; the
+    ``language_model.``-prefixed form is only reached when nothing else matches.
+    """
+    return (
+        k,
+        k.replace('model', 'model.language_model'),
+        k.replace('visual', 'model.visual'),
+        f"language_model.{k}",
+    )
+
+
 def get_tensor_from_dict(weights, k):
-    k_language = k.replace('model', 'model.language_model')
-    k_visual = k.replace('visual', 'model.visual')
-    if k in weights:
-        return weights[k]
-    elif k_language in weights:
-        return weights[k_language]
-    elif k_visual in weights:
-        return weights[k_visual]
-    else:
-        for key, value in weights.items():
-            print(key)
-        
-        raise KeyError(f"Fail to extract {k} from weights")
+    for cand in _checkpoint_key_candidates(k):
+        if cand in weights:
+            return weights[cand]
+    # Iterate keys only -- ``weights`` may be a lazy view whose ``items()``
+    # would read every tensor from disk just to print names.
+    for key in weights:
+        print(key)
+
+    raise KeyError(f"Fail to extract {k} from weights")
 
 
 def has_tensor_in_dict(weights, k) -> bool:
@@ -147,11 +171,7 @@ def has_tensor_in_dict(weights, k) -> bool:
     Used to probe which MoE checkpoint layout a key is stored in (per-expert
     vs stacked) without triggering the verbose KeyError path.
     """
-    return (
-        k in weights
-        or k.replace('model', 'model.language_model') in weights
-        or k.replace('visual', 'model.visual') in weights
-    )
+    return any(cand in weights for cand in _checkpoint_key_candidates(k))
 
 
 # ---------------------------------------------------------------------------
