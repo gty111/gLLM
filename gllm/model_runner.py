@@ -514,6 +514,14 @@ class ModelRunner:
         if tools:
             template_kwargs["tools"] = tools
         if chat:
+            # OpenAI-style requests may send ``content: null`` (e.g. an assistant
+            # turn that only carries ``tool_calls``). Many chat templates assume
+            # ``content`` is a str or list and iterate it in the non-string
+            # branch, so a None surfaces as ``TypeError: 'NoneType' object is not
+            # iterable`` mid-render. Normalize null content to "" before render.
+            for message in messages:
+                if isinstance(message, dict) and message.get("content") is None:
+                    message["content"] = ""
             if not self.use_mm or not has_mm:
                 out = self.tokenizer.apply_chat_template(
                     messages,

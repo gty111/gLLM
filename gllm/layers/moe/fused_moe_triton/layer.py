@@ -607,7 +607,7 @@ class FusedMoE(torch.nn.Module):
             self.intermediate_size_per_partition = intermediate_size
         else:
             self.local_num_experts, self.expert_map = (self.global_num_experts, None)
-            assert intermediate_size % self.tp_size == 0
+            self._validate_tp_size(intermediate_size)
             self.intermediate_size_per_partition = intermediate_size // self.tp_size
 
         self.top_k = top_k
@@ -637,6 +637,54 @@ class FusedMoE(torch.nn.Module):
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             params_dtype=params_dtype,
+        )
+
+    def _validate_tp_size(self, intermediate_size: int) -> None:
+        """Fail fast (non-EP) when the TP size can't shard the experts.
+
+        Two constraints:
+          * ``intermediate_size`` must be divisible by ``tp_size``.
+          * For block-scale FP8, the per-rank intermediate size must also be a
+            multiple of the quant block size ``weight_block_size[0]``; otherwise
+            the fused gate/up weight rows and their block scales disagree
+            (``cdiv(2*inter_pp, block_n) != 2*cdiv(inter_pp, block_n)``) and the
+            Triton MoE kernel aborts with a bare ``AssertionError`` deep in the
+            launch. Surfacing the valid TP sizes here is far more actionable.
+        """
+        block_n = None
+        if (
+            self.quant_config is not None
+            and self.quant_config.get("quant_method") == "fp8"
+            and self.quant_config.get("weight_block_size")
+        ):
+            block_n = self.quant_config["weight_block_size"][0]
+
+        def _tp_ok(tp: int) -> bool:
+            if intermediate_size % tp != 0:
+                return False
+            if block_n is not None and (intermediate_size // tp) % block_n != 0:
+                return False
+            return True
+
+        if _tp_ok(self.tp_size):
+            return
+
+        valid = [tp for tp in range(1, intermediate_size + 1) if _tp_ok(tp)]
+        if block_n is not None:
+            detail = (
+                f"block-scale FP8 (weight_block_size[0]={block_n}) requires "
+                f"intermediate_size ({intermediate_size}) to be divisible by "
+                f"tp_size and the per-rank shard "
+                f"(intermediate_size // tp_size) to be a multiple of {block_n}"
+            )
+        else:
+            detail = (
+                f"intermediate_size ({intermediate_size}) must be divisible by "
+                f"tp_size"
+            )
+        raise ValueError(
+            f"--tp {self.tp_size} is not compatible with this MoE: {detail}. "
+            f"Supported tp sizes for this model: {valid}."
         )
 
     def dispatch_quant_method(self):
