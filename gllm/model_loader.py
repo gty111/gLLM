@@ -1,6 +1,5 @@
 import glob
 import os
-import re
 import threading
 from typing import Dict, Tuple
 
@@ -9,8 +8,6 @@ from huggingface_hub import snapshot_download
 from logger import logger
 from safetensors import safe_open
 from transformers import AutoConfig, GenerationConfig
-
-from gllm.dist_utils import get_ep_rank, get_ep_size, is_use_ep
 
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
@@ -315,91 +312,25 @@ class ModelLoader:
         weights_path = glob.glob(f"{path}/*.safetensors")
         if not weights_path:
             return False
-        skip = self._make_expert_skip_predicate()
         # Build only a key -> (shard, key) index from the shard headers; tensors
         # are read lazily on demand (see LazySafetensors). This avoids loading
         # the entire checkpoint into CPU memory before the GPU copy starts.
+        #
+        # NB: we intentionally index *all* keys, including routed experts not
+        # owned by this EP rank. The pull-based weight loader
+        # (load_fused_w13_per_expert / load_w2_per_expert) checks expert
+        # ownership via resolve_ep_expert_idx *before* calling
+        # get_tensor_from_dict, so non-local experts are never lazily
+        # materialized -- indexing them costs only a dict entry, not any disk I/O.
         index: Dict[str, Tuple[str, str]] = {}
-        n_skipped = 0
         for weight_path in weights_path:
             with safe_open(weight_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
-                    if skip is not None and skip(k):
-                        # EP shard: this rank does not own this routed expert,
-                        # so don't even index it -- the (slow, shared) shard is
-                        # never read. See _make_expert_skip_predicate.
-                        n_skipped += 1
-                        continue
                     index[k] = (weight_path, k)
-        if n_skipped:
-            logger.info(
-                f"EP rank {get_ep_rank()}/{get_ep_size()}: skipped indexing "
-                f"{n_skipped} non-local routed-expert tensors"
-            )
         if not index:
             return False
         self.weights = LazySafetensors(index)
         return True
-
-    def _make_expert_skip_predicate(self):
-        """Return ``predicate(key) -> bool`` that is True for routed-expert
-        weights NOT owned by this EP rank, else ``None`` when no skipping
-        applies.
-
-        Under expert parallelism each rank only needs its slice of the routed
-        experts, but the routed-expert tensors dominate the checkpoint size
-        (e.g. Kimi-K2.5: 384 experts x 60 layers of int4 weights). Reading the
-        full checkpoint on every rank multiplies the load over a shared /
-        network filesystem by ``ep_size`` and serializes on its bandwidth.
-        Skipping the ``ep_size - 1`` / ``ep_size`` fraction this rank will
-        never use cuts per-rank disk reads proportionally.
-
-        Returns ``None`` (no skipping) when EP is off, so the pure-TP path --
-        where every rank slices *within* each expert and therefore needs all
-        of them -- is unchanged.
-        """
-        if not is_use_ep():
-            return None
-
-        ep_size = get_ep_size()
-        ep_rank = get_ep_rank()
-        if ep_size <= 1:
-            return None
-
-        num_experts = self._get_num_routed_experts()
-        if not num_experts:
-            return None
-
-        # Mirror determine_expert_map's contiguous block assignment: each
-        # non-last rank owns ``num_experts // ep_size`` experts; the last rank
-        # takes the remainder.
-        per_rank = num_experts // ep_size
-        start = ep_rank * per_rank
-        end = num_experts if ep_rank == ep_size - 1 else start + per_rank
-
-        expert_re = re.compile(r"\.experts\.(\d+)\.")
-
-        def skip(key: str) -> bool:
-            m = expert_re.search(key)
-            if m is None:
-                return False  # not a routed-expert tensor -> always needed
-            idx = int(m.group(1))
-            return not (start <= idx < end)
-
-        return skip
-
-    def _get_num_routed_experts(self):
-        """Number of routed experts, looking through ``text_config`` for VL
-        wrappers (Kimi-K2.5). Returns ``None`` when the model is not MoE."""
-        for cfg in (self.config, getattr(self.config, "text_config", None)):
-            if cfg is None:
-                continue
-            for attr in ("n_routed_experts", "num_experts"):
-                val = getattr(cfg, attr, None)
-                if val:
-                    return int(val)
-        return None
-
 
     def load_bin(self, path):
         weights_path = glob.glob(f"{path}/*.bin")
