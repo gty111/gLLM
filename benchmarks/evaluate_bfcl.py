@@ -144,16 +144,18 @@ def build_chat_payload(entry, mode, model, max_tokens, temperature, no_thinking)
 
     if mode == "native":
         # Hand the tools to the server and let it emit structured tool_calls.
+        # convert_to_tool sanitizes names to satisfy OpenAI's
+        # ^[a-zA-Z0-9_-]{1,64}$ rule (e.g. ``math.factorial`` -> ``math_factorial``).
+        # Keep the sanitized names: this is the portable convention shared by
+        # all OpenAI-compatible servers and their native tool parsers (vLLM's
+        # ``kimi_k2`` parser, etc.), and it matches how BFCL's native-FC
+        # handlers talk to the model. The scoring side symmetrically maps the
+        # gold names via ``convert_func_name`` whenever the chosen
+        # ``--bfcl-model-name`` config has ``underscore_to_dot=True``, so the
+        # comparison stays consistent without any dotted-name round-trip.
         tools = convert_to_tool(
             functions, GORILLA_TO_OPENAPI, ModelStyle.OPENAI_COMPLETIONS
         )
-        # convert_to_tool sanitizes names for OpenAI's ^[a-zA-Z0-9_-]{1,64}$
-        # rule (e.g. ``math.factorial`` -> ``math_factorial``). gLLM accepts
-        # dotted names, so restore the originals (convert_to_tool preserves
-        # order 1:1 with ``functions``); the model then emits the exact gold
-        # name and we avoid an ambiguous underscore->dot round-trip at scoring.
-        for tool, fn in zip(tools, functions):
-            tool["function"]["name"] = fn["name"]
         payload["messages"] = messages
         payload["tools"] = tools
         # NB: don't send tool_choice="auto" -- gLLM only accepts "none" or a
@@ -350,9 +352,12 @@ def main():
     parser.add_argument("--model", required=True,
                         help="Model name sent in the request body / served name.")
     parser.add_argument(
-        "--bfcl-model-name", default="qwen3-8b",
+        "--bfcl-model-name", default="kimi-k2-0905-preview-FC",
         help="A model name registered in bfcl_eval, used ONLY by the AST "
-        "checker for function-name normalization (does not affect generation).",
+        "checker for function-name normalization (does not affect generation). "
+        "Pick a native-FC config with underscore_to_dot=True (the default) so "
+        "the gold function names are converted to match the underscore-"
+        "sanitized names that OpenAI-compatible servers emit.",
     )
     parser.add_argument(
         "--test-category", default="simple_python,multiple,parallel,parallel_multiple,irrelevance",
