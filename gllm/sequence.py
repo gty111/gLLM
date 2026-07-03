@@ -52,6 +52,12 @@ class Sequence:
         self.to_compute_token_num = 0
         # used for abort
         self.is_abort = False
+        # DP-attention request pinning: when the frontend exposes one HTTP
+        # endpoint per DP replica (``--endpoint-per-dp``), the endpoint that
+        # received this request pins it to that replica index so the seq's KV
+        # lives there. ``None`` => frontend round-robins across replicas (the
+        # default single-endpoint behaviour).
+        self.target_dp: Optional[int] = None
         # used for multimodal input
         self.mm_contents = mm_contents
         # used to remove redundant token_ids

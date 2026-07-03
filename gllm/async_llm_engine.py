@@ -77,6 +77,7 @@ class PipeAsyncLLM(LLM):
         repetition_penalty: float,
         mm_contents=None,
         mm_items=None,
+        dp_index=None,
     ):
         seq = self.allocate_seq(
             token_ids,
@@ -89,6 +90,10 @@ class PipeAsyncLLM(LLM):
             mm_contents,
             mm_items,
         )
+        # Pin to a specific DP replica when the request came in on a per-replica
+        # endpoint (``--endpoint-per-dp``); ``None`` keeps the round-robin default.
+        if dp_index is not None and self.dp_size > 1:
+            seq.target_dp = dp_index % self.dp_size
         stream = AsyncStream(raw_request, seq=seq)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream

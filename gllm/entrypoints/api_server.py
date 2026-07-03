@@ -27,7 +27,7 @@ from gllm.entrypoints.serving_completions import (
     completion_stream_generator,
 )
 from gllm.entrypoints.tool_parsers import get_tool_parser
-from gllm.utils import make_async
+from gllm.utils import find_free_ports, make_async
 
 router = APIRouter()
 
@@ -124,6 +124,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             request.repetition_penalty,
             mm_contents,
             mm_items,
+            dp_index=getattr(raw_request.app.state, "dp_index", None),
         )
     else:
         return ErrorResponse(
@@ -152,6 +153,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             request.top_p,
             request.top_k,
             request.repetition_penalty,
+            dp_index=getattr(raw_request.app.state, "dp_index", None),
         )
     else:
         return ErrorResponse(
@@ -179,16 +181,57 @@ async def stop_profile():
     return JSONResponse(content={"message": "Profiler stopped", "success": True})
 
 
-async def run_server(args):
+def _build_app(dp_index=None):
+    """One FastAPI app. ``dp_index`` (via ``app.state``) pins every request that
+    arrives on this app to a specific DP replica; ``None`` = round-robin."""
     app = fastapi.FastAPI()
     app.include_router(router)
+    app.state.dp_index = dp_index
+    return app
 
-    server = uvicorn.Server(uvicorn.Config(app, port=args.port, host=args.host))
 
+def _endpoint_ports(args):
+    """Ports for the per-DP-replica endpoints: explicit ``--endpoint-per-dp-ports``
+    (comma-separated, one per replica) or auto-allocated free ports."""
+    dp_size = getattr(args, "dp", 1)
+    if getattr(args, "endpoint_per_dp_ports", None):
+        ports = [int(p) for p in args.endpoint_per_dp_ports.split(",") if p != ""]
+        assert len(ports) == dp_size, (
+            f"--endpoint-per-dp-ports has {len(ports)} ports but dp_size={dp_size}"
+        )
+        return ports
+    return find_free_ports(dp_size, args.host)
+
+
+async def run_server(args):
     loop = asyncio.get_running_loop()
 
-    server_task = loop.create_task(server.serve())
+    # Per-DP-replica endpoints: one HTTP listener per replica, each pinning its
+    # requests to that replica (the single engine still runs the shared schedule
+    # loop and routes outputs back by seq_id). Off by default => one endpoint,
+    # requests round-robined across replicas.
+    if getattr(args, "endpoint_per_dp", False) and getattr(args, "dp", 1) > 1:
+        ports = _endpoint_ports(args)
+        servers = [
+            uvicorn.Server(uvicorn.Config(_build_app(d), port=port, host=args.host))
+            for d, port in enumerate(ports)
+        ]
+        logger.info(
+            "DP per-replica endpoints enabled: %s",
+            ", ".join(f"dp{d}->:{p}" for d, p in enumerate(ports)),
+        )
+        tasks = [loop.create_task(s.serve()) for s in servers]
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            for s in servers:
+                await s.shutdown()
+        return
 
+    port = args.port if args.port is not None else find_free_ports(1, args.host)[0]
+    logger.info("HTTP endpoint on %s:%d", args.host, port)
+    server = uvicorn.Server(uvicorn.Config(_build_app(), port=port, host=args.host))
+    server_task = loop.create_task(server.serve())
     try:
         await server_task
     except asyncio.CancelledError:
@@ -197,12 +240,23 @@ async def run_server(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Launch gLLM server")
-    # Network
+    # Network. Ports default to ``None`` -> a free port is auto-allocated at
+    # startup and logged. Pass explicit values for multi-node runs where every
+    # node must agree on the same ports.
     parser.add_argument("--host", type=str, help="Host addr", default="0.0.0.0")
-    parser.add_argument("--port", type=int, help="Uvicorn port", default=8000)
+    parser.add_argument(
+        "--port",
+        type=int,
+        help="Uvicorn HTTP port (auto-selects a free port when unset).",
+        default=None,
+    )
     parser.add_argument("--master-addr", type=str, help="NCCL addr", default="0.0.0.0")
-    parser.add_argument("--master-port", type=str, help="NCCL port", default="8001")
-    parser.add_argument("--zmq-port-base", type=int, help="ZeroMQ port", default=8002)
+    parser.add_argument(
+        "--master-port",
+        type=str,
+        help="NCCL rendezvous port (auto-selects a free port when unset).",
+        default=None,
+    )
     # Model
     parser.add_argument(
         "--model-path",
@@ -289,6 +343,30 @@ if __name__ == "__main__":
             "EP = dp*tp ranks per pipeline stage."
         ),
         default=1,
+    )
+    parser.add_argument(
+        "--endpoint-per-dp",
+        dest="endpoint_per_dp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Expose one HTTP endpoint per DP replica (dp_size > 1). Requests that "
+            "arrive on endpoint d are pinned to DP replica d (its KV cache lives "
+            "there) instead of being round-robined. A single engine still runs "
+            "the shared per-iter schedule/barrier and routes outputs back by "
+            "seq_id. Off => one endpoint on --port, round-robin across replicas."
+        ),
+    )
+    parser.add_argument(
+        "--endpoint-per-dp-ports",
+        dest="endpoint_per_dp_ports",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated ports for the per-replica endpoints (one per DP "
+            "replica, in DP-rank order), used with --endpoint-per-dp. Defaults "
+            "to auto-allocated free ports."
+        ),
     )
     parser.add_argument(
         "--enable-ep",
@@ -393,7 +471,6 @@ if __name__ == "__main__":
         host=args.host,
         master_addr=args.master_addr,
         master_port=args.master_port,
-        zmq_port_base=args.zmq_port_base,
         launch_mode=args.launch_mode,
         worker_ranks=args.ranks,
         load_format=args.load_format,

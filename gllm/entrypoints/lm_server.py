@@ -50,8 +50,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "pp_size stays 1.",
     )
     p.add_argument("--master-addr", type=str, default="0.0.0.0")
-    p.add_argument("--master-port", type=str, default="8001")
-    p.add_argument("--zmq-port-base", type=int, default=8002)
+    p.add_argument("--master-port", type=str, default=None)
     # NIXL transport backend (PP0 receive side). The data-plane endpoint is
     # auto-negotiated via the metadata exchanged over the ZMQ control plane, so
     # there is no fixed listen port to configure here.
@@ -176,7 +175,6 @@ def main():
         host=args.host,
         master_addr=args.master_addr,
         master_port=args.master_port,
-        zmq_port_base=args.zmq_port_base,
         launch_mode="normal",
         worker_ranks=None,
         load_format=args.load_format,

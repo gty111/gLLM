@@ -320,7 +320,6 @@ with **0 empty responses and no tail stall**; GPUs stayed 47–80 % utilized. Be
 python -m gllm.entrypoints.api_server \
     --model-path <MLA-model> \
     --tp 2 --dp 2 --enable-ep \
-    --port 8010 --master-port 8011 --zmq-port-base 8012 \
     --model-max-length 8192
 ```
 

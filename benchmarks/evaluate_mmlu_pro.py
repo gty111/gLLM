@@ -142,7 +142,11 @@ def single_request(api_url, single_question, cot_examples_dict, pbar):
 
 
 async def evaluate(subjects):
-    api_url = f"http://{args.host}:{args.port}/v1/chat/completions"
+    # ``--port`` may be a comma-separated list (e.g. per-DP endpoints); requests
+    # are round-robined across the resulting URLs so load is split across them.
+    ports = [p.strip() for p in str(args.port).split(",") if p.strip()]
+    api_urls = [f"http://{args.host}:{p}/v1/chat/completions" for p in ports]
+    print("endpoints:", api_urls)
     test_df, dev_df = load_mmlu_pro()
     if not subjects:
         subjects = list(test_df.keys())
@@ -155,7 +159,7 @@ async def evaluate(subjects):
     # (no page-exhaustion throttling) and makes the run reproducible.
     sem = asyncio.Semaphore(args.concurrency)
 
-    async def bounded_request(each):
+    async def bounded_request(api_url, each):
         async with sem:
             return await single_request(api_url, each, dev_df, pbar)
 
@@ -167,7 +171,8 @@ async def evaluate(subjects):
         test_data = test_df[subject][: args.num_per_sub]
         test_data_total.extend(test_data)
         for each in test_data:
-            tasks.append(bounded_request(each))
+            api_url = api_urls[len(tasks) % len(api_urls)]
+            tasks.append(bounded_request(api_url, each))
     pbar.total = len(tasks)
     completions = await asyncio.gather(*tasks)
     pbar.close()
@@ -221,7 +226,13 @@ if __name__ == "__main__":
         "economics, math, physics, computer science, philosophy, engineering",
     )
     parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--port",
+        type=str,
+        default="8000",
+        help="Server port, or a comma-separated list of ports to round-robin "
+        "across (e.g. per-DP endpoints).",
+    )
     parser.add_argument("--output-len", type=int, default=1024)
     parser.add_argument("--num-per-sub", type=int, default=100)
     parser.add_argument("--num-shots", type=int, default=5)

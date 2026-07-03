@@ -13,7 +13,12 @@ from gllm.id_allocator import IDAllocator
 from gllm.model_runner import ModelRunner, OverlapModelRunner
 from gllm.overlap_worker import OverlapWorker, run_overlap_worker
 from gllm.sequence import Sequence
-from gllm.utils import get_model_load_pbar, init_logger, random_uuid
+from gllm.utils import (
+    find_free_port,
+    get_model_load_pbar,
+    init_logger,
+    random_uuid,
+)
 from gllm.worker import Worker, run_worker
 
 
@@ -30,8 +35,7 @@ class LLM:
         model_path,
         host=None,
         master_addr: str = "0.0.0.0",
-        master_port: str = "8000",
-        zmq_port_base: int = 8001,
+        master_port: str = None,
         launch_mode: str = "normal",
         worker_ranks: str = None,
         load_format: str = "auto",
@@ -127,8 +131,13 @@ class LLM:
         self.use_ep = use_ep
         self.host = host
         self.master_addr = master_addr
+        # Auto-allocate a free NCCL rendezvous port when unset, so offline /
+        # library usage (constructing the engine directly) gets a working port
+        # without the caller having to pick one.
+        if master_port is None:
+            master_port = str(find_free_port(master_addr))
+            logger.info(f"Auto-selected NCCL master_port {master_port}")
         self.master_port = master_port
-        self.zmq_port_base = zmq_port_base
         self.launch_mode = launch_mode
         self.worker_ranks = worker_ranks
         self.id_allocator = IDAllocator(0, 99999)
@@ -211,7 +220,6 @@ class LLM:
 
         self.comm = zmqComm(
             self.host,
-            self.zmq_port_base,
             self.launch_mode,
             self.master_addr,
             self.schedule_path,
@@ -274,7 +282,6 @@ class LLM:
             run_target = run_worker
         comm = zmqComm(
             self.host,
-            self.zmq_port_base,
             self.launch_mode,
             self.master_addr,
             self.schedule_path,
@@ -421,11 +428,13 @@ class LLM:
     def _send_ipc_package_dp(self, wait_lists, abort_ids, log=True):
         """Spread new requests across DP replicas; broadcast aborts to all.
 
-        New sequences are round-robined one per package so zmq delivers each to
-        exactly one replica (that replica then owns the seq's KV for its whole
-        lifetime). Aborts don't carry replica ownership on the frontend, so they
-        are broadcast to every replica; a replica that doesn't own the seq_id
-        simply ignores the unknown id.
+        New sequences are sent one per package so zmq delivers each to exactly
+        one replica (that replica then owns the seq's KV for its whole lifetime).
+        A seq's target replica is ``seq.target_dp`` when the request arrived on a
+        per-replica HTTP endpoint (``--endpoint-per-dp``); otherwise it is
+        round-robined across replicas. Aborts don't carry replica ownership on
+        the frontend, so they are broadcast to every replica; a replica that
+        doesn't own the seq_id simply ignores the unknown id.
 
         ``wait_lists`` / ``abort_ids`` are the snapshots already claimed (and
         cleared from ``self``) by :meth:`send_ipc_package` under the lock.
@@ -433,8 +442,11 @@ class LLM:
         for seq in wait_lists:
             pkg = IPCPackage([seq])
             pkg.log = log
-            self.comm.send_ipc_package_to_dp(pkg, self._dp_rr)
-            self._dp_rr = (self._dp_rr + 1) % self.dp_size
+            target = getattr(seq, "target_dp", None)
+            if target is None:
+                target = self._dp_rr
+                self._dp_rr = (self._dp_rr + 1) % self.dp_size
+            self.comm.send_ipc_package_to_dp(pkg, target)
         if len(abort_ids) != 0:
             logger.warning(
                 f"Abort {len(abort_ids)} request(s) due to loss of network connection"
