@@ -1,7 +1,97 @@
+import os
 from typing import Union
 
 import torch
 from typing_extensions import TypeAlias
+
+from gllm.dist_utils import (
+    dp_gather_hidden,
+    dp_local_slice,
+    ep_all_reduce,
+    get_dp_forward_counts,
+    get_dp_size,
+)
+
+
+def get_moe_chunk_size() -> int:
+    """Max #tokens fed to the routed experts per call on the DP+EP path.
+
+    Under DP attention the experts run over the *gathered* global batch
+    (``dp_size x local_tokens``), so the ``FusedMoE`` intermediate activation
+    scales with ``dp_size`` and can dominate memory -- squeezing the KV cache
+    (and, before profiling was fixed to a real prefill, OOMing outright).
+
+    Splitting the global batch into row-chunks bounds that peak to ``chunk``
+    rows regardless of ``dp_size``. Routing is per-token, so processing the rows
+    in chunks is bit-identical to one big call. ``<= 0`` disables chunking.
+
+    Configured via ``GLLM_FUSED_MOE_CHUNK_SIZE`` and defaults to 32768. Lower it
+    (e.g. 8192 ~ one replica's prefill budget) to bound the peak harder and free
+    more KV, raise it (or set 0 to disable) to favor larger, more efficient
+    expert GEMMs.
+    """
+    try:
+        return int(os.environ.get("GLLM_FUSED_MOE_CHUNK_SIZE", "32768"))
+    except ValueError:
+        return 32768
+
+
+def dp_ep_moe_routed(experts, gate, hidden_states, num_tokens):
+    """Routed-expert core for DP-attention + Expert-Parallel MoE (``EP = DP x TP``).
+
+    Under DP attention each replica arrives with only *its own* tokens while the
+    routed experts are sharded across the whole DP/EP group. So we:
+
+    1. all-gather every replica's tokens into the global batch;
+    2. run this replica's local expert shard over the global batch (``experts``
+       must be built with ``reduce_results=False`` -> partial output, rows whose
+       top experts live elsewhere are zero), chunking the rows so the peak
+       expert activation stays bounded by :func:`get_moe_chunk_size` regardless
+       of ``dp_size``;
+    3. all-reduce over the EP group so every token accumulates all its top-k
+       experts wherever they live;
+    4. slice this replica's own rows back out.
+
+    ``gate`` maps the (global) hidden states to router logits; ``experts`` is the
+    block's :class:`FusedMoE`. Returns this replica's local routed output. Shared
+    experts / scaling are the caller's responsibility (they differ per model).
+
+    ``get_dp_forward_counts`` gives the per-replica row counts (published by the
+    worker each iteration); it is ``None`` only during the profile / graph-warmup
+    dummy forward, where every replica runs the same batch so a symmetric gather
+    (``num_tokens`` per replica) is exact.
+    """
+    counts = get_dp_forward_counts()
+    if counts is None:
+        counts = [num_tokens] * get_dp_size()
+    global_hidden = dp_gather_hidden(hidden_states, counts)
+    router_logits = gate(global_hidden)
+
+    # Chunk the routed-expert forward over the gathered rows. Routing is
+    # per-token, so this is exact; it just caps the intermediate activation at
+    # ``chunk`` rows instead of the full ``dp_size x local_tokens`` batch.
+    # Decode / CUDA-graph batches are small (``dp_size x bucket``) and stay
+    # below ``chunk``, so they take the single-call fast path unchanged.
+    chunk = get_moe_chunk_size()
+    m = global_hidden.shape[0]
+    if chunk <= 0 or m <= chunk:
+        routed = experts(hidden_states=global_hidden, router_logits=router_logits)
+    else:
+        routed = None
+        for start in range(0, m, chunk):
+            end = min(start + chunk, m)
+            out = experts(
+                hidden_states=global_hidden[start:end],
+                router_logits=router_logits[start:end],
+            )
+            if routed is None:
+                # Allocate from the expert output so dtype/width match exactly.
+                routed = out.new_empty((m, out.shape[1]))
+            routed[start:end] = out
+
+    routed = ep_all_reduce(routed)
+    routed = dp_local_slice(routed, counts)
+    return routed
 
 
 def extract_rope_config(config, default_theta: float = 10000.0):

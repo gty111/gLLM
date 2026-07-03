@@ -4,11 +4,6 @@ import torch
 import torch.nn as nn
 
 from gllm.dist_utils import (
-    dp_gather_hidden,
-    dp_local_slice,
-    ep_all_reduce,
-    get_dp_forward_counts,
-    get_dp_size,
     get_pp_layers,
     get_tp_size,
     is_dp_attn,
@@ -34,7 +29,7 @@ from gllm.utils import yarn_get_mscale
 
 from .qwen2 import Qwen2ForCausalLM
 from .qwen2_moe import Qwen2MoeForCausalLM
-from .utils import extract_rope_config
+from .utils import dp_ep_moe_routed, extract_rope_config
 from .weight_loader import (
     WeightRule,
     contains,
@@ -186,17 +181,7 @@ class DeepseekV2MOE(nn.Module):
             if get_tp_size() > 1:
                 shared_output = tensor_model_parallel_all_reduce(shared_output)
 
-        counts = get_dp_forward_counts()
-        if counts is None:
-            counts = [num_tokens] * get_dp_size()
-
-        global_hidden = dp_gather_hidden(hidden_states, counts)
-        router_logits = self.gate(global_hidden)
-        routed = self.experts(
-            hidden_states=global_hidden, router_logits=router_logits
-        )
-        routed = ep_all_reduce(routed)
-        routed = dp_local_slice(routed, counts)
+        routed = dp_ep_moe_routed(self.experts, self.gate, hidden_states, num_tokens)
 
         if hidden_states.dtype != torch.float16:
             final_hidden_states = routed * self.routed_scaling_factor

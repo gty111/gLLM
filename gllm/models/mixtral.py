@@ -6,12 +6,14 @@ from torch import nn
 from gllm.dist_utils import (
     get_ep_rank,
     get_ep_size,
+    is_dp_attn,
 )
 from gllm.input_data import InputData
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe import FusedMoE, determine_expert_map
 
 from .qwen2 import Qwen2Attention, Qwen2ForCausalLM, Qwen2Model
+from .utils import dp_ep_moe_routed
 from .weight_loader import (
     WeightRule,
     contains,
@@ -30,7 +32,11 @@ class MixtralMoE(nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
-            reduce_results=True,
+            # Under DP attention the routed output is summed over the EP group
+            # (``ep_all_reduce`` in the DP path), so the FusedMoE must emit
+            # partials (``reduce_results=False``); the non-DP path keeps its
+            # internal TP reduce.
+            reduce_results=not is_dp_attn(),
             renormalize=True,
         )
         self.gate = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
@@ -39,6 +45,14 @@ class MixtralMoE(nn.Module):
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
+        if is_dp_attn():
+            # Mixtral has no shared expert -> the DP+EP routed core is the whole
+            # block (attention already ran data-parallel; experts are EP-sharded).
+            num_tokens = hidden_states.shape[0]
+            final_hidden_states = dp_ep_moe_routed(
+                self.experts, self.gate, hidden_states, num_tokens
+            )
+            return final_hidden_states.view(orig_shape)
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)

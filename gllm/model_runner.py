@@ -1360,9 +1360,58 @@ class ModelRunner:
             seq.to_compute_token_num = 1
         return seqs
 
+    def create_dummy_prefill_seqs(self, total_tokens):
+        """Build a dummy *prefill* batch totalling ``total_tokens`` tokens.
+
+        The largest single forward the engine can issue is a full prefill of
+        ``max_num_batched_tokens`` tokens (the input buffers are sized to
+        exactly this), so this is the batch shape that drives peak activation
+        memory. Profiling with it lets :meth:`profile_run` size the KV cache
+        from what is *actually* left after the worst-case forward.
+
+        This matters most under DP-attention + EP: the MoE ``dp_gather`` runs
+        the experts over ``dp_size x local_tokens``, so a decode-shaped dummy
+        (1 token/seq, ``max_running_seqs`` seqs) under-measures the MoE
+        activation by roughly ``max_num_batched_tokens / max_running_seqs``.
+        The profiler then over-reserves KV and the first real prefill OOMs.
+
+        Attention is skipped during profiling (the KV segment is only built in
+        ``MemoryManager.init`` afterwards -- see ``FlashAttention.forward`` /
+        ``MLAAttention.forward``), so the page-table / slot indices below are
+        only used to build ``input_data`` and never dereference a real cache.
+        """
+        total_tokens = max(1, int(total_tokens))
+        # Cap each dummy sequence at the context window so RoPE positions stay
+        # valid; tile as many as needed (peak activation depends on the *total*
+        # token count, not how it is split across sequences).
+        per_seq = max(1, min(total_tokens, self.model_max_length))
+        seqs = []
+        next_page = 0
+        remaining = total_tokens
+        idx = 0
+        while remaining > 0:
+            length = min(per_seq, remaining)
+            seq = Sequence(idx, [1] * length, [], output_len=1)
+            seq.prompt_len = length
+            seq.computed_token_num = 0
+            seq.to_compute_token_num = length
+            num_pages = (length + self.page_size - 1) // self.page_size
+            seq.page_table.extend(range(next_page, next_page + num_pages))
+            next_page += num_pages
+            seqs.append(seq)
+            remaining -= length
+            idx += 1
+        return seqs
+
     @torch.inference_mode()
     def profile_run(self, stream: Optional[torch.cuda.Stream] = None):
-        """Run one dummy forward at max batch size.
+        """Run one dummy forward at the peak batch shape.
+
+        The dummy is a full prefill of ``max_num_batched_tokens`` tokens (see
+        :meth:`create_dummy_prefill_seqs`) -- the largest single forward the
+        engine can issue -- so the memory profile captures true peak activation
+        (including the DP+EP ``dp_gather`` amplification) before the KV cache is
+        sized from the remainder.
 
         Used both for startup memory profiling (``stream=None``, runs on the
         current stream) and as the pre-capture warmup in :meth:`capture_graph`
@@ -1370,7 +1419,7 @@ class ModelRunner:
         workspace there *before* graph capture begins; the run is synchronized
         on return so all that lazy init has completed).
         """
-        seqs = self.create_dummy_seqs(self.max_running_seqs)
+        seqs = self.create_dummy_prefill_seqs(self.max_num_batched_tokens)
         self.input_data.cal_and_set_input(seqs)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if self.uses_mrope:

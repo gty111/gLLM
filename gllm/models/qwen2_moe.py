@@ -8,6 +8,7 @@ from gllm.dist_utils import (
     get_ep_rank,
     get_ep_size,
     get_tp_size,
+    is_dp_attn,
     tensor_model_parallel_all_reduce,
 )
 
@@ -19,6 +20,7 @@ from .qwen2 import Qwen2Attention as Qwen2MoeAttention
 from .qwen2 import Qwen2ForCausalLM
 from .qwen2 import Qwen2MLP as Qwen2MoeMLP
 from .qwen2 import Qwen2Model
+from .utils import dp_ep_moe_routed
 from .weight_loader import (
     WeightRule,
     contains,
@@ -71,13 +73,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
-        shared_output = None
-        if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
-            if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
+        if is_dp_attn():
+            return self._forward_dp_ep(hidden_states, orig_shape)
+        shared_output = self._shared_output(hidden_states)
 
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -89,6 +87,41 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states.view(orig_shape)
+
+    def _shared_output(self, hidden_states: torch.Tensor):
+        if self.shared_expert is None:
+            return None
+        shared_output = self.shared_expert(hidden_states)
+        if self.shared_expert_gate is not None:
+            shared_output = (
+                F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
+            )
+        return shared_output
+
+    def _forward_dp_ep(self, hidden_states: torch.Tensor, orig_shape):
+        """DP-attention + Expert-Parallel MoE (``EP = DP x TP``).
+
+        Attention already ran data-parallel (this replica holds only its own
+        tokens). The routed experts are EP-sharded across the whole DP/TP group,
+        so the routed core all-gathers the global batch, runs the local shard,
+        EP-all-reduces, and slices this replica's rows back out (see
+        :func:`dp_ep_moe_routed`). The dense shared expert runs on local tokens;
+        under TP its ``down_proj`` was built with ``reduce_results=False`` so we
+        sum its partials over the TP subgroup here (the routed leg's EP all-reduce
+        replaces the block's usual trailing TP all-reduce).
+        """
+        num_tokens = hidden_states.shape[0]
+        shared_output = self._shared_output(hidden_states)
+        if shared_output is not None and self.tp_size > 1:
+            shared_output = tensor_model_parallel_all_reduce(shared_output)
+
+        final_hidden_states = dp_ep_moe_routed(
+            self.experts, self.gate, hidden_states, num_tokens
+        )
+        if shared_output is not None:
+            final_hidden_states = final_hidden_states + shared_output
 
         return final_hidden_states.view(orig_shape)
 
