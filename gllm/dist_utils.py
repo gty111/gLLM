@@ -39,6 +39,31 @@ _PP_SIZE = 1
 _TP_SIZE = 1
 _EP_SIZE = 1
 _WORLD_SIZE = 1
+# Data-parallel (DP) attention state. When ``_DP_SIZE > 1`` the engine runs
+# ``_DP_SIZE`` full-model replicas (one per GPU). Each replica owns its own
+# scheduler + KV cache and serves a disjoint shard of requests (round-robined
+# by the frontend), so the *attention* path is pure data-parallel -- the
+# compressed MLA latent KV cache is sharded across replicas instead of being
+# replicated on every TP rank.
+#
+# The *experts* are, in contrast, sharded across all replicas with
+# ``EP = DP x TP`` (the DeepSeek/SGLang MoE deployment): every replica holds
+# ``1/DP`` of the routed experts. Each MoE layer therefore all-gathers the
+# per-replica tokens into the global batch, runs its local expert shard, and
+# all-reduces the result back before each replica slices out its own rows. To
+# do that the replicas *do* form a shared NCCL communicator -- the torch
+# *default* process group of size ``_DP_SIZE`` (see :func:`init_dp_ep`). gLLM's
+# own TP/PP/world bookkeeping is deliberately left in single-rank mode so each
+# replica still behaves as a self-contained column driver (own frontend
+# sockets, no PP/TP followers); only ``_EP_*`` and the DP collectives use the
+# default group.
+_DP_RANK = 0
+_DP_SIZE = 1
+# Per-forward token counts across the DP group (one int per replica), published
+# by the worker before each forward and consumed by the MoE layers to drive the
+# variable-length all-gather. ``None`` outside a driven forward (profile /
+# graph-warmup), where the MoE falls back to a symmetric gather.
+_DP_FWD_COUNTS = None
 _ASSIGNED_LAYERS = None
 _TP_GROUP = None
 # Dedicated TP communicator for the per-iter IPC broadcast (rank 0 ->
@@ -49,6 +74,15 @@ _TP_GROUP = None
 # previous iter's per-layer ARs to drain on the same NCCL stream); on
 # a dedicated group the same broadcast finishes in ~10-20 us.
 _IPC_TP_GROUP = None
+# DP process group: the ranks that share this replica's ``tp_rank`` across all
+# DP groups (``{d*tp_size + tp_rank : d in range(dp_size)}``). Used by the MoE
+# to all-gather tokens across the DP dimension. ``None`` outside DP.
+_DP_GROUP = None
+# EP process group: the routed experts are sharded across the ranks of a single
+# pipeline stage (``dp_size * tp_size`` ranks). For ``pp_size == 1`` this is the
+# whole world; :func:`ep_all_reduce` sums the expert shards over it. ``None``
+# outside DP+EP (the non-DP MoE path reduces over the TP group instead).
+_EP_GROUP = None
 _USE_EP = True
 
 
@@ -70,6 +104,262 @@ def get_tp_rank():
 
 def get_ep_rank():
     return _EP_RANK
+
+
+def get_dp_rank():
+    return _DP_RANK
+
+
+def get_dp_size():
+    return _DP_SIZE
+
+
+def get_dp_group():
+    return _DP_GROUP
+
+
+def get_ep_group():
+    return _EP_GROUP
+
+
+def is_dp_attn():
+    """True when DP-attention (independent per-GPU replicas) is enabled."""
+    return _DP_SIZE > 1
+
+
+def set_dp_info(dp_rank, dp_size, local_rank=None):
+    """Record this replica's DP rank/size (bookkeeping/logging only).
+
+    Used on the ``dp_size == 1`` path (and as a fallback) to record
+    ``local_rank`` in dist_utils: with ``pp_size == tp_size == 1`` the engine
+    never calls :func:`init_dist`, so ``_LOCAL_RANK`` would otherwise stay ``0``
+    on every process. Several call sites key off ``get_local_rank()`` -- most
+    importantly the weight-load progress array (indexed ``rank*2`` /
+    ``rank*2+1``), which would collide onto slot 0 and hang the frontend's
+    ``load_progress`` wait. The ``dp_size > 1`` path uses :func:`init_dp_ep`
+    instead, which records the same state and additionally forms the NCCL group.
+    """
+    global _DP_RANK, _DP_SIZE, _LOCAL_RANK
+    _DP_RANK = dp_rank
+    _DP_SIZE = dp_size
+    if local_rank is not None:
+        _LOCAL_RANK = local_rank
+
+
+def init_dp_ep(
+    pp_size,
+    dp_size,
+    tp_size,
+    pp_rank,
+    dp_rank,
+    tp_rank,
+    use_ep,
+    local_rank,
+    master_addr,
+    master_port,
+    assigned_layers=None,
+):
+    """Bring up (PP x) DP-attention + Expert-Parallel (``EP = DP x TP``).
+
+    Layout: ``world = pp_size * dp_size * tp_size`` ranks arranged as a
+    ``pp x dp x tp`` grid with
+
+        ``global_rank = pp_rank * S + dp_rank * tp_size + tp_rank``,  ``S = dp_size * tp_size``.
+
+    ``S`` is the *stage size*: within one pipeline stage the ``dp x tp`` grid is
+    exactly the single-stage DP+EP layout, offset by ``pp_rank * S``. Four group
+    families are formed (every rank calls ``new_group`` the same number of times
+    in the same order, since all iterate the identical nested loops):
+
+    * **TP subgroups** -- fix ``(pp, dp)``, vary ``tp``. Standard tensor
+      parallelism *within* a DP group at one stage (attention heads,
+      embedding/lm-head, o_proj/down_proj all-reduce). The MLA latent KV is
+      replicated across these ``tp_size`` ranks and sharded across DP groups.
+    * **DP subgroups** -- fix ``(pp, tp)``, vary ``dp``. Used by the MoE to
+      all-gather tokens across the DP dimension *within a stage*
+      (:func:`dp_gather_hidden`, :func:`dp_all_gather_meta`).
+    * **EP groups** -- fix ``pp``, all ``(dp, tp)`` (the ``S`` ranks of one
+      stage). The routed experts are sharded across a stage's ``S`` ranks;
+      :func:`ep_all_reduce` sums the shards over :func:`get_ep_group`.
+    * **PP** -- adjacent stages talk via ``rank +/- S`` (same ``(dp, tp)``),
+      see :func:`get_next_pp_rank` / :func:`get_last_pp_rank`.
+
+    For ``pp_size == 1`` this reduces to the single-stage DP+EP layout (EP group
+    == whole world). For ``tp_size == 1`` the TP subgroups are singletons.
+    """
+    global _DP_RANK, _DP_SIZE, _DP_GROUP, _EP_RANK, _EP_SIZE, _EP_GROUP, _USE_EP
+    global _RANK, _WORLD_SIZE, _TP_SIZE, _PP_SIZE, _TP_RANK, _PP_RANK, _LOCAL_RANK
+    global _TP_GROUP, _IPC_TP_GROUP, _ASSIGNED_LAYERS
+
+    stage_size = dp_size * tp_size
+    world_size = pp_size * stage_size
+    global_rank = pp_rank * stage_size + dp_rank * tp_size + tp_rank
+
+    _DP_RANK = dp_rank
+    _DP_SIZE = dp_size
+    _TP_SIZE = tp_size
+    _TP_RANK = tp_rank
+    _PP_SIZE = pp_size
+    _PP_RANK = pp_rank
+    _RANK = global_rank
+    _WORLD_SIZE = world_size
+    _USE_EP = use_ep
+    _ASSIGNED_LAYERS = assigned_layers
+    # EP spans one pipeline stage (EP = DP x TP); each rank owns 1/S experts.
+    _EP_SIZE = stage_size if use_ep else tp_size
+    _EP_RANK = (dp_rank * tp_size + tp_rank) if use_ep else tp_rank
+    _LOCAL_RANK = local_rank
+
+    init_method = f"tcp://{master_addr}:{master_port}"
+    logger.info(
+        f"NCCL(DP+EP): Init_method {init_method}, Rank {global_rank}, "
+        f"PP {pp_rank}/{pp_size}, DP {dp_rank}/{dp_size}, TP {tp_rank}/{tp_size}, "
+        f"EP size {_EP_SIZE}, World_size {world_size}"
+    )
+    dist.init_process_group(
+        init_method=init_method,
+        backend="nccl",
+        world_size=world_size,
+        rank=global_rank,
+    )
+
+    def _stage_base(pp):
+        return pp * stage_size
+
+    # TP subgroups (attention / embedding / lm-head + a separate IPC
+    # communicator for the input broadcast; see ``_IPC_TP_GROUP``).
+    tp_groups = [
+        [_stage_base(pp) + d * tp_size + t for t in range(tp_size)]
+        for pp in range(pp_size)
+        for d in range(dp_size)
+    ]
+    for ranks in tp_groups:
+        g = dist.new_group(ranks)
+        if global_rank in ranks:
+            _TP_GROUP = g
+    for ranks in tp_groups:
+        g = dist.new_group(ranks)
+        if global_rank in ranks:
+            _IPC_TP_GROUP = g
+
+    # DP subgroups (MoE token all-gather across the DP dimension, per stage).
+    dp_groups = [
+        [_stage_base(pp) + d * tp_size + t for d in range(dp_size)]
+        for pp in range(pp_size)
+        for t in range(tp_size)
+    ]
+    for ranks in dp_groups:
+        g = dist.new_group(ranks)
+        if global_rank in ranks:
+            _DP_GROUP = g
+
+    # EP groups (routed-expert all-reduce, one per pipeline stage).
+    ep_groups = [
+        [_stage_base(pp) + i for i in range(stage_size)] for pp in range(pp_size)
+    ]
+    for ranks in ep_groups:
+        g = dist.new_group(ranks)
+        if global_rank in ranks:
+            _EP_GROUP = g
+
+
+def set_dp_forward_counts(counts):
+    """Publish this forward's per-replica token counts (see ``_DP_FWD_COUNTS``)."""
+    global _DP_FWD_COUNTS
+    _DP_FWD_COUNTS = counts
+
+
+def get_dp_forward_counts():
+    return _DP_FWD_COUNTS
+
+
+def dp_all_gather_num_tokens(local_ntok: int):
+    """All-gather each replica's forward token count over the DP group.
+
+    Called once per iteration by every replica (an unconditional barrier that
+    keeps the replicas in lockstep). Returns the per-replica counts as a list.
+    """
+    t = torch.tensor([local_ntok], dtype=torch.long, device="cuda")
+    out = torch.empty(_DP_SIZE, dtype=torch.long, device="cuda")
+    dist.all_gather_into_tensor(out, t, group=_DP_GROUP)
+    return out.tolist()
+
+
+def dp_all_gather_meta(local_ntok: int, is_decode: bool):
+    """All-gather each DP group's ``(token count, is_decode)`` this iteration.
+
+    A single fixed-size collective (one row per DP group) that doubles as the
+    per-iter lockstep barrier. ``is_decode`` lets the driver decide whether the
+    whole world can take the CUDA-graph path (only when *every* group is a pure
+    decode / idle-dummy step; any prefill forces the eager, variable-length
+    gather). Returns ``(counts, decode_flags)`` as two lists of length
+    ``dp_size``.
+    """
+    t = torch.tensor(
+        [local_ntok, 1 if is_decode else 0], dtype=torch.long, device="cuda"
+    )
+    out = torch.empty(_DP_SIZE, 2, dtype=torch.long, device="cuda")
+    dist.all_gather_into_tensor(out, t, group=_DP_GROUP)
+    out = out.tolist()
+    counts = [row[0] for row in out]
+    decode_flags = [row[1] for row in out]
+    return counts, decode_flags
+
+
+def _dp_counts_uniform(counts) -> bool:
+    return all(c == counts[0] for c in counts)
+
+
+def dp_gather_hidden(x: torch.Tensor, counts) -> torch.Tensor:
+    """Gather per-replica token rows into the global batch.
+
+    ``x`` is this replica's ``[counts[dp_rank], H]`` hidden states. Two layouts:
+
+    * **Uniform** (``counts`` all equal -- SGLang's MAX_LEN mode, used on the
+      CUDA-graph decode path where every group is padded to a common bucket):
+      the fixed-size all-gather output *is* the contiguous global batch
+      ``[dp_size*B, H]`` already, so we return it directly. No ``torch.cat`` ->
+      no data-dependent allocation, so this is safe to capture in a CUDA graph.
+    * **Ragged** (variable ``counts`` -- eager prefill / mixed): pad to the max,
+      all-gather, then concatenate the real slices into ``[sum(counts), H]``.
+    """
+    max_n = max(counts)
+    hidden = x.shape[1]
+    padded = x.new_zeros((max_n, hidden))
+    padded[: x.shape[0]] = x
+    gathered = x.new_empty((_DP_SIZE * max_n, hidden))
+    dist.all_gather_into_tensor(gathered, padded, group=_DP_GROUP)
+    if _dp_counts_uniform(counts):
+        return gathered
+    gathered = gathered.view(_DP_SIZE, max_n, hidden)
+    parts = [gathered[d, : counts[d]] for d in range(_DP_SIZE)]
+    return torch.cat(parts, dim=0)
+
+
+def dp_local_slice(x_global: torch.Tensor, counts) -> torch.Tensor:
+    """Slice this replica's own rows back out of the global batch.
+
+    Mirrors :func:`dp_gather_hidden`: for the uniform layout each group owns a
+    contiguous ``B``-row block at ``dp_rank*B``; for the ragged layout the
+    offset is the prefix sum of ``counts``.
+    """
+    if _dp_counts_uniform(counts):
+        block = counts[0]
+        start = _DP_RANK * block
+        return x_global[start : start + block]
+    start = sum(counts[:_DP_RANK])
+    end = start + counts[_DP_RANK]
+    return x_global[start:end]
+
+
+def ep_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    """Sum expert-shard contributions across the EP group (one pipeline stage).
+
+    EP spans the ``dp_size * tp_size`` ranks of a single stage (``_EP_GROUP``).
+    For ``pp_size == 1`` that is the whole world.
+    """
+    dist.all_reduce(x, group=_EP_GROUP)
+    return x
 
 
 def get_local_rank():
@@ -100,12 +390,17 @@ def is_use_ep():
     return _USE_EP
 
 
+def _pp_stage_size():
+    """Ranks per pipeline stage: ``dp_size * tp_size`` (``tp_size`` when no DP)."""
+    return get_dp_size() * get_tp_size()
+
+
 def get_next_pp_rank():
-    return get_rank() + get_tp_size()
+    return get_rank() + _pp_stage_size()
 
 
 def get_last_pp_rank():
-    return get_rank() - get_tp_size()
+    return get_rank() - _pp_stage_size()
 
 
 def get_pp_size():

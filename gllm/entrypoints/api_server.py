@@ -281,6 +281,16 @@ if __name__ == "__main__":
         "--tp", type=int, help="Number of tensor parallel degrees", default=1
     )
     parser.add_argument(
+        "--dp",
+        type=int,
+        help=(
+            "Number of data-parallel (DP-attention) replicas. World size is "
+            "pp*dp*tp; with EP enabled the MoE experts are sharded across "
+            "EP = dp*tp ranks per pipeline stage."
+        ),
+        default=1,
+    )
+    parser.add_argument(
         "--enable-ep",
         dest="enable_ep",
         action="store_true",
@@ -399,6 +409,7 @@ if __name__ == "__main__":
         enable_prefix_caching=args.enable_prefix_caching,
         pp_size=args.pp,
         tp_size=args.tp,
+        dp_size=args.dp,
         use_ep=args.enable_ep,
         assigned_layers=args.assigned_layers,
         schedule_method=args.schedule_method,

@@ -98,9 +98,18 @@ class PipeAsyncLLM(LLM):
         return stream
 
     async def check_abort_seqs(self):
-        for id, seq in self.running_maps.items():
-            if await self.async_streams[id].is_disconnected() and not seq.is_abort:
-                self.abort_ids.append(id)
+        # Snapshot: the engine step (``send_ipc_package`` / ``_apply_ipc_package``
+        # on an executor thread) mutates ``running_maps`` concurrently, so
+        # iterating it live could raise "dictionary changed size during
+        # iteration". ``async_streams`` may also drop an id between the snapshot
+        # and the lookup, so guard the read.
+        for id, seq in list(self.running_maps.items()):
+            stream = self.async_streams.get(id)
+            if stream is None:
+                continue
+            if await stream.is_disconnected() and not seq.is_abort:
+                with self._pending_lock:
+                    self.abort_ids.append(id)
                 seq.is_abort = True
 
     async def schedule(self):

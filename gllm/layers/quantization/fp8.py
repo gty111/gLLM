@@ -59,8 +59,25 @@ def deepgemm_available() -> bool:
     except Exception as e:  # noqa: BLE001
         logger.warning(f"DeepGEMM FP8 backend unavailable, falling back to Triton: {e}")
         return False
-    logger.info("DeepGEMM FP8 GEMM backend enabled (Hopper block-scale kernels).")
+    # NOTE: intentionally silent -- this is a pure capability probe (device +
+    # library self-test) and is also called during CUDA-graph warmup regardless
+    # of whether the model has any FP8 weights. The "enabled" line is emitted
+    # once from the actual FP8 GEMM path (see ``_log_deepgemm_enabled_once``) so
+    # it only appears when the model really runs DeepGEMM FP8 kernels.
     return True
+
+
+_deepgemm_logged = False
+
+
+def _log_deepgemm_enabled_once() -> None:
+    """Emit the DeepGEMM-enabled info line once, on first real FP8 GEMM use."""
+    global _deepgemm_logged
+    if not _deepgemm_logged:
+        _deepgemm_logged = True
+        logger.info(
+            "DeepGEMM FP8 GEMM backend enabled (Hopper block-scale kernels)."
+        )
 
 
 def _deepgemm_shape_supported(
@@ -217,6 +234,7 @@ def fp8LinearMethod(
         if _deepgemm_shape_supported(
             N, K, block_n, block_k, input.dtype
         ) and deepgemm_available():
+            _log_deepgemm_enabled_once()
             output = w8a8_block_fp8_matmul_deepgemm(
                 q_input, weight, x_scale, weight_scale, block_size, input.dtype
             )

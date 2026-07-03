@@ -48,6 +48,11 @@ to the (also-refactored) :class:`gllm.worker.Worker` path.
 
 from collections import deque
 
+from gllm.dist_utils import (
+    dp_all_gather_meta,
+    is_dp_attn,
+    set_dp_forward_counts,
+)
 from gllm.input_data import InputData
 from gllm.model_runner import OverlapModelRunner
 from gllm.scheduler import OverlapScheduler
@@ -72,6 +77,9 @@ class OverlapWorker(Worker):
         Worker.init(self)
         self._prefetched_input = None
         self._gpu_pending = deque()
+        # Fixed after ``init``: DP-attention + EP needs the per-iter cross-DP
+        # barrier + dummy-batch lockstep in ``run_pp0``; plain TP does not.
+        self._dp = is_dp_attn()
 
     def _init_role_state(self):
         """Override base setup: every PP=0 TP rank gets an OverlapScheduler.
@@ -130,7 +138,7 @@ class OverlapWorker(Worker):
         next_input.cal_input(schedule_seqs)
         self._prefetched_input = next_input
 
-    def _launch_batch(self, input_data: InputData):
+    def _launch_batch(self, input_data: InputData, dp_padded_size=None):
         # Pipelined input prep:
         #   * ``prepare_input_cpu`` is pure CPU work and overlaps with the
         #     previous batch's GPU forward.
@@ -145,45 +153,72 @@ class OverlapWorker(Worker):
         #     ``forward_stream`` with a wait_event on ``input_ready_event``.
         self.model_runner.prepare_input_cpu(input_data)
         self.model_runner.prepare_input_gpu()
-        return self.model_runner.run_batch_async()
+        return self.model_runner.run_batch_async(dp_padded_size=dp_padded_size)
 
-    def _collect_batch(self, pending_entry, deferred_seqs):
-        """Wait for the batch's CPU buffer and finalize seq state.
+    def _build_dummy_input(self, size: int = 1) -> InputData:
+        """Build a throwaway ``size``-token decode batch for an idle DP group.
 
-        Every PP-0 TP rank reads its own ``_next_tokens_bufs`` slot --
-        each rank does its own D2H copy from the broadcast tokens
-        tensor inside ``run_batch_async``. ``deferred_seqs`` is the
-        per-rank metadata produced by ``process_output_deferred`` and
-        is used by every rank to update its local Sequence state /
-        free pages. Only rank 0 sends the resulting ``IPCPackage`` to
-        the frontend.
+        Idle groups must still enter the forward (its MoE layers run a
+        collective over the whole DP/EP world), so they ride along with a dummy
+        batch whose sampled tokens are discarded. The dummy references the
+        memory manager's dummy pages, so it never touches real KV state.
         """
-        copy_done, batch_size, buf_idx, _input_data = pending_entry
-        copy_done.synchronize()
-        tokens = self.model_runner._next_tokens_bufs[buf_idx][
-            :batch_size
-        ].tolist()
-        self._finalize_deferred(deferred_seqs, tokens)
+        seqs = self.model_runner.create_dummy_seqs(size)
+        dummy = InputData(
+            use_buffer=False,
+            memory_manager=self.model_runner.memory_manager,
+            max_seq_length=self.model_runner.model_max_length,
+        )
+        dummy.cal_input(seqs)
+        return dummy
 
-    def _finalize_deferred(self, deferred_seqs, tokens):
-        if deferred_seqs is None or tokens is None:
+    def _collect_batch(self, entry) -> None:
+        """Wait for a batch's D2H copy and finalize its seq state.
+
+        Every PP-0 TP rank reads its own ``_next_tokens_bufs`` slot (each rank
+        did its own D2H copy from the broadcast tokens inside
+        ``run_batch_async``) and updates its local Sequence state / frees pages;
+        only the frontend poller (rank 0, or each DP group's ``tp_rank == 0``)
+        forwards the resulting ``IPCPackage``. ``is_dummy`` batches (idle DP
+        groups) and empty ``deferred`` carry no output and are skipped.
+        """
+        copy_done, batch_size, buf_idx, deferred, _input_data, is_dummy = entry
+        copy_done.synchronize()
+        if is_dummy or deferred is None:
             return
-        ipc_package = self.scheduler.process_output_finalize(deferred_seqs, tokens)
-        if ipc_package is not None and self.rank == 0:
+        tokens = self.model_runner._next_tokens_bufs[buf_idx][:batch_size].tolist()
+        ipc_package = self.scheduler.process_output_finalize(deferred, tokens)
+        if ipc_package is not None and self._polls_frontend():
             self.comm.send_output(ipc_package)
 
-    # ------------------------------------------------------------------
-    # Driver loop -- now identical for every PP-0 TP rank
-    # ------------------------------------------------------------------
+    def _drain_pending(self) -> None:
+        while self._gpu_pending:
+            self._collect_batch(self._gpu_pending.popleft())
 
     def run_pp0(self):
-        """Per-iter loop run by every PP-0 TP rank under the new design.
+        """Per-iter loop run by every PP-0 TP rank.
 
-        Ordering is the same as the previous ``run_driver`` for
-        rank 0 -- launch first, collect later -- but every TP rank
-        executes it independently. Determinism + identical inputs
-        keeps every rank's queue / future-map / scheduler in lockstep
-        without any inter-TP zmq traffic on the critical path.
+        Ordering is launch-first, collect-later -- but every TP rank executes
+        it independently. Determinism + identical inputs keeps every rank's
+        queue / future-map / scheduler in lockstep without any inter-TP zmq
+        traffic on the critical path.
+
+        DP-attention + EP (``self._dp``) wraps the same launch->collect pipeline
+        in a per-iter cross-DP barrier (a tiny ``dp_all_gather_meta``
+        all-gather) so the world stays lockstep through the MoE collectives:
+
+        * every group agrees whether *anyone* has work (else nobody launches --
+          a lone MoE collective would hang -- and the pipeline drains);
+        * every group agrees whether the whole world can take the CUDA-graph
+          path this step (only when *all* groups are pure decode / idle) and on
+          the common bucket, so the captured global MoE batch matches;
+        * an idle group rides along with a 1-token dummy so its MoE collective
+          still joins; its sampled token is discarded.
+
+        The agreed counts are published via ``set_dp_forward_counts`` right
+        before dispatch (consumed synchronously as the eager forward is enqueued,
+        or baked at capture time for graphs), so they never race the in-flight
+        batch.
         """
         self.check_abort_seqs()
         # ``recv_ipc_package`` also drives the disagg coordinator (TP0) and
@@ -195,33 +230,62 @@ class OverlapWorker(Worker):
         if self._prefetched_input is None:
             self._build_prefetched_input()
 
+        input_data = self._prefetched_input
+        is_dummy = False
+        dp_padded_size = None
+
+        if self._dp:
+            # Cross-DP barrier: agree on who runs + the graph decision.
+            if input_data is not None:
+                real_ntok = int(input_data.tokens_cpu.shape[0])
+                is_decode = bool(input_data.seqs[-1].computed_prompt)
+            else:
+                real_ntok = 0
+                is_decode = True  # idle groups don't veto the graph path
+            counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
+            if sum(counts) == 0:
+                # Nobody has work: skip the forward in unison, drain the pipe.
+                self._drain_pending()
+                return
+            if input_data is None:
+                input_data = self._build_dummy_input(1)
+                is_dummy = True
+            fwd_counts = [c if c > 0 else 1 for c in counts]
+            if all(bool(d) for d in decode_flags):
+                dp_padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
+            set_dp_forward_counts(
+                [dp_padded_size] * self.dp_size
+                if dp_padded_size is not None
+                else fwd_counts
+            )
+
         pending_before = len(self._gpu_pending)
 
-        if self._prefetched_input is not None:
-            # Keep the InputData alive in ``_gpu_pending`` until the
-            # batch finishes -- ``prep_stream`` is still DMA'ing from
-            # its CPU tensors when we reach this line.
-            input_data = self._prefetched_input
+        if input_data is not None:
+            # Keep the InputData alive in ``_gpu_pending`` until the batch
+            # finishes -- ``prep_stream`` is still DMA'ing from its CPU tensors.
             self._prefetched_input = None
-            copy_done, batch_size, future_slot_ids, buf_idx = self._launch_batch(
-                input_data
+            try:
+                copy_done, batch_size, future_slot_ids, buf_idx = (
+                    self._launch_batch(input_data, dp_padded_size=dp_padded_size)
+                )
+            finally:
+                if self._dp:
+                    set_dp_forward_counts(None)
+            deferred = (
+                None
+                if is_dummy
+                else self.scheduler.process_output_deferred(future_slot_ids)
             )
-            deferred = self.scheduler.process_output_deferred(future_slot_ids)
             self._gpu_pending.append(
-                (copy_done, batch_size, buf_idx, deferred, input_data)
+                (copy_done, batch_size, buf_idx, deferred, input_data, is_dummy)
             )
 
         if pending_before > 0:
-            copy_done, batch_size, buf_idx, deferred, input_data = (
-                self._gpu_pending.popleft()
-            )
-            self._collect_batch(
-                (copy_done, batch_size, buf_idx, input_data), deferred
-            )
+            self._collect_batch(self._gpu_pending.popleft())
 
-        # Build + (no-op zmq send) the next iter AFTER finalize so
-        # any max_len/eos seqs from this iter are already freed when
-        # we reschedule.
+        # Build the next iter AFTER finalize so any max_len/eos seqs from this
+        # iter are already freed when we reschedule.
         self._build_prefetched_input()
 
 
@@ -230,7 +294,7 @@ def run_overlap_worker(worker: OverlapWorker):
     try:
         worker.init()
         # PP=1 means every rank in the world is on PP-0; the unified
-        # ``run_pp0`` body covers driver and follower alike.
+        # ``run_pp0`` body covers driver and follower, TP and DP+EP alike.
         while True:
             worker.run_pp0()
     except KeyboardInterrupt:

@@ -7,7 +7,7 @@ from typing import List, Optional
 from logger import logger
 
 from gllm.comm import IPCPackage
-from gllm.dist_utils import get_rank, get_world_size
+from gllm.dist_utils import get_pp_rank, get_rank, get_tp_rank, get_world_size
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
@@ -58,6 +58,15 @@ class Scheduler:
         self.delta_log_num_preempt_seqs = 10
         # num wait tokens
         self.num_wait_tokens = 0
+        # Deterministic rotating jitter for the decode-token-budget split (see
+        # ``get_balanced_decode_token_budget``). Replaces a ``random.randint``
+        # that was safe only for ``pp_size == 1`` (randint(0,0)==0): with pp>1
+        # each rank's RNG diverged, so TP peers -- which must run *identical*
+        # column-driver schedules -- picked different budgets and scheduled
+        # mismatched batch sizes, deadlocking the stage-wide MoE/EP all-reduce
+        # (and PP hidden-state exchange). A rotating counter advanced in lockstep
+        # by every rank keeps the split deterministic and TP-consistent.
+        self._decode_budget_jitter = 0
         # abort ids
         self.abort_ids = set()
         # log
@@ -323,11 +332,16 @@ class Scheduler:
         if num_total_decode_seqs < self.pp_size:
             decode_token_budget = 1
         else:
-            # here we add num_total_decode_seqs to random.randint(0,self.pp_size-1))
-            # because we want to solve the situation when #seqs=5 pp_size=4
-            decode_token_budget = (
-                num_total_decode_seqs + random.randint(0, self.pp_size - 1)
-            ) // self.pp_size
+            # Add a rotating [0, pp_size-1] jitter before the floor-divide so the
+            # split doesn't always round down (e.g. #seqs=5, pp_size=4). The
+            # jitter must be *deterministic and identical across ranks* -- every
+            # column-driver runs the same schedule, so a per-scheduler counter
+            # advanced in lockstep keeps TP peers on the same budget (a prior
+            # ``random.randint`` diverged them for pp_size>1 and deadlocked the
+            # MoE/EP all-reduce; see ``__init__``).
+            jitter = self._decode_budget_jitter % self.pp_size
+            self._decode_budget_jitter += 1
+            decode_token_budget = (num_total_decode_seqs + jitter) // self.pp_size
 
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
@@ -524,8 +538,14 @@ class Scheduler:
 
         # Every TP/PP rank runs an identical copy of the scheduler, so logging
         # the batch stats on all of them floods the console with N duplicate
-        # lines per tick. Restrict to global rank 0.
-        if self.log and get_rank() == 0 and time.time() - self.log_time > 1:
+        # lines per tick. Restrict to the driver of each DP replica (stage-0,
+        # TP-0), so every DP group reports its own batch stats exactly once.
+        if (
+            self.log
+            and get_pp_rank() == 0
+            and get_tp_rank() == 0
+            and time.time() - self.log_time > 1
+        ):
             self.log_time = time.time()
             log_info = (
                 "#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%"
@@ -603,8 +623,14 @@ class Scheduler:
 
         # Every TP/PP rank runs an identical copy of the scheduler, so logging
         # the batch stats on all of them floods the console with N duplicate
-        # lines per tick. Restrict to global rank 0.
-        if self.log and get_rank() == 0 and time.time() - self.log_time > 1:
+        # lines per tick. Restrict to the driver of each DP replica (stage-0,
+        # TP-0), so every DP group reports its own batch stats exactly once.
+        if (
+            self.log
+            and get_pp_rank() == 0
+            and get_tp_rank() == 0
+            and time.time() - self.log_time > 1
+        ):
             self.log_time = time.time()
             log_info = (
                 "#wait: %4d/%8d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%"

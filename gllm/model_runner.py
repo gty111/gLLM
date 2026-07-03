@@ -20,13 +20,18 @@ from transformers.tokenization_utils_base import VERY_LARGE_INTEGER
 
 from gllm.async_utils import FutureMap, OverlapRuntime
 from gllm.dist_utils import (
+    get_dp_size,
     get_local_rank,
     get_output_rank,
+    get_rank,
     get_tp_group,
+    get_tp_rank,
     get_tp_size,
+    is_dp_attn,
     is_first_pp_rank,
     is_last_pp_rank,
     is_output_rank,
+    set_dp_forward_counts,
 )
 from gllm.input_data import InputData
 from gllm.layers.rotary_embedding import MRotaryEmbedding
@@ -1446,26 +1451,41 @@ class ModelRunner:
             warmup_per_bucket = deepgemm_available() or flashinfer_swapab_available()
         except Exception:  # noqa: BLE001
             warmup_per_bucket = False
-        if warmup_per_bucket:
-            for size in self.capture_sizes:
-                seqs = self.create_dummy_seqs(size)
-                self.input_data.cal_and_set_input(seqs=seqs)
-                if self.uses_mrope:
-                    self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
-                self.forward()
-            torch.cuda.synchronize()
+        # In DP+EP every group captures each bucket with a uniform global batch
+        # (``dp_size * size``): publish ``[size] * dp_size`` so the MoE layer's
+        # gather/all-reduce is baked at the right static shape (SGLang MAX_LEN).
+        dp_size = get_dp_size() if is_dp_attn() else 1
 
-        capture_ctx = car.capture() if car is not None else _nullcontext()
-        with capture_ctx:
-            for size in iterator:
-                seqs = self.create_dummy_seqs(size)
-                self.input_data.cal_and_set_input(seqs=seqs)
-                if self.uses_mrope:
-                    self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
+        def _set_dp_counts(size: int) -> None:
+            if is_dp_attn():
+                set_dp_forward_counts([size] * dp_size)
+
+        try:
+            if warmup_per_bucket:
+                for size in self.capture_sizes:
+                    seqs = self.create_dummy_seqs(size)
+                    self.input_data.cal_and_set_input(seqs=seqs)
+                    if self.uses_mrope:
+                        self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
+                    _set_dp_counts(size)
                     self.forward()
-                self.size_to_graph[size] = g
+                torch.cuda.synchronize()
+
+            capture_ctx = car.capture() if car is not None else _nullcontext()
+            with capture_ctx:
+                for size in iterator:
+                    seqs = self.create_dummy_seqs(size)
+                    self.input_data.cal_and_set_input(seqs=seqs)
+                    if self.uses_mrope:
+                        self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
+                    _set_dp_counts(size)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
+                        self.forward()
+                    self.size_to_graph[size] = g
+        finally:
+            if is_dp_attn():
+                set_dp_forward_counts(None)
         if torch.distributed.is_initialized():
             torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
@@ -1533,11 +1553,42 @@ class ModelRunner:
         # we only check the last seq
         return self.input_data.seqs[-1].computed_prompt
 
+    def dp_select_bucket(self, max_tokens: int) -> Optional[int]:
+        """Pick the CUDA-graph bucket for a DP decode step, or ``None``.
+
+        In DP+EP the graph bucket must be the *same* on every DP group (the
+        global MoE batch is a static ``dp_size * bucket``), so the driver feeds
+        the group-wide ``max_tokens`` here. Returns the smallest captured bucket
+        ``>= max_tokens``, or ``None`` when graphs are disabled / the batch is
+        larger than any captured bucket (caller then runs eager).
+        """
+        if self.disable_cuda_graph:
+            return None
+        padded_size = None
+        for bucket in self.capture_sizes:
+            if bucket >= max_tokens:
+                padded_size = bucket
+        if padded_size is not None and padded_size in self.size_to_graph:
+            return padded_size
+        return None
+
     @torch.inference_mode()
-    def step_once(self):
+    def step_once(self, dp_padded_size: Optional[int] = None):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
+        if dp_padded_size is not None:
+            # DP+EP CUDA-graph decode: every group pads to the *same*
+            # group-wide bucket (chosen by the driver via ``dp_select_bucket``)
+            # so the captured global ``dp_size * bucket`` MoE batch matches.
+            num_real_tokens = self.input_data.pad_for_cuda_graph(dp_padded_size)
+            self.size_to_graph[dp_padded_size].replay()
+            num_cal_tokens = num_real_tokens
+        elif is_dp_attn():
+            # DP+EP eager path (prefill / mixed, or bucket miss): plain forward.
+            # The per-group bucket decision was already made by the driver, so
+            # never fall into the local-only bucket selection below.
+            self.forward()
         # Only pure decode batches use CUDA graph.
-        if self.check_decode_batch():
+        elif self.check_decode_batch():
             # Find the smallest captured bucket >= actual batch size.
             padded_size = None
             for bucket in self.capture_sizes:
@@ -1773,8 +1824,20 @@ class OverlapModelRunner(ModelRunner):
                 self.prepare_input_embeddings(input_embeddings)
             rt.input_ready_event.record(rt.prep_stream)
 
-    def _run_forward_on_stream(self, num_cal_tokens: int) -> int:
-        if self.check_decode_batch():
+    def _run_forward_on_stream(
+        self, num_cal_tokens: int, dp_padded_size: Optional[int] = None
+    ) -> int:
+        if dp_padded_size is not None:
+            # DP+EP graph decode: replay the driver-agreed group-wide bucket so
+            # the captured global ``dp_size * bucket`` MoE batch matches.
+            num_cal_tokens = self.input_data.pad_for_cuda_graph(dp_padded_size)
+            self.size_to_graph[dp_padded_size].replay()
+        elif is_dp_attn():
+            # DP+EP eager path (prefill / mixed / bucket miss): the driver
+            # already made the per-group decision, so never fall into the
+            # local-only bucket selection below.
+            self.forward()
+        elif self.check_decode_batch():
             padded_size = None
             for bucket in self.capture_sizes:
                 if bucket >= num_cal_tokens:
@@ -1789,8 +1852,16 @@ class OverlapModelRunner(ModelRunner):
         return num_cal_tokens
 
     @torch.inference_mode()
-    def run_batch_async(self) -> Tuple[torch.cuda.Event, int, List[int], int]:
-        """Launch forward + sample on forward_stream (pp_size=1 only)."""
+    def run_batch_async(
+        self, dp_padded_size: Optional[int] = None
+    ) -> Tuple[torch.cuda.Event, int, List[int], int]:
+        """Launch forward + sample on forward_stream (pp_size=1 only).
+
+        ``dp_padded_size`` (DP+EP only) forces the graph bucket agreed on by the
+        driver across all DP groups, keeping the captured MoE collectives'
+        shapes identical world-wide; ``None`` runs eager (prefill/mixed) or the
+        normal local bucket selection (non-DP).
+        """
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         batch_size = len(self.input_data.seqs)
         buf_idx = self._next_tokens_buf_idx
@@ -1828,7 +1899,9 @@ class OverlapModelRunner(ModelRunner):
             )
             self._fixup_vl_decode_embeddings(num_decode_tokens)
 
-            num_cal_tokens = self._run_forward_on_stream(num_cal_tokens)
+            num_cal_tokens = self._run_forward_on_stream(
+                num_cal_tokens, dp_padded_size=dp_padded_size
+            )
 
             logits = self.model.compute_logits(
                 self.input_data, self.output_hidden_states[:num_cal_tokens]
@@ -1852,9 +1925,19 @@ class OverlapModelRunner(ModelRunner):
                 # ordering hazards that were occasionally letting TP ranks
                 # store stale tokens into ``token_ids_buf`` and surface as
                 # repetition loops in long generations.
+                #
+                # ``src`` is a *global* rank. In DP+EP each DP group is its own
+                # TP subgroup, so the group's output rank is its local tp_rank-0
+                # (``get_rank() - get_tp_rank()``), not the world's output rank
+                # 0 (which isn't even a member of group>0's TP subgroup).
+                tp_src = (
+                    get_rank() - get_tp_rank()
+                    if is_dp_attn()
+                    else get_output_rank()
+                )
                 dist.broadcast(
                     next_tokens_gpu,
-                    src=get_output_rank(),
+                    src=tp_src,
                     group=get_tp_group(),
                 )
             self.future_map.store_to_map(future_indices, next_tokens_gpu)
