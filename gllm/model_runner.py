@@ -37,7 +37,7 @@ from gllm.input_data import InputData
 from gllm.layers.rotary_embedding import MRotaryEmbedding
 from gllm.layers.sampler import Sampler
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.model_loader import ModelLoader
+from gllm.model_loader import ModelLoader, propagate_serving_config
 from gllm.sequence import Sequence
 from gllm.utils import unify_decode
 
@@ -242,7 +242,7 @@ class ModelRunner:
         mm_processor_max_pixels: int = None,
         skip_visual: bool = False,
         skip_language: bool = False,
-        mla_decode_backend: str = "flashmla",
+        mla_decode_backend: str = "fa3",
     ):
         
         self.max_num_batched_tokens = (
@@ -297,18 +297,17 @@ class ModelRunner:
 
         # Resolve the MLA decode backend at this (upper) layer and thread the
         # decision down to the attention layers through the model config. The
-        # default preference is FlashMLA, which requires a KV page size of 64;
-        # bump page_size automatically so the requirement is satisfied without
-        # the user having to pass --page-size 64. The attention layer performs
-        # the final availability check and falls back to Triton if the
-        # FlashMLA kernel cannot actually run on this build/hardware.
+        # default is FA3 (SGLang-compatible absorbed MLA decode). FlashMLA
+        # requires a KV page size of 64; bump page_size automatically when
+        # that backend is selected. The attention layer performs the final
+        # availability check and falls back when the kernel cannot run.
         # 64 == required FlashMLA block size (kept as a literal to avoid
         # importing the CUDA-heavy attention module in the parent process).
         _FLASHMLA_PAGE_SIZE = 64
-        self.mla_decode_backend = (mla_decode_backend or "flashmla").lower()
-        if self.mla_decode_backend not in ("triton", "flashmla"):
+        self.mla_decode_backend = (mla_decode_backend or "fa3").lower()
+        if self.mla_decode_backend not in ("triton", "flashmla", "fa3"):
             raise ValueError(
-                "mla_decode_backend must be 'triton' or 'flashmla', "
+                "mla_decode_backend must be 'fa3', 'flashmla', or 'triton', "
                 f"got {self.mla_decode_backend!r}."
             )
         if self.use_mla and self.mla_decode_backend == "flashmla":
@@ -325,6 +324,7 @@ class ModelRunner:
             self.mla_decode_backend if self.use_mla else None
         )
         self.model_loader.config.page_size = self.page_size
+        propagate_serving_config(self.model_loader.config)
 
         # Kimi-K2.5 ships a bespoke processor (``KimiK25Processor``) whose API
         # and outputs diverge from the Qwen-VL ``AutoProcessor`` contract:

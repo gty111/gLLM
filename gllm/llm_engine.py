@@ -69,7 +69,7 @@ class LLM:
         mm_processor_min_pixels=None,
         mm_processor_max_pixels=None,
         disagg_config=None,
-        mla_decode_backend="flashmla",
+        mla_decode_backend="fa3",
     ):
         init_logger()
         self.model_path = model_path

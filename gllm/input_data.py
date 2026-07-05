@@ -554,6 +554,11 @@ class InputData:
         if self.num_decodes > 0:
             decode_seqs = seqs[: self.num_decode_tokens]
             _, self.decode_seq_lens_cpu = self._cal_seq_lens(decode_seqs)
+            decode_query_lens = (
+                self.query_start_loc_cpu[1 : self.num_decodes + 1]
+                - self.query_start_loc_cpu[: self.num_decodes]
+            )
+            self.decode_max_query_len = int(decode_query_lens.max().item())
 
         if self.num_prefills > 0:
             prefill_seqs = seqs[self.num_decode_tokens :]
@@ -678,6 +683,8 @@ class InputData:
             MLACommonDecodeMetadata(
                 block_table=self.get_block_table()[: self.num_decode_tokens],
                 seq_lens=self.decode_seq_lens[: self.decode_seq_lens_cpu.shape[0]],
+                query_start_loc=self.query_start_loc[: self.num_decodes + 1],
+                max_query_len=self.decode_max_query_len,
             )
             if self.num_decodes > 0
             else None
@@ -722,6 +729,10 @@ class InputData:
 class MLACommonDecodeMetadata:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
+    # Cumulative query lengths for decode tokens (length num_decodes + 1).
+    query_start_loc: torch.Tensor
+    # Max decode query length (computed on CPU; safe for CUDA graph capture).
+    max_query_len: int
     # Lazily populated by the FlashMLA decode backend with the tuple
     # (tile_scheduler_metadata, num_splits) returned by ``get_mla_metadata``.
     # It only depends on ``seq_lens`` + head count, so it is computed once per

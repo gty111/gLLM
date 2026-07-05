@@ -10,6 +10,17 @@ from gllm.layers.ops.merge_attn_states import merge_attn_states
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
+# FA3 MLA decode (sgl_kernel flash_attn with qv=) — same path as SGLang ``fa3``.
+try:
+    from sgl_kernel.flash_attn import is_fa3_supported
+
+    _FA3_AVAILABLE = bool(is_fa3_supported())
+    _FA3_IMPORT_ERROR: Optional[Exception] = None
+except Exception as _e:  # pragma: no cover - depends on hardware / build
+    is_fa3_supported = None  # type: ignore[misc, assignment]
+    _FA3_AVAILABLE = False
+    _FA3_IMPORT_ERROR = _e
+
 # FlashMLA (DeepSeek SM90 MLA decode kernel) is optional: the extension only
 # loads on Hopper with a recent CUDA driver. Import lazily so the default
 # Triton decode backend keeps working when it is unavailable.
@@ -170,38 +181,58 @@ class MLAAttention:
 
         self.decode_backend = self._resolve_decode_backend(decode_backend, page_size)
 
+    @staticmethod
+    def _flashmla_available(page_size: Optional[int]) -> Optional[str]:
+        if not _FLASHMLA_AVAILABLE:
+            return f"sgl_kernel.flash_mla unavailable ({_FLASHMLA_IMPORT_ERROR})"
+        if page_size is not None and page_size != _FLASHMLA_PAGE_SIZE:
+            return f"page_size={page_size} != required {_FLASHMLA_PAGE_SIZE}"
+        return None
+
     def _resolve_decode_backend(
         self, requested: str, page_size: Optional[int]
     ) -> str:
-        """Pick the decode backend, auto-falling back to Triton when FlashMLA
-        cannot run on this build/hardware.
+        """Pick the decode backend with hardware-aware fallbacks.
 
-        The choice is made by the upper layer (default "flashmla"), but the
-        final availability check has to happen here in the worker process where
-        CUDA and the ``sgl_kernel`` extension are actually loaded. "triton" is
-        always valid; "flashmla" requires the extension and ``page_size == 64``.
+        The choice is made by the upper layer (default ``fa3``), but the final
+        availability check happens here in the worker where ``sgl_kernel`` is
+        loaded. ``triton`` is always valid; ``fa3`` needs Hopper FA3;
+        ``flashmla`` needs the FlashMLA extension and ``page_size == 64``.
         """
-        requested = (requested or "triton").lower()
-        if requested not in ("triton", "flashmla"):
+        requested = (requested or "fa3").lower()
+        if requested not in ("triton", "flashmla", "fa3"):
             raise ValueError(
-                "mla_decode_backend must be 'triton' or 'flashmla', "
+                "mla_decode_backend must be 'fa3', 'flashmla', or 'triton', "
                 f"got {requested!r}."
             )
         if requested == "triton":
             return "triton"
 
-        reason = None
-        if not _FLASHMLA_AVAILABLE:
-            reason = f"sgl_kernel.flash_mla unavailable ({_FLASHMLA_IMPORT_ERROR})"
-        elif page_size is not None and page_size != _FLASHMLA_PAGE_SIZE:
-            reason = (
-                f"page_size={page_size} != required {_FLASHMLA_PAGE_SIZE}"
+        if requested == "fa3":
+            if _FA3_AVAILABLE:
+                return "fa3"
+            reason = f"sgl_kernel FA3 unavailable ({_FA3_IMPORT_ERROR})"
+            flashmla_reason = self._flashmla_available(page_size)
+            if flashmla_reason is None:
+                logger.warning(
+                    "MLA decode backend 'fa3' is unavailable (%s); "
+                    "falling back to 'flashmla'.",
+                    reason,
+                )
+                return "flashmla"
+            logger.warning(
+                "MLA decode backend 'fa3' is unavailable (%s); "
+                "falling back to 'triton'.",
+                reason,
             )
-        if reason is not None:
+            return "triton"
+
+        flashmla_reason = self._flashmla_available(page_size)
+        if flashmla_reason is not None:
             logger.warning(
                 "MLA decode backend 'flashmla' is unavailable (%s); "
                 "falling back to 'triton'.",
-                reason,
+                flashmla_reason,
             )
             return "triton"
         return "flashmla"
@@ -436,11 +467,83 @@ class MLAAttention:
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.decode_backend == "fa3":
+            return self._forward_decode_fa3(q, kv_c_and_k_pe_cache, attn_metadata)
         if self.decode_backend == "flashmla":
             return self._forward_decode_flashmla(
                 q, kv_c_and_k_pe_cache, attn_metadata
             )
         return self._forward_decode_triton(q, kv_c_and_k_pe_cache, attn_metadata)
+
+    def _forward_decode_fa3(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Absorbed MLA decode via FA3 (SGLang ``FlashAttentionBackend`` path)."""
+        assert kv_c_and_k_pe_cache.numel() > 0
+        assert attn_metadata.decode is not None
+
+        if self.kv_cache_dtype.startswith("fp8"):
+            raise NotImplementedError(
+                "FP8 KV cache is not yet supported by the FA3 MLA decode backend."
+            )
+        if type(q) is not tuple:
+            raise ValueError(
+                "FA3 MLA decode expects absorbed (q_nope, q_pe) tuple."
+            )
+
+        q_nope, q_rope = q
+        decode_meta = attn_metadata.decode
+
+        # Paged latent cache: rope on k, compressed latent on v (MQA head dim 1).
+        c_kv_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank].unsqueeze(2)
+        k_rope_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank :].unsqueeze(2)
+
+        cu_seqlens_q = decode_meta.query_start_loc
+        max_seqlen_q = max(1, decode_meta.max_query_len)
+
+        result = flash_attn_with_kvcache(
+            q=q_rope,
+            k_cache=k_rope_cache,
+            v_cache=c_kv_cache,
+            qv=q_nope,
+            page_table=decode_meta.block_table,
+            cache_seqlens=decode_meta.seq_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=self.scale,
+            causal=True,
+            return_softmax_lse=True,
+            num_splits=0,
+        )
+
+        if isinstance(result, tuple):
+            o, softmax_lse, *_ = result
+        else:
+            o = result
+            softmax_lse = None
+
+        if o.dim() == 2:
+            o = o.view(-1, self.num_heads, self.kv_lora_rank)
+        elif o.dim() == 3 and o.shape[1] != self.num_heads:
+            o = o.view(-1, self.num_heads, self.kv_lora_rank)
+
+        if softmax_lse is not None:
+            if softmax_lse.dim() == 3:
+                softmax_lse = softmax_lse.squeeze(-1)
+            if softmax_lse.shape[0] == self.num_heads:
+                softmax_lse = softmax_lse.transpose(0, 1).contiguous()
+        else:
+            softmax_lse = torch.zeros(
+                o.shape[0],
+                self.num_heads,
+                dtype=o.dtype,
+                device=o.device,
+            )
+
+        return o, softmax_lse
 
     def _forward_decode_flashmla(
         self,

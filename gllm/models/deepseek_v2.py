@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from logger import logger
 
 from gllm.dist_utils import (
     get_pp_layers,
@@ -469,6 +470,15 @@ class DeepseekV2MLAAttention(Attention):
             **extra_kwargs
         )
 
+        mla_decode_backend = getattr(config, "mla_decode_backend", None)
+        if mla_decode_backend is None:
+            logger.warning(
+                "mla_decode_backend not set on language config; defaulting MLA "
+                "decode to 'fa3'. For multimodal models ensure "
+                "propagate_serving_config() ran before load_model."
+            )
+            mla_decode_backend = "fa3"
+
         self.mla_attn = MLAAttention(
             layer_id=layer_id,
             scale=self.scaling,
@@ -482,7 +492,7 @@ class DeepseekV2MLAAttention(Attention):
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             kv_b_proj=self.kv_b_proj,
-            decode_backend=getattr(config, "mla_decode_backend", "triton"),
+            decode_backend=mla_decode_backend,
             page_size=getattr(config, "page_size", None),
         )
 

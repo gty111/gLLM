@@ -94,11 +94,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--mla-decode-backend",
         type=str,
-        choices=["flashmla", "triton"],
-        default="flashmla",
+        choices=["fa3", "flashmla", "triton"],
+        default="fa3",
         help=(
-            "MLA decode attention backend. 'flashmla' (default) auto-bumps "
-            "page_size to 64 and falls back to Triton if unavailable."
+            "MLA decode attention backend. 'fa3' (default) uses FA3 absorbed "
+            "MLA decode; 'flashmla' auto-bumps page_size to 64; 'triton' is "
+            "the in-tree fallback."
         ),
     )
     p.add_argument("--disable-cuda-graph", action="store_true")

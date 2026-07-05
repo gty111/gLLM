@@ -304,13 +304,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mla-decode-backend",
         type=str,
-        choices=["flashmla", "triton"],
-        default="flashmla",
+        choices=["fa3", "flashmla", "triton"],
+        default="fa3",
         help=(
-            "MLA decode attention backend. 'flashmla' (default) uses the "
-            "DeepSeek FlashMLA kernel (auto-bumps page_size to 64; falls back "
-            "to Triton if unavailable); 'triton' uses the in-tree Triton "
-            "kernel. Only affects MLA models (e.g. DeepSeek)."
+            "MLA decode attention backend. 'fa3' (default) uses FA3 absorbed "
+            "MLA decode via sgl_kernel (SGLang-compatible); 'flashmla' uses "
+            "DeepSeek FlashMLA (auto-bumps page_size to 64); 'triton' uses "
+            "the in-tree Triton kernel. Unavailable backends fall back "
+            "automatically."
         ),
     )
     parser.add_argument(

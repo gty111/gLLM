@@ -163,15 +163,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.full_config = config
+        # Language backbone reads ``text_config``; runtime serving flags are
+        # mirrored there by :func:`gllm.model_loader.propagate_serving_config`.
         self.config = config.text_config
-        # DeepSeek text backbone expects these runtime flags on its local config.
-        self.config.use_mla = getattr(config, "use_mla", True)
-        self.config.use_hybrid_state = getattr(config, "use_hybrid_state", False)
-        self.config.max_num_batched_tokens = getattr(
-            config,
-            "max_num_batched_tokens",
-            getattr(self.config, "max_num_batched_tokens", 0),
-        )
 
         # ``vision_config`` ships as a plain dict on the top-level config.
         vc = config.vision_config
