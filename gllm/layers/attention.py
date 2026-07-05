@@ -38,6 +38,9 @@ except Exception as _e:  # pragma: no cover - depends on hardware / build
 # FlashMLA only supports a KV page/block size of 64.
 _FLASHMLA_PAGE_SIZE = 64
 
+# Log the resolved MLA decode backend once per worker at model load.
+_mla_decode_backend_startup_logged = False
+
 
 def _flash_attn_paged_varlen(
     q: torch.Tensor,
@@ -180,6 +183,33 @@ class MLAAttention:
         self.kv_cache_dtype = "auto"
 
         self.decode_backend = self._resolve_decode_backend(decode_backend, page_size)
+        self._log_startup_decode_backend(
+            decode_backend, page_size, self.decode_backend
+        )
+
+    @staticmethod
+    def _log_startup_decode_backend(
+        requested: str, page_size: Optional[int], resolved: str
+    ) -> None:
+        global _mla_decode_backend_startup_logged
+        if _mla_decode_backend_startup_logged:
+            return
+        _mla_decode_backend_startup_logged = True
+        req = (requested or "fa3").lower()
+        ps = page_size if page_size is not None else "default"
+        if resolved == req:
+            logger.info(
+                "MLA decode attention backend: %s (page_size=%s)",
+                resolved,
+                ps,
+            )
+        else:
+            logger.info(
+                "MLA decode attention backend: %s (requested %r, page_size=%s)",
+                resolved,
+                req,
+                ps,
+            )
 
     @staticmethod
     def _flashmla_available(page_size: Optional[int]) -> Optional[str]:
