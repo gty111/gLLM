@@ -2,10 +2,12 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+from logger import logger
 
 from gllm.dist_utils import (
     get_pp_layers,
     get_tp_size,
+    is_dp_attn,
     is_first_pp_rank,
     is_last_pp_rank,
     tensor_model_parallel_all_reduce,
@@ -28,7 +30,7 @@ from gllm.utils import yarn_get_mscale
 
 from .qwen2 import Qwen2ForCausalLM
 from .qwen2_moe import Qwen2MoeForCausalLM
-from .utils import extract_rope_config
+from .utils import dp_ep_moe_routed, extract_rope_config
 from .weight_loader import (
     WeightRule,
     contains,
@@ -115,6 +117,8 @@ class DeepseekV2MOE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if is_dp_attn():
+            return self._forward_dp_ep(hidden_states, num_tokens, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
@@ -143,6 +147,54 @@ class DeepseekV2MOE(nn.Module):
 
         if get_tp_size() > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def _forward_dp_ep(
+        self, hidden_states: torch.Tensor, num_tokens: int, hidden_dim: int
+    ) -> torch.Tensor:
+        """DP-attention + Expert-Parallel MoE (``EP = DP x TP``, TP=1 here).
+
+        Each replica arrives with only *its own* tokens. The routed experts are
+        sharded across the whole DP group, so we:
+
+        1. run the (dense, replicated) shared experts on the local tokens;
+        2. all-gather every replica's tokens into the global batch;
+        3. run this replica's local expert shard over the global batch
+           (``reduce_results=False`` -> partial, non-local rows are zero);
+        4. all-reduce over the DP/EP group so every token accumulates the
+           contribution of *all* its top-k experts wherever they live;
+        5. slice this replica's own rows back out and fold in the shared output.
+
+        ``get_dp_forward_counts`` gives the per-replica row counts (published by
+        the worker each iteration). It is ``None`` only during the profile /
+        graph-warmup dummy forward, where every replica runs the same batch, so
+        a symmetric gather (``num_tokens`` per replica) is exact.
+        """
+        shared_output = None
+        if self.n_shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+            # The shared experts are dense and TP-sharded with
+            # ``reduce_results=False`` (the non-DP path relies on the single
+            # trailing TP all-reduce to sum them). Here the trailing reduce is
+            # replaced by the EP all-reduce on the *routed* output only, so the
+            # shared partials must be summed across the TP subgroup explicitly.
+            if get_tp_size() > 1:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+
+        routed = dp_ep_moe_routed(self.experts, self.gate, hidden_states, num_tokens)
+
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = routed * self.routed_scaling_factor
+            if shared_output is not None:
+                final_hidden_states = final_hidden_states + shared_output
+        else:
+            # Fix FP16 overflow (see DeepseekV2DecoderLayer).
+            final_hidden_states = routed
+            if shared_output is not None:
+                final_hidden_states = final_hidden_states + shared_output * (
+                    1.0 / self.routed_scaling_factor
+                )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -418,6 +470,15 @@ class DeepseekV2MLAAttention(Attention):
             **extra_kwargs
         )
 
+        mla_decode_backend = getattr(config, "mla_decode_backend", None)
+        if mla_decode_backend is None:
+            logger.warning(
+                "mla_decode_backend not set on language config; defaulting MLA "
+                "decode to 'fa3'. For multimodal models ensure "
+                "propagate_serving_config() ran before load_model."
+            )
+            mla_decode_backend = "fa3"
+
         self.mla_attn = MLAAttention(
             layer_id=layer_id,
             scale=self.scaling,
@@ -431,7 +492,7 @@ class DeepseekV2MLAAttention(Attention):
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             kv_b_proj=self.kv_b_proj,
-            decode_backend=getattr(config, "mla_decode_backend", "triton"),
+            decode_backend=mla_decode_backend,
             page_size=getattr(config, "page_size", None),
         )
 

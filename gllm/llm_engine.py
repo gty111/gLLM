@@ -1,4 +1,5 @@
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
@@ -12,7 +13,12 @@ from gllm.id_allocator import IDAllocator
 from gllm.model_runner import ModelRunner, OverlapModelRunner
 from gllm.overlap_worker import OverlapWorker, run_overlap_worker
 from gllm.sequence import Sequence
-from gllm.utils import get_model_load_pbar, init_logger, random_uuid
+from gllm.utils import (
+    find_free_port,
+    get_model_load_pbar,
+    init_logger,
+    random_uuid,
+)
 from gllm.worker import Worker, run_worker
 
 
@@ -29,8 +35,7 @@ class LLM:
         model_path,
         host=None,
         master_addr: str = "0.0.0.0",
-        master_port: str = "8000",
-        zmq_port_base: int = 8001,
+        master_port: str = None,
         launch_mode: str = "normal",
         worker_ranks: str = None,
         load_format: str = "auto",
@@ -53,6 +58,7 @@ class LLM:
         enable_prefix_caching=True,
         pp_size=1,
         tp_size=1,
+        dp_size=1,
         use_ep=True,
         assigned_layers=None,
         schedule_method="chunked_prefill",
@@ -63,7 +69,7 @@ class LLM:
         mm_processor_min_pixels=None,
         mm_processor_max_pixels=None,
         disagg_config=None,
-        mla_decode_backend="flashmla",
+        mla_decode_backend="fa3",
     ):
         init_logger()
         self.model_path = model_path
@@ -109,11 +115,29 @@ class LLM:
         )
         self.pp_size = pp_size
         self.tp_size = tp_size
+        # Data-parallel (DP) attention + Expert-Parallel MoE. Run ``dp_size``
+        # full-model replicas (one per GPU). Each replica owns its own
+        # scheduler + KV cache and serves a disjoint shard of requests
+        # (round-robined by the frontend), so the MLA latent KV cache is
+        # *sharded* across replicas instead of being replicated on every TP
+        # rank. The routed experts are in turn sharded across all replicas with
+        # ``EP = dp_size * tp_size`` (here tp_size == 1): each MoE layer gathers
+        # the global batch, runs its ``1/dp_size`` expert shard, and all-reduces
+        # the result (see ``DeepseekV2MOE._forward_dp_ep``).
+        self.dp_size = dp_size
+        # Round-robin cursor used by the frontend to spread new requests across
+        # DP replicas.
+        self._dp_rr = 0
         self.use_ep = use_ep
         self.host = host
         self.master_addr = master_addr
+        # Auto-allocate a free NCCL rendezvous port when unset, so offline /
+        # library usage (constructing the engine directly) gets a working port
+        # without the caller having to pick one.
+        if master_port is None:
+            master_port = str(find_free_port(master_addr))
+            logger.info(f"Auto-selected NCCL master_port {master_port}")
         self.master_port = master_port
-        self.zmq_port_base = zmq_port_base
         self.launch_mode = launch_mode
         self.worker_ranks = worker_ranks
         self.id_allocator = IDAllocator(0, 99999)
@@ -140,6 +164,16 @@ class LLM:
         self.abort_ids: List[int] = []
         self.running_maps: Dict[int, Sequence] = dict()  # seq_id => Sequence
         self.async_streams = None
+        # Guards the newly-arrived ``wait_lists`` / ``abort_ids`` hand-off queues.
+        # The async server runs both request intake (``add_requests``) and the
+        # engine step (``send_ipc_package``) on the event loop's default
+        # ``ThreadPoolExecutor`` (many threads via ``make_async``), so the two
+        # touch these lists concurrently. Without this lock a request appended in
+        # the window between the dispatch loop and the ``wait_lists = []`` reset
+        # was silently dropped -- never sent to any worker, its stream never
+        # finished, and the client hung forever (a rare tail-of-run stall under
+        # high concurrency). Snapshot-and-clear under the lock makes it atomic.
+        self._pending_lock = threading.Lock()
 
         # Init workers
         self.init_workers()
@@ -168,7 +202,9 @@ class LLM:
             self.act_worker_ranks = [int(i) for i in self.worker_ranks.split(",")]
             assert len(self.act_worker_ranks) != 0
         else:
-            self.act_worker_ranks = list(range(self.pp_size * self.tp_size))
+            self.act_worker_ranks = list(
+                range(self.pp_size * self.tp_size * self.dp_size)
+            )
         self.num_workers = len(self.act_worker_ranks)
 
         self.ctx = mp.get_context("spawn")
@@ -184,13 +220,13 @@ class LLM:
 
         self.comm = zmqComm(
             self.host,
-            self.zmq_port_base,
             self.launch_mode,
             self.master_addr,
             self.schedule_path,
             self.output_path,
             self.token_path,
             frontend=True,
+            dp_size=self.dp_size,
         )
         self.comm.init()
 
@@ -207,9 +243,22 @@ class LLM:
         # capture) already runs concurrently inside the children.
         self.process_list = []
         for local_rank, rank in enumerate(self.act_worker_ranks):
-            pp_rank = rank // self.tp_size
-            tp_rank = rank % self.tp_size
-            self.build_worker(local_rank, pp_rank, tp_rank)
+            if self.dp_size > 1:
+                # (PP x) DP+TP+EP: the world is pp_size*dp_size*tp_size ranks laid
+                # out as a pp x dp x tp grid, global_rank = pp*S + dp*tp_size + tp
+                # with S = dp_size*tp_size (the per-stage size). Attention is TP
+                # *within* each DP group; experts are sharded across a stage's S
+                # ranks. Reduces to the single-stage layout when pp_size == 1.
+                stage_size = self.dp_size * self.tp_size
+                pp_rank = rank // stage_size
+                within = rank % stage_size
+                dp_rank = within // self.tp_size
+                tp_rank = within % self.tp_size
+            else:
+                pp_rank = rank // self.tp_size
+                tp_rank = rank % self.tp_size
+                dp_rank = 0
+            self.build_worker(local_rank, pp_rank, tp_rank, dp_rank)
 
         if self.num_workers == 1:
             self.process_list[0].start()
@@ -224,7 +273,7 @@ class LLM:
         if self.load_format == "auto":
             self.load_progress()
 
-    def build_worker(self, local_rank, pp_rank, tp_rank):
+    def build_worker(self, local_rank, pp_rank, tp_rank, dp_rank=0):
         if self.overlap_scheduling:
             worker_cls = OverlapWorker
             run_target = run_overlap_worker
@@ -233,12 +282,13 @@ class LLM:
             run_target = run_worker
         comm = zmqComm(
             self.host,
-            self.zmq_port_base,
             self.launch_mode,
             self.master_addr,
             self.schedule_path,
             self.output_path,
             self.token_path,
+            dp_rank=dp_rank,
+            dp_size=self.dp_size,
         )
         worker = worker_cls(
             self.model_runner,
@@ -257,6 +307,9 @@ class LLM:
             self.schedule_method,
             self.disagg_config,
         )
+        # DP bookkeeping (logging + is_dp_attn); no signature change to Worker.
+        worker.dp_rank = dp_rank
+        worker.dp_size = self.dp_size
         process = self.ctx.Process(
             target=run_target,
             args=(worker,),
@@ -296,17 +349,41 @@ class LLM:
                 sys.exit()
 
     def add_requests(self, requests: List[Sequence]):
-        self.wait_lists.extend(requests)
+        with self._pending_lock:
+            self.wait_lists.extend(requests)
 
     def recv_ipc_package(self):
         """
         return: number of finished requests in each schedule
+
+        Drains *all* output packages currently queued. Under DP attention the
+        ``dp_size`` replicas each PUSH their own output packages into the shared
+        frontend PULL (fan-in), so more than one package can be waiting per
+        schedule tick; draining keeps the frontend from lagging behind the
+        replicas. Each package is self-describing (its own ``act_schedule_ids``
+        aligned with ``next_tokens``), so ordering across replicas is irrelevant
+        -- everything is keyed by ``seq_id`` via ``running_maps``.
         """
-        ipc_package: IPCPackage = self.comm.recv_output()
+        num_finish = 0
+        while True:
+            ipc_package: IPCPackage = self.comm.recv_output()
+            if ipc_package is None:
+                break
+            num_finish += self._apply_ipc_package(ipc_package)
+        return num_finish
+
+    def _apply_ipc_package(self, ipc_package):
         if ipc_package is not None:
             for idx, id in enumerate(ipc_package.act_schedule_ids):
+                # Under overlap scheduling a worker can emit a trailing token
+                # for a sequence it freed one step earlier (EOS detected after
+                # the next step was already launched), so the driver may have
+                # popped ``id`` already. Drop such a stale post-free token
+                # instead of crashing the engine on a missing running_maps key.
+                seq: Sequence = self.running_maps.get(id)
+                if seq is None:
+                    continue
                 if len(ipc_package.next_tokens) != 0:
-                    seq: Sequence = self.running_maps[id]
                     seq.append(ipc_package.next_tokens[idx])
                     if self.async_streams:
                         self.async_streams[id].put(
@@ -322,24 +399,71 @@ class LLM:
         return 0
 
     def send_ipc_package(self, log=True):
-        if len(self.wait_lists) != 0 or len(self.abort_ids) != 0:
-            for seq in self.wait_lists:
-                self.running_maps[seq.seq_id] = seq
-            ipc_package = IPCPackage(self.wait_lists)
-            if len(self.abort_ids) != 0:
-                logger.warning(
-                    f"Abort {len(self.abort_ids)} request(s) due to loss of network connection"
-                )
-            ipc_package.abort_ids = self.abort_ids
-            ipc_package.log = log
+        # Atomically claim the pending intake so a concurrent ``add_requests``
+        # (running on another executor thread) can't have a request dropped in
+        # the gap between reading ``wait_lists`` and clearing it. Anything that
+        # arrives after this swap simply goes to the next tick's fresh list.
+        with self._pending_lock:
+            if len(self.wait_lists) == 0 and len(self.abort_ids) == 0:
+                return
+            wait_lists = self.wait_lists
+            abort_ids = self.abort_ids
             self.wait_lists = []
             self.abort_ids = []
-            self.comm.send_ipc_package(ipc_package)
+
+        for seq in wait_lists:
+            self.running_maps[seq.seq_id] = seq
+        if self.dp_size > 1:
+            self._send_ipc_package_dp(wait_lists, abort_ids, log)
+            return
+        ipc_package = IPCPackage(wait_lists)
+        if len(abort_ids) != 0:
+            logger.warning(
+                f"Abort {len(abort_ids)} request(s) due to loss of network connection"
+            )
+        ipc_package.abort_ids = abort_ids
+        ipc_package.log = log
+        self.comm.send_ipc_package(ipc_package)
+
+    def _send_ipc_package_dp(self, wait_lists, abort_ids, log=True):
+        """Spread new requests across DP replicas; broadcast aborts to all.
+
+        New sequences are sent one per package so zmq delivers each to exactly
+        one replica (that replica then owns the seq's KV for its whole lifetime).
+        A seq's target replica is ``seq.target_dp`` when the request arrived on a
+        per-replica HTTP endpoint (``--endpoint-per-dp``); otherwise it is
+        round-robined across replicas. Aborts don't carry replica ownership on
+        the frontend, so they are broadcast to every replica; a replica that
+        doesn't own the seq_id simply ignores the unknown id.
+
+        ``wait_lists`` / ``abort_ids`` are the snapshots already claimed (and
+        cleared from ``self``) by :meth:`send_ipc_package` under the lock.
+        """
+        for seq in wait_lists:
+            pkg = IPCPackage([seq])
+            pkg.log = log
+            target = getattr(seq, "target_dp", None)
+            if target is None:
+                target = self._dp_rr
+                self._dp_rr = (self._dp_rr + 1) % self.dp_size
+            self.comm.send_ipc_package_to_dp(pkg, target)
+        if len(abort_ids) != 0:
+            logger.warning(
+                f"Abort {len(abort_ids)} request(s) due to loss of network connection"
+            )
+            abort_pkg = IPCPackage([])
+            abort_pkg.abort_ids = abort_ids
+            abort_pkg.log = log
+            self.comm.broadcast_ipc_package_to_dp(abort_pkg)
 
     def send_control_command(self, control_cmd: str):
         ipc_package = IPCPackage([])
         ipc_package.control_cmd = control_cmd
-        self.comm.send_ipc_package(ipc_package)
+        if self.dp_size > 1:
+            # Control commands (profiler start/stop) must reach every replica.
+            self.comm.broadcast_ipc_package_to_dp(ipc_package)
+        else:
+            self.comm.send_ipc_package(ipc_package)
 
     def start_profile(self):
         self.send_control_command("start_profile")

@@ -3,6 +3,7 @@ import hashlib
 import logging
 import math
 import os
+import socket
 import tempfile
 import uuid
 from functools import partial
@@ -87,6 +88,51 @@ def make_socket(ctx, path: str, type):
         return socket
     else:
         assert 0
+
+
+def find_free_port(host="0.0.0.0"):
+    """Ask the OS for a free TCP port on ``host`` (bind to :0)."""
+    bind_host = "" if host in ("0.0.0.0", "", None) else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((bind_host, 0))
+        return s.getsockname()[1]
+
+
+def find_free_ports(count, host="0.0.0.0"):
+    """Return ``count`` distinct free TCP ports (not necessarily contiguous).
+
+    Binds all sockets to ``:0`` simultaneously before reading their assigned
+    ports, so the OS hands back distinct numbers instead of reusing the same
+    just-released ephemeral port across a loop.
+    """
+    bind_host = "" if host in ("0.0.0.0", "", None) else host
+    socks = []
+    try:
+        for _ in range(count):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((bind_host, 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
+
+
+def make_pull_random(ctx, host):
+    """Bind a PULL socket to an OS-chosen free TCP port on ``host``.
+
+    Returns ``(socket, port)``. Instead of deriving a TCP port from a fixed
+    base (which can collide with whatever else is already listening), the
+    binder grabs whatever port is free and hands it to the connecting PUSH
+    peer out of band via ``send_obj_list``.
+    """
+    socket = ctx.socket(zmq.PULL)
+    port = socket.bind_to_random_port(f"tcp://{host}")
+    socket.setsockopt(zmq.RCVHWM, 0)
+    socket.setsockopt(zmq.RCVBUF, int(0.5 * 1024**3))
+    return socket, port
 
 
 temp_dir = tempfile.gettempdir()

@@ -13,16 +13,14 @@ from gllm.dist_utils import (
     get_pp_rank,
     get_pp_size,
     get_rank,
-    get_tp_group,
     get_tp_rank,
     get_tp_size,
-    get_world_size,
     is_output_rank,
     recv_obj_list,
     send_obj_list,
 )
 from gllm.sequence import Sequence
-from gllm.utils import make_socket
+from gllm.utils import make_socket, make_pull_random
 
 
 _SHUTDOWN = object()  # sentinel pushed onto a sender queue to drain it
@@ -76,22 +74,30 @@ class zmqComm:
     def __init__(
         self,
         host_addr,
-        port_base,
         launch_mode,
         master_addr,
         schedule_path,
         output_path,
         token_path,
         frontend=False,
+        dp_rank=0,
+        dp_size=1,
     ):
         self.host_addr = host_addr
-        self.port_base = port_base
         self.master_addr = master_addr
         self.launch_mode = launch_mode
         self.schedule_path = schedule_path
         self.output_path = output_path
         self.token_path = token_path
         self.frontend = frontend
+        # Data-parallel (DP) attention. When ``dp_size > 1`` the engine runs
+        # ``dp_size`` independent full-model replicas. Each replica binds its
+        # *own* request PULL socket (``schedule_path_dp{r}``) and the frontend
+        # keeps one PUSH socket per replica so it can round-robin new requests
+        # and broadcast aborts/control. Outputs still fan-in to the single
+        # frontend output PULL. ``dp_rank`` selects this replica's request path.
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
 
     def init(self):
         self.ctx = zmq.Context()
@@ -100,7 +106,20 @@ class zmqComm:
         self._senders: Dict["zmq.Socket", "queue.SimpleQueue"] = {}
 
         if self.frontend:  # front-end process
-            self.request_socket = make_socket(self.ctx, self.schedule_path, zmq.PUSH)
+            if self.dp_size > 1:
+                # One PUSH per DP replica (connects to that replica's request
+                # PULL bind). Enables explicit round-robin of new requests and
+                # broadcast of aborts/control across replicas. ``request_socket``
+                # aliases replica 0 for any legacy single-socket call site.
+                self.request_sockets = [
+                    make_socket(self.ctx, f"{self.schedule_path}_dp{r}", zmq.PUSH)
+                    for r in range(self.dp_size)
+                ]
+                self.request_socket = self.request_sockets[0]
+            else:
+                self.request_socket = make_socket(
+                    self.ctx, self.schedule_path, zmq.PUSH
+                )
             self.output_socket = make_socket(self.ctx, self.output_path, zmq.PULL)
             return
 
@@ -140,23 +159,33 @@ class zmqComm:
         pp_size = get_pp_size()
         tp_size = get_tp_size()
 
-        if rank == 0:
-            # rank 0 is the only worker that talks to the frontend.
-            self.request_socket = make_socket(self.ctx, self.schedule_path, zmq.PULL)
+        # The frontend driver is PP=0 TP=0. Non-DP: that's global rank 0 (the
+        # sole poller, unchanged). DP+EP: each DP group's tp_rank==0 is a
+        # driver, so there are ``dp_size`` drivers, each binding a *distinct*
+        # request path (``schedule_path_dp{dp_rank}``); the frontend keeps one
+        # PUSH per DP group pointed at these paths (see the frontend branch).
+        if pp_rank == 0 and tp_rank == 0:
+            req_path = self.schedule_path
+            if self.dp_size > 1:
+                req_path = f"{self.schedule_path}_dp{self.dp_rank}"
+            self.request_socket = make_socket(self.ctx, req_path, zmq.PULL)
             self.output_socket = make_socket(self.ctx, self.output_path, zmq.PUSH)
             if pp_size > 1:
-                # output_rank => rank 0 : next tokens (single PULL,
-                # broadcast inside TP group below)
+                # last-stage output_rank => this column's PP=0 driver : next
+                # tokens (single PULL, broadcast inside the stage-0 TP group
+                # below). DP+PP: each DP group is an independent replica, so the
+                # token leg is keyed per DP group (``token_path_dp{d}``) -- group
+                # ``d``'s last stage pushes to group ``d``'s PP=0 driver.
+                tok_path = self.token_path
+                if self.dp_size > 1:
+                    tok_path = f"{self.token_path}_dp{self.dp_rank}"
                 if self.launch_mode == "normal":
                     self.token_socket = make_socket(
-                        self.ctx, self.token_path, zmq.PULL
+                        self.ctx, tok_path, zmq.PULL
                     )
                 else:
-                    port_token = self.port_base + get_world_size()
-                    self.token_socket = make_socket(
-                        self.ctx,
-                        f"tcp://{self.master_addr}:{port_token}",
-                        zmq.PULL,
+                    self.token_socket, port_token = make_pull_random(
+                        self.ctx, self.master_addr
                     )
                     send_obj_list([port_token], get_output_rank())
 
@@ -176,10 +205,14 @@ class zmqComm:
         self._input_tp_recv_socket: Optional[zmq.Socket] = None
         if pp_rank == 0:
             self.schedule_other_sockets: List[zmq.Socket] = []
+            # Ranks per pipeline stage. DP+PP: a stage is a ``dp x tp`` grid, so
+            # this column's PP-other rank at stage ``pp`` sits ``pp * stage_size``
+            # above this driver's global rank (same ``(dp, tp)`` position).
+            stage_size = self.dp_size * tp_size
             if pp_size > 1:
                 if self.launch_mode == "normal":
                     for pp in range(1, pp_size):
-                        target_rank = pp * tp_size + tp_rank
+                        target_rank = pp * stage_size + rank
                         socket = make_socket(
                             self.ctx,
                             f"{self.schedule_path}_{target_rank}",
@@ -188,14 +221,15 @@ class zmqComm:
                         self.schedule_other_sockets.append(socket)
                 else:
                     for pp in range(1, pp_size):
-                        target_rank = pp * tp_size + tp_rank
-                        port_each = self.port_base + target_rank
-                        send_obj_list([port_each], target_rank)
-                        addr_each = [None]
-                        recv_obj_list(addr_each, target_rank)
+                        target_rank = pp * stage_size + rank
+                        # The PULL binder (target) picks a free port and sends
+                        # back its (addr, port); we just connect to it.
+                        info = [None, None]
+                        recv_obj_list(info, target_rank)
+                        addr_each, port_each = info
                         socket = make_socket(
                             self.ctx,
-                            f"tcp://{addr_each[0]}:{port_each}",
+                            f"tcp://{addr_each}:{port_each}",
                             zmq.PUSH,
                         )
                         self.schedule_other_sockets.append(socket)
@@ -204,9 +238,15 @@ class zmqComm:
             # broadcast short-circuits and we never touch any of
             # these sockets, so skip the setup entirely.
             if tp_size > 1:
-                if rank == 0:
+                if tp_rank == 0:
+                    # Each DP group's tp_rank==0 fans out to *its own* TP peers
+                    # (global ranks ``rank+1 .. rank+tp_size-1``). For the
+                    # non-DP case ``rank == 0`` so this is the original
+                    # ``peer_rank = peer_tp``; for DP+TP each group's driver
+                    # targets its own peers (global ranks are unique, so the
+                    # ``_tpinput_{peer_rank}`` paths never collide across groups).
                     for peer_tp in range(1, tp_size):
-                        peer_rank = peer_tp  # PP=0 TP=peer_tp == global rank peer_tp
+                        peer_rank = rank + peer_tp
                         if self.launch_mode == "normal":
                             socket = make_socket(
                                 self.ctx,
@@ -214,20 +254,14 @@ class zmqComm:
                                 zmq.PUSH,
                             )
                         else:
-                            # Skip the world_size + token (==world_size)
-                            # offsets used above; +1 keeps a free slot
-                            # in case a future feature wants
-                            # port_base + world_size + 1 - peer_rank
-                            # encoded somewhere.
-                            port_each = (
-                                self.port_base + get_world_size() + 1 + peer_rank
-                            )
-                            send_obj_list([port_each], peer_rank)
-                            addr_each = [None]
-                            recv_obj_list(addr_each, peer_rank)
+                            # The PULL peer picks a free port and sends back its
+                            # (addr, port); we just connect to it.
+                            info = [None, None]
+                            recv_obj_list(info, peer_rank)
+                            addr_each, port_each = info
                             socket = make_socket(
                                 self.ctx,
-                                f"tcp://{addr_each[0]}:{port_each}",
+                                f"tcp://{addr_each}:{port_each}",
                                 zmq.PUSH,
                             )
                         self._input_tp_sockets.append(socket)
@@ -239,14 +273,11 @@ class zmqComm:
                             zmq.PULL,
                         )
                     else:
-                        port_input = [None]
-                        recv_obj_list(port_input, 0)
-                        send_obj_list([self.host_addr], 0)
-                        self._input_tp_recv_socket = make_socket(
-                            self.ctx,
-                            f"tcp://{self.host_addr}:{port_input[0]}",
-                            zmq.PULL,
+                        # Bind a free port and hand (addr, port) to rank 0.
+                        self._input_tp_recv_socket, port_input = make_pull_random(
+                            self.ctx, self.host_addr
                         )
+                        send_obj_list([self.host_addr, port_input], 0)
         else:
             # PP-other rank: pull from its own column driver
             # (rank ``tp_rank`` on PP=0).
@@ -255,19 +286,20 @@ class zmqComm:
                     self.ctx, f"{self.schedule_path}_{rank}", zmq.PULL
                 )
             else:
-                port_schedule = [None]
-                recv_obj_list(port_schedule, tp_rank)  # column driver
-                send_obj_list([self.host_addr], tp_rank)
-                self.schedule_socket = make_socket(
-                    self.ctx,
-                    f"tcp://{self.host_addr}:{port_schedule[0]}",
-                    zmq.PULL,
+                # Bind a free port and hand (addr, port) to the column driver.
+                self.schedule_socket, port_schedule = make_pull_random(
+                    self.ctx, self.host_addr
                 )
+                send_obj_list([self.host_addr, port_schedule], tp_rank)
 
         if is_output_rank() and pp_size != 1:
-            # output_rank (last-PP TP=0) => rank 0 : next tokens.
+            # output_rank (last-PP TP=0) => this column's PP=0 driver : tokens.
+            # DP+PP keys the leg per DP group (see the PP=0 PULL bind above).
+            tok_path = self.token_path
+            if self.dp_size > 1:
+                tok_path = f"{self.token_path}_dp{self.dp_rank}"
             if self.launch_mode == "normal":
-                self.token_socket = make_socket(self.ctx, self.token_path, zmq.PUSH)
+                self.token_socket = make_socket(self.ctx, tok_path, zmq.PUSH)
             else:
                 port_token = [None]
                 recv_obj_list(port_token, 0)
@@ -428,10 +460,12 @@ class zmqComm:
             self._tp_bcast_flag_cpu = torch.zeros(
                 1, dtype=torch.long, device="cpu", pin_memory=True
             )
-            # Source rank inside the TP group: tp_rank == 0 of this PP
-            # stage. Pre-compute once so the per-iter broadcast doesn't
-            # have to recompute it. For pp_size=1 this is global rank 0.
-            self._tp_bcast_src_rank = get_pp_rank() * get_tp_size()
+            # Source rank inside the TP group: tp_rank == 0 of this TP
+            # subgroup. ``get_rank() - get_tp_rank()`` is that group's tp0
+            # global rank -- equal to ``pp_rank * tp_size`` for the non-DP case
+            # and to ``dp_rank * tp_size`` for DP+TP (each DP group broadcasts
+            # its own sampled tokens within its own TP subgroup).
+            self._tp_bcast_src_rank = get_rank() - get_tp_rank()
 
     def broadcast_input_to_tp(
         self, ipc_package: Optional["IPCPackage"]
@@ -457,7 +491,7 @@ class zmqComm:
         if get_tp_size() <= 1:
             return ipc_package
 
-        if get_rank() == 0:
+        if get_tp_rank() == 0:
             # ``send_pyobj`` pickles + sends; we accept the per-peer
             # pickle cost (3 pickles for tp_size=4) because pickling
             # ``None`` or an empty IPCPackage is < 1 us each and the
@@ -544,6 +578,15 @@ class zmqComm:
 
     def send_ipc_package(self, ipc_package):
         self.request_socket.send_pyobj(ipc_package)
+
+    def send_ipc_package_to_dp(self, ipc_package, dp_index):
+        """Send a package to one DP replica (frontend, dp_size > 1 only)."""
+        self.request_sockets[dp_index].send_pyobj(ipc_package)
+
+    def broadcast_ipc_package_to_dp(self, ipc_package):
+        """Send a copy of the package to every DP replica (aborts/control)."""
+        for sock in self.request_sockets:
+            sock.send_pyobj(ipc_package)
 
     def recv_ipc_package(self):
         if self.request_socket.poll(timeout=0) != 0:

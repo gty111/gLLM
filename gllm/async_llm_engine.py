@@ -77,6 +77,7 @@ class PipeAsyncLLM(LLM):
         repetition_penalty: float,
         mm_contents=None,
         mm_items=None,
+        dp_index=None,
     ):
         seq = self.allocate_seq(
             token_ids,
@@ -89,6 +90,10 @@ class PipeAsyncLLM(LLM):
             mm_contents,
             mm_items,
         )
+        # Pin to a specific DP replica when the request came in on a per-replica
+        # endpoint (``--endpoint-per-dp``); ``None`` keeps the round-robin default.
+        if dp_index is not None and self.dp_size > 1:
+            seq.target_dp = dp_index % self.dp_size
         stream = AsyncStream(raw_request, seq=seq)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
@@ -98,9 +103,18 @@ class PipeAsyncLLM(LLM):
         return stream
 
     async def check_abort_seqs(self):
-        for id, seq in self.running_maps.items():
-            if await self.async_streams[id].is_disconnected() and not seq.is_abort:
-                self.abort_ids.append(id)
+        # Snapshot: the engine step (``send_ipc_package`` / ``_apply_ipc_package``
+        # on an executor thread) mutates ``running_maps`` concurrently, so
+        # iterating it live could raise "dictionary changed size during
+        # iteration". ``async_streams`` may also drop an id between the snapshot
+        # and the lookup, so guard the read.
+        for id, seq in list(self.running_maps.items()):
+            stream = self.async_streams.get(id)
+            if stream is None:
+                continue
+            if await stream.is_disconnected() and not seq.is_abort:
+                with self._pending_lock:
+                    self.abort_ids.append(id)
                 seq.is_abort = True
 
     async def schedule(self):

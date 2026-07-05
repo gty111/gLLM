@@ -289,6 +289,50 @@ def propagate_quantization_config(
             sub.quantization_config = resolved
 
 
+# Runtime serving flags written by :class:`ModelLoader.load_config` and
+# :class:`ModelRunner` onto the top-level HF config. VL wrappers construct
+# their language backbone from ``text_config``, so each field here must be
+# propagated explicitly (see :func:`propagate_serving_config`).
+SERVING_CONFIG_FIELDS: Tuple[str, ...] = (
+    "mla_decode_backend",
+    "page_size",
+    "use_mla",
+    "use_hybrid_state",
+    "max_num_batched_tokens",
+)
+
+
+def propagate_serving_config(
+    config,
+    propagate_to: Tuple[str, ...] = ("text_config",),
+    fields: Tuple[str, ...] = SERVING_CONFIG_FIELDS,
+) -> None:
+    """Mirror gLLM runtime serving flags from the top-level config to nested
+    sub-configs (default: ``text_config``).
+
+    Multimodal wrappers (``KimiK25ForConditionalGeneration``, Qwen-VL, …)
+    build their language sub-model from ``config.text_config``. Serving
+    decisions such as ``mla_decode_backend``, ``page_size``, and
+    ``max_num_batched_tokens`` are stamped on the top-level config by
+    :class:`ModelRunner` / :meth:`ModelLoader.load_config`; without this
+    helper the LM silently keeps HF defaults (e.g. MLA decode falls back to
+    Triton).
+
+    Top-level wins: every listed field that exists on the top-level config
+    overwrites the corresponding sub-config attribute.
+
+    Mutates ``config`` in place. Safe to call repeatedly. No-op when a listed
+    sub-config is absent.
+    """
+    for name in propagate_to:
+        sub = getattr(config, name, None)
+        if sub is None:
+            continue
+        for field in fields:
+            if hasattr(config, field):
+                setattr(sub, field, getattr(config, field))
+
+
 class ModelLoader:
     def __init__(
         self,

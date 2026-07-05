@@ -178,6 +178,17 @@ class SchedulePayload:
     mrope_positions: Optional[torch.Tensor] = None
     control_cmd: int = 0
     control_data: Any = None
+    # DP+PP coordination (``pp_size > 1`` and ``dp_size > 1`` only). The stage-0
+    # driver of a DP group reconciles the per-group token counts + graph bucket
+    # via the cross-DP barrier once, then piggybacks the agreed decision on the
+    # payload so every downstream PP stage sizes its MoE gather / picks the same
+    # CUDA-graph bucket without re-running the barrier. ``dp_dummy_size > 0``
+    # marks an idle group's filler microbatch: the follower builds a dummy input
+    # of that many tokens (no real seqs) so the stage's MoE collectives stay
+    # matched, and its sampled output is discarded (never returned to the driver).
+    dp_counts: Optional[List[int]] = None
+    dp_padded_size: Optional[int] = None
+    dp_dummy_size: int = 0
 
     def is_empty(self) -> bool:
         return (
@@ -186,6 +197,8 @@ class SchedulePayload:
             and not self.frees
             and self.mrope_positions is None
             and self.control_cmd == 0
+            and self.dp_counts is None
+            and self.dp_dummy_size == 0
         )
 
 
