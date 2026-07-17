@@ -320,9 +320,9 @@ class zmqComm:
 
     def send_tokens(self, tokens):
         # ``tokens`` is either a plain ``list`` of token ids or a
-        # ``(tokens, logprobs)`` tuple (PP>1 logprobs ride the same socket back
-        # to rank 0). ``recv_tokens`` returns it verbatim for the caller to
-        # unpack.
+        # ``(tokens, gen_logprobs, prompt_logprobs)`` tuple (PP>1 logprobs ride
+        # the same socket back to rank 0). ``recv_tokens`` returns it verbatim
+        # for the caller to unpack.
         assert type(tokens) in (list, tuple)
         self.token_socket.send_pyobj(tokens)
 

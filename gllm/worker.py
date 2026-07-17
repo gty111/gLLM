@@ -486,7 +486,11 @@ class Worker(TorchProfilerMixin):
                 # the driver (its scheduler only tracks real in-flight batches).
                 if not (dp and getattr(input_data, "dp_dummy", False)):
                     self.comm.send_tokens(
-                        (output, self.model_runner._last_logprobs)
+                        (
+                            output,
+                            self.model_runner._last_logprobs,
+                            self.model_runner._last_prompt_logprobs,
+                        )
                     )
             elif not is_last_pp_rank():
                 send_pp_data(output, get_next_pp_rank())
@@ -627,14 +631,16 @@ class Worker(TorchProfilerMixin):
 
         next_tokens: Optional[List[int]] = None
         logprobs = None
+        prompt_logprobs = None
         # The column driver that owns the token PULL socket. Non-DP: global
         # rank 0. DP+PP: each DP group's PP=0 TP=0 owns its own per-group token
         # leg (``token_path_dp{d}``); ``_polls_frontend`` is exactly that rank.
         if self._polls_frontend():
             recv = self.comm.recv_tokens()
             if recv is not None:
-                # Output rank always ships ``(tokens, logprobs)`` under PP>1.
-                next_tokens, logprobs = recv
+                # Output rank always ships ``(tokens, gen_logprobs,
+                # prompt_logprobs)`` under PP>1.
+                next_tokens, logprobs, prompt_logprobs = recv
 
         if get_tp_size() > 1:
             # Only the tokens need TP-fanout (every column driver runs its own
@@ -643,7 +649,7 @@ class Worker(TorchProfilerMixin):
             next_tokens = self.comm.broadcast_tokens_to_tp(next_tokens)
 
         if next_tokens is not None:
-            self.scheduler.add_next_tokens(next_tokens, logprobs)
+            self.scheduler.add_next_tokens(next_tokens, logprobs, prompt_logprobs)
 
     def check_abort_seqs(self):
         """Process aborts on every column driver; only the driver replies."""
@@ -887,9 +893,16 @@ class Worker(TorchProfilerMixin):
                 # rank 0 via the existing token zmq pair; the other
                 # column drivers pick them up in next iter's
                 # ``recv_next_tokens`` (which NCCL-fans them out
-                # across the PP-0 TP group). Logprobs ride the same
-                # socket so rank 0 can attach them in ``process_output``.
-                self.comm.send_tokens((next_tokens, logprobs))
+                # across the PP-0 TP group). Generation + prompt logprobs ride
+                # the same socket so rank 0 can attach them in
+                # ``process_output``.
+                self.comm.send_tokens(
+                    (
+                        next_tokens,
+                        logprobs,
+                        self.model_runner._last_prompt_logprobs,
+                    )
+                )
             # last-PP TP>0 ranks for PP>1: discard ``next_tokens``;
             # they don't drive a scheduler.
         else:

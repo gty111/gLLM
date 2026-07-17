@@ -123,10 +123,18 @@ class SeqRegister:
     repetition_penalty: float
     # Generation-logprobs flags: the output rank (a follower under PP>1) needs
     # these to know which seqs want per-token logprobs and how many top
-    # alternatives to report. Prompt-logprobs is intentionally not mirrored
-    # (only supported for pp_size == 1, where the driver holds the real seqs).
+    # alternatives to report.
     logprobs_enabled: bool = False
     num_top_logprobs: int = 0
+    # Prompt-logprobs flags (PP>1): the output-rank follower computes prompt
+    # logprobs over the full prompt during prefill (it holds the hidden states
+    # + LM head), so it needs the request flag, the top-k count, and the
+    # original prompt length. The follower must also keep the full prompt
+    # ``token_ids`` (to look up the target token at each position) -- forced on
+    # via ``_keeps_token_ids`` when ``prompt_logprobs_enabled``.
+    prompt_logprobs_enabled: bool = False
+    num_prompt_logprobs: int = 0
+    raw_prompt_len: int = 0
     # ``mm_contents`` is the dict produced by
     # ``ModelRunner.extract_modify_mm`` ({"image": [...], "video": [...]}).
     # For non-VL or non-multimodal requests it's ``None``.
@@ -304,6 +312,9 @@ class DriverPayloadBuilder:
                         repetition_penalty=seq.repetition_penalty,
                         logprobs_enabled=seq.logprobs_enabled,
                         num_top_logprobs=seq.num_top_logprobs,
+                        prompt_logprobs_enabled=seq.prompt_logprobs_enabled,
+                        num_prompt_logprobs=seq.num_prompt_logprobs,
+                        raw_prompt_len=seq.raw_prompt_len,
                         # ``mm_contents`` is a small dict of refs / URLs
                         # / bytes; pickle-by-reference is fine. The
                         # driver mutates it only in
@@ -406,6 +417,10 @@ class FollowerSeq:
         "_keeps_token_ids",
         "logprobs_enabled",
         "num_top_logprobs",
+        "prompt_logprobs_enabled",
+        "num_prompt_logprobs",
+        "raw_prompt_len",
+        "prompt_logprobs_data",
     )
 
     def __init__(self, reg: SeqRegister, mm_needs_token_ids: bool = False):
@@ -430,6 +445,9 @@ class FollowerSeq:
             reg.needs_token_id_accumulation
             or reg.mm_contents is not None
             or mm_needs_token_ids
+            # Prompt logprobs read the full prompt token_ids on the follower to
+            # look up the target token at each position, so keep them alive.
+            or reg.prompt_logprobs_enabled
         )
         self.token_ids: Optional[List[int]] = (
             list(reg.prompt_token_ids) if self._keeps_token_ids else None
@@ -452,6 +470,17 @@ class FollowerSeq:
         self.output_len = reg.output_len
         self.logprobs_enabled = reg.logprobs_enabled
         self.num_top_logprobs = reg.num_top_logprobs
+        # Prompt-logprobs mirror. ``_compute_prompt_logprobs`` reads
+        # ``prompt_logprobs_enabled`` / ``num_prompt_logprobs`` / ``raw_prompt_len``
+        # and accumulates into ``prompt_logprobs_data`` (same shape as the real
+        # ``Sequence``). No ``_prompt_logprobs_sent`` latch is needed: the
+        # follower emits each completed list exactly once via the runner's
+        # ``_last_prompt_logprobs`` (keyed on the prefill-completing step), and
+        # decode steps are skipped by the ``computed_prompt`` gate.
+        self.prompt_logprobs_enabled = reg.prompt_logprobs_enabled
+        self.num_prompt_logprobs = reg.num_prompt_logprobs
+        self.raw_prompt_len = reg.raw_prompt_len
+        self.prompt_logprobs_data = None
 
     # ---- duck-typed Sequence surface --------------------------------------
 

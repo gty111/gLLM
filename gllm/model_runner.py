@@ -286,6 +286,13 @@ class ModelRunner:
         # sampled tokens (incl. over the token socket under PP>1). ``None`` when
         # the last batch requested no logprobs.
         self._last_logprobs = None
+        # Prompt logprobs that finished prefill on the most recent forward,
+        # keyed by seq_id (``{seq_id: prompt_logprobs_data}``). Only used under
+        # PP>1, where the output-rank follower computes them and ships them to
+        # rank 0 over the token socket alongside the sampled tokens; rank 0
+        # attaches them in ``process_output``. Empty on the common path. (PP=1
+        # attaches directly from the local seq in the scheduler instead.)
+        self._last_prompt_logprobs = {}
 
         self.use_mm = self.model_loader.use_mm
         self.use_mla = self.model_loader.use_mla
@@ -1657,18 +1664,28 @@ class ModelRunner:
         run the LM head over this chunk's positions, then record the logprob of
         the *actual* next prompt token at each position (plus top-k). Handles
         chunked prefill by filling only the positions this chunk covers;
-        prefix-cache-skipped positions stay ``None``. Requires the real
-        ``Sequence`` (full ``token_ids`` + ``raw_prompt_len``), so it is a no-op
-        for follower mirrors under PP>1 (they lack ``prompt_logprobs_enabled``).
+        prefix-cache-skipped positions stay ``None``. Needs the full prompt
+        ``token_ids`` + ``raw_prompt_len``: works on the real ``Sequence``
+        (PP=1) and on the ``FollowerSeq`` mirror (PP>1), which carries those
+        fields when ``prompt_logprobs_enabled``.
 
-        TP>1 is intentionally unsupported: this is only invoked on the output
-        rank (tp0), but ``logits_from_hidden`` -> ``ParallelLMHead`` issues a
-        ``tensor_model_parallel_all_gather``; running it on tp0 alone would
-        deadlock the other TP ranks. Skip rather than hang (matches the PP>1
-        no-op limitation).
+        Runs on both PP=1 and the PP>1 output-rank follower. Under PP>1 the
+        completed lists are stashed in ``self._last_prompt_logprobs`` (keyed on
+        the prefill-completing step) for the worker to ship to rank 0 over the
+        token socket; under PP=1 the scheduler attaches directly from the seq.
+
+        TP>1: ``logits_from_hidden`` -> ``ParallelLMHead`` issues a
+        ``tensor_model_parallel_all_gather``, so this MUST be invoked on *every*
+        TP rank of the (last-PP) stage, not just the output rank, or it
+        deadlocks. That is safe because every TP rank of the stage holds
+        identical seqs (real ``Sequence`` for PP=1, identical ``FollowerSeq``
+        mirrors for PP>1), identical ``hidden_states`` and ``query_start_loc``:
+        the per-seq ``project`` calls (count + shapes) match bit-for-bit across
+        ranks, so the collective is balanced. Each rank computes the same
+        result; only the output rank's copy is actually shipped (others drop).
         """
-        if get_tp_size() > 1:
-            return
+        # Reset each call so stale completions don't re-ship under PP>1.
+        self._last_prompt_logprobs = {}
         if not any(getattr(s, "prompt_logprobs_enabled", False) for s in seqs):
             return
         # Models expose ``logits_from_hidden`` to project arbitrary positions to
@@ -1718,6 +1735,12 @@ class ModelRunner:
                     top_ids[j],
                     top_vals[j],
                 )
+            # The prompt finishes prefill this step once the chunk reaches the
+            # end of the prompt (c0 + n >= prompt_len). At that point every
+            # position 1..prompt_len-1 is filled, so the list is complete --
+            # record it for the PP>1 socket path (harmless/ignored under PP=1).
+            if c0 + n >= prompt_len:
+                self._last_prompt_logprobs[seq.seq_id] = seq.prompt_logprobs_data
 
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
@@ -1776,8 +1799,11 @@ class ModelRunner:
                 next_tokens = next_tokens_gpu.cpu().tolist()
             else:
                 next_tokens = self.sampler.forward(logits, self.input_data)
-            if is_output_rank():
-                self._compute_prompt_logprobs(seqs, hidden)
+            # Prompt logprobs re-enter the LM head (a TP all-gather), so this
+            # runs on ALL last-PP TP ranks (not just the output rank) to keep
+            # the collective balanced; every rank has the same real seqs, so
+            # they compute identical data and only tp0's copy is shipped.
+            self._compute_prompt_logprobs(seqs, hidden)
             return next_tokens
         return (
             self.output_hidden_states[:num_cal_tokens],
@@ -2129,10 +2155,14 @@ class OverlapModelRunner(ModelRunner):
                     next_tokens_gpu = self.sampler.forward_gpu(
                         logits, self.input_data
                     )
-                # Prompt logprobs accumulate directly onto the (real) seqs; the
-                # scheduler ships the completed list once the prompt finishes
-                # prefill. Gated inside the helper on ``prompt_logprobs_enabled``.
-                self._compute_prompt_logprobs(seqs, hidden)
+            # Prompt logprobs accumulate directly onto the (real) seqs; the
+            # scheduler ships the completed list once the prompt finishes
+            # prefill. Gated inside the helper on ``prompt_logprobs_enabled``.
+            # Run on ALL last-PP TP ranks (outside the output-rank block): it
+            # re-enters the LM head (a TP all-gather) and must stay balanced
+            # across the TP group. Every rank has identical seqs, so the result
+            # is identical; only the output rank's IPC package is forwarded.
+            self._compute_prompt_logprobs(self.input_data.seqs, hidden)
             if get_tp_size() > 1:
                 if next_tokens_gpu is None:
                     next_tokens_gpu = torch.empty(

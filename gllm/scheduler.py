@@ -173,13 +173,15 @@ class Scheduler:
     def add_new_requests(self, seqs):
         self.seqs_to_prefill.extend(seqs)
 
-    def add_next_tokens(self, next_tokens, logprobs=None):
+    def add_next_tokens(self, next_tokens, logprobs=None, prompt_logprobs=None):
         # ``logprobs`` (when present) is a per-batch-row list aligned with
         # ``next_tokens`` -- ``None`` for seqs that didn't request logprobs,
-        # else ``(sampled, top_ids, top_vals)``. Queued alongside the tokens so
-        # ``process_output`` can attach them (works for PP>1, where the tokens
-        # + logprobs arrive together over the token socket).
-        self.next_tokens_queue.append((next_tokens, logprobs))
+        # else ``(sampled, top_ids, top_vals)``. ``prompt_logprobs`` (PP>1 only)
+        # is a ``{seq_id: prompt_logprobs_data}`` dict for prompts that just
+        # finished prefill, computed on the output-rank follower and shipped
+        # over the token socket. Both are queued alongside the tokens so
+        # ``process_output`` can attach them in batch order.
+        self.next_tokens_queue.append((next_tokens, logprobs, prompt_logprobs))
 
     @staticmethod
     def _attach_prompt_logprobs(ipc_package, seq):
@@ -206,7 +208,7 @@ class Scheduler:
             return None
 
         schedule_seqs: List[Sequence] = self.batch_running.popleft()
-        next_tokens, logprobs = self.next_tokens_queue.popleft()
+        next_tokens, logprobs, prompt_logprobs = self.next_tokens_queue.popleft()
 
         ipc_package = IPCPackage([])
 
@@ -219,7 +221,15 @@ class Scheduler:
                     ipc_package.logprobs.append(logprobs[idx])
                 else:
                     ipc_package.logprobs.append(None)
-                self._attach_prompt_logprobs(ipc_package, seq)
+                if prompt_logprobs and seq.seq_id in prompt_logprobs:
+                    # PP>1: prompt logprobs computed on the follower and shipped
+                    # over the token socket; attach the received list directly.
+                    ipc_package.prompt_logprobs[seq.seq_id] = prompt_logprobs[
+                        seq.seq_id
+                    ]
+                else:
+                    # PP=1: attach from the local seq's accumulated data.
+                    self._attach_prompt_logprobs(ipc_package, seq)
                 seq.append(next_tokens[idx])
                 # The token is real (non-overlap appends immediately), so it is
                 # safe to register the prefix-cache hash for any page boundary
