@@ -121,6 +121,12 @@ class SeqRegister:
     top_p: float
     top_k: int
     repetition_penalty: float
+    # Generation-logprobs flags: the output rank (a follower under PP>1) needs
+    # these to know which seqs want per-token logprobs and how many top
+    # alternatives to report. Prompt-logprobs is intentionally not mirrored
+    # (only supported for pp_size == 1, where the driver holds the real seqs).
+    logprobs_enabled: bool = False
+    num_top_logprobs: int = 0
     # ``mm_contents`` is the dict produced by
     # ``ModelRunner.extract_modify_mm`` ({"image": [...], "video": [...]}).
     # For non-VL or non-multimodal requests it's ``None``.
@@ -296,6 +302,8 @@ class DriverPayloadBuilder:
                         top_p=seq.top_p,
                         top_k=seq.top_k,
                         repetition_penalty=seq.repetition_penalty,
+                        logprobs_enabled=seq.logprobs_enabled,
+                        num_top_logprobs=seq.num_top_logprobs,
                         # ``mm_contents`` is a small dict of refs / URLs
                         # / bytes; pickle-by-reference is fine. The
                         # driver mutates it only in
@@ -396,6 +404,8 @@ class FollowerSeq:
         "ignore_eos",
         "output_len",
         "_keeps_token_ids",
+        "logprobs_enabled",
+        "num_top_logprobs",
     )
 
     def __init__(self, reg: SeqRegister, mm_needs_token_ids: bool = False):
@@ -440,6 +450,8 @@ class FollowerSeq:
         self.finish_tokens = reg.finish_tokens
         self.ignore_eos = reg.ignore_eos
         self.output_len = reg.output_len
+        self.logprobs_enabled = reg.logprobs_enabled
+        self.num_top_logprobs = reg.num_top_logprobs
 
     # ---- duck-typed Sequence surface --------------------------------------
 

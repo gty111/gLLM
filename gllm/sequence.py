@@ -18,6 +18,10 @@ class Sequence:
         top_k=10,
         repetition_penalty=1.0,
         mm_contents=None,
+        logprobs_enabled=False,
+        num_top_logprobs=0,
+        prompt_logprobs_enabled=False,
+        num_prompt_logprobs=0,
     ):
         self.seq_id = seq_id
         self.token_ids: List[int] = token_ids
@@ -47,6 +51,26 @@ class Sequence:
         self.top_p = top_p
         self.top_k = top_k
         self.repetition_penalty = repetition_penalty
+        # Per-token logprobs (OpenAI ``logprobs``). ``logprobs_enabled`` turns
+        # the (gated) log_softmax + top-k on for this seq; ``num_top_logprobs``
+        # is how many alternative tokens to report alongside the sampled one
+        # (0 => only the sampled token's logprob). ``_pending_logprob`` is the
+        # scratch slot the sampler/runner stashes this decode step's result in
+        # (non-overlap path); the scheduler drains it into the IPC package.
+        self.logprobs_enabled = logprobs_enabled
+        self.num_top_logprobs = num_top_logprobs
+        self._pending_logprob = None
+        # Prompt-token logprobs (vLLM ``prompt_logprobs``). Accumulated on the
+        # worker across (possibly chunked) prefill into ``prompt_logprobs_data``
+        # -- a list of length ``raw_prompt_len`` where index 0 is ``None`` (no
+        # preceding context) and later entries are
+        # ``(token_id, logprob, top_ids, top_vals)``. Sent to the frontend once
+        # via the IPC package on the step the prompt finishes prefill;
+        # ``_prompt_logprobs_sent`` guards against re-sending on later decodes.
+        self.prompt_logprobs_enabled = prompt_logprobs_enabled
+        self.num_prompt_logprobs = num_prompt_logprobs
+        self.prompt_logprobs_data = None
+        self._prompt_logprobs_sent = False
         # used for prefix cache and chunked prefill
         self.computed_token_num = 0
         self.to_compute_token_num = 0

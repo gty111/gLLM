@@ -33,6 +33,32 @@ K = TypeVar("K")
 T = TypeVar("T")
 
 
+class StreamOutput:
+    """A single streamed generation delta.
+
+    ``text`` is the incremental detokenized text (may be empty while a
+    multi-byte token is still being assembled). ``logprob`` is the OpenAI-ready
+    per-token logprob dict for the token that produced this delta, or ``None``
+    when the request did not ask for logprobs. Kept as a plain object (not a
+    bare str) so the async stream can carry both without a second channel.
+    """
+
+    __slots__ = ("text", "logprob", "prompt_logprobs")
+
+    def __init__(
+        self,
+        text: str,
+        logprob: Optional[dict] = None,
+        prompt_logprobs: Optional[list] = None,
+    ):
+        self.text = text
+        self.logprob = logprob
+        # Set only on the first delta of a request that asked for
+        # ``prompt_logprobs``: the full per-prompt-token list (index 0 is
+        # ``None``). ``None`` on every other delta.
+        self.prompt_logprobs = prompt_logprobs
+
+
 def init_logger():
     formatter = logging.Formatter(
         f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s",

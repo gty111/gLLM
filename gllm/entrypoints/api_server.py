@@ -112,6 +112,15 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         if request.max_completion_tokens is not None
         else request.max_tokens
     )
+    # OpenAI chat logprobs: ``logprobs`` (bool) turns them on, ``top_logprobs``
+    # (0-20) is how many alternatives to report per token. Clamp to the OpenAI
+    # ceiling to bound the per-step top-k work.
+    logprobs_enabled = bool(request.logprobs)
+    num_top_logprobs = min(request.top_logprobs or 0, 20) if logprobs_enabled else 0
+    prompt_logprobs_enabled = request.prompt_logprobs is not None
+    num_prompt_logprobs = (
+        min(request.prompt_logprobs, 20) if prompt_logprobs_enabled else 0
+    )
     if llm.check_seq_length(token_ids, max_output_tokens):
         stream = await llm.add_requests_async(
             raw_request,
@@ -125,6 +134,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             mm_contents,
             mm_items,
             dp_index=getattr(raw_request.app.state, "dp_index", None),
+            logprobs_enabled=logprobs_enabled,
+            num_top_logprobs=num_top_logprobs,
+            prompt_logprobs_enabled=prompt_logprobs_enabled,
+            num_prompt_logprobs=num_prompt_logprobs,
         )
     else:
         return ErrorResponse(
@@ -143,6 +156,15 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
     token_ids = await make_async(llm.model_runner.encode)(request.prompt)
+    # OpenAI completions ``logprobs`` is an int: the number of top alternatives
+    # to report (the sampled token's logprob is always included). ``None`` /
+    # unset disables it. Clamp to the OpenAI ceiling.
+    logprobs_enabled = request.logprobs is not None
+    num_top_logprobs = min(request.logprobs or 0, 20) if logprobs_enabled else 0
+    prompt_logprobs_enabled = request.prompt_logprobs is not None
+    num_prompt_logprobs = (
+        min(request.prompt_logprobs, 20) if prompt_logprobs_enabled else 0
+    )
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(
             raw_request,
@@ -154,6 +176,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             request.top_k,
             request.repetition_penalty,
             dp_index=getattr(raw_request.app.state, "dp_index", None),
+            logprobs_enabled=logprobs_enabled,
+            num_top_logprobs=num_top_logprobs,
+            prompt_logprobs_enabled=prompt_logprobs_enabled,
+            num_prompt_logprobs=num_prompt_logprobs,
         )
     else:
         return ErrorResponse(

@@ -182,14 +182,38 @@ class OverlapWorker(Worker):
         forwards the resulting ``IPCPackage``. ``is_dummy`` batches (idle DP
         groups) and empty ``deferred`` carry no output and are skipped.
         """
-        copy_done, batch_size, buf_idx, deferred, _input_data, is_dummy = entry
+        copy_done, batch_size, buf_idx, deferred, _input_data, is_dummy, lp_k = entry
         copy_done.synchronize()
         if is_dummy or deferred is None:
             return
         tokens = self.model_runner._next_tokens_bufs[buf_idx][:batch_size].tolist()
-        ipc_package = self.scheduler.process_output_finalize(deferred, tokens)
+        # Logprobs were staged only on the output rank (== the frontend poller
+        # for PP=1); other columns skip the read since their IPC is discarded.
+        logprobs = None
+        if lp_k is not None and self._polls_frontend():
+            logprobs = self._read_logprobs(buf_idx, batch_size, lp_k)
+        ipc_package = self.scheduler.process_output_finalize(
+            deferred, tokens, logprobs
+        )
         if ipc_package is not None and self._polls_frontend():
             self.comm.send_output(ipc_package)
+
+    def _read_logprobs(self, buf_idx: int, batch_size: int, lp_k: int):
+        """Materialize this batch's staged logprobs as a per-row Python list.
+
+        Returns a list of ``(sampled_logprob, top_ids, top_vals)`` indexed by
+        the batch (== schedule) position, which ``process_output_finalize``
+        keys into by ``batch_idx``.
+        """
+        mr = self.model_runner
+        sampled = mr._lp_sampled_bufs[buf_idx][:batch_size].tolist()
+        if lp_k > 0:
+            ids = mr._lp_topid_bufs[buf_idx][:batch_size, :lp_k].tolist()
+            vals = mr._lp_topval_bufs[buf_idx][:batch_size, :lp_k].tolist()
+        else:
+            ids = [[] for _ in range(batch_size)]
+            vals = [[] for _ in range(batch_size)]
+        return [(sampled[i], ids[i], vals[i]) for i in range(batch_size)]
 
     def _drain_pending(self) -> None:
         while self._gpu_pending:
@@ -266,7 +290,7 @@ class OverlapWorker(Worker):
             # finishes -- ``prep_stream`` is still DMA'ing from its CPU tensors.
             self._prefetched_input = None
             try:
-                copy_done, batch_size, future_slot_ids, buf_idx = (
+                copy_done, batch_size, future_slot_ids, buf_idx, lp_k = (
                     self._launch_batch(input_data, dp_padded_size=dp_padded_size)
                 )
             finally:
@@ -278,7 +302,7 @@ class OverlapWorker(Worker):
                 else self.scheduler.process_output_deferred(future_slot_ids)
             )
             self._gpu_pending.append(
-                (copy_done, batch_size, buf_idx, deferred, input_data, is_dummy)
+                (copy_done, batch_size, buf_idx, deferred, input_data, is_dummy, lp_k)
             )
 
         if pending_before > 0:

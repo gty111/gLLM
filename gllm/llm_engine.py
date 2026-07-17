@@ -14,6 +14,7 @@ from gllm.model_runner import ModelRunner, OverlapModelRunner
 from gllm.overlap_worker import OverlapWorker, run_overlap_worker
 from gllm.sequence import Sequence
 from gllm.utils import (
+    StreamOutput,
     find_free_port,
     get_model_load_pbar,
     init_logger,
@@ -372,6 +373,54 @@ class LLM:
             num_finish += self._apply_ipc_package(ipc_package)
         return num_finish
 
+    def _make_logprob_entry(self, token_id, lp):
+        """Turn a raw ``(sampled_logprob, top_ids, top_vals)`` tuple into the
+        OpenAI-ready per-token dict, decoding each id to its piece + bytes.
+
+        Returns ``None`` when the seq did not request logprobs (``lp is None``).
+        The token string uses the tokenizer's single-id decode; the response
+        builder applies ``return_tokens_as_token_ids`` on top if requested.
+        """
+        if lp is None:
+            return None
+        sampled, top_ids, top_vals = lp
+        tokenizer = self.model_runner.tokenizer
+
+        def build(tid, val):
+            try:
+                piece = tokenizer.decode([int(tid)])
+            except Exception:
+                piece = ""
+            return {
+                "token_id": int(tid),
+                "token": piece,
+                "logprob": float(val),
+                "bytes": list(piece.encode("utf-8")),
+            }
+
+        entry = build(token_id, sampled)
+        entry["top_logprobs"] = [
+            build(tid, val) for tid, val in zip(top_ids, top_vals)
+        ]
+        return entry
+
+    def _make_prompt_logprobs(self, raw):
+        """Decode the worker's ``prompt_logprobs_data`` into response dicts.
+
+        ``raw`` is a list (length prompt_len) where index 0 is ``None`` and
+        each other entry is ``(token_id, logprob, top_ids, top_vals)``. Returns
+        the same-length list with ``None`` preserved and every populated entry
+        turned into the OpenAI logprob dict shape.
+        """
+        out = []
+        for item in raw:
+            if item is None:
+                out.append(None)
+                continue
+            token_id, sampled, top_ids, top_vals = item
+            out.append(self._make_logprob_entry(token_id, (sampled, top_ids, top_vals)))
+        return out
+
     def _apply_ipc_package(self, ipc_package):
         if ipc_package is not None:
             for idx, id in enumerate(ipc_package.act_schedule_ids):
@@ -384,10 +433,21 @@ class LLM:
                 if seq is None:
                     continue
                 if len(ipc_package.next_tokens) != 0:
-                    seq.append(ipc_package.next_tokens[idx])
+                    token_id = ipc_package.next_tokens[idx]
+                    seq.append(token_id)
                     if self.async_streams:
+                        text = seq.detokenize_inc(self.model_runner.tokenizer)
+                        logprob = None
+                        if idx < len(ipc_package.logprobs):
+                            logprob = self._make_logprob_entry(
+                                token_id, ipc_package.logprobs[idx]
+                            )
+                        prompt_lp = None
+                        raw_prompt_lp = ipc_package.prompt_logprobs.get(id)
+                        if raw_prompt_lp is not None:
+                            prompt_lp = self._make_prompt_logprobs(raw_prompt_lp)
                         self.async_streams[id].put(
-                            seq.detokenize_inc(self.model_runner.tokenizer)
+                            StreamOutput(text, logprob, prompt_lp)
                         )
                 if id in ipc_package.free_ids:
                     self.running_maps.pop(id)
@@ -500,6 +560,10 @@ class LLM:
         repetition_penalty=None,
         mm_contents=None,
         mm_items=None,
+        logprobs_enabled=False,
+        num_top_logprobs=0,
+        prompt_logprobs_enabled=False,
+        num_prompt_logprobs=0,
     ):
         # Models without a ``generation_config.json`` (e.g. Qwen3.5-0.8B)
         # leave the HF ``GenerationConfig`` defaults as ``None``, which then
@@ -526,6 +590,10 @@ class LLM:
             top_k,
             repetition_penalty,
             mm_contents,
+            logprobs_enabled,
+            num_top_logprobs,
+            prompt_logprobs_enabled,
+            num_prompt_logprobs,
         )
         # Encoder-disaggregation: the ordered raw mm items the encoder will
         # process. Present only on the disaggregated LM frontend; ``None`` for

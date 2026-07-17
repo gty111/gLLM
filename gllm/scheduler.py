@@ -173,8 +173,30 @@ class Scheduler:
     def add_new_requests(self, seqs):
         self.seqs_to_prefill.extend(seqs)
 
-    def add_next_tokens(self, next_tokens):
-        self.next_tokens_queue.append(next_tokens)
+    def add_next_tokens(self, next_tokens, logprobs=None):
+        # ``logprobs`` (when present) is a per-batch-row list aligned with
+        # ``next_tokens`` -- ``None`` for seqs that didn't request logprobs,
+        # else ``(sampled, top_ids, top_vals)``. Queued alongside the tokens so
+        # ``process_output`` can attach them (works for PP>1, where the tokens
+        # + logprobs arrive together over the token socket).
+        self.next_tokens_queue.append((next_tokens, logprobs))
+
+    @staticmethod
+    def _attach_prompt_logprobs(ipc_package, seq):
+        """Emit a seq's completed prompt-logprobs exactly once.
+
+        Called on the step the prompt finishes prefill (its first output
+        token). ``prompt_logprobs_data`` is fully populated by then, so we hand
+        it to the frontend keyed by seq_id and latch ``_prompt_logprobs_sent``
+        so later decode steps don't resend it.
+        """
+        if (
+            getattr(seq, "prompt_logprobs_enabled", False)
+            and not seq._prompt_logprobs_sent
+            and seq.prompt_logprobs_data is not None
+        ):
+            ipc_package.prompt_logprobs[seq.seq_id] = seq.prompt_logprobs_data
+            seq._prompt_logprobs_sent = True
 
     def set_log(self, log):
         self.log = log
@@ -184,7 +206,7 @@ class Scheduler:
             return None
 
         schedule_seqs: List[Sequence] = self.batch_running.popleft()
-        next_tokens = self.next_tokens_queue.popleft()
+        next_tokens, logprobs = self.next_tokens_queue.popleft()
 
         ipc_package = IPCPackage([])
 
@@ -193,6 +215,11 @@ class Scheduler:
             if seq.computed_prompt:
                 ipc_package.act_schedule_ids.append(seq.seq_id)
                 ipc_package.next_tokens.append(next_tokens[idx])
+                if logprobs is not None and seq.logprobs_enabled:
+                    ipc_package.logprobs.append(logprobs[idx])
+                else:
+                    ipc_package.logprobs.append(None)
+                self._attach_prompt_logprobs(ipc_package, seq)
                 seq.append(next_tokens[idx])
                 # The token is real (non-overlap appends immediately), so it is
                 # safe to register the prefix-cache hash for any page boundary
@@ -683,8 +710,14 @@ class OverlapScheduler(Scheduler):
 
         return deferred_seqs
 
-    def process_output_finalize(self, deferred_seqs, next_tokens):
-        """Replace placeholders with real tokens after D2H / PP token delivery."""
+    def process_output_finalize(self, deferred_seqs, next_tokens, logprobs=None):
+        """Replace placeholders with real tokens after D2H / PP token delivery.
+
+        ``logprobs`` (when provided) is a per-batch-row list of
+        ``(sampled_logprob, top_ids, top_vals)`` produced by the overlap
+        worker; it is keyed by the same ``batch_idx`` as ``next_tokens`` and
+        sliced per-seq to that seq's ``num_top_logprobs``.
+        """
         if deferred_seqs is None:
             return None
 
@@ -707,6 +740,15 @@ class OverlapScheduler(Scheduler):
             if seq.computed_prompt:
                 ipc_package.act_schedule_ids.append(seq.seq_id)
                 ipc_package.next_tokens.append(real_token)
+                if logprobs is not None and seq.logprobs_enabled:
+                    sampled, top_ids, top_vals = logprobs[batch_idx]
+                    k = seq.num_top_logprobs
+                    ipc_package.logprobs.append(
+                        (sampled, top_ids[:k], top_vals[:k])
+                    )
+                else:
+                    ipc_package.logprobs.append(None)
+                self._attach_prompt_logprobs(ipc_package, seq)
 
             is_eos = not seq.ignore_eos and real_token in seq.finish_tokens
             generated_len = placeholder_pos + 1 - seq.raw_prompt_len
