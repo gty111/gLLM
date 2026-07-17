@@ -1650,25 +1650,6 @@ class ModelRunner:
             rows.append((sampled[i], top_ids[i][:k], top_vals[i][:k]))
         return rows
 
-    def _resolve_lm_head(self):
-        """Locate the LM head module for direct all-position projection.
-
-        Text models expose ``lm_head`` on the top-level model; multimodal
-        wrappers (e.g. ``Qwen3_5ForConditionalGeneration``) keep it on the
-        nested ``language_model``. Cached after the first lookup. Returns
-        ``None`` if neither exists (prompt logprobs then silently no-op).
-        """
-        lm_head = getattr(self, "_prompt_lm_head", "unset")
-        if lm_head != "unset":
-            return lm_head
-        lm_head = getattr(self.model, "lm_head", None)
-        if lm_head is None:
-            inner = getattr(self.model, "language_model", None)
-            if inner is not None:
-                lm_head = getattr(inner, "lm_head", None)
-        self._prompt_lm_head = lm_head
-        return lm_head
-
     def _compute_prompt_logprobs(self, seqs, hidden_states):
         """Accumulate prompt-token logprobs for prefilling seqs (pp_size==1).
 
@@ -1682,8 +1663,11 @@ class ModelRunner:
         """
         if not any(getattr(s, "prompt_logprobs_enabled", False) for s in seqs):
             return
-        lm_head = self._resolve_lm_head()
-        if lm_head is None:
+        # Models expose ``logits_from_hidden`` to project arbitrary positions to
+        # full-vocab logits (LM-head placement stays a model-internal detail).
+        # A model lacking it simply doesn't support prompt logprobs (no-op).
+        project = getattr(self.model, "logits_from_hidden", None)
+        if project is None:
             return
         qsl = self.input_data.query_start_loc_cpu
         for i, seq in enumerate(seqs):
@@ -1701,7 +1685,7 @@ class ModelRunner:
             jmax = min(n, prompt_len - 1 - c0)
             if jmax <= 0:
                 continue
-            logits = lm_head(hidden_states[start : start + jmax])
+            logits = project(hidden_states[start : start + jmax])
             logprobs = torch.log_softmax(logits.float(), dim=-1)
             target_ids = seq.token_ids[c0 + 1 : c0 + 1 + jmax]
             target = torch.tensor(

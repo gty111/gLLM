@@ -271,6 +271,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
     def compute_logits(self, input_data, hidden_states: torch.Tensor):
         return self.language_model.compute_logits(input_data, hidden_states)
 
+    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.language_model.logits_from_hidden(hidden_states)
+
     def load_weights(self, weights, mp_load_progress=None):
         # 1) Language model: the checkpoint namespaces the DeepSeek backbone
         # under ``language_model.``, but ``get_tensor_from_dict`` /

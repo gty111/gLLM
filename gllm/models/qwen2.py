@@ -211,7 +211,17 @@ class Qwen2ForCausalLM(nn.Module):
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
         # fetch hidden_states of last token in each seq
         idx_list = input_data.get_query_start_loc() - 1
-        return self.lm_head(hidden_states[idx_list[1:]])
+        return self.logits_from_hidden(hidden_states[idx_list[1:]])
+
+    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project the given hidden states to full-vocab logits.
+
+        ``compute_logits`` gathers only each seq's last position (for
+        sampling); this projects *every* supplied position and is used by the
+        prompt-logprobs path. Keeping it here means LM-head placement (tied
+        weights, TP gather, multimodal nesting) stays a model-internal detail.
+        """
+        return self.lm_head(hidden_states)
 
     def weight_rules(self):
         """Ordered ``(match, handler)`` table for this rank's parameters.

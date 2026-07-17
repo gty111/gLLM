@@ -935,6 +935,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> torch.Tensor | None:
         return self.language_model.compute_logits(input_data, hidden_states)
 
+    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.language_model.logits_from_hidden(hidden_states)
+
     def embed_multimodal_single(self, **mm_input) -> torch.Tensor:
         """Encode exactly one mm item and return its raw visual embedding.
 
