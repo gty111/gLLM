@@ -23,6 +23,7 @@ from gllm.dist_utils import (
     get_dp_size,
     get_local_rank,
     get_output_rank,
+    get_pp_size,
     get_rank,
     get_tp_group,
     get_tp_rank,
@@ -453,13 +454,33 @@ class ModelRunner:
 
     def init(self, mp_load_progress=None):
         self.model = self.model_loader.load_model(mp_load_progress)
-        memory_manager_cls = (
-            PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
-        )
         # Hybrid models (Qwen3.5 GDN) advertise a ready-to-use SSM cache
         # config via ``model.ssm_cache_config``. ``num_layers`` for the KV
         # path must then be the count of *full-attention* layers only.
         ssm_cache_config = getattr(self.model, "ssm_cache_config", None)
+        # SSM prefix caching is incompatible with pipeline parallelism: the
+        # snapshot/restore of recurrent state is a rank-0-local GPU copy driven
+        # by the scheduler, but each PP stage owns a *different* slice of the
+        # GDN layers on its own GPU. Under PP>1 the last stage's recurrent
+        # state would never be snapshotted/restored, so a prefix-cache hit
+        # would feed garbage initial state to the tail layers. Disable prefix
+        # caching for hybrid models when PP>1 to keep results correct (KV +
+        # SSM both recompute from scratch each request).
+        if (
+            self.enable_prefix_caching
+            and ssm_cache_config is not None
+            and get_pp_size() > 1
+        ):
+            logger.warning(
+                "Disabling prefix caching: SSM/GDN recurrent-state "
+                "snapshotting is not supported under pipeline parallelism "
+                "(pp_size=%d).",
+                get_pp_size(),
+            )
+            self.enable_prefix_caching = False
+        memory_manager_cls = (
+            PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
+        )
         kv_num_layers = getattr(self.model, "num_kv_layers", self.model.num_layers)
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util,

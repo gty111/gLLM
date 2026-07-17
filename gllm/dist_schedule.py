@@ -172,6 +172,12 @@ class SeqUpdate:
     # follower resets its mirror's page_table to ``page_table_reset``
     # before appending ``new_page_ids``. Almost always ``None``.
     page_table_reset: Optional[List[int]] = None
+    # Hybrid/SSM (GDN) models only: the per-request SSM working-slot id the
+    # driver allocated for this seq. The GDN kernels index the recurrent state
+    # tensor by this slot every iteration, so the follower needs the current
+    # value each iter (it is allocated once but changes on preempt/realloc).
+    # ``None`` for non-hybrid models (no SSM segment).
+    ssm_state_slot: Optional[int] = None
 
 
 @dataclass(slots=True)
@@ -354,6 +360,7 @@ class DriverPayloadBuilder:
                     ),
                     new_page_ids=new_page_ids,
                     page_table_reset=page_table_reset,
+                    ssm_state_slot=seq.ssm_state_slot,
                 )
             )
 
@@ -421,6 +428,7 @@ class FollowerSeq:
         "num_prompt_logprobs",
         "raw_prompt_len",
         "prompt_logprobs_data",
+        "ssm_state_slot",
     )
 
     def __init__(self, reg: SeqRegister, mm_needs_token_ids: bool = False):
@@ -460,6 +468,9 @@ class FollowerSeq:
         self.computed_token_num = 0
         self.to_compute_token_num = 0
         self.to_compute_tokens: Optional[List[int]] = None
+        # Hybrid/SSM working-slot mirror; overwritten by ``apply_update`` every
+        # iter (``None`` for non-hybrid models). ``_cal_ssm_metadata`` reads it.
+        self.ssm_state_slot: Optional[int] = None
         self.mm_contents = reg.mm_contents
         self.temperature = reg.temperature
         self.top_p = reg.top_p
@@ -517,6 +528,7 @@ class FollowerSeq:
         self.computed_token_num = upd.computed_token_num
         self.to_compute_token_num = upd.to_compute_token_num
         self.to_compute_tokens = upd.to_compute_tokens
+        self.ssm_state_slot = upd.ssm_state_slot
 
         if upd.page_table_reset is not None:
             # Preemption / first scheduling.
