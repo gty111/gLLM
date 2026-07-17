@@ -587,9 +587,9 @@ class CompletionResponseChoice(OpenAIBaseModel):
     index: int
     text: str
     logprobs: Optional[CompletionLogProbs] = None
-    # vLLM extension: per prompt-token logprobs (index 0 is null since the
-    # first token has no preceding context). Each entry mirrors the chat
-    # logprob shape: {token, logprob, bytes, top_logprobs}.
+    # Per prompt-token logprobs (index 0 is null since the first token has no
+    # preceding context). Each entry mirrors the chat logprob shape:
+    # {token, logprob, bytes, top_logprobs}.
     prompt_logprobs: Optional[List[Optional[Dict[str, Any]]]] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = Field(

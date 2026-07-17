@@ -54,13 +54,12 @@ class Sequence:
         # Per-token logprobs (OpenAI ``logprobs``). ``logprobs_enabled`` turns
         # the (gated) log_softmax + top-k on for this seq; ``num_top_logprobs``
         # is how many alternative tokens to report alongside the sampled one
-        # (0 => only the sampled token's logprob). ``_pending_logprob`` is the
-        # scratch slot the sampler/runner stashes this decode step's result in
-        # (non-overlap path); the scheduler drains it into the IPC package.
+        # (0 => only the sampled token's logprob). The computed per-step values
+        # travel with the sampled tokens (runner ``_last_logprobs`` -> scheduler
+        # -> IPC package), so no per-seq scratch slot is needed.
         self.logprobs_enabled = logprobs_enabled
         self.num_top_logprobs = num_top_logprobs
-        self._pending_logprob = None
-        # Prompt-token logprobs (vLLM ``prompt_logprobs``). Accumulated on the
+        # Prompt-token logprobs (``prompt_logprobs``). Accumulated on the
         # worker across (possibly chunked) prefill into ``prompt_logprobs_data``
         # -- a list of length ``raw_prompt_len`` where index 0 is ``None`` (no
         # preceding context) and later entries are

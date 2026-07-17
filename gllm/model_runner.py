@@ -1660,7 +1660,15 @@ class ModelRunner:
         prefix-cache-skipped positions stay ``None``. Requires the real
         ``Sequence`` (full ``token_ids`` + ``raw_prompt_len``), so it is a no-op
         for follower mirrors under PP>1 (they lack ``prompt_logprobs_enabled``).
+
+        TP>1 is intentionally unsupported: this is only invoked on the output
+        rank (tp0), but ``logits_from_hidden`` -> ``ParallelLMHead`` issues a
+        ``tensor_model_parallel_all_gather``; running it on tp0 alone would
+        deadlock the other TP ranks. Skip rather than hang (matches the PP>1
+        no-op limitation).
         """
+        if get_tp_size() > 1:
+            return
         if not any(getattr(s, "prompt_logprobs_enabled", False) for s in seqs):
             return
         # Models expose ``logits_from_hidden`` to project arbitrary positions to
@@ -1711,6 +1719,7 @@ class ModelRunner:
                     top_vals[j],
                 )
 
+    @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if dp_padded_size is not None:
