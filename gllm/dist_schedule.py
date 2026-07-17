@@ -172,6 +172,25 @@ class SeqUpdate:
     # follower resets its mirror's page_table to ``page_table_reset``
     # before appending ``new_page_ids``. Almost always ``None``.
     page_table_reset: Optional[List[int]] = None
+    # Hybrid/SSM (GDN) models only: the per-request SSM working-slot id the
+    # driver allocated for this seq. The GDN kernels index the recurrent state
+    # tensor by this slot every iteration, so the follower needs the current
+    # value each iter (it is allocated once but changes on preempt/realloc).
+    # ``None`` for non-hybrid models (no SSM segment).
+    ssm_state_slot: Optional[int] = None
+    # Hybrid/SSM + prefix caching under PP>1 only: the snapshot-pool slot id
+    # assigned to each page in ``new_page_ids`` (``-1`` = no snapshot slot).
+    # The follower mirrors these into its own ``page2ssm_snapshot`` table so its
+    # ``_cal_ssm_metadata`` picks the same snapshot WRITE targets the driver
+    # does. Parallel to ``new_page_ids``; ``None`` when there is nothing to
+    # mirror (non-hybrid, no prefix cache, or no new pages).
+    new_page_snap_slots: Optional[List[int]] = None
+    # Hybrid/SSM + prefix caching under PP>1 only: when a prefix-cache hit
+    # restored recurrent state on the driver, the snapshot-pool slot to copy
+    # into this seq's working slot BEFORE its next forward. The follower
+    # replays the identical ``copy_state`` on its own GDN-layer pools. A
+    # one-shot per-iteration signal (``None`` on every other iteration).
+    ssm_restore_src_slot: Optional[int] = None
 
 
 @dataclass(slots=True)
@@ -262,6 +281,8 @@ class DriverPayloadBuilder:
         control_cmd: int = 0,
         control_data: Any = None,
         use_mm: bool = False,
+        ssm_page2snap: Optional[List[Optional[int]]] = None,
+        ssm_restores: Optional[Dict[int, int]] = None,
     ) -> SchedulePayload:
         """Snapshot ``scheduled_seqs`` into a payload + update cursors.
 
@@ -342,6 +363,18 @@ class DriverPayloadBuilder:
                 new_page_ids = list(seq.page_table[last_n:cur_n])
             self._last_pages_len[sid] = cur_n
 
+            # Mirror the snapshot-slot assignment for each newly shipped page so
+            # the follower's ``_cal_ssm_metadata`` picks the same SSM snapshot
+            # WRITE targets. ``page2ssm_snapshot`` is keyed by physical page id;
+            # a re-minted page is re-shipped with its fresh slot, so followers
+            # stay in sync without tracking frees. ``-1`` encodes "no slot".
+            new_page_snap_slots: Optional[List[int]] = None
+            if ssm_page2snap is not None and new_page_ids:
+                new_page_snap_slots = [
+                    s if (s := ssm_page2snap[p]) is not None else -1
+                    for p in new_page_ids
+                ]
+
             updates.append(
                 SeqUpdate(
                     seq_id=sid,
@@ -354,6 +387,11 @@ class DriverPayloadBuilder:
                     ),
                     new_page_ids=new_page_ids,
                     page_table_reset=page_table_reset,
+                    ssm_state_slot=seq.ssm_state_slot,
+                    new_page_snap_slots=new_page_snap_slots,
+                    ssm_restore_src_slot=(
+                        ssm_restores.get(sid) if ssm_restores else None
+                    ),
                 )
             )
 
@@ -421,6 +459,8 @@ class FollowerSeq:
         "num_prompt_logprobs",
         "raw_prompt_len",
         "prompt_logprobs_data",
+        "ssm_state_slot",
+        "ssm_restore_src_slot",
     )
 
     def __init__(self, reg: SeqRegister, mm_needs_token_ids: bool = False):
@@ -460,6 +500,13 @@ class FollowerSeq:
         self.computed_token_num = 0
         self.to_compute_token_num = 0
         self.to_compute_tokens: Optional[List[int]] = None
+        # Hybrid/SSM working-slot mirror; overwritten by ``apply_update`` every
+        # iter (``None`` for non-hybrid models). ``_cal_ssm_metadata`` reads it.
+        self.ssm_state_slot: Optional[int] = None
+        # One-shot prefix-cache-hit restore signal (snapshot slot -> working
+        # slot copy the follower must run before its next forward). Reset to
+        # ``None`` by every ``apply_update`` so it only fires on the hit iter.
+        self.ssm_restore_src_slot: Optional[int] = None
         self.mm_contents = reg.mm_contents
         self.temperature = reg.temperature
         self.top_p = reg.top_p
@@ -517,6 +564,8 @@ class FollowerSeq:
         self.computed_token_num = upd.computed_token_num
         self.to_compute_token_num = upd.to_compute_token_num
         self.to_compute_tokens = upd.to_compute_tokens
+        self.ssm_state_slot = upd.ssm_state_slot
+        self.ssm_restore_src_slot = upd.ssm_restore_src_slot
 
         if upd.page_table_reset is not None:
             # Preemption / first scheduling.

@@ -398,19 +398,36 @@ class ModelRunner:
 
         # cuda graph
         self.disable_cuda_graph = disable_cuda_graph
-        # ``max_cuda_graph_bs`` cannot exceed ``maxd`` — the runtime decode
-        # batch is hard-capped at ``maxd`` (scheduler) and several device
-        # buffers (e.g. ``InputData.block_table``, ``slot_mapping``) are
-        # sized at ``maxd`` rows. Capturing a larger graph would either
-        # overflow those buffers during capture or produce graphs that are
-        # never replayed at runtime. Clamp here so the user can keep the
-        # ``--max-cuda-graph-bs`` default without manually matching ``maxd``.
-        if max_cuda_graph_bs > maxd:
+        # ``max_cuda_graph_bs`` cannot exceed *either* of two runtime bounds:
+        #
+        #   * ``maxd`` — the decode batch is hard-capped at ``maxd`` (scheduler)
+        #     and several device buffers (``InputData.block_table``,
+        #     ``slot_mapping``, the SSM working pool, ...) are sized at ``maxd``
+        #     rows.
+        #   * ``max_num_batched_tokens`` — a captured decode graph of ``B``
+        #     sequences writes ``B`` token-rows into the shared activation
+        #     buffers (``input_hidden_states`` / ``residual`` / PP recv), which
+        #     are sized to ``max_num_batched_tokens``. Under ``chunked_prefill``
+        #     / ``split_pd`` that equals ``maxp``, so a small ``--maxp`` (below
+        #     the ``--max-cuda-graph-bs`` default of 512) would overflow those
+        #     buffers *during capture* — e.g. ``--maxp 256`` tried to write 512
+        #     rows into a 256-row buffer and crashed with a shape mismatch on
+        #     ``ssm_state_indices`` / the output hidden states.
+        #
+        # A real forward never batches more than ``max_num_batched_tokens``
+        # tokens (decode eats into the same per-tick budget as prefill), so
+        # buckets above that bound are never replayed anyway. Clamp to the
+        # tighter of the two so users can keep the ``--max-cuda-graph-bs``
+        # default without manually matching ``maxd`` / ``maxp``.
+        cuda_graph_cap = min(maxd, self.max_num_batched_tokens)
+        if max_cuda_graph_bs > cuda_graph_cap:
             logger.warning(
-                f"max_cuda_graph_bs={max_cuda_graph_bs} exceeds maxd={maxd}; "
-                f"clamping to {maxd} (decode batch is bounded by maxd)."
+                f"max_cuda_graph_bs={max_cuda_graph_bs} exceeds the runtime "
+                f"decode-batch bound min(maxd={maxd}, "
+                f"max_num_batched_tokens={self.max_num_batched_tokens})="
+                f"{cuda_graph_cap}; clamping to {cuda_graph_cap}."
             )
-            max_cuda_graph_bs = maxd
+            max_cuda_graph_bs = cuda_graph_cap
         self.max_cuda_graph_bs = max_cuda_graph_bs
         self.size_to_graph: Dict[int, torch.cuda.CUDAGraph] = dict()
         # Use power-of-two bucket sizes to reduce the number of captured graphs.
@@ -453,13 +470,13 @@ class ModelRunner:
 
     def init(self, mp_load_progress=None):
         self.model = self.model_loader.load_model(mp_load_progress)
-        memory_manager_cls = (
-            PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
-        )
         # Hybrid models (Qwen3.5 GDN) advertise a ready-to-use SSM cache
         # config via ``model.ssm_cache_config``. ``num_layers`` for the KV
         # path must then be the count of *full-attention* layers only.
         ssm_cache_config = getattr(self.model, "ssm_cache_config", None)
+        memory_manager_cls = (
+            PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
+        )
         kv_num_layers = getattr(self.model, "num_kv_layers", self.model.num_layers)
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util,
