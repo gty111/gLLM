@@ -7,6 +7,7 @@ from logger import logger
 
 from collections import deque
 
+from gllm.dist_utils import get_pp_size
 from gllm.id_allocator import IDAllocator
 from gllm.sequence import Sequence
 from gllm.utils import async_tensor_h2d, get_dtype_bytes
@@ -372,6 +373,10 @@ class MemoryManager:
     @property
     def use_ssm_cache(self) -> bool:
         return self.ssm_cache_config is not None
+
+    def consume_pending_ssm_restores(self) -> Dict[int, int]:
+        """No SSM prefix caching without a snapshot pool (base manager)."""
+        return {}
 
     def init(self, segment_cls=Segment, reserve_dummy_page: bool = False):
         # Allocate SSM pools before sizing the KV cache so ``mem_get_info``
@@ -794,6 +799,15 @@ class PrefixMemoryManager(MemoryManager):
         self.num_allocated_pages = 0
         self.num_hit_pages = 0
 
+        # PP>1 only: SSM snapshot restores performed this scheduling iteration,
+        # keyed by seq_id -> snapshot-pool slot. Each PP follower owns a
+        # *different* slice of the GDN layers on its own GPU, so the restore
+        # (snapshot->working ``copy_state``) the driver runs on rank-0's pools
+        # must be replayed on every stage. The driver records the restores here
+        # and the payload builder ships them; ``consume`` clears the buffer so
+        # each is shipped exactly once.
+        self._pending_ssm_restores: Dict[int, int] = {}
+
     def pre_allocate_computed_page(self, seqs: List[Sequence]):
         for seq in seqs:
             assert len(seq.page_table) == 0
@@ -865,6 +879,12 @@ class PrefixMemoryManager(MemoryManager):
                 self.ssm_segment.copy_state(
                     "snapshot", snap_slot, "working", seq.ssm_state_slot
                 )
+                # PP>1: record so the same restore is replayed on every PP
+                # stage (each owns a different GDN-layer slice). Skip entirely
+                # on PP=1 where rank-0's copy above is the whole story (and
+                # nothing would ever drain the buffer).
+                if get_pp_size() > 1:
+                    self._pending_ssm_restores[seq.seq_id] = snap_slot
                 return
             seq.computed_token_num -= self.page_size
             self.num_hit_pages -= 1
@@ -908,6 +928,19 @@ class PrefixMemoryManager(MemoryManager):
                 else:
                     page_num = self.segment.allocate()
                 seq.page_table.append(page_num)
+
+    def consume_pending_ssm_restores(self) -> Dict[int, int]:
+        """Return and clear this iteration's SSM snapshot restores (PP>1).
+
+        Called by the driver's payload builder so each prefix-cache-hit restore
+        is shipped to the PP followers exactly once. Empty (cheap) on PP=1 and
+        for every non-hit iteration.
+        """
+        if not self._pending_ssm_restores:
+            return {}
+        restores = self._pending_ssm_restores
+        self._pending_ssm_restores = {}
+        return restores
 
     def _valid_snapshot_slot(self, page_num: int) -> Optional[int]:
         """Return the snapshot slot for ``page_num`` only if it was actually

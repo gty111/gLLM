@@ -412,6 +412,12 @@ class Worker(TorchProfilerMixin):
 
         seqs = self.follower_store.apply_payload(payload)
 
+        # Hybrid/SSM (GDN) under PP>1: mirror the driver's per-page snapshot-slot
+        # assignments into this stage's ``page2ssm_snapshot`` so its local
+        # ``_cal_ssm_metadata`` picks the same snapshot WRITE targets. Keyed by
+        # physical page id; re-minted pages arrive again with a fresh slot.
+        self._mirror_ssm_snapshot_slots(payload)
+
         # Clean up follower-local caches (VL ``embedding_cache``) for
         # seqs the driver just freed.  Important to do this *after*
         # ``apply_payload`` so we use the same eviction order rank-0
@@ -456,6 +462,45 @@ class Worker(TorchProfilerMixin):
         input_data.dp_dummy = False
         self.schedule_queue.append(input_data)
 
+    def _mirror_ssm_snapshot_slots(self, payload) -> None:
+        """Replicate the driver's page->snapshot-slot map on this PP follower.
+
+        No-op unless the model is hybrid *and* prefix caching is on (the segment
+        then exposes ``page2ssm_snapshot``). We only mirror the slot *assignment*
+        (needed by ``_cal_ssm_metadata`` to choose write targets); the follower
+        never reads ``page2ssm_snapshot_valid`` (its restores are shipped, not
+        computed), so that table is left untouched.
+        """
+        seg = getattr(self.model_runner.memory_manager, "segment", None)
+        page2snap = getattr(seg, "page2ssm_snapshot", None)
+        if page2snap is None:
+            return
+        for upd in payload.updates:
+            slots = upd.new_page_snap_slots
+            if not slots:
+                continue
+            for page_num, snap in zip(upd.new_page_ids, slots):
+                page2snap[page_num] = snap if snap >= 0 else None
+
+    def _apply_ssm_restores(self, seqs) -> None:
+        """Replay driver prefix-cache-hit restores on this stage's GDN pools.
+
+        Each PP stage owns a different slice of the GDN layers, so the
+        snapshot->working ``copy_state`` the driver ran on rank-0 must be redone
+        here for this stage's local layers before the seq's forward reads its
+        working slot. Same default stream as the forward => correctly ordered
+        after the earlier prefill that wrote the snapshot.
+        """
+        ssm_segment = getattr(self.model_runner.memory_manager, "ssm_segment", None)
+        if ssm_segment is None:
+            return
+        for seq in seqs:
+            src = getattr(seq, "ssm_restore_src_slot", None)
+            if src is not None and seq.ssm_state_slot is not None:
+                ssm_segment.copy_state(
+                    "snapshot", src, "working", seq.ssm_state_slot
+                )
+
     def forward_pp(self):
         if len(self.schedule_queue) != 0:
             input_data: InputData = self.schedule_queue.popleft()
@@ -468,6 +513,9 @@ class Worker(TorchProfilerMixin):
                 self.ret_residual,
             )
             self.model_runner.prepare_input(input_data=input_data)
+            # Hybrid/SSM prefix-cache-hit restores for this stage's GDN layers,
+            # issued before the forward reads the working slots.
+            self._apply_ssm_restores(input_data.seqs)
             # DP+PP: this stage replays the driver's agreed per-group counts +
             # graph bucket (no local barrier); publish them so the MoE gather is
             # sized identically across the stage's DP groups.
@@ -678,11 +726,25 @@ class Worker(TorchProfilerMixin):
         """
         if get_world_size() <= 1:
             return None
+        # Hybrid/SSM (GDN) models under PP>1: ship the driver's per-page SSM
+        # snapshot-slot assignments (so followers pick the same snapshot WRITE
+        # targets) and this iteration's prefix-cache-hit restores (so followers
+        # replay the snapshot->working ``copy_state`` on their own GDN layers).
+        # ``None`` / empty for non-hybrid or non-prefix-cache runs.
+        ssm_page2snap = None
+        ssm_restores = None
+        mm = self.model_runner.memory_manager
+        if getattr(mm, "ssm_segment", None) is not None and get_pp_size() > 1:
+            seg = getattr(mm, "segment", None)
+            ssm_page2snap = getattr(seg, "page2ssm_snapshot", None)
+            ssm_restores = mm.consume_pending_ssm_restores()
         return self.payload_builder.build(
             scheduled_seqs=schedule_seqs,
             frees=self.scheduler.consume_pending_follower_frees(),
             mrope_positions=None,
             use_mm=self.model_runner.use_mm,
+            ssm_page2snap=ssm_page2snap,
+            ssm_restores=ssm_restores,
         )
 
     def _schedule_forward_dp(self):
