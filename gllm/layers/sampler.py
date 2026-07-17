@@ -21,8 +21,22 @@ def _fused_top_k_top_p_sample(
 
 class Sampler:
 
-    def forward_gpu(self, logits: torch.Tensor, input_data: InputData) -> torch.Tensor:
-        """Sample on GPU; caller is responsible for D2H."""
+    def forward_gpu(
+        self,
+        logits: torch.Tensor,
+        input_data: InputData,
+        return_logprobs: bool = False,
+        num_logprobs: int = 0,
+    ):
+        """Sample on GPU; caller is responsible for D2H.
+
+        When ``return_logprobs`` is set the return value becomes
+        ``(next_tokens, logprobs)`` where ``logprobs`` is the tuple produced by
+        :meth:`compute_logprobs` (sampled-token logprob + top-``num_logprobs``
+        alternatives). Logprobs are computed from the same (penalty- and
+        temperature-adjusted) logits used to sample, so they match the
+        effective sampling distribution.
+        """
         flags = self._get_sampling_flags(input_data)
 
         if flags["need_repetition_penalty"]:
@@ -31,16 +45,50 @@ class Sampler:
         if flags["is_all_greedy"]:
             # argmax is invariant to positive temperature scaling, so the
             # full-vocab div_ would be wasted work here -- skip it.
-            return torch.argmax(logits, dim=-1)
+            next_tokens = torch.argmax(logits, dim=-1)
+            if return_logprobs:
+                return next_tokens, self.compute_logprobs(
+                    logits, next_tokens, num_logprobs
+                )
+            return next_tokens
 
         if flags["need_temperature"]:
             logits.div_(input_data.temperature.unsqueeze(1))
 
         probs = torch.softmax(logits, dim=-1)
-        return _fused_top_k_top_p_sample(probs, input_data.top_k, input_data.top_p)
+        next_tokens = _fused_top_k_top_p_sample(
+            probs, input_data.top_k, input_data.top_p
+        )
+        if return_logprobs:
+            return next_tokens, self.compute_logprobs(
+                logits, next_tokens, num_logprobs
+            )
+        return next_tokens
 
     def forward(self, logits: torch.Tensor, input_data: InputData) -> list[int]:
         return self.forward_gpu(logits, input_data).cpu().tolist()
+
+    @staticmethod
+    def compute_logprobs(
+        logits: torch.Tensor,
+        next_tokens: torch.Tensor,
+        num_logprobs: int,
+    ):
+        """Return ``(sampled_logprob, top_vals, top_ids)`` on GPU.
+
+        ``sampled_logprob`` is ``[batch]`` (logprob of the chosen token, always
+        reported). ``top_vals`` / ``top_ids`` are ``[batch, k]`` (the k most
+        likely tokens and their logprobs); ``k == 0`` yields empty columns.
+        """
+        logprobs = torch.log_softmax(logits.float(), dim=-1)
+        sampled = logprobs.gather(1, next_tokens.view(-1, 1)).squeeze(1)
+        k = max(0, min(num_logprobs, logprobs.shape[-1]))
+        if k > 0:
+            top_vals, top_ids = torch.topk(logprobs, k, dim=-1)
+        else:
+            top_vals = logprobs.new_zeros((logprobs.shape[0], 0))
+            top_ids = next_tokens.new_zeros((logprobs.shape[0], 0))
+        return sampled, top_vals, top_ids
 
     @staticmethod
     def _get_sampling_flags(input_data: InputData) -> dict[str, bool]:

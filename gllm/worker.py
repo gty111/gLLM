@@ -485,7 +485,13 @@ class Worker(TorchProfilerMixin):
                 # Idle-group dummies produce no real tokens: don't return them to
                 # the driver (its scheduler only tracks real in-flight batches).
                 if not (dp and getattr(input_data, "dp_dummy", False)):
-                    self.comm.send_tokens(output)
+                    self.comm.send_tokens(
+                        (
+                            output,
+                            self.model_runner._last_logprobs,
+                            self.model_runner._last_prompt_logprobs,
+                        )
+                    )
             elif not is_last_pp_rank():
                 send_pp_data(output, get_next_pp_rank())
 
@@ -624,17 +630,26 @@ class Worker(TorchProfilerMixin):
             return
 
         next_tokens: Optional[List[int]] = None
+        logprobs = None
+        prompt_logprobs = None
         # The column driver that owns the token PULL socket. Non-DP: global
         # rank 0. DP+PP: each DP group's PP=0 TP=0 owns its own per-group token
         # leg (``token_path_dp{d}``); ``_polls_frontend`` is exactly that rank.
         if self._polls_frontend():
-            next_tokens = self.comm.recv_tokens()
+            recv = self.comm.recv_tokens()
+            if recv is not None:
+                # Output rank always ships ``(tokens, gen_logprobs,
+                # prompt_logprobs)`` under PP>1.
+                next_tokens, logprobs, prompt_logprobs = recv
 
         if get_tp_size() > 1:
+            # Only the tokens need TP-fanout (every column driver runs its own
+            # scheduler); logprobs live only on the poller, which is the sole
+            # rank that forwards the IPC package to the frontend.
             next_tokens = self.comm.broadcast_tokens_to_tp(next_tokens)
 
         if next_tokens is not None:
-            self.scheduler.add_next_tokens(next_tokens)
+            self.scheduler.add_next_tokens(next_tokens, logprobs, prompt_logprobs)
 
     def check_abort_seqs(self):
         """Process aborts on every column driver; only the driver replies."""
@@ -739,6 +754,9 @@ class Worker(TorchProfilerMixin):
         # does. Every TP rank in the group runs an identical schedule, so they
         # all consume the tokens (or all skip, for an idle group).
         next_tokens = output
+        # PP=1: the output rank (this group's tp0, == the frontend poller) holds
+        # the logprobs locally; other TP ranks' scheduler output is discarded.
+        logprobs = self.model_runner._last_logprobs if is_output_rank() else None
         if get_tp_size() > 1:
             next_tokens = self.comm.broadcast_tokens_to_tp(
                 next_tokens if is_output_rank() else None
@@ -746,7 +764,7 @@ class Worker(TorchProfilerMixin):
         # Only a group with real work consumes the sampled tokens; the idle
         # dummy's output is discarded.
         if real_ntok > 0 and next_tokens is not None:
-            self.scheduler.add_next_tokens(next_tokens)
+            self.scheduler.add_next_tokens(next_tokens, logprobs)
 
     def _schedule_forward_dp_pp(self):
         """PP=0 driver step for PP + DP-attention + EP.
@@ -849,6 +867,11 @@ class Worker(TorchProfilerMixin):
             # ``step_once`` returns a List[int] of sampled tokens on
             # every last-PP TP rank.
             next_tokens = output
+            # Generation logprobs (if any) are computed on the output rank in
+            # ``step_once`` and stashed on the runner as a per-batch-row list.
+            logprobs = (
+                self.model_runner._last_logprobs if is_output_rank() else None
+            )
             if get_pp_size() == 1:
                 # PP=1: every TP rank is also a column driver and
                 # needs these tokens for ``add_next_tokens``. Random
@@ -864,14 +887,22 @@ class Worker(TorchProfilerMixin):
                         next_tokens if is_output_rank() else None
                     )
                 if next_tokens is not None:
-                    self.scheduler.add_next_tokens(next_tokens)
+                    self.scheduler.add_next_tokens(next_tokens, logprobs)
             elif is_output_rank():
                 # PP>1: only output_rank's tokens flow back to
                 # rank 0 via the existing token zmq pair; the other
                 # column drivers pick them up in next iter's
                 # ``recv_next_tokens`` (which NCCL-fans them out
-                # across the PP-0 TP group).
-                self.comm.send_tokens(next_tokens)
+                # across the PP-0 TP group). Generation + prompt logprobs ride
+                # the same socket so rank 0 can attach them in
+                # ``process_output``.
+                self.comm.send_tokens(
+                    (
+                        next_tokens,
+                        logprobs,
+                        self.model_runner._last_prompt_logprobs,
+                    )
+                )
             # last-PP TP>0 ranks for PP>1: discard ``next_tokens``;
             # they don't drive a scheduler.
         else:

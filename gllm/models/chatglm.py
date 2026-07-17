@@ -246,7 +246,15 @@ class ChatGLMForCausalLM(nn.Module):
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
         # fetch hidden_states of last token in each seq
         idx_list = input_data.get_query_start_loc() - 1
-        return self.lm_head(hidden_states[idx_list[1:]])
+        return self.logits_from_hidden(hidden_states[idx_list[1:]])
+
+    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project the given hidden states to full-vocab logits (all positions).
+
+        Used by the prompt-logprobs path; ``compute_logits`` uses this after
+        selecting each seq's last position.
+        """
+        return self.lm_head(hidden_states)
 
     def _chatglm_rules(self):
         return [

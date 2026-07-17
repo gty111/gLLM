@@ -78,6 +78,10 @@ class PipeAsyncLLM(LLM):
         mm_contents=None,
         mm_items=None,
         dp_index=None,
+        logprobs_enabled=False,
+        num_top_logprobs=0,
+        prompt_logprobs_enabled=False,
+        num_prompt_logprobs=0,
     ):
         seq = self.allocate_seq(
             token_ids,
@@ -89,6 +93,10 @@ class PipeAsyncLLM(LLM):
             repetition_penalty,
             mm_contents,
             mm_items,
+            logprobs_enabled=logprobs_enabled,
+            num_top_logprobs=num_top_logprobs,
+            prompt_logprobs_enabled=prompt_logprobs_enabled,
+            num_prompt_logprobs=num_prompt_logprobs,
         )
         # Pin to a specific DP replica when the request came in on a per-replica
         # endpoint (``--endpoint-per-dp``); ``None`` keeps the round-robin default.

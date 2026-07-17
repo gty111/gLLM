@@ -1004,7 +1004,16 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
         idx = input_data.get_query_start_loc() - 1
-        return self.lm_head(hidden_states[idx[1:]])
+        return self.logits_from_hidden(hidden_states[idx[1:]])
+
+    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project the given hidden states to full-vocab logits.
+
+        ``compute_logits`` gathers only each seq's last position (for
+        sampling); this projects *every* supplied position and is used by the
+        prompt-logprobs path.
+        """
+        return self.lm_head(hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

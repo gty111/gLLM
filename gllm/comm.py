@@ -54,6 +54,15 @@ class IPCPackage:
         self.free_ids = []  # seq_ids to free
         self.act_schedule_ids = []
         self.next_tokens = []
+        # Per-token logprobs aligned with ``next_tokens`` (one entry per acted
+        # seq). Each entry is ``(sampled_logprob, top_ids, top_vals)`` or
+        # ``None`` when the seq did not request logprobs. Empty on the common
+        # (no-logprobs) path so it adds nothing to the pickled payload.
+        self.logprobs = []
+        # Prompt-token logprobs, keyed by seq_id, sent once when a seq finishes
+        # prefill. Each value is the seq's ``prompt_logprobs_data`` list
+        # (per prompt position: ``None`` or ``(token_id, logprob, ids, vals)``).
+        self.prompt_logprobs = {}
 
     def is_input_empty(self) -> bool:
         """True iff this package carries no front-end => worker work.
@@ -310,7 +319,11 @@ class zmqComm:
                 )
 
     def send_tokens(self, tokens):
-        assert type(tokens) == list
+        # ``tokens`` is either a plain ``list`` of token ids or a
+        # ``(tokens, gen_logprobs, prompt_logprobs)`` tuple (PP>1 logprobs ride
+        # the same socket back to rank 0). ``recv_tokens`` returns it verbatim
+        # for the caller to unpack.
+        assert type(tokens) in (list, tuple)
         self.token_socket.send_pyobj(tokens)
 
     def recv_tokens(self):

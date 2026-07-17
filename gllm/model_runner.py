@@ -281,6 +281,18 @@ class ModelRunner:
         self.min_new_token_ratio = min_new_token_ratio
         self.schedule_method = schedule_method
         self.sampler = Sampler()
+        # Per-batch-row generation logprobs from the most recent ``step_once``
+        # (non-overlap path); consumed by the worker and carried alongside the
+        # sampled tokens (incl. over the token socket under PP>1). ``None`` when
+        # the last batch requested no logprobs.
+        self._last_logprobs = None
+        # Prompt logprobs that finished prefill on the most recent forward,
+        # keyed by seq_id (``{seq_id: prompt_logprobs_data}``). Only used under
+        # PP>1, where the output-rank follower computes them and ships them to
+        # rank 0 over the token socket alongside the sampled tokens; rank 0
+        # attaches them in ``process_output``. Empty on the common path. (PP=1
+        # attaches directly from the local seq in the scheduler instead.)
+        self._last_prompt_logprobs = {}
 
         self.use_mm = self.model_loader.use_mm
         self.use_mla = self.model_loader.use_mla
@@ -1621,6 +1633,115 @@ class ModelRunner:
             return padded_size
         return None
 
+    @staticmethod
+    def _build_logprob_rows(seqs, logprobs):
+        """Materialize per-batch-row generation logprobs as a Python list.
+
+        ``logprobs`` is the GPU tuple from ``Sampler.compute_logprobs``
+        (``sampled`` ``[B]``, ``top_vals`` ``[B, k]``, ``top_ids`` ``[B, k]``).
+        Returns a list aligned with ``seqs`` (batch order): ``None`` for seqs
+        that did not request logprobs, else ``(sampled, top_ids, top_vals)``
+        sliced to that seq's own ``num_top_logprobs``. The scheduler keys into
+        this by batch index.
+        """
+        sampled, top_vals, top_ids = logprobs
+        sampled = sampled.cpu().tolist()
+        top_vals = top_vals.cpu().tolist()
+        top_ids = top_ids.cpu().tolist()
+        rows = []
+        for i, seq in enumerate(seqs):
+            if not seq.logprobs_enabled:
+                rows.append(None)
+                continue
+            k = seq.num_top_logprobs
+            rows.append((sampled[i], top_ids[i][:k], top_vals[i][:k]))
+        return rows
+
+    def _compute_prompt_logprobs(self, seqs, hidden_states):
+        """Accumulate prompt-token logprobs for prefilling seqs (pp_size==1).
+
+        For each seq requesting ``prompt_logprobs`` that is still in prefill,
+        run the LM head over this chunk's positions, then record the logprob of
+        the *actual* next prompt token at each position (plus top-k). Handles
+        chunked prefill by filling only the positions this chunk covers;
+        prefix-cache-skipped positions stay ``None``. Needs the full prompt
+        ``token_ids`` + ``raw_prompt_len``: works on the real ``Sequence``
+        (PP=1) and on the ``FollowerSeq`` mirror (PP>1), which carries those
+        fields when ``prompt_logprobs_enabled``.
+
+        Runs on both PP=1 and the PP>1 output-rank follower. Under PP>1 the
+        completed lists are stashed in ``self._last_prompt_logprobs`` (keyed on
+        the prefill-completing step) for the worker to ship to rank 0 over the
+        token socket; under PP=1 the scheduler attaches directly from the seq.
+
+        TP>1: ``logits_from_hidden`` -> ``ParallelLMHead`` issues a
+        ``tensor_model_parallel_all_gather``, so this MUST be invoked on *every*
+        TP rank of the (last-PP) stage, not just the output rank, or it
+        deadlocks. That is safe because every TP rank of the stage holds
+        identical seqs (real ``Sequence`` for PP=1, identical ``FollowerSeq``
+        mirrors for PP>1), identical ``hidden_states`` and ``query_start_loc``:
+        the per-seq ``project`` calls (count + shapes) match bit-for-bit across
+        ranks, so the collective is balanced. Each rank computes the same
+        result; only the output rank's copy is actually shipped (others drop).
+        """
+        # Reset each call so stale completions don't re-ship under PP>1.
+        self._last_prompt_logprobs = {}
+        if not any(getattr(s, "prompt_logprobs_enabled", False) for s in seqs):
+            return
+        # Models expose ``logits_from_hidden`` to project arbitrary positions to
+        # full-vocab logits (LM-head placement stays a model-internal detail).
+        # A model lacking it simply doesn't support prompt logprobs (no-op).
+        project = getattr(self.model, "logits_from_hidden", None)
+        if project is None:
+            return
+        qsl = self.input_data.query_start_loc_cpu
+        for i, seq in enumerate(seqs):
+            if not getattr(seq, "prompt_logprobs_enabled", False):
+                continue
+            if seq.computed_prompt:
+                continue
+            c0 = seq.computed_token_num
+            prompt_len = seq.raw_prompt_len
+            start = int(qsl[i])
+            n = int(qsl[i + 1]) - start
+            # positions p=c0+j predict prompt token p+1; only p+1 <= prompt_len-1
+            # is a prompt token (the last position predicts the first generated
+            # token, handled by the generation-logprobs path).
+            jmax = min(n, prompt_len - 1 - c0)
+            if jmax <= 0:
+                continue
+            logits = project(hidden_states[start : start + jmax])
+            logprobs = torch.log_softmax(logits.float(), dim=-1)
+            target_ids = seq.token_ids[c0 + 1 : c0 + 1 + jmax]
+            target = torch.tensor(
+                target_ids, device=logprobs.device, dtype=torch.long
+            ).view(-1, 1)
+            sampled = logprobs.gather(1, target).squeeze(1).cpu().tolist()
+            k = min(seq.num_prompt_logprobs, logprobs.shape[-1])
+            if k > 0:
+                top_vals, top_ids = torch.topk(logprobs, k, dim=-1)
+                top_vals = top_vals.cpu().tolist()
+                top_ids = top_ids.cpu().tolist()
+            else:
+                top_vals = [[] for _ in range(jmax)]
+                top_ids = [[] for _ in range(jmax)]
+            if seq.prompt_logprobs_data is None:
+                seq.prompt_logprobs_data = [None] * prompt_len
+            for j in range(jmax):
+                pos = c0 + 1 + j
+                seq.prompt_logprobs_data[pos] = (
+                    target_ids[j],
+                    sampled[j],
+                    top_ids[j],
+                    top_vals[j],
+                )
+            # The prompt finishes prefill this step once the chunk reaches the
+            # end of the prompt (c0 + n >= prompt_len). At that point every
+            # position 1..prompt_len-1 is filled, so the list is complete --
+            # record it for the PP>1 socket path (harmless/ignored under PP=1).
+            if c0 + n >= prompt_len:
+                self._last_prompt_logprobs[seq.seq_id] = seq.prompt_logprobs_data
+
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
@@ -1655,11 +1776,34 @@ class ModelRunner:
         else:
             self.forward()
         if is_last_pp_rank():
-            logits = self.model.compute_logits(
-                self.input_data, self.output_hidden_states[:num_cal_tokens]
-            )
+            hidden = self.output_hidden_states[:num_cal_tokens]
+            logits = self.model.compute_logits(self.input_data, hidden)
             self.input_data.prepare_sample()
-            next_tokens = self.sampler.forward(logits, self.input_data)
+            # Logprobs are only computable on the output rank (only it holds the
+            # gathered full-vocab logits) and only worth the extra full-vocab
+            # log_softmax + top-k when some seq in the batch asked for them.
+            # ``_last_logprobs`` (per-batch-row list) is picked up by the worker
+            # and travels with ``next_tokens`` -- including back to rank 0 over
+            # the token socket under PP>1, where the sampling rank is a follower.
+            seqs = self.input_data.seqs
+            self._last_logprobs = None
+            if is_output_rank() and any(s.logprobs_enabled for s in seqs):
+                num_logprobs = max(
+                    (s.num_top_logprobs for s in seqs if s.logprobs_enabled),
+                    default=0,
+                )
+                next_tokens_gpu, logprobs = self.sampler.forward_gpu(
+                    logits, self.input_data, True, num_logprobs
+                )
+                self._last_logprobs = self._build_logprob_rows(seqs, logprobs)
+                next_tokens = next_tokens_gpu.cpu().tolist()
+            else:
+                next_tokens = self.sampler.forward(logits, self.input_data)
+            # Prompt logprobs re-enter the LM head (a TP all-gather), so this
+            # runs on ALL last-PP TP ranks (not just the output rank) to keep
+            # the collective balanced; every rank has the same real seqs, so
+            # they compute identical data and only tp0's copy is shipped.
+            self._compute_prompt_logprobs(seqs, hidden)
             return next_tokens
         return (
             self.output_hidden_states[:num_cal_tokens],
@@ -1811,6 +1955,38 @@ class OverlapModelRunner(ModelRunner):
             ),
         ]
         self._next_tokens_buf_idx = 0
+        # Double-buffered pinned staging for per-token logprobs, mirroring
+        # ``_next_tokens_bufs`` (keyed by the same ``buf_idx``). Only written on
+        # the output rank and only when a batch requested logprobs; sized to the
+        # OpenAI ``top_logprobs`` ceiling so the top-k columns never overflow.
+        self._max_top_logprobs = 20
+        self._lp_sampled_bufs = [
+            torch.zeros(
+                self.max_running_seqs,
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(2)
+        ]
+        self._lp_topval_bufs = [
+            torch.zeros(
+                (self.max_running_seqs, self._max_top_logprobs),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(2)
+        ]
+        self._lp_topid_bufs = [
+            torch.zeros(
+                (self.max_running_seqs, self._max_top_logprobs),
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=True,
+            )
+            for _ in range(2)
+        ]
         # Holds the context produced by ``_mm_prepare_cpu`` between the CPU
         # and GPU phases of input prep when the overlap worker drives us.
         self._pending_mm_ctx: Optional[Dict] = None
@@ -1952,13 +2128,41 @@ class OverlapModelRunner(ModelRunner):
                 num_cal_tokens, dp_padded_size=dp_padded_size
             )
 
-            logits = self.model.compute_logits(
-                self.input_data, self.output_hidden_states[:num_cal_tokens]
-            )
+            hidden = self.output_hidden_states[:num_cal_tokens]
+            logits = self.model.compute_logits(self.input_data, hidden)
             self.input_data.prepare_sample()
             next_tokens_gpu = None
+            # ``lp_k`` doubles as the "logprobs requested this batch" flag for
+            # the collect side: ``None`` => none requested (skip staging),
+            # >= 0 => number of top alternatives staged. Only the output rank
+            # holds full logits, so only it computes/stages logprobs.
+            lp_k = None
+            lp_gpu = None
             if is_output_rank():
-                next_tokens_gpu = self.sampler.forward_gpu(logits, self.input_data)
+                seqs = self.input_data.seqs
+                if any(s.logprobs_enabled for s in seqs):
+                    lp_k = min(
+                        self._max_top_logprobs,
+                        max(
+                            (s.num_top_logprobs for s in seqs if s.logprobs_enabled),
+                            default=0,
+                        ),
+                    )
+                    next_tokens_gpu, lp_gpu = self.sampler.forward_gpu(
+                        logits, self.input_data, True, lp_k
+                    )
+                else:
+                    next_tokens_gpu = self.sampler.forward_gpu(
+                        logits, self.input_data
+                    )
+            # Prompt logprobs accumulate directly onto the (real) seqs; the
+            # scheduler ships the completed list once the prompt finishes
+            # prefill. Gated inside the helper on ``prompt_logprobs_enabled``.
+            # Run on ALL last-PP TP ranks (outside the output-rank block): it
+            # re-enters the LM head (a TP all-gather) and must stay balanced
+            # across the TP group. Every rank has identical seqs, so the result
+            # is identical; only the output rank's IPC package is forwarded.
+            self._compute_prompt_logprobs(self.input_data.seqs, hidden)
             if get_tp_size() > 1:
                 if next_tokens_gpu is None:
                     next_tokens_gpu = torch.empty(
@@ -2006,6 +2210,20 @@ class OverlapModelRunner(ModelRunner):
                     next_tokens_cpu[:batch_size].copy_(
                         next_tokens_gpu, non_blocking=True
                     )
+                    # Stage this batch's logprobs into the same buf_idx slot so
+                    # ``_collect_batch`` can read them once ``copy_done`` fires.
+                    if lp_gpu is not None:
+                        sampled, top_vals, top_ids = lp_gpu
+                        self._lp_sampled_bufs[buf_idx][:batch_size].copy_(
+                            sampled, non_blocking=True
+                        )
+                        if lp_k > 0:
+                            self._lp_topval_bufs[buf_idx][
+                                :batch_size, :lp_k
+                            ].copy_(top_vals, non_blocking=True)
+                            self._lp_topid_bufs[buf_idx][
+                                :batch_size, :lp_k
+                            ].copy_(top_ids, non_blocking=True)
 
             self.overlap_runtime.input_consumed_event.record(self.forward_stream)
 
@@ -2014,7 +2232,7 @@ class OverlapModelRunner(ModelRunner):
             copy_done.record(self.copy_stream)
         else:
             copy_done.record(self.forward_stream)
-        return copy_done, batch_size, future_slot_ids, buf_idx
+        return copy_done, batch_size, future_slot_ids, buf_idx, lp_k
 
     @torch.inference_mode()
     def step_collect_async(
