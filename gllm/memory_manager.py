@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+import os
+
 import torch
 import torch.distributed as dist
 from logger import logger
@@ -15,6 +17,13 @@ from gllm.utils import async_tensor_h2d, get_dtype_bytes
 # DeepSeek Sparse Attention FP8 MLA cache: the nope latent is quantized in
 # 128-wide tiles (one fp32 scale per tile), matching FlashMLA's packed layout.
 _DSA_FP8_TILE = 128
+
+# DSA indexer scoring backend (mirrors gllm/models/deepseek_v32.py). When
+# ``GLLM_DSA_FP8_SCORE=1`` the indexer scores via deep_gemm FP8 MQA-logits
+# kernels; decode needs a persistent paged FP8 index-K cache in the 132-byte
+# block-contiguous layout ``get_paged_mqa_logits_metadata`` / ``fp8_paged_mqa_logits``
+# expect (per page: [page_size*128 fp8 bytes][page_size*4 fp32-scale bytes]).
+_DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "0") == "1"
 
 
 @dataclass
@@ -329,8 +338,27 @@ class Segment:
                 torch.zeros((num_pages, page_size, index_head_dim))
                 for _ in range(num_layers)
             ]
+            # DSA FP8 indexer scoring: a parallel paged FP8 index-K cache in the
+            # 132-byte block-contiguous layout the deep_gemm paged-MQA-logits
+            # kernel reads (per page: [page_size*index_head_dim fp8][page_size*
+            # (index_head_dim/128)*4 scale]). ``index_head_dim`` (128) => 128 fp8
+            # + 4 scale = 132 bytes/token. Only allocated when FP8 scoring is on.
+            if _DSA_FP8_SCORE:
+                assert index_head_dim % _DSA_FP8_TILE == 0
+                n_sf = index_head_dim // _DSA_FP8_TILE  # scales per token (=1)
+                self.index_fp8_bytes = index_head_dim + n_sf * 4  # 132
+                self.index_k_fp8_cache = [
+                    torch.zeros(
+                        (num_pages, page_size * self.index_fp8_bytes),
+                        dtype=torch.uint8,
+                    )
+                    for _ in range(num_layers)
+                ]
+            else:
+                self.index_k_fp8_cache = None
         else:
             self.index_k_cache = None
+            self.index_k_fp8_cache = None
         self.id_allocator = IDAllocator(0, num_pages - 1)
 
     def allocate(self):
@@ -624,6 +652,31 @@ class MemoryManager:
         num_pages, page_size, dim = cache.shape
         flat = cache.view(num_pages * page_size, dim)
         flat[slot_mapping_tensor] = index_k.to(flat.dtype)
+
+    def store_index_k_fp8(
+        self,
+        layer_idx: int,
+        index_k: torch.Tensor,
+        slot_mapping_tensor: torch.Tensor,
+    ):
+        """Quantize + write the indexer key into the paged FP8 index cache.
+
+        Companion to :meth:`store_index_k` for the DSA FP8 scoring path: writes
+        ``index_k`` ``[num_tokens, index_head_dim]`` into the 132-byte
+        block-contiguous paged FP8 index cache that ``fp8_paged_mqa_logits``
+        reads. Only valid when ``segment.index_k_fp8_cache`` is allocated
+        (``GLLM_DSA_FP8_SCORE=1``).
+        """
+        from gllm import _custom_ops as ops
+
+        cache = self.segment.index_k_fp8_cache[layer_idx]
+        ops.store_index_k_fp8(
+            index_k,
+            cache,
+            slot_mapping_tensor,
+            self.segment.page_size,
+            self.segment.index_head_dim,
+        )
 
     def batch_store(
         self,

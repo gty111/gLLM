@@ -41,6 +41,7 @@ from gllm.layers.ops.cache_kernels import (
     gather_and_dequant_mla_fp8 as _triton_gather_and_dequant_mla_fp8,
     gather_and_maybe_dequant_cache as _triton_gather_and_maybe_dequant_cache,
     reshape_and_cache_flash as _triton_reshape_and_cache_flash,
+    store_index_k_fp8 as _triton_store_index_k_fp8,
 )
 from gllm.layers.ops.batched_rotary_kernel import (
     batched_rotary_embedding as _triton_batched_rotary_embedding,
@@ -165,6 +166,20 @@ def dequant_mla_fp8_slots(
     """
     return _triton_dequant_mla_fp8_slots(
         src_cache, slot_ids, kv_lora_rank, qk_rope_head_dim
+    )
+
+
+def store_index_k_fp8(
+    idx_k: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_size: int,
+    index_head_dim: int,
+) -> None:
+    """Quantize + write the DSA indexer key into the paged FP8 index cache. See
+    :func:`gllm.layers.ops.cache_kernels.store_index_k_fp8`."""
+    _triton_store_index_k_fp8(
+        idx_k, cache, slot_mapping, page_size, index_head_dim
     )
 
 

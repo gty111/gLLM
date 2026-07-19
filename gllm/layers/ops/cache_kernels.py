@@ -700,6 +700,82 @@ def dequant_mla_fp8_slots(
 
 
 # =============================================================================
+# store_index_k_fp8  (write DSA indexer key into the paged FP8 index-K cache)
+# =============================================================================
+#
+# Quantizes each token's index key ``[index_head_dim]`` (bf16) to e4m3 + one fp32
+# scale (amax/448) and writes it into the block-contiguous paged FP8 index cache
+# that ``deep_gemm.fp8_paged_mqa_logits`` reads. Per page (page_size tokens) the
+# bytes are laid out as ``[page_size*D fp8]`` then ``[page_size*(D/128)*4 scale]``
+# -- NOT per-token interleaved. One program per token, addressed by slot_mapping.
+
+
+@triton.jit
+def _store_index_k_fp8_kernel(
+    idx_k_ptr,          # [num_tokens, D] bf16
+    cache_ptr,          # [num_pages, page_size*(D + n_sf*4)] uint8
+    slot_mapping_ptr,   # [num_tokens] int
+    idx_k_stride,
+    cache_page_stride,
+    page_size: tl.constexpr,
+    D: tl.constexpr,          # index_head_dim (128)
+    n_sf: tl.constexpr,       # scales per token (D // 128 = 1)
+):
+    t = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + t)
+    if slot < 0:
+        return
+    page = slot // page_size
+    off = slot % page_size
+    page_base = page * cache_page_stride
+
+    offs = tl.arange(0, D)
+    x = tl.load(idx_k_ptr + t * idx_k_stride + offs).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x)), 1e-4)
+    scale = amax / 448.0
+    # Quantize to e4m3 and store the fp8 BYTE PATTERN into the uint8 cache: cast
+    # the write pointer to float8 so the fp8 bits are written verbatim (a plain
+    # ``.to(uint8)`` would truncate the fp8 *value* to an integer instead).
+    q = tl.clamp(x / scale, -448.0, 448.0).to(tl.float8e4nv)
+    tl.store(
+        (cache_ptr + page_base + off * D).cast(tl.pointer_type(tl.float8e4nv)) + offs,
+        q,
+    )
+    # scale region: starts at page_size*D, one fp32 per token (n_sf==1).
+    scale_byte = page_size * D + off * (n_sf * 4)
+    tl.store(
+        (cache_ptr + page_base + scale_byte).cast(tl.pointer_type(tl.float32)),
+        scale,
+    )
+
+
+def store_index_k_fp8(
+    idx_k: torch.Tensor,        # [num_tokens, index_head_dim] bf16
+    cache: torch.Tensor,        # [num_pages, page_size*(D + n_sf*4)] uint8
+    slot_mapping: torch.Tensor,
+    page_size: int,
+    index_head_dim: int,
+    tile_size: int = 128,
+) -> None:
+    """Quantize + write the DSA indexer key into the paged FP8 index cache."""
+    assert index_head_dim % tile_size == 0
+    n_sf = index_head_dim // tile_size
+    num_tokens = idx_k.shape[0]
+    if num_tokens == 0:
+        return
+    _store_index_k_fp8_kernel[(num_tokens,)](
+        idx_k,
+        cache,
+        slot_mapping,
+        idx_k.stride(0),
+        cache.stride(0),
+        page_size=page_size,
+        D=index_head_dim,
+        n_sf=n_sf,
+    )
+
+
+# =============================================================================
 # gather_and_maybe_dequant_cache
 # =============================================================================
 

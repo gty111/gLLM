@@ -27,6 +27,8 @@ Reference: HuggingFace ``transformers>=5.11`` ``modeling_deepseek_v32`` /
 
 from typing import Optional
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -60,6 +62,14 @@ _INDEX_SCORE_TILE = 512
 # long context OOMs. Chunking the query axis caps peak scratch. Prefill runs
 # eagerly (never CUDA-graph captured), so a Python loop here is fine.
 _INDEX_QUERY_CHUNK = 512
+
+# DSA prefill indexer scoring backend. Default: exact fp32 einsum
+# (``_select_topk_prefill``). With ``GLLM_DSA_FP8_SCORE=1`` the prefill selector
+# instead uses SGLang's FP8 path (Hadamard -> e4m3 quant -> deep_gemm
+# ``fp8_mqa_logits``): ~10-50x faster indexer scoring at long context, at the
+# cost of FP8 score quantization (~13% mean rel err on the logits, but the
+# indexer only *selects* top-k, so end-to-end impact is validated on RULER).
+_DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "0") == "1"
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -336,6 +346,81 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         valid = pos.unsqueeze(0) < seq_lens.unsqueeze(1)  # [num_decode, max_L]
         return self._topk_slots(flat, block_table, valid, q_idx, weights, page_sz)
 
+    @torch.no_grad()
+    def _select_topk_decode_fp8(
+        self, input_data: InputData, q_idx: torch.Tensor, weights: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """FP8 decode selector via ``deep_gemm.fp8_paged_mqa_logits``.
+
+        Same contract/output as :meth:`_select_topk_decode` (per-decode-query top
+        ``index_topk`` physical KV slots, -1 padded) but scores with the paged
+        FP8 MQA-logits kernel over the persistent FP8 index-K cache. Both the
+        metadata call and the kernel are CUDA-graph-capturable (verified), and
+        all shapes are static in ``max_L``/``index_topk``, so this stays
+        graph-safe on the captured decode path. ``fp8_paged_mqa_logits`` applies
+        ReLU internally and folds the per-head ``weights`` (carrying q_scale *
+        softmax_scale) + the cache's per-token scale.
+        """
+        import deep_gemm
+        from sgl_kernel import hadamard_transform
+
+        meta = input_data.metadata
+        if meta is None or meta.num_decodes == 0:
+            return None
+        seg = input_data.memory_manager.segment
+        fp8_cache = seg.index_k_fp8_cache[self.layer_id]  # [pages, page_sz*132] uint8
+        pages = fp8_cache.shape[0]
+        page_sz = seg.page_size
+        dim = seg.index_head_dim
+        fp8_bytes = seg.index_fp8_bytes  # 132
+        decode = meta.decode
+        block_table = decode.block_table  # [num_decode, max_blocks] int32
+        seq_lens = decode.seq_lens  # [num_decode] int32 (GPU)
+        num_decode = q_idx.shape[0]
+        topk = self.indexer.index_topk
+        device = q_idx.device
+        max_L = block_table.shape[1] * page_sz
+
+        # Hadamard + FP8-quant the query (matches the stored key path).
+        qh = hadamard_transform(q_idx.contiguous(), scale=dim ** -0.5)
+        qf = qh.float().reshape(num_decode, self.indexer.n_heads, dim // 128, 128)
+        q_scale = (qf.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448.0)
+        q_fp8 = (qf / q_scale).clamp(-448, 448).to(torch.float8_e4m3fn).reshape(
+            num_decode, self.indexer.n_heads, dim
+        )
+        q_scale = q_scale.reshape(num_decode, self.indexer.n_heads)
+        w = (weights.float() * q_scale * self.indexer.softmax_scale).contiguous()
+
+        kv = fp8_cache.view(pages, page_sz, 1, fp8_bytes)
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        sched = deep_gemm.get_paged_mqa_logits_metadata(seq_lens, page_sz, sm_count)
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_fp8.unsqueeze(1),   # [num_decode, next_n=1, H, D]
+            kv,
+            w,
+            seq_lens,
+            block_table,
+            sched,
+            max_L,
+            clean_logits=False,
+        )  # [num_decode, max_L] fp32 (positions beyond seq_len are -inf/invalid)
+
+        # Positions -> physical slots via the block table (same as _topk_slots).
+        pos = torch.arange(max_L, device=device)
+        blocks = block_table[:, pos // page_sz]
+        slots = (blocks * page_sz + (pos % page_sz)).to(torch.int32)  # [nd, max_L]
+        valid = pos.unsqueeze(0) < seq_lens.unsqueeze(1)
+        logits = logits.masked_fill(~valid, float("-inf"))
+
+        k = min(topk, max_L)
+        sel = logits.topk(k, dim=-1).indices  # [nd, k] positions
+        sel_slots = torch.gather(slots, 1, sel)
+        sel_valid = torch.gather(valid, 1, sel)
+        sel_slots = torch.where(sel_valid, sel_slots, sel_slots.new_full((), -1))
+        out = q_idx.new_full((num_decode, topk), -1, dtype=torch.int32)
+        out[:, :k] = sel_slots
+        return out
+
     def _select_topk_prefill(
         self, input_data: InputData, q_idx: torch.Tensor, weights: torch.Tensor
     ) -> Optional[torch.Tensor]:
@@ -422,6 +507,99 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             )
         return out
 
+    @torch.no_grad()
+    def _select_topk_prefill_fp8(
+        self, input_data: InputData, q_idx: torch.Tensor, weights: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """FP8 variant of :meth:`_select_topk_prefill` using ``fp8_mqa_logits``.
+
+        Per prefill sequence: gather its cached index-key history (physical
+        slots), Hadamard-transform + FP8-quantize both the indexer query and key
+        (SGLang's NSA recipe), score with ``deep_gemm.fp8_mqa_logits`` under the
+        per-query causal bounds ``ks/ke``, top-k, and map back to physical slots.
+        ``fp8_mqa_logits`` applies ReLU internally and folds the per-head
+        ``weights`` (which carry ``q_scale * softmax_scale``), matching the exact
+        ``Σ_h w·ReLU(scale·q·k)`` score. Much faster than the fp32 einsum at long
+        context; the FP8 quantization error only perturbs the *selection*.
+
+        Gathering + quantizing K per forward (rather than a persistent FP8 index
+        cache) keeps this change local to the model; a persistent FP8 index-K
+        cache is a later perf optimization.
+        """
+        import deep_gemm
+        from sgl_kernel import hadamard_transform
+
+        meta = input_data.metadata
+        prefill = meta.prefill
+        seg = input_data.memory_manager.segment
+        index_cache = seg.index_k_cache[self.layer_id]  # [pages, page_sz, D]
+        pages, page_sz, dim = index_cache.shape
+        flat = index_cache.view(pages * page_sz, dim)  # [num_slots, D]
+
+        block_table = prefill.block_table  # [num_prefills, max_blocks]
+        qsl_cpu = prefill.query_start_loc.cpu().tolist()  # [num_prefills + 1]
+        seq_lens_cpu = prefill.seq_lens.cpu().tolist()
+        context_lens_cpu = prefill.context_lens.cpu().tolist()
+        num_prefill_tokens = q_idx.shape[0]
+        topk = self.indexer.index_topk
+        scale = self.indexer.softmax_scale
+        device = flat.device
+        hdim = q_idx.shape[-1]
+
+        out = q_idx.new_full((num_prefill_tokens, topk), -1, dtype=torch.int32)
+
+        def _quant(x):  # x [..., D] bf16 -> (e4m3, per-D-block fp32 scale)
+            xf = x.float().reshape(*x.shape[:-1], hdim // 128, 128)
+            amax = xf.abs().amax(-1, keepdim=True).clamp_min(1e-4)
+            s = amax / 448.0
+            q = (xf / s).clamp(-448, 448).to(torch.float8_e4m3fn).reshape(x.shape)
+            return q, s.reshape(*x.shape[:-1], hdim // 128).squeeze(-1)
+
+        for i in range(len(seq_lens_cpu)):
+            q0, q1 = qsl_cpu[i], qsl_cpu[i + 1]
+            qlen = q1 - q0
+            if qlen == 0:
+                continue
+            seq_len = seq_lens_cpu[i]
+            ctx_len = context_lens_cpu[i]
+            # Physical slots for this seq's whole history [0, seq_len).
+            posk = torch.arange(seq_len, device=device)
+            blk = block_table[i, posk // page_sz]
+            seq_slots = (blk * page_sz + (posk % page_sz)).to(torch.int64)  # [seq_len]
+            k_bf16 = flat[seq_slots]  # [seq_len, D]
+
+            q_seq = q_idx[q0:q1]  # [qlen, n_heads, D]
+            w_seq = weights[q0:q1]  # [qlen, n_heads]
+
+            # Hadamard + FP8 quant (SGLang NSA recipe).
+            qh = hadamard_transform(q_seq.contiguous(), scale=hdim ** -0.5)
+            kh = hadamard_transform(k_bf16.contiguous(), scale=hdim ** -0.5)
+            q_fp8, q_scale = _quant(qh)  # [qlen,H,D], [qlen,H]
+            k_fp8, k_scale = _quant(kh)  # [seq_len,D], [seq_len]
+            w_folded = w_seq.float() * q_scale * scale  # [qlen, n_heads]
+
+            # Per-query causal bounds: query at intra-seq offset j (abs pos
+            # ctx_len + j) attends to keys [0, ctx_len + j].
+            j = torch.arange(qlen, device=device, dtype=torch.int32)
+            ks = torch.zeros(qlen, device=device, dtype=torch.int32)
+            ke = (ctx_len + j + 1).clamp(max=seq_len).to(torch.int32)
+
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8.contiguous(),
+                (k_fp8.contiguous(), k_scale.contiguous()),
+                w_folded.contiguous(),
+                ks, ke, clean_logits=False,
+            )  # [qlen, seq_len]
+
+            k_sel = min(topk, seq_len)
+            sel = logits.topk(k_sel, dim=-1).indices  # [qlen, k_sel] positions
+            sel_slots = seq_slots[sel].to(torch.int32)  # [qlen, k_sel]
+            # positions beyond a query's causal horizon are invalid -> -1.
+            sel_valid = sel < ke.unsqueeze(1)
+            sel_slots = torch.where(sel_valid, sel_slots, sel_slots.new_full((), -1))
+            out[q0:q1, :k_sel] = sel_slots
+        return out
+
     def forward(
         self,
         input_data: InputData,
@@ -459,6 +637,23 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             mm.store_index_k(
                 self.layer_id, idx_k, input_data.get_slot_mapping()
             )
+            # DSA FP8 scoring also needs the key in the persistent paged FP8
+            # index cache (block-contiguous 132B layout for fp8_paged_mqa_logits).
+            # The FP8 score path scores Hadamard(q)·Hadamard(k) (the Hadamard
+            # transform decorrelates activations so FP8 quant is accurate); the
+            # decode query is Hadamard'd in ``_select_topk_decode_fp8``, so the
+            # stored key MUST be Hadamard'd here to match -- otherwise the score
+            # is Hadamard(q)·k, which is wrong (H is orthogonal: (Hq)·(Hk)=q·k
+            # but (Hq)·k != q·k).
+            if _DSA_FP8_SCORE and mm.segment.index_k_fp8_cache is not None:
+                from sgl_kernel import hadamard_transform
+
+                idx_k_had = hadamard_transform(
+                    idx_k.contiguous(), scale=idx_k.shape[-1] ** -0.5
+                )
+                mm.store_index_k_fp8(
+                    self.layer_id, idx_k_had, input_data.get_slot_mapping()
+                )
             num_dec = meta.num_decode_tokens
             # DeepSeek Sparse Attention: feed the indexer's top-k selection into
             # the sparse decode kernel. MLAAttention routes by cache dtype:
@@ -467,7 +662,12 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             # (paged bf16 sparse is rejected by FlashMLA on SM90). Either way
             # sparse decode runs regardless of cache precision.
             if meta.num_decodes > 0:
-                decode_topk = self._select_topk_decode(
+                sel_decode = (
+                    self._select_topk_decode_fp8
+                    if _DSA_FP8_SCORE
+                    else self._select_topk_decode
+                )
+                decode_topk = sel_decode(
                     input_data, idx_q[:num_dec], weights[:num_dec]
                 )
             # DeepSeek Sparse Attention (prefill): per-query causal top-k over the
@@ -475,7 +675,12 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             # (== dense) for any query whose causal horizon <= index_topk, so this
             # is a no-op for prompts <= index_topk and only changes long context.
             if meta.num_prefills > 0:
-                prefill_topk = self._select_topk_prefill(
+                sel_prefill = (
+                    self._select_topk_prefill_fp8
+                    if _DSA_FP8_SCORE
+                    else self._select_topk_prefill
+                )
+                prefill_topk = sel_prefill(
                     input_data, idx_q[num_dec:], weights[num_dec:]
                 )
 

@@ -253,10 +253,39 @@ python -m gllm.entrypoints.api_server --model-path <V3.2> \
 DSA (decode + prefill) is always on for V3.2; it is a no-op for prompts ≤
 `index_topk` and only diverges from dense beyond that.
 
-## 9. Known limitations / follow-ups
+## 9. FP8 indexer scoring (optional, `GLLM_DSA_FP8_SCORE=1`)
 
-- FP8 sparse-prefill dequant is gather-only but still allocates a full-width bf16
-  buffer; a compact gather + remap would cut that allocation.
-- The indexer scoring is plain torch (einsum + ReLU + weight, tiled). SGLang uses
-  `deep_gemm.fp8_mqa_logits` + `fast_topk_transform_fused` (both available in the
-  env) — a faster follow-up that would match SGLang bit-for-bit.
+By default the indexer scores in fp32 (exact einsum + ReLU, tiled). Setting
+`GLLM_DSA_FP8_SCORE=1` switches BOTH selectors to SGLang's FP8 path — 10-50×
+faster indexer scoring at long context:
+
+- **prefill** (`_select_topk_prefill_fp8`): reads the fp32 index-K cache, applies
+  Hadamard to q and k, quantizes to e4m3 + per-token scale, scores with
+  `deep_gemm.fp8_mqa_logits` (ragged, per-query causal `ks/ke`). No cache change.
+- **decode** (`_select_topk_decode_fp8`): scores with `deep_gemm.fp8_paged_mqa_logits`
+  over a **persistent paged FP8 index-K cache** (`index_k_fp8_cache`, 132-byte
+  block-contiguous layout: per page `[page_size*128 fp8][page_size*4 scale]`),
+  written by the `store_index_k_fp8` Triton kernel. Both the metadata call and the
+  kernel are CUDA-graph-capturable, so the decode selector stays graph-safe.
+
+Key correctness rules (both learned the hard way):
+- `fp8_mqa_logits` / `fp8_paged_mqa_logits` apply ReLU internally and fold the
+  per-head weights (carrying `q_scale * softmax_scale`) + cache scale — matching
+  `Σ_h w·ReLU(scale·q·k)`.
+- The FP8 path scores `Hadamard(q)·Hadamard(k)`. BOTH q and k must be Hadamard'd:
+  H is orthogonal so `(Hq)·(Hk)=q·k`, but `(Hq)·k ≠ q·k`. Hadamard-ing only q (and
+  storing the raw key) silently corrupts selection (RULER 84% vs 94%).
+- `store_index_k_fp8` must write the fp8 **byte pattern** via a `float8e4nv`-cast
+  pointer, not `.to(uint8)` (which truncates the fp8 value to an integer).
+
+**Accuracy (RULER 4096, retrieval):** fp32 96.15% · fp8 prefill-only 95.38% ·
+fp8 prefill+decode 93.85%. FP8 scoring is near-lossless for prefill and ~2pt below
+fp32 for decode (FP8 quant + mild autoregressive accumulation). Default OFF; enable
+for long-context throughput when the ~2pt is acceptable.
+
+## 10. Known limitations / follow-ups
+
+- FP8 sparse-prefill dequant (KV read) is gather-only but still allocates a
+  full-width bf16 buffer; a compact gather + remap would cut that allocation.
+- The prefill FP8 selector re-quantizes K from the fp32 index cache each layer; it
+  could read the persistent paged FP8 index cache (as decode does) to avoid that.
