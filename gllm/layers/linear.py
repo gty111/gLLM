@@ -71,6 +71,10 @@ class LinearBase(torch.nn.Module):
                     f"FP8 quantizaiton method is not supported on device capability less than 89 (current is {get_device_capability()})"
                 )
             self.activation_scheme = self.quant_config["activation_scheme"]
+            # ``scale_fmt="ue8m0"`` (DeepSeek-V3.2) rounds FP8 group scales to
+            # powers of two -- for weights offline and activations online. Round
+            # the activation scale to match the reference numerics.
+            self.use_ue8m0 = self.quant_config.get("scale_fmt") == "ue8m0"
             self.block_quant = "weight_block_size" in self.quant_config
             if self.block_quant:
                 self.weight_block_size = self.quant_config["weight_block_size"]
@@ -135,6 +139,7 @@ class LinearBase(torch.nn.Module):
                 block_size=self.weight_block_size,
                 weight_scale=self.weight_scale_inv,
                 input_scale=self.input_scale,
+                round_scale=self.use_ue8m0,
             )
         else:
             raise Exception(

@@ -243,8 +243,9 @@ class ModelRunner:
         skip_visual: bool = False,
         skip_language: bool = False,
         mla_decode_backend: str = "fa3",
+        mla_cache_dtype: str = "bf16",
     ):
-        
+
         self.max_num_batched_tokens = (
             maxp
             if schedule_method in ["chunked_prefill", "split_pd"]
@@ -321,6 +322,14 @@ class ModelRunner:
             raise ValueError(
                 "mla_decode_backend must be 'fa3', 'flashmla', or 'triton', "
                 f"got {self.mla_decode_backend!r}."
+            )
+        # MLA latent KV cache precision (DeepSeek Sparse Attention). "bf16"
+        # (default) = full-precision latent cache + dense decode; "fp8" = native
+        # FP8-packed cache driving FlashMLA sparse decode on SM90.
+        self.mla_cache_dtype = (mla_cache_dtype or "bf16").lower()
+        if self.mla_cache_dtype not in ("bf16", "fp8"):
+            raise ValueError(
+                f"mla_cache_dtype must be 'bf16' or 'fp8', got {self.mla_cache_dtype!r}."
             )
         if self.use_mla and self.mla_decode_backend == "flashmla":
             if self.page_size != _FLASHMLA_PAGE_SIZE:
@@ -501,6 +510,14 @@ class ModelRunner:
                 else 0
             ),
             max_running_seqs=self.max_running_seqs,
+            # DeepSeek Sparse Attention (V3.2): non-zero => allocate a parallel
+            # paged indexer key cache. 0 for every other model.
+            index_head_dim=getattr(self.model, "index_head_dim", 0),
+            # MLA rope head dim (needed to size the native FP8 MLA cache for DSA).
+            qk_rope_head_dim=getattr(self.model, "qk_rope_head_dim", 0),
+            # DSA MLA latent cache precision: FP8-packed only when explicitly
+            # requested (drives SM90 sparse decode); default bf16 + dense decode.
+            mla_cache_fp8=(self.mla_cache_dtype == "fp8"),
         )
         # Input buffer
         self.input_data = InputData(

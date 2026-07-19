@@ -283,6 +283,7 @@ class InputData:
         "num_prefills",
         "max_context_len",
         "decode_seq_lens_cpu",
+        "decode_max_query_len",
         "prefill_max_query_len",
         "prefill_query_start_loc_cpu",
         "chunk_starts_cpu",
@@ -702,18 +703,22 @@ class InputData:
             else None
         )
 
-        prefill_metadata = (
-            MLACommonPrefillMetadata(
+        prefill_metadata = None
+        if self.num_prefills > 0:
+            prefill_qsl = self.prefill_query_start_loc[
+                : self.prefill_query_start_loc_cpu.shape[0]
+            ]
+            prefill_seq_lens = self.get_seq_lens()[self.num_decode_tokens :]
+            # query_lens[i] = qsl[i+1] - qsl[i]; context = seq_len - query_len.
+            prefill_query_lens = prefill_qsl[1:] - prefill_qsl[:-1]
+            prefill_metadata = MLACommonPrefillMetadata(
                 block_table=self.get_block_table()[self.num_decode_tokens :],
-                query_start_loc=self.prefill_query_start_loc[
-                    : self.prefill_query_start_loc_cpu.shape[0]
-                ],
+                query_start_loc=prefill_qsl,
                 max_query_len=self.prefill_max_query_len,
                 chunked_context=chunked_context_metadata,
+                seq_lens=prefill_seq_lens,
+                context_lens=prefill_seq_lens - prefill_query_lens,
             )
-            if self.num_prefills > 0
-            else None
-        )
         self.metadata = MLACommonMetadata(
             self.num_actual_tokens,
             self.get_slot_mapping(),
@@ -758,6 +763,13 @@ class MLACommonPrefillMetadata:
     query_start_loc: torch.Tensor
     max_query_len: int
     chunked_context: Optional[ChunkedContextMetadata] = None
+    # Per-prefill-seq total sequence length (context + this step's new tokens) and
+    # cached-context length, both on GPU, int32, length ``num_prefills``. Used by
+    # DeepSeek-V3.2 DSA to build each prefill query's causal horizon
+    # (abs_pos(q) = context_len + intra-seq query offset). ``None`` for models
+    # that don't need them.
+    seq_lens: Optional[torch.Tensor] = None
+    context_lens: Optional[torch.Tensor] = None
 
 
 @dataclass

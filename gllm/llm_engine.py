@@ -71,6 +71,7 @@ class LLM:
         mm_processor_max_pixels=None,
         disagg_config=None,
         mla_decode_backend="fa3",
+        mla_cache_dtype="bf16",
     ):
         init_logger()
         self.model_path = model_path
@@ -113,6 +114,7 @@ class LLM:
             skip_visual=skip_visual,
             skip_language=skip_language,
             mla_decode_backend=mla_decode_backend,
+            mla_cache_dtype=mla_cache_dtype,
         )
         self.pp_size = pp_size
         self.tp_size = tp_size

@@ -12,6 +12,10 @@ from gllm.id_allocator import IDAllocator
 from gllm.sequence import Sequence
 from gllm.utils import async_tensor_h2d, get_dtype_bytes
 
+# DeepSeek Sparse Attention FP8 MLA cache: the nope latent is quantized in
+# 128-wide tiles (one fp32 scale per tile), matching FlashMLA's packed layout.
+_DSA_FP8_TILE = 128
+
 
 @dataclass
 class SSMCacheConfig:
@@ -250,18 +254,40 @@ class Segment:
         kv_head_num: int,
         kv_head_dim: int,
         use_mla: bool,
+        index_head_dim: int = 0,
+        qk_rope_head_dim: int = 0,
+        mla_cache_fp8: bool = False,
     ):
         """``num_layers`` here is the number of layers that *actually consume
         KV pages*. For text-only / non-hybrid models that's the full decoder
         depth; for Qwen3.5 and other hybrid GDN models it's the count of
         ``full_attention`` layers (the linear-attention layers route their
         recurrent state through :class:`SSMSegment` instead).
+
+        ``index_head_dim`` (> 0 only for DeepSeek Sparse Attention / V3.2)
+        allocates a parallel per-layer **indexer key cache** of shape
+        ``[num_pages, page_size, index_head_dim]``. The lightning indexer's
+        post-norm+rope key is a single-head ``index_head_dim`` (128) vector per
+        token that cannot be derived from the MLA latent (it comes from a
+        separate ``wk`` projection), so it needs its own paged cache written by
+        the same ``slot_mapping`` as the MLA latent.
         """
         self.num_layers = num_layers
         self.num_pages = num_pages
         self.page_size = page_size
         self.kv_head_num = kv_head_num
         self.kv_head_dim = kv_head_dim
+        self.index_head_dim = index_head_dim
+        # DeepSeek Sparse Attention: the MLA latent cache is stored in FlashMLA's
+        # FP8 packed layout (656 bytes/token) only when ``mla_cache_fp8`` is
+        # explicitly enabled -- that layout is what the SM90 *sparse* decode
+        # kernel reads (bf16 sparse decode is Blackwell-only). Default is a plain
+        # bf16 latent cache + dense decode, which is exact for prompts <=
+        # index_topk. Every non-DSA model keeps its bf16 latent cache unchanged.
+        self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
+        # Packed FP8 layout size: kv_lora_rank(=kv_head_dim - qk_rope) FP8 bytes
+        # + (kv_lora_rank/128) fp32 scale bytes + qk_rope_head_dim bf16 bytes.
+        # For MLA, kv_head_dim = kv_lora_rank + qk_rope_head_dim.
 
         if not use_mla:
             # We don't need zero initialization here
@@ -273,11 +299,38 @@ class Segment:
                 torch.ones((num_pages, page_size, kv_head_num, kv_head_dim))
                 for _ in range(num_layers)
             ]
+        elif self.mla_cache_fp8:
+            # kv_head_dim is kv_lora_rank + qk_rope_head_dim (e.g. 512 + 64).
+            qk_rope = qk_rope_head_dim
+            kv_lora = kv_head_dim - qk_rope
+            assert kv_lora % _DSA_FP8_TILE == 0, (
+                f"kv_lora_rank {kv_lora} must be divisible by FP8 tile "
+                f"{_DSA_FP8_TILE} for the DSA FP8 MLA cache"
+            )
+            num_tiles = kv_lora // _DSA_FP8_TILE
+            self.mla_fp8_dim = kv_lora + num_tiles * 4 + qk_rope * 2  # 656
+            self.kv_cache = [
+                torch.zeros(
+                    (num_pages, page_size, 1, self.mla_fp8_dim),
+                    dtype=torch.float8_e4m3fn,
+                )
+                for _ in range(num_layers)
+            ]
         else:
             self.kv_cache = [
                 torch.ones((num_pages, page_size, kv_head_dim))
                 for _ in range(num_layers)
             ]
+        # DeepSeek Sparse Attention: parallel indexer key cache (bf16, one
+        # single-head index_head_dim vector per token per layer). Only
+        # allocated when index_head_dim > 0.
+        if index_head_dim > 0:
+            self.index_k_cache = [
+                torch.zeros((num_pages, page_size, index_head_dim))
+                for _ in range(num_layers)
+            ]
+        else:
+            self.index_k_cache = None
         self.id_allocator = IDAllocator(0, num_pages - 1)
 
     def allocate(self):
@@ -312,6 +365,9 @@ class MemoryManager:
         max_working_ssm_slots: int = 0,
         max_snapshot_ssm_slots: int = 0,
         max_running_seqs: int = 256,
+        index_head_dim: int = 0,
+        qk_rope_head_dim: int = 0,
+        mla_cache_fp8: bool = False,
     ):
         """
         Args:
@@ -342,6 +398,16 @@ class MemoryManager:
         self.dtype = dtype
         self.vocab_size = vocab_size
         self.use_mla = use_mla
+        # DeepSeek Sparse Attention indexer key cache head dim (0 = disabled).
+        self.index_head_dim = index_head_dim
+        # MLA rope head dim, needed to size the native FP8 MLA cache layout.
+        self.qk_rope_head_dim = qk_rope_head_dim
+        # Whether the MLA latent cache is stored natively in FP8 (DSA). Default
+        # is bf16 (full precision, dense decode); FP8-packed is opt-in and only
+        # needed to drive FlashMLA's *sparse* decode kernel on SM90 for long
+        # context (> index_topk). DSA on bf16 runs dense decode, which is exact
+        # for prompts <= index_topk (the sparse top-k would select every key).
+        self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
         self.ssm_cache_config = ssm_cache_config
         self.max_working_ssm_slots = max_working_ssm_slots
         self.max_snapshot_ssm_slots = max_snapshot_ssm_slots
@@ -395,8 +461,15 @@ class MemoryManager:
             dist.all_gather_object(num_pages_all, num_pages)
             self.num_pages = min(num_pages_all)
 
+        # KV cache element precision: native FP8 for DeepSeek Sparse Attention
+        # (packed 656-byte MLA latent), otherwise the model dtype (e.g. bf16).
+        if self.mla_cache_fp8:
+            kv_dtype_str = "fp8_e4m3 (nope) + bf16 (rope)"
+        else:
+            kv_dtype_str = str(self.dtype).replace("torch.", "")
         logger.info(
             f"KV cache: {self.num_pages} pages ({self.page_size} tokens/page), "
+            f"dtype {kv_dtype_str}, "
             f"{round(self.get_sizeof_KV_per_page()/(2**10*self.page_size),2)} KB (per token), "
             f"{round(self.num_pages*self.get_sizeof_KV_per_page()/(2**30),2)} GB (total)"
         )
@@ -408,6 +481,9 @@ class MemoryManager:
             self.kv_head_num,
             self.kv_head_dim,
             self.use_mla,
+            index_head_dim=self.index_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            mla_cache_fp8=self.mla_cache_fp8,
         )
 
         # Reserve a dedicated dummy page for CUDA graph padding only when
@@ -514,12 +590,40 @@ class MemoryManager:
                 * get_dtype_bytes(self.dtype)
             )
         else:
-            return (
-                self.num_layers
-                * self.page_size
-                * self.kv_head_dim
-                * get_dtype_bytes(self.dtype)
-            )
+            # Per-token MLA latent bytes. Native FP8 (DSA) uses the packed
+            # 656-byte layout (1 byte/elem, computed in Segment as mla_fp8_dim);
+            # otherwise bf16 kv_head_dim. The index key cache adds its own
+            # per-token bytes (bf16) on top.
+            if self.mla_cache_fp8:
+                qk_rope = self.qk_rope_head_dim
+                kv_lora = self.kv_head_dim - qk_rope
+                num_tiles = kv_lora // _DSA_FP8_TILE
+                mla_bytes = kv_lora + num_tiles * 4 + qk_rope * 2  # 656, 1 B/elem
+            else:
+                mla_bytes = self.kv_head_dim * get_dtype_bytes(self.dtype)
+            index_bytes = self.index_head_dim * get_dtype_bytes(self.dtype)
+            return self.num_layers * self.page_size * (mla_bytes + index_bytes)
+
+    def store_index_k(
+        self,
+        layer_idx: int,
+        index_k: torch.Tensor,
+        slot_mapping_tensor: torch.Tensor,
+    ):
+        """Write the DSA indexer key into the paged index cache by slot.
+
+        ``index_k`` is ``[num_tokens, index_head_dim]`` (post norm+rope, single
+        head). The paged cache is ``[num_pages, page_size, index_head_dim]``;
+        ``slot_mapping_tensor`` gives the flattened ``page*page_size + offset``
+        slot for each token, identical to the MLA latent's slot mapping. A plain
+        indexed scatter into the flattened (num_slots, dim) view is enough here
+        -- the indexer is not the throughput bottleneck and this keeps the write
+        dtype-agnostic and kernel-free.
+        """
+        cache = self.segment.index_k_cache[layer_idx]
+        num_pages, page_size, dim = cache.shape
+        flat = cache.view(num_pages * page_size, dim)
+        flat[slot_mapping_tensor] = index_k.to(flat.dtype)
 
     def batch_store(
         self,

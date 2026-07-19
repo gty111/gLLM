@@ -341,6 +341,19 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--mla-cache-dtype",
+        type=str,
+        choices=["bf16", "fp8"],
+        default="bf16",
+        help=(
+            "MLA latent KV cache precision for DeepSeek Sparse Attention "
+            "(V3.2). 'bf16' (default) stores a full-precision latent cache and "
+            "runs dense decode (exact for prompts <= index_topk). 'fp8' stores "
+            "the FlashMLA FP8-packed cache to drive SM90 sparse decode for long "
+            "context. No effect on non-DSA models."
+        ),
+    )
+    parser.add_argument(
         "--disable-cuda-graph",
         help="Enable full cuda graph for decode batch",
         action="store_true",
@@ -524,6 +537,7 @@ if __name__ == "__main__":
         mm_processor_min_pixels=args.mm_processor_min_pixels,
         mm_processor_max_pixels=args.mm_processor_max_pixels,
         mla_decode_backend=args.mla_decode_backend,
+        mla_cache_dtype=args.mla_cache_dtype,
     )
 
     # Resolve the tool-call parser once: explicit ``--tool-call-parser`` wins,

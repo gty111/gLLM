@@ -26,12 +26,14 @@ except Exception as _e:  # pragma: no cover - depends on hardware / build
 # Triton decode backend keeps working when it is unavailable.
 try:
     from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
     _FLASHMLA_AVAILABLE = True
     _FLASHMLA_IMPORT_ERROR: Optional[Exception] = None
 except Exception as _e:  # pragma: no cover - depends on hardware / build
     flash_mla_with_kvcache = None
     get_mla_metadata = None
+    flash_mla_sparse_fwd = None
     _FLASHMLA_AVAILABLE = False
     _FLASHMLA_IMPORT_ERROR = _e
 
@@ -379,16 +381,32 @@ class MLAAttention:
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            ops.gather_and_maybe_dequant_cache(
-                src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
-                batch_size=attn_metadata.num_prefills,
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=k_scale,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
-            )
+            if kv_c_and_k_pe_cache.dtype == torch.float8_e4m3fn:
+                # DeepSeek Sparse Attention: the paged latent cache is stored in
+                # FlashMLA's 656-byte FP8-packed layout, so read it back through
+                # the dequantizing gather (per-tile fp8 -> bf16 + rope verbatim).
+                # The scales are embedded in the cache, so no external k_scale.
+                ops.gather_and_dequant_mla_fp8(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
+                    batch_size=attn_metadata.num_prefills,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+            else:
+                ops.gather_and_maybe_dequant_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
+                    batch_size=attn_metadata.num_prefills,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=k_scale,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
 
             kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
@@ -443,6 +461,99 @@ class MLAAttention:
             return_softmax_lse=return_softmax_lse,
         )
 
+    def _forward_prefill_sparse(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        topk_indices: torch.Tensor,
+        k_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sparse MLA prefill via ``flash_mla_sparse_fwd`` (DeepSeek-V3.2 DSA).
+
+        ``topk_indices`` are per-prefill-query absolute physical KV slots
+        (``[num_prefill_tokens, index_topk]`` int32, -1 padded) already made
+        causal by the indexer. Mirrors the absorbed decode path: project the
+        query nope part into the latent space with ``W_UK_T``, feed the sparse
+        kernel the latent KV cache indexed by the top-k slots, then ``W_UV`` the
+        result back to the value space.
+
+        ``flash_mla_sparse_fwd(q, kv, indices, sm_scale, d_v)`` expects a
+        contiguous ``kv`` of shape ``[num_slots, 1, kv_lora + qk_rope]`` and
+        ``indices`` of shape ``[num_q, 1, topk]`` indexing ``kv``'s first dim; -1
+        entries are skipped. Physical slots index the flat cache directly, so the
+        flat latent cache IS that ``kv`` (bf16); the FP8-packed cache is
+        dequantized to the same layout first.
+        """
+        if flash_mla_sparse_fwd is None:
+            raise RuntimeError(
+                "flash_mla_sparse_fwd unavailable; cannot run DSA sparse prefill."
+            )
+        if self.W_UK_T is None or self.W_UV is None:
+            self.process_weights()
+
+        num_q = q.shape[0]
+        # Absorb q_nope -> latent: (B,N,P) -> (N,B,P) x (N,P,L) -> (B,N,L).
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_nope = q_nope.transpose(0, 1)  # (N, B, P)
+        N, B, P = q_nope.shape
+        _, _, L = self.W_UK_T.shape
+        ql_nope = q_nope.new_empty((N, B, L))
+        torch.bmm(q_nope, self.W_UK_T, out=ql_nope)  # (N, B, L)
+        ql_nope = ql_nope.transpose(0, 1)  # (B, N, L)
+        # Sparse-kernel query: latent nope ++ rope -> (num_q, num_heads, L + R).
+        q_sparse = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
+
+        # Build the contiguous latent KV the kernel indexes into.
+        dim = self.kv_lora_rank + self.qk_rope_head_dim
+        if kv_c_and_k_pe_cache.dtype == torch.float8_e4m3fn:
+            # FP8-packed (656B) cache: sparse prefill on the FP8 layout needs a
+            # dequantizing gather to the bf16 latent layout the kernel indexes.
+            # Not wired yet -- validate the bf16 cache path first (the default
+            # ``mla_cache_dtype``); FP8 sparse prefill is a follow-up.
+            raise NotImplementedError(
+                "DSA sparse prefill on the FP8-packed MLA cache is not yet "
+                "implemented; run with the default bf16 MLA cache "
+                "(--mla-cache-dtype bf16)."
+            )
+        kv = kv_c_and_k_pe_cache.reshape(-1, 1, dim)
+
+        indices = topk_indices.to(torch.int32)
+        if indices.dim() == 2:
+            indices = indices.unsqueeze(1)  # (num_q, 1, topk)
+
+        # FlashMLA's sparse prefill kernel requires the query head count to be a
+        # multiple of 64 (SM90/Hopper) or 128 (SM100+/Blackwell). Under TP the
+        # per-rank head count is smaller (e.g. 128/8=16), so zero-pad the head
+        # axis up to the required multiple and trim the output back (matches
+        # SGLang's NSA backend).
+        required = 128 if torch.cuda.get_device_capability()[0] >= 10 else 64
+        num_heads = q_sparse.shape[1]
+        pad = num_heads % required != 0
+        if pad:
+            assert required % num_heads == 0, (
+                f"num_heads {num_heads} cannot be zero-padded to {required}; "
+                "TP size may be too large for this model."
+            )
+            q_in = q_sparse.new_zeros((num_q, required, q_sparse.shape[-1]))
+            q_in[:, :num_heads, :] = q_sparse
+        else:
+            q_in = q_sparse
+
+        o, _, _ = flash_mla_sparse_fwd(
+            q=q_in,
+            kv=kv,
+            indices=indices,
+            sm_scale=self.scale,
+            d_v=self.kv_lora_rank,
+        )
+        if pad:
+            o = o[:, :num_heads, :]
+        # o: (num_q, num_heads, kv_lora_rank) -> v_up -> (num_q, num_heads*v_head_dim).
+        out = q.new_empty((num_q, self.num_heads * self.v_head_dim))
+        self._v_up_proj(o.reshape(num_q, self.num_heads, self.kv_lora_rank), out=out)
+        return out
+
     def _forward_prefill(
         self,
         q: torch.Tensor,
@@ -451,8 +562,20 @@ class MLAAttention:
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert attn_metadata.prefill is not None
+
+        # DeepSeek Sparse Attention (V3.2): when the indexer supplies per-prefill
+        # -query top-k physical KV slots, run the sparse prefill. The top-k set
+        # already spans each query's full causal history (cached prefix + earlier
+        # new tokens, all written to the KV cache before this call), so the sparse
+        # path replaces BOTH the dense new-token (suffix) and context (prefix)
+        # pieces below -- no separate merge needed.
+        if topk_indices is not None:
+            return self._forward_prefill_sparse(
+                q, kv_c_and_k_pe_cache, attn_metadata, topk_indices, k_scale
+            )
 
         has_context = attn_metadata.prefill.chunked_context is not None
         kv_nope = self.kv_b_proj(kv_c_normed).view(
@@ -496,7 +619,26 @@ class MLAAttention:
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if topk_indices is not None:
+            # DeepSeek Sparse Attention decode. Two viable kernels on SM90:
+            #   * FP8-packed KV cache -> FlashMLA sparse ``fwd_kvcache_mla``
+            #     (takes ``indices`` + ``is_fp8_kvcache=True``); paged bf16 sparse
+            #     is rejected by that kernel ("Sparse BF16 MLA not supported").
+            #   * bf16 KV cache -> FA3 ``flash_attn_with_kvcache`` fed the top-k
+            #     physical slots as a ``page_size=1`` page table (SGLang's NSA
+            #     ``fa3`` decode path). FA3 has no ``indices`` arg, but a
+            #     per-query page table of length ``index_topk`` with
+            #     ``cache_seqlens`` clamped to the selected count is exactly
+            #     equivalent, and FA3 reads bf16 natively.
+            if kv_c_and_k_pe_cache.dtype == torch.float8_e4m3fn:
+                return self._forward_decode_flashmla(
+                    q, kv_c_and_k_pe_cache, attn_metadata, topk_indices=topk_indices
+                )
+            return self._forward_decode_fa3(
+                q, kv_c_and_k_pe_cache, attn_metadata, topk_indices=topk_indices
+            )
         if self.decode_backend == "fa3":
             return self._forward_decode_fa3(q, kv_c_and_k_pe_cache, attn_metadata)
         if self.decode_backend == "flashmla":
@@ -510,8 +652,18 @@ class MLAAttention:
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Absorbed MLA decode via FA3 (SGLang ``FlashAttentionBackend`` path)."""
+        """Absorbed MLA decode via FA3 (SGLang ``FlashAttentionBackend`` path).
+
+        When ``topk_indices`` is supplied (DeepSeek Sparse Attention), the
+        indexer's per-query top-k **physical KV slots** are fed to FA3 as a
+        ``page_size == 1`` page table with ``cache_seqlens`` clamped to the
+        selected count -- exactly SGLang's NSA ``fa3`` decode path. FA3 has no
+        sparse ``indices`` argument, but a length-``index_topk`` per-query page
+        table of physical slots is equivalent and reads bf16 KV natively (unlike
+        FlashMLA's paged sparse kernel, which rejects bf16 on SM90).
+        """
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
@@ -527,9 +679,28 @@ class MLAAttention:
         q_nope, q_rope = q
         decode_meta = attn_metadata.decode
 
-        # Paged latent cache: rope on k, compressed latent on v (MQA head dim 1).
-        c_kv_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank].unsqueeze(2)
-        k_rope_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank :].unsqueeze(2)
+        sparse = topk_indices is not None
+        if sparse:
+            # Sparse: view the cache flat over physical slots (page_size == 1)
+            # so each page-table entry is one selected slot. ``topk_indices``
+            # are absolute physical slots front-packed with -1 padding at the
+            # tail; ``cache_seqlens`` = number of valid (>= 0) selected slots
+            # per query, so FA3 never walks into the -1 padding.
+            flat = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
+            c_kv_cache = flat[..., : self.kv_lora_rank].view(-1, 1, 1, self.kv_lora_rank)
+            k_rope_cache = flat[..., self.kv_lora_rank :].view(
+                -1, 1, 1, flat.shape[-1] - self.kv_lora_rank
+            )
+            if topk_indices.dim() == 3:
+                topk_indices = topk_indices.squeeze(1)
+            page_table = topk_indices.to(torch.int32)
+            cache_seqlens = (page_table >= 0).sum(dim=1).to(torch.int32)
+        else:
+            # Paged latent cache: rope on k, compressed latent on v (MQA head 1).
+            c_kv_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank].unsqueeze(2)
+            k_rope_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank :].unsqueeze(2)
+            page_table = decode_meta.block_table
+            cache_seqlens = decode_meta.seq_lens
 
         cu_seqlens_q = decode_meta.query_start_loc
         max_seqlen_q = max(1, decode_meta.max_query_len)
@@ -539,8 +710,8 @@ class MLAAttention:
             k_cache=k_rope_cache,
             v_cache=c_kv_cache,
             qv=q_nope,
-            page_table=decode_meta.block_table,
-            cache_seqlens=decode_meta.seq_lens,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             softmax_scale=self.scale,
@@ -580,6 +751,7 @@ class MLAAttention:
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
@@ -608,6 +780,51 @@ class MLAAttention:
             f"{_FLASHMLA_PAGE_SIZE}, got {page_size}. Launch with "
             f"--page-size {_FLASHMLA_PAGE_SIZE}."
         )
+
+        # DeepSeek Sparse Attention (V3.2): when the indexer supplies per-query
+        # top-k indices (already transformed to absolute physical KV slots), run
+        # the *sparse* FlashMLA decode. On SM90 (Hopper) this requires the FP8
+        # packed KV cache -- ``kv_c_and_k_pe_cache`` is then float8 with the
+        # 656-byte packed last dim. Metadata + kernel both take
+        # ``is_fp8_kvcache=True``; ``causal=False`` because the top-k set is
+        # already causal (the indexer masked future tokens before selecting).
+        sparse = topk_indices is not None
+        if sparse:
+            is_fp8 = kv_c_and_k_pe_cache.dtype == torch.float8_e4m3fn
+            topk = topk_indices.shape[-1]
+            # indices: (batch, q_len, topk) int32; -1 = invalid/skip.
+            if topk_indices.dim() == 2:
+                topk_indices = topk_indices.unsqueeze(1)
+            # FP8 cache is already [pages, page_sz, 1, packed_dim]; the bf16
+            # latent cache is [pages, page_sz, dim] and needs a head dim of 1.
+            k_cache = (
+                kv_c_and_k_pe_cache
+                if kv_c_and_k_pe_cache.dim() == 4
+                else kv_c_and_k_pe_cache.unsqueeze(-2)
+            )
+            flashmla_meta = get_mla_metadata(
+                decode_meta.seq_lens,
+                q_len * self.num_heads,
+                1,
+                num_heads_q=self.num_heads,
+                is_fp8_kvcache=is_fp8,
+                topk=topk,
+            )
+            tile_scheduler_metadata, num_splits = flashmla_meta
+            o, lse = flash_mla_with_kvcache(
+                q=q,
+                k_cache=k_cache,
+                block_table=decode_meta.block_table,
+                cache_seqlens=decode_meta.seq_lens,
+                head_dim_v=self.kv_lora_rank,
+                tile_scheduler_metadata=tile_scheduler_metadata,
+                num_splits=num_splits,
+                softmax_scale=self.scale,
+                causal=False,
+                is_fp8_kvcache=is_fp8,
+                indices=topk_indices,
+            )
+            return o.squeeze(1), lse.squeeze(-1)
 
         # The tile-scheduler metadata only depends on cache_seqlens and the
         # head count, so it is identical for every MLA layer within a single
@@ -711,7 +928,17 @@ class MLAAttention:
         k_pe: torch.Tensor,  # value in unified attn
         input_data: InputData,
         output: torch.Tensor,
+        decode_topk_indices: Optional[torch.Tensor] = None,
+        prefill_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """MLA attention.
+
+        ``decode_topk_indices`` / ``prefill_topk_indices`` (DeepSeek Sparse
+        Attention / V3.2) carry the indexer's per-query top-k token selection
+        for the decode / prefill token ranges respectively. When ``None`` the
+        dense (full) attention is used, which is exactly equivalent for
+        sequences no longer than ``index_topk`` (top-k then selects all keys).
+        """
         assert output is not None, "Output tensor must be provided."
 
         # profile run (see FlashAttention.forward): guard on ``is None`` so the
@@ -756,14 +983,26 @@ class MLAAttention:
 
         # write the latent and rope to kv cache
         if kv_cache.numel() > 0:
-            ops.concat_and_cache_mla(
-                k_c_normed,
-                k_pe.squeeze(1),
-                kv_cache,
-                attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=self._k_scale,
-            )
+            if getattr(input_data.memory_manager, "mla_cache_fp8", False):
+                # DeepSeek Sparse Attention: native FP8-packed MLA latent cache
+                # (nope FP8 + per-tile scales + rope bf16). Written directly so
+                # the FP8 sparse decode kernel can read it without any runtime
+                # dequant. Prefill reads it back via dequant (see below).
+                ops.concat_and_cache_mla_fp8(
+                    k_c_normed,
+                    k_pe.squeeze(1),
+                    kv_cache,
+                    attn_metadata.slot_mapping.flatten(),
+                )
+            else:
+                ops.concat_and_cache_mla(
+                    k_c_normed,
+                    k_pe.squeeze(1),
+                    kv_cache,
+                    attn_metadata.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=self._k_scale,
+                )
 
         if has_prefill:
             output[num_decode_tokens:] = self._forward_prefill(
@@ -773,6 +1012,7 @@ class MLAAttention:
                 kv_cache,
                 attn_metadata,
                 self._k_scale,
+                topk_indices=prefill_topk_indices,
             )
 
         if has_decode:
@@ -798,8 +1038,10 @@ class MLAAttention:
 
             decode_q = (decode_ql_nope, decode_q_pe)
 
-            # call decode attn
-            attn_out, lse = self._forward_decode(decode_q, kv_cache, attn_metadata)
+            # call decode attn (sparse when the indexer supplied top-k indices)
+            attn_out, lse = self._forward_decode(
+                decode_q, kv_cache, attn_metadata, topk_indices=decode_topk_indices
+            )
 
             # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])

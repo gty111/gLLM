@@ -1,7 +1,7 @@
 pydantic >= 2.11.7
 numpy
 tqdm
-transformers == 5.5.4
+transformers >= 5.11.0
 fastapi[standard] >= 0.115.0
 openai >= 1.99.1
 logger
