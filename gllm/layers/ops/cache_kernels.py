@@ -517,6 +517,189 @@ def gather_and_dequant_mla_fp8(
 
 
 # =============================================================================
+# dequant_mla_fp8_flat  (whole-cache FP8 -> bf16 latent, physical-slot indexed)
+# =============================================================================
+#
+# Dequantizes the 656-byte FP8-packed MLA cache into a flat, physical-slot-indexed
+# bf16 latent buffer ``[num_slots, kv_lora_rank + qk_rope_head_dim]``. Unlike
+# ``gather_and_dequant_mla_fp8`` (which packs a batch's sequences contiguously by
+# ``cu_seq_lens``), this preserves the physical slot ordering so absolute cache
+# slots index the output directly -- exactly what DeepSeek Sparse Attention's
+# prefill kernel needs, since its top-k ``indices`` are absolute physical slots
+# (see ``MLAAttention._forward_prefill_sparse``). One program per slot.
+
+
+@triton.jit
+def _dequant_mla_fp8_flat_kernel(
+    src_ptr,           # [num_slots, dim_q] float8_e4m3fn (packed 656B row)
+    dst_ptr,           # [num_slots, kv_lora_rank + qk_rope_head_dim] bf16
+    src_stride,
+    dst_stride,
+    kv_lora_rank: tl.constexpr,      # 512
+    qk_rope_head_dim: tl.constexpr,  # 64
+    tile_size: tl.constexpr,         # 128
+    num_tiles: tl.constexpr,         # 4
+):
+    slot = tl.program_id(0)
+    row = slot * src_stride
+    dst_row = slot * dst_stride
+
+    # ---- nope: per-128-tile dequant (fp8 * per-tile fp32 scale) ----
+    for t in tl.static_range(num_tiles):
+        offs = t * tile_size + tl.arange(0, tile_size)
+        q = tl.load(src_ptr + row + offs).to(tl.float32)
+        scale_byte = kv_lora_rank + t * 4
+        scale = tl.load(
+            (src_ptr + row + scale_byte).cast(tl.pointer_type(tl.float32))
+        )
+        tl.store(dst_ptr + dst_row + offs, (q * scale).to(dst_ptr.dtype.element_ty))
+
+    # ---- rope: bf16 verbatim ----
+    rope_offs = tl.arange(0, qk_rope_head_dim)
+    rope_byte = kv_lora_rank + num_tiles * 4
+    rope = tl.load(
+        (src_ptr + row + rope_byte).cast(tl.pointer_type(tl.bfloat16)) + rope_offs
+    )
+    tl.store(
+        dst_ptr + dst_row + kv_lora_rank + rope_offs,
+        rope.to(dst_ptr.dtype.element_ty),
+    )
+
+
+def dequant_mla_fp8_flat(
+    src_cache: torch.Tensor,   # [num_blocks, block_size, 1, dim_q] float8_e4m3fn
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    tile_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize the whole FP8-packed MLA cache to a flat bf16 latent buffer.
+
+    Returns ``[num_slots, kv_lora_rank + qk_rope_head_dim]`` bf16 where
+    ``num_slots == num_blocks * block_size``, so an absolute physical cache slot
+    indexes it directly (matching the bf16 latent cache's flat view). Used by
+    the DSA sparse-prefill path when the MLA cache is stored FP8-packed.
+    """
+    assert kv_lora_rank % tile_size == 0
+    num_tiles = kv_lora_rank // tile_size
+    dim_q = src_cache.shape[-1]
+    assert dim_q == kv_lora_rank + num_tiles * 4 + qk_rope_head_dim * 2, (
+        f"fp8 MLA cache last dim {dim_q} != expected "
+        f"{kv_lora_rank + num_tiles * 4 + qk_rope_head_dim * 2}"
+    )
+    src = src_cache.reshape(-1, dim_q)  # [num_slots, dim_q]
+    num_slots = src.shape[0]
+    dst = torch.empty(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        dtype=torch.bfloat16,
+        device=src_cache.device,
+    )
+    _dequant_mla_fp8_flat_kernel[(num_slots,)](
+        src,
+        dst,
+        src.stride(0),
+        dst.stride(0),
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        tile_size=tile_size,
+        num_tiles=num_tiles,
+    )
+    return dst
+
+
+# =============================================================================
+# dequant_mla_fp8_slots  (dequant only referenced slots -> full-width bf16 buf)
+# =============================================================================
+#
+# Gather-only variant of ``dequant_mla_fp8_flat``: dequantizes ONLY the physical
+# slots listed in ``slot_ids`` (the unique slots the DSA prefill top-k actually
+# references) into a full-width ``[num_slots, dim]`` bf16 buffer. Unreferenced
+# rows are left uninitialized -- the sparse kernel never reads them -- so absolute
+# physical slots still index the output directly (NO index remapping needed),
+# while the dequant compute scales with the referenced-slot count, not the whole
+# cache. One program per referenced slot.
+
+
+@triton.jit
+def _dequant_mla_fp8_slots_kernel(
+    src_ptr,           # [num_slots, dim_q] float8_e4m3fn
+    dst_ptr,           # [num_slots, kv_lora_rank + qk_rope_head_dim] bf16
+    slot_ids_ptr,      # [num_ref] int32 physical slots to dequant
+    src_stride,
+    dst_stride,
+    kv_lora_rank: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,
+    tile_size: tl.constexpr,
+    num_tiles: tl.constexpr,
+):
+    i = tl.program_id(0)
+    slot = tl.load(slot_ids_ptr + i)
+    if slot < 0:
+        return
+    row = slot * src_stride
+    dst_row = slot * dst_stride
+
+    for t in tl.static_range(num_tiles):
+        offs = t * tile_size + tl.arange(0, tile_size)
+        q = tl.load(src_ptr + row + offs).to(tl.float32)
+        scale_byte = kv_lora_rank + t * 4
+        scale = tl.load(
+            (src_ptr + row + scale_byte).cast(tl.pointer_type(tl.float32))
+        )
+        tl.store(dst_ptr + dst_row + offs, (q * scale).to(dst_ptr.dtype.element_ty))
+
+    rope_offs = tl.arange(0, qk_rope_head_dim)
+    rope_byte = kv_lora_rank + num_tiles * 4
+    rope = tl.load(
+        (src_ptr + row + rope_byte).cast(tl.pointer_type(tl.bfloat16)) + rope_offs
+    )
+    tl.store(
+        dst_ptr + dst_row + kv_lora_rank + rope_offs,
+        rope.to(dst_ptr.dtype.element_ty),
+    )
+
+
+def dequant_mla_fp8_slots(
+    src_cache: torch.Tensor,   # [num_blocks, block_size, 1, dim_q] float8_e4m3fn
+    slot_ids: torch.Tensor,    # [num_ref] int32/int64 physical slots (>=0)
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    tile_size: int = 128,
+) -> torch.Tensor:
+    """Dequant only ``slot_ids`` of the FP8-packed MLA cache -> flat bf16 buffer.
+
+    Like :func:`dequant_mla_fp8_flat` but only fills the referenced rows (the
+    DSA prefill top-k's unique slots), so dequant cost scales with usage not
+    cache size. Returns ``[num_slots, kv_lora_rank + qk_rope_head_dim]`` bf16;
+    absolute physical slots index it directly (unreferenced rows are never read).
+    """
+    assert kv_lora_rank % tile_size == 0
+    num_tiles = kv_lora_rank // tile_size
+    dim_q = src_cache.shape[-1]
+    assert dim_q == kv_lora_rank + num_tiles * 4 + qk_rope_head_dim * 2
+    src = src_cache.reshape(-1, dim_q)  # [num_slots, dim_q]
+    num_slots = src.shape[0]
+    slot_ids = slot_ids.to(torch.int32).contiguous()
+    dst = torch.empty(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        dtype=torch.bfloat16,
+        device=src_cache.device,
+    )
+    if slot_ids.numel() > 0:
+        _dequant_mla_fp8_slots_kernel[(slot_ids.numel(),)](
+            src,
+            dst,
+            slot_ids,
+            src.stride(0),
+            dst.stride(0),
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            tile_size=tile_size,
+            num_tiles=num_tiles,
+        )
+    return dst
+
+
+# =============================================================================
 # gather_and_maybe_dequant_cache
 # =============================================================================
 

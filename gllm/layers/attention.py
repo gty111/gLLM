@@ -507,16 +507,19 @@ class MLAAttention:
         # Build the contiguous latent KV the kernel indexes into.
         dim = self.kv_lora_rank + self.qk_rope_head_dim
         if kv_c_and_k_pe_cache.dtype == torch.float8_e4m3fn:
-            # FP8-packed (656B) cache: sparse prefill on the FP8 layout needs a
-            # dequantizing gather to the bf16 latent layout the kernel indexes.
-            # Not wired yet -- validate the bf16 cache path first (the default
-            # ``mla_cache_dtype``); FP8 sparse prefill is a follow-up.
-            raise NotImplementedError(
-                "DSA sparse prefill on the FP8-packed MLA cache is not yet "
-                "implemented; run with the default bf16 MLA cache "
-                "(--mla-cache-dtype bf16)."
-            )
-        kv = kv_c_and_k_pe_cache.reshape(-1, 1, dim)
+            # FP8-packed (656B) cache: dequantize to a flat, physical-slot-indexed
+            # bf16 latent buffer so the top-k physical slots index it exactly like
+            # the bf16 cache. Gather-only: dequant just the slots the top-k
+            # actually references (unique, >=0), so dequant cost scales with usage
+            # not cache size; unreferenced rows are never read by the kernel.
+            ref_slots = torch.unique(topk_indices)
+            ref_slots = ref_slots[ref_slots >= 0]
+            kv = ops.dequant_mla_fp8_slots(
+                kv_c_and_k_pe_cache, ref_slots, self.kv_lora_rank,
+                self.qk_rope_head_dim,
+            ).view(-1, 1, dim)
+        else:
+            kv = kv_c_and_k_pe_cache.reshape(-1, 1, dim)
 
         indices = topk_indices.to(torch.int32)
         if indices.dim() == 2:

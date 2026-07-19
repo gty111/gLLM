@@ -36,6 +36,8 @@ from sgl_kernel import (
 from gllm.layers.ops.cache_kernels import (
     concat_and_cache_mla as _triton_concat_and_cache_mla,
     concat_and_cache_mla_fp8 as _triton_concat_and_cache_mla_fp8,
+    dequant_mla_fp8_flat as _triton_dequant_mla_fp8_flat,
+    dequant_mla_fp8_slots as _triton_dequant_mla_fp8_slots,
     gather_and_dequant_mla_fp8 as _triton_gather_and_dequant_mla_fp8,
     gather_and_maybe_dequant_cache as _triton_gather_and_maybe_dequant_cache,
     reshape_and_cache_flash as _triton_reshape_and_cache_flash,
@@ -130,6 +132,39 @@ def gather_and_dequant_mla_fp8(
         kv_lora_rank,
         qk_rope_head_dim,
         seq_starts,
+    )
+
+
+def dequant_mla_fp8_flat(
+    src_cache: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> torch.Tensor:
+    """Dequant the whole FP8-packed MLA cache to a flat bf16 latent buffer.
+
+    Returns ``[num_slots, kv_lora_rank + qk_rope_head_dim]`` bf16 indexed by
+    absolute physical cache slot (DeepSeek Sparse Attention prefill). See
+    :func:`gllm.layers.ops.cache_kernels.dequant_mla_fp8_flat`.
+    """
+    return _triton_dequant_mla_fp8_flat(
+        src_cache, kv_lora_rank, qk_rope_head_dim
+    )
+
+
+def dequant_mla_fp8_slots(
+    src_cache: torch.Tensor,
+    slot_ids: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> torch.Tensor:
+    """Dequant only ``slot_ids`` of the FP8-packed MLA cache -> flat bf16 buffer.
+
+    Gather-only variant of :func:`dequant_mla_fp8_flat`: fills only the referenced
+    physical slots (DSA prefill top-k's unique slots), physical-slot-indexed. See
+    :func:`gllm.layers.ops.cache_kernels.dequant_mla_fp8_slots`.
+    """
+    return _triton_dequant_mla_fp8_slots(
+        src_cache, slot_ids, kv_lora_rank, qk_rope_head_dim
     )
 
 
