@@ -18,12 +18,13 @@ from gllm.utils import async_tensor_h2d, get_dtype_bytes
 # 128-wide tiles (one fp32 scale per tile), matching FlashMLA's packed layout.
 _DSA_FP8_TILE = 128
 
-# DSA indexer scoring backend (mirrors gllm/models/deepseek_v32.py). When
-# ``GLLM_DSA_FP8_SCORE=1`` the indexer scores via deep_gemm FP8 MQA-logits
-# kernels; decode needs a persistent paged FP8 index-K cache in the 132-byte
-# block-contiguous layout ``get_paged_mqa_logits_metadata`` / ``fp8_paged_mqa_logits``
-# expect (per page: [page_size*128 fp8 bytes][page_size*4 fp32-scale bytes]).
-_DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "0") == "1"
+# DSA indexer scoring backend (mirrors gllm/models/deepseek_v32.py). Default on:
+# the indexer scores via deep_gemm FP8 MQA-logits kernels; decode needs a
+# persistent paged FP8 index-K cache in the 132-byte block-contiguous layout
+# ``get_paged_mqa_logits_metadata`` / ``fp8_paged_mqa_logits`` expect (per page:
+# [page_size*128 fp8 bytes][page_size*4 fp32-scale bytes]). Set
+# ``GLLM_DSA_FP8_SCORE=0`` to fall back to fp32 einsum scoring (no FP8 cache).
+_DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "1") == "1"
 
 
 @dataclass

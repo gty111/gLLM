@@ -63,21 +63,24 @@ _INDEX_SCORE_TILE = 512
 # eagerly (never CUDA-graph captured), so a Python loop here is fine.
 _INDEX_QUERY_CHUNK = 512
 
-# DSA prefill indexer scoring backend. Default: exact fp32 einsum
-# (``_select_topk_prefill``). With ``GLLM_DSA_FP8_SCORE=1`` the prefill selector
-# instead uses SGLang's FP8 path (Hadamard -> e4m3 quant -> deep_gemm
-# ``fp8_mqa_logits``): ~10-50x faster indexer scoring at long context, at the
-# cost of FP8 score quantization (~13% mean rel err on the logits, but the
-# indexer only *selects* top-k, so end-to-end impact is validated on RULER).
-_DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "0") == "1"
+# DSA prefill indexer scoring backend. Default: SGLang's FP8 path (Hadamard ->
+# e4m3 quant -> deep_gemm ``fp8_mqa_logits`` / ``fp8_paged_mqa_logits``):
+# ~10-50x faster indexer scoring at long context, verified bit-aligned with
+# vLLM's indexer quant and within noise of fp32 on RULER. Set
+# ``GLLM_DSA_FP8_SCORE=0`` to fall back to the exact fp32 einsum selector
+# (``_select_topk_prefill`` / ``_select_topk_decode``).
+_DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "1") == "1"
 
 # Whether to Hadamard-transform the indexer q/k before FP8 quantization (SGLang's
 # NSA recipe: H decorrelates activations so e4m3 quant is more accurate). vLLM's
-# indexer does NOT apply Hadamard at all. Default on (current behavior). Set
-# ``GLLM_DSA_HADAMARD=0`` to disable -- MUST toggle q and stored-k together, since
-# the score is (Hq)·(Hk)=q·k only when both sides are transformed (H orthogonal;
-# (Hq)·k != q·k). Only affects the FP8 score path.
-_DSA_HADAMARD = os.environ.get("GLLM_DSA_HADAMARD", "1") == "1"
+# indexer does NOT apply Hadamard at all. Default OFF: measured net-negative on
+# this model -- on RULER 4096 it systematically lost the ``vt`` (variable
+# tracking) task (15/20 vs 19/20 without it) by flattening the output logits at
+# greedy tie-break points, and the fp8 quant is already accurate enough via
+# UE8M0. Set ``GLLM_DSA_HADAMARD=1`` to re-enable -- MUST toggle q and stored-k
+# together, since the score is (Hq)·(Hk)=q·k only when both sides are transformed
+# (H orthogonal; (Hq)·k != q·k). Only affects the FP8 score path.
+_DSA_HADAMARD = os.environ.get("GLLM_DSA_HADAMARD", "0") == "1"
 
 
 class DeepseekV32Indexer(nn.Module):
