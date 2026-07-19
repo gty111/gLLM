@@ -83,22 +83,23 @@ def fused_grouped_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
-    if scoring_func == "softmax":
-        scores = torch.softmax(gating_output, dim=-1)
-    elif scoring_func == "sigmoid":
-        scores = gating_output.sigmoid()
-    else:
-        raise ValueError(f"Unsupported scoring function: {scoring_func}")
-
-    scores_with_bias = scores + e_score_correction_bias.unsqueeze(0)
+    # ``ops.grouped_topk`` (sgl_kernel.moe_fused_gate) applies the sigmoid score
+    # function internally, so it must receive the RAW router logits and the RAW
+    # correction bias. Do NOT pre-sigmoid here -- doing so double-applies the
+    # nonlinearity and shifts expert selection off the reference.
+    if scoring_func != "sigmoid":
+        raise ValueError(
+            f"fused_grouped_topk only supports sigmoid scoring; got {scoring_func!r}."
+        )
     topk_values, topk_indices = ops.grouped_topk(
-        scores,
-        scores_with_bias.to(scores.dtype),
+        gating_output,
+        e_score_correction_bias,
         num_expert_group,
         topk_group,
         topk,
         renormalize,
         routed_scaling_factor,
+        scoring_func=scoring_func,
     )
     return topk_values.to(torch.float32), topk_indices.to(torch.int32)
 

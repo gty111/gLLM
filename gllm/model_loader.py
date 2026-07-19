@@ -11,6 +11,7 @@ from transformers import AutoConfig, GenerationConfig
 
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
+from gllm.models.deepseek_v32 import DeepseekV32ForCausalLM
 from gllm.models.kimi_k25 import KimiK25ForConditionalGeneration
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.mixtral import MixtralForCausalLM
@@ -474,6 +475,7 @@ class ModelLoader:
         return self.architecture in [
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
         ]
 
@@ -515,6 +517,8 @@ class ModelLoader:
             or self.architecture == "DeepseekV3ForCausalLM"
         ):
             model_type = DeepseekV2ForCausalLM
+        elif self.architecture == "DeepseekV32ForCausalLM":
+            model_type = DeepseekV32ForCausalLM
         elif self.architecture == "Qwen2_5_VLForConditionalGeneration":
             model_type = Qwen2_5_VLForConditionalGeneration
         elif self.architecture == "Qwen3VLForConditionalGeneration":

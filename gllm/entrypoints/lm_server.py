@@ -102,6 +102,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "the in-tree fallback."
         ),
     )
+    p.add_argument(
+        "--mla-cache-dtype",
+        type=str,
+        choices=["bf16", "fp8"],
+        default="bf16",
+        help=(
+            "MLA latent KV cache precision for DeepSeek Sparse Attention. "
+            "'bf16' (default) = full-precision cache + dense decode; 'fp8' = "
+            "FP8-packed cache for SM90 sparse decode. No effect on non-DSA models."
+        ),
+    )
     p.add_argument("--disable-cuda-graph", action="store_true")
     p.add_argument("--max-cuda-graph-bs", type=int, default=512)
     p.add_argument(
@@ -202,6 +213,7 @@ def main():
         mm_processor_max_pixels=args.mm_processor_max_pixels,
         disagg_config=disagg_config,
         mla_decode_backend=args.mla_decode_backend,
+        mla_cache_dtype=args.mla_cache_dtype,
     )
 
     asyncio.run(api.run_server(args))

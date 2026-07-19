@@ -35,8 +35,13 @@ from sgl_kernel import (
 # Custom Triton kernels
 from gllm.layers.ops.cache_kernels import (
     concat_and_cache_mla as _triton_concat_and_cache_mla,
+    concat_and_cache_mla_fp8 as _triton_concat_and_cache_mla_fp8,
+    dequant_mla_fp8_flat as _triton_dequant_mla_fp8_flat,
+    dequant_mla_fp8_slots as _triton_dequant_mla_fp8_slots,
+    gather_and_dequant_mla_fp8 as _triton_gather_and_dequant_mla_fp8,
     gather_and_maybe_dequant_cache as _triton_gather_and_maybe_dequant_cache,
     reshape_and_cache_flash as _triton_reshape_and_cache_flash,
+    store_index_k_fp8 as _triton_store_index_k_fp8,
 )
 from gllm.layers.ops.batched_rotary_kernel import (
     batched_rotary_embedding as _triton_batched_rotary_embedding,
@@ -74,6 +79,21 @@ def concat_and_cache_mla(
     _triton_concat_and_cache_mla(kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale)
 
 
+def concat_and_cache_mla_fp8(
+    kv_c: torch.Tensor,
+    k_pe: torch.Tensor,
+    fp8_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """Native FP8-packed MLA cache store (DeepSeek Sparse Attention).
+
+    Writes each token's latent into FlashMLA's FP8 sparse-decode layout
+    (nope FP8 + per-128-tile fp32 scales + rope bf16) at its ``slot_mapping``
+    slot. See :func:`gllm.layers.ops.cache_kernels.concat_and_cache_mla_fp8`.
+    """
+    _triton_concat_and_cache_mla_fp8(kv_c, k_pe, fp8_cache, slot_mapping)
+
+
 def gather_and_maybe_dequant_cache(
     src_cache: torch.Tensor,
     dst: torch.Tensor,
@@ -86,6 +106,81 @@ def gather_and_maybe_dequant_cache(
 ) -> None:
     _triton_gather_and_maybe_dequant_cache(
         src_cache, dst, block_table, cu_seq_lens, batch_size, kv_cache_dtype, scale, seq_starts
+    )
+
+
+def gather_and_dequant_mla_fp8(
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    batch_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    seq_starts: torch.Tensor | None = None,
+) -> None:
+    """Gather + dequant the native FP8-packed MLA cache into a bf16 buffer.
+
+    Inverse of :func:`concat_and_cache_mla_fp8` (DeepSeek Sparse Attention). See
+    :func:`gllm.layers.ops.cache_kernels.gather_and_dequant_mla_fp8`.
+    """
+    _triton_gather_and_dequant_mla_fp8(
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        batch_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        seq_starts,
+    )
+
+
+def dequant_mla_fp8_flat(
+    src_cache: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> torch.Tensor:
+    """Dequant the whole FP8-packed MLA cache to a flat bf16 latent buffer.
+
+    Returns ``[num_slots, kv_lora_rank + qk_rope_head_dim]`` bf16 indexed by
+    absolute physical cache slot (DeepSeek Sparse Attention prefill). See
+    :func:`gllm.layers.ops.cache_kernels.dequant_mla_fp8_flat`.
+    """
+    return _triton_dequant_mla_fp8_flat(
+        src_cache, kv_lora_rank, qk_rope_head_dim
+    )
+
+
+def dequant_mla_fp8_slots(
+    src_cache: torch.Tensor,
+    slot_ids: torch.Tensor,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> torch.Tensor:
+    """Dequant only ``slot_ids`` of the FP8-packed MLA cache -> flat bf16 buffer.
+
+    Gather-only variant of :func:`dequant_mla_fp8_flat`: fills only the referenced
+    physical slots (DSA prefill top-k's unique slots), physical-slot-indexed. See
+    :func:`gllm.layers.ops.cache_kernels.dequant_mla_fp8_slots`.
+    """
+    return _triton_dequant_mla_fp8_slots(
+        src_cache, slot_ids, kv_lora_rank, qk_rope_head_dim
+    )
+
+
+def store_index_k_fp8(
+    idx_k: torch.Tensor,
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    page_size: int,
+    index_head_dim: int,
+    use_ue8m0: bool = False,
+) -> None:
+    """Quantize + write the DSA indexer key into the paged FP8 index cache. See
+    :func:`gllm.layers.ops.cache_kernels.store_index_k_fp8`."""
+    _triton_store_index_k_fp8(
+        idx_k, cache, slot_mapping, page_size, index_head_dim, use_ue8m0=use_ue8m0
     )
 
 
@@ -357,27 +452,38 @@ def moe_align_block_size(
 
 
 def grouped_topk(
-    scores: torch.Tensor,
-    scores_with_bias: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     topk: int,
     renormalize: bool,
     routed_scaling_factor: float,
+    scoring_func: str = "sigmoid",
 ):
     """
     Two-stage expert selection (DeepSeek-V2/V3 style).
 
     Uses sgl_kernel.moe_fused_gate for the fused implementation.
-    """
-    # moe_fused_gate expects the bias to be separate from scores
-    # It takes (input_tensor, bias, num_expert_group, topk_group, topk, ...)
-    # and returns (topk_weights, topk_ids)
-    bias = scores_with_bias - scores  # Extract the bias component
 
+    ``moe_fused_gate`` applies the score function (sigmoid) *internally*, so it
+    must be fed the **raw** router logits and the **raw** correction bias -- NOT
+    a pre-sigmoid'd score. Passing already-sigmoid'd scores double-applies the
+    nonlinearity (``sigmoid(sigmoid(logits))``), which silently shifts expert
+    selection and routing weights away from the reference. The kernel only
+    supports the sigmoid scoring function.
+    """
+    assert scoring_func == "sigmoid", (
+        "moe_fused_gate only implements sigmoid scoring; "
+        f"got {scoring_func!r}."
+    )
+    # moe_fused_gate requires input and bias to share a dtype, and does the
+    # sigmoid + group reduction internally. Route in float32 (matches the HF
+    # reference, which casts router logits to float32 before sigmoid) so the
+    # bias add and top-2 group sum are done at full precision.
     topk_weights, topk_ids = _sgl_moe_fused_gate(
-        input_tensor=scores,
-        bias=bias,
+        input_tensor=gating_output.to(torch.float32),
+        bias=correction_bias.to(torch.float32),
         num_expert_group=num_expert_group,
         topk_group=topk_group,
         topk=topk,

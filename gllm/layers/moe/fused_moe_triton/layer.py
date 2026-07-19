@@ -104,6 +104,9 @@ class Fp8MoEMethod(FusedMoEMethod):
         super().__init__()
         self.quant_config = quant_config
         self.weight_block_size = self.quant_config["weight_block_size"]
+        # ``scale_fmt="ue8m0"`` (DeepSeek-V3.2) rounds FP8 activation group
+        # scales to powers of two, matching the reference numerics.
+        self.use_ue8m0 = self.quant_config.get("scale_fmt") == "ue8m0"
 
     def create_weights(
         self,
@@ -194,6 +197,7 @@ class Fp8MoEMethod(FusedMoEMethod):
             w1_scale=layer.w13_weight_scale_inv,
             w2_scale=layer.w2_weight_scale_inv,
             block_shape=self.weight_block_size,
+            use_ue8m0=self.use_ue8m0,
         )
 
 

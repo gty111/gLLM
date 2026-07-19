@@ -205,6 +205,7 @@ def fp8LinearMethod(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    round_scale: bool = False,
 ):
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
@@ -218,8 +219,11 @@ def fp8LinearMethod(
     # Decode (small M): FlashInfer's swapAB kernel takes the BF16 activation
     # directly and fuses quantization + GEMM, ~2x faster than DeepGEMM's 1d2d.
     # Restricted to M<32 (perf *and* accuracy: swapAB degrades at larger M).
+    # UE8M0 activation rounding needs the explicit quant path (swapAB quantizes
+    # internally with a plain scale), so skip the fused kernel when it's on.
     if (
-        M < _FLASHINFER_SWAPAB_MAX_M
+        not round_scale
+        and M < _FLASHINFER_SWAPAB_MAX_M
         and input.dtype == torch.bfloat16
         and _flashinfer_shape_supported(N, K, block_n, block_k, weight_scale)
         and flashinfer_swapab_available()
@@ -229,7 +233,8 @@ def fp8LinearMethod(
         )
     else:
         q_input, x_scale = per_token_group_quant_fp8(
-            input_2d, block_size[1], column_major_scales=False
+            input_2d, block_size[1], column_major_scales=False,
+            round_scale=round_scale,
         )
         if _deepgemm_shape_supported(
             N, K, block_n, block_k, input.dtype
@@ -564,6 +569,7 @@ def _per_token_group_quant_fp8(
     fp8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    ROUND_SCALE: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform per-token-group
     quantization on a tensor.
@@ -593,6 +599,10 @@ def _per_token_group_quant_fp8(
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / fp8_max
+    if ROUND_SCALE:
+        # UE8M0: round the scale up to the next power of two (matches the
+        # reference ``fast_pow2(fast_log2_ceil(amax/fp8_max))``).
+        y_s = tl.exp2(tl.ceil(tl.log2(y_s)))
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
@@ -618,6 +628,7 @@ def _per_token_group_quant_fp8_colmajor(
     fp8_max,
     # Meta-parameters
     BLOCK: tl.constexpr,
+    ROUND_SCALE: tl.constexpr = False,
 ):
     """A Triton-accelerated function to perform per-token-group
     quantization on a tensor.
@@ -655,6 +666,8 @@ def _per_token_group_quant_fp8_colmajor(
     # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / fp8_max
+    if ROUND_SCALE:
+        y_s = tl.exp2(tl.ceil(tl.log2(y_s)))
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
@@ -668,6 +681,7 @@ def per_token_group_quant_fp8(
     dtype: Optional[torch.dtype] = None,
     column_major_scales: bool = False,
     out_q: Optional[torch.Tensor] = None,
+    round_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Function to perform per-token-group quantization on an input tensor `x`.
     It converts the tensor values into signed float8 values and returns the
@@ -680,6 +694,9 @@ def per_token_group_quant_fp8(
         is supported for now.
         column_major_scales: Outputs scales in column major.
         out_q: Optional output tensor. If not provided, function will create.
+        round_scale: Round each group scale up to the next power of two (UE8M0),
+        matching ``scale_fmt="ue8m0"`` checkpoints (e.g. DeepSeek-V3.2). Forces
+        the Triton path since the sgl-kernel fast path does not round.
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the
         scaling factor for quantization.
@@ -703,10 +720,12 @@ def per_token_group_quant_fp8(
     # Fast path: fused CUDA kernel from sgl-kernel. Only the row-major scale
     # layout is a drop-in match for the Triton kernel below, which is exactly
     # what every gLLM caller uses; anything else falls through to Triton.
+    # UE8M0 rounding is not supported by the sgl kernel, so skip it there.
     sgl_quant = _sgl_group_quant_fp8()
     if (
         sgl_quant is not None
         and not column_major_scales
+        and not round_scale
         and dtype == torch.float8_e4m3fn
         and x.is_contiguous()
     ):
@@ -749,6 +768,7 @@ def per_token_group_quant_fp8(
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             BLOCK=BLOCK,
+            ROUND_SCALE=round_scale,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -764,6 +784,7 @@ def per_token_group_quant_fp8(
             fp8_min=fp8_min,
             fp8_max=fp8_max,
             BLOCK=BLOCK,
+            ROUND_SCALE=round_scale,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -776,6 +797,7 @@ def _fp8_quantize(
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
+    round_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform fp8 quantization on the inputs.  If a block_shape
@@ -789,7 +811,12 @@ def _fp8_quantize(
         assert not per_act_token
         assert len(block_shape) == 2
         _, block_k = block_shape[0], block_shape[1]
-        A, A_scale = per_token_group_quant_fp8(A, block_k)
+        # Match the dense FP8 path: round the per-group activation scale to a
+        # power of two for ``scale_fmt="ue8m0"`` checkpoints (DeepSeek-V3.2).
+        # This covers the MoE experts, which are the bulk of the FP8 GEMMs.
+        A, A_scale = per_token_group_quant_fp8(
+            A, block_k, round_scale=round_scale
+        )
         assert cdiv(A.size(-1), block_k) == A_scale.size(-1)
 
     return A, A_scale

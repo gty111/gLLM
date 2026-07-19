@@ -27,6 +27,11 @@ class RequestFuncInput:
     # requests by sending ``chat_template_kwargs={"thinking"/"enable_thinking":
     # False}``. Set this from a ``--no-thinking`` CLI flag in the caller.
     no_thinking: bool = False
+    # Optional pre-built chat messages (list of {role, content}). When set, the
+    # OpenAI chat backend sends these verbatim instead of wrapping ``prompt`` in
+    # a single user turn -- used to render few-shot examples as real multi-turn
+    # user/assistant turns so the model answers only the final question.
+    messages: Optional[list] = None
 
 
 @dataclass
@@ -309,14 +314,17 @@ async def async_request_openai_chat_completions(
 
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         assert not request_func_input.use_beam_search
+        # Use pre-built multi-turn messages when supplied (few-shot examples as
+        # real user/assistant turns); otherwise wrap the prompt in one user turn.
+        messages = request_func_input.messages or [
+            {
+                "role": "user",
+                "content": request_func_input.prompt,
+            },
+        ]
         payload = {
             "model": request_func_input.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": request_func_input.prompt,
-                },
-            ],
+            "messages": messages,
             "temperature": 0.0,
             "top_p": 1,
             "top_k": 1,

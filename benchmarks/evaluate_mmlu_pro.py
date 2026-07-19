@@ -84,6 +84,23 @@ def format_example(question, options, cot_content=""):
     return example
 
 
+def format_question(question, options):
+    """The question + lettered options only (a single chat user turn)."""
+    text = "Question: {}\nOptions: ".format(question)
+    choice_map = "ABCDEFGHIJ"
+    for i, opt in enumerate(options):
+        text += "{}. {}\n".format(choice_map[i], opt)
+    text += "Answer: Let's think step by step."
+    return text
+
+
+def format_answer(cot_content):
+    """The assistant turn for a few-shot example: its CoT + final answer line."""
+    if cot_content.startswith("A: "):
+        cot_content = cot_content[3:]
+    return cot_content
+
+
 def extract_answer(text):
     pattern = r"answer is \(?([A-J])\)?"
     match = re.search(pattern, text)
@@ -116,22 +133,31 @@ def single_request(api_url, single_question, cot_examples_dict, pbar):
     cot_examples = cot_examples_dict[category]
     question = single_question["question"]
     options = single_question["options"]
-    prompt = (
-        "The following are multiple choice questions (with answers) about {}. Think step by"
-        ' step and then output the answer in the format of "The answer is (X)" at the end.\n\n'.format(
-            category
-        )
+    # Render few-shot examples as real multi-turn chat: a system instruction,
+    # then one user(question)/assistant(CoT+answer) turn per example, then the
+    # target question as the final user turn. This keeps the model from
+    # re-answering the shots (which happens when they are flattened into one
+    # user message) so the "The answer is (X)" it emits is for THIS question.
+    system = (
+        "The following are multiple choice questions (with answers) about {}. Think"
+        ' step by step and then output the answer in the format of "The answer is (X)"'
+        " at the end.".format(category)
     )
+    messages = [{"role": "system", "content": system}]
     for each in cot_examples[: args.num_shots]:
-        prompt += format_example(each["question"], each["options"], each["cot_content"])
-    input_text = format_example(question, options)
-
-    prompt = prompt + input_text
+        messages.append(
+            {"role": "user", "content": format_question(each["question"], each["options"])}
+        )
+        messages.append(
+            {"role": "assistant", "content": format_answer(each["cot_content"])}
+        )
+    messages.append({"role": "user", "content": format_question(question, options)})
 
     request_func_input = RequestFuncInput(
-        prompt=prompt,
+        prompt="",
+        messages=messages,
         api_url=api_url,
-        prompt_len=len(prompt),
+        prompt_len=sum(len(m["content"]) for m in messages),
         output_len=args.output_len,
         model=args.model,
         no_thinking=args.no_thinking,

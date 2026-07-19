@@ -541,6 +541,7 @@ def inplace_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    use_ue8m0: bool = False,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -565,6 +566,7 @@ def inplace_fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
+        use_ue8m0,
     )
 
 
@@ -590,6 +592,7 @@ def inplace_fused_experts_fake(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    use_ue8m0: bool = False,
 ) -> None:
     pass
 
@@ -625,6 +628,7 @@ def outplace_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    use_ue8m0: bool = False,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -649,6 +653,7 @@ def outplace_fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
+        use_ue8m0,
     )
 
 
@@ -673,6 +678,7 @@ def outplace_fused_experts_fake(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    use_ue8m0: bool = False,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -725,6 +731,7 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    use_ue8m0: bool = False,
 ) -> torch.Tensor:
     return dispatch_fused_experts_func(inplace)(
         hidden_states=hidden_states,
@@ -748,6 +755,7 @@ def fused_experts(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        use_ue8m0=use_ue8m0,
     )
 
 
@@ -758,9 +766,12 @@ def moe_kernel_quantize_input(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
     is_fp4_scale_swizzled: bool = True,
+    use_ue8m0: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     if quant_dtype == torch.float8_e4m3fn:
-        return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+        return _fp8_quantize(
+            A, A_scale, per_act_token_quant, block_shape, round_scale=use_ue8m0
+        )
     else:
         return A, A_scale
 
@@ -788,6 +799,7 @@ def fused_experts_impl(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    use_ue8m0: bool = False,
 ) -> torch.Tensor:
     # Check constraints.
     if use_int4_w4a16:
@@ -893,6 +905,7 @@ def fused_experts_impl(
             quant_dtype=quant_dtype,
             per_act_token_quant=per_channel_quant,
             block_shape=block_shape,
+            use_ue8m0=use_ue8m0,
         )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
@@ -939,6 +952,7 @@ def fused_experts_impl(
             quant_dtype=quant_dtype,
             per_act_token_quant=per_channel_quant,
             block_shape=block_shape,
+            use_ue8m0=use_ue8m0,
         )
 
         invoke_fused_moe_kernel(
