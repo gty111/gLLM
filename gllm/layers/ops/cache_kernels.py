@@ -720,6 +720,7 @@ def _store_index_k_fp8_kernel(
     page_size: tl.constexpr,
     D: tl.constexpr,          # index_head_dim (128)
     n_sf: tl.constexpr,       # scales per token (D // 128 = 1)
+    USE_UE8M0: tl.constexpr,
 ):
     t = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + t)
@@ -733,6 +734,10 @@ def _store_index_k_fp8_kernel(
     x = tl.load(idx_k_ptr + t * idx_k_stride + offs).to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(x)), 1e-4)
     scale = amax / 448.0
+    if USE_UE8M0:
+        # Round the scale up to a power of two (UE8M0), matching vLLM's
+        # per_token_group_quant_fp8(use_ue8m0=True) for the indexer key.
+        scale = tl.exp2(tl.ceil(tl.log2(scale)))
     # Quantize to e4m3 and store the fp8 BYTE PATTERN into the uint8 cache: cast
     # the write pointer to float8 so the fp8 bits are written verbatim (a plain
     # ``.to(uint8)`` would truncate the fp8 *value* to an integer instead).
@@ -756,6 +761,7 @@ def store_index_k_fp8(
     page_size: int,
     index_head_dim: int,
     tile_size: int = 128,
+    use_ue8m0: bool = False,
 ) -> None:
     """Quantize + write the DSA indexer key into the paged FP8 index cache."""
     assert index_head_dim % tile_size == 0
@@ -772,6 +778,7 @@ def store_index_k_fp8(
         page_size=page_size,
         D=index_head_dim,
         n_sf=n_sf,
+        USE_UE8M0=use_ue8m0,
     )
 
 

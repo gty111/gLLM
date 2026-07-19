@@ -175,11 +175,12 @@ def store_index_k_fp8(
     slot_mapping: torch.Tensor,
     page_size: int,
     index_head_dim: int,
+    use_ue8m0: bool = False,
 ) -> None:
     """Quantize + write the DSA indexer key into the paged FP8 index cache. See
     :func:`gllm.layers.ops.cache_kernels.store_index_k_fp8`."""
     _triton_store_index_k_fp8(
-        idx_k, cache, slot_mapping, page_size, index_head_dim
+        idx_k, cache, slot_mapping, page_size, index_head_dim, use_ue8m0=use_ue8m0
     )
 
 

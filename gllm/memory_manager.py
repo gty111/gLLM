@@ -658,6 +658,7 @@ class MemoryManager:
         layer_idx: int,
         index_k: torch.Tensor,
         slot_mapping_tensor: torch.Tensor,
+        use_ue8m0: bool = False,
     ):
         """Quantize + write the indexer key into the paged FP8 index cache.
 
@@ -665,7 +666,8 @@ class MemoryManager:
         ``index_k`` ``[num_tokens, index_head_dim]`` into the 132-byte
         block-contiguous paged FP8 index cache that ``fp8_paged_mqa_logits``
         reads. Only valid when ``segment.index_k_fp8_cache`` is allocated
-        (``GLLM_DSA_FP8_SCORE=1``).
+        (``GLLM_DSA_FP8_SCORE=1``). ``use_ue8m0`` rounds the per-token scale to a
+        power of two (set by the caller from the checkpoint's ``scale_fmt``).
         """
         from gllm import _custom_ops as ops
 
@@ -676,6 +678,7 @@ class MemoryManager:
             slot_mapping_tensor,
             self.segment.page_size,
             self.segment.index_head_dim,
+            use_ue8m0=use_ue8m0,
         )
 
     def batch_store(

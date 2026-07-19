@@ -71,6 +71,14 @@ _INDEX_QUERY_CHUNK = 512
 # indexer only *selects* top-k, so end-to-end impact is validated on RULER).
 _DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "0") == "1"
 
+# Whether to Hadamard-transform the indexer q/k before FP8 quantization (SGLang's
+# NSA recipe: H decorrelates activations so e4m3 quant is more accurate). vLLM's
+# indexer does NOT apply Hadamard at all. Default on (current behavior). Set
+# ``GLLM_DSA_HADAMARD=0`` to disable -- MUST toggle q and stored-k together, since
+# the score is (Hq)·(Hk)=q·k only when both sides are transformed (H orthogonal;
+# (Hq)·k != q·k). Only affects the FP8 score path.
+_DSA_HADAMARD = os.environ.get("GLLM_DSA_HADAMARD", "1") == "1"
+
 
 class DeepseekV32Indexer(nn.Module):
     """DeepSeek Sparse Attention (DSA) lightning indexer.
@@ -104,6 +112,13 @@ class DeepseekV32Indexer(nn.Module):
         self.index_topk: int = config.index_topk
         self.q_lora_rank: int = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
+        # FP8 indexer scoring uses UE8M0 (power-of-2) group scales when the
+        # checkpoint declares ``scale_fmt="ue8m0"`` (DeepSeek-V3.2), matching the
+        # reference / vLLM. Plain amax/448 otherwise.
+        self.scale_fmt = (
+            quant_config.get("scale_fmt") if quant_config is not None else None
+        )
+        self.use_ue8m0 = self.scale_fmt == "ue8m0"
 
         # wq_b / wk are FP8 block-quant in released checkpoints; both are
         # replicated (not TP-sharded) -- the indexer is cheap and its per-head
@@ -381,10 +396,18 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         device = q_idx.device
         max_L = block_table.shape[1] * page_sz
 
-        # Hadamard + FP8-quant the query (matches the stored key path).
-        qh = hadamard_transform(q_idx.contiguous(), scale=dim ** -0.5)
+        # Hadamard + FP8-quant the query (matches the stored key path). UE8M0
+        # scale (round to power of two) matches vLLM's indexer q quant when the
+        # checkpoint declares scale_fmt="ue8m0".
+        qh = (
+            hadamard_transform(q_idx.contiguous(), scale=dim ** -0.5)
+            if _DSA_HADAMARD
+            else q_idx
+        )
         qf = qh.float().reshape(num_decode, self.indexer.n_heads, dim // 128, 128)
         q_scale = (qf.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448.0)
+        if self.indexer.use_ue8m0:
+            q_scale = torch.exp2(torch.ceil(torch.log2(q_scale)))
         q_fp8 = (qf / q_scale).clamp(-448, 448).to(torch.float8_e4m3fn).reshape(
             num_decode, self.indexer.n_heads, dim
         )
@@ -548,10 +571,14 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
 
         out = q_idx.new_full((num_prefill_tokens, topk), -1, dtype=torch.int32)
 
+        use_ue8m0 = self.indexer.use_ue8m0
+
         def _quant(x):  # x [..., D] bf16 -> (e4m3, per-D-block fp32 scale)
             xf = x.float().reshape(*x.shape[:-1], hdim // 128, 128)
             amax = xf.abs().amax(-1, keepdim=True).clamp_min(1e-4)
             s = amax / 448.0
+            if use_ue8m0:  # power-of-2 scale, matches vLLM when scale_fmt=ue8m0
+                s = torch.exp2(torch.ceil(torch.log2(s)))
             q = (xf / s).clamp(-448, 448).to(torch.float8_e4m3fn).reshape(x.shape)
             return q, s.reshape(*x.shape[:-1], hdim // 128).squeeze(-1)
 
@@ -571,9 +598,13 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             q_seq = q_idx[q0:q1]  # [qlen, n_heads, D]
             w_seq = weights[q0:q1]  # [qlen, n_heads]
 
-            # Hadamard + FP8 quant (SGLang NSA recipe).
-            qh = hadamard_transform(q_seq.contiguous(), scale=hdim ** -0.5)
-            kh = hadamard_transform(k_bf16.contiguous(), scale=hdim ** -0.5)
+            # Hadamard + FP8 quant (SGLang NSA recipe). Skipped when
+            # GLLM_DSA_HADAMARD=0 (q and k toggled together so (Hq)·(Hk)=q·k holds).
+            if _DSA_HADAMARD:
+                qh = hadamard_transform(q_seq.contiguous(), scale=hdim ** -0.5)
+                kh = hadamard_transform(k_bf16.contiguous(), scale=hdim ** -0.5)
+            else:
+                qh, kh = q_seq, k_bf16
             q_fp8, q_scale = _quant(qh)  # [qlen,H,D], [qlen,H]
             k_fp8, k_scale = _quant(kh)  # [seq_len,D], [seq_len]
             w_folded = w_seq.float() * q_scale * scale  # [qlen, n_heads]
@@ -646,13 +677,17 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             # is Hadamard(q)·k, which is wrong (H is orthogonal: (Hq)·(Hk)=q·k
             # but (Hq)·k != q·k).
             if _DSA_FP8_SCORE and mm.segment.index_k_fp8_cache is not None:
-                from sgl_kernel import hadamard_transform
+                if _DSA_HADAMARD:
+                    from sgl_kernel import hadamard_transform
 
-                idx_k_had = hadamard_transform(
-                    idx_k.contiguous(), scale=idx_k.shape[-1] ** -0.5
-                )
+                    idx_k_had = hadamard_transform(
+                        idx_k.contiguous(), scale=idx_k.shape[-1] ** -0.5
+                    )
+                else:
+                    idx_k_had = idx_k
                 mm.store_index_k_fp8(
-                    self.layer_id, idx_k_had, input_data.get_slot_mapping()
+                    self.layer_id, idx_k_had, input_data.get_slot_mapping(),
+                    use_ue8m0=self.indexer.use_ue8m0,
                 )
             num_dec = meta.num_decode_tokens
             # DeepSeek Sparse Attention: feed the indexer's top-k selection into
