@@ -26,7 +26,7 @@ from gllm.entrypoints.serving_completions import (
     completion_generator,
     completion_stream_generator,
 )
-from gllm.entrypoints.tool_parsers import get_tool_parser
+from gllm.tokenizers.tool_parsers import get_tool_parser
 from gllm.utils import find_free_ports, make_async
 
 router = APIRouter()
@@ -548,8 +548,23 @@ if __name__ == "__main__":
         "architecture",
         None,
     )
+    # DeepSeek-V3.2's tool-call parser uses the checkpoint's reference decoder
+    # for exact-typed argument parsing. Load it in this (API server) process from
+    # the model dir; None => parser falls back to a lenient regex.
+    dsv32_encoder = None
+    model_path = getattr(
+        getattr(getattr(llm, "model_runner", None), "model_loader", None),
+        "model_path",
+        None,
+    ) or getattr(getattr(llm, "model_runner", None), "model_path", None)
+    if model_path and architecture == "DeepseekV32ForCausalLM":
+        from gllm.tokenizers.deepseek_v32 import load_dsv32_encoder
+
+        dsv32_encoder = load_dsv32_encoder(model_path)
     tool_parser = get_tool_parser(
-        architecture=architecture, name=args.tool_call_parser
+        architecture=architecture,
+        name=args.tool_call_parser,
+        encoder=dsv32_encoder,
     )
     if args.tool_call_parser or tool_parser is not None:
         logger.info(

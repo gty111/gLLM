@@ -11,7 +11,7 @@ from gllm.entrypoints.protocol import (
     ChatMessage,
     DeltaMessage,
 )
-from gllm.entrypoints.tool_parsers import ToolParser
+from gllm.tokenizers.tool_parsers import ToolParser
 from gllm.utils import build_usage, get_finish_reason
 
 

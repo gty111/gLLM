@@ -480,6 +480,139 @@ class KimiToolParser(ToolParser):
         return StreamToolParser(self, tools)
 
 
+class DeepSeekToolParser(ToolParser):
+    """DeepSeek-V3.2 DSML tool calls.
+
+    The model emits tool calls as a ``<｜DSML｜function_calls>`` block, each call
+    an ``<｜DSML｜invoke name="fn">`` with typed ``<｜DSML｜parameter>`` children::
+
+        <｜DSML｜function_calls>
+        <｜DSML｜invoke name="get_weather">
+        <｜DSML｜parameter name="city" string="true">Beijing</｜DSML｜parameter>
+        </｜DSML｜invoke>
+        </｜DSML｜function_calls>
+
+    Parsing/typing is delegated to the model's own reference decoder
+    (``encoding_dsv32.parse_message_from_completion_text``) when available -- the
+    same code path vLLM uses -- so the OpenAI ``arguments`` JSON matches upstream
+    exactly. ``encoder`` is injected by the server (loaded from the checkpoint's
+    ``encoding/`` dir). When it's absent we fall back to a lenient regex that
+    extracts names + parameters without the reference typing.
+    """
+
+    name = "deepseek"
+    _DSML = "｜DSML｜"
+    # The model emits the block with the ``｜DSML｜`` special token, but some
+    # checkpoints/decodes drop it and produce the plain ``<function_calls>`` form.
+    # Detect and parse BOTH: treat the ``｜DSML｜`` prefix as optional everywhere.
+    _BLOCK_START_DSML = f"<{_DSML}function_calls"
+    _BLOCK_START_PLAIN = "<function_calls"
+    _INVOKE_RE = re.compile(
+        r"<(?:｜DSML｜)?invoke\s+name=\"(?P<name>[^\"]+)\">(?P<body>.*?)"
+        r"</(?:｜DSML｜)?invoke>",
+        re.DOTALL,
+    )
+    _PARAM_RE = re.compile(
+        r"<(?:｜DSML｜)?parameter\s+name=\"(?P<key>[^\"]+)\"\s+"
+        r"string=\"(?P<is_str>true|false)\">(?P<value>.*?)</(?:｜DSML｜)?parameter>",
+        re.DOTALL,
+    )
+
+    def __init__(self, encoder=None) -> None:
+        self._encoder = encoder
+
+    def _block_start(self, full_text: str) -> int:
+        """Index of the tool-call block (DSML or plain form), or -1."""
+        for marker in (self._BLOCK_START_DSML, self._BLOCK_START_PLAIN):
+            i = full_text.find(marker)
+            if i != -1:
+                return i
+        return -1
+
+    def content_prefix(self, full_text: str) -> str:
+        i = self._block_start(full_text)
+        return full_text if i == -1 else full_text[:i]
+
+    def _parse_official(self, full_text: str):
+        """Use the checkpoint's reference decoder; returns tool_calls or raises.
+
+        The reference parser requires the assistant text to terminate with the
+        EOS token and rejects trailing content, so append EOS when the streamed
+        text (stop token stripped) lacks it. It also requires the ``｜DSML｜``
+        special token, so re-insert it if the model emitted the plain form.
+        """
+        eos = "<｜end▁of▁sentence｜>"
+        text = full_text
+        if self._DSML not in text:
+            # Restore the DSML token the strict decoder expects.
+            for tag in ("function_calls", "invoke", "parameter"):
+                text = text.replace(f"<{tag}", f"<{self._DSML}{tag}")
+                text = text.replace(f"</{tag}", f"</{self._DSML}{tag}")
+        text = text if text.endswith(eos) else text + eos
+        parsed = self._encoder.parse_message_from_completion_text(
+            text, thinking_mode="chat"
+        )
+        calls: List[ToolCall] = []
+        for tc in parsed.get("tool_calls") or []:
+            fn = tc["function"]
+            calls.append(
+                ToolCall(
+                    function=FunctionCall(
+                        name=fn["name"],
+                        arguments=_dump_arguments(fn["arguments"]),
+                    )
+                )
+            )
+        return parsed.get("content") or None, calls
+
+    def _parse_regex(self, full_text: str):
+        """Encoder-free fallback: extract name + params via regex (no reference
+        typing -- string params stay strings, others JSON-decoded best-effort)."""
+        calls: List[ToolCall] = []
+        for m in self._INVOKE_RE.finditer(full_text):
+            args: Dict[str, Any] = {}
+            for pm in self._PARAM_RE.finditer(m.group("body")):
+                key, is_str, value = (
+                    pm.group("key"),
+                    pm.group("is_str"),
+                    pm.group("value"),
+                )
+                if is_str == "true":
+                    args[key] = value
+                else:
+                    try:
+                        args[key] = json.loads(value)
+                    except (TypeError, ValueError):
+                        args[key] = value
+            calls.append(
+                ToolCall(
+                    function=FunctionCall(
+                        name=m.group("name"),
+                        arguments=_dump_arguments(args),
+                    )
+                )
+            )
+        return self.content_prefix(full_text).strip() or None, calls
+
+    def parse(
+        self, full_text: str, tools=None
+    ) -> Tuple[Optional[str], List[ToolCall]]:
+        if self._block_start(full_text) == -1:
+            return full_text, []
+
+        if self._encoder is not None:
+            try:
+                return self._parse_official(full_text)
+            except Exception:
+                # Reference parser is strict about formatting; fall back to the
+                # lenient regex rather than dropping the tool call entirely.
+                pass
+        return self._parse_regex(full_text)
+
+    def stream_parser(self, tools=None) -> StreamToolParser:
+        return StreamToolParser(self, tools)
+
+
 def _qwen_parser_for_arch(architecture: Optional[str]) -> ToolParser:
     """Pick the right Qwen markup for the architecture: Qwen3.5 switched from
     the Hermes JSON ``<tool_call>{...}</tool_call>`` form to the
@@ -492,18 +625,24 @@ def _qwen_parser_for_arch(architecture: Optional[str]) -> ToolParser:
 
 # Explicit ``--tool-call-parser`` names. The qwen-family names defer to the
 # architecture to pick the markup variant; "hermes"/"qwen3" force a variant.
-_AVAILABLE_NAMES = ("qwen", "qwen2", "qwen2.5", "qwen3", "qwen3.5", "hermes", "kimi")
+_AVAILABLE_NAMES = (
+    "qwen", "qwen2", "qwen2.5", "qwen3", "qwen3.5", "hermes", "kimi", "deepseek",
+)
 
 
 def get_tool_parser(
-    architecture: Optional[str] = None, name: Optional[str] = None
+    architecture: Optional[str] = None,
+    name: Optional[str] = None,
+    encoder=None,
 ) -> Optional[ToolParser]:
     """Resolve the tool-call parser.
 
     An explicit ``name`` takes precedence; otherwise the parser is auto-detected
     from the model ``architecture`` string. The qwen-family names ("qwen",
     "qwen2", "qwen3", ...) resolve to the Hermes or XML variant based on the
-    architecture; "hermes" forces Hermes and "qwen3.5" forces XML. Returns
+    architecture; "hermes" forces Hermes and "qwen3.5" forces XML. ``encoder``
+    (the DeepSeek reference message decoder, loaded from the checkpoint) is
+    injected into :class:`DeepSeekToolParser` for exact-typed parsing. Returns
     ``None`` for unknown models (raw text then passes through as ``content``).
     """
     if name:
@@ -516,6 +655,8 @@ def get_tool_parser(
             return Qwen3ToolParser()
         if n == "kimi":
             return KimiToolParser()
+        if n == "deepseek":
+            return DeepSeekToolParser(encoder=encoder)
         raise ValueError(
             f"Unknown tool-call parser '{name}'. Available: {list(_AVAILABLE_NAMES)}"
         )
@@ -526,5 +667,7 @@ def get_tool_parser(
             return _qwen_parser_for_arch(architecture)
         if "kimi" in arch:
             return KimiToolParser()
+        if "deepseekv32" in arch or "deepseek_v32" in arch:
+            return DeepSeekToolParser(encoder=encoder)
 
     return None

@@ -270,6 +270,17 @@ class ModelRunner:
         self.tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = (
             AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
         )
+        # DeepSeek-V3.2 ships no usable chat_template; it bundles the official
+        # message encoder at ``<model_path>/encoding/encoding_dsv32.py``. Flag it
+        # so ``encode`` renders the reference DSML prompt (thinking gating, tool
+        # calls) instead of a hand-written Jinja template. We only store a bool
+        # (the loaded encoder is a module object and is NOT picklable -- the
+        # runner is pickled to spawn TP workers); the encoder itself is
+        # lazy-loaded per process inside ``encode`` via a module-level cache.
+        self._use_dsv32_encoder = (
+            getattr(self.model_loader, "architecture", None)
+            == "DeepseekV32ForCausalLM"
+        )
         self.maxp = maxp
         self.maxd = maxd
         self.minp = minp
@@ -573,7 +584,26 @@ class ModelRunner:
             for message in messages:
                 if isinstance(message, dict) and message.get("content") is None:
                     message["content"] = ""
-            if not self.use_mm or not has_mm:
+            dsv32_encoder = None
+            if self._use_dsv32_encoder:
+                from gllm.tokenizers.deepseek_v32 import load_dsv32_encoder
+
+                dsv32_encoder = load_dsv32_encoder(self.model_path)
+            if dsv32_encoder is not None and (not self.use_mm or not has_mm):
+                # DeepSeek-V3.2: render with the model's official encoder
+                # (reference DSML format) instead of a Jinja chat template.
+                from gllm.tokenizers.deepseek_v32 import (
+                    apply_dsv32_chat_template,
+                )
+
+                out = apply_dsv32_chat_template(
+                    dsv32_encoder,
+                    messages,
+                    self.tokenizer,
+                    tokenize=True,
+                    **template_kwargs,
+                )
+            elif not self.use_mm or not has_mm:
                 out = self.tokenizer.apply_chat_template(
                     messages,
                     add_generation_prompt=True,
