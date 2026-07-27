@@ -37,6 +37,7 @@ PP>1 specifics
 
 import logging
 import os
+import sys
 import traceback
 from collections import deque
 from typing import List, Optional, Union
@@ -944,7 +945,11 @@ class Worker(TorchProfilerMixin):
                 # the eager non-overlap path doesn't, so we do it
                 # explicitly here. For greedy decoding the broadcast
                 # is harmless (~10us / iter).
-                if get_tp_size() > 1:
+                # MTP spec-decode returns per-seq token LISTS and runs
+                # identically (greedy) on every TP rank, so the int-list
+                # broadcast neither applies nor is needed -- skip it.
+                is_mtp = bool(next_tokens) and isinstance(next_tokens[0], list)
+                if get_tp_size() > 1 and not is_mtp:
                     next_tokens = self.comm.broadcast_tokens_to_tp(
                         next_tokens if is_output_rank() else None
                     )
@@ -986,17 +991,35 @@ class Worker(TorchProfilerMixin):
         self.forward_pp()
 
     def handle_keyboardInterrupt(self):
+        # Same rationale as ``handle_exception``: on shutdown do not call the
+        # collective ``dist.destroy_process_group()``. Ranks receive SIGINT at
+        # slightly different points (some mid-collective), so a coordinated
+        # destroy can block forever inside NCCL waiting on a rank that already
+        # left. Signal the watchdog and hard-exit; the OS reclaims CUDA/NCCL.
+        logger.info("Exit")
         self.mp_alive[self.local_rank] = -1
-        logger.info(f"Exit")
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
     def handle_exception(self, e):
         logger.error(e)
         traceback.print_exc()
-        if dist.is_initialized():
-            dist.destroy_process_group()
+        # Signal the parent watchdog FIRST, then hard-exit. Do NOT call
+        # ``dist.destroy_process_group()`` on the crash path: it is a COLLECTIVE
+        # op that needs every rank to participate, but a crashed rank means the
+        # group is already unhealthy -- the other ranks are still blocked in the
+        # in-flight NCCL collective (e.g. forward's all-reduce) and will never
+        # join the destroy, so ``destroy_process_group`` blocks forever inside
+        # NCCL. That is the "worker hangs on exit" symptom: the process never
+        # reaches ``os._exit`` and never releases its ~96GB, so the whole group
+        # has to be killed by hand. ``os._exit`` skips atexit/GC and lets the OS
+        # reclaim the CUDA context / NCCL fds / memory immediately; the parent's
+        # ``mp_alive == -1`` watchdog then tears down the rest of the group.
         self.mp_alive[self.local_rank] = -1
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
 
 
 def run_worker(worker: Worker):

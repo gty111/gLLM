@@ -702,7 +702,9 @@ class MemoryManager:
             self.v_scale,
         )
 
-    def pre_allocate_page(self, seqs: List[Sequence]):
+    def pre_allocate_page(self, seqs: List[Sequence], cacheable: bool = True):
+        # Base manager has no prefix cache; ``cacheable`` is accepted for a
+        # uniform signature with ``PrefixMemoryManager`` and ignored.
         for seq in seqs:
             num_page = (seq.seq_len + self.page_size - 1) // self.page_size - len(
                 seq.page_table
@@ -1077,14 +1079,26 @@ class PrefixMemoryManager(MemoryManager):
         if 0 <= page_idx < len(seq.page_table):
             self.segment.update(seq, n, seq.page_table[page_idx])
 
-    def pre_allocate_page(self, seqs: List[Sequence]):
+    def pre_allocate_page(self, seqs: List[Sequence], cacheable: bool = True):
+        """Grow each seq's page table to cover its current ``seq_len``.
+
+        ``cacheable`` (default True) registers a prefix-cache hash for any page
+        that closes a complete ``page_size`` boundary, so a later seq sharing
+        that prefix can hit it. MTP draft/verify must pass ``cacheable=False``:
+        those calls run over SPECULATIVE token_ids (unverified drafts) that are
+        mostly rejected, so hashing them would poison ``hash2page`` with entries
+        keyed on tokens that never get committed -- a sibling seq could then hit
+        a stale mapping and corrupt the page ref-count (double-free). The real
+        hash is registered later over committed tokens via
+        ``register_decode_boundary`` (from the scheduler's finalize hook).
+        """
         for seq in seqs:
             len_page_table = len(seq.page_table)
             num_page = (
                 seq.seq_len + self.page_size - 1
             ) // self.page_size - len_page_table
             for i in range(len_page_table, len_page_table + num_page):
-                if (i + 1) * self.page_size <= len(seq):
+                if cacheable and (i + 1) * self.page_size <= len(seq):
                     page_num = self.segment.allocate(seq, (i + 1) * self.page_size)
                 else:
                     page_num = self.segment.allocate()

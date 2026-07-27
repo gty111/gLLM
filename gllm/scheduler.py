@@ -216,7 +216,7 @@ class Scheduler:
             seq.computed_token_num += seq.to_compute_token_num
             if seq.computed_prompt:
                 ipc_package.act_schedule_ids.append(seq.seq_id)
-                ipc_package.next_tokens.append(next_tokens[idx])
+                tok = next_tokens[idx]
                 if logprobs is not None and seq.logprobs_enabled:
                     ipc_package.logprobs.append(logprobs[idx])
                 else:
@@ -230,12 +230,30 @@ class Scheduler:
                 else:
                     # PP=1: attach from the local seq's accumulated data.
                     self._attach_prompt_logprobs(ipc_package, seq)
-                seq.append(next_tokens[idx])
-                # The token is real (non-overlap appends immediately), so it is
-                # safe to register the prefix-cache hash for any page boundary
-                # it just completed. Driven from here -- not pre_allocate_page --
-                # so a placeholder id can never be hashed (see model_runner).
-                self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
+                # MTP: ``tok`` may be a LIST = [x1] + accepted_drafts + [bonus].
+                # KV was written by the verify forward for x1 + accepted_drafts
+                # (they were verify INPUTS); the trailing bonus is the target's
+                # PREDICTION and has NO KV yet, so it must stay uncached and be
+                # reprocessed by the next decode step (the standard invariant:
+                # computed_token_num == len(token_ids) - 1). For the ordinary
+                # path ``tok`` is a single int (one uncached token, extra=0).
+                committed = tok if isinstance(tok, list) else [tok]
+                kept = 0
+                for t in committed:
+                    seq.append(t)
+                    kept += 1
+                    self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
+                    if seq.is_finish:
+                        break
+                # Cached beyond the base decode's +1: the accepted drafts, i.e.
+                # everything committed except x1 (already counted) and the final
+                # uncached bonus. = kept - 2 when the bonus was reached; if an
+                # earlier token finished the seq, nothing extra is cached.
+                extra = kept - 1
+                if extra > 0:
+                    seq.computed_token_num += extra
+                    self.model_runner.memory_manager.pre_allocate_page([seq])
+                ipc_package.next_tokens.append(committed if isinstance(tok, list) else tok)
             if seq.is_finish:
                 ipc_package.free_ids.append(seq.seq_id)
                 # Mirror the free to follower-side state cleanup. ``free_ids``

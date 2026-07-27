@@ -36,6 +36,9 @@ class IDAllocator:
             self.free_ids.pop(id, None)
         return id
 
+    def is_free(self, id: int) -> bool:
+        return id in self.free_ids
+
     def free(self, id: int):
         # Insert at the back (FIFO) to keep already-warm pages cached
         # longer; mirrors the original ``deque.append`` behavior.
