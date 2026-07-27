@@ -72,6 +72,8 @@ class LLM:
         disagg_config=None,
         mla_decode_backend="fa3",
         mla_cache_dtype="bf16",
+        mtp_enabled=None,
+        mtp_k=3,
     ):
         init_logger()
         self.model_path = model_path
@@ -115,6 +117,8 @@ class LLM:
             skip_language=skip_language,
             mla_decode_backend=mla_decode_backend,
             mla_cache_dtype=mla_cache_dtype,
+            mtp_enabled=mtp_enabled,
+            mtp_k=mtp_k,
         )
         self.pp_size = pp_size
         self.tp_size = tp_size
@@ -436,13 +440,16 @@ class LLM:
                     continue
                 if len(ipc_package.next_tokens) != 0:
                     token_id = ipc_package.next_tokens[idx]
-                    seq.append(token_id)
+                    # MTP: a per-seq entry may be a LIST of committed tokens.
+                    tokens = token_id if isinstance(token_id, list) else [token_id]
+                    for t in tokens:
+                        seq.append(t)
                     if self.async_streams:
                         text = seq.detokenize_inc(self.model_runner.tokenizer)
                         logprob = None
                         if idx < len(ipc_package.logprobs):
                             logprob = self._make_logprob_entry(
-                                token_id, ipc_package.logprobs[idx]
+                                tokens[-1], ipc_package.logprobs[idx]
                             )
                         prompt_lp = None
                         raw_prompt_lp = ipc_package.prompt_logprobs.get(id)
@@ -615,6 +622,8 @@ class LLM:
         temperature=None,
         top_p=None,
         top_k=None,
+        progress_bar: bool = True,
+        log_stats: bool = False,
     ):
         seqs: List[Sequence] = []
         assert prompts is not None or tokens is not None
@@ -633,10 +642,22 @@ class LLM:
                 seqs.append(seq)
         self.add_requests(seqs)
 
-        pbar = tqdm.tqdm(total=len(seqs), ncols=100)
-        while pbar.n != len(seqs):
-            num_finish_seqs = self.schedule(log=False)
-            pbar.update(num_finish_seqs)
+        # Set ``progress_bar=False`` (e.g. when piping to a log file) to skip
+        # the tqdm bar: off-TTY tqdm cannot rewrite the line in place and would
+        # emit a fresh progress line on every refresh -> thousands of spam
+        # lines. We track progress with our own counter (a ``disable=True``
+        # tqdm is a no-op whose ``.n`` never advances, so it cannot drive the
+        # loop condition). ``log_stats=True`` re-enables the TP0 scheduler's
+        # own periodic ``#wait #run #prefill #decode memory_util`` status line
+        # (the same one the online server prints), off by default here.
+        pbar = tqdm.tqdm(total=len(seqs), ncols=100, disable=not progress_bar)
+        done = 0
+        while done != len(seqs):
+            num_finish_seqs = self.schedule(log=log_stats)
+            if num_finish_seqs:
+                done += num_finish_seqs
+                pbar.update(num_finish_seqs)
+        pbar.close()
 
         for seq in seqs:
             seq.prompt = self.model_runner.decode(seq[: seq.raw_prompt_len])

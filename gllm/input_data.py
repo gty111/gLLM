@@ -113,6 +113,12 @@ class InputData:
         assert len(seqs) != 0
         self.seqs = seqs
         self.embedding_size = 0
+        # MTP verify batch: every seq is a decode seq re-expanded to a uniform
+        # 1+k query over its cached context (flagged in ModelRunner._mtp_decode).
+        # Lets the DSA attention pick the batched verify top-k selector.
+        self.is_mtp_verify = bool(seqs) and all(
+            getattr(s, "_mtp_verify", False) for s in seqs
+        )
 
         self.tokens_cpu = self._cal_tokens(seqs)
         self.positions_cpu = self._cal_position(seqs)
@@ -270,6 +276,7 @@ class InputData:
         "top_k",
         "repetition_penalty",
         "needs_repetition_penalty",
+        "is_mtp_verify",
     )
     _PREBUILT_SSM_ATTRS = (
         "ssm_state_slot_per_seq_cpu",
@@ -543,7 +550,13 @@ class InputData:
         self.num_decode_tokens = self.num_decodes
         self.num_prefills = 0
         for idx, seq in enumerate(seqs):
-            if not seq.computed_prompt:
+            # A seq takes the PREFILL (multi-query, with-context) attention path
+            # when it is still prefilling its prompt, OR when it is an MTP verify
+            # seq (a decode seq re-expanded to 1+k query tokens over its cached
+            # context). Without the ``_mtp_verify`` override such a seq would be
+            # mis-classified as decode (computed_prompt is True) and run through
+            # the q_len==1 decode kernel with q_len=1+k -> wrong attention.
+            if (not seq.computed_prompt) or getattr(seq, "_mtp_verify", False):
                 self.num_decodes = idx
                 self.num_decode_tokens = idx
                 self.num_prefills = len(seqs) - self.num_decodes
@@ -727,6 +740,7 @@ class InputData:
             self.num_prefills,
             decode_metadata,
             prefill_metadata,
+            is_mtp_verify=self.is_mtp_verify,
         )
 
 
@@ -799,3 +813,8 @@ class MLACommonMetadata:
 
     decode: Optional[MLACommonDecodeMetadata] = None
     prefill: Optional[MLACommonPrefillMetadata] = None
+    # True when this batch is an MTP-verify batch (every prefill seq is a
+    # re-expanded decode seq with a uniform 1+k query over its cached context).
+    # Routes the DSA attention to the fp8 decode-sparse kernel (graph-safe,
+    # q_len=1+k) instead of the bf16 prefill-sparse kernel.
+    is_mtp_verify: bool = False

@@ -157,12 +157,10 @@ def get_tensor_from_dict(weights, k):
     for cand in _checkpoint_key_candidates(k):
         if cand in weights:
             return weights[cand]
-    # Iterate keys only -- ``weights`` may be a lazy view whose ``items()``
-    # would read every tensor from disk just to print names.
-    for key in weights:
-        print(key)
-
-    raise KeyError(f"Fail to extract {k} from weights")
+    raise KeyError(
+        f"Fail to extract {k!r} from weights (tried candidates "
+        f"{list(_checkpoint_key_candidates(k))})"
+    )
 
 
 def has_tensor_in_dict(weights, k) -> bool:

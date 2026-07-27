@@ -557,6 +557,92 @@ class MLAAttention:
         self._v_up_proj(o.reshape(num_q, self.num_heads, self.kv_lora_rank), out=out)
         return out
 
+    def _forward_verify_sparse(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: MLACommonMetadata,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sparse MLA for the MTP *verify* batch via the fp8 decode kernel.
+
+        The verify batch is a set of ``nd`` decode seqs each re-expanded to a
+        uniform ``qlen = 1+k`` query over its cached context. Unlike a general
+        prefill, this is exactly the shape the FlashMLA *decode* sparse kernel
+        (``flash_mla_with_kvcache`` with ``q_len = qlen``) handles -- the same
+        kernel the plain decode path uses. Routing
+        here instead of ``_forward_prefill_sparse`` (a) drops that path's
+        ``torch.unique`` + ``dequant_mla_fp8_slots`` (dynamic-shape, graph-
+        hostile, bf16-only) ops and (b) reads the fp8-packed cache natively.
+        Per-(seq, query) causality comes entirely from ``topk_indices`` (already
+        causal-masked by the indexer), so ``causal=False``.
+
+        Requires the fp8-packed latent cache (DSA default). Mirrors the fp8
+        branch of :meth:`_forward_decode_flashmla` but with ``q_len = qlen``.
+        """
+        if flash_mla_with_kvcache is None:
+            raise RuntimeError("flash_mla_with_kvcache unavailable for verify sparse.")
+        if self.W_UK_T is None or self.W_UV is None:
+            self.process_weights()
+        assert kv_c_and_k_pe_cache.dtype == torch.float8_e4m3fn, (
+            "verify sparse requires the fp8-packed MLA cache (mla_cache_dtype=fp8)."
+        )
+        prefill = attn_metadata.prefill
+        assert prefill is not None and prefill.seq_lens is not None
+        nd = prefill.block_table.shape[0]
+        num_q = q.shape[0]
+        qlen = num_q // nd  # uniform 1+k
+
+        # Absorb q_nope -> latent: (B,N,P) -> (N,B,P) x (N,P,L) -> (B,N,L).
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_nope = q_nope.transpose(0, 1)  # (N, B, P)
+        N, B, P = q_nope.shape
+        _, _, L = self.W_UK_T.shape
+        ql_nope = q_nope.new_empty((N, B, L))
+        torch.bmm(q_nope, self.W_UK_T, out=ql_nope)  # (N, B, L)
+        ql_nope = ql_nope.transpose(0, 1)  # (B, N, L)
+        # (num_q, num_heads, L + R) -> (nd, qlen, num_heads, L + R)
+        q_sparse = torch.cat([ql_nope, q_pe], dim=-1).contiguous()
+        q_sparse = q_sparse.view(nd, qlen, self.num_heads, L + self.qk_rope_head_dim)
+
+        # fp8-packed cache: [pages, page_sz, 1, packed_dim].
+        k_cache = (
+            kv_c_and_k_pe_cache
+            if kv_c_and_k_pe_cache.dim() == 4
+            else kv_c_and_k_pe_cache.unsqueeze(-2)
+        )
+        topk = topk_indices.shape[-1]
+        indices = topk_indices.to(torch.int32).view(nd, qlen, topk)
+        seq_lens = prefill.seq_lens  # [nd] int32 = ctx_len + qlen
+
+        flashmla_meta = get_mla_metadata(
+            seq_lens,
+            qlen * self.num_heads,
+            1,
+            num_heads_q=self.num_heads,
+            is_fp8_kvcache=True,
+            topk=topk,
+        )
+        tile_scheduler_metadata, num_splits = flashmla_meta
+        o, _ = flash_mla_with_kvcache(
+            q=q_sparse,
+            k_cache=k_cache,
+            block_table=prefill.block_table,
+            cache_seqlens=seq_lens,
+            head_dim_v=self.kv_lora_rank,
+            tile_scheduler_metadata=tile_scheduler_metadata,
+            num_splits=num_splits,
+            softmax_scale=self.scale,
+            causal=False,
+            is_fp8_kvcache=True,
+            indices=indices,
+        )  # o: (nd, qlen, num_heads, kv_lora_rank)
+        out = q.new_empty((num_q, self.num_heads * self.v_head_dim))
+        self._v_up_proj(
+            o.reshape(num_q, self.num_heads, self.kv_lora_rank), out=out
+        )
+        return out
+
     def _forward_prefill(
         self,
         q: torch.Tensor,
@@ -576,6 +662,13 @@ class MLAAttention:
         # path replaces BOTH the dense new-token (suffix) and context (prefix)
         # pieces below -- no separate merge needed.
         if topk_indices is not None:
+            # MTP verify batch: uniform 1+k query per seq -> use the fp8
+            # decode-sparse kernel (graph-safe, no unique/dequant). Otherwise
+            # the general bf16 prefill-sparse path.
+            if getattr(attn_metadata, "is_mtp_verify", False):
+                return self._forward_verify_sparse(
+                    q, kv_c_and_k_pe_cache, attn_metadata, topk_indices
+                )
             return self._forward_prefill_sparse(
                 q, kv_c_and_k_pe_cache, attn_metadata, topk_indices, k_scale
             )

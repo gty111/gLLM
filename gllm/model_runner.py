@@ -1,4 +1,5 @@
 import hashlib
+import os
 from collections import OrderedDict
 from contextlib import nullcontext as _nullcontext
 from typing import Dict, List, Optional, Tuple, Union
@@ -21,6 +22,7 @@ from transformers.tokenization_utils_base import VERY_LARGE_INTEGER
 from gllm.async_utils import FutureMap, OverlapRuntime
 from gllm.dist_utils import (
     get_dp_size,
+    get_ipc_tp_group,
     get_local_rank,
     get_output_rank,
     get_rank,
@@ -244,6 +246,8 @@ class ModelRunner:
         skip_language: bool = False,
         mla_decode_backend: str = "fa3",
         mla_cache_dtype: str = "bf16",
+        mtp_enabled: Optional[bool] = None,
+        mtp_k: int = 3,
     ):
 
         self.max_num_batched_tokens = (
@@ -356,6 +360,19 @@ class ModelRunner:
             self.mla_decode_backend if self.use_mla else None
         )
         self.model_loader.config.page_size = self.page_size
+        # MTP (multi-token prediction) config. ``mtp_enabled=None`` auto-detects:
+        # enable iff the checkpoint declares nextn-predict layers
+        # (``num_nextn_predict_layers >= 1``). Stamped onto the model config so
+        # the model builder (e.g. DeepseekV32ForCausalLM) constructs the MTP head
+        # from config instead of an env var. ``mtp_k`` is the draft-chain length.
+        _num_nextn = getattr(
+            self.model_loader.config, "num_nextn_predict_layers", 0
+        ) or 0
+        self._mtp_enabled = (
+            (_num_nextn >= 1) if mtp_enabled is None else bool(mtp_enabled)
+        )
+        self._mtp_k_cfg = mtp_k
+        self.model_loader.config.mtp_enabled = self._mtp_enabled
         propagate_serving_config(self.model_loader.config)
 
         # Kimi-K2.5 ships a bespoke processor (``KimiK25Processor``) whose API
@@ -490,6 +507,12 @@ class ModelRunner:
 
     def init(self, mp_load_progress=None):
         self.model = self.model_loader.load_model(mp_load_progress)
+        # MTP speculative decoding: number of draft tokens per step (k). Active
+        # only when the model built an MTP head (mtp_enabled + nextn layers).
+        self._mtp_k = (
+            self._mtp_k_cfg
+            if getattr(self.model, "mtp", None) is not None else 0
+        )
         # Hybrid models (Qwen3.5 GDN) advertise a ready-to-use SSM cache
         # config via ``model.ssm_cache_config``. ``num_layers`` for the KV
         # path must then be the count of *full-attention* layers only.
@@ -542,6 +565,65 @@ class ModelRunner:
         # Output buffer
         self.output_hidden_states = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
         self.output_residual = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
+        # MTP draft-step CUDA-graph buffers. A draft step is a batch x 1-token
+        # decode of the MTP head; we capture one graph per decode bucket and
+        # replay it k times, advancing tok/hidden/positions/seq_lens/slot in
+        # place on the GPU (no Python / H2D / .item() per step). Gated on MTP
+        # active + graphs enabled + env opt-out. Buffers + the aliasing
+        # ``_draft_input`` are lazily built in ``_init_draft_graph_state`` after
+        # the model + memory manager exist.
+        self._mtp_draft_graph = (
+            getattr(self, "_mtp_k", 0) > 0
+            and getattr(self.model, "mtp", None) is not None
+            and not self.disable_cuda_graph
+        )
+        self._draft_size_to_graph: Dict[int, torch.cuda.CUDAGraph] = {}
+        # Separate captured graphs for the sampled (rejection) draft step, which
+        # runs Gumbel-max sampling + q-dist stash instead of argmax.
+        self._draft_size_to_graph_sampled: Dict[int, torch.cuda.CUDAGraph] = {}
+        self._draft_input = None
+        # MTP verify CUDA graph: capture the full target verify forward (over the
+        # uniform 1+k query per decode seq) per bucket at init and replay it. The
+        # verify forward is 99% of MTP step time and is pure eager per-layer launch
+        # overhead (~250ms, ~constant vs batch size), so graphing it is the main
+        # speedup lever. Requires the fp8 decode-sparse verify kernel (graph-safe).
+        self._mtp_verify_graph = (
+            getattr(self, "_mtp_k", 0) > 0
+            and getattr(self.model, "mtp", None) is not None
+            and not self.disable_cuda_graph
+        )
+        self._verify_size_to_graph: Dict[int, torch.cuda.CUDAGraph] = {}
+        self._verify_k = getattr(self, "_mtp_k", 0)
+        # Fused MTP (default ON, opt out with GLLM_MTP_FUSED=0): eliminate the
+        # separate x1-decode forward by relaying each step's verify bonus token +
+        # its hidden as the NEXT step's draft seed. One target forward (verify)
+        # per step instead of two. ``_mtp_relay`` maps seq_id -> (seed_tok:int,
+        # seed_hidden:tensor[H]) carried across consecutive steps; a seq missing
+        # from it (freshly admitted / batch reshuffle) forces the bootstrap path
+        # (decode forward) for that step.
+        self._mtp_fused = (
+            getattr(self, "_mtp_k", 0) > 0
+            and getattr(self.model, "mtp", None) is not None
+            and os.environ.get("GLLM_MTP_FUSED", "1") == "1"
+        )
+        self._mtp_relay: Dict[int, tuple] = {}
+        # MTP rejection sampling: make MTP distribution-lossless under
+        # temperature/top-p instead of greedy-only. Activated per-batch by
+        # RUNTIME DETECTION of any non-greedy seq -- NOT an env flag: a greedy
+        # batch takes the argmax fast path, a batch with any sampling seq takes
+        # the lossless rejection path. ``_mtp_can_sample`` just means "MTP is
+        # active" and gates allocating/capturing the sampled-draft buffers +
+        # graphs at init (any request may sample, so they must always be ready).
+        # TP consistency of the stochastic draws is handled by ``_mtp_rng``
+        # (TP-synced per-step
+        # seed) + broadcasting drawn tokens, since independent per-rank sampling
+        # would otherwise diverge the KV caches.
+        self._mtp_can_sample = (
+            getattr(self, "_mtp_k", 0) > 0
+            and getattr(self.model, "mtp", None) is not None
+        )
+        self._mtp_rng = None  # lazily built on the compute device
+        self._mtp_step = 0
         # Profile run
         self.profile_run()
         # Init KV cache at last; only reserve the dummy page when CUDA graphs
@@ -1537,8 +1619,8 @@ class ModelRunner:
         """
         iterator = self.capture_sizes
         if get_local_rank() == 0:
-            logger.info(f"Capturing CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}")
-            iterator = tqdm(self.capture_sizes, desc="Capturing CUDA Graphs", ncols=100)
+            logger.info(f"Capturing decode full CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}")
+            iterator = tqdm(self.capture_sizes, desc="Capturing Decode Full Graphs", ncols=100)
         memory_pool = torch.cuda.graph_pool_handle()
 
         # If the custom NVLink-P2P all-reduce is active, wrap the whole
@@ -1608,6 +1690,16 @@ class ModelRunner:
                     with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
                         self.forward()
                     self.size_to_graph[size] = g
+                # MTP: capture the draft-step graph per bucket on the same
+                # stream/pool (inside the custom-AR capture context) so replay in
+                # ``_draft_chain_graph`` agrees on stream + IPC handles.
+                if self._mtp_draft_graph:
+                    self._capture_draft_graphs(memory_pool, stream)
+                # MTP: capture the full verify forward per bucket (same stream/
+                # pool/AR-context). This is the dominant MTP cost; replay in
+                # ``_mtp_decode`` collapses the ~250ms eager forward to a graph.
+                if self._mtp_verify_graph:
+                    self._capture_verify_graphs(memory_pool, stream)
         finally:
             if is_dp_attn():
                 set_dp_forward_counts(None)
@@ -1806,9 +1898,954 @@ class ModelRunner:
             if c0 + n >= prompt_len:
                 self._last_prompt_logprobs[seq.seq_id] = seq.prompt_logprobs_data
 
+    def _record_mtp_metrics(self, nd: int, k: int, n_accepted: list) -> None:
+        """Accumulate MTP acceptance stats and periodically log them (TP0 only).
+
+        Metric definitions (so the numbers are comparable to common
+        spec-decode reporting):
+
+        * **draft acceptance rate** = accepted_draft_tokens / drafted_tokens.
+          ``drafted_tokens = num_drafts * k`` (k proposals per draft/step).
+        * **mean acceptance length** = 1 + accepted/num_drafts (the ``1`` is the
+          always-committed target token x1, i.e. the "bonus"; so a value of
+          ``k+1`` means every draft accepted).
+        * **per-position acceptance rate**[i] = fraction of drafts whose accepted
+          length reached position ``i`` (i in ``0..k-1``), i.e.
+          ``count(n_accepted > i) / num_drafts`` -- the standard per-position
+          histogram.
+
+        ``num_drafts`` counts one draft *per sequence per step* (nd per call).
+        Logging is time-based on a 1s window to match gLLM's scheduler status
+        log period (``scheduler.py`` ``time.time() - log_time > 1``), and only on
+        TP rank 0 to avoid N duplicate lines. Reset the window after each log.
+        """
+        import time as _time
+
+        if not hasattr(self, "_mtp_m_drafts"):
+            self._mtp_m_drafts = 0            # number of (seq,step) drafts
+            self._mtp_m_accepted = 0          # total accepted draft tokens
+            self._mtp_m_pos = [0] * k         # per-position accept counts
+            self._mtp_m_t0 = _time.time()
+        self._mtp_m_drafts += nd
+        for na in n_accepted:
+            self._mtp_m_accepted += na
+            for i in range(na):
+                self._mtp_m_pos[i] += 1
+
+        if get_tp_rank() != 0:
+            return
+        now = _time.time()
+        if now - self._mtp_m_t0 < 1.0:
+            return
+        drafts = self._mtp_m_drafts
+        acc = self._mtp_m_accepted
+        drafted_tokens = drafts * k
+        rate = 100.0 * acc / drafted_tokens if drafted_tokens else 0.0
+        mean_len = 1.0 + acc / drafts if drafts else 1.0
+        per_pos = ", ".join(
+            f"{(self._mtp_m_pos[i] / drafts if drafts else 0.0):.3f}" for i in range(k)
+        )
+        logger.info(
+            "MTP metrics: Mean acceptance length: %.2f, Accepted: %d tokens, "
+            "Drafted: %d tokens, Per-position acceptance rate: %s, "
+            "Draft acceptance rate: %.1f%%",
+            mean_len, acc, drafted_tokens, per_pos, rate,
+        )
+        # reset window
+        self._mtp_m_drafts = 0
+        self._mtp_m_accepted = 0
+        self._mtp_m_pos = [0] * k
+        self._mtp_m_t0 = now
+
+    # ------------------------------------------------------------------
+    # MTP rejection sampling (lossless speculative decoding under sampling)
+    # ------------------------------------------------------------------
+    def _mtp_rng_step(self, device):
+        """Return a TP-synchronized ``torch.Generator`` seeded for this step.
+
+        Every column driver runs the same deterministic schedule, so seeding
+        from a per-runner step counter makes the seed identical on every TP
+        rank -> identical draws -> TP-consistent committed tokens (the sampling
+        analog of the greedy-argmax determinism the MTP sync path relies on).
+        """
+        if self._mtp_rng is None:
+            self._mtp_rng = torch.Generator(device=device)
+        # A fixed base keeps runs reproducible; the counter advances in lockstep
+        # across ranks. 0x9E3779B9 (golden-ratio) spreads consecutive seeds.
+        self._mtp_rng.manual_seed(0x9E3779B9 * (self._mtp_step + 1) & 0x7FFFFFFFFFFFFFFF)
+        self._mtp_step += 1
+        return self._mtp_rng
+
+    def _mtp_bcast_tp(self, tok: torch.Tensor) -> torch.Tensor:
+        """Broadcast an int64 token tensor from TP-rank-0 across the TP group.
+
+        Rejection sampling draws random tokens, so unlike greedy argmax it is NOT
+        deterministic across TP ranks (per-rank logits differ by fp all-reduce
+        epsilon, and multinomial amplifies that into different token picks). To
+        keep every column driver's committed tokens + draft-forward inputs
+        identical (the invariant the MTP sync path relies on), TP-rank-0's draws
+        win: sample only there, broadcast to peers. No-op for tp_size==1.
+
+        Uses the SAME TP communicator (``get_tp_group``) as the model's
+        all-reduces and ``run_batch_async``'s token broadcast, NOT the IPC group:
+        NCCL's per-communicator FIFO ordering then implicitly serializes this
+        broadcast against the surrounding forward all-reduces on every rank,
+        which is exactly what prevents the cross-communicator ordering hazard
+        that otherwise deadlocks (broadcast on one communicator racing the
+        forward all-reduce on another when ranks reach them in different orders).
+        """
+        if get_tp_size() <= 1:
+            return tok
+        dist.broadcast(tok, src=get_rank() - get_tp_rank(), group=get_tp_group())
+        return tok
+
+    def _mtp_probs_from_logits(self, logits, seqs):
+        """Apply the per-seq sampling transform (temp -> softmax -> top-k/top-p
+        renorm) to ``logits`` [n, vocab], returning a proper prob distribution
+        [n, vocab]. Mirrors ``Sampler.forward_gpu`` so the MTP draft dist ``q``
+        and target dist ``p`` live on the SAME transformed space, which is what
+        rejection sampling requires. ``seqs`` is aligned row-for-row with logits.
+        """
+        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+        dev = logits.device
+        temps = torch.tensor(
+            [s.temperature if s.temperature > 1e-5 else 1.0 for s in seqs],
+            device=dev, dtype=torch.float32,
+        ).unsqueeze(1)
+        probs = torch.softmax(logits.float() / temps, dim=-1)
+        top_ks = torch.tensor(
+            [s.top_k if s.top_k != -1 else self.memory_manager.vocab_size for s in seqs],
+            device=dev, dtype=torch.int32,
+        )
+        top_ps = torch.tensor(
+            [s.top_p for s in seqs], device=dev, dtype=torch.float32
+        )
+        # Only renorm when some seq actually restricts (cheap guard).
+        if int(top_ks.min().item()) < self.memory_manager.vocab_size:
+            probs = top_k_renorm_prob(probs, top_ks)
+        if float(top_ps.min().item()) < 1.0:
+            probs = top_p_renorm_prob(probs, top_ps)
+        return probs
+
+    def _mtp_probs_static(self, logits, temps, top_ks, top_ps):
+        """Graph-safe variant of ``_mtp_probs_from_logits``: all inputs are
+        static GPU tensors (no python seq list, no ``.item()`` guards) so the
+        whole thing is CUDA-graph capturable. Always applies top-k/top-p renorm
+        kernels unconditionally (a seq that doesn't restrict passes top_k=vocab /
+        top_p=1, which the kernels treat as no-ops). ``temps`` [n,1], ``top_ks``
+        [n] int32, ``top_ps`` [n] float32.
+        """
+        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+        probs = torch.softmax(logits.float() / temps, dim=-1)
+        probs = top_k_renorm_prob(probs, top_ks)
+        probs = top_p_renorm_prob(probs, top_ps)
+        return probs
+
+    def _gumbel_argmax(self, q):
+        """Draw from ``q`` [n, vocab] via the Gumbel-max trick:
+        ``argmax(q / Exp(1))``. Distributionally equal to ``torch.multinomial``
+        but graph-safe -- the only randomness is ``exponential_`` (a capturable
+        RNG kernel whose Philox offset advances correctly across graph replays),
+        and ``multinomial``'s device-side distribution-validity assert (which a
+        graph would capture + replay every step) is avoided. Uses the DEFAULT
+        CUDA generator (the only one capturable inside ``torch.cuda.graph``).
+        """
+        noise = torch.empty_like(q, dtype=torch.float32).exponential_(1.0)
+        noise.clamp_min_(torch.finfo(torch.float32).tiny)
+        return (q.float() / noise).argmax(dim=-1).to(torch.int64)
+
+    @torch.inference_mode()
+    def _draft_chain_eager_sampled(self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen):
+        """Eager draft chain that SAMPLES each draft token (for rejection mode).
+
+        Same forward structure as ``_draft_chain_eager`` but instead of argmax it
+        draws each draft token from the per-seq transformed distribution ``q`` and
+        records the full per-step ``q`` so the accept step can compute
+        ``min(1, p/q)`` and the residual ``(p-q)+``. Returns
+        ``(drafts, q_dists)`` where ``drafts`` is per-seq ``[d1..dk]`` (CPU ints)
+        and ``q_dists`` is a ``[nd, k, vocab]`` GPU tensor (float32).
+        """
+        mtp = self.model.mtp
+        dev = hidden.device
+        drafts_cols = [[] for _ in range(nd)]
+        tok = torch.tensor(x1, device=dev, dtype=torch.int64)
+        cur_hidden = hidden
+        q_steps = []  # list of [nd, vocab]
+        for j in range(k):
+            for i, s in enumerate(decode_seqs):
+                s.token_ids = orig_tokens[i] + [x1[i]] + drafts_cols[i]
+                s.computed_token_num = len(s.token_ids) - 1
+                s.to_compute_token_num = 1
+            self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+            self.prepare_input(decode_seqs)
+            out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
+            logits = mtp.logits_from_hidden(out_hidden)
+            q = self._mtp_probs_from_logits(logits, decode_seqs)  # [nd, vocab]
+            # Sample one draft token per seq from q (TP-synced generator), then
+            # broadcast TP-rank-0's picks so every rank feeds the SAME token into
+            # the next draft forward (multinomial isn't TP-deterministic).
+            tok = torch.multinomial(q, num_samples=1, generator=gen).squeeze(1).to(torch.int64)
+            tok = self._mtp_bcast_tp(tok)
+            q_steps.append(q)
+            tok_cpu = tok.tolist()
+            for i in range(nd):
+                drafts_cols[i].append(tok_cpu[i])
+            cur_hidden = out_hidden
+        q_dists = torch.stack(q_steps, dim=1)  # [nd, k, vocab]
+        return drafts_cols, q_dists
+
+    @torch.inference_mode()
+    def _draft_chain_eager(self, decode_seqs, orig_tokens, x1, hidden, k, nd):
+        """Eager k-step MTP draft chain (fallback / graph-disabled path).
+
+        One D2H at the end (a ``[nd, k]`` tensor -> list) instead of a ``.item()``
+        per token per step. Returns ``drafts`` = per-seq ``[d1..dk]`` (CPU ints).
+        """
+        mtp = self.model.mtp
+        dev = hidden.device
+        drafts_cols = [[] for _ in range(nd)]   # per-seq python (for token_ids mutation)
+        tok = torch.tensor(x1, device=dev, dtype=torch.int64)
+        cur_hidden = hidden
+        step_toks = []  # list of [nd] GPU tensors
+        for j in range(k):
+            cols = [drafts_cols[i] for i in range(nd)]
+            for i, s in enumerate(decode_seqs):
+                s.token_ids = orig_tokens[i] + [x1[i]] + cols[i]
+                s.computed_token_num = len(s.token_ids) - 1
+                s.to_compute_token_num = 1
+            self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+            self.prepare_input(decode_seqs)
+            out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
+            tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
+            step_toks.append(tok)
+            # Need python token_ids for the next step's slot bookkeeping, so this
+            # step's tokens must be materialized before building step j+1. Keep a
+            # single per-step D2H (unavoidable in the eager path since positions/
+            # slots are rebuilt from python token_ids each step).
+            tok_cpu = tok.tolist()
+            for i in range(nd):
+                drafts_cols[i].append(tok_cpu[i])
+            cur_hidden = out_hidden
+        return drafts_cols
+
+    @torch.inference_mode()
+    def _draft_chain_graph(self, decode_seqs, orig_tokens, x1, hidden, k, nd):
+        """CUDA-graph k-step MTP draft chain.
+
+        Captures ONE draft-step graph per exact batch size ``nd`` (lazily) and
+        replays it k times. Between replays, tok/hidden/positions/slot_mapping/
+        seq_lens are advanced **in place on the GPU** (no Python/H2D/.item()),
+        so the whole chain has zero per-step host overhead and a single D2H at
+        the end. The captured graph runs ``mtp.forward`` over ``self.input_data``
+        with the MTP head's ``prev_hidden``/``input_ids`` aliased to static
+        buffers ``self._d_hidden``/``self._d_tok``; its argmax is written to
+        ``self._d_next_tok`` and post-block hidden to ``self._d_out_hidden``.
+
+        Requires all seqs share one page-table width and per-step positions stay
+        within the pre-allocated draft slots. Falls back is handled by the caller
+        (this is only entered when ``nd <= max bucket``).
+        """
+        dev = hidden.device
+        page_sz = self.memory_manager.page_size
+
+        # Smallest captured bucket >= nd (sorted() ascending, take the first
+        # match). Fall back to eager if this batch size wasn't captured at init.
+        bucket = None
+        for b in sorted(self._draft_size_to_graph.keys()):
+            if b >= nd:
+                bucket = b
+                break
+        if bucket is None:
+            return self._draft_chain_eager(decode_seqs, orig_tokens, x1, hidden, k, nd)
+        g = self._draft_size_to_graph[bucket]
+
+        # --- Pre-allocate all k draft slots for the real seqs (real KV lives in
+        # real pages; padded rows use the dummy page via the draft-input setup). ---
+        for i, s in enumerate(decode_seqs):
+            s.token_ids = orig_tokens[i] + [x1[i]] + [0] * (k - 1)
+            s.computed_token_num = len(orig_tokens[i])
+            s.to_compute_token_num = 1 + (k - 1)
+        self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+        for i, s in enumerate(decode_seqs):
+            s.token_ids = orig_tokens[i] + [x1[i]]
+            s.computed_token_num = len(s.token_ids) - 1
+            s.to_compute_token_num = 1
+
+        # Fill the static draft-input buffers IN PLACE for this step (the captured
+        # graph reads these exact buffers). Pad [nd:bucket] with dummy decode seqs.
+        pad_seqs = self.create_dummy_seqs(bucket - nd) if bucket > nd else []
+        graph_seqs = list(decode_seqs) + pad_seqs
+        self._draft_input.cal_and_set_input(graph_seqs)
+        self._d_nd = bucket
+        self._d_tok[:nd].copy_(torch.tensor(x1, device=dev, dtype=torch.int64))
+        if bucket > nd:
+            self._d_tok[nd:bucket].zero_()
+        self._d_hidden[:nd].copy_(hidden)
+        if bucket > nd:
+            self._d_hidden[nd:bucket].zero_()
+
+        base_pos = self._draft_input.positions[:bucket].clone()
+        block_table = self._draft_input.get_block_table()[:bucket]
+
+        def _slot_for(pos):
+            blk = block_table[torch.arange(bucket, device=dev), (pos // page_sz)]
+            return (blk.to(torch.int64) * page_sz + (pos % page_sz))
+
+        step_next = []
+        for j in range(k):
+            if j > 0:
+                self._d_tok[:bucket].copy_(self._d_next_tok[:bucket])
+                self._d_hidden[:bucket].copy_(self._d_out_hidden[:bucket])
+                new_pos = base_pos + j
+                self._draft_input.positions[:bucket].copy_(new_pos)
+                self._draft_input.slot_mapping[:bucket].copy_(_slot_for(new_pos))
+                self._draft_input.decode_seq_lens[:bucket].add_(1)
+                self._draft_input.seq_lens[:bucket].add_(1)
+            g.replay()
+            step_next.append(self._d_next_tok[:nd].clone())
+
+        mat = torch.stack(step_next, dim=1).tolist()  # [nd, k]
+        return [mat[i] for i in range(nd)]
+
+    @torch.inference_mode()
+    def _draft_chain_graph_sampled(self, decode_seqs, orig_tokens, x1, hidden, k, nd):
+        """CUDA-graph k-step SAMPLED (rejection) MTP draft chain.
+
+        Mirrors :meth:`_draft_chain_graph` but replays the sampled draft step
+        (Gumbel-max draw + q-dist stash). Between replays the drawn token is
+        broadcast across TP (host side, OUTSIDE the graph) so every rank feeds
+        the same token into the next step -- the Gumbel-max RNG (default CUDA
+        generator, captured) is not guaranteed identical across ranks, so we
+        sync the token explicitly rather than rely on RNG lockstep. Returns
+        ``(drafts, q_dists)`` -- ``drafts`` per-seq ``[d1..dk]`` (CPU ints),
+        ``q_dists`` ``[nd, k, vocab]`` (the per-step draw distribution the accept
+        step keys into). Falls back to eager if the bucket wasn't captured.
+        """
+        dev = hidden.device
+        page_sz = self.memory_manager.page_size
+        bucket = None
+        for b in sorted(self._draft_size_to_graph_sampled.keys()):
+            if b >= nd:
+                bucket = b
+                break
+        if bucket is None:
+            gen = self._mtp_rng_step(dev)
+            return self._draft_chain_eager_sampled(
+                decode_seqs, orig_tokens, x1, hidden, k, nd, gen
+            )
+        g = self._draft_size_to_graph_sampled[bucket]
+
+        # Pre-allocate all k draft slots (same as the greedy graph path).
+        for i, s in enumerate(decode_seqs):
+            s.token_ids = orig_tokens[i] + [x1[i]] + [0] * (k - 1)
+            s.computed_token_num = len(orig_tokens[i])
+            s.to_compute_token_num = 1 + (k - 1)
+        self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+        for i, s in enumerate(decode_seqs):
+            s.token_ids = orig_tokens[i] + [x1[i]]
+            s.computed_token_num = len(s.token_ids) - 1
+            s.to_compute_token_num = 1
+
+        pad_seqs = self.create_dummy_seqs(bucket - nd) if bucket > nd else []
+        graph_seqs = list(decode_seqs) + pad_seqs
+        self._draft_input.cal_and_set_input(graph_seqs)
+        self._d_nd = bucket
+        self._d_tok[:nd].copy_(torch.tensor(x1, device=dev, dtype=torch.int64))
+        if bucket > nd:
+            self._d_tok[nd:bucket].zero_()
+        self._d_hidden[:nd].copy_(hidden)
+        if bucket > nd:
+            self._d_hidden[nd:bucket].zero_()
+        # Fill per-seq sampling params into the static buffers the graph reads.
+        V = self.memory_manager.vocab_size
+        self._d_temp[:nd, 0].copy_(torch.tensor(
+            [s.temperature if s.temperature > 1e-5 else 1.0 for s in decode_seqs],
+            device=dev, dtype=torch.float32))
+        self._d_topk[:nd].copy_(torch.tensor(
+            [s.top_k if s.top_k != -1 else V for s in decode_seqs],
+            device=dev, dtype=torch.int32))
+        self._d_topp[:nd].copy_(torch.tensor(
+            [s.top_p for s in decode_seqs], device=dev, dtype=torch.float32))
+        if bucket > nd:  # padded rows: harmless greedy-ish params
+            self._d_temp[nd:bucket].fill_(1.0)
+            self._d_topk[nd:bucket].fill_(V)
+            self._d_topp[nd:bucket].fill_(1.0)
+
+        base_pos = self._draft_input.positions[:bucket].clone()
+        block_table = self._draft_input.get_block_table()[:bucket]
+
+        def _slot_for(pos):
+            blk = block_table[torch.arange(bucket, device=dev), (pos // page_sz)]
+            return (blk.to(torch.int64) * page_sz + (pos % page_sz))
+
+        step_next = []
+        step_q = []
+        for j in range(k):
+            if j > 0:
+                self._d_tok[:bucket].copy_(self._d_next_tok[:bucket])
+                self._d_hidden[:bucket].copy_(self._d_out_hidden[:bucket])
+                new_pos = base_pos + j
+                self._draft_input.positions[:bucket].copy_(new_pos)
+                self._draft_input.slot_mapping[:bucket].copy_(_slot_for(new_pos))
+                self._draft_input.decode_seq_lens[:bucket].add_(1)
+                self._draft_input.seq_lens[:bucket].add_(1)
+            g.replay()
+            # TP-sync the drawn token (Gumbel RNG isn't guaranteed identical
+            # across ranks); broadcast BEFORE it seeds the next step's forward.
+            self._mtp_bcast_tp(self._d_next_tok[:bucket])
+            step_next.append(self._d_next_tok[:nd].clone())
+            step_q.append(self._d_q[:nd].clone())
+
+        mat = torch.stack(step_next, dim=1).tolist()  # [nd, k]
+        q_dists = torch.stack(step_q, dim=1)           # [nd, k, vocab]
+        return [mat[i] for i in range(nd)], q_dists
+
+    @torch.inference_mode()
+    def _ensure_draft_buffers(self):
+        """Allocate the static MTP-draft-step buffers + aliasing InputData once."""
+        if self._draft_input is not None:
+            return
+        dev = torch.cuda.current_device()
+        B = max(self.capture_sizes)
+        H = self.hidden_size
+        dt = self.output_hidden_states.dtype
+        self._d_tok = torch.zeros(B, dtype=torch.int64, device=dev)
+        self._d_hidden = torch.zeros((B, H), dtype=dt, device=dev)
+        self._d_next_tok = torch.zeros(B, dtype=torch.int64, device=dev)
+        self._d_out_hidden = torch.zeros((B, H), dtype=dt, device=dev)
+        # Sampled-draft (rejection sampling) static buffers: per-seq sampling
+        # params + the drawn q distribution the accept step reads. Vocab-wide q
+        # is the only large one (B*vocab); allocated once, reused across replays.
+        if self._mtp_can_sample:
+            V = self.memory_manager.vocab_size
+            self._d_temp = torch.ones((B, 1), dtype=torch.float32, device=dev)
+            self._d_topk = torch.full((B,), V, dtype=torch.int32, device=dev)
+            self._d_topp = torch.ones((B,), dtype=torch.float32, device=dev)
+            self._d_q = torch.zeros((B, V), dtype=torch.float32, device=dev)
+        self._draft_input = InputData(
+            max_running_seqs=self.max_running_seqs,
+            max_seq_length=self.model_max_length,
+            memory_manager=self.memory_manager,
+            use_buffer=True,
+        )
+
+    @torch.inference_mode()
+    def _capture_draft_graphs(self, memory_pool, stream):
+        """Capture one MTP draft-step graph per decode bucket (init-time).
+
+        Mirrors the decode-graph capture: per bucket, set up the draft-input with
+        dummy decode seqs (KV -> dummy page), seed the static ``_d_*`` buffers,
+        warm up eager once (DeepGEMM/FlashInfer JIT), then capture
+        ``_draft_step_forward`` on the shared capture ``stream``/``pool``. Replay
+        (``_draft_chain_graph``) later updates the same buffers in place.
+        """
+        self._ensure_draft_buffers()
+        iterator = self.capture_sizes
+        if get_local_rank() == 0:
+            logger.info(
+                f"Capturing MTP draft CUDA graphs for bucket sizes: "
+                f"{list(reversed(self.capture_sizes))}"
+            )
+            iterator = tqdm(
+                self.capture_sizes, desc="Capturing MTP Draft Graphs", ncols=100
+            )
+        for bucket in iterator:
+            seqs = self.create_dummy_seqs(bucket)
+            self._draft_input.cal_and_set_input(seqs)
+            self._d_nd = bucket
+            # seed dummy head inputs
+            self._d_tok[:bucket].zero_()
+            self._d_hidden[:bucket].zero_()
+            # warm up JIT outside capture
+            self._draft_step_forward()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
+                self._draft_step_forward()
+            self._draft_size_to_graph[bucket] = g
+            # Also capture the sampled (rejection) draft step when enabled, so
+            # sampling requests get a graphed draft too (Gumbel-max, graph-safe).
+            if self._mtp_can_sample:
+                self._d_temp[:bucket].fill_(1.0)
+                self._d_topk[:bucket].fill_(self.memory_manager.vocab_size)
+                self._d_topp[:bucket].fill_(1.0)
+                self._draft_step_forward_sampled()
+                torch.cuda.synchronize()
+                gs = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cuda_graph=gs, pool=memory_pool, stream=stream):
+                    self._draft_step_forward_sampled()
+                self._draft_size_to_graph_sampled[bucket] = gs
+
+    @torch.inference_mode()
+    def _draft_step_forward(self):
+        """One MTP draft step over the static draft buffers (captured/replayed).
+
+        Reads ``self._draft_input`` (positions/slot/seq_lens/block already set),
+        ``self._d_hidden`` (prev hidden), ``self._d_tok`` (input token); writes
+        argmax to ``self._d_next_tok`` and post-norm hidden to ``self._d_out_hidden``.
+        """
+        nd = self._d_nd
+        mtp = self.model.mtp
+        out_hidden = mtp.forward(self._draft_input, self._d_hidden[:nd], self._d_tok[:nd])
+        self._d_out_hidden[:nd].copy_(out_hidden)
+        tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
+        self._d_next_tok[:nd].copy_(tok)
+
+    @torch.inference_mode()
+    def _draft_step_forward_sampled(self):
+        """Sampled (rejection) MTP draft step over the static buffers.
+
+        Like :meth:`_draft_step_forward` but draws the draft token from the
+        temperature/top-k/top-p transformed distribution via Gumbel-max (graph-
+        safe) instead of argmax, and stashes that distribution ``q`` into
+        ``_d_q`` (the accept step needs it for ``min(1,p/q)`` + residual). The
+        per-seq sampling params (``_d_temp``/``_d_topk``/``_d_topp``) are static
+        buffers filled before each replay. RNG uses the default CUDA generator
+        (advances across replays); TP consistency is enforced by broadcasting the
+        drawn token between replays in :meth:`_draft_chain_graph_sampled` (host
+        side, outside the graph).
+        """
+        nd = self._d_nd
+        mtp = self.model.mtp
+        out_hidden = mtp.forward(self._draft_input, self._d_hidden[:nd], self._d_tok[:nd])
+        self._d_out_hidden[:nd].copy_(out_hidden)
+        logits = mtp.logits_from_hidden(out_hidden)
+        q = self._mtp_probs_static(
+            logits, self._d_temp[:nd], self._d_topk[:nd], self._d_topp[:nd]
+        )
+        self._d_q[:nd].copy_(q)
+        self._d_next_tok[:nd].copy_(self._gumbel_argmax(q))
+
+    def _create_dummy_verify_seqs(self, nd: int, qlen: int, ctx: int = 1):
+        """Build ``nd`` dummy MTP-verify seqs (each: ``ctx`` cached + ``qlen`` new).
+
+        Each seq references the memory manager's dummy page (all KV reads/writes
+        land there harmlessly), is flagged ``_mtp_verify`` so ``cal_input``
+        classifies the batch as verify (prefill-with-context, fp8 decode-sparse
+        selector + kernel), and has ``computed_token_num=ctx`` /
+        ``to_compute_token_num=qlen`` so ``prepare_input`` builds the exact
+        uniform 1+k shape the captured graph expects.
+        """
+        dummy_page = self.memory_manager.dummy_page
+        seqs = []
+        for i in range(nd):
+            s = Sequence(i, [1] * (ctx + qlen), [], output_len=1)
+            s.prompt_len = ctx + qlen
+            # Enough pages to cover ctx+qlen tokens, all the dummy page.
+            npages = (ctx + qlen + self.page_size - 1) // self.page_size
+            s.page_table = [dummy_page] * npages
+            s.computed_token_num = ctx
+            s.to_compute_token_num = qlen
+            s._mtp_verify = True
+            seqs.append(s)
+        return seqs
+
+    @torch.inference_mode()
+    def _capture_verify_graphs(self, memory_pool, stream):
+        """Capture the full MTP-verify forward per decode bucket (init-time).
+
+        The verify forward (target model over the uniform 1+k query per decode
+        seq) is 99% of MTP step time and pure eager per-layer launch overhead.
+        Capture ``self.forward()`` at each bucket into a graph keyed by bucket
+        size; ``_mtp_decode`` pads the real verify batch up to a bucket and
+        replays. Uses the fp8 decode-sparse verify kernel + batched selector,
+        both graph-safe (the selector reads only static-buffer views; the kernel
+        + ``get_mla_metadata`` already run inside the captured decode graph).
+        """
+        qlen = 1 + self._verify_k
+        iterator = self.capture_sizes
+        if get_local_rank() == 0:
+            logger.info(
+                f"Capturing MTP verify CUDA graphs (qlen={qlen}) for bucket sizes: "
+                f"{list(reversed(self.capture_sizes))}"
+            )
+            iterator = tqdm(
+                self.capture_sizes, desc="Capturing MTP Verify Graphs", ncols=100
+            )
+        for bucket in iterator:
+            seqs = self._create_dummy_verify_seqs(bucket, qlen)
+            self.input_data.cal_and_set_input(seqs=seqs)
+            # warm up JIT (DeepGEMM/FlashInfer per-M-bucket) outside capture
+            self.forward()
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
+                self.forward()
+            self._verify_size_to_graph[bucket] = g
+
+    @torch.inference_mode()
+    def _verify_forward_graph(self, decode_seqs, orig_tokens, x1, drafts, nd, kk):
+        """Run the verify forward via a captured graph if the batch fits a bucket.
+
+        Sets up ``decode_seqs`` as the uniform ``1+kk`` verify batch, selects the
+        smallest captured bucket >= nd, pads [nd:bucket] with dummy verify seqs,
+        fills the static ``input_data`` buffers, replays, and returns the
+        target's greedy predictions ``v_pred`` (per verify-token) + the
+        ``query_start_loc`` list -- matching the eager path's contract. Returns
+        ``None`` when no bucket fits (caller falls back to eager).
+        """
+        qlen = 1 + kk
+        if qlen != 1 + self._verify_k:
+            return None  # only the captured qlen is supported
+        bucket = None
+        for b in sorted(self._verify_size_to_graph.keys()):
+            if b >= nd:
+                bucket = b
+                break
+        if bucket is None:
+            return None
+
+        for i, s in enumerate(decode_seqs):
+            s.token_ids = orig_tokens[i] + [x1[i]] + drafts[i]
+            s.computed_token_num = len(orig_tokens[i])
+            s.to_compute_token_num = qlen
+            s._mtp_verify = True
+        self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+        pad_seqs = (
+            self._create_dummy_verify_seqs(bucket - nd, qlen) if bucket > nd else []
+        )
+        graph_seqs = list(decode_seqs) + pad_seqs
+        self.prepare_input(graph_seqs)
+        self._verify_size_to_graph[bucket].replay()
+        num_real = nd * qlen
+        v_hidden = self.output_hidden_states[:num_real]
+        v_pred = self.model.logits_from_hidden(v_hidden).argmax(dim=-1).cpu().tolist()
+        # query_start_loc over the REAL seqs only (uniform qlen).
+        qsl = [i * qlen for i in range(nd + 1)]
+        return v_pred, qsl, v_hidden
+
+
+    @torch.inference_mode()
+    def _mtp_decode(self, hidden: torch.Tensor, x1_tokens: list):
+        """MTP speculative decode for a pure-decode batch (greedy, correct-first).
+
+        Returns a list (len == batch size) of per-seq committed-token lists. For
+        decode seqs the list is the accepted prefix + bonus (1..k+1 tokens); any
+        non-decode seq keeps its single ``x1`` token.
+
+        Correctness model (greedy): with a greedy target and greedy draft, the
+        accepted tokens are exactly the tokens the target would have produced
+        one-at-a-time, so committing them is identical to non-speculative greedy
+        decoding. KV for committed tokens is written by the verify forward into
+        the seqs' real slots; rejected-tail slots are simply overwritten next
+        step (seq length only advances by the accepted count).
+        """
+        nd = self.input_data.num_decodes
+        k = self._mtp_k
+        mtp = self.model.mtp
+        decode_seqs = self.input_data.seqs[:nd]
+        dev = hidden.device
+        # ``hidden`` is a view into the persistent output_hidden_states buffer;
+        # clone so subsequent forwards (draft/verify) can't mutate it underfoot.
+        hidden = hidden[:nd].clone()
+
+        x1 = [int(x1_tokens[i]) for i in range(nd)]
+        # x1 is already TP-synchronized by ``step_once`` (it broadcasts the
+        # sampled x1 from TP-rank-0 before calling this method whenever sampling
+        # is active), so no broadcast here. Runtime dispatch: if ANY seq in the
+        # batch samples (temperature != 1 or top_k != 1) take the lossless
+        # rejection path; an all-greedy batch takes the argmax fast path. No env
+        # flag -- purely data-driven.
+        _rej_active = self._mtp_can_sample and any(
+            (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5) or s.top_k != 1
+            for s in decode_seqs
+        )
+        # Original committed token_ids / lengths / page tables (pre spec-mutation).
+        orig_tokens = [s.token_ids[:] for s in decode_seqs]
+        orig_ctn = [s.computed_token_num for s in decode_seqs]
+        orig_tctn = [s.to_compute_token_num for s in decode_seqs]
+        orig_pages = [s.page_table[:] for s in decode_seqs]
+
+        def restore():
+            # NOTE: deliberately do NOT restore page_table. The verify forward
+            # wrote each committed token's KV into the pages allocated during
+            # verify; the scheduler will commit ``m`` tokens and must keep those
+            # exact pages so the next decode step reads valid KV. Restoring the
+            # page_table here would orphan the verify pages and let the scheduler
+            # hand out different physical slots (garbage KV) -> divergence.
+            for i, s in enumerate(decode_seqs):
+                s.token_ids = orig_tokens[i][:]
+                s.computed_token_num = orig_ctn[i]
+                s.to_compute_token_num = orig_tctn[i]
+                s._mtp_verify = False
+
+        # --- 1. Draft k tokens per seq by looping the MTP head. ---
+        # Two paths: a CUDA-graph replay path (``_mtp_draft_graph``) that captures
+        # one draft-step graph per decode bucket and replays it k times with
+        # in-place GPU buffer advance (no per-step Python / H2D / .item()); and an
+        # eager fallback. Both produce ``drafts`` = per-seq [d1..dk] on CPU.
+        # ``_rej_active`` (computed above for the x1 broadcast) also selects the
+        # sampling draft chain, which keeps the per-step draft dist ``q``.
+        _use_rej = _rej_active
+        q_dists = None
+        # One TP-synced generator per MTP step, used by BOTH the eager sampled
+        # draft chain (if taken) AND the accept-step residual/bonus draws below.
+        # (The graph draft path uses the default CUDA generator internally and
+        # broadcasts its tokens, so it doesn't consume ``gen``.)
+        gen = self._mtp_rng_step(dev) if _use_rej else None
+        if _use_rej:
+            # Sampling draft chain: prefer the captured Gumbel-max graph (draft
+            # forward + sampling in-graph, token broadcast between replays); fall
+            # back to eager when graphs are off or the batch exceeds the max
+            # bucket. Both draw from q and keep the per-step q dist for accept.
+            if (
+                self._mtp_draft_graph
+                and self._draft_size_to_graph_sampled
+                and nd <= max(self._draft_size_to_graph_sampled.keys())
+            ):
+                drafts, q_dists = self._draft_chain_graph_sampled(
+                    decode_seqs, orig_tokens, x1, hidden, k, nd
+                )
+            else:
+                drafts, q_dists = self._draft_chain_eager_sampled(
+                    decode_seqs, orig_tokens, x1, hidden, k, nd, gen
+                )
+        elif self._mtp_draft_graph and self.capture_sizes and nd <= max(self.capture_sizes):
+            drafts = self._draft_chain_graph(decode_seqs, orig_tokens, x1, hidden, k, nd)
+        else:
+            drafts = self._draft_chain_eager(decode_seqs, orig_tokens, x1, hidden, k, nd)
+        restore()
+
+        # --- 2. Verify: one base forward over [x1, d1..dk] per seq. ---
+        kk = len(drafts[0]) if nd else 0  # actual drafts per seq
+        # Fast path: replay the captured verify graph (collapses the eager
+        # per-layer launch overhead). Only when MTP verify graphs are captured
+        # and the batch fits a bucket; falls back to the eager forward otherwise.
+        _v_done = False
+        if (
+            self._mtp_verify_graph
+            and self._verify_size_to_graph
+            and nd <= max(self._verify_size_to_graph.keys())
+        ):
+            _res = self._verify_forward_graph(decode_seqs, orig_tokens, x1, drafts, nd, kk)
+            if _res is not None:
+                v_pred, qsl, v_hidden = _res
+                _v_done = True
+        if not _v_done:
+            for i, s in enumerate(decode_seqs):
+                s.token_ids = orig_tokens[i] + [x1[i]] + drafts[i]  # +1+kk new
+                s.computed_token_num = len(orig_tokens[i])          # context cached
+                s.to_compute_token_num = 1 + kk
+                s._mtp_verify = True   # force the prefill-with-context attn path
+            self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+            self.prepare_input(decode_seqs)
+            v_out = self.model(self.input_data)
+            v_hidden = v_out[0] if isinstance(v_out, tuple) else v_out
+            v_pred = self.model.logits_from_hidden(v_hidden).argmax(dim=-1).cpu().tolist()
+            qsl = self.input_data.get_query_start_loc().cpu().tolist()  # [nd+1]
+
+        # Rejection mode: build the target dist ``p`` at each of the 1+kk verify
+        # positions from the verify hidden. ``v_hidden`` rows are laid out
+        # [seq0: x1,d1..dk | seq1: ...] (qsl gives the per-seq start). We need the
+        # transformed p for every position; the per-position seq is the decode
+        # seq owning that row (uniform 1+kk per seq for the verify batch).
+        p_dists = None
+        if _use_rej:
+            num_v = nd * (1 + kk)
+            v_logits = self.model.logits_from_hidden(v_hidden[:num_v])
+            per_row_seqs = []
+            for i in range(nd):
+                per_row_seqs.extend([decode_seqs[i]] * (1 + kk))
+            p_dists = self._mtp_probs_from_logits(v_logits, per_row_seqs)  # [num_v, vocab]
+
+        # --- 3. Greedy accept per seq. ---
+        # Verify inputs per seq are [x1, d1..dk] at positions start..start+k.
+        # v_pred[start+p] = target's greedy token AFTER consuming input p. So the
+        # target's token following x1 is v_pred[start+0]; accept d_{p+1} iff it
+        # equals v_pred[start+p]. Commit x1 always; append accepted drafts; the
+        # bonus token is the target prediction at the first rejection (or after
+        # the last accepted draft).
+        # Commit x1 + the longest prefix of drafts the target agrees with. We do
+        # NOT commit a trailing "bonus"/corrected token: the next normal decode
+        # step produces it through the exact decode path, avoiding any reliance
+        # on the verify forward's prediction at the last (post-drafts) position.
+        # Every committed token here was a verify INPUT, so its KV is valid.
+        # Size to ``nd`` (the real decode seqs captured at entry). The graph path
+        # leaves ``self.input_data.seqs`` holding bucket-padded seqs, so it is no
+        # longer a reliable count here -- use ``nd`` directly. This batch is pure
+        # decode/verify (no real non-decode seqs), so there is no tail to fill.
+        results = [None] * nd
+        n_accepted = [0] * nd   # accepted DRAFT tokens per seq (excludes x1/bonus)
+        _fused_stash = self._mtp_fused  # relay bonus+hidden for next step's draft
+        new_relay = {} if _fused_stash else None
+
+        if _use_rej:
+            # --- 3b. Rejection-sampling accept (distribution-lossless). ---
+            # x1 is already a proper target sample (step_once's sampler), always
+            # committed. For each draft d_p ~ q, accept with prob min(1, p/q);
+            # on reject, resample the position from the residual (p-q)+ and stop;
+            # if all accepted, sample a bonus from p at the last position.
+            #
+            # Bonus handling matches the fused/non-fused split of the GREEDY path:
+            #   * non-fused: append the bonus to ``committed`` (it rides the
+            #     scheduler's uncached-tail path -- reprocessed next decode step).
+            #   * fused: DON'T commit the bonus this step; relay (bonus_tok,
+            #     bonus_hidden) as the NEXT step's x1 (committed there). Committing
+            #     it both here AND as next-step x1 would double-emit it (observed
+            #     as token repetition). ``bonus_hidden`` is the verify hidden at
+            #     the last-accepted position (start+na) -- exactly the state the
+            #     bonus was sampled from, so it correctly seeds the next draft.
+            px_all = p_dists  # [num_v, vocab]
+            # Pre-draw one uniform per (seq, draft-pos) on the TP-synced generator.
+            u = torch.rand((nd, kk), generator=gen, device=dev) if kk > 0 else None
+            u_cpu = u.cpu().tolist() if u is not None else [[] for _ in range(nd)]
+            for i, s in enumerate(decode_seqs):
+                start = qsl[i]
+                committed = [x1[i]]
+                na = 0
+                rejected_at = None
+                for p in range(kk):
+                    d = drafts[i][p]
+                    qx = float(q_dists[i, p, d])
+                    px = float(px_all[start + p, d])
+                    ratio = 1.0 if qx <= 0 else min(1.0, px / qx)
+                    if u_cpu[i][p] < ratio:
+                        committed.append(d)
+                        na += 1
+                    else:
+                        rejected_at = p
+                        break
+                if rejected_at is not None:
+                    # Residual (p - q)+ at the rejection position, renormalized.
+                    resid = torch.clamp(
+                        px_all[start + rejected_at] - q_dists[i, rejected_at], min=0
+                    )
+                    tot = float(resid.sum())
+                    if tot <= 1e-12:
+                        # Degenerate (p==q on support): fall back to sampling p.
+                        resid = px_all[start + rejected_at]
+                    bonus = int(torch.multinomial(resid, 1, generator=gen).item())
+                else:
+                    # All drafts accepted: sample the bonus from p at the tail.
+                    bonus = int(torch.multinomial(px_all[start + kk], 1, generator=gen).item())
+                if _fused_stash:
+                    # Relay the bonus as next step's x1; do NOT commit it now.
+                    new_relay[s.seq_id] = (bonus, v_hidden[start + na].clone())
+                else:
+                    committed.append(bonus)
+                n_accepted[i] = na
+                results[i] = committed
+            # The accept decisions used per-rank distributions (p/q differ by fp
+            # all-reduce epsilon across TP ranks) + per-rank RNG draws, so
+            # ``results`` / ``n_accepted`` / the relayed bonus can diverge. Make
+            # TP-rank-0's decisions authoritative: broadcast a padded token grid
+            # (committed lists) + the relayed bonus token, then every rank rebuilds
+            # identical state. (Draft tokens were already broadcast; the accept +
+            # bonus draws happen here.)
+            if get_tp_size() > 1:
+                # ``results`` holds [x1 + accepted_drafts] (+ bonus only when NOT
+                # fused). Max len = x1 + kk drafts + (bonus if not fused).
+                maxlen = kk + 1 + (0 if _fused_stash else 1)
+                grid = torch.full((nd, maxlen), -1, dtype=torch.int64, device=dev)
+                lens = torch.zeros(nd, dtype=torch.int64, device=dev)
+                bonus_t = torch.zeros(nd, dtype=torch.int64, device=dev)
+                if get_tp_rank() == 0:
+                    for i in range(nd):
+                        c = results[i]
+                        lens[i] = len(c)
+                        grid[i, : len(c)] = torch.tensor(c, dtype=torch.int64, device=dev)
+                        if _fused_stash:
+                            bonus_t[i] = new_relay[decode_seqs[i].seq_id][0]
+                src = get_rank() - get_tp_rank()
+                dist.broadcast(lens, src=src, group=get_ipc_tp_group())
+                dist.broadcast(grid, src=src, group=get_ipc_tp_group())
+                if _fused_stash:
+                    dist.broadcast(bonus_t, src=src, group=get_ipc_tp_group())
+                lens_cpu = lens.cpu().tolist()
+                grid_cpu = grid.cpu().tolist()
+                bonus_cpu = bonus_t.cpu().tolist()
+                for i in range(nd):
+                    n = lens_cpu[i]
+                    results[i] = grid_cpu[i][:n]
+                    # committed = [x1] + accepted_drafts (+ bonus if not fused).
+                    # n_accepted = accepted drafts = n - x1(1) - (bonus if in results).
+                    n_accepted[i] = max(0, n - (1 if _fused_stash else 2))
+                    if _fused_stash:
+                        # Adopt rank-0's bonus token; keep this rank's own hidden
+                        # (only seeds the next draft, whose token is broadcast).
+                        _, h = new_relay[decode_seqs[i].seq_id]
+                        new_relay[decode_seqs[i].seq_id] = (bonus_cpu[i], h)
+        else:
+            # --- 3. Greedy accept per seq. ---
+            # Verify inputs per seq are [x1, d1..dk] at positions start..start+k.
+            # v_pred[start+p] = target's greedy token AFTER consuming input p. So the
+            # target's token following x1 is v_pred[start+0]; accept d_{p+1} iff it
+            # equals v_pred[start+p]. Commit x1 + the longest prefix of drafts the
+            # target agrees with. We do NOT commit a trailing "bonus"/corrected
+            # token: it has no KV (it was never a verify INPUT, only a prediction),
+            # so committing it would leave the next decode step reading garbage KV
+            # for it (divergence). The next normal decode step reproduces it
+            # through the exact decode path instead. (Fused relays the bonus as the
+            # next step's x1, where it IS committed once -- see the stash below.)
+            for i, s in enumerate(decode_seqs):
+                start = qsl[i]
+                committed = [x1[i]]
+                na = 0
+                for p in range(kk):
+                    tgt = v_pred[start + p]
+                    if tgt == drafts[i][p]:
+                        committed.append(drafts[i][p])
+                        na += 1
+                    else:
+                        break
+                n_accepted[i] = na
+                results[i] = committed
+                if _fused_stash:
+                    # Bonus = target's prediction AFTER the last accepted token, at
+                    # verify position ``start + na`` (na accepted drafts => x1 + na
+                    # tokens consumed => the (na)-th prediction is the next token).
+                    # This bonus token + its verify hidden seed the NEXT step's draft,
+                    # replacing the separate decode forward. bonus_tok is greedily
+                    # deterministic and equals the token a decode forward would emit,
+                    # so committed token streams are byte-identical to the unfused
+                    # path; only the draft-seed hidden differs (verify vs decode
+                    # kernel, epsilon) which can only change acceptance, not output.
+                    bonus_tok = int(v_pred[start + na])
+                    bonus_hidden = v_hidden[start + na].clone()
+                    new_relay[s.seq_id] = (bonus_tok, bonus_hidden)
+
+        self._record_mtp_metrics(nd, kk, n_accepted)
+
+        if _fused_stash:
+            # Replace the relay map wholesale so seqs absent from this batch are
+            # evicted (their stale hidden must never seed a later draft).
+            self._mtp_relay = new_relay
+
+        restore()
+        return results
+
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
+        # Fused MTP fast path: when every seq in a pure-decode batch carries relay
+        # state from the immediately-preceding step, skip the leading x1-decode
+        # forward entirely -- the previous verify already produced each seq's
+        # bonus token + hidden, which seed this step's draft. One target forward
+        # (verify) per step instead of two. Falls back to the normal path (which
+        # runs the decode forward and stashes relay) on any relay miss.
+        if (
+            self._mtp_fused
+            and dp_padded_size is None
+            and not is_dp_attn()
+            and is_last_pp_rank()
+            and self.input_data.num_prefills == 0
+            and self.input_data.num_decodes > 0
+            and self.check_decode_batch()
+        ):
+            seqs = self.input_data.seqs[: self.input_data.num_decodes]
+            if seqs and all(s.seq_id in self._mtp_relay for s in seqs):
+                relay = [self._mtp_relay[s.seq_id] for s in seqs]
+                x1 = [r[0] for r in relay]
+                hidden = torch.stack([r[1] for r in relay], dim=0)
+                # Fused bypasses the sampler/logprobs block below; the relayed
+                # x1 (last step's bonus) is committed by ``_mtp_decode``. Works
+                # for both greedy (bonus = argmax) and sampling (bonus = the
+                # rejection resample), since the sampling accept relays-not-commits
+                # the bonus when fused (no double-commit).
+                self._last_logprobs = None
+                return self._mtp_decode(hidden, x1)
         if dp_padded_size is not None:
             # DP+EP CUDA-graph decode: every group pads to the *same*
             # group-wide bucket (chosen by the driver via ``dp_select_bucket``)
@@ -1868,6 +2905,40 @@ class ModelRunner:
             # the collective balanced; every rank has the same real seqs, so
             # they compute identical data and only tp0's copy is shipped.
             self._compute_prompt_logprobs(seqs, hidden)
+            # MTP speculative decoding: on a pure-decode batch, draft k tokens
+            # per seq with the MTP head and verify them with one base forward,
+            # committing the accepted prefix. Returns per-seq token LISTS.
+            if (getattr(self.model, "mtp", None) is not None
+                    and self._mtp_k > 0
+                    and self.input_data.num_prefills == 0
+                    and self.input_data.num_decodes > 0):
+                # x1 (this decode batch's first target token) was just sampled by
+                # the per-rank sampler above. Under GREEDY (top_k==1 -> argmax) it
+                # is TP-deterministic, but under SAMPLING each TP rank draws
+                # independently -> x1 diverges -> the draft/verify forwards in
+                # ``_mtp_decode`` get different inputs -> the seq token_ids diverge
+                # -> next-iter scheduling / overlap ``_gpu_pending`` depth diverges
+                # across ranks -> NCCL deadlock. MTP's whole sync design assumes
+                # TP-identical tokens. So when any seq samples, make TP-rank-0's x1
+                # authoritative before ``_mtp_decode`` touches the model. (This is
+                # independent of rejection sampling -- plain sampling + MTP needs
+                # it too.) Greedy skips the broadcast (argmax already matches).
+                nd_dec = self.input_data.num_decodes
+                dec_seqs = self.input_data.seqs[:nd_dec]
+                _sampling = any(
+                    (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5)
+                    or s.top_k != 1
+                    for s in dec_seqs
+                )
+                if _sampling and get_tp_size() > 1:
+                    x1_t = torch.tensor(
+                        next_tokens[:nd_dec], dtype=torch.int64, device=hidden.device
+                    )
+                    self._mtp_bcast_tp(x1_t)
+                    x1_list = x1_t.tolist()
+                    for _i in range(nd_dec):
+                        next_tokens[_i] = x1_list[_i]
+                return self._mtp_decode(hidden, next_tokens)
             return next_tokens
         return (
             self.output_hidden_states[:num_cal_tokens],
@@ -2202,9 +3273,27 @@ class OverlapModelRunner(ModelRunner):
             # holds full logits, so only it computes/stages logprobs.
             lp_k = None
             lp_gpu = None
-            if is_output_rank():
+            # Determinism/deadlock note: ``compute_logits`` all-gathers, so EVERY
+            # TP rank holds full logits and CAN sample. Historically only the
+            # output rank sampled (others received the broadcast), but under
+            # non-greedy sampling that made the output rank do a heavier kernel
+            # (multi-round rejection sampling) than its peers every step. In the
+            # overlap pipeline that per-rank GPU-time asymmetry lets ranks drift
+            # out of lockstep, and the get_tp_group collective sequence
+            # (graph all-reduce -> LM-head all-gather -> token broadcast) then
+            # interleaves across iterations -> NCCL deadlock (greedy's argmax is
+            # cheap enough to hide it, which is why it only surfaced with
+            # sampling). Fix: run the SAMPLER on every rank so the per-iteration
+            # GPU work + collective cadence is identical across ranks. The result
+            # still diverges by fp all-reduce epsilon (sampling amplifies it), so
+            # the broadcast below keeps the output rank's draw authoritative for
+            # correctness -- but the timing is now symmetric, which is what makes
+            # the pipeline deadlock-free by construction.
+            _all_greedy = all(s.top_k == 1 for s in self.input_data.seqs)
+            _sample_here = is_output_rank() or not _all_greedy
+            if _sample_here:
                 seqs = self.input_data.seqs
-                if any(s.logprobs_enabled for s in seqs):
+                if is_output_rank() and any(s.logprobs_enabled for s in seqs):
                     lp_k = min(
                         self._max_top_logprobs,
                         max(
@@ -2216,9 +3305,10 @@ class OverlapModelRunner(ModelRunner):
                         logits, self.input_data, True, lp_k
                     )
                 else:
-                    next_tokens_gpu = self.sampler.forward_gpu(
-                        logits, self.input_data
-                    )
+                    _nt = self.sampler.forward_gpu(logits, self.input_data)
+                    # Non-output ranks discard their own draw (only run it for
+                    # timing symmetry); the broadcast overwrites it anyway.
+                    next_tokens_gpu = _nt
             # Prompt logprobs accumulate directly onto the (real) seqs; the
             # scheduler ships the completed list once the prompt finishes
             # prefill. Gated inside the helper on ``prompt_logprobs_enabled``.

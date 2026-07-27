@@ -46,6 +46,7 @@ own per-column ``SchedulePayload`` to its PP-other followers), but
 to the (also-refactored) :class:`gllm.worker.Worker` path.
 """
 
+import os
 from collections import deque
 
 from gllm.dist_utils import (
@@ -80,6 +81,17 @@ class OverlapWorker(Worker):
         # Fixed after ``init``: DP-attention + EP needs the per-iter cross-DP
         # barrier + dummy-batch lockstep in ``run_pp0``; plain TP does not.
         self._dp = is_dp_attn()
+        # MTP speculative decoding runs a synchronous draft->verify->accept block
+        # (``ModelRunner._mtp_decode`` via ``step_once``) that needs committed CPU
+        # token ids and rebuilds ``self.input_data`` in place -- incompatible with
+        # the future-map/placeholder GPU relay pipeline. When active we route the
+        # pure-decode (verify) batches through the synchronous ``step_once`` path
+        # (mirrors the non-overlap worker), so MTP works under overlap scheduling
+        # while still reusing the target x1-decode CUDA graph.
+        self._mtp_active = (
+            getattr(self.model_runner, "_mtp_k", 0) > 0
+            and getattr(self.model_runner.model, "mtp", None) is not None
+        )
 
     def _init_role_state(self):
         """Override base setup: every PP=0 TP rank gets an OverlapScheduler.
@@ -219,6 +231,56 @@ class OverlapWorker(Worker):
         while self._gpu_pending:
             self._collect_batch(self._gpu_pending.popleft())
 
+    def _run_mtp_sync(self) -> None:
+        """Run one MTP speculative-decode step synchronously (plain TP only).
+
+        Mirrors the non-overlap worker's ``schedule_forward`` for the MTP verify
+        batch: the seqs were already scheduled (and appended to
+        ``batch_running``) by ``_build_prefetched_input``; we re-prepare them into
+        the buffered ``self.input_data`` that ``step_once`` reads, run the
+        synchronous draft->verify->accept (``step_once`` -> ``_mtp_decode``, which
+        returns per-seq token LISTS), then commit via the base variable-length
+        ``add_next_tokens`` + ``process_output``.
+
+        Any in-flight overlapped batch is drained first so every seq's
+        ``token_ids`` are fully committed (no ``-future_slot_id`` placeholders)
+        before MTP reads them. MTP is greedy and deterministic across TP ranks,
+        so sampled tokens are TP-identical -- no cross-TP broadcast is needed
+        (each column driver finalizes its own identical copy).
+        """
+        self._drain_pending()
+        schedule_seqs = self._prefetched_input.seqs
+        self._prefetched_input = None
+        # ``_drain_pending`` above finalizes the previous decode step's deferred
+        # batch, which can FINISH+free a seq (EOS / max_len) that was ALREADY
+        # scheduled into THIS batch (it is in ``batch_running`` -> our
+        # ``schedule_seqs``). Such a seq is now freed (pages released) but still a
+        # member here; feeding it to ``prepare_input`` reads an empty/By-then
+        # -reused page_table -> IndexError / double-free. The overlap pipeline
+        # marks these with ``_overlap_freed`` (see ``process_output_finalize``),
+        # so drop them from the batch AND from the ``batch_running`` entry that
+        # ``process_output`` will pop, keeping the two in lockstep.
+        if any(getattr(s, "_overlap_freed", False) for s in schedule_seqs):
+            kept = [s for s in schedule_seqs if not getattr(s, "_overlap_freed", False)]
+            # ``batch_running``'s tail is this batch (schedule_once appended it);
+            # replace it in place so process_output pops the filtered list.
+            if self.scheduler.batch_running and self.scheduler.batch_running[-1] is schedule_seqs:
+                self.scheduler.batch_running[-1] = kept
+            schedule_seqs = kept
+        if not schedule_seqs:
+            # Whole batch was freed under us; nothing to forward this step.
+            self._build_prefetched_input()
+            return
+        self.model_runner.prepare_input(schedule_seqs)
+        next_tokens = self.model_runner.step_once()
+        if next_tokens is not None:
+            self.scheduler.add_next_tokens(next_tokens, self.model_runner._last_logprobs)
+            ipc_package = self.scheduler.process_output()
+            if ipc_package is not None and self._polls_frontend():
+                self.comm.send_output(ipc_package)
+        # Build the next iter AFTER finalize so any max_len/eos seqs are freed.
+        self._build_prefetched_input()
+
     def run_pp0(self):
         """Per-iter loop run by every PP-0 TP rank.
 
@@ -253,6 +315,21 @@ class OverlapWorker(Worker):
         # (the previous iter's tail already built next-iter's input).
         if self._prefetched_input is None:
             self._build_prefetched_input()
+
+        # MTP speculative decode: a pure-decode (verify) batch runs synchronously
+        # through ``step_once`` (draft->verify->accept + variable-length commit),
+        # not the future-map relay pipeline. DP+EP is out of scope for the sync
+        # path (the cross-DP collective lockstep does not tolerate a variable
+        # per-step token count), so only take it on plain TP.
+        if (
+            self._mtp_active
+            and not self._dp
+            and self._prefetched_input is not None
+            and getattr(self._prefetched_input, "num_prefills", 0) == 0
+            and self._prefetched_input.seqs[-1].computed_prompt
+        ):
+            self._run_mtp_sync()
+            return
 
         input_data = self._prefetched_input
         is_dummy = False

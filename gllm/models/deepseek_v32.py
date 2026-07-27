@@ -634,6 +634,103 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             out[q0:q1, :k_sel] = sel_slots
         return out
 
+    @torch.no_grad()
+    def _select_topk_verify_fp8(
+        self, input_data: InputData, q_idx: torch.Tensor, weights: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Batched FP8 top-k selector for the MTP *verify* batch.
+
+        The verify batch is a REGULAR prefill: every one of ``nd`` decode
+        sequences contributes exactly ``qlen = 1+k`` new query tokens over its
+        cached context (positions ``ctx_len .. ctx_len+k``). This regularity lets
+        us use the paged MQA-logits kernel with ``next_n = qlen`` (exactly like
+        :meth:`_select_topk_decode_fp8` uses ``next_n=1``), scoring ALL seqs and
+        ALL 1+k query positions in ONE batched call -- eliminating the per-seq
+        Python loop + ``.item()`` syncs + ``nd`` tiny kernel launches per layer
+        that dominate the eager :meth:`_select_topk_prefill_fp8` (the verify hot
+        spot). Returns ``[nd*qlen, index_topk]`` int32 physical slots (-1 padded),
+        matching the ``prefill_topk`` contract (row-major over seq then query).
+        """
+        import deep_gemm
+        from sgl_kernel import hadamard_transform
+
+        meta = input_data.metadata
+        prefill = meta.prefill
+        seg = input_data.memory_manager.segment
+        fp8_cache = seg.index_k_fp8_cache[self.layer_id]  # [pages, page_sz*132] uint8
+        pages = fp8_cache.shape[0]
+        page_sz = seg.page_size
+        dim = seg.index_head_dim
+        fp8_bytes = seg.index_fp8_bytes  # 132
+        block_table = prefill.block_table       # [nd, max_blocks] int32 (GPU)
+        # NOTE: derive the per-seq cached-context length from ``seq_lens`` (a view
+        # of the static InputData.seq_lens buffer, stable address) rather than
+        # reading ``prefill.context_lens`` (freshly allocated each prepare_input,
+        # so a captured graph would bind its capture-time address). For the MTP
+        # verify batch every seq has a uniform ``qlen`` query, so
+        # ``context_len = seq_len - qlen`` exactly. This keeps the selector
+        # CUDA-graph-safe (all reads alias static buffers).
+        seq_lens = prefill.seq_lens             # [nd] int32 (GPU) = ctx_len + qlen
+        nd = block_table.shape[0]
+        num_q = q_idx.shape[0]
+        qlen = num_q // nd                      # uniform 1+k per seq (MTP verify)
+        context_lens = (seq_lens - qlen)        # [nd] int32 = ctx_len
+        topk = self.indexer.index_topk
+        device = q_idx.device
+        H = self.indexer.n_heads
+        max_L = block_table.shape[1] * page_sz
+
+        # Hadamard + FP8-quant the query (matches the stored key path / decode).
+        qh = (
+            hadamard_transform(q_idx.contiguous(), scale=dim ** -0.5)
+            if _DSA_HADAMARD else q_idx
+        )
+        qf = qh.float().reshape(num_q, H, dim // 128, 128)
+        q_scale = (qf.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448.0)
+        if self.indexer.use_ue8m0:
+            q_scale = torch.exp2(torch.ceil(torch.log2(q_scale)))
+        q_fp8 = (qf / q_scale).clamp(-448, 448).to(torch.float8_e4m3fn).reshape(num_q, H, dim)
+        q_scale = q_scale.reshape(num_q, H)
+        w = (weights.float() * q_scale * self.indexer.softmax_scale).contiguous()
+
+        # Normalize to the (N_total, next_n=1) layout the paged kernel wants:
+        # treat EACH of the nd*qlen
+        # query tokens as its own logical sequence with its OWN causal seq_len
+        # (= ctx_len + j + 1 for query j) and its own block-table row. The
+        # kernel's built-in seq_len masking then gives exact per-query causality
+        # -- no separate mask needed. This avoids the next_n>1 assert +
+        # per-seq Python loop.
+        row = torch.arange(qlen, device=device)                     # [qlen]
+        per_q_seqlen = (context_lens.unsqueeze(1) + row.unsqueeze(0) + 1).reshape(
+            num_q
+        ).to(torch.int32)                                           # [num_q]
+        bt = block_table.unsqueeze(1).expand(nd, qlen, block_table.shape[1]).reshape(
+            num_q, block_table.shape[1]
+        ).contiguous()                                              # [num_q, max_blocks]
+
+        kv = fp8_cache.view(pages, page_sz, 1, fp8_bytes)
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        sched = deep_gemm.get_paged_mqa_logits_metadata(per_q_seqlen, page_sz, sm_count)
+        logits = deep_gemm.fp8_paged_mqa_logits(
+            q_fp8.unsqueeze(1),   # [num_q, next_n=1, H, D]
+            kv, w, per_q_seqlen, bt, sched, max_L, clean_logits=False,
+        )  # [num_q, max_L] fp32 (positions >= per_q_seqlen already invalid)
+
+        pos = torch.arange(max_L, device=device)
+        blocks = bt[:, pos // page_sz]                              # [num_q, max_L]
+        slots = (blocks * page_sz + (pos % page_sz)).to(torch.int32)
+        valid = pos.unsqueeze(0) < per_q_seqlen.unsqueeze(1)        # [num_q, max_L]
+        logits = logits.masked_fill(~valid, float("-inf"))
+
+        k = min(topk, max_L)
+        sel = logits.topk(k, dim=-1).indices                       # [num_q, k]
+        sel_slots = torch.gather(slots, 1, sel)
+        sel_valid = torch.gather(valid, 1, sel)
+        sel_slots = torch.where(sel_valid, sel_slots, sel_slots.new_full((), -1))
+        out = q_idx.new_full((num_q, topk), -1, dtype=torch.int32)
+        out[:, :k] = sel_slots
+        return out
+
     def forward(
         self,
         input_data: InputData,
@@ -713,11 +810,22 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             # (== dense) for any query whose causal horizon <= index_topk, so this
             # is a no-op for prompts <= index_topk and only changes long context.
             if meta.num_prefills > 0:
-                sel_prefill = (
-                    self._select_topk_prefill_fp8
-                    if _DSA_FP8_SCORE
-                    else self._select_topk_prefill
+                # MTP verify batch (all prefill seqs are re-expanded decode seqs
+                # with a uniform 1+k query, flagged ``_mtp_verify``): use the
+                # BATCHED paged selector (one kernel over all seqs+positions)
+                # instead of the per-seq Python-loop prefill selector -- the
+                # latter's nd x 61-layer launches/syncs are the verify hot spot.
+                is_mtp_verify = _DSA_FP8_SCORE and getattr(
+                    input_data, "is_mtp_verify", False
                 )
+                if is_mtp_verify:
+                    sel_prefill = self._select_topk_verify_fp8
+                else:
+                    sel_prefill = (
+                        self._select_topk_prefill_fp8
+                        if _DSA_FP8_SCORE
+                        else self._select_topk_prefill
+                    )
                 prefill_topk = sel_prefill(
                     input_data, idx_q[num_dec:], weights[num_dec:]
                 )
@@ -816,4 +924,47 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         # MLA rope head dim, needed to size the native FP8 MLA latent cache
         # (DSA sparse decode on SM90 requires the FP8-packed layout).
         self.qk_rope_head_dim = config.qk_rope_head_dim
+
+        # Optional MTP (Multi-Token Prediction) head for speculative decoding.
+        # Built only when requested (env flag for now; a proper CLI arg later),
+        # and only on the last PP rank (where the base lm_head / final hidden
+        # live). The head is layer ``num_hidden_layers`` (61 for V3.2).
+        self.mtp = None
+        num_nextn = getattr(config, "num_nextn_predict_layers", 0) or 0
+        # ``mtp_enabled`` is resolved by ModelRunner (auto-detect from nextn
+        # layers unless explicitly set) and stamped onto the config. Build the
+        # MTP head only when enabled AND the checkpoint has a nextn layer.
+        want_mtp = getattr(config, "mtp_enabled", False) and num_nextn >= 1
+        if want_mtp and is_last_pp_rank():
+            from .deepseek_mtp import DeepseekMTP
+
+            self.mtp = DeepseekMTP(config, layer_id=config.num_hidden_layers)
+
+    @property
+    def num_kv_layers(self):
+        # The MTP block runs its own MLA attention + DSA indexer at
+        # ``layer_id = num_hidden_layers`` and writes into that slot of the
+        # shared paged KV / index cache, so the MemoryManager must size one
+        # extra layer when the head is present. (PP=1: the head lives on every
+        # rank; under PP>1 it is only on the last rank, which is also the only
+        # rank whose ``num_layers`` reaches ``num_hidden_layers``.)
+        base = len(self.model.layers)
+        return base + 1 if self.mtp is not None else base
+
+    def load_weights(self, weights, mp_load_progress=None):
+        # The base loader iterates ``self.named_parameters()`` and looks each up
+        # in the checkpoint by its parameter path. The MTP head's params live
+        # under ``mtp.*`` (no such checkpoint key -- they are ``model.layers.N.*``)
+        # and are loaded separately below, so detach the head for the base pass.
+        mtp = self.mtp
+        self.mtp = None
+        try:
+            super().load_weights(weights, mp_load_progress)
+        finally:
+            self.mtp = mtp
+        # Then the MTP head's layer-``num_hidden_layers`` weights, reusing this
+        # model's own rule table + load context (see DeepseekMTP.load_weights).
+        if self.mtp is not None:
+            self.mtp.load_weights(weights, self, mp_load_progress)
+
 
