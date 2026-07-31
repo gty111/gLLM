@@ -16,3 +16,6 @@ av # video
 sgl-kernel==0.3.21
 flashinfer-python==0.6.12 # Hopper FP8 block-scale GEMM with auto-swapAB (fast decode)
 flashinfer-cubin==0.6.12 # prebuilt cubins for flashinfer (avoids first-run JIT)
+# sgl-kernel's vendored FA4 (flash_attn_origin.cute) still uses nvvm.RoundingModeKind,
+# which cutlass-dsl 4.6.0 removed; >=4.5.0 keeps flashinfer happy
+nvidia-cutlass-dsl>=4.5.0,<4.6.0
