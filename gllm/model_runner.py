@@ -361,18 +361,32 @@ class ModelRunner:
         )
         self.model_loader.config.page_size = self.page_size
         # MTP (multi-token prediction) config. ``mtp_enabled=None`` auto-detects:
-        # enable iff the checkpoint declares nextn-predict layers
-        # (``num_nextn_predict_layers >= 1``). Stamped onto the model config so
-        # the model builder (e.g. DeepseekV32ForCausalLM) constructs the MTP head
-        # from config instead of an env var. ``mtp_k`` is the draft-chain length.
-        _num_nextn = getattr(
-            self.model_loader.config, "num_nextn_predict_layers", 0
-        ) or 0
+        # enable iff the checkpoint declares nextn-predict layers. Stamped onto
+        # the model config so the model builder (e.g. DeepseekV32ForCausalLM,
+        # Qwen3_5ForCausalLM) constructs the MTP head from config instead of an
+        # env var. ``mtp_k`` is the draft-chain length.
+        #
+        # Two config conventions are supported:
+        #   * DeepSeek V3/V3.2, GLM-MoE-DSA: top-level ``num_nextn_predict_layers``.
+        #   * Qwen3.5 (hybrid GDN): ``text_config.mtp_num_hidden_layers`` (the
+        #     multimodal wrapper nests the text config; the MTP head is a single
+        #     full-attention block shipped under ``mtp.*``).
+        _cfg = self.model_loader.config
+        _text_cfg = getattr(_cfg, "text_config", None) or _cfg
+        _num_nextn = (
+            getattr(_cfg, "num_nextn_predict_layers", 0)
+            or getattr(_text_cfg, "mtp_num_hidden_layers", 0)
+            or 0
+        )
         self._mtp_enabled = (
             (_num_nextn >= 1) if mtp_enabled is None else bool(mtp_enabled)
         )
         self._mtp_k_cfg = mtp_k
         self.model_loader.config.mtp_enabled = self._mtp_enabled
+        # Nested text config (Qwen3.5-VL wrapper) reads ``mtp_enabled`` off its
+        # own config object, so mirror the flag there too.
+        if _text_cfg is not _cfg:
+            _text_cfg.mtp_enabled = self._mtp_enabled
         propagate_serving_config(self.model_loader.config)
 
         # Kimi-K2.5 ships a bespoke processor (``KimiK25Processor``) whose API
@@ -552,6 +566,14 @@ class ModelRunner:
             # DSA MLA latent cache precision: FP8-packed only when explicitly
             # requested (drives SM90 sparse decode); default bf16 + dense decode.
             mla_cache_fp8=(self.mla_cache_dtype == "fp8"),
+            # MTP draft-chain length for hybrid GDN models: each running seq may
+            # borrow up to mtp_k transient checkpoint blocks from the shared SSM
+            # block pool during a verify step. 0 for non-MTP or non-hybrid.
+            mtp_k=(
+                self._mtp_k
+                if (ssm_cache_config is not None and self._mtp_k > 0)
+                else 0
+            ),
         )
         # Input buffer
         self.input_data = InputData(
@@ -576,6 +598,10 @@ class ModelRunner:
             getattr(self, "_mtp_k", 0) > 0
             and getattr(self.model, "mtp", None) is not None
             and not self.disable_cuda_graph
+            # Works for both MLA (DeepSeek) and non-MLA (Qwen3.5 GDN): the draft
+            # step captures ``mtp.forward`` (a single decoder layer, no dynamic
+            # ops / host sync). The only MLA-specific replay op (advancing
+            # ``decode_seq_lens``) is guarded in ``_draft_chain_graph``.
         )
         self._draft_size_to_graph: Dict[int, torch.cuda.CUDAGraph] = {}
         # Separate captured graphs for the sampled (rejection) draft step, which
@@ -591,6 +617,10 @@ class ModelRunner:
             getattr(self, "_mtp_k", 0) > 0
             and getattr(self.model, "mtp", None) is not None
             and not self.disable_cuda_graph
+            # Works for MLA (DeepSeek fp8 decode-sparse kernel) and non-MLA
+            # (Qwen3.5 GDN): the verify forward reads only static input buffers
+            # (incl. the 2D SSM block table + num_accepted static buffers filled
+            # by copy_to_input_buffer), so it is graph-capturable for both.
         )
         self._verify_size_to_graph: Dict[int, torch.cuda.CUDAGraph] = {}
         self._verify_k = getattr(self, "_mtp_k", 0)
@@ -607,6 +637,13 @@ class ModelRunner:
             and os.environ.get("GLLM_MTP_FUSED", "1") == "1"
         )
         self._mtp_relay: Dict[int, tuple] = {}
+        # Phase 2 (GPU-native verify prep): persistent per-seq context length
+        # kept ON the GPU and advanced by ``1 + na`` on-device each MTP step, so
+        # the next verify's slot_mapping/positions can be built without D2H'ing
+        # the accepted count. Keyed by seq_id -> a 0-dim GPU int tensor (host
+        # never reads its value on the hot path). Shadow-validated against the
+        # host ``computed_token_num`` under GLLM_MTP_GPUPREP_ASSERT=1.
+        self._mtp_ctxlen_gpu: Dict[int, torch.Tensor] = {}
         # MTP rejection sampling: make MTP distribution-lossless under
         # temperature/top-p instead of greedy-only. Activated per-batch by
         # RUNTIME DETECTION of any non-greedy seq -- NOT an env flag: a greedy
@@ -2201,12 +2238,20 @@ class ModelRunner:
                 new_pos = base_pos + j
                 self._draft_input.positions[:bucket].copy_(new_pos)
                 self._draft_input.slot_mapping[:bucket].copy_(_slot_for(new_pos))
-                self._draft_input.decode_seq_lens[:bucket].add_(1)
+                # ``decode_seq_lens`` is MLA-only metadata (set in
+                # ``_cal_mla_metadata``); non-MLA models advance only
+                # ``seq_lens``, which the GDN/full-attn decode kernels read.
+                if self.use_mla:
+                    self._draft_input.decode_seq_lens[:bucket].add_(1)
                 self._draft_input.seq_lens[:bucket].add_(1)
             g.replay()
             step_next.append(self._d_next_tok[:nd].clone())
 
-        mat = torch.stack(step_next, dim=1).tolist()  # [nd, k]
+        drafts_gpu = torch.stack(step_next, dim=1)  # [nd, k] on GPU
+        mat = drafts_gpu.tolist()
+        # Stash the GPU draft tensor so the greedy accept can compare on-device
+        # without an H2D round-trip of the host ``drafts`` list.
+        self._drafts_gpu = drafts_gpu
         return [mat[i] for i in range(nd)]
 
     @torch.inference_mode()
@@ -2289,7 +2334,11 @@ class ModelRunner:
                 new_pos = base_pos + j
                 self._draft_input.positions[:bucket].copy_(new_pos)
                 self._draft_input.slot_mapping[:bucket].copy_(_slot_for(new_pos))
-                self._draft_input.decode_seq_lens[:bucket].add_(1)
+                # ``decode_seq_lens`` is MLA-only metadata (set in
+                # ``_cal_mla_metadata``); non-MLA models advance only
+                # ``seq_lens``, which the GDN/full-attn decode kernels read.
+                if self.use_mla:
+                    self._draft_input.decode_seq_lens[:bucket].add_(1)
                 self._draft_input.seq_lens[:bucket].add_(1)
             g.replay()
             # TP-sync the drawn token (Gumbel RNG isn't guaranteed identical
@@ -2429,18 +2478,57 @@ class ModelRunner:
         uniform 1+k shape the captured graph expects.
         """
         dummy_page = self.memory_manager.dummy_page
+        # Dummy SSM block table (all point at the dummy block 0) so the verify
+        # metadata (2D block table) is built during graph capture with the same
+        # shape as a real verify batch. num_accepted stays 1 (resume col 0).
+        k1 = 1 + self._mtp_k
+        # Dummy seq ids are offset high to avoid the common case of colliding
+        # with a live request id, but correctness does NOT rely on that: we only
+        # seed an embedding-cache stub when the id is currently ABSENT, remember
+        # exactly which ids we inserted (``self._dummy_verify_cache_ids``), and
+        # ``_drop_dummy_verify_cache`` removes only those after the forward. So a
+        # dummy id can safely overlap a real one -- we never clobber or delete a
+        # genuine entry.
+        base_id = 1_000_000
+        seeded_ids = []
         seqs = []
         for i in range(nd):
-            s = Sequence(i, [1] * (ctx + qlen), [], output_len=1)
-            s.prompt_len = ctx + qlen
-            # Enough pages to cover ctx+qlen tokens, all the dummy page.
+            sid = base_id + i
+            s = Sequence(sid, [1] * (ctx + qlen), [], output_len=1)
+            # ``prompt_len = ctx`` => computed_prompt True => the seq is
+            # decode-classified in the VL mm-prep path (reads a position-delta
+            # stub from embedding_cache instead of trying to build image
+            # embeddings for a text-only dummy). ``_mtp_verify`` still forces the
+            # verify (prefill-with-context) ATTENTION shape independently.
+            s.prompt_len = ctx
             npages = (ctx + qlen + self.page_size - 1) // self.page_size
             s.page_table = [dummy_page] * npages
             s.computed_token_num = ctx
             s.to_compute_token_num = qlen
             s._mtp_verify = True
+            if self.memory_manager.ssm_segment is not None and self._mtp_k > 0:
+                s.ssm_block_table = [0] * k1
+                s.ssm_state_slot = 0
+                s.ssm_num_accepted = 1
+            # Seed a minimal embedding-cache stub so the VL mrope decode branch
+            # (``mm_prepare_inputs``) finds a position delta for this dummy --
+            # but ONLY if this id isn't already a live entry (never clobber).
+            if self.use_mm and self.uses_mrope and sid not in self.embedding_cache:
+                self.embedding_cache[sid] = EmbeddingInfo(
+                    None, None, torch.zeros(1, dtype=torch.long)
+                )
+                seeded_ids.append(sid)
             seqs.append(s)
+        self._dummy_verify_cache_ids = seeded_ids
         return seqs
+
+    def _drop_dummy_verify_cache(self) -> None:
+        """Remove the embedding-cache stubs seeded by the last
+        ``_create_dummy_verify_seqs`` so they never leak / shadow a real seq id
+        allocated later."""
+        for sid in getattr(self, "_dummy_verify_cache_ids", ()):
+            self.embedding_cache.pop(sid, None)
+        self._dummy_verify_cache_ids = []
 
     @torch.inference_mode()
     def _capture_verify_graphs(self, memory_pool, stream):
@@ -2474,6 +2562,7 @@ class ModelRunner:
             with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
                 self.forward()
             self._verify_size_to_graph[bucket] = g
+            self._drop_dummy_verify_cache()
 
     @torch.inference_mode()
     def _verify_forward_graph(self, decode_seqs, orig_tokens, x1, drafts, nd, kk):
@@ -2509,13 +2598,114 @@ class ModelRunner:
         graph_seqs = list(decode_seqs) + pad_seqs
         self.prepare_input(graph_seqs)
         self._verify_size_to_graph[bucket].replay()
+        # Drop the pad dummies' embedding-cache stubs immediately so they can
+        # never shadow a real seq id allocated on a later step.
+        self._drop_dummy_verify_cache()
         num_real = nd * qlen
         v_hidden = self.output_hidden_states[:num_real]
-        v_pred = self.model.logits_from_hidden(v_hidden).argmax(dim=-1).cpu().tolist()
+        # Keep the greedy predictions on the GPU ([num_real] argmax). The old
+        # ``.cpu().tolist()`` here was a [nd*qlen] pageable, blocking D2H (~9ms
+        # at nd=64 -- it stalls the host until the verify graph + logits drain).
+        # The greedy accept now runs on the GPU and only D2Hs a tiny [nd] result.
+        v_pred = self.model.logits_from_hidden(v_hidden).argmax(dim=-1)
         # query_start_loc over the REAL seqs only (uniform qlen).
         qsl = [i * qlen for i in range(nd + 1)]
+        # Shadow validation of the GPU-native slot_mapping builder (Phase 2
+        # P2-1). Opt-in via GLLM_MTP_GPUPREP_ASSERT=1: build the verify batch's
+        # slot_mapping on the GPU from a per-seq context-length tensor + a
+        # page-table mirror and assert it matches the CPU-built one that the
+        # forward actually used. Proves the GPU formula before we remove the
+        # host sync that currently gates paging. Real (non-pad) seqs only.
+        if os.environ.get("GLLM_MTP_GPUPREP_ASSERT", "0") == "1":
+            self._assert_gpu_slot_mapping(decode_seqs, qlen, nd)
         return v_pred, qsl, v_hidden
 
+    def _build_verify_slot_mapping_gpu(self, ctx_len, page_table_gpu, qlen):
+        """GPU-native slot_mapping for a uniform MTP verify batch.
+
+        ``ctx_len`` [nd] int: each seq's cached context length (== the position
+        of its first verify token). ``page_table_gpu`` [nd, max_blk] int: per-seq
+        physical KV page ids. Each seq contributes ``qlen`` consecutive tokens at
+        absolute positions ``ctx_len[i] .. ctx_len[i]+qlen-1``. Returns a flat
+        [nd*qlen] int64 slot_mapping = page_table[i, pos//P]*P + pos%P.
+
+        Pure torch (graph-capturable, no custom kernel); verified bit-exact vs the
+        CPU ``_cal_slot_mapping`` uniform-verify path.
+        """
+        dev = page_table_gpu.device
+        page_size = self.memory_manager.page_size
+        nd = ctx_len.shape[0]
+        seq_ar = torch.arange(nd, device=dev).unsqueeze(1)          # [nd,1]
+        jj = torch.arange(qlen, device=dev).unsqueeze(0)            # [1,qlen]
+        pos = ctx_len.long().unsqueeze(1) + jj                      # [nd,qlen]
+        pidx = pos // page_size
+        sidx = pos - pidx * page_size
+        phys = page_table_gpu.long()[seq_ar, pidx]                  # [nd,qlen]
+        return (phys * page_size + sidx).reshape(-1)                # [nd*qlen]
+
+    def _assert_gpu_slot_mapping(self, decode_seqs, qlen, nd):
+        """Shadow-mode check: GPU slot_mapping == the CPU one the forward used."""
+        dev = torch.cuda.current_device()
+        page_size = self.memory_manager.page_size
+        # Per-seq context length + page-table mirror (host-built here for the
+        # shadow check; P2-2 will persist these on-GPU across steps).
+        ctx = torch.tensor(
+            [s.computed_token_num for s in decode_seqs], device=dev, dtype=torch.int64
+        )
+        max_blk = max(len(s.page_table) for s in decode_seqs)
+        pt = torch.zeros((nd, max_blk), device=dev, dtype=torch.int64)
+        for i, s in enumerate(decode_seqs):
+            pt[i, : len(s.page_table)] = torch.tensor(
+                s.page_table, device=dev, dtype=torch.int64
+            )
+        gpu_sm = self._build_verify_slot_mapping_gpu(ctx, pt, qlen)
+        # The CPU slot_mapping the forward used covers all graph_seqs (real+pad);
+        # the first nd*qlen entries are the real verify seqs (uniform qlen).
+        cpu_sm = self.input_data.slot_mapping_cpu[: nd * qlen].to(dev)
+        if not torch.equal(gpu_sm, cpu_sm):
+            ndiff = int((gpu_sm != cpu_sm).sum())
+            logger.error(
+                "GPU slot_mapping MISMATCH: %d/%d differ (nd=%d qlen=%d)",
+                ndiff, nd * qlen, nd, qlen,
+            )
+        else:
+            logger.info("GPU slot_mapping OK (nd=%d qlen=%d)", nd, qlen)
+
+    def _advance_ctxlen_gpu(self, decode_seqs, orig_tokens, na_gpu):
+        """Maintain a persistent per-seq GPU context length across MTP steps.
+
+        This step's verify used ``computed_token_num == len(orig_tokens[i])`` as
+        each seq's context length. After committing ``1+na`` tokens, the NEXT
+        step's context length is ``len(orig_tokens[i]) + 1 + na`` -- computed here
+        entirely on the GPU (no D2H of ``na``) and stashed per seq_id for the next
+        verify to consume. Under GLLM_MTP_GPUPREP_ASSERT=1 we also verify that the
+        value we predicted on the PREVIOUS step matches this step's actual host
+        context length (proves the on-GPU advance tracks host bookkeeping exactly).
+        """
+        dev = na_gpu.device
+        assert_on = os.environ.get("GLLM_MTP_GPUPREP_ASSERT", "0") == "1"
+        cur_ctx = [len(t) for t in orig_tokens]  # this step's host context lengths
+        if assert_on:
+            for i, s in enumerate(decode_seqs):
+                prev = self._mtp_ctxlen_gpu.get(s.seq_id)
+                if prev is not None:
+                    pv = int(prev.item())
+                    if pv != cur_ctx[i]:
+                        logger.error(
+                            "ctxlen_gpu MISMATCH seq=%s predicted=%d actual=%d",
+                            s.seq_id, pv, cur_ctx[i],
+                        )
+        # Advance on-GPU: next_ctx = cur_ctx + 1 + na. cur_ctx is host-known here
+        # (it's len(orig_tokens)), but we keep the result as a GPU tensor so P2-2's
+        # slot_mapping/positions builder can consume it without any host sync.
+        na_long = na_gpu.to(torch.int64)
+        new_ctx = {}
+        for i, s in enumerate(decode_seqs):
+            nxt = torch.tensor(cur_ctx[i], device=dev, dtype=torch.int64) + 1 + na_long[i]
+            new_ctx[s.seq_id] = nxt
+        # Replace wholesale so finished/evicted seqs don't leak entries (mirrors
+        # the ``_mtp_relay`` eviction policy).
+        self._mtp_ctxlen_gpu = new_ctx
 
     @torch.inference_mode()
     def _mtp_decode(self, hidden: torch.Tensor, x1_tokens: list):
@@ -2537,6 +2727,16 @@ class ModelRunner:
         mtp = self.model.mtp
         decode_seqs = self.input_data.seqs[:nd]
         dev = hidden.device
+        # Opt-in phase profiler (GLLM_MTP_PROF=1): cuda-synced wall-clock for the
+        # draft / verify / accept+commit phases, accumulated across steps and
+        # dumped periodically. Off by default (no sync overhead).
+        _prof = os.environ.get("GLLM_MTP_PROF", "0") == "1"
+        if _prof:
+            import time as _t
+            def _ck():
+                torch.cuda.synchronize()
+                return _t.perf_counter()
+            _p0 = _ck()
         # ``hidden`` is a view into the persistent output_hidden_states buffer;
         # clone so subsequent forwards (draft/verify) can't mutate it underfoot.
         hidden = hidden[:nd].clone()
@@ -2557,6 +2757,21 @@ class ModelRunner:
         orig_ctn = [s.computed_token_num for s in decode_seqs]
         orig_tctn = [s.to_compute_token_num for s in decode_seqs]
         orig_pages = [s.page_table[:] for s in decode_seqs]
+
+        # --- Hybrid GDN recurrent-state: block-table column commit ---
+        # The verify forward (GDN ``_forward_mtp_verify``) wrote each of the
+        # ``1+k`` verify tokens' post-state into that column of every seq's SSM
+        # block table (column 0 held the committed pre-x1 state on entry). After
+        # the accept step decides how many drafts each seq kept (``na``), the
+        # exact post-acceptance state (after ``1+na`` committed tokens) sits at
+        # column ``na``. We copy it back into column 0 so the plain decode /
+        # snapshot paths keep reading column 0. Pure-attention models (DeepSeek
+        # MTP) have no SSM segment and skip this.
+        _ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
+        _has_gdn = (
+            _ssm_seg is not None
+            and all(s.ssm_block_table is not None for s in decode_seqs)
+        )
 
         def restore():
             # NOTE: deliberately do NOT restore page_table. The verify forward
@@ -2585,6 +2800,9 @@ class ModelRunner:
         # (The graph draft path uses the default CUDA generator internally and
         # broadcasts its tokens, so it doesn't consume ``gen``.)
         gen = self._mtp_rng_step(dev) if _use_rej else None
+        # Reset the GPU-draft stash; only the greedy graph draft chain fills it
+        # (the accept step reads it to skip an H2D of the host drafts list).
+        self._drafts_gpu = None
         if _use_rej:
             # Sampling draft chain: prefer the captured Gumbel-max graph (draft
             # forward + sampling in-graph, token broadcast between replays); fall
@@ -2607,6 +2825,8 @@ class ModelRunner:
         else:
             drafts = self._draft_chain_eager(decode_seqs, orig_tokens, x1, hidden, k, nd)
         restore()
+        if _prof:
+            _p_draft = _ck()
 
         # --- 2. Verify: one base forward over [x1, d1..dk] per seq. ---
         kk = len(drafts[0]) if nd else 0  # actual drafts per seq
@@ -2633,8 +2853,13 @@ class ModelRunner:
             self.prepare_input(decode_seqs)
             v_out = self.model(self.input_data)
             v_hidden = v_out[0] if isinstance(v_out, tuple) else v_out
-            v_pred = self.model.logits_from_hidden(v_hidden).argmax(dim=-1).cpu().tolist()
-            qsl = self.input_data.get_query_start_loc().cpu().tolist()  # [nd+1]
+            # Keep greedy predictions on the GPU (see ``_verify_forward_graph``);
+            # the accept step consumes them on-device. Verify seqs are uniform
+            # ``1+kk`` query length, so ``qsl`` is the uniform stride.
+            v_pred = self.model.logits_from_hidden(v_hidden).argmax(dim=-1)
+            qsl = [i * (1 + kk) for i in range(nd + 1)]
+        if _prof:
+            _p_verify = _ck()
 
         # Rejection mode: build the target dist ``p`` at each of the 1+kk verify
         # positions from the verify hidden. ``v_hidden`` rows are laid out
@@ -2768,43 +2993,68 @@ class ModelRunner:
                         _, h = new_relay[decode_seqs[i].seq_id]
                         new_relay[decode_seqs[i].seq_id] = (bonus_cpu[i], h)
         else:
-            # --- 3. Greedy accept per seq. ---
+            # --- 3. Greedy accept per seq (vectorized on GPU). ---
             # Verify inputs per seq are [x1, d1..dk] at positions start..start+k.
-            # v_pred[start+p] = target's greedy token AFTER consuming input p. So the
-            # target's token following x1 is v_pred[start+0]; accept d_{p+1} iff it
-            # equals v_pred[start+p]. Commit x1 + the longest prefix of drafts the
-            # target agrees with. We do NOT commit a trailing "bonus"/corrected
-            # token: it has no KV (it was never a verify INPUT, only a prediction),
-            # so committing it would leave the next decode step reading garbage KV
-            # for it (divergence). The next normal decode step reproduces it
-            # through the exact decode path instead. (Fused relays the bonus as the
-            # next step's x1, where it IS committed once -- see the stash below.)
+            # v_pred[start+p] = target's greedy token AFTER consuming input p, so
+            # accept d_{p+1} iff it equals v_pred[start+p]; the accepted count is
+            # the length of the leading all-match prefix. ``v_pred`` is a GPU
+            # tensor ``[nd*qlen]`` (qlen == 1+kk, uniform); compute ``n_accepted``
+            # on-device and D2H only the tiny ``[nd]`` results (+ ``[nd]`` fused
+            # bonus tokens), instead of the old blocking ``[nd*qlen]`` v_pred D2H.
+            # ``results`` is rebuilt on the host from the already-known ``x1`` /
+            # ``drafts`` lists sliced to ``n_accepted`` -- no full v_pred needed.
+            qlen = 1 + kk
+            vp = v_pred.view(nd, qlen)
+            if kk > 0:
+                # Prefer the GPU draft tensor threaded from ``_draft_chain_graph``
+                # (avoids a blocking pageable H2D of the host ``drafts`` list --
+                # that stalls on the outstanding verify graph, ~9ms at load). Fall
+                # back to a one-shot H2D only on the eager draft path.
+                dg = getattr(self, "_drafts_gpu", None)
+                if dg is not None and tuple(dg.shape) == (nd, kk):
+                    drafts_gpu = dg.to(vp.dtype)
+                else:
+                    drafts_gpu = torch.tensor(drafts, device=dev, dtype=vp.dtype)
+                match = (vp[:, :kk] == drafts_gpu)                    # [nd,kk] bool
+                # cumprod over the bool prefix: 1 until the first mismatch, 0 after
+                # -> sum = length of the leading all-accept prefix.
+                na_gpu = torch.cumprod(match.to(torch.int32), dim=1).sum(dim=1)  # [nd]
+            else:
+                na_gpu = torch.zeros(nd, device=dev, dtype=torch.int32)
+            if _fused_stash:
+                # Bonus = target prediction at verify position ``start + na`` (the
+                # token after the last accepted one). Gather per-seq on-device.
+                seq_ar = torch.arange(nd, device=dev)
+                bonus_gpu = vp[seq_ar, na_gpu.to(torch.long)]
+                # One combined pinned D2H: [n_accepted | bonus_tok].
+                packed = torch.stack((na_gpu.to(torch.int64), bonus_gpu.to(torch.int64)))
+                packed_cpu = packed.cpu()  # [2, nd]
+                na_cpu = packed_cpu[0].tolist()
+                bonus_cpu2 = packed_cpu[1].tolist()
+                # Batch-gather every seq's bonus hidden in ONE op (verify row
+                # ``i*qlen + na``) instead of nd separate per-seq ``.clone()``s
+                # (those were 64 tiny D2D copies per step). Row i of this tensor
+                # is seq i's draft-seed hidden for the next step.
+                bonus_rows = seq_ar * qlen + na_gpu.to(torch.long)
+                bonus_hidden_all = v_hidden.index_select(0, bonus_rows)  # [nd, H]
+            else:
+                na_cpu = na_gpu.cpu().tolist()
+                bonus_cpu2 = None
             for i, s in enumerate(decode_seqs):
-                start = qsl[i]
-                committed = [x1[i]]
-                na = 0
-                for p in range(kk):
-                    tgt = v_pred[start + p]
-                    if tgt == drafts[i][p]:
-                        committed.append(drafts[i][p])
-                        na += 1
-                    else:
-                        break
+                na = na_cpu[i]
                 n_accepted[i] = na
-                results[i] = committed
+                # committed = x1 + the accepted draft prefix (both host-known).
+                results[i] = [x1[i]] + drafts[i][:na]
                 if _fused_stash:
-                    # Bonus = target's prediction AFTER the last accepted token, at
-                    # verify position ``start + na`` (na accepted drafts => x1 + na
-                    # tokens consumed => the (na)-th prediction is the next token).
-                    # This bonus token + its verify hidden seed the NEXT step's draft,
-                    # replacing the separate decode forward. bonus_tok is greedily
-                    # deterministic and equals the token a decode forward would emit,
-                    # so committed token streams are byte-identical to the unfused
-                    # path; only the draft-seed hidden differs (verify vs decode
-                    # kernel, epsilon) which can only change acceptance, not output.
-                    bonus_tok = int(v_pred[start + na])
-                    bonus_hidden = v_hidden[start + na].clone()
-                    new_relay[s.seq_id] = (bonus_tok, bonus_hidden)
+                    # bonus token from the on-device gather; bonus hidden is row i
+                    # of the batched gather (a GPU view; only seeds the next draft).
+                    bonus_tok = bonus_cpu2[i]
+                    new_relay[s.seq_id] = (bonus_tok, bonus_hidden_all[i])
+
+            # Phase 2: advance the persistent GPU context length by 1+na for
+            # each seq, entirely on-device (no D2H of na). Next step's verify
+            # slot_mapping/positions will read these. Shadow-validated below.
+            self._advance_ctxlen_gpu(decode_seqs, orig_tokens, na_gpu)
 
         self._record_mtp_metrics(nd, kk, n_accepted)
 
@@ -2812,8 +3062,63 @@ class ModelRunner:
             # Replace the relay map wholesale so seqs absent from this batch are
             # evicted (their stale hidden must never seed a later draft).
             self._mtp_relay = new_relay
+        if _prof:
+            _p_acc_loop = _ck()
+
+        # --- Hybrid GDN recurrent-state: commit the accepted column to col 0 ---
+        # The verify forward wrote token t's post-state into block-table column
+        # t. Each seq committed ``1+na`` tokens, so the post-acceptance state is
+        # already sitting in the block at column ``na``. Rather than COPY that
+        # block's 18.6MB (all 18 layers) into column 0 -- pure memory-bandwidth
+        # cost, ~2.2ms at nd=64 -- we just SWAP the two block-table entries: the
+        # physical block holding the committed state becomes column 0, and the
+        # old column-0 block moves to column ``na`` where it's overwritten as
+        # scratch by the next verify. O(1) per seq, zero data movement. The next
+        # step rebuilds ``ssm_block_table_2d`` / ``ssm_state_slot`` from the
+        # (now-permuted) list, so decode/snapshot read the committed state from
+        # column 0 as before. na==0 -> committed state already at column 0.
+        if _has_gdn:
+            for i in range(nd):
+                na = n_accepted[i]
+                if na > 0:
+                    bt = decode_seqs[i].ssm_block_table
+                    bt[0], bt[na] = bt[na], bt[0]
+                    # Keep the scalar slot mirror consistent with column 0 (read
+                    # by the plain decode path + prefix-cache snapshot capture).
+                    decode_seqs[i].ssm_state_slot = bt[0]
+                # Reset the persisted resume column: committed state is now at
+                # column 0, so next step's num_accepted is neutral (1).
+                decode_seqs[i].ssm_num_accepted = 1
 
         restore()
+        if _prof:
+            _p_end = _ck()
+            if not hasattr(self, "_mtp_prof_acc"):
+                self._mtp_prof_acc = {"draft": 0.0, "verify": 0.0, "accept": 0.0,
+                                      "acc_loop": 0.0, "commit": 0.0,
+                                      "steps": 0, "nd": 0}
+            pa = self._mtp_prof_acc
+            pa["draft"] += _p_draft - _p0
+            pa["verify"] += _p_verify - _p_draft
+            pa["accept"] += _p_end - _p_verify
+            pa["acc_loop"] += _p_acc_loop - _p_verify
+            pa["commit"] += _p_end - _p_acc_loop
+            pa["steps"] += 1
+            pa["nd"] += nd
+            if pa["steps"] % 50 == 0:
+                tot = pa["draft"] + pa["verify"] + pa["accept"]
+                logger.info(
+                    "MTP prof (%d steps, avg nd=%.1f): draft=%.1fms(%.0f%%) "
+                    "verify=%.1fms(%.0f%%) accept=%.1fms(%.0f%%)"
+                    "[loop=%.1f commit=%.1f] total=%.1fms/step",
+                    pa["steps"], pa["nd"] / pa["steps"],
+                    1e3 * pa["draft"] / pa["steps"], 100 * pa["draft"] / tot,
+                    1e3 * pa["verify"] / pa["steps"], 100 * pa["verify"] / tot,
+                    1e3 * pa["accept"] / pa["steps"], 100 * pa["accept"] / tot,
+                    1e3 * pa["acc_loop"] / pa["steps"],
+                    1e3 * pa["commit"] / pa["steps"],
+                    1e3 * tot / pa["steps"],
+                )
         return results
 
     @torch.inference_mode()

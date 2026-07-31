@@ -204,6 +204,7 @@ async def evaluate(subjects):
     pbar.close()
     print(f"Processing completions ...")
     n_empty = 0
+    saved_rows = []
     for idx, each in tqdm(enumerate(test_data_total), total=len(tasks)):
         label = each["answer"]
         response = completions[idx].generated_text
@@ -222,6 +223,15 @@ async def evaluate(subjects):
         else:
             category_record[category]["#wrong"] += 1
             category_record["total"]["#wrong"] += 1
+        if args.save:
+            saved_rows.append({
+                "qid": each.get("question_id", idx),
+                "category": category,
+                "gold": label,
+                "pred": pred,
+                "correct": (pred == label),
+                "response": response,
+            })
     total = category_record["total"]
     total["score"] = round(
         100 * total["#correct"] / (total["#correct"] + total["#wrong"]), 2
@@ -238,6 +248,12 @@ async def evaluate(subjects):
         f"TOTAL accuracy: {total['score']}  "
         f"({total['#correct']}/{total['#correct'] + total['#wrong']})"
     )
+    if args.save:
+        import json as _json
+        with open(args.save, "w") as _f:
+            for row in saved_rows:
+                _f.write(_json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"Saved {len(saved_rows)} per-question rows to {args.save}")
 
 
 if __name__ == "__main__":
@@ -282,6 +298,13 @@ if __name__ == "__main__":
         help="Send chat_template_kwargs={'thinking'/'enable_thinking': False} so "
         "reasoning models (e.g. Kimi-K2.5) answer directly instead of emitting a "
         "long reasoning trace that gets truncated by --output-len.",
+    )
+    parser.add_argument(
+        "--save",
+        type=str,
+        default="",
+        help="Optional path to dump per-question {id, gold, pred, correct, "
+        "response} as JSONL for base-vs-MTP prediction diffing.",
     )
     assigned_subjects = []
     args = parser.parse_args()

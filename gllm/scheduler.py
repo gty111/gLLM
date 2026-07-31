@@ -429,17 +429,15 @@ class Scheduler:
             and (max_seqs is None or len(prefill_batch) < max_seqs)
         ):
             seq = self.seqs_to_prefill.popleft()
-            # If this seq hasn't taken a working slot yet AND the pool is
-            # exhausted, put the request back on the wait queue and stop
-            # admitting fresh prefills this round. In-flight prefill seqs
-            # (those whose chunk continues this round) keep their slot.
-            if (
-                ssm_seg is not None
-                and seq.ssm_state_slot is None
-                and ssm_seg.num_free_working() == 0
-            ):
-                self.seqs_to_prefill.appendleft(seq)
-                break
+            # If this seq hasn't taken its SSM state block(s) yet AND the pool
+            # cannot fit a whole per-seq allocation (1 block, or 1+k for MTP),
+            # put the request back on the wait queue and stop admitting fresh
+            # prefills this round. In-flight prefill seqs keep their blocks.
+            if ssm_seg is not None and seq.ssm_state_slot is None:
+                need = 1 + getattr(self.memory_manager, "mtp_k", 0)
+                if ssm_seg.num_free_blocks() < need:
+                    self.seqs_to_prefill.appendleft(seq)
+                    break
             if (
                 isinstance(self.memory_manager, PrefixMemoryManager)
                 and seq.computed_token_num == 0

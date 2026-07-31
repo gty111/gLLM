@@ -26,6 +26,8 @@ from gllm.layers.ops.fla.fused_gdn_gating import fused_gdn_gating
 from gllm.layers.ops.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
+    fused_recurrent_gated_delta_rule_update,
+    fused_recurrent_gdn_spec,
 )
 from gllm.layers.ops.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -39,6 +41,8 @@ __all__ = [
     "fused_gdn_gating",
     "fused_recurrent_gated_delta_rule",
     "fused_recurrent_gated_delta_rule_packed_decode",
+    "fused_recurrent_gated_delta_rule_update",
+    "fused_recurrent_gdn_spec",
     "fused_sigmoid_gating_delta_rule_update",
     "rms_norm_gated",
 ]

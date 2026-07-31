@@ -505,7 +505,24 @@ if __name__ == "__main__":
         "tool_calls. Default: auto-detect from model architecture; pass a "
         "name to override.",
     )
+    parser.add_argument(
+        "--mtp-enabled",
+        type=str,
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="MTP speculative decoding: 'auto' (default) enables it iff the "
+        "checkpoint ships an MTP head; 'on'/'off' force it. Use 'off' for a "
+        "non-speculative baseline.",
+    )
+    parser.add_argument(
+        "--mtp-k",
+        type=int,
+        default=3,
+        help="MTP draft-chain length (tokens drafted per target forward).",
+    )
     args = parser.parse_args()
+
+    _mtp_enabled = {"auto": None, "on": True, "off": False}[args.mtp_enabled]
 
     llm = PipeAsyncLLM(
         host=args.host,
@@ -538,6 +555,8 @@ if __name__ == "__main__":
         mm_processor_max_pixels=args.mm_processor_max_pixels,
         mla_decode_backend=args.mla_decode_backend,
         mla_cache_dtype=args.mla_cache_dtype,
+        mtp_enabled=_mtp_enabled,
+        mtp_k=args.mtp_k,
     )
 
     # Resolve the tool-call parser once: explicit ``--tool-call-parser`` wins,

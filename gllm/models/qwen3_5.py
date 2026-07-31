@@ -65,6 +65,7 @@ from gllm.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from gllm.layers.ops.fla import (
@@ -73,6 +74,7 @@ from gllm.layers.ops.fla import (
     fused_gdn_gating,
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
+    fused_recurrent_gdn_spec,
 )
 from gllm.layers.ops.mamba import causal_conv1d_fn, causal_conv1d_update
 from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
@@ -324,8 +326,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if snap_targets is None:
             return
         seg = input_data.memory_manager.ssm_segment
-        if seg.conv_state_snap is None:
-            return
         # Host-side early-exit: the original ``bool(valid_mask.any())`` check
         # forced one ``cudaStreamSynchronize`` per linear-attn layer per
         # prefill step (18 layers × 32 prefill steps in the 16k/c8 profile
@@ -349,13 +349,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         src_idx = src_slots.index_select(0, valid_idx).to(torch.long)
         dst_idx = snap_targets.index_select(0, valid_idx).to(torch.long)
 
-        conv_snap = seg.conv_state_snap[self.ssm_layer_id]
-        temporal_snap = seg.temporal_state_snap[self.ssm_layer_id]
-
-        conv_snap.index_copy_(
+        # Capture = copy this layer's working block -> the page's cached block,
+        # both in the SAME shared pool (``conv_state_working`` /
+        # ``ssm_state_working`` are ``seg.conv_state[ssm_layer_id]`` /
+        # ``seg.temporal_state[ssm_layer_id]``). ``src_idx`` (live rolling block)
+        # and ``dst_idx`` (cached block) are distinct block ids -> no alias.
+        conv_state_working.index_copy_(
             0, dst_idx, conv_state_working.index_select(0, src_idx)
         )
-        temporal_snap.index_copy_(
+        ssm_state_working.index_copy_(
             0, dst_idx, ssm_state_working.index_select(0, src_idx)
         )
 
@@ -367,6 +369,117 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         length to stay robust against future fused-batch scheduling.
         """
         return getattr(input_data, "max_query_len", 1) == 1
+
+    def _forward_mtp_verify(
+        self,
+        input_data: InputData,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias,
+        cache_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """MTP verify GDN forward (vLLM-style 2D block-table checkpointing).
+
+        The verify batch is ``nseq`` sequences, each a uniform ``T = 1+k`` query
+        ``[x1, d1..dk]`` over its cached context. Each seq holds a ``[1+k]`` SSM
+        state block table; column 0 holds its committed (pre-x1) rolling state.
+        We run the recurrent GDN kernel token-by-token starting from column 0 and
+        write each token ``t``'s post-state into column ``t`` of the block table
+        (both temporal state and conv window). The blocks are the SAME shared
+        pool the rolling state lives in -- no separate intermediate buffer. After
+        sampling, the accept step copies the committed column (``na``) back to
+        column 0 (see ``model_runner._mtp_decode``), so the plain decode/snapshot
+        paths keep reading column 0.
+
+        Returns ``core_attn_out`` shaped ``[nseq*T, tp_num_v_heads, head_v_dim]``.
+        """
+        block_table_2d = input_data.get_ssm_block_table_2d()  # [nseq, 1+k] int32
+        num_accepted = input_data.get_ssm_num_accepted()       # [nseq] int32
+        assert block_table_2d is not None, "MTP verify needs an SSM block table"
+
+        nseq = block_table_2d.shape[0]
+        total = mixed_qkv.shape[0]
+        assert total % nseq == 0, (
+            f"MTP verify batch not uniform: {total} tokens / {nseq} seqs"
+        )
+        qlen = total // nseq  # == 1 + k
+        dev = mixed_qkv.device
+
+        c_in = mixed_qkv.shape[1]
+        # Per-token conv: process each verify column t reading the conv block at
+        # column ``t-1`` (or the resume column ``num_accepted-1`` for t=0) and
+        # writing column t's conv block. T (<=1+k) tiny single-token updates.
+        conv_x = mixed_qkv.view(nseq, qlen, c_in)  # [nseq, T, c_in]
+        conv_out = torch.empty_like(conv_x)
+        seq_ar = torch.arange(nseq, device=dev)
+        na_m1 = (num_accepted - 1).clamp_(min=0).to(torch.long)
+        for t in range(qlen):
+            src_col = na_m1 if t == 0 else torch.full((nseq,), t - 1, device=dev,
+                                                       dtype=torch.long)
+            dst_col = torch.full((nseq,), t, device=dev, dtype=torch.long)
+            src_blk = block_table_2d[seq_ar, src_col].to(torch.int32)
+            dst_blk = block_table_2d[seq_ar, dst_col].to(torch.int32)
+            # Seed the dst conv block with the src block's window, then do a
+            # single-token in-place conv update at dst (reads its own history +
+            # the new token). Copying src->dst first makes the update start from
+            # the correct resume window without a separate kernel signature.
+            if t == 0:
+                conv_state.index_copy_(
+                    0, dst_blk.to(torch.long),
+                    conv_state.index_select(0, src_blk.to(torch.long)),
+                )
+            else:
+                # column t-1 already holds this seq's post-(t-1) window; seed t.
+                conv_state.index_copy_(
+                    0, dst_blk.to(torch.long),
+                    conv_state.index_select(0, src_blk.to(torch.long)),
+                )
+            out_t = causal_conv1d_update(
+                conv_x[:, t, :],           # [nseq, c_in]
+                conv_state,
+                conv_weights,
+                conv_bias,
+                self.activation,
+                conv_state_indices=dst_blk,
+            )
+            conv_out[:, t, :] = out_t
+        conv_out = conv_out.reshape(total, c_in)
+
+        kd = self.key_dim // get_tp_size()
+        vd = self.value_dim // get_tp_size()
+        qd_, kd_, vd_ = torch.split(conv_out, [kd, kd, vd], dim=-1)
+        # ``split`` returns non-contiguous views (row stride = c_in, not the
+        # per-tensor width); the raw ``fused_recurrent_gdn_spec`` kernel assumes
+        # contiguous ``[1, T, H, K]`` layout, so materialize contiguous copies.
+        q = qd_.reshape(1, total, self.tp_num_k_heads, self.head_k_dim).contiguous()
+        k = kd_.reshape(1, total, self.tp_num_k_heads, self.head_k_dim).contiguous()
+        v = vd_.reshape(1, total, self.tp_num_v_heads, self.head_v_dim).contiguous()
+
+        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        query_start_loc = input_data.get_query_start_loc()
+
+        # Temporal state: recurrent kernel reads column ``num_accepted-1`` and
+        # writes each verify token t's post-state into column t (in the shared
+        # ``ssm_state`` pool, addressed by the 2D block table).
+        core_attn_out = fused_recurrent_gdn_spec(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=self._scale,
+            state_source=ssm_state,
+            ssm_state_indices=block_table_2d,
+            num_accepted_tokens=num_accepted,
+            cu_seqlens=query_start_loc,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return core_attn_out.reshape(total, self.tp_num_v_heads, self.head_v_dim)
+
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         # Profile-run path (no allocated cache). Cheap, prevents crashes
@@ -397,7 +510,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), -1)
         conv_bias = self.conv1d.bias  # None for Qwen3.5
 
-        if self._is_decode_batch(input_data):
+        if getattr(input_data, "is_mtp_verify", False):
+            # MTP verify: every seq is [x1, d1..dk] (uniform 1+k query) over its
+            # cached context. Run the recurrent GDN kernel token-by-token and
+            # checkpoint the state AFTER each token into the SSMSegment
+            # intermediate buffers, so the accept step can commit the exact
+            # post-acceptance state back to the working slot (no rollback /
+            # recompute). Uses the same recurrent kernel as plain decode, so it
+            # is numerically consistent with the non-MTP decode path.
+            core_attn_out = self._forward_mtp_verify(
+                input_data, mixed_qkv, a, b, conv_state, ssm_state,
+                conv_weights, conv_bias, cache_indices,
+            )
+        elif self._is_decode_batch(input_data):
             # Decode: one new token per seq updates conv_state in-place and
             # runs the recurrent kernel for a single step. ``conv_state`` and
             # ``ssm_state`` are mutated in-place; the slot id is the row
@@ -932,6 +1057,141 @@ def _load_gdn_layer_weights(layer: Qwen3_5GatedDeltaNet, prefix: str, weights):
 
 
 # ---------------------------------------------------------------------------
+# Qwen3_5MTP (Multi-Token Prediction head for speculative decoding)
+# ---------------------------------------------------------------------------
+
+
+class Qwen3_5MTP(nn.Module):
+    """A single Qwen3.5 MTP (NextN) head — the checkpoint's ``mtp.*`` block.
+
+    Unlike DeepSeek's MLA-based MTP head, the Qwen3.5 head is ONE
+    *full-attention* decoder layer (``mtp.layers.0.*``) plus the fusion
+    projection ``fc`` and its two pre-norms. It reuses the base model's token
+    embedding and (tied) LM head — the checkpoint ships neither a dedicated
+    ``embed_tokens`` (``mtp_use_dedicated_embeddings = false``) nor a separate
+    LM head (``tie_word_embeddings = true``).
+
+    Forward (matches sglang ``Qwen3_5ForCausalLMMTP``)::
+
+        e = pre_fc_norm_embedding(embed(input_ids))   # GemmaRMSNorm
+        h = pre_fc_norm_hidden(prev_hidden)           # GemmaRMSNorm
+        x = fc(cat([e, h], dim=-1))                   # [2H -> H], embed first
+        x, residual = mtp_block(x)                     # one full-attn decoder layer
+        x = residual + x
+        x = norm(x)                                    # GemmaRMSNorm
+        logits = lm_head(x)                            # tied to embed_tokens
+
+    ``kv_layer_id`` is the dense full-attention slot the head's attention uses
+    to index the shared paged KV cache (it is ``num_kv_layers`` of the base
+    model — one past the last base full-attn layer). The head shares the target
+    model's KV cache the same way DeepSeek's does; its slot is only ever written
+    during draft steps (the verify forward runs the base model, so correctness
+    does not depend on the head's KV — only acceptance rate does).
+    """
+
+    def __init__(self, config, kv_layer_id: int, parent_model: "Qwen3_5Model"):
+        super().__init__()
+        self.config = config
+        self.kv_layer_id = kv_layer_id
+        self._parent_model = [parent_model]  # list to avoid registering as submodule
+        self._lm_head = []  # set by the owning ForCausalLM (base tied LM head)
+        eps = config.rms_norm_eps
+        hidden = config.hidden_size
+        quant_config = getattr(config, "quantization_config", None)
+
+        # Fusion of (next-token embedding, previous hidden state).
+        self.pre_fc_norm_embedding = GemmaRMSNorm(hidden, eps)
+        self.pre_fc_norm_hidden = GemmaRMSNorm(hidden, eps)
+        # fc: [2*hidden -> hidden], replicated (small, unsharded in ckpt).
+        self.fc = ReplicatedLinear(hidden * 2, hidden, bias=False)
+
+        # One full-attention decoder layer (the MTP block, ``mtp.layers.0``).
+        self.mtp_block = Qwen3_5DecoderLayer(
+            config,
+            layer_id=0,
+            layer_type="full_attention",
+            kv_layer_id=kv_layer_id,
+            ssm_layer_id=None,
+        )
+
+        # Final norm (``mtp.norm``); the LM head is the base model's (tied).
+        self.norm = GemmaRMSNorm(hidden, eps)
+
+    @property
+    def _embed(self):
+        return self._parent_model[0].embed_tokens
+
+    def forward(
+        self,
+        input_data: InputData,
+        prev_hidden: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the MTP block's post-norm hidden state ``[num_tokens, hidden]``.
+
+        ``prev_hidden``: hidden state (pre-final-norm) of the position whose
+        *next* token we are drafting. ``input_ids``: the already-known token id
+        at each of those positions (the token the draft is conditioned on).
+        """
+        e = self.pre_fc_norm_embedding(self._embed(input_ids))
+        h = self.pre_fc_norm_hidden(prev_hidden)
+        x = self.fc(torch.cat([e, h], dim=-1))
+        # mtp_block is a standard decoder layer: (input_data, hidden, residual).
+        x, residual = self.mtp_block(input_data, x, None)
+        x, _ = self.norm(x, residual)
+        return x
+
+    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The MTP head shares the base model's (tied) LM head.
+        return self._lm_head[0](hidden_states)
+
+    def _src_key(self, param_name: str) -> str:
+        """Map an MTP-module parameter name to its checkpoint key.
+
+        The checkpoint stores the head under ``mtp.``:
+
+            fc / pre_fc_norm_embedding / pre_fc_norm_hidden / norm -> mtp.<same>
+            mtp_block.self_attn.<x>   -> mtp.layers.0.self_attn.<x>
+            mtp_block.mlp.<x>         -> mtp.layers.0.mlp.<x>
+            mtp_block.input_layernorm / post_attention_layernorm
+                                      -> mtp.layers.0.<same>
+
+        The gated fused ``qkv_proj`` / fused ``gate_up_proj`` param names are
+        preserved so the parent's rule handlers (which ``str.replace`` them back
+        to ``q_proj`` / ``gate_proj`` / ``up_proj``) find the split checkpoint
+        tensors.
+        """
+        if param_name.startswith("mtp_block."):
+            rest = param_name[len("mtp_block."):]
+            return f"mtp.layers.0.{rest}"
+        # fc / pre_fc_norm_embedding / pre_fc_norm_hidden / norm: verbatim.
+        return f"mtp.{param_name}"
+
+    def load_weights(self, weights, parent_lm, mp_load_progress=None):
+        """Load the ``mtp.*`` head weights, reusing the base rule table.
+
+        ``parent_lm`` is the built :class:`Qwen3_5ForCausalLM`; we borrow its
+        ``weight_rules()`` + ``LoadContext`` (gated-qkv geometry) and remap each
+        of THIS module's parameter names to the checkpoint's ``mtp.*`` key via
+        :meth:`_src_key`, so the same handlers that loaded the base full-attn
+        layers load the MTP block unchanged.
+        """
+        rules = parent_lm.weight_rules()
+        # The embed/lm_head rule never matches an MTP param (the head has no own
+        # embed/lm_head — it shares the base's), so drop it for clarity.
+        rules = [r for r in rules if r.name != "embed_lm_head"]
+        ctx = parent_lm._make_load_context(weights)
+        for name, p in dict(self.named_parameters()).items():
+            src = self._src_key(name)
+            for rule in rules:
+                if rule.match(src):
+                    rule.handler(ctx, src, p.data)
+                    break
+            else:
+                p.data.copy_(get_tensor_from_dict(weights, src))
+
+
+# ---------------------------------------------------------------------------
 # Qwen3_5ForCausalLM
 # ---------------------------------------------------------------------------
 
@@ -948,8 +1208,8 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.start_layer = self.model.start_layer
         self.end_layer = self.model.end_layer
         # SSM bookkeeping that ``model_runner`` reads when sizing the
-        # SSMSegment.
-        self.num_kv_layers = self.model.num_kv_layers
+        # SSMSegment. ``num_kv_layers`` is a property (accounts for the MTP
+        # head's extra full-attn slot) so it is not assigned here.
         self.num_ssm_layers = self.model.num_ssm_layers
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = getattr(
@@ -962,6 +1222,34 @@ class Qwen3_5ForCausalLM(nn.Module):
             self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
             if getattr(config, "tie_word_embeddings", False):
                 self.lm_head.tie_weights(self.model.embed_tokens)
+
+        # Optional MTP (Multi-Token Prediction) head for speculative decoding.
+        # Built only when the checkpoint ships an ``mtp.*`` block
+        # (``mtp_num_hidden_layers >= 1``) AND MTP is enabled by the runner
+        # (``config.mtp_enabled``, resolved from the ``mtp_enabled`` CLI/arg with
+        # auto-detect). Only on the last PP rank, where the base ``lm_head`` /
+        # final hidden live. The head's full-attention block uses the KV slot
+        # just past the base full-attention layers (``num_kv_layers``).
+        self.mtp = None
+        num_mtp = getattr(config, "mtp_num_hidden_layers", 0) or 0
+        want_mtp = getattr(config, "mtp_enabled", False) and num_mtp >= 1
+        if want_mtp and is_last_pp_rank():
+            self.mtp = Qwen3_5MTP(
+                config,
+                kv_layer_id=self.model.num_kv_layers,
+                parent_model=self.model,
+            )
+            self.mtp._lm_head = [self.lm_head]
+
+    @property
+    def num_kv_layers(self):
+        # The MTP block runs its own full-attention layer and writes into the
+        # KV slot just past the base full-attn layers, so the MemoryManager
+        # must size one extra layer when the head is present. (PP=1: the head is
+        # on this rank; PP>1: only the last rank, which is also the only rank
+        # whose full-attn slots reach the top.)
+        base = self.model.num_kv_layers
+        return base + 1 if self.mtp is not None else base
 
     def _build_ssm_cache_config(self, config) -> SSMCacheConfig:
         """Compose the per-rank :class:`SSMCacheConfig`.
@@ -1071,22 +1359,35 @@ class Qwen3_5ForCausalLM(nn.Module):
         ]
 
     def load_weights(self, weights, mp_load_progress=None):
-        ctx = self._make_load_context(weights)
-        # qkv rule only fires when a full-attention layer exists; if none,
-        # ``num_q_rows`` is 0 and no qkv_proj parameters are present anyway.
-        rules = self.weight_rules()
-        if ctx.extra.get("_attn_ref") is None:
-            rules = [r for r in rules if r.name != "qkv_proj"]
-        run_weight_loader(
-            self,
-            weights,
-            rules,
-            mp_load_progress,
-            pp_idx_offset=2,
-            start_layer=self.start_layer,
-            ctx=ctx,
-            pre_passes=[make_gdn_pre_pass(self.GDN_SUBS, _load_gdn_layer_weights)],
-        )
+        # The base loader iterates ``self.named_parameters()`` and looks each up
+        # by its parameter path under ``model.*`` / ``lm_head``. The MTP head's
+        # params live under ``mtp.*`` (no ``model.layers.N`` path), so detach it
+        # for the base pass and load it separately below.
+        mtp = self.mtp
+        self.mtp = None
+        try:
+            ctx = self._make_load_context(weights)
+            # qkv rule only fires when a full-attention layer exists; if none,
+            # ``num_q_rows`` is 0 and no qkv_proj parameters are present anyway.
+            rules = self.weight_rules()
+            if ctx.extra.get("_attn_ref") is None:
+                rules = [r for r in rules if r.name != "qkv_proj"]
+            run_weight_loader(
+                self,
+                weights,
+                rules,
+                mp_load_progress,
+                pp_idx_offset=2,
+                start_layer=self.start_layer,
+                ctx=ctx,
+                pre_passes=[make_gdn_pre_pass(self.GDN_SUBS, _load_gdn_layer_weights)],
+            )
+        finally:
+            self.mtp = mtp
+        # Then the MTP head's ``mtp.*`` weights, reusing this model's rule table
+        # + load context (see Qwen3_5MTP.load_weights).
+        if self.mtp is not None:
+            self.mtp.load_weights(weights, self, mp_load_progress)
 
 
 # ---------------------------------------------------------------------------
@@ -1120,6 +1421,15 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.ssm_cache_config = self.language_model.ssm_cache_config
         self.num_kv_layers = self.language_model.num_kv_layers
         self.num_ssm_layers = self.language_model.num_ssm_layers
+
+    @property
+    def mtp(self):
+        # ModelRunner reads ``self.model.mtp`` to detect / drive the MTP head.
+        # It lives on the language model; surface it at the wrapper level.
+        # (``compute_logits`` / ``logits_from_hidden`` are already delegated to
+        # the language model by the Qwen3-VL parent.)
+        lm = getattr(self, "language_model", None)
+        return getattr(lm, "mtp", None) if lm is not None else None
 
     def load_weights(self, weights, mp_load_progress=None):
         # Language model load is delegated; it walks ``self.language_model``'s

@@ -178,6 +178,11 @@ class SeqUpdate:
     # value each iter (it is allocated once but changes on preempt/realloc).
     # ``None`` for non-hybrid models (no SSM segment).
     ssm_state_slot: Optional[int] = None
+    # Hybrid MTP (vLLM-style spec decode): the fixed ``1+k`` SSM state block
+    # table + persisted accepted-token count, mirrored to followers so their
+    # GDN forward resumes from the same column. ``None`` for non-MTP seqs.
+    ssm_block_table: Optional[List[int]] = None
+    ssm_num_accepted: int = 1
     # Hybrid/SSM + prefix caching under PP>1 only: the snapshot-pool slot id
     # assigned to each page in ``new_page_ids`` (``-1`` = no snapshot slot).
     # The follower mirrors these into its own ``page2ssm_snapshot`` table so its
@@ -388,6 +393,8 @@ class DriverPayloadBuilder:
                     new_page_ids=new_page_ids,
                     page_table_reset=page_table_reset,
                     ssm_state_slot=seq.ssm_state_slot,
+                    ssm_block_table=seq.ssm_block_table,
+                    ssm_num_accepted=seq.ssm_num_accepted,
                     new_page_snap_slots=new_page_snap_slots,
                     ssm_restore_src_slot=(
                         ssm_restores.get(sid) if ssm_restores else None
@@ -460,6 +467,8 @@ class FollowerSeq:
         "raw_prompt_len",
         "prompt_logprobs_data",
         "ssm_state_slot",
+        "ssm_block_table",
+        "ssm_num_accepted",
         "ssm_restore_src_slot",
     )
 
@@ -503,6 +512,8 @@ class FollowerSeq:
         # Hybrid/SSM working-slot mirror; overwritten by ``apply_update`` every
         # iter (``None`` for non-hybrid models). ``_cal_ssm_metadata`` reads it.
         self.ssm_state_slot: Optional[int] = None
+        self.ssm_block_table: Optional[List[int]] = None
+        self.ssm_num_accepted: int = 1
         # One-shot prefix-cache-hit restore signal (snapshot slot -> working
         # slot copy the follower must run before its next forward). Reset to
         # ``None`` by every ``apply_update`` so it only fires on the hit iter.
@@ -565,6 +576,8 @@ class FollowerSeq:
         self.to_compute_token_num = upd.to_compute_token_num
         self.to_compute_tokens = upd.to_compute_tokens
         self.ssm_state_slot = upd.ssm_state_slot
+        self.ssm_block_table = upd.ssm_block_table
+        self.ssm_num_accepted = upd.ssm_num_accepted
         self.ssm_restore_src_slot = upd.ssm_restore_src_slot
 
         if upd.page_table_reset is not None:

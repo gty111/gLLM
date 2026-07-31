@@ -71,6 +71,20 @@ class InputData:
                 self.ssm_snapshot_write_slot_per_seq = torch.full(
                     (max_running_seqs,), -1, dtype=torch.int32
                 )
+                # MTP verify (vLLM-style 2D block table): static GPU buffers so
+                # the verify forward can run inside a CUDA graph (the values are
+                # refilled via ``copy_to_input_buffer`` before each replay; the
+                # buffer address stays fixed across capture/replay). Width is
+                # ``1 + mtp_k`` (rolling col + k checkpoint cols); 0 when MTP off.
+                _mtp_k = getattr(memory_manager, "mtp_k", 0) or 0
+                self._mtp_bt_width = 1 + _mtp_k
+                if _mtp_k > 0:
+                    self.ssm_block_table_2d = torch.zeros(
+                        (max_running_seqs, self._mtp_bt_width), dtype=torch.int32
+                    )
+                    self.ssm_num_accepted = torch.ones(
+                        max_running_seqs, dtype=torch.int32
+                    )
 
             if self.use_mla:
                 self.workspace = torch.empty(
@@ -134,6 +148,30 @@ class InputData:
 
         if self.use_mla:
             self._cal_mla_metadata(seqs)
+        else:
+            self._cal_batch_split(seqs)
+
+    def _cal_batch_split(self, seqs: List[Sequence]):
+        """Set ``num_decodes`` / ``num_decode_tokens`` / ``num_prefills`` for the
+        non-MLA (standard / hybrid) path.
+
+        ``_cal_mla_metadata`` sets these for the MLA path; the flash-attention
+        and hybrid GDN models never called it, so the MTP speculative-decode
+        code (``ModelRunner.step_once`` / ``_mtp_decode``) — which reads these
+        counts to gate the pure-decode fast path — would ``AttributeError``.
+        The scheduler orders decode seqs first and prefill/verify seqs last, so
+        the first non-decode seq marks the split (mirrors the MLA logic). An MTP
+        *verify* seq is a decode seq re-expanded to ``1+k`` query tokens over its
+        cached context and rides the prefill path, so it counts as non-decode.
+        """
+        self.num_decodes = len(seqs)
+        self.num_prefills = 0
+        for idx, seq in enumerate(seqs):
+            if (not seq.computed_prompt) or getattr(seq, "_mtp_verify", False):
+                self.num_decodes = idx
+                self.num_prefills = len(seqs) - idx
+                break
+        self.num_decode_tokens = self.num_decodes
 
     def _cal_ssm_metadata(self, seqs: List[Sequence]):
         """Build per-seq SSM slot id + initial-state flag + snapshot target.
@@ -170,7 +208,6 @@ class InputData:
         for i, seq in enumerate(seqs):
             slots[i] = seq.ssm_state_slot if seq.ssm_state_slot is not None else 0
             has_init[i] = seq.computed_token_num > 0
-
             # Snapshot timing: prefill chunk landing on a page boundary.
             # Decode rows skip this branch since ``computed_prompt`` flips
             # True before any decode token is emitted (see Sequence) and
@@ -202,6 +239,31 @@ class InputData:
         self.ssm_snapshot_write_slot_per_seq_cpu = (
             torch.from_numpy(snap_targets).pin_memory()
         )
+
+        # vLLM-style spec-decode 2D block table + accepted-count (MTP hybrid).
+        # Built only when at least one seq carries a ``ssm_block_table`` (MTP on).
+        # ``ssm_block_table_2d[i]`` = the seq's ``1+k`` state block ids; the GDN
+        # verify kernel writes each verify token's post-state to its column and
+        # reads the resume state from column ``num_accepted-1``. Non-MTP runs
+        # leave these ``None`` and keep the scalar ``ssm_state_slot_per_seq``.
+        bt0 = next((s.ssm_block_table for s in seqs if s.ssm_block_table), None)
+        if bt0 is not None:
+            width = len(bt0)
+            bt2d = np.zeros((len(seqs), width), dtype=np.int32)
+            nacc = np.ones(len(seqs), dtype=np.int32)
+            for i, seq in enumerate(seqs):
+                if seq.ssm_block_table is not None:
+                    bt2d[i, :] = seq.ssm_block_table
+                    nacc[i] = seq.ssm_num_accepted
+                else:
+                    # Shouldn't happen in a homogeneous MTP batch; fall back to
+                    # the scalar slot in column 0 so the kernel still resolves.
+                    bt2d[i, 0] = seq.ssm_state_slot or 0
+            self.ssm_block_table_2d_cpu = torch.from_numpy(bt2d).pin_memory()
+            self.ssm_num_accepted_cpu = torch.from_numpy(nacc).pin_memory()
+        else:
+            self.ssm_block_table_2d_cpu = None
+            self.ssm_num_accepted_cpu = None
 
     def copy_to_input_buffer(self):
         assert self.use_buffer
@@ -251,6 +313,16 @@ class InputData:
             self.ssm_snapshot_write_slot_per_seq[:n_seqs].copy_(
                 self.ssm_snapshot_write_slot_per_seq_cpu, non_blocking=True
             )
+            # MTP verify 2D block table + accepted-count into the static GPU
+            # buffers (present only when MTP is on). Refilled every step so a
+            # captured verify graph replays against the same buffer address.
+            bt2d_cpu = getattr(self, "ssm_block_table_2d_cpu", None)
+            if bt2d_cpu is not None and hasattr(self, "ssm_block_table_2d"):
+                r, w = bt2d_cpu.shape
+                self.ssm_block_table_2d[:r, :w].copy_(bt2d_cpu, non_blocking=True)
+                self.ssm_num_accepted[: bt2d_cpu.shape[0]].copy_(
+                    self.ssm_num_accepted_cpu, non_blocking=True
+                )
 
         if self.use_mla:
             self._set_mla_metadata()
@@ -277,6 +349,11 @@ class InputData:
         "repetition_penalty",
         "needs_repetition_penalty",
         "is_mtp_verify",
+        # Batch decode/prefill split — set for both MLA (_cal_mla_metadata) and
+        # non-MLA (_cal_batch_split) paths; the MTP fast-path gate reads them.
+        "num_decodes",
+        "num_decode_tokens",
+        "num_prefills",
     )
     _PREBUILT_SSM_ATTRS = (
         "ssm_state_slot_per_seq_cpu",
@@ -285,9 +362,6 @@ class InputData:
     )
     _PREBUILT_MLA_ATTRS = (
         "num_actual_tokens",
-        "num_decodes",
-        "num_decode_tokens",
-        "num_prefills",
         "max_context_len",
         "decode_seq_lens_cpu",
         "decode_max_query_len",
@@ -425,6 +499,27 @@ class InputData:
 
     def get_has_initial_state_per_seq(self):
         return self.has_initial_state_per_seq[: self.has_initial_state_per_seq_cpu.shape[0]]
+
+    def get_ssm_block_table_2d(self):
+        """Per-seq ``[nseq, 1+k]`` SSM state block table (int32 GPU), or None
+        when the batch has no MTP block-table seqs. Returns a slice of the
+        STATIC GPU buffer (filled by ``copy_to_input_buffer``) so the verify
+        forward is CUDA-graph-capturable -- the address is fixed across replays.
+        """
+        cpu = getattr(self, "ssm_block_table_2d_cpu", None)
+        if cpu is None or not hasattr(self, "ssm_block_table_2d"):
+            return None
+        r, w = cpu.shape
+        return self.ssm_block_table_2d[:r, :w]
+
+    def get_ssm_num_accepted(self):
+        """Per-seq accepted-token count (int32 GPU) selecting the resume column
+        (``num_accepted-1``), or None when no MTP block-table seqs. Slice of the
+        static GPU buffer (graph-capturable)."""
+        cpu = getattr(self, "ssm_num_accepted_cpu", None)
+        if cpu is None or not hasattr(self, "ssm_num_accepted"):
+            return None
+        return self.ssm_num_accepted[: cpu.shape[0]]
 
     def get_ssm_snapshot_write_slot_per_seq(self):
         """Per-seq snapshot-pool slot id to write at end of forward (-1=skip).

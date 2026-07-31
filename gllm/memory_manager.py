@@ -103,57 +103,51 @@ class SSMSegment:
     def __init__(
         self,
         cfg: SSMCacheConfig,
-        working_pool_size: int,
-        snapshot_pool_size: int,
+        num_blocks: int,
     ):
         self.cfg = cfg
-        # +1 so slot 0 stays available as the CUDA-graph dummy slot.
-        self.working_pool_size = working_pool_size + 1
-        self.snapshot_pool_size = max(snapshot_pool_size, 0) + 1
+        # Shared recurrent-state block pool. Each block holds ONE full per-layer
+        # GDN recurrent state (conv window + temporal state). A running sequence
+        # borrows one block for its rolling state; an MTP verify step transiently
+        # borrows ``k`` extra blocks per seq for the per-token checkpoints; a
+        # prefix-cached prefix keeps its state in a ref-counted block borrowed
+        # from THIS SAME pool (there is no separate snapshot pool anymore -- the
+        # cached-state block lives here and is copied into a fresh working block
+        # on a cache hit, so GDN's in-place updates never touch the cached copy;
+        # vLLM-style). The pool size is derived from the memory budget, NOT from
+        # ``maxd``; max concurrency is *bounded by* ``num_blocks``.
+        # +1 keeps block 0 reserved as the CUDA-graph dummy block.
+        self.num_blocks = num_blocks + 1
+        # Back-compat alias: some call sites / logs still read working_pool_size.
+        self.working_pool_size = self.num_blocks
 
         conv_shape = cfg.conv_state_shape_per_slot()
         temp_shape = cfg.temporal_state_shape_per_slot()
 
-        # Layout: ``[num_layers, pool_size, *per_slot]``. Indexing always uses
-        # ``[layer_id, slot_id, ...]`` so layers can do batched gather via the
-        # per-token slot mapping. ``torch.zeros`` (not ``empty``) because the
-        # SSM kernels read from slot 0 / freshly-allocated slots before the
-        # first write and require a clean initial state (h_0 = 0).
-        self.conv_state = [
-            torch.zeros((self.working_pool_size, *conv_shape),
-                        dtype=cfg.conv_state_dtype)
-            for _ in range(cfg.num_layers)
-        ]
-        self.temporal_state = [
-            torch.zeros((self.working_pool_size, *temp_shape), dtype=cfg.dtype)
-            for _ in range(cfg.num_layers)
-        ]
+        # Layout: ``[num_layers, num_blocks, *per_block]`` as a single stacked
+        # tensor (not a Python list of per-layer tensors). ``conv_state[layer_id]``
+        # still returns that layer's ``[num_blocks, *per_block]`` slice -- a
+        # contiguous view -- so every per-layer call site (kernels, ``copy_state``,
+        # ``zero_``) is unchanged. The stacked layout lets ``commit_blocks`` copy
+        # the checkpoint across ALL layers in one ``index_copy_`` (2 kernel
+        # launches total) instead of ``2 * num_layers`` per-layer launches.
+        # ``torch.zeros`` (not ``empty``) because the SSM kernels read from
+        # block 0 / freshly-allocated blocks before the first write and require a
+        # clean initial state (h_0 = 0).
+        self.conv_state = torch.zeros(
+            (cfg.num_layers, self.num_blocks, *conv_shape),
+            dtype=cfg.conv_state_dtype,
+        )
+        self.temporal_state = torch.zeros(
+            (cfg.num_layers, self.num_blocks, *temp_shape), dtype=cfg.dtype
+        )
 
-        if self.snapshot_pool_size > 1:
-            self.conv_state_snap = [
-                torch.zeros((self.snapshot_pool_size, *conv_shape),
-                            dtype=cfg.conv_state_dtype)
-                for _ in range(cfg.num_layers)
-            ]
-            self.temporal_state_snap = [
-                torch.zeros((self.snapshot_pool_size, *temp_shape), dtype=cfg.dtype)
-                for _ in range(cfg.num_layers)
-            ]
-        else:
-            self.conv_state_snap = None
-            self.temporal_state_snap = None
+        # Block 0 reserved as the CUDA-graph dummy.
+        self.working_alloc = IDAllocator(1, self.num_blocks - 1)
 
-        # Slot 0 reserved for both pools.
-        self.working_alloc = IDAllocator(1, self.working_pool_size - 1)
-        if self.snapshot_pool_size > 1:
-            self.snapshot_alloc = IDAllocator(1, self.snapshot_pool_size - 1)
-        else:
-            self.snapshot_alloc = None
-
-        # Dummy slots that padded rows / unused snapshot pointers can refer to
-        # without aliasing any real state.
+        # Dummy slot that padded rows / unused pointers can refer to without
+        # aliasing any real state.
         self.dummy_working_slot: int = 0
-        self.dummy_snapshot_slot: int = 0
 
         # Optional CUDA stream that ``copy_state`` (the prefix-cache restore)
         # must run on. Under overlap scheduling the snapshot WRITE happens
@@ -167,44 +161,80 @@ class SSMSegment:
         # where it is already serialized with the forward.
         self.restore_stream: Optional["torch.cuda.Stream"] = None
 
-    # --- working pool ---------------------------------------------------
+    # --- block pool -----------------------------------------------------
+    #
+    # A "block" holds one full per-layer GDN recurrent state. Sequences borrow
+    # one block for their rolling state; MTP verify borrows extra transient
+    # blocks for per-token checkpoints. ``allocate_working`` / ``free_working``
+    # are kept as aliases so pre-existing call sites keep working.
 
-    def allocate_working(self) -> int:
+    def allocate_block(self) -> int:
         return self.working_alloc.allocate()
 
-    def free_working(self, slot: int) -> None:
-        if slot is None or slot == self.dummy_working_slot:
+    def free_block(self, block: int) -> None:
+        if block is None or block == self.dummy_working_slot:
             return
-        # Zero before returning so the next request starts from h_0 = 0
+        # Zero before returning so the next borrower starts from h_0 = 0
         # without needing an explicit "reset state" pass through every layer.
-        for layer_id in range(self.cfg.num_layers):
-            self.conv_state[layer_id][slot].zero_()
-            self.temporal_state[layer_id][slot].zero_()
-        self.working_alloc.free(slot)
+        # Stacked layout -> one ``zero_`` per state covers all layers.
+        self.conv_state[:, block].zero_()
+        self.temporal_state[:, block].zero_()
+        self.working_alloc.free(block)
 
-    def num_free_working(self) -> int:
+    def num_free_blocks(self) -> int:
         return self.working_alloc.get_num_free_ids()
 
-    # --- snapshot pool --------------------------------------------------
+    def allocate_block_table(self, n: int) -> Optional[list]:
+        """Borrow ``n`` blocks for a sequence's SSM state block table.
+
+        vLLM-style spec decode gives each sequence a fixed ``1+k`` block table
+        (column 0 the rolling/committed state, columns 1..k the verify-step
+        checkpoint scratch). Returns a list of ``n`` block ids, or ``None`` if
+        the pool cannot satisfy the whole request (caller must not partially
+        allocate -- the scheduler gates admission on ``num_free_blocks``).
+        """
+        if self.working_alloc.get_num_free_ids() < n:
+            return None
+        return [self.working_alloc.allocate() for _ in range(n)]
+
+    def free_block_table(self, blocks) -> None:
+        """Return a sequence's whole SSM block table to the pool (zeroing each)."""
+        if not blocks:
+            return
+        for blk in blocks:
+            self.free_block(blk)
+
+    # Back-compat aliases (one working slot == one borrowed block).
+    def allocate_working(self) -> int:
+        return self.allocate_block()
+
+    def free_working(self, slot: int) -> None:
+        self.free_block(slot)
+
+    def num_free_working(self) -> int:
+        return self.num_free_blocks()
+
+    # --- prefix-cache cached-state blocks ------------------------------
+    #
+    # A prefix-cached prefix keeps its recurrent state in a block borrowed from
+    # the SAME main pool (no separate snapshot pool). ``allocate_snapshot`` /
+    # ``free_snapshot`` are thin aliases over the block allocator so the
+    # PrefixSegment lifecycle code (which reserves a cached-state block per
+    # cacheable page and frees it on re-mint) reads naturally. Returns None when
+    # the pool is exhausted -> the caller degrades to "KV-cached but no SSM".
 
     def allocate_snapshot(self) -> Optional[int]:
-        if self.snapshot_alloc is None or self.snapshot_alloc.get_num_free_ids() == 0:
+        if self.working_alloc.get_num_free_ids() == 0:
             return None
-        return self.snapshot_alloc.allocate()
+        return self.working_alloc.allocate()
 
     def free_snapshot(self, slot: int) -> None:
-        if (
-            slot is None
-            or self.snapshot_alloc is None
-            or slot == self.dummy_snapshot_slot
-        ):
+        if slot is None or slot == self.dummy_working_slot:
             return
-        self.snapshot_alloc.free(slot)
+        self.free_block(slot)
 
     def num_free_snapshot(self) -> int:
-        if self.snapshot_alloc is None:
-            return 0
-        return self.snapshot_alloc.get_num_free_ids()
+        return self.num_free_blocks()
 
     # --- transfer -------------------------------------------------------
 
@@ -215,16 +245,16 @@ class SSMSegment:
         dst_kind: str,
         dst_slot: int,
     ) -> None:
-        """Copy a full multi-layer state snapshot between pools.
+        """Copy a full multi-layer recurrent state between two blocks of the
+        shared pool. ``src_kind``/``dst_kind`` ("working"/"snapshot") are only
+        semantic labels for the copy direction; both index the same pool.
 
-        ``kind`` is one of ``"working"`` / ``"snapshot"``. Used in two places:
-
-        * Prefill snapshot capture: ``copy_state("working", req_slot,
-          "snapshot", page_slot)`` after the GDN layer finishes a chunk that
-          crosses a page boundary.
-        * Prefix-cache hit restore: ``copy_state("snapshot", page_slot,
-          "working", req_slot)`` before the new request runs its first
-          forward.
+        * Prefill capture: ``copy_state("working", req_block, "snapshot",
+          cached_block)`` after the GDN layer crosses a cacheable page boundary.
+        * Prefix-cache hit restore: ``copy_state("snapshot", cached_block,
+          "working", req_block)`` before the new request's first forward, giving
+          it a private mutable copy (copy-on-write; the cached block stays
+          read-only for other future hits).
         """
         src_conv, src_temp = self._pool(src_kind)
         dst_conv, dst_temp = self._pool(dst_kind)
@@ -232,9 +262,10 @@ class SSMSegment:
             return
 
         def _do_copies():
-            for layer_id in range(self.cfg.num_layers):
-                dst_conv[layer_id][dst_slot].copy_(src_conv[layer_id][src_slot])
-                dst_temp[layer_id][dst_slot].copy_(src_temp[layer_id][src_slot])
+            # Stacked ``[num_layers, num_blocks, *]`` -> copy every layer's slot
+            # in one op per state (2 launches) instead of ``2 * num_layers``.
+            dst_conv[:, dst_slot].copy_(src_conv[:, src_slot])
+            dst_temp[:, dst_slot].copy_(src_temp[:, src_slot])
 
         # Pin the copies to ``restore_stream`` when set (overlap scheduling) so
         # a restore that reads a snapshot written by the in-flight forward is
@@ -248,11 +279,50 @@ class SSMSegment:
             _do_copies()
 
     def _pool(self, kind: str):
-        if kind == "working":
+        # Both "working" and "snapshot" now live in the SAME block pool -- the
+        # kind is just a semantic label for the copy direction (capture vs
+        # restore). Cached-state ("snapshot") blocks and live rolling
+        # ("working") blocks are distinct block ids in ``conv_state`` /
+        # ``temporal_state``; the copy is always between different block ids.
+        if kind in ("working", "snapshot"):
             return self.conv_state, self.temporal_state
-        if kind == "snapshot":
-            return self.conv_state_snap, self.temporal_state_snap
         raise ValueError(f"unknown ssm pool kind: {kind!r}")
+
+    # --- MTP verify checkpoint commit ----------------------------------
+    #
+    # An MTP verify forward runs the GDN recurrent kernel over [x1, d1..dk] and
+    # checkpoints the state after each token into a set of transient blocks
+    # borrowed from this same pool (one block per verify step, per sequence).
+    # The verify forward does NOT write the sequence's rolling block (it passes
+    # ``disable_state_update``). After the accept step knows each seq committed
+    # ``1+na`` tokens, we copy the step-``na`` checkpoint block's contents into
+    # the sequence's rolling block -- the exact post-commit recurrent state,
+    # with no rollback and no recompute forward. The transient blocks are then
+    # freed back to the shared pool. vLLM keeps the 1+K blocks live across steps
+    # and selects via ``num_accepted_tokens``; gLLM keeps one rolling block as
+    # the source of truth (so the plain decode path is untouched) and commits
+    # the chosen checkpoint here, freeing the rest.
+
+    def commit_blocks(self, commit) -> None:
+        """Copy chosen checkpoint blocks into rolling blocks (batched).
+
+        ``commit`` is a list of ``(dst_block, src_block)`` pairs. For each, the
+        full per-layer state at ``src_block`` is copied into ``dst_block``.
+        With the stacked ``[num_layers, num_blocks, *]`` layout the copy is one
+        ``index_copy_`` over the block dim (dim=1) across ALL layers at once --
+        2 kernel launches total (conv + temporal) instead of ``2 * num_layers``.
+        """
+        if not commit:
+            return
+        dev = self.conv_state.device
+        dst = torch.as_tensor([c[0] for c in commit], dtype=torch.long, device=dev)
+        src = torch.as_tensor([c[1] for c in commit], dtype=torch.long, device=dev)
+        self.conv_state.index_copy_(
+            1, dst, self.conv_state.index_select(1, src)
+        )
+        self.temporal_state.index_copy_(
+            1, dst, self.temporal_state.index_select(1, src)
+        )
 
 
 class Segment:
@@ -397,6 +467,7 @@ class MemoryManager:
         index_head_dim: int = 0,
         qk_rope_head_dim: int = 0,
         mla_cache_fp8: bool = False,
+        mtp_k: int = 0,
     ):
         """
         Args:
@@ -440,6 +511,9 @@ class MemoryManager:
         self.ssm_cache_config = ssm_cache_config
         self.max_working_ssm_slots = max_working_ssm_slots
         self.max_snapshot_ssm_slots = max_snapshot_ssm_slots
+        # Draft-chain length (mtp_k); a running seq borrows up to this many
+        # transient checkpoint blocks during an MTP verify step (0 = MTP off).
+        self.mtp_k = mtp_k
         # Upper bound on the share of util-scaled free memory the SSM pools may
         # occupy before the KV cache is sized. The snapshot pool (best-effort)
         # is clamped to fit; the working pool (mandatory) is always honored.
@@ -526,83 +600,92 @@ class MemoryManager:
         self.v_scale = self.k_scale
 
     def _init_ssm_segment_if_needed(self) -> None:
-        """Allocate the SSM working+snapshot pools when the model needs them.
+        """Allocate the SSM block pool + snapshot pool when the model needs them.
 
-        For hybrid GDN/Mamba models each pool slot holds the full per-layer
-        recurrent state, so the requested pools (``maxd`` working +
-        ``4*maxd`` snapshot) can be tens of GB and -- allocated eagerly before
-        the KV cache is sized -- exhaust the device and OOM right here. To make
-        startup robust we size the pools against the *currently free* memory:
+        For hybrid GDN/Mamba models each pool block holds the full per-layer
+        recurrent state. We size ONE shared block pool from the memory budget
+        (vLLM-style), decoupled from ``maxd``. Every consumer borrows from it:
 
-        * the **working pool** (one slot per concurrently-running seq) is
-          mandatory for correctness and always allocated; if even it cannot
-          fit we raise a clear, actionable error instead of a bare CUDA OOM;
-        * the **snapshot pool** (best-effort prefix-cache state reuse) is
-          clamped so the total SSM footprint stays within
-          ``ssm_pool_budget_frac`` of the util-scaled free memory, leaving the
-          remainder for the KV cache. When memory is ample the full requested
-          snapshot pool is honored (behavior unchanged); when tight it shrinks,
-          down to 0 (SSM prefix caching disabled) before anything OOMs.
+        * a running seq borrows 1 rolling block; an MTP verify step borrows a
+          few transient checkpoint blocks; a prefix-cached prefix keeps its
+          state in a ref-counted block borrowed from this same pool.
+        * ``num_ssm_blocks = min(budget/per_block, working_cap + cache_cap)``
+          where ``working_cap = maxd * (1 + mtp_k)`` (max blocks live seqs can
+          borrow at once) and ``cache_cap`` (== requested prefix-cache blocks)
+          is best-effort headroom for cached-prefix reuse. Floored at ``maxd``
+          (>=1 rolling block per running seq) or we raise a clear error.
         """
         if self.ssm_cache_config is None:
             return
         cfg = self.ssm_cache_config
-        per_slot = cfg.per_slot_bytes()
+        per_block = cfg.per_slot_bytes()
 
         free_mem, _ = torch.cuda.mem_get_info()
         budget = int(free_mem * self.gpu_memory_util * self.ssm_pool_budget_frac)
 
-        # +1 mirrors SSMSegment's reserved CUDA-graph dummy slot in each pool.
-        working_slots = self.max_working_ssm_slots
-        working_bytes = (working_slots + 1) * per_slot
-        if working_bytes >= free_mem:
+        maxd = self.max_working_ssm_slots
+        # Blocks a single running seq may hold at once: 1 rolling + mtp_k
+        # transient checkpoint blocks during an MTP verify (0 extra when MTP off).
+        per_seq_blocks = 1 + self.mtp_k
+        working_cap = maxd * per_seq_blocks
+        # Best-effort headroom for prefix-cached-prefix state blocks (borrowed
+        # from the same pool, ref-counted alongside their KV page).
+        cache_cap = max(self.max_snapshot_ssm_slots, 0)
+        block_cap = working_cap + cache_cap
+        # Budget-derived block count (like KV pages = free_mem*util / kv_page).
+        affordable_blocks = int(budget // per_block)
+        num_ssm_blocks = min(block_cap, affordable_blocks)
+        # Floor: at least one rolling block per concurrently-running seq, else
+        # the scheduler could admit a seq with no state block. If even that
+        # doesn't fit, fail early with an actionable message.
+        if num_ssm_blocks < maxd:
+            need = maxd * per_block
             raise RuntimeError(
-                f"SSM working pool needs {working_bytes / (1 << 30):.1f} GB "
-                f"({working_slots} slots x {per_slot / (1 << 20):.1f} MB) but only "
-                f"{free_mem / (1 << 30):.1f} GB is free after loading weights. "
-                f"Lower --maxd (currently {working_slots}) or use more "
-                f"tensor-parallel GPUs (--tp) to shrink the per-rank state."
+                f"SSM block pool needs >= {need / (1 << 30):.1f} GB for {maxd} "
+                f"concurrent sequences ({maxd} blocks x "
+                f"{per_block / (1 << 20):.1f} MB) but only "
+                f"{budget / (1 << 30):.1f} GB SSM budget is available. Lower "
+                f"--maxd (currently {maxd}) or raise --tp to shrink per-rank state."
             )
 
-        requested_snapshot = self.max_snapshot_ssm_slots
-        affordable_snapshot = max(0, (budget - working_bytes) // per_slot - 1)
-        snapshot_slots = min(requested_snapshot, int(affordable_snapshot))
-
         # Keep every TP rank's pool layout identical (state is sharded, not
-        # replicated, but the slot *count* must match across ranks); free
+        # replicated, but the block *count* must match across ranks); free
         # memory can differ slightly per rank, so agree on the minimum.
         if dist.is_initialized():
             gathered = [None for _ in range(dist.get_world_size())]
-            dist.all_gather_object(gathered, snapshot_slots)
-            snapshot_slots = min(gathered)
+            dist.all_gather_object(gathered, num_ssm_blocks)
+            num_ssm_blocks = min(gathered)
 
-        if snapshot_slots < requested_snapshot:
+        # Prefix-cache headroom actually available after the mandatory working
+        # capacity (informational; the pool is shared so cache borrows compete
+        # with live seqs at runtime and degrade gracefully when tight).
+        cache_headroom = max(0, num_ssm_blocks - working_cap)
+        if cache_headroom < cache_cap:
             logger.warning(
-                "SSM snapshot pool clamped %d -> %d slots to fit the memory "
+                "SSM prefix-cache headroom %d -> %d blocks to fit the memory "
                 "budget (%.1f GB free, %.0f%% util, %.0f%% SSM share); prefix-cache "
                 "state reuse is %s. Lower --maxd or raise --tp for the full pool.",
-                requested_snapshot,
-                snapshot_slots,
+                cache_cap,
+                cache_headroom,
                 free_mem / (1 << 30),
                 self.gpu_memory_util * 100,
                 self.ssm_pool_budget_frac * 100,
-                "reduced" if snapshot_slots > 0 else "disabled",
+                "reduced" if cache_headroom > 0 else "disabled",
             )
 
         self.ssm_segment = SSMSegment(
             cfg,
-            working_pool_size=working_slots,
-            snapshot_pool_size=snapshot_slots,
+            num_blocks=num_ssm_blocks,
         )
-        total = per_slot * (
-            self.ssm_segment.working_pool_size + self.ssm_segment.snapshot_pool_size
-        )
+        total = per_block * self.ssm_segment.num_blocks
         logger.info(
-            "SSM cache: %d working slots, %d snapshot slots, "
-            "%.2f KB/slot, %.2f GB total (linear-attn layers: %d)",
-            self.ssm_segment.working_pool_size,
-            self.ssm_segment.snapshot_pool_size,
-            per_slot / 1024,
+            "SSM cache: %d state blocks (max decode concurrency ~%d, prefix-cache "
+            "headroom ~%d blocks), %.2f KB/block, %.2f GB total (linear-attn "
+            "layers: %d)",
+            self.ssm_segment.num_blocks,
+            num_ssm_blocks // per_seq_blocks if per_seq_blocks else num_ssm_blocks,
+            cache_headroom,
+            per_block / 1024,
             total / (1 << 30),
             cfg.num_layers,
         )
@@ -837,12 +920,36 @@ class MemoryManager:
     # ``free_ssm_slot`` when the sequence finishes or is aborted/preempted.
 
     def allocate_ssm_slot(self, seq: Sequence) -> None:
-        if self.ssm_segment is None or seq.ssm_state_slot is not None:
+        if self.ssm_segment is None:
             return
-        seq.ssm_state_slot = self.ssm_segment.allocate_working()
+        if self.mtp_k > 0:
+            # MTP on: give the seq a fixed 1+k block table (column 0 rolling
+            # state + k verify checkpoint columns). vLLM-style spec decode.
+            if seq.ssm_block_table is not None:
+                return
+            bt = self.ssm_segment.allocate_block_table(1 + self.mtp_k)
+            if bt is None:
+                return  # pool exhausted; scheduler gates admission on this
+            seq.ssm_block_table = bt
+            # Mirror column 0 into the scalar slot so any legacy single-slot
+            # reader (e.g. prefix-cache snapshot restore) still works.
+            seq.ssm_state_slot = bt[0]
+            seq.ssm_num_accepted = 1
+        else:
+            if seq.ssm_state_slot is not None:
+                return
+            seq.ssm_state_slot = self.ssm_segment.allocate_working()
 
     def free_ssm_slot(self, seq: Sequence) -> None:
-        if self.ssm_segment is None or seq.ssm_state_slot is None:
+        if self.ssm_segment is None:
+            return
+        if seq.ssm_block_table is not None:
+            self.ssm_segment.free_block_table(seq.ssm_block_table)
+            seq.ssm_block_table = None
+            seq.ssm_state_slot = None
+            seq.ssm_num_accepted = 1
+            return
+        if seq.ssm_state_slot is None:
             return
         self.ssm_segment.free_working(seq.ssm_state_slot)
         seq.ssm_state_slot = None
