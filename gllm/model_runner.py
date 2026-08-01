@@ -273,6 +273,7 @@ class ModelRunner:
         mtp_enabled: Optional[bool] = None,
         mtp_k: int = 3,
         mtp_max_batch: int = 0,
+        ssm_snapshot_stride_tokens: int = 256,
     ):
 
         self.max_num_batched_tokens = (
@@ -296,6 +297,9 @@ class ModelRunner:
         self.enable_prefix_caching = enable_prefix_caching
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size
+        # Recurrent-state (GDN/Mamba) prefix-cache granularity, in tokens.
+        # Only meaningful for hybrid models with prefix caching on.
+        self.ssm_snapshot_stride_tokens = ssm_snapshot_stride_tokens
         self.tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = (
             AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
         )
@@ -640,6 +644,9 @@ class ModelRunner:
             # MTP draft-chain length for hybrid GDN models: each running seq may
             # borrow up to mtp_k transient checkpoint blocks from the shared SSM
             # block pool during a verify step. 0 for non-MTP or non-hybrid.
+            # Recurrent-state prefix-cache granularity (tokens). Rounded to
+            # whole pages by ``PrefixMemoryManager.init``.
+            ssm_snapshot_stride_tokens=self.ssm_snapshot_stride_tokens,
             mtp_k=(
                 self._mtp_k
                 if (ssm_cache_config is not None and self._mtp_k > 0)

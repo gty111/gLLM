@@ -112,6 +112,23 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--ssm-snapshot-stride-tokens",
+        type=int,
+        default=256,
+        help=(
+            "Token granularity at which a hybrid model's recurrent state is "
+            "cached for prefix reuse (default: 256). Rounded down to whole KV "
+            "pages, floored at one page. Smaller means finer restore points on "
+            "a prefix-cache hit (less tail recompute) but more state blocks "
+            "reserved per prompt; those blocks come from the same pool live "
+            "sequences borrow their rolling state from, so going too small "
+            "starves sequence admission. Also the grid the scheduler aligns "
+            "prefill chunk cuts to (a chunk must END on a boundary for its "
+            "state to be cacheable). Only affects hybrid linear-attention "
+            "models (e.g. Qwen3.5) with prefix caching enabled."
+        ),
+    )
+    p.add_argument(
         "--mla-cache-dtype",
         type=str,
         choices=["bf16", "fp8"],
@@ -278,6 +295,7 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
         "page_size": args.page_size,
         "mla_decode_backend": args.mla_decode_backend,
         "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
+        "ssm_snapshot_stride_tokens": args.ssm_snapshot_stride_tokens,
         "mla_cache_dtype": args.mla_cache_dtype,
         "disable_cuda_graph": args.disable_cuda_graph,
         "max_cuda_graph_bs": args.max_cuda_graph_bs,

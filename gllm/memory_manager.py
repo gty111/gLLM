@@ -468,6 +468,7 @@ class MemoryManager:
         qk_rope_head_dim: int = 0,
         mla_cache_fp8: bool = False,
         mtp_k: int = 0,
+        ssm_snapshot_stride_tokens: int = 256,
     ):
         """
         Args:
@@ -489,6 +490,11 @@ class MemoryManager:
                 keeping per-request SSM state. Otherwise this is the budget
                 for cross-request state reuse (mirrors sglang's
                 ``--max-mamba-cache-size``).
+            ssm_snapshot_stride_tokens: token granularity of recurrent-state
+                prefix caching, rounded down to whole KV pages (see
+                ``PrefixSegment.ssm_snapshot_stride``). Smaller = finer restore
+                points but more snapshot blocks per prompt; the pool is shared
+                with the working state, so too small starves admission.
         """
         self.gpu_memory_util = gpu_memory_util
         self.num_layers = num_layers
@@ -514,6 +520,10 @@ class MemoryManager:
         # Draft-chain length (mtp_k); a running seq borrows up to this many
         # transient checkpoint blocks during an MTP verify step (0 = MTP off).
         self.mtp_k = mtp_k
+        # Recurrent-state prefix-cache granularity, in TOKENS. Converted to
+        # whole pages and installed on the segment by
+        # ``PrefixMemoryManager.init``; ignored without prefix caching.
+        self.ssm_snapshot_stride_tokens = ssm_snapshot_stride_tokens
         # Upper bound on the share of util-scaled free memory the SSM pools may
         # occupy before the KV cache is sized. The snapshot pool (best-effort)
         # is clamped to fit; the working pool (mandatory) is always honored.
@@ -975,13 +985,6 @@ class MemoryManager:
 _PREFIX_HASH_SEED = 0x9E3779B97F4A7C15
 _PREFIX_CANARY_LEN = 8
 
-# Token granularity at which a hybrid model's recurrent state may be cached for
-# prefix reuse (rounded to whole KV pages by ``PrefixSegment``). Deliberately
-# much coarser than the KV page: state blocks are ~1 MB per layer while a page
-# is 16 tokens, so per-page state caching drains the shared block pool and
-# starves sequence admission. See ``PrefixSegment.ssm_snapshot_stride``.
-_SSM_SNAPSHOT_STRIDE_TOKENS = 256
-
 
 def _hash_source(seq: Sequence) -> List[int]:
     """Pick the token list used for prefix-cache hashing.
@@ -1083,6 +1086,28 @@ class PrefixMemoryManager(MemoryManager):
             if self.ssm_segment is not None
             else 0
         )
+        # Recurrent-state caching granularity for this run. Rounded DOWN to
+        # whole pages (only page boundaries can carry a snapshot) with a floor
+        # of one page; a request below ``page_size`` therefore degrades to
+        # per-page snapshots, which is the configuration that drained the block
+        # pool (see ``PrefixSegment.ssm_snapshot_stride``), so say so out loud.
+        stride_tokens = int(self.ssm_snapshot_stride_tokens)
+        if stride_tokens < self.page_size:
+            logger.warning(
+                "ssm_snapshot_stride_tokens=%d is below page_size=%d; clamping to "
+                "one page. Per-page recurrent-state caching reserves a state block "
+                "per %d tokens of prompt and can starve sequence admission.",
+                stride_tokens, self.page_size, self.page_size,
+            )
+        self.segment.ssm_snapshot_stride = max(
+            1, stride_tokens // self.page_size
+        )
+        if self.ssm_segment is not None:
+            logger.info(
+                "SSM snapshot stride: %d tokens (%d pages)",
+                self.segment.ssm_snapshot_stride * self.page_size,
+                self.segment.ssm_snapshot_stride,
+            )
 
         # Cache-hit-rate stats.
         self.num_allocated_pages = 0
@@ -1284,6 +1309,26 @@ class PrefixSegment(Segment):
     # Set by :class:`PrefixMemoryManager.init`.
     ssm_segment: Optional[SSMSegment] = None
 
+    # Recurrent-state caching granularity, in PAGES: only page boundaries at a
+    # multiple of this stride can hold a cached state. Installed by
+    # :meth:`PrefixMemoryManager.init` from ``--ssm-snapshot-stride-tokens``;
+    # the value here is only a floor for a segment built outside that path.
+    #
+    # This used to be every cacheable page: ``allocate`` reserved one state
+    # block per 16-token page, so a single 2.5k-token prompt reserved ~156
+    # blocks out of a ~1800-block pool. Ten such requests drained it, and
+    # since new admissions need ``1 + mtp_k`` blocks from the same pool the
+    # scheduler then stalled with #run=1 and 120+ queued (observed on
+    # MMLU-Pro 5-shot). Worse, those reservations were nearly all dead
+    # weight: a state is only ever *written* at a chunk end, so the interior
+    # boundaries kept a reserved-but-zeroed block forever and every hit was
+    # rejected on the SSM half -> 0% cache hit rate. Coarse + lazy (see
+    # ``reserve_ssm_snapshot``) fixes both: ~10 blocks per prompt, and only
+    # for boundaries a chunk actually lands on. Restoring from a coarse
+    # boundary means recomputing at most ``stride`` pages of tail, which is
+    # the same trade vLLM makes with ``mamba_block_size``.
+    ssm_snapshot_stride: int = 1
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.hash2page: Dict[int, int] = {}
@@ -1302,25 +1347,6 @@ class PrefixSegment(Segment):
         # "reserved" from "filled" so the restore path never grafts a zeroed
         # state (== h_0) onto a non-empty prefix.
         self.page2ssm_snapshot_valid: List[bool] = [False for _ in range(self.num_pages)]
-        # Recurrent-state caching granularity, in PAGES. Only page boundaries at
-        # a multiple of this stride can hold a cached state.
-        #
-        # This used to be every cacheable page: ``allocate`` reserved one state
-        # block per 16-token page, so a single 2.5k-token prompt reserved ~156
-        # blocks out of a ~1800-block pool. Ten such requests drained it, and
-        # since new admissions need ``1 + mtp_k`` blocks from the same pool the
-        # scheduler then stalled with #run=1 and 120+ queued (observed on
-        # MMLU-Pro 5-shot). Worse, those reservations were nearly all dead
-        # weight: a state is only ever *written* at a chunk end, so the interior
-        # boundaries kept a reserved-but-zeroed block forever and every hit was
-        # rejected on the SSM half -> 0% cache hit rate. Coarse + lazy (see
-        # ``reserve_ssm_snapshot``) fixes both: ~10 blocks per prompt, and only
-        # for boundaries a chunk actually lands on. Restoring from a coarse
-        # boundary means recomputing at most ``stride`` pages of tail, which is
-        # the same trade vLLM makes with ``mamba_block_size``.
-        self.ssm_snapshot_stride = max(
-            1, _SSM_SNAPSHOT_STRIDE_TOKENS // self.page_size
-        )
 
     # --- public API ---------------------------------------------------------
 
