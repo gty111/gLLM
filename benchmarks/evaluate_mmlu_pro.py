@@ -194,16 +194,23 @@ async def evaluate(subjects):
     tasks = []
     test_data_total = []
     for subject in subjects:
-        test_data = test_df[subject][: args.num_per_sub]
-        test_data_total.extend(test_data)
-        for each in test_data:
-            api_url = api_urls[len(tasks) % len(api_urls)]
-            tasks.append(bounded_request(api_url, each))
+        test_data_total.extend(test_df[subject][: args.num_per_sub])
+    if args.shuffle_seed is not None:
+        # Vary only *which questions share a batch*: same questions, same
+        # prompts, same few-shot examples, different dispatch order. Kernels are
+        # not batch-invariant, so two runs of one configuration do not score
+        # identically; shuffling measures that noise floor, which is what any
+        # A/B difference has to be compared against.
+        random.Random(args.shuffle_seed).shuffle(test_data_total)
+    for each in test_data_total:
+        api_url = api_urls[len(tasks) % len(api_urls)]
+        tasks.append(bounded_request(api_url, each))
     pbar.total = len(tasks)
     completions = await asyncio.gather(*tasks)
     pbar.close()
     print(f"Processing completions ...")
     n_empty = 0
+    saved_rows = []
     for idx, each in tqdm(enumerate(test_data_total), total=len(tasks)):
         label = each["answer"]
         response = completions[idx].generated_text
@@ -222,6 +229,15 @@ async def evaluate(subjects):
         else:
             category_record[category]["#wrong"] += 1
             category_record["total"]["#wrong"] += 1
+        if args.save:
+            saved_rows.append({
+                "qid": each.get("question_id", idx),
+                "category": category,
+                "gold": label,
+                "pred": pred,
+                "correct": (pred == label),
+                "response": response,
+            })
     total = category_record["total"]
     total["score"] = round(
         100 * total["#correct"] / (total["#correct"] + total["#wrong"]), 2
@@ -238,6 +254,12 @@ async def evaluate(subjects):
         f"TOTAL accuracy: {total['score']}  "
         f"({total['#correct']}/{total['#correct'] + total['#wrong']})"
     )
+    if args.save:
+        import json as _json
+        with open(args.save, "w") as _f:
+            for row in saved_rows:
+                _f.write(_json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"Saved {len(saved_rows)} per-question rows to {args.save}")
 
 
 if __name__ == "__main__":
@@ -263,6 +285,15 @@ if __name__ == "__main__":
     parser.add_argument("--num-per-sub", type=int, default=100)
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=None,
+        help="Shuffle the dispatch order with this seed. Same questions and "
+        "prompts, different batch composition -- use it to measure a "
+        "configuration's own run-to-run spread before reading anything into an "
+        "A/B difference.",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=128,
@@ -282,6 +313,13 @@ if __name__ == "__main__":
         help="Send chat_template_kwargs={'thinking'/'enable_thinking': False} so "
         "reasoning models (e.g. Kimi-K2.5) answer directly instead of emitting a "
         "long reasoning trace that gets truncated by --output-len.",
+    )
+    parser.add_argument(
+        "--save",
+        type=str,
+        default="",
+        help="Optional path to dump per-question {id, gold, pred, correct, "
+        "response} as JSONL for base-vs-MTP prediction diffing.",
     )
     assigned_subjects = []
     args = parser.parse_args()

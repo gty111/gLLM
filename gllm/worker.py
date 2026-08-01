@@ -432,7 +432,7 @@ class Worker(TorchProfilerMixin):
         # a dummy input of the agreed size so this stage still joins the MoE
         # collective; its sampled output is discarded (never sent to the driver).
         if payload.dp_dummy_size > 0:
-            dummy_seqs = self.model_runner.create_dummy_seqs(payload.dp_dummy_size)
+            dummy_seqs = self.model_runner.create_dummy_seqs(payload.dp_dummy_size, runtime=True)
             input_data = InputData(
                 use_buffer=False,
                 memory_manager=self.model_runner.memory_manager,
@@ -793,7 +793,7 @@ class Worker(TorchProfilerMixin):
         # Idle replicas pad to a 1-token dummy so all kernels see >=1 token.
         fwd_counts = [c if c > 0 else 1 for c in real_counts]
         if real_ntok == 0:
-            dummy_seqs = self.model_runner.create_dummy_seqs(1)
+            dummy_seqs = self.model_runner.create_dummy_seqs(1, runtime=True)
             self.model_runner.prepare_input(dummy_seqs)
 
         # Graph only when *every* group is a pure-decode (or idle-dummy) step and
@@ -855,7 +855,7 @@ class Worker(TorchProfilerMixin):
 
         fwd_counts = [c if c > 0 else 1 for c in real_counts]
         if real_ntok == 0:
-            dummy_seqs = self.model_runner.create_dummy_seqs(1)
+            dummy_seqs = self.model_runner.create_dummy_seqs(1, runtime=True)
             self.model_runner.prepare_input(dummy_seqs)
 
         padded_size = None
@@ -911,7 +911,21 @@ class Worker(TorchProfilerMixin):
         # For ``pp_size == 1`` ``send_schedule_payload`` is an inline
         # no-op since this column has no PP-other followers.
         payload = self._build_schedule_payload(schedule_seqs)
-        self.model_runner.prepare_input(schedule_seqs)
+        # One authoritative call: decides whether this iteration speculates
+        # (cached for the gate sites in prep / ``step_once``) and times the
+        # previous decode iteration for the adaptive gate.
+        _pure_decode = bool(schedule_seqs) and schedule_seqs[-1].computed_prompt
+        self.model_runner.mtp_begin_iter(
+            len(schedule_seqs) if _pure_decode else None
+        )
+        # See ``ModelRunner.mtp_fused_prep_eligible``: a fused MTP step throws
+        # this prep's per-token arrays away, so skip building them. The predicate
+        # is False under PP>1 (fused needs the last PP rank), so the mrope
+        # payload below is unaffected.
+        if self.model_runner.mtp_fused_prep_eligible(schedule_seqs):
+            self.model_runner.prepare_input_mtp_fused(schedule_seqs)
+        else:
+            self.model_runner.prepare_input(schedule_seqs)
         if payload is not None and get_pp_size() > 1:
             # Subsequent PP stages don't run ``_mm_prepare_cpu``,
             # so we ship the m-rope positions we just built.

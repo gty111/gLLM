@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from logger import logger
 
+from gllm.entrypoints import cli_args
 from gllm.async_llm_engine import PipeAsyncLLM
 from gllm.entrypoints.protocol import (
     ChatCompletionRequest,
@@ -264,8 +265,16 @@ async def run_server(args):
         await server.shutdown()
 
 
-if __name__ == "__main__":
+def build_arg_parser() -> argparse.ArgumentParser:
+    """CLI for the OpenAI-compatible server.
+
+    Every engine-facing flag comes from :mod:`gllm.entrypoints.cli_args`, which
+    ``lm_server`` shares; only the front-end / topology flags below belong to
+    this entrypoint.
+    """
     parser = argparse.ArgumentParser(description="Launch gLLM server")
+    cli_args.add_engine_args(parser)
+    cli_args.add_frontend_args(parser)
     # Network. Ports default to ``None`` -> a free port is auto-allocated at
     # startup and logged. Pass explicit values for multi-node runs where every
     # node must agree on the same ports.
@@ -276,104 +285,10 @@ if __name__ == "__main__":
         help="Uvicorn HTTP port (auto-selects a free port when unset).",
         default=None,
     )
-    parser.add_argument("--master-addr", type=str, help="NCCL addr", default="0.0.0.0")
-    parser.add_argument(
-        "--master-port",
-        type=str,
-        help="NCCL rendezvous port (auto-selects a free port when unset).",
-        default=None,
-    )
     # Model
-    parser.add_argument(
-        "--model-path",
-        help="Path to the model, either from local disk or from huggingface",
-        type=str,
-        required=True,
-    )
-    parser.add_argument(
-        "--load-format",
-        type=str,
-        choices=["auto", "dummy"],
-        help="auto: actually load model weights; dummy: initialize the model with random values",
-        default="auto",
-    )
-    parser.add_argument(
-        "--model-max-length",
-        type=int,
-        help="Maximum sequence length supported by the model (including prompt and generated tokens)",
-        default=None,
-    )
     # Runtime
-    parser.add_argument(
-        "--overlap-scheduling",
-        dest="overlap_scheduling",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="CPU/GPU overlap scheduling with FutureMap (default: on; requires pp=1)",
-    )
-    parser.add_argument(
-        "--gpu-memory-util",
-        type=float,
-        help="GPU memory utilization for KV cache (excluding model weights)",
-        default=0.9,
-    )
-    parser.add_argument(
-        "--enable-prefix-caching",
-        dest="enable_prefix_caching",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable KV cache reuse across requests (default: on)",
-    )
-    parser.add_argument(
-        "--page-size", type=int, help="Number of tokens in a page", default=16
-    )
-    parser.add_argument(
-        "--mla-decode-backend",
-        type=str,
-        choices=["fa3", "flashmla", "triton"],
-        default="fa3",
-        help=(
-            "MLA decode attention backend. 'fa3' (default) uses FA3 absorbed "
-            "MLA decode via sgl_kernel (SGLang-compatible); 'flashmla' uses "
-            "DeepSeek FlashMLA (auto-bumps page_size to 64); 'triton' uses "
-            "the in-tree Triton kernel. Unavailable backends fall back "
-            "automatically."
-        ),
-    )
-    parser.add_argument(
-        "--mla-cache-dtype",
-        type=str,
-        choices=["bf16", "fp8"],
-        default="bf16",
-        help=(
-            "MLA latent KV cache precision for DeepSeek Sparse Attention "
-            "(V3.2). 'bf16' (default) stores a full-precision latent cache and "
-            "runs dense decode (exact for prompts <= index_topk). 'fp8' stores "
-            "the FlashMLA FP8-packed cache to drive SM90 sparse decode for long "
-            "context. No effect on non-DSA models."
-        ),
-    )
-    parser.add_argument(
-        "--disable-cuda-graph",
-        help="Enable full cuda graph for decode batch",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--max-cuda-graph-bs",
-        type=int,
-        help=(
-            "Maximum batch size for CUDA graph capture. "
-            "Larger values allow more decode batches to benefit from CUDA graphs "
-            "but increase startup time and GPU memory usage during graph capture. "
-            "Default: 512."
-        ),
-        default=512,
-    )
     # Parallelism
     parser.add_argument("--pp", type=int, help="Number of pipeline stages", default=1)
-    parser.add_argument(
-        "--tp", type=int, help="Number of tensor parallel degrees", default=1
-    )
     parser.add_argument(
         "--dp",
         type=int,
@@ -428,51 +343,6 @@ if __name__ == "__main__":
         default=None,
     )
     # Token Throttling
-    parser.add_argument(
-        "--maxd",
-        type=int,
-        help="Maximum decode token count per batch (Token Throttling)",
-        default=512,
-    )
-    parser.add_argument(
-        "--maxp",
-        type=int,
-        help="Maximum prefill token count per batch (Token Throttling) or token budget in Sarathi-Serve",
-        default=8192,
-    )
-    parser.add_argument(
-        "--minp",
-        type=int,
-        help="Minimum prefill token count per batch (Token Throttling)",
-        default=32,
-    )
-    parser.add_argument(
-        "--iterp",
-        type=int,
-        help="Number of iterations to process waiting prefill tokens (Token Throttling)",
-        default=8,
-    )
-    parser.add_argument(
-        "--init-new-token-ratio",
-        type=float,
-        help="Initial/ceiling fraction of remaining output length reserved for "
-        "in-flight decodes (adaptive KV admission control)",
-        default=0.7,
-    )
-    parser.add_argument(
-        "--min-new-token-ratio",
-        type=float,
-        help="Floor the new-token-ratio decays toward when the system is stable "
-        "(adaptive KV admission control)",
-        default=0.1,
-    )
-    parser.add_argument(
-        "--schedule-method",
-        type=str,
-        choices=["split_pd", "chunked_prefill", "token_throttling"],
-        help="Specify scheduling method",
-        default="chunked_prefill",
-    )
     # Multi-Node deployment
     parser.add_argument(
         "--launch-mode",
@@ -484,65 +354,19 @@ if __name__ == "__main__":
         "--ranks", type=str, help="Specify the ranks of worker like 0,1", default=None
     )
     # MultiModal 
-    parser.add_argument(
-        "--mm-processor-min-pixels",
-        type=int,
-        help="Minimum pixels for multimodal processor",
-        default=None,
-    )
-    parser.add_argument(
-        "--mm-processor-max-pixels",
-        type=int,
-        help="Maximum pixels for multimodal processor",
-        default=None,
-    )
-    parser.add_argument(
-        "--tool-call-parser",
-        type=str,
-        default=None,
-        choices=["kimi", "qwen"],
-        help="Parser for model-native tool-call output -> structured "
-        "tool_calls. Default: auto-detect from model architecture; pass a "
-        "name to override.",
-    )
-    args = parser.parse_args()
+    return parser
 
-    llm = PipeAsyncLLM(
-        host=args.host,
-        master_addr=args.master_addr,
-        master_port=args.master_port,
-        launch_mode=args.launch_mode,
-        worker_ranks=args.ranks,
-        load_format=args.load_format,
-        model_path=args.model_path,
-        gpu_memory_util=args.gpu_memory_util,
-        page_size=args.page_size,
-        maxd=args.maxd,
-        maxp=args.maxp,
-        minp=args.minp,
-        iterp=args.iterp,
-        init_new_token_ratio=args.init_new_token_ratio,
-        min_new_token_ratio=args.min_new_token_ratio,
-        enable_prefix_caching=args.enable_prefix_caching,
-        pp_size=args.pp,
-        tp_size=args.tp,
-        dp_size=args.dp,
-        use_ep=args.enable_ep,
-        assigned_layers=args.assigned_layers,
-        schedule_method=args.schedule_method,
-        overlap_scheduling=args.overlap_scheduling,
-        disable_cuda_graph=args.disable_cuda_graph,
-        max_cuda_graph_bs=args.max_cuda_graph_bs,
-        model_max_length=args.model_max_length,
-        mm_processor_min_pixels=args.mm_processor_min_pixels,
-        mm_processor_max_pixels=args.mm_processor_max_pixels,
-        mla_decode_backend=args.mla_decode_backend,
-        mla_cache_dtype=args.mla_cache_dtype,
-    )
 
-    # Resolve the tool-call parser once: explicit ``--tool-call-parser`` wins,
-    # else auto-detect from the model architecture. ``None`` (unknown model)
-    # leaves tool-call markup in ``content`` unparsed.
+def resolve_tool_parser(name=None):
+    """Resolve the module-level tool-call parser from the loaded model.
+
+    Explicit ``--tool-call-parser`` wins, else auto-detect from the model
+    architecture; ``None`` (unknown model) leaves tool-call markup in ``content``
+    unparsed. Both entrypoints call this -- ``lm_server`` serves this same app,
+    so a model whose tool calls parse here must parse there too.
+    """
+    global tool_parser
+
     architecture = getattr(
         getattr(getattr(llm, "model_runner", None), "model_loader", None),
         "architecture",
@@ -563,16 +387,38 @@ if __name__ == "__main__":
         dsv32_encoder = load_dsv32_encoder(model_path)
     tool_parser = get_tool_parser(
         architecture=architecture,
-        name=args.tool_call_parser,
+        name=name,
         encoder=dsv32_encoder,
     )
-    if args.tool_call_parser or tool_parser is not None:
+    if name or tool_parser is not None:
         logger.info(
             "Tool-call parser: %s (arch=%s, --tool-call-parser=%s)",
             tool_parser.name if tool_parser else "none",
             architecture,
-            args.tool_call_parser,
+            name,
         )
+    return tool_parser
+
+
+def main():
+    # ``llm`` is the module-level handle every route reads; this used to be a
+    # plain module-scope assignment under ``if __name__ == "__main__"``.
+    global llm
+
+    args = build_arg_parser().parse_args()
+
+    llm = PipeAsyncLLM(
+        host=args.host,
+        launch_mode=args.launch_mode,
+        worker_ranks=args.ranks,
+        pp_size=args.pp,
+        dp_size=args.dp,
+        use_ep=args.enable_ep,
+        assigned_layers=args.assigned_layers,
+        **cli_args.engine_kwargs(args),
+    )
+
+    resolve_tool_parser(args.tool_call_parser)
 
     if args.launch_mode != "slave":
         asyncio.run(run_server(args))
@@ -585,3 +431,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(e)
             traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()

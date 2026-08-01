@@ -622,3 +622,359 @@ draft-graph/verify-graph. Fused C=1 speedup ~2.09×.
 
 Removed during cleanup: `gllm/spec_decode/mtp_proposer.py` (superseded by the
 `_draft_chain_*` methods) and its `spec_decode/` package.
+
+### 10.10 GPU-native input prep (`gllm/mtp_gpu_prep.py`)
+
+An MTP step prepares **two** batches (the draft chain's batch×1 and the verify
+batch's uniform `1+k`) on top of whatever the scheduler already prepared. Doing
+that with `InputData.cal_input` meant rebuilding every per-token array in Python
+per phase per step. Measured on Qwen3.5-0.8B (1×H200, 64 concurrent greedy
+decodes, with host-side phase profiling): **4.3 ms of the 12.4 ms step was
+host-side prep**.
+
+`MtpGpuPrep` replaces it with the vLLM-model-runner-V2 pattern:
+
+* per-*sequence* facts (context length, mrope delta, `x1`, page table, SSM block
+  table) live in persistent **pinned** staging buffers and cross to the device in
+  three small H2D copies, staged **once per step** (draft + verify share it,
+  memoized on `(epoch, bucket)`);
+* every per-*token* array is derived by vectorized CUDA ops written straight into
+  the static buffers the captured graphs read -- the verify token ids come from
+  the draft chain's GPU tensor and never round-trip through the host;
+* CUDA-graph bucket padding writes dummy rows on the GPU instead of building
+  throwaway `Sequence` objects.
+
+Supporting changes in `ModelRunner`: one page pre-allocation per step for the
+whole `1+k` speculative window (was one per phase); `orig_tokens` kept by
+reference so the step no longer costs O(context) per seq; the draft chain's
+mid-step `drafts.tolist()` folded into the single end-of-step packed D2H
+(`[n_accepted | bonus | drafts]`); and `mtp_fused_prep_eligible` /
+`prepare_input_mtp_fused`, which skip the scheduler-side decode prep that a fused
+step would only overwrite.
+
+Env vars: `GLLM_MTP_GPUPREP=0` reverts to the CPU builders (both paths are kept).
+
+Result at nd=64 greedy: host prep 4.3 ms → 1.3 ms, step 12.4 → 8.3 ms, decode
+throughput **8.8k → 10.9k tok/s** (nd=20: 3.1k → 4.5k). Token streams are
+bit-identical to the CPU-prep path.
+
+Also fixed here, because the MTP draft chain is what exposed it:
+`create_dummy_seqs` gave its padding rows `page_table = [seq_id]`, i.e. pages
+`0..size-1`. Harmless at graph-capture time, but the draft chain pads its bucket
+at **runtime**, where those pages belong to live sequences -- the dummy rows
+overwrote real KV, so any step with `bucket > nd` diverged. Runtime callers now
+pass `runtime=True`, which points every pad row at the reserved `dummy_page`.
+
+### 10.11 Rejection-sampling accept: vectorized
+
+The sampling (rejection) accept was a per-sequence python loop that read
+`float(q_dists[i,p,d])` / `float(p_dists[start+p,d])` — each one a device-scalar
+sync, up to `2·nd·k` (384 at nd=64) per step — and then ran one
+`torch.multinomial` + `.item()` per sequence. It measured **20.5 ms of a 34.6 ms**
+sampling step at nd=64.
+
+Now every decision is a batched tensor op:
+
+* `p(d_p)` / `q(d_p)` come from two `gather`s → `[nd, k]`;
+* accept mask `u < min(1, p/q)`, then `cumprod(...).sum(1)` gives `n_accepted`
+  (the same trick the greedy accept uses);
+* the bonus draw needs exactly **one** distribution row per sequence — the
+  residual `(p-q)+` at the rejected position, or `p` at the tail when all drafts
+  were accepted. Both are row `n_accepted` of `p`, so one gather covers both
+  cases and a **single batched `multinomial`** replaces the per-seq loop;
+* the host learns the outcome from one packed D2H (`[n_accepted | bonus |
+  drafts]`), same shape as the greedy path.
+
+The verify forward now also returns raw **logits** instead of an argmax, so the
+greedy argmax and the rejection `p` transform share one lm-head pass (the
+rejection path used to re-run `logits_from_hidden` over the same hidden), and the
+per-row sampling params are expanded with `repeat_interleave` instead of building
+a `nd·(1+k)`-entry python seq list per step.
+
+Result at nd=64, T=0.8/top_k=20: accept **20.5 → 5.3 ms**, step **34.6 → 19.3 ms**,
+throughput **3.5k → 5.7k tok/s**. Mean acceptance length is unchanged (2.21).
+Distribution check (512 samples, T=1.0, no top-k/p): pooled total-variation
+distance to non-MTP sampling is 0.175, *below* the 0.218 split-half noise floor
+of the non-MTP sample itself — i.e. no detectable bias.
+
+### 10.12 `max_tokens` overshoot (fixed)
+
+`Scheduler.process_output` stops committing at `seq.is_finish`, but shipped the
+**untruncated** speculative burst in `ipc_package.next_tokens`, so
+`LLM._apply_ipc_package` appended all `1+n_accepted` tokens to the frontend's copy
+of the sequence: a request with `max_tokens=16` returned 16–19 tokens (and text
+could continue past the stop token). It now ships `committed[:kept]`.
+
+### 10.13 Sparse (top-k) `p` / `q` for rejection sampling
+
+With the per-seq loop gone, what remained was the *distribution transform*
+itself. Measured at this vocab (248k) on H200: `softmax -> top_k_renorm ->
+top_p_renorm` costs **1.5 ms for 64 rows** and **3.1 ms for 256 rows**, and the
+sampling step pays it `k` times in the draft chain (once per draft step, 64 rows)
+plus once in the accept (`nd·(1+k)` = 256 rows) — ~7 ms of the 17 ms step.
+
+But when a request restricts `top_k`, the transformed distribution has **at most
+`top_k` nonzero entries**, so carrying it as a dense `[rows, vocab]` tensor is
+pure waste. `_mtp_sparse_probs` computes the same distribution as
+`(vals, idx)` over its top-k support:
+
+```
+vals, idx = topk(logits, k_pad)          # descending
+keep      = vals >= vals[:, top_k-1]     # tie-inclusive, like the dense kernel
+probs     = softmax(vals.masked_fill(~keep, -inf) / temp)
+probs     = zero where exclusive-cumsum >= top_p; renormalize
+```
+
+`softmax` restricted to the kept set *is* the dense renormalization of that set,
+and `keep` is a prefix of the descending order, so this is mathematically the
+dense chain — verified to 1e-7 against the sgl kernels on non-tied logits. Cost:
+**0.2 ms / 0.6 ms** for the same 64 / 256 rows.
+
+Two details matter:
+
+* the reference kernel is **tie-inclusive** (`probs=[.4,.2,.2,.2]`, `top_k=2`
+  keeps all four), and bf16 logits over a 248k vocab tie often enough to see it
+  (support for `top_k=20` measured 20–24), hence `keep = vals >= kth` and the
+  `_SPARSE_TIE_MARGIN` (64) of headroom. `topk`'s cost is dominated by the vocab
+  scan, so the margin is nearly free. A device-side counter reports (at the 1 Hz
+  metrics log, never on the hot path) if ties ever spill past the window.
+* `q` and `p` must be built by the *same* code, so sparseness is decided **once
+  per step** (`_mtp_sparse_eligible`: every request's `top_k` within the window)
+  and threaded into both the draft chain and the accept. An unrestricted request
+  (`top_k=-1`, top-p only) keeps the dense path end to end.
+
+`q` now travels as `MtpQDist` — either dense `[nd, k, vocab]` or sparse
+`vals`/`idx` `[nd, k, k_pad]` plus `drawn` `[nd, k]` (the probability of the token
+each draft step actually sampled, so the accept needs no lookup at all). The
+residual `(p-q)+` is supported inside p's kept set (p is 0 outside it), so it is
+computed on `[nd, k_pad]` and the bonus is drawn with one `multinomial` over that.
+The sparse sampled-draft step is captured as its own graph family
+(`_draft_size_to_graph_sampled_sparse`, `k_pad` baked in at capture).
+
+Result at nd=64, T=0.8/top_k=20: draft **7.5 → 3.7 ms**, accept **5.3 → 2.5 ms**,
+step **17.4 → 12.7 ms**, throughput **6.0k → 8.1k tok/s**. Cumulative for the
+sampling path across §10.11 + §10.13: **3.5k → 8.1k tok/s (2.3×)**, step
+34.6 → 12.7 ms. Distribution check (512 samples, T=1.0, top_k=20): pooled TV to
+non-MTP sampling 0.138 vs a 0.136 split-half noise floor — no detectable bias.
+Validated on greedy / sampling × sparse / dense × graph / eager × TP=1 / TP=2.
+
+### 10.14 What the torch profiler found (online serving, sampling + MTP)
+
+Profiled through the server's own hooks (`POST /start_profile` /
+`/stop_profile`, trace + `key_averages` summary under
+`GLLM_TORCH_PROFILER_DIR`) over a **steady-state 2 s window** at 64-way
+concurrency, T=0.8 / top_k=20, k=3 — warmed up first with *disjoint* prompts so
+the window contains neither first-use JIT nor prefix-cache hits on the measured
+requests. Two things came out of it and are fixed:
+
+* **`_mtp_sample_params` was 3 device syncs per step, 558 ms of the 2 s window.**
+  `torch.tensor(list, device="cuda")` copies from pageable memory, which torch
+  serializes with a `cudaStreamSynchronize`; sitting right after the verify graph
+  was enqueued, it blocked the host on the entire outstanding GPU queue. Now
+  staged through persistent pinned buffers with `non_blocking` copies, and the
+  sampled draft chain fills `_d_temp`/`_d_topk`/`_d_topp` from that same staging
+  (D2D). `k_pad` likewise moved to a host-side max instead of
+  `int(top_ks.max().item())`. Syncs per step **9.0 → 2.1** (562 ms → 0.6 ms),
+  eager launches **215 → 178**.
+* **The verify conv loop was over half of all GPU ops in the step** — see §10.15.
+
+Still open, in profile order: `fused_recurrent_gdn_spec_fwd_kernel` (the
+`1+k` full recurrent-state checkpoints, ~17% of GPU time and the reason MTP
+trails plain decode on a 0.8B model — the bytes per checkpoint are now halved by
+the engine-wide `mamba_ssm_cache_dtype` knob, which stores the recurrent state in
+the activation dtype by default like vLLM does, but the *count* of checkpoints is
+inherent to verifying `1+k` tokens); the sparse `topk` (16 radix passes/step —
+`_sparse_kpad_capture` is a fixed 128 even when a request asks for `top_k=20`, so
+per-bucket `k_pad` capture would cut it); and ~178 eager launches/step of prep +
+accept glue that could be fused into a couple of Triton kernels. The step is also
+still ~60% GPU-idle in the window because MTP runs synchronously
+(`_run_mtp_sync` drains the pipeline), so the scheduler + output processing sit
+in the critical path instead of overlapping the MTP GPU work.
+
+### 10.15 Verify conv: one kernel instead of one per token
+
+`Qwen3_5GatedDeltaNet._forward_mtp_verify` used to walk the `1+k` verify tokens
+in python, doing `index_select` + `index_copy_` + a single-token
+`causal_conv1d_update` per step. At k=3 over 18 GDN layers that is **~380 GPU ops
+per MTP step** (72 conv kernels, 72 `index_copy`, 150 index, 86 gather) — more
+than half of every op in the step.
+
+`causal_conv1d_update` already supports the whole thing in one launch (vLLM's
+spec-decode path): `x` as `[nseq, dim, 1+k]` plus `intermediate_conv_window`,
+which records the post-window after **every** token. Two details make it fit
+gLLM's block-table layout:
+
+* that path needs a window physically wider than the query (`width-1 + k`), while
+  a state block holds exactly `width-1`; so the resume window is staged into a
+  small shared scratch buffer of the right width and the kernel's own rolling
+  write-back lands there and is discarded;
+* `num_accepted_tokens` is passed as all-ones (rewind offset 0) because the
+  resume column is chosen while staging, not by the kernel's rewind.
+
+Then one `index_copy_` scatters `intermediate_conv_window` into the seqs'
+block-table columns (its `[seq][step]` layout matches the block table's row-major
+flattening). Per layer: **4 ops instead of 4·(1+k)**, with the conv running once.
+
+Bit-exactness was checked two ways: a standalone comparison against the old loop
+(outputs *and* every touched/untouched state block, `max|diff| = 0`, including
+non-trivial resume columns), and end-to-end — greedy MTP token streams are
+20/20 identical to the pre-change engine under the same protocol.
+
+Measured at nd=64 (same protocol, back-to-back):
+
+| | conv loop | batched conv |
+| --- | --- | --- |
+| verify phase | 6.3 ms | **5.4 ms** |
+| step (greedy) | 9.1 ms | **8.2 ms** |
+| greedy throughput | 11.0k | **12.0k tok/s** |
+| sampling throughput | 9.3k | **10.0k tok/s** |
+| greedy @ conc=20 | 4.9k | **5.7k tok/s** |
+
+### 10.16 Select the top-k support on the *raw* logits
+
+`_mtp_sparse_probs` (§10.13) opened with `topk(logits.float(), k_pad)`. Measured
+on this vocab (248k), `topk` is **flat in `k`** over the whole range that matters
+— 0.313 ms at `k` = 64, 84, 96 and 128 (64 rows) — but it scales with the *bytes
+it scans*, so selecting on the widened copy costs exactly double:
+
+| 248k vocab | select on fp32 copy | select on bf16 logits |
+| --- | --- | --- |
+| 64 rows (draft step) | 0.313 ms | **0.163 ms** |
+| 256 rows (accept) | 1.014 ms | **0.552 ms** |
+
+So `topk` runs on the logits as they come out of the LM head and only the
+selected `[rows, k_pad]` slice is widened to fp32 for the softmax. This is
+**bit-identical**, not an approximation: bf16 → fp32 is lossless and order
+preserving, so the selected set, its order, and every value the softmax then sees
+are unchanged (checked over top_k ∈ {1,20,50} × top_p ∈ {0.9,0.95,1.0} × fp32/bf16
+logits: `max|diff| = 0.000e+00` against the previous implementation).
+
+Worth recording as a negative result too: this measurement killed a planned
+optimization. `k_pad` was fixed at 128 to cover `top_k ≤ 64`, and bucketing it
+(a batch of `top_k=20` needs only 84) looked like an easy win — but since `topk`
+is flat in `k`, it would have bought nothing.
+
+Sampling, k=2, conc=64: **11.6k → 12.4k tok/s (+6.5%)**.
+
+### 10.17 MTP is a *scheduling* decision: the batch-size gate
+
+Every measurement above holds the batch fixed and asks "how much cheaper can the
+MTP step get?". The other question is *when to take an MTP step at all*.
+Speculating multiplies the target work per step by `1+k` and buys back
+`mean_accept` tokens, so it wins only while the decode batch leaves the GPU
+under-utilized.
+
+A measurement note first, because it changes the numbers: comparing two engine
+configurations by total wall time at `out=256` is **not safe at low concurrency**.
+There is a fixed ~0.5 s of prefill + first-step + settling in every run, it
+differs between modes, and at `conc=1` it is most of the wall. That artifact
+alone produced an apparent "+26% at conc=1" which does not survive a longer run
+(and an apparent "−11% at conc=4" in the other direction at `out=512`). The
+numbers below are `out=1024`, 3 repetitions each, spread ~1%:
+
+| conc | MTP off | k=2 always | |
+| --- | --- | --- | --- |
+| 1 | 502 | 517 | **+2.9%** |
+| 2 | 740 | 864 | **+16.6%** |
+| 4 | 1656 | 1796 | **+8.5%** |
+| 6 | 2564 | 2266 | −11.6% |
+| 8 | 3541 | 2976 | −16.0% |
+| 32 | 12422 | 9513 | −23% |
+| 64 | 20373 | 15343 | −25% |
+
+Acceptance is healthy throughout (mean 1.98 of 3 at k=2, 2.17 of 4 at k=3), so
+this is not a draft-quality problem — it is GPU saturation. A 0.8B model
+saturates an H200 at a *very* small batch, so the profitable window here is
+`conc <= 4`; it widens with model size (a larger target forward amortizes the
+1-layer draft head better), which is exactly why the crossover cannot be a
+constant in the code.
+
+Hence `--mtp-max-batch N` (vLLM's speculative `disable_by_batch_size` analogue): speculate only while the decode batch is at
+most `N` sequences.
+
+It is a *scheduling* decision, not a second code path: a declined step takes the
+plain decode path that already exists as MTP's bootstrap path. Three details:
+
+* the decision is taken **once per iteration** (`mtp_begin_iter`, called by both
+  workers) and cached for the four sites that consult it (fused-prep eligibility
+  in each worker, `step_once`'s fused and non-fused gates). If they could
+  disagree within a step, a step whose prep was skipped as "fused MTP" could then
+  take the plain path — running the plain forward on minimal input prep;
+* it is a pure function of `num_decodes` and of state each rank derives from its
+  own (identical) steps, so TP/PP ranks agree without a collective — MTP's sync
+  design requires TP-identical tokens;
+* a declined step advances every seq by one token *without* refreshing the fused
+  relay, so the stashed `(bonus_tok, bonus_hidden)` no longer describes the seq's
+  last position. `_mtp_drop_relay()` invalidates it, costing one bootstrap
+  (non-fused) step when the batch falls back below the threshold.
+
+Default is `0` (always speculate): the crossover depends on the model, `k`, the
+GPU and the acceptance rate, and a baked-in default would silently disable
+speculation on models where it wins far above this batch size.
+
+Measured with a threshold of 4, same `out=1024` protocol as the table above:
+
+| conc | always speculate | **gate** | MTP off |
+| --- | --- | --- | --- |
+| 4 | 1724 | **1779** | 1648 |
+| 64 | 15989 | **20288** | 20284 |
+
+The gate recovers essentially all of the ~22% that always-speculating gives away
+at large batch while keeping the small-batch win, which is what makes it safe to
+leave MTP enabled in a serving deployment. It matters more under sampling, where
+the speculating step is the more expensive of the two: `conc=64`, T=0.8 /
+top_k=20, `out=256` — always 12490, **gate 18171**, off 18474.
+
+Accuracy: MMLU-Pro, 1400 questions, k=2, greedy, concurrency 32, threshold 16 —
+chosen so the batch crosses the gate continuously and the MTP↔plain transitions
+and relay invalidation are exercised throughout: **32.5%**, against 27.6% for
+MTP-always at the same settings. A stale-relay bug would have collapsed this to
+chance (~10%); the spread is the batch-composition numerics effect these kernels
+already show (§10.14).
+
+### 10.18 Finding the crossover automatically: what went wrong (not shipped)
+
+`--mtp-max-batch` asks the operator for a number they do not have. The criterion
+itself is simple and, as measured, correct:
+
+    speculating wins  <=>  accepted_tokens_per_step / t_spec > 1 / t_plain
+
+Pinning each mode and reading the steady state off real steps confirms it:
+
+| | t_spec | accept | spec ms/token | t_plain | criterion | truth |
+| --- | --- | --- | --- | --- | --- | --- |
+| conc=4 | 4.55 ms | 2.22 | 2.05 | 2.07 ms | speculate | +4.5% |
+| conc=64 | 7.24 ms | 2.24 | 3.23 | 2.76 ms | plain | −21% |
+
+What does not work is estimating those quantities *online*, from a gate that is
+also choosing the mode. Four attempts, each fixing a real and separately
+verified bias, and the controller still ended up bistable — the same command run
+twice settled all-speculate once and all-plain the next. The failure modes are
+worth recording, because they are properties of the measurement and not of the
+particular controller:
+
+* **the switch step is not a sample of the mode it switches to.** The first
+  speculating step after a plain one is the non-fused bootstrap step (a second
+  target forward) and it also drains/refills the overlap pipeline. Timing
+  speculation there is self-fulfilling: it reads slow, the gate picks plain, and
+  the estimate is never revisited. Skipping the first few steps of each streak
+  fixes the bias but makes exploration blocks long and rare.
+* **whichever mode explores first eats the cold start.** Exploring
+  sequentially (all of A, then all of B) charged post-prefill warm-up entirely to
+  A — measured at nd=1, +9% on speculation, enough to invert the decision.
+  Alternating blocks fixes this one.
+* **acceptance is high-variance.** A step accepts 1, 2 or 3 tokens; a short
+  block's EMA read 1.93 against a 2.22 steady state. A cumulative mean fixes it.
+* **hysteresis must anchor on the last decision, not the last sample.**
+  Anchoring on the last *sampled* mode makes the margin depend on which mode
+  exploration happened to end with — always plain, so the margin always pushed
+  against speculation.
+* **the estimates are only valid for the batch they were taken at.** Bucketing
+  by power of two still mixes nd=33 with nd=64, and a batch that is filling or
+  draining moves through buckets while the samples are being taken.
+
+A controller that samples the mode it is not currently running, on a workload it
+is simultaneously perturbing, needs more care than the 25% it is protecting.
+The fixed threshold is predictable, and the table in §10.17 is how to pick it:
+sweep concurrency at a fixed `out` of ~1024 with a few repetitions, and take the
+batch size where the two curves cross.

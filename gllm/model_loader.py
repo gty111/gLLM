@@ -300,6 +300,9 @@ SERVING_CONFIG_FIELDS: Tuple[str, ...] = (
     "use_mla",
     "use_hybrid_state",
     "max_num_batched_tokens",
+    # Recurrent-state cache precision for hybrid linear-attention models; the
+    # nested text config is what builds the SSMCacheConfig.
+    "mamba_ssm_cache_dtype",
 )
 
 

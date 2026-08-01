@@ -72,8 +72,11 @@ class LLM:
         disagg_config=None,
         mla_decode_backend="fa3",
         mla_cache_dtype="bf16",
+        mamba_ssm_cache_dtype="auto",
         mtp_enabled=None,
         mtp_k=3,
+        mtp_max_batch=0,
+        ssm_snapshot_stride_tokens=256,
     ):
         init_logger()
         self.model_path = model_path
@@ -117,8 +120,11 @@ class LLM:
             skip_language=skip_language,
             mla_decode_backend=mla_decode_backend,
             mla_cache_dtype=mla_cache_dtype,
+            mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
             mtp_enabled=mtp_enabled,
             mtp_k=mtp_k,
+            mtp_max_batch=mtp_max_batch,
+            ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
         )
         self.pp_size = pp_size
         self.tp_size = tp_size

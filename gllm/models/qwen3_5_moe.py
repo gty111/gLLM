@@ -10,7 +10,9 @@ The VL wrapper (``Qwen3_5MoeForConditionalGeneration``) keeps the same
 shape as ``Qwen3_5ForConditionalGeneration``: a thin subclass of
 ``Qwen3VLForConditionalGeneration`` that plugs in this language model.
 Vision tower load is intentionally a best-effort copy of the existing
-Qwen3.5 dense VL path. Checkpoint ``mtp.*`` weights are not loaded.
+Qwen3.5 dense VL path. The checkpoint's ``mtp.*`` MTP head is loaded when
+MTP is enabled (its block is a MoE decoder layer, like every other layer
+here -- the MoE/dense dispatch is inside ``Qwen3_5DecoderLayer``).
 
 FP8 block-quant scope:
 
@@ -49,6 +51,7 @@ from gllm.models.qwen3_5 import (
     _load_gdn_layer_weights,
 )
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from gllm.models.weight_utils import get_tensor_from_dict
 from gllm.models.weight_loader import (
     LoadContext,
     WeightRule,
@@ -141,6 +144,46 @@ class Qwen3_5MoeLLMForCausalLM(Qwen3_5ForCausalLM):
             ),
         ]
 
+    def _mtp_pre_pass(self, model, parameters, ctx, update):
+        """Load the ``mtp.*`` MTP head; returns the parameter names it filled.
+
+        A pre-pass rather than a second loader run, because the head's
+        parameters need a *different key mapping* than everything else: they
+        live under ``mtp.*`` in the checkpoint with no ``model.layers.N`` path,
+        so the main loop -- which looks each parameter up by its own path --
+        cannot resolve them. Reporting them as filled is exactly the contract
+        the main loop uses to skip the GDN blocks.
+
+        The head's block is a MoE decoder layer like every other layer here, and
+        it loads through THIS class's rule table: the expert handlers derive
+        their per-expert keys from the parameter path, so the head's
+        ``mtp.layers.0.mlp.experts.w13_weight`` gathers
+        ``mtp.layers.0.mlp.experts.<i>.{gate,up}_proj.weight`` from the
+        checkpoint the same way the base layers do. ``Qwen3_5MTP._src_key``
+        supplies the ``mtp_block.<x>`` -> ``mtp.layers.0.<x>`` remap.
+        """
+        mtp = getattr(model, "mtp", None)
+        if mtp is None:
+            return set()
+        # The embed/lm_head rule can never match an MTP parameter (the head
+        # shares the base model's), so drop it.
+        rules = [r for r in self.weight_rules() if r.name != "embed_lm_head"]
+        filled = set()
+        for name, p in mtp.named_parameters():
+            local_key = f"mtp.{name}"
+            if local_key not in parameters:
+                continue
+            src = mtp._src_key(name)
+            for rule in rules:
+                if rule.match(src):
+                    rule.handler(ctx, src, p.data)
+                    break
+            else:
+                p.data.copy_(get_tensor_from_dict(ctx.weights, src))
+            filled.add(local_key)
+            update()
+        return filled
+
     def load_weights(self, weights, mp_load_progress=None):
         run_weight_loader(
             self,
@@ -150,7 +193,10 @@ class Qwen3_5MoeLLMForCausalLM(Qwen3_5ForCausalLM):
             pp_idx_offset=2,
             start_layer=self.start_layer,
             ctx=self._make_load_context(weights),
-            pre_passes=[make_gdn_pre_pass(self.GDN_SUBS, _load_gdn_layer_weights)],
+            pre_passes=[
+                make_gdn_pre_pass(self.GDN_SUBS, _load_gdn_layer_weights),
+                self._mtp_pre_pass,
+            ],
         )
 
 
@@ -188,13 +234,23 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.num_kv_layers = self.language_model.num_kv_layers
         self.num_ssm_layers = self.language_model.num_ssm_layers
 
+    @property
+    def mtp(self):
+        # ModelRunner reads ``self.model.mtp`` to detect / drive the MTP head.
+        # It lives on the language model; surface it at the wrapper level, the
+        # same way :class:`Qwen3_5ForConditionalGeneration` does. Without this
+        # the head loads but is never used -- the runner sees no head, so it
+        # captures no draft/verify graphs and never speculates.
+        lm = getattr(self, "language_model", None)
+        return getattr(lm, "mtp", None) if lm is not None else None
+
     def load_weights(self, weights, mp_load_progress=None):
         """Load language model weights; vision tower load is a best-effort
         bf16 path that mirrors :class:`Qwen3_5ForConditionalGeneration`.
 
-        ``mtp.*`` checkpoint keys are skipped (MTP speculative decoding is
-        not implemented); only ``model.*``, ``lm_head``, and ``visual.*``
-        tensors are loaded.
+        ``model.*``, ``lm_head``, ``visual.*`` and -- when MTP is enabled --
+        the ``mtp.*`` head are loaded (the language model handles the
+        two-pass split; see ``Qwen3_5MoeLLMForCausalLM.load_weights``).
         """
         if not getattr(self, "skip_language", False) and self.language_model is not None:
             self.language_model.load_weights(weights, mp_load_progress)

@@ -90,6 +90,16 @@ class Sequence:
         # has not yet allocated a slot for this seq. The slot lives for the
         # whole lifetime of the request and is reset on preempt/free.
         self.ssm_state_slot: Optional[int] = None
+        # vLLM-style spec-decode block table for hybrid MTP: a fixed ``1+k``
+        # list of SSM state block ids (column 0 == rolling/committed state,
+        # columns 1..k == verify-step per-token checkpoints). ``None`` for
+        # non-MTP / non-hybrid seqs (those use the scalar ``ssm_state_slot``).
+        # ``ssm_num_accepted`` persists the last accepted-token count so the
+        # next verify's recurrent kernel resumes from column ``num_accepted-1``
+        # (1 = neutral: resume from column 0). See the column protocol in
+        # memory: vllm-gdn-spec-decode-mechanism.
+        self.ssm_block_table: Optional[list] = None
+        self.ssm_num_accepted: int = 1
         # Persistent per-seq slot in the repetition-penalty mask pool
         # (``MemoryManager._rep_pool``). ``None`` means no slot yet / the seq
         # has ``repetition_penalty == 1.0`` and needs none. ``rep_filled`` is
@@ -167,6 +177,8 @@ class Sequence:
         # released by the scheduler via ``MemoryManager.free_ssm_slot`` so
         # that ``SSMSegment.free_working`` can also zero the tensors.
         self.ssm_state_slot = None
+        self.ssm_block_table = None
+        self.ssm_num_accepted = 1
 
     @property
     def computed_prompt(self):
