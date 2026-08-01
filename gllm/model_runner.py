@@ -730,19 +730,13 @@ class ModelRunner:
         # ``gllm/mtp_gpu_prep.py``). Replaces the per-step Python rebuild of the
         # draft / verify input arrays with persistent pinned staging + a few
         # vectorized CUDA ops writing straight into the static graph buffers.
-        # ``GLLM_MTP_GPUPREP=0`` falls back to the CPU builders (``cal_input``),
-        # ``GLLM_MTP_GPUPREP_ASSERT=1`` cross-checks the two per step.
+        # ``GLLM_MTP_GPUPREP=0`` falls back to the CPU builders (``cal_input``).
         self._mtp_gpu_prep = None
         self._mtp_gpu_prep_on = (
             getattr(self, "_mtp_k", 0) > 0
             and getattr(self.model, "mtp", None) is not None
             and os.environ.get("GLLM_MTP_GPUPREP", "1") == "1"
         )
-        self._mtp_gpu_prep_assert = (
-            os.environ.get("GLLM_MTP_GPUPREP_ASSERT", "0") == "1"
-        )
-        # Scratch InputData used only by the assert path (lazily built).
-        self._assert_prep_input = None
         # Persistent pinned/device staging for the per-seq sampling params (see
         # ``_mtp_sample_params``); lazily allocated on first use.
         self._sp_host_f = None
@@ -762,11 +756,6 @@ class ModelRunner:
                 uses_mrope=self.uses_mrope,
                 device=torch.device("cuda", torch.cuda.current_device()),
             )
-        # Fine-grained host-side phase profiler (GLLM_MTP_PROF=2); see
-        # ``_mtp_mark`` / ``_mtp_marks_flush``.
-        self._mtp_prof_detail = os.environ.get("GLLM_MTP_PROF", "0") == "2"
-        self._mtp_marks: list = []
-        self._mtp_prof_h: Dict[str, float] = {}
         # MTP rejection sampling: make MTP distribution-lossless under
         # temperature/top-p instead of greedy-only. Activated per-batch by
         # RUNTIME DETECTION of any non-greedy seq -- NOT an env flag: a greedy
@@ -2235,54 +2224,6 @@ class ModelRunner:
         self._mtp_m_t0 = now
 
     # ------------------------------------------------------------------
-    # MTP fine-grained phase profiler (GLLM_MTP_PROF=2)
-    # ------------------------------------------------------------------
-    #
-    # ``GLLM_MTP_PROF=1`` gives the coarse draft/verify/accept split with a
-    # ``cudaSynchronize`` at each boundary (so each bucket = host + GPU time).
-    # ``=2`` instead marks HOST timestamps at every sub-step with NO syncs, so
-    # the numbers isolate per-step host (Python) cost -- the thing GPU-native
-    # input prep is meant to remove. The final ``drain`` bucket syncs once at
-    # the end of the step, so it absorbs whatever GPU work was still in flight.
-    def _mtp_mark(self, label: str) -> None:
-        if not self._mtp_prof_detail:
-            return
-        import time as _t
-
-        self._mtp_marks.append((label, _t.perf_counter()))
-
-    def _mtp_marks_flush(self, nd: int) -> None:
-        """Fold this step's marks into the accumulator; log every 50 steps."""
-        if not self._mtp_prof_detail or not self._mtp_marks:
-            self._mtp_marks = []
-            return
-        import time as _t
-
-        torch.cuda.synchronize()
-        self._mtp_marks.append(("drain", _t.perf_counter()))
-        acc = self._mtp_prof_h
-        for (_, t0), (label, t1) in zip(self._mtp_marks, self._mtp_marks[1:]):
-            acc[label] = acc.get(label, 0.0) + (t1 - t0)
-        acc["steps"] = acc.get("steps", 0) + 1
-        acc["nd"] = acc.get("nd", 0) + nd
-        self._mtp_marks = []
-        steps = acc["steps"]
-        if steps % 50:
-            return
-        if get_tp_rank() == 0:
-            total = sum(v for kk, v in acc.items() if kk not in ("steps", "nd"))
-            parts = " ".join(
-                f"{kk}={1e3 * v / steps:.2f}"
-                for kk, v in sorted(acc.items(), key=lambda kv: -kv[1])
-                if kk not in ("steps", "nd")
-            )
-            logger.info(
-                "MTP host prof (%d steps, avg nd=%.1f) total=%.2fms/step: %s",
-                steps, acc["nd"] / steps, 1e3 * total / steps, parts,
-            )
-        self._mtp_prof_h = {}
-
-    # ------------------------------------------------------------------
     # MTP rejection sampling (lossless speculative decoding under sampling)
     # ------------------------------------------------------------------
     def _mtp_rng_step(self, device):
@@ -2675,7 +2616,6 @@ class ModelRunner:
             )
             graph_seqs = list(decode_seqs) + pad_seqs
             self._draft_input.cal_and_set_input(graph_seqs)
-        self._mtp_mark("d_calinput")
         self._d_nd = bucket
         if gp is not None:
             # x1 already sits in the staged metadata on the device -> D2D copy
@@ -2714,7 +2654,6 @@ class ModelRunner:
             step_next.append(self._d_next_tok[:nd].clone())
 
         drafts_gpu = torch.stack(step_next, dim=1)  # [nd, k] on GPU
-        self._mtp_mark("d_replay")
         # Stash the GPU draft tensor and return ``None`` for the host copy:
         # ``.tolist()`` here is a blocking D2H that stalls the host on the whole
         # draft chain (~0.55 ms at nd=64) only to hand the accept loop token ids
@@ -2777,7 +2716,6 @@ class ModelRunner:
             )
             graph_seqs = list(decode_seqs) + pad_seqs
             self._draft_input.cal_and_set_input(graph_seqs)
-        self._mtp_mark("d_calinput")
         self._d_nd = bucket
         if gp is not None:
             self._d_tok[:nd].copy_(gp.x1_gpu(nd))
@@ -2863,7 +2801,6 @@ class ModelRunner:
         # D2H, same as before.
         self._drafts_gpu = drafts_gpu
         mat = drafts_gpu.tolist()
-        self._mtp_mark("d_tolist_SYNC")
         return [mat[i] for i in range(nd)], q
 
     @torch.inference_mode()
@@ -3170,17 +3107,10 @@ class ModelRunner:
                     if kk
                     else self.input_data.tokens.new_zeros((nd, 0))
                 )
-            self._mtp_mark("v_seqsetup")
             gp.fill_verify(self.input_data, qlen, dg)
             self.input_data.mark_gpu_prepared(
                 seqs=decode_seqs, num_rows=bucket, qlen=qlen, is_mtp_verify=True
             )
-            self._mtp_mark("v_prepare_input")
-            if self._mtp_gpu_prep_assert:
-                self._assert_gpu_prep(
-                    decode_seqs, orig_tokens, x1,
-                    self._drafts_host(drafts, nd, kk), nd, bucket, qlen,
-                )
         else:
             drafts = self._drafts_host(drafts, nd, kk)
             for i, s in enumerate(decode_seqs):
@@ -3192,11 +3122,8 @@ class ModelRunner:
                 self._create_dummy_verify_seqs(bucket - nd, qlen) if bucket > nd else []
             )
             graph_seqs = list(decode_seqs) + pad_seqs
-            self._mtp_mark("v_seqsetup")
             self.prepare_input(graph_seqs)
-            self._mtp_mark("v_prepare_input")
         self._verify_size_to_graph[bucket].replay()
-        self._mtp_mark("v_replay")
         # Drop the pad dummies' embedding-cache stubs immediately so they can
         # never shadow a real seq id allocated on a later step.
         self._drop_dummy_verify_cache()
@@ -3257,8 +3184,8 @@ class ModelRunner:
 
         The graph draft chain returns ``None`` and leaves its output on the GPU
         (``self._drafts_gpu``) so the hot path never syncs mid-step. Only the
-        CPU-side fallbacks (eager verify, GPU-prep assert) need the host copy;
-        they pay the D2H here.
+        CPU-side fallbacks (eager verify) need the host copy; they pay the D2H
+        here.
         """
         if drafts is not None:
             return drafts
@@ -3266,86 +3193,6 @@ class ModelRunner:
         if dg is None or nd == 0 or kk == 0:
             return [[] for _ in range(nd)]
         return dg[:nd, :kk].tolist()
-
-    def _assert_gpu_prep(self, decode_seqs, orig_tokens, x1, drafts, nd, bucket, qlen):
-        """Cross-check the GPU-native verify prep against the CPU builders.
-
-        Opt-in via ``GLLM_MTP_GPUPREP_ASSERT=1`` (dev/CI only -- it rebuilds the
-        batch on the host and syncs). Builds the exact same verify batch the old
-        path built (real seqs mutated to the ``1+kk`` verify shape + dummy pad
-        seqs) into a scratch :class:`InputData`, then compares every device
-        buffer the captured graph reads. Logs an error per mismatching buffer.
-        """
-        if self._assert_prep_input is None:
-            self._assert_prep_input = InputData(
-                max_running_seqs=self.max_running_seqs,
-                max_seq_length=self.model_max_length,
-                memory_manager=self.memory_manager,
-                use_buffer=False,
-            )
-        kk = qlen - 1
-        saved = [
-            (s.token_ids, s.computed_token_num, s.to_compute_token_num,
-             getattr(s, "_mtp_verify", False))
-            for s in decode_seqs
-        ]
-        for i, s in enumerate(decode_seqs):
-            s.token_ids = orig_tokens[i] + [x1[i]] + list(drafts[i])
-            s.computed_token_num = len(orig_tokens[i])
-            s.to_compute_token_num = qlen
-            s._mtp_verify = True
-        pads = self._create_dummy_verify_seqs(bucket - nd, qlen) if bucket > nd else []
-        ref = self._assert_prep_input
-        ref.cal_input(list(decode_seqs) + pads)
-        self._drop_dummy_verify_cache()
-        for i, s in enumerate(decode_seqs):
-            s.token_ids, s.computed_token_num, s.to_compute_token_num, s._mtp_verify = (
-                saved[i]
-            )
-
-        ntok = bucket * qlen
-        idata = self.input_data
-        checks = [
-            ("tokens", idata.tokens[:ntok], ref.tokens_cpu),
-            ("positions", idata.positions[:ntok], ref.positions_cpu),
-            ("slot_mapping", idata.slot_mapping[:ntok], ref.slot_mapping_cpu),
-            ("seq_lens", idata.seq_lens[:bucket], ref.seq_lens_cpu),
-            ("query_start_loc", idata.query_start_loc[: bucket + 1],
-             ref.query_start_loc_cpu),
-            ("block_table",
-             idata.block_table[:bucket, : ref.block_table_cpu.shape[1]],
-             ref.block_table_cpu),
-        ]
-        if idata.use_ssm_cache:
-            checks += [
-                ("ssm_state_slot", idata.ssm_state_slot_per_seq[:bucket],
-                 ref.ssm_state_slot_per_seq_cpu),
-                ("ssm_snapshot_write", idata.ssm_snapshot_write_slot_per_seq[:bucket],
-                 ref.ssm_snapshot_write_slot_per_seq_cpu),
-            ]
-            if getattr(ref, "ssm_block_table_2d_cpu", None) is not None:
-                w = ref.ssm_block_table_2d_cpu.shape[1]
-                checks += [
-                    ("ssm_block_table_2d", idata.ssm_block_table_2d[:bucket, :w],
-                     ref.ssm_block_table_2d_cpu),
-                    ("ssm_num_accepted", idata.ssm_num_accepted[:bucket],
-                     ref.ssm_num_accepted_cpu),
-                ]
-        bad = []
-        for name, got, want in checks:
-            want_dev = want.to(got.device, dtype=got.dtype)
-            if got.shape != want_dev.shape or not torch.equal(got, want_dev):
-                bad.append(name)
-        if bad:
-            logger.error(
-                "MTP GPU prep MISMATCH (nd=%d bucket=%d qlen=%d): %s",
-                nd, bucket, qlen, ", ".join(bad),
-            )
-        elif self._mtp_prep_epoch % 50 == 0:
-            logger.info(
-                "MTP GPU prep OK (nd=%d bucket=%d qlen=%d, %d buffers)",
-                nd, bucket, qlen, len(checks),
-            )
 
     @torch.inference_mode()
     def _mtp_decode(self, hidden: torch.Tensor, x1_tokens: list):
@@ -3367,16 +3214,6 @@ class ModelRunner:
         mtp = self.model.mtp
         decode_seqs = self.input_data.seqs[:nd]
         dev = hidden.device
-        # Opt-in phase profiler (GLLM_MTP_PROF=1): cuda-synced wall-clock for the
-        # draft / verify / accept+commit phases, accumulated across steps and
-        # dumped periodically. Off by default (no sync overhead).
-        _prof = os.environ.get("GLLM_MTP_PROF", "0") == "1"
-        if _prof:
-            import time as _t
-            def _ck():
-                torch.cuda.synchronize()
-                return _t.perf_counter()
-            _p0 = _ck()
         # ``hidden`` is a view into the persistent output_hidden_states buffer;
         # clone so subsequent forwards (draft/verify) can't mutate it underfoot.
         hidden = hidden[:nd].clone()
@@ -3392,7 +3229,6 @@ class ModelRunner:
             (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5) or s.top_k != 1
             for s in decode_seqs
         )
-        self._mtp_mark("start")
         # Original committed token_ids / lengths (pre spec-mutation). These are
         # REFERENCES, not copies: every spec mutation below rebinds
         # ``seq.token_ids`` to a freshly concatenated list and never mutates the
@@ -3415,7 +3251,6 @@ class ModelRunner:
             s.computed_token_num = len(orig_tokens[i])
             s.to_compute_token_num = 1 + k
         self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
-        self._mtp_mark("snapshot_hostlists")
 
         # --- Hybrid GDN recurrent-state: block-table column commit ---
         # The verify forward (GDN ``_forward_mtp_verify``) wrote each of the
@@ -3491,8 +3326,6 @@ class ModelRunner:
         else:
             drafts = self._draft_chain_eager(decode_seqs, orig_tokens, x1, hidden, k, nd)
         restore()
-        if _prof:
-            _p_draft = _ck()
 
         # --- 2. Verify: one base forward over [x1, d1..dk] per seq. ---
         # ``drafts is None`` == the graph draft chain kept its output on the GPU
@@ -3526,8 +3359,6 @@ class ModelRunner:
             # uniform stride. Logits stay raw (see ``_verify_forward_graph``).
             v_logits = self.model.logits_from_hidden(v_hidden)
             qsl = [i * (1 + kk) for i in range(nd + 1)]
-        if _prof:
-            _p_verify = _ck()
 
         # Rejection mode: the target dist ``p`` at each of the 1+kk verify
         # positions, in the SAME transformed space as the draft dist ``q``
@@ -3804,7 +3635,6 @@ class ModelRunner:
                 # is seq i's draft-seed hidden for the next step.
                 bonus_rows = seq_ar * qlen + na_gpu.to(torch.long)
                 bonus_hidden_all = v_hidden.index_select(0, bonus_rows)  # [nd, H]
-            self._mtp_mark("a_accept_gpu_SYNC")
             for i, s in enumerate(decode_seqs):
                 na = na_cpu[i]
                 n_accepted[i] = na
@@ -3814,7 +3644,6 @@ class ModelRunner:
                     # bonus token from the on-device gather; bonus hidden is row i
                     # of the batched gather (a GPU view; only seeds the next draft).
                     new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
-            self._mtp_mark("a_commit_loop")
 
         self._record_mtp_metrics(nd, kk, n_accepted)
 
@@ -3822,8 +3651,6 @@ class ModelRunner:
             # Replace the relay map wholesale so seqs absent from this batch are
             # evicted (their stale hidden must never seed a later draft).
             self._mtp_relay = new_relay
-        if _prof:
-            _p_acc_loop = _ck()
 
         # --- Hybrid GDN recurrent-state: commit the accepted column to col 0 ---
         # The verify forward wrote token t's post-state into block-table column
@@ -3849,39 +3676,8 @@ class ModelRunner:
                 # Reset the persisted resume column: committed state is now at
                 # column 0, so next step's num_accepted is neutral (1).
                 decode_seqs[i].ssm_num_accepted = 1
-        self._mtp_mark("a_bt_swap")
 
         restore()
-        self._mtp_mark("a_restore")
-        self._mtp_marks_flush(nd)
-        if _prof:
-            _p_end = _ck()
-            if not hasattr(self, "_mtp_prof_acc"):
-                self._mtp_prof_acc = {"draft": 0.0, "verify": 0.0, "accept": 0.0,
-                                      "acc_loop": 0.0, "commit": 0.0,
-                                      "steps": 0, "nd": 0}
-            pa = self._mtp_prof_acc
-            pa["draft"] += _p_draft - _p0
-            pa["verify"] += _p_verify - _p_draft
-            pa["accept"] += _p_end - _p_verify
-            pa["acc_loop"] += _p_acc_loop - _p_verify
-            pa["commit"] += _p_end - _p_acc_loop
-            pa["steps"] += 1
-            pa["nd"] += nd
-            if pa["steps"] % 50 == 0:
-                tot = pa["draft"] + pa["verify"] + pa["accept"]
-                logger.info(
-                    "MTP prof (%d steps, avg nd=%.1f): draft=%.1fms(%.0f%%) "
-                    "verify=%.1fms(%.0f%%) accept=%.1fms(%.0f%%)"
-                    "[loop=%.1f commit=%.1f] total=%.1fms/step",
-                    pa["steps"], pa["nd"] / pa["steps"],
-                    1e3 * pa["draft"] / pa["steps"], 100 * pa["draft"] / tot,
-                    1e3 * pa["verify"] / pa["steps"], 100 * pa["verify"] / tot,
-                    1e3 * pa["accept"] / pa["steps"], 100 * pa["accept"] / tot,
-                    1e3 * pa["acc_loop"] / pa["steps"],
-                    1e3 * pa["commit"] / pa["steps"],
-                    1e3 * tot / pa["steps"],
-                )
         return results
 
     @torch.inference_mode()

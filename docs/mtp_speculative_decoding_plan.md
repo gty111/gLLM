@@ -629,7 +629,8 @@ An MTP step prepares **two** batches (the draft chain's batch×1 and the verify
 batch's uniform `1+k`) on top of whatever the scheduler already prepared. Doing
 that with `InputData.cal_input` meant rebuilding every per-token array in Python
 per phase per step. Measured on Qwen3.5-0.8B (1×H200, 64 concurrent greedy
-decodes, `GLLM_MTP_PROF=2`): **4.3 ms of the 12.4 ms step was host-side prep**.
+decodes, with host-side phase profiling): **4.3 ms of the 12.4 ms step was
+host-side prep**.
 
 `MtpGpuPrep` replaces it with the vLLM-model-runner-V2 pattern:
 
@@ -651,11 +652,7 @@ mid-step `drafts.tolist()` folded into the single end-of-step packed D2H
 `prepare_input_mtp_fused`, which skip the scheduler-side decode prep that a fused
 step would only overwrite.
 
-Env vars: `GLLM_MTP_GPUPREP=0` reverts to the CPU builders (both paths are kept);
-`GLLM_MTP_GPUPREP_ASSERT=1` rebuilds the verify batch on the host every step and
-compares all 10 device buffers (dev/CI only); `GLLM_MTP_PROF=2` reports the
-per-sub-step **host** time breakdown (`=1` stays the cuda-synced draft/verify/
-accept split).
+Env vars: `GLLM_MTP_GPUPREP=0` reverts to the CPU builders (both paths are kept).
 
 Result at nd=64 greedy: host prep 4.3 ms → 1.3 ms, step 12.4 → 8.3 ms, decode
 throughput **8.8k → 10.9k tok/s** (nd=20: 3.1k → 4.5k). Token streams are

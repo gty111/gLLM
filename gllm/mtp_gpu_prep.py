@@ -1,7 +1,7 @@
 """GPU-native input preparation for the MTP draft / verify forwards.
 
-Motivation (measured on Qwen3.5-0.8B, 1×H200, 64 concurrent greedy decodes,
-``GLLM_MTP_PROF=2``): one fused MTP step cost ~12.4 ms, of which ~4.3 ms was
+Motivation (measured on Qwen3.5-0.8B, 1×H200, 64 concurrent greedy decodes with
+host-side phase profiling): one fused MTP step cost ~12.4 ms, of which ~4.3 ms was
 **host** time spent rebuilding input arrays in Python -- ``cal_input`` for the
 draft batch (0.5 ms) and for the verify batch (1.5 ms), the per-seq GPU
 context-length bookkeeping (2.1 ms) and the dummy pad-``Sequence`` objects the
@@ -25,8 +25,7 @@ So, following vLLM's model-runner-V2 "persistent batch" idea, this module:
 
 The formulas mirror ``InputData._cal_*`` exactly for the shapes MTP uses (one
 token per seq for a draft step, a uniform ``1+k`` query over a cached context
-for a verify step); ``GLLM_MTP_GPUPREP_ASSERT=1`` cross-checks every buffer
-against the CPU builders at runtime (see ``ModelRunner._assert_gpu_prep``).
+for a verify step).
 """
 
 from typing import List, Optional
@@ -154,8 +153,7 @@ class MtpGpuPrep:
             # Padding rows mirror the throwaway dummy ``Sequence`` objects the
             # CPU path used (``_create_dummy_verify_seqs`` / ``create_dummy_seqs``):
             # context length 1, token id 1, SSM block 0, page table all
-            # ``dummy_page``. Keeping them value-identical means the
-            # ``GLLM_MTP_GPUPREP_ASSERT`` cross-check covers the pad rows too.
+            # ``dummy_page`` -- value-identical to what the CPU path produced.
             meta[nd:bucket, :] = 0
             meta[nd:bucket, META_CTX] = 1
             meta[nd:bucket, META_X1] = 1

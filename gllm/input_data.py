@@ -351,8 +351,8 @@ class InputData:
         accessors slice by those shapes, so point them at cached, correctly
         shaped placeholders: the values are not read by the captured graph (it
         reads the device buffers), but keeping the shapes truthful means every
-        accessor -- and the ``GLLM_MTP_GPUPREP_ASSERT`` cross-check -- still
-        returns the right view. Cached per (num_rows, qlen); no per-step alloc.
+        accessor still returns the right view. Cached per (num_rows, qlen); no
+        per-step alloc.
         """
         key = (num_rows, qlen, self.use_ssm_cache)
         cache = getattr(self, "_gpu_shape_cache", None)
