@@ -975,6 +975,13 @@ class MemoryManager:
 _PREFIX_HASH_SEED = 0x9E3779B97F4A7C15
 _PREFIX_CANARY_LEN = 8
 
+# Token granularity at which a hybrid model's recurrent state may be cached for
+# prefix reuse (rounded to whole KV pages by ``PrefixSegment``). Deliberately
+# much coarser than the KV page: state blocks are ~1 MB per layer while a page
+# is 16 tokens, so per-page state caching drains the shared block pool and
+# starves sequence admission. See ``PrefixSegment.ssm_snapshot_stride``.
+_SSM_SNAPSHOT_STRIDE_TOKENS = 256
+
 
 def _hash_source(seq: Sequence) -> List[int]:
     """Pick the token list used for prefix-cache hashing.
@@ -1064,6 +1071,18 @@ class PrefixMemoryManager(MemoryManager):
     def init(self, reserve_dummy_page: bool = False):
         super().init(segment_cls=PrefixSegment, reserve_dummy_page=reserve_dummy_page)
         self.segment.ssm_segment = self.ssm_segment
+        # Watermark for lazy cached-state reservation: the cache may only use
+        # blocks *beyond* the full concurrency budget (``maxd * (1 + mtp_k)``),
+        # which is exactly how the pool was sized (``block_cap = working_cap +
+        # cache_cap`` in ``_init_ssm_segment_if_needed``). Without this the
+        # cache eats the working budget, the scheduler's admission gate (needs
+        # ``1 + mtp_k`` free blocks per new sequence) starves, and the running
+        # batch collapses to one sequence with a full wait queue.
+        self.segment.ssm_reserve_floor = (
+            self.max_working_ssm_slots * (1 + self.mtp_k)
+            if self.ssm_segment is not None
+            else 0
+        )
 
         # Cache-hit-rate stats.
         self.num_allocated_pages = 0
@@ -1277,16 +1296,31 @@ class PrefixSegment(Segment):
         # was captured (e.g. when the SSM cache is disabled or the boundary
         # never had a chance to snapshot during prefill).
         self.page2ssm_snapshot: List[Optional[int]] = [None for _ in range(self.num_pages)]
-        # Whether the reserved snapshot slot actually holds a *written*
-        # recurrent state yet. A slot is reserved at ``allocate`` time for
-        # every cacheable page, but the GDN layer only writes the snapshot
-        # for the page boundary on which a prefill chunk *ends* (see
-        # ``InputData._cal_ssm_metadata``). Interior boundaries crossed inside
-        # a single chunk keep their reserved-but-zeroed slot, so a hit there
-        # must NOT restore it (restoring zeros == h_0 grafted onto a non-zero
-        # prefix -> garbage). ``page2ssm_snapshot_valid`` separates "reserved"
-        # from "filled" so the restore/rollback paths only trust real states.
+        # Whether the snapshot slot actually holds a *written* recurrent state.
+        # A slot only ever gets written for the boundary a prefill chunk *ends*
+        # on (see ``InputData._cal_ssm_metadata``); this flag separates
+        # "reserved" from "filled" so the restore path never grafts a zeroed
+        # state (== h_0) onto a non-empty prefix.
         self.page2ssm_snapshot_valid: List[bool] = [False for _ in range(self.num_pages)]
+        # Recurrent-state caching granularity, in PAGES. Only page boundaries at
+        # a multiple of this stride can hold a cached state.
+        #
+        # This used to be every cacheable page: ``allocate`` reserved one state
+        # block per 16-token page, so a single 2.5k-token prompt reserved ~156
+        # blocks out of a ~1800-block pool. Ten such requests drained it, and
+        # since new admissions need ``1 + mtp_k`` blocks from the same pool the
+        # scheduler then stalled with #run=1 and 120+ queued (observed on
+        # MMLU-Pro 5-shot). Worse, those reservations were nearly all dead
+        # weight: a state is only ever *written* at a chunk end, so the interior
+        # boundaries kept a reserved-but-zeroed block forever and every hit was
+        # rejected on the SSM half -> 0% cache hit rate. Coarse + lazy (see
+        # ``reserve_ssm_snapshot``) fixes both: ~10 blocks per prompt, and only
+        # for boundaries a chunk actually lands on. Restoring from a coarse
+        # boundary means recomputing at most ``stride`` pages of tail, which is
+        # the same trade vLLM makes with ``mamba_block_size``.
+        self.ssm_snapshot_stride = max(
+            1, _SSM_SNAPSHOT_STRIDE_TOKENS // self.page_size
+        )
 
     # --- public API ---------------------------------------------------------
 
@@ -1350,15 +1384,10 @@ class PrefixSegment(Segment):
             self.page2hash[page_num] = page_hash
             self.hash2page[page_hash] = page_num
             self.page2canary[page_num] = key_canary
-            # Pre-reserve a snapshot slot so the GDN layer can fill it when
-            # it crosses this page boundary. If the snapshot pool is full
-            # we silently degrade to "KV-cached but no SSM" (the hit path
-            # in PrefixMemoryManager will then roll the hit back if it
-            # cannot honor the SSM half).
-            if self.ssm_segment is not None:
-                self.page2ssm_snapshot[page_num] = self.ssm_segment.allocate_snapshot()
-                # Freshly reserved slot holds no written state yet.
-                self.page2ssm_snapshot_valid[page_num] = False
+            # NO state block is reserved here. Reservation is lazy and coarse --
+            # see ``reserve_ssm_snapshot`` and ``ssm_snapshot_stride``.
+            self.page2ssm_snapshot[page_num] = None
+            self.page2ssm_snapshot_valid[page_num] = False
         else:
             self.page2hash[page_num] = 0
             self.page2canary[page_num] = None
@@ -1381,6 +1410,38 @@ class PrefixSegment(Segment):
             # prompt would always lose the snapshot half of the hit and
             # ``_rollback_to_last_ssm_hit`` would drop the KV half too.
             self.id_allocator.free(page_num)
+
+    def reserve_ssm_snapshot(self, page_num: int, n_tokens: int) -> Optional[int]:
+        """Lazily reserve the cached-state block for ``page_num``, or ``None``.
+
+        Called from the *write* path (``InputData._cal_ssm_metadata``) for the
+        boundary a prefill chunk just landed on, so a block is only ever taken
+        for a boundary that will actually hold a state. Returns ``None`` when:
+
+        * the boundary is not on the coarse ``ssm_snapshot_stride`` grid,
+        * the page is not cacheable (nothing could ever hit it), or
+        * the pool is at its watermark -- cached states must never eat the
+          blocks that live sequences need for their rolling state, otherwise
+          the scheduler's admission gate (which needs ``1 + mtp_k`` free blocks
+          per new sequence) starves and the batch collapses to one sequence.
+        """
+        if self.ssm_segment is None:
+            return None
+        if n_tokens <= 0 or n_tokens % (self.ssm_snapshot_stride * self.page_size):
+            return None
+        if self.page2hash[page_num] == 0:
+            return None
+        slot = self.page2ssm_snapshot[page_num]
+        if slot is not None:
+            return slot
+        if self.ssm_segment.num_free_blocks() <= self.ssm_reserve_floor:
+            return None
+        slot = self.ssm_segment.allocate_snapshot()
+        if slot is None:
+            return None
+        self.page2ssm_snapshot[page_num] = slot
+        self.page2ssm_snapshot_valid[page_num] = False
+        return slot
 
     def _release_snapshot_for(self, page_num: int) -> None:
         if self.ssm_segment is None:

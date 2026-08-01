@@ -194,11 +194,17 @@ async def evaluate(subjects):
     tasks = []
     test_data_total = []
     for subject in subjects:
-        test_data = test_df[subject][: args.num_per_sub]
-        test_data_total.extend(test_data)
-        for each in test_data:
-            api_url = api_urls[len(tasks) % len(api_urls)]
-            tasks.append(bounded_request(api_url, each))
+        test_data_total.extend(test_df[subject][: args.num_per_sub])
+    if args.shuffle_seed is not None:
+        # Vary only *which questions share a batch*: same questions, same
+        # prompts, same few-shot examples, different dispatch order. Kernels are
+        # not batch-invariant, so two runs of one configuration do not score
+        # identically; shuffling measures that noise floor, which is what any
+        # A/B difference has to be compared against.
+        random.Random(args.shuffle_seed).shuffle(test_data_total)
+    for each in test_data_total:
+        api_url = api_urls[len(tasks) % len(api_urls)]
+        tasks.append(bounded_request(api_url, each))
     pbar.total = len(tasks)
     completions = await asyncio.gather(*tasks)
     pbar.close()
@@ -278,6 +284,15 @@ if __name__ == "__main__":
     parser.add_argument("--output-len", type=int, default=1024)
     parser.add_argument("--num-per-sub", type=int, default=100)
     parser.add_argument("--num-shots", type=int, default=5)
+    parser.add_argument(
+        "--shuffle-seed",
+        type=int,
+        default=None,
+        help="Shuffle the dispatch order with this seed. Same questions and "
+        "prompts, different batch composition -- use it to measure a "
+        "configuration's own run-to-run spread before reading anything into an "
+        "A/B difference.",
+    )
     parser.add_argument(
         "--concurrency",
         type=int,

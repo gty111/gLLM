@@ -100,6 +100,18 @@ class Scheduler:
     def get_num_free_pages(self):
         return self.memory_manager.get_num_free_pages()
 
+    def _ssm_snapshot_stride_tokens(self) -> int:
+        """Token granularity of the recurrent-state cache, or 0 if inapplicable.
+
+        Non-zero only for a hybrid model with prefix caching on, i.e. when a
+        prefill chunk boundary landing on the grid buys a cacheable state.
+        """
+        seg = getattr(self.memory_manager, "segment", None)
+        stride = getattr(seg, "ssm_snapshot_stride", None)
+        if stride is None or getattr(seg, "ssm_segment", None) is None:
+            return 0
+        return stride * self.page_size
+
     def get_num_decode_seqs(self):
         num_decode_seqs = len(self.seqs_to_decode) + sum(
             len(i) for i in self.batch_running
@@ -253,7 +265,15 @@ class Scheduler:
                 if extra > 0:
                     seq.computed_token_num += extra
                     self.model_runner.memory_manager.pre_allocate_page([seq])
-                ipc_package.next_tokens.append(committed if isinstance(tok, list) else tok)
+                # Ship only the tokens we actually kept. The loop above stops at
+                # ``is_finish``, so ``kept`` is where EOS / max_tokens landed;
+                # sending the untruncated ``committed`` made the frontend append
+                # the whole speculative burst to its own copy of the sequence
+                # (``LLM._apply_ipc_package``), overshooting ``max_tokens`` by up
+                # to ``k`` tokens and emitting text past the stop token.
+                ipc_package.next_tokens.append(
+                    committed[:kept] if isinstance(tok, list) else tok
+                )
             if seq.is_finish:
                 ipc_package.free_ids.append(seq.seq_id)
                 # Mirror the free to follower-side state cleanup. ``free_ids``
@@ -482,6 +502,22 @@ class Scheduler:
                 seq.to_compute_token_num = prefill_avail
             else:
                 seq.to_compute_token_num = prefill_token_budget
+            # Hybrid + prefix caching: a recurrent state can only be captured for
+            # the boundary a chunk *ends* on, so land the cut on the state grid.
+            # A chunk ending mid-grid caches nothing, and then every later prefix
+            # hit is rejected on its SSM half -- that is why the hit rate was a
+            # flat 0% for prompts that prefilled in a single chunk. Aligning down
+            # costs one extra prefill step for such a prompt (same total tokens)
+            # and in exchange its prefix becomes reusable, which is the trade
+            # vLLM makes by chunking on ``mamba_block_size``. Never grows a chunk,
+            # and a no-op for prompts shorter than one stride.
+            stride = self._ssm_snapshot_stride_tokens()
+            if stride:
+                end = seq.computed_token_num + seq.to_compute_token_num
+                if end % stride:
+                    aligned = (end // stride) * stride
+                    if aligned > seq.computed_token_num:
+                        seq.to_compute_token_num = aligned - seq.computed_token_num
             # Page guard: the prefill ``token`` budget only accounts for the
             # *uncached tail* a seq computes this step, but ``pre_allocate_page``
             # below grabs a KV page for every NEW page boundary the seq crosses

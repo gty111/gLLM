@@ -175,7 +175,7 @@ class OverlapWorker(Worker):
         batch whose sampled tokens are discarded. The dummy references the
         memory manager's dummy pages, so it never touches real KV state.
         """
-        seqs = self.model_runner.create_dummy_seqs(size)
+        seqs = self.model_runner.create_dummy_seqs(size, runtime=True)
         dummy = InputData(
             use_buffer=False,
             memory_manager=self.model_runner.memory_manager,
@@ -271,7 +271,14 @@ class OverlapWorker(Worker):
             # Whole batch was freed under us; nothing to forward this step.
             self._build_prefetched_input()
             return
-        self.model_runner.prepare_input(schedule_seqs)
+        # A fused MTP step runs no decode forward, so building the decode
+        # batch's per-token input arrays here would be immediately overwritten
+        # by the draft/verify prep inside ``_mtp_decode``. Skip straight to the
+        # batch bookkeeping when the fused fast path is guaranteed to be taken.
+        if self.model_runner.mtp_fused_prep_eligible(schedule_seqs):
+            self.model_runner.prepare_input_mtp_fused(schedule_seqs)
+        else:
+            self.model_runner.prepare_input(schedule_seqs)
         next_tokens = self.model_runner.step_once()
         if next_tokens is not None:
             self.scheduler.add_next_tokens(next_tokens, self.model_runner._last_logprobs)
@@ -321,13 +328,23 @@ class OverlapWorker(Worker):
         # not the future-map relay pipeline. DP+EP is out of scope for the sync
         # path (the cross-DP collective lockstep does not tolerate a variable
         # per-step token count), so only take it on plain TP.
-        if (
+        # A batch past the speculation crossover (``mtp_speculate_batch``) skips
+        # the sync path entirely and rides the normal overlapped pipeline -- which
+        # is both the faster plain step *and* overlapped, so declining to
+        # speculate costs nothing extra.
+        _pure_decode = (
             self._mtp_active
             and not self._dp
             and self._prefetched_input is not None
             and getattr(self._prefetched_input, "num_prefills", 0) == 0
             and self._prefetched_input.seqs[-1].computed_prompt
-        ):
+        )
+        # One authoritative call: decides the mode for this iteration (cached for
+        # the other gate sites) and times the previous one.
+        _spec = self.model_runner.mtp_begin_iter(
+            len(self._prefetched_input.seqs) if _pure_decode else None
+        )
+        if _spec:
             self._run_mtp_sync()
             return
 

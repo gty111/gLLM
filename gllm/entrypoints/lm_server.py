@@ -17,12 +17,19 @@ import asyncio
 import os
 
 
+from gllm.entrypoints import cli_args
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="gLLM LM Server (encoder-disaggregated)")
-    # --- Model ---
-    p.add_argument("--model-path", required=True, type=str)
-    p.add_argument("--load-format", choices=["auto", "dummy"], default="auto")
-    p.add_argument("--model-max-length", type=int, default=None)
+    # --- Model / engine: shared with api_server (gllm/entrypoints/cli_args.py) ---
+    cli_args.add_frontend_args(p)
+    cli_args.add_engine_args(
+        p,
+        tp_help="LM tensor-parallel size. The full visual embedding is "
+        "multi-written by the encoder into every TP rank's slot pool; "
+        "pp_size stays 1.",
+    )
     # The defining flag of the LM node. On by default for this entrypoint.
     p.add_argument(
         "--skip-visual",
@@ -41,16 +48,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "tp_size=1, or a comma-separated list (e.g. '0,1') whose length equals "
         "--tp for tensor parallelism.",
     )
-    p.add_argument(
-        "--tp",
-        type=int,
-        default=1,
-        help="LM tensor-parallel size. The full visual embedding is "
-        "multi-written by the encoder into every TP rank's slot pool; "
-        "pp_size stays 1.",
-    )
-    p.add_argument("--master-addr", type=str, default="0.0.0.0")
-    p.add_argument("--master-port", type=str, default=None)
     # NIXL transport backend (PP0 receive side). The data-plane endpoint is
     # auto-negotiated via the metadata exchanged over the ZMQ control plane, so
     # there is no fixed listen port to configure here.
@@ -88,56 +85,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="discovery registry HOST:PORT (run discovery_server there)",
     )
-    # --- Runtime (mirror api_server defaults) ---
-    p.add_argument("--gpu-memory-util", type=float, default=0.9)
-    p.add_argument("--page-size", type=int, default=16)
-    p.add_argument(
-        "--mla-decode-backend",
-        type=str,
-        choices=["fa3", "flashmla", "triton"],
-        default="fa3",
-        help=(
-            "MLA decode attention backend. 'fa3' (default) uses FA3 absorbed "
-            "MLA decode; 'flashmla' auto-bumps page_size to 64; 'triton' is "
-            "the in-tree fallback."
-        ),
-    )
-    p.add_argument(
-        "--mla-cache-dtype",
-        type=str,
-        choices=["bf16", "fp8"],
-        default="bf16",
-        help=(
-            "MLA latent KV cache precision for DeepSeek Sparse Attention. "
-            "'bf16' (default) = full-precision cache + dense decode; 'fp8' = "
-            "FP8-packed cache for SM90 sparse decode. No effect on non-DSA models."
-        ),
-    )
-    p.add_argument("--disable-cuda-graph", action="store_true")
-    p.add_argument("--max-cuda-graph-bs", type=int, default=512)
-    p.add_argument(
-        "--overlap-scheduling",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    p.add_argument(
-        "--enable-prefix-caching",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    p.add_argument("--maxd", type=int, default=512)
-    p.add_argument("--maxp", type=int, default=8192)
-    p.add_argument("--minp", type=int, default=32)
-    p.add_argument("--iterp", type=int, default=8)
-    p.add_argument("--init-new-token-ratio", type=float, default=0.7)
-    p.add_argument("--min-new-token-ratio", type=float, default=0.1)
-    p.add_argument(
-        "--schedule-method",
-        choices=["split_pd", "chunked_prefill", "token_throttling"],
-        default="chunked_prefill",
-    )
-    p.add_argument("--mm-processor-min-pixels", type=int, default=None)
-    p.add_argument("--mm-processor-max-pixels", type=int, default=None)
     return p
 
 
@@ -185,36 +132,17 @@ def main():
 
     api.llm = PipeAsyncLLM(
         host=args.host,
-        master_addr=args.master_addr,
-        master_port=args.master_port,
         launch_mode="normal",
         worker_ranks=None,
-        load_format=args.load_format,
-        model_path=args.model_path,
-        gpu_memory_util=args.gpu_memory_util,
-        page_size=args.page_size,
-        maxd=args.maxd,
-        maxp=args.maxp,
-        minp=args.minp,
-        iterp=args.iterp,
-        init_new_token_ratio=args.init_new_token_ratio,
-        min_new_token_ratio=args.min_new_token_ratio,
-        enable_prefix_caching=args.enable_prefix_caching,
         pp_size=1,
-        tp_size=args.tp,
         use_ep=False,
         assigned_layers=None,
-        schedule_method=args.schedule_method,
-        overlap_scheduling=args.overlap_scheduling,
-        disable_cuda_graph=args.disable_cuda_graph,
-        max_cuda_graph_bs=args.max_cuda_graph_bs,
-        model_max_length=args.model_max_length,
-        mm_processor_min_pixels=args.mm_processor_min_pixels,
-        mm_processor_max_pixels=args.mm_processor_max_pixels,
         disagg_config=disagg_config,
-        mla_decode_backend=args.mla_decode_backend,
-        mla_cache_dtype=args.mla_cache_dtype,
+        **cli_args.engine_kwargs(args),
     )
+
+    # Same OpenAI frontend as api_server -> same tool-call parsing.
+    api.resolve_tool_parser(args.tool_call_parser)
 
     asyncio.run(api.run_server(args))
 

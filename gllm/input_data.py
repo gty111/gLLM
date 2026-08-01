@@ -202,17 +202,21 @@ class InputData:
         # :meth:`MemoryManager.init`, so during the pre-init profile run
         # we may not have it yet — fall back to ``None`` (no snapshots).
         segment = getattr(self.memory_manager, "segment", None)
-        page2snap = getattr(segment, "page2ssm_snapshot", None) if segment is not None else None
+        reserve = getattr(segment, "reserve_ssm_snapshot", None)
         page_size = self.memory_manager.page_size
 
         for i, seq in enumerate(seqs):
             slots[i] = seq.ssm_state_slot if seq.ssm_state_slot is not None else 0
             has_init[i] = seq.computed_token_num > 0
-            # Snapshot timing: prefill chunk landing on a page boundary.
-            # Decode rows skip this branch since ``computed_prompt`` flips
-            # True before any decode token is emitted (see Sequence) and
-            # ``page2snap is None`` for non-prefix-cache runs.
-            if page2snap is None or seq.computed_prompt:
+            # Snapshot timing: prefill chunk landing on a page boundary. The
+            # state block is reserved HERE, lazily, and only for boundaries on
+            # the coarse ``ssm_snapshot_stride`` grid -- reserving one per
+            # cacheable page drained the shared block pool and starved sequence
+            # admission (see ``PrefixSegment.reserve_ssm_snapshot``). Decode rows
+            # skip this branch since ``computed_prompt`` flips True before any
+            # decode token is emitted (see Sequence), and ``reserve`` is None for
+            # non-prefix-cache runs.
+            if reserve is None or seq.computed_prompt:
                 continue
             end_tokens = seq.computed_token_num + seq.to_compute_token_num
             if end_tokens == 0 or end_tokens % page_size != 0:
@@ -221,7 +225,7 @@ class InputData:
             if page_idx < 0 or page_idx >= len(seq.page_table):
                 continue
             page_num = seq.page_table[page_idx]
-            snap_slot = page2snap[page_num]
+            snap_slot = reserve(page_num, end_tokens)
             if snap_slot is not None:
                 snap_targets[i] = snap_slot
                 # This forward WILL write the recurrent state for ``page_num``
@@ -330,6 +334,71 @@ class InputData:
     def cal_and_set_input(self, seqs: List[Sequence]):
         self.cal_input(seqs)
         self.copy_to_input_buffer()
+
+    def mark_gpu_prepared(
+        self,
+        *,
+        seqs: List[Sequence],
+        num_rows: int,
+        qlen: int,
+        is_mtp_verify: bool = False,
+    ):
+        """Declare that the GPU buffers were filled without the CPU builders.
+
+        ``MtpGpuPrep`` writes the device buffers directly (see
+        ``gllm/mtp_gpu_prep.py``), so the ``*_cpu`` staging tensors this class
+        normally derives its *shapes* from are never built. The ``get_*``
+        accessors slice by those shapes, so point them at cached, correctly
+        shaped placeholders: the values are not read by the captured graph (it
+        reads the device buffers), but keeping the shapes truthful means every
+        accessor -- and the ``GLLM_MTP_GPUPREP_ASSERT`` cross-check -- still
+        returns the right view. Cached per (num_rows, qlen); no per-step alloc.
+        """
+        key = (num_rows, qlen, self.use_ssm_cache)
+        cache = getattr(self, "_gpu_shape_cache", None)
+        if cache is None:
+            cache = self._gpu_shape_cache = {}
+        shapes = cache.get(key)
+        if shapes is None:
+            ntok = num_rows * qlen
+
+            def _e(*shape, dtype):
+                return torch.empty(shape, dtype=dtype, device="cpu")
+
+            shapes = {
+                "tokens_cpu": _e(ntok, dtype=torch.long),
+                "positions_cpu": _e(ntok, dtype=torch.long),
+                "slot_mapping_cpu": _e(ntok, dtype=torch.int64),
+                "block_table_cpu": _e(num_rows, self.max_num_block, dtype=torch.int32),
+                "seq_lens_cpu": _e(num_rows, dtype=torch.int32),
+                "query_start_loc_cpu": _e(num_rows + 1, dtype=torch.int32),
+            }
+            if self.use_ssm_cache:
+                shapes["ssm_state_slot_per_seq_cpu"] = _e(num_rows, dtype=torch.int32)
+                shapes["has_initial_state_per_seq_cpu"] = _e(num_rows, dtype=torch.bool)
+                shapes["ssm_snapshot_write_slot_per_seq_cpu"] = _e(
+                    num_rows, dtype=torch.int32
+                )
+                if hasattr(self, "ssm_block_table_2d"):
+                    shapes["ssm_block_table_2d_cpu"] = _e(
+                        num_rows, self._mtp_bt_width, dtype=torch.int32
+                    )
+                    shapes["ssm_num_accepted_cpu"] = _e(num_rows, dtype=torch.int32)
+            cache[key] = shapes
+        for name, tensor in shapes.items():
+            setattr(self, name, tensor)
+        self.seqs = seqs
+        self.embedding_size = 0
+        # mrope buffer is filled by the prep, but the captured graphs read the
+        # 1-D ``positions`` buffer (``mrope_positions_cpu`` was ``None`` at
+        # capture time), so keep ``get_position`` on the same branch.
+        self.mrope_positions_cpu = None
+        self.is_mtp_verify = is_mtp_verify
+        self.max_query_len = qlen
+        # Uniform batch: every row contributes ``qlen`` query tokens.
+        self.num_decodes = 0 if is_mtp_verify else len(seqs)
+        self.num_decode_tokens = self.num_decodes
+        self.num_prefills = len(seqs) if is_mtp_verify else 0
 
     # Attributes copied verbatim from a prebuilt InputData.
     _PREBUILT_COMMON_ATTRS = (

@@ -370,6 +370,125 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         return getattr(input_data, "max_query_len", 1) == 1
 
+    def _verify_conv(
+        self,
+        input_data: InputData,
+        mixed_qkv: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias,
+        block_table_2d: torch.Tensor,
+        num_accepted: torch.Tensor,
+        nseq: int,
+        qlen: int,
+    ) -> torch.Tensor:
+        """Causal conv over all ``qlen`` verify tokens in ONE kernel call.
+
+        Semantics (unchanged): token ``t`` is convolved against the window left
+        by token ``t-1``, with ``t = 0`` resuming from block-table column
+        ``num_accepted - 1``; each token's post-window lands in column ``t``.
+
+        The first implementation ran that literally -- a python loop over ``t``
+        doing ``index_select`` + ``index_copy_`` + a single-token
+        ``causal_conv1d_update`` per step. At ``k=3`` over 18 GDN layers the
+        torch profiler counted **~380 GPU ops per MTP step** from this loop alone
+        (72 conv kernels, 72 index_copy, 150 index, 86 gather), more than half of
+        all ops in the step.
+
+        The kernel already supports the whole thing in one launch (vLLM's
+        spec-decode path): ``x`` as ``[nseq, dim, qlen]`` plus
+        ``intermediate_conv_window``, which records the post-window after every
+        token. Two details make it fit gLLM's block-table layout:
+
+        * that path needs a window physically wider than ``qlen``
+          (``width-1 + qlen-1``), while a block holds exactly ``width-1``. So the
+          resume window is staged into a small scratch buffer of the right width;
+          the kernel's own rolling write-back lands there and is discarded.
+        * ``num_accepted`` is passed as all-ones (offset 0) because the resume
+          column is selected while staging, not by the kernel's rewind.
+
+        Per layer: 2 staging copies + 1 conv + 1 scatter (4 ops) instead of
+        ``4 * qlen`` (12 at k=3), and the conv itself runs once instead of
+        ``qlen`` times.
+        """
+        dev = mixed_qkv.device
+        c_in = mixed_qkv.shape[1]
+        width_1 = conv_state.shape[-1]              # kernel_width - 1
+        # Size the shared buffers to the largest decode batch so their addresses
+        # are stable across every captured verify bucket.
+        rows = max(getattr(input_data.memory_manager, "max_running_seqs", nseq), nseq)
+        seq_ar = torch.arange(nseq, device=dev)
+        # Resume window: column ``num_accepted-1`` of each seq's block table.
+        src_blk = block_table_2d[
+            seq_ar, (num_accepted.to(torch.long) - 1).clamp_(min=0)
+        ].to(torch.long)
+
+        scratch, inter = self._verify_conv_buffers(conv_state, qlen, dev, rows)
+        # Stage the resume window into the scratch rows; the tail slots are not
+        # read as history (the kernel only looks at the first ``width-1``).
+        scratch[:nseq, :, :width_1].copy_(conv_state.index_select(0, src_blk))
+
+        # Identity indices: the scratch row / intermediate row for seq ``i`` is
+        # ``i``. ``conv_state_indices`` must be passed for the kernel to take its
+        # continuous-batching branch, which is also where it picks up
+        # ``intermediate_state_indices``.
+        ident = self._verify_conv_ident(rows, dev)[:nseq]
+        out = causal_conv1d_update(
+            mixed_qkv.view(nseq, qlen, c_in).transpose(1, 2),   # [nseq, dim, T]
+            scratch,
+            conv_weights,
+            conv_bias,
+            self.activation,
+            conv_state_indices=ident,
+            num_accepted_tokens=self._verify_conv_ones(rows, dev)[:nseq],
+            intermediate_conv_window=inter,
+            intermediate_state_indices=ident,
+        )                                                       # [nseq, dim, T]
+        # Scatter every token's post-window into its block-table column. Rows of
+        # ``inter`` are laid out [seq][step], matching ``block_table_2d``'s
+        # row-major flattening, so this is a single ``index_copy_``.
+        conv_state.index_copy_(
+            0,
+            block_table_2d[:, :qlen].reshape(-1).to(torch.long),
+            inter[:nseq].reshape(nseq * qlen, c_in, width_1),
+        )
+        return out.transpose(1, 2)                              # [nseq, T, dim]
+
+    def _verify_conv_buffers(self, conv_state, qlen, dev, rows):
+        """Scratch conv window + per-token intermediate buffer (allocated once).
+
+        Shared by every GDN layer (they run sequentially) and sized to the
+        largest decode batch, so the buffers handed to the kernel keep a fixed
+        address across CUDA-graph capture and replay.
+        """
+        cache = getattr(self, "_vconv_buf", None)
+        want = qlen + conv_state.shape[-1] - 1
+        if cache is not None and cache[0].shape[0] >= rows and cache[0].shape[2] >= want:
+            return cache
+        c_in, width_1 = conv_state.shape[1], conv_state.shape[2]
+        scratch = torch.zeros(
+            (rows, c_in, want), dtype=conv_state.dtype, device=dev
+        )
+        inter = torch.zeros(
+            (rows, qlen, c_in, width_1), dtype=conv_state.dtype, device=dev
+        )
+        self._vconv_buf = (scratch, inter)
+        return self._vconv_buf
+
+    def _verify_conv_ones(self, rows, dev):
+        cache = getattr(self, "_vconv_ones", None)
+        if cache is None or cache.shape[0] < rows:
+            cache = torch.ones(rows, dtype=torch.int32, device=dev)
+            self._vconv_ones = cache
+        return cache
+
+    def _verify_conv_ident(self, rows, dev):
+        cache = getattr(self, "_vconv_ident", None)
+        if cache is None or cache.shape[0] < rows:
+            cache = torch.arange(rows, dtype=torch.int32, device=dev)
+            self._vconv_ident = cache
+        return cache
+
     def _forward_mtp_verify(
         self,
         input_data: InputData,
@@ -410,44 +529,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         dev = mixed_qkv.device
 
         c_in = mixed_qkv.shape[1]
-        # Per-token conv: process each verify column t reading the conv block at
-        # column ``t-1`` (or the resume column ``num_accepted-1`` for t=0) and
-        # writing column t's conv block. T (<=1+k) tiny single-token updates.
-        conv_x = mixed_qkv.view(nseq, qlen, c_in)  # [nseq, T, c_in]
-        conv_out = torch.empty_like(conv_x)
-        seq_ar = torch.arange(nseq, device=dev)
-        na_m1 = (num_accepted - 1).clamp_(min=0).to(torch.long)
-        for t in range(qlen):
-            src_col = na_m1 if t == 0 else torch.full((nseq,), t - 1, device=dev,
-                                                       dtype=torch.long)
-            dst_col = torch.full((nseq,), t, device=dev, dtype=torch.long)
-            src_blk = block_table_2d[seq_ar, src_col].to(torch.int32)
-            dst_blk = block_table_2d[seq_ar, dst_col].to(torch.int32)
-            # Seed the dst conv block with the src block's window, then do a
-            # single-token in-place conv update at dst (reads its own history +
-            # the new token). Copying src->dst first makes the update start from
-            # the correct resume window without a separate kernel signature.
-            if t == 0:
-                conv_state.index_copy_(
-                    0, dst_blk.to(torch.long),
-                    conv_state.index_select(0, src_blk.to(torch.long)),
-                )
-            else:
-                # column t-1 already holds this seq's post-(t-1) window; seed t.
-                conv_state.index_copy_(
-                    0, dst_blk.to(torch.long),
-                    conv_state.index_select(0, src_blk.to(torch.long)),
-                )
-            out_t = causal_conv1d_update(
-                conv_x[:, t, :],           # [nseq, c_in]
-                conv_state,
-                conv_weights,
-                conv_bias,
-                self.activation,
-                conv_state_indices=dst_blk,
-            )
-            conv_out[:, t, :] = out_t
-        conv_out = conv_out.reshape(total, c_in)
+        conv_out = self._verify_conv(
+            input_data, mixed_qkv, conv_state, conv_weights, conv_bias,
+            block_table_2d, num_accepted, nseq, qlen,
+        ).reshape(total, c_in)
 
         kd = self.key_dim // get_tp_size()
         vd = self.value_dim // get_tp_size()
@@ -1257,24 +1342,32 @@ class Qwen3_5ForCausalLM(nn.Module):
         ``num_layers`` is the count of GDN layers on this PP rank;
         ``conv_dim`` is the per-rank packed projection width (``2*K + V``)
         because :class:`Qwen3_5GatedDeltaNet` shards along the head dim;
-        ``head_v_dim`` etc. are unchanged by TP. The state dtype is
-        ``mamba_ssm_dtype`` (float32 on Qwen3.5-0.8B), keeping recurrent
-        accumulation in fp32 even when the rest of the model runs in
-        bfloat16.
+        ``head_v_dim`` etc. are unchanged by TP.
+
+        The recurrent-state dtype comes from the engine's
+        ``mamba_ssm_cache_dtype`` (see ``ModelRunner``), NOT from the
+        checkpoint's ``mamba_ssm_dtype`` hint: at ``auto`` (the default) the
+        state is stored in the model's activation dtype, matching vLLM's
+        ``--mamba-ssm-cache-dtype`` default. Pass ``float32`` to get the
+        checkpoint's fp32 recommendation back. The recurrence itself always
+        accumulates in fp32 inside the kernels regardless -- this only controls
+        what is *stored* between steps.
         """
         tp_size = get_tp_size()
         key_dim = config.linear_num_key_heads * config.linear_key_head_dim
         value_dim = config.linear_num_value_heads * config.linear_value_head_dim
         conv_dim_per_partition = (2 * key_dim + value_dim) // tp_size
-        dtype_str = getattr(config, "mamba_ssm_dtype", "float32")
-        dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16,
-                     "float16": torch.float16}
-        ssm_dtype = dtype_map.get(str(dtype_str), torch.float32)
         # Conv state needs to match the activation dtype so the conv1d
         # kernels can ``tl.load`` from it without an implicit cast. We use
         # the current default dtype (set by the engine to the checkpoint
         # dtype before instantiating the model).
         conv_state_dtype = torch.get_default_dtype()
+        dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16,
+                     "float16": torch.float16}
+        req = str(getattr(config, "mamba_ssm_cache_dtype", "auto")).lower()
+        ssm_dtype = conv_state_dtype if req == "auto" else dtype_map.get(
+            req, conv_state_dtype
+        )
         return SSMCacheConfig(
             num_layers=self.num_ssm_layers,
             conv_dim=conv_dim_per_partition,
