@@ -7,7 +7,13 @@ from typing import List, Optional
 from logger import logger
 
 from gllm.comm import IPCPackage
-from gllm.dist_utils import get_pp_rank, get_rank, get_tp_rank, get_world_size
+from gllm.dist_utils import (
+    get_pp_rank,
+    get_rank,
+    get_tp_rank,
+    get_world_size,
+    is_dp_attn,
+)
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.model_runner import ModelRunner
 from gllm.sequence import Sequence
@@ -243,13 +249,10 @@ class Scheduler:
                 else:
                     # PP=1: attach from the local seq's accumulated data.
                     self._attach_prompt_logprobs(ipc_package, seq)
-                # MTP: ``tok`` may be a LIST = [x1] + accepted_drafts + [bonus].
-                # KV was written by the verify forward for x1 + accepted_drafts
-                # (they were verify INPUTS); the trailing bonus is the target's
-                # PREDICTION and has NO KV yet, so it must stay uncached and be
-                # reprocessed by the next decode step (the standard invariant:
-                # computed_token_num == len(token_ids) - 1). For the ordinary
-                # path ``tok`` is a single int (one uncached token, extra=0).
+                # MTP: ``tok`` may be ``[x1] + accepted_drafts``. Every element
+                # was a verify input, so its KV is already valid; the target
+                # bonus is relay-only and is committed as the next MTP step's
+                # x1. For the ordinary path ``tok`` is one uncached token.
                 committed = tok if isinstance(tok, list) else [tok]
                 kept = 0
                 for t in committed:
@@ -258,10 +261,7 @@ class Scheduler:
                     self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
                     if seq.is_finish:
                         break
-                # Cached beyond the base decode's +1: the accepted drafts, i.e.
-                # everything committed except x1 (already counted) and the final
-                # uncached bonus. = kept - 2 when the bonus was reached; if an
-                # earlier token finished the seq, nothing extra is cached.
+                # Cached beyond the base decode's +1: the accepted drafts.
                 extra = kept - 1
                 if extra > 0:
                     seq.computed_token_num += extra
@@ -432,6 +432,11 @@ class Scheduler:
         ``max_num_batched_tokens`` buffers.
         """
         if not mtp_eligible or num_decode_seqs <= 0:
+            return 1
+        # ModelRunner currently disables MTP under DP-attention until the
+        # bootstrap/draft/verify forward cadence is coordinated across every
+        # replica. Keep scheduling ordinary one-token decode batches there.
+        if is_dp_attn():
             return 1
         k = int(getattr(self.model_runner, "_mtp_k", 0) or 0)
         if k <= 0 or getattr(self.model_runner.model, "mtp", None) is None:

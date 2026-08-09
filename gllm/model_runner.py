@@ -669,12 +669,14 @@ class ModelRunner:
         # decode of the MTP head; we capture one graph per decode bucket and
         # replay it k times, advancing tok/hidden/positions/seq_lens/slot in
         # place on the GPU (no Python / H2D / .item() per step). Gated on MTP
-        # active + graphs enabled + env opt-out. Buffers + the aliasing
+        # active + graphs enabled; DP-attention is excluded until its phase
+        # counts are coordinated. Buffers + the aliasing
         # ``_draft_input`` are lazily built in ``_init_draft_graph_state`` after
         # the model + memory manager exist.
         self._mtp_draft_graph = (
             getattr(self, "_mtp_k", 0) > 0
             and getattr(self.model, "mtp", None) is not None
+            and not is_dp_attn()
             and not self.disable_cuda_graph
             # Works for both MLA (DeepSeek) and non-MLA (Qwen3.5 GDN): the draft
             # step captures ``mtp.forward`` (a single decoder layer, no dynamic
@@ -697,6 +699,7 @@ class ModelRunner:
         self._mtp_verify_graph = (
             getattr(self, "_mtp_k", 0) > 0
             and getattr(self.model, "mtp", None) is not None
+            and not is_dp_attn()
             and not self.disable_cuda_graph
             # Works for MLA (DeepSeek fp8 decode-sparse kernel) and non-MLA
             # (Qwen3.5 GDN): the verify forward reads only static input buffers
@@ -705,28 +708,33 @@ class ModelRunner:
         )
         self._verify_size_to_graph: Dict[int, torch.cuda.CUDAGraph] = {}
         self._verify_k = getattr(self, "_mtp_k", 0)
-        # Fused MTP (default ON, opt out with GLLM_MTP_FUSED=0): eliminate the
-        # separate x1-decode forward by relaying each step's verify bonus token +
-        # its hidden as the NEXT step's draft seed. One target forward (verify)
-        # per step instead of two. ``_mtp_relay`` maps seq_id -> (seed_tok:int,
-        # seed_hidden:tensor[H]) carried across consecutive steps; a seq missing
-        # from it (freshly admitted / batch reshuffle) forces the bootstrap path
-        # (decode forward) for that step.
+        # Fused MTP is the only MTP execution mode: eliminate the separate
+        # x1-decode forward by relaying each step's verify bonus token + its
+        # hidden as the NEXT step's draft seed. One target forward (verify) per
+        # steady-state step instead of two. ``_mtp_relay`` maps seq_id ->
+        # (seed_tok:int, seed_hidden:tensor[H]) across consecutive steps; a seq
+        # missing from it (fresh admission / batch reshuffle) is seeded by one
+        # padded verify-shaped bootstrap before joining the fused steady state.
         self._mtp_fused = (
             getattr(self, "_mtp_k", 0) > 0
             and getattr(self.model, "mtp", None) is not None
-            and os.environ.get("GLLM_MTP_FUSED", "1") == "1"
         )
         self._mtp_relay: Dict[int, tuple] = {}
         # Batch-adaptive MTP (vLLM's ``disable_by_batch_size`` analogue).
         # Speculating multiplies the per-step target work by ``1+k``; it wins only
         # while the decode batch leaves the GPU under-utilized. Past the crossover
-        # a plain 1-token step is strictly faster, so skip MTP for that step (the
-        # plain path is already the bootstrap path -- see ``step_once`` -- so this
-        # is a scheduling decision, not a second code path). ``0`` disables the
-        # gate (always speculate).
+        # a plain 1-token step is strictly faster, so skip MTP for that step.
+        # Returning to MTP invalidates the relay and takes one padded bootstrap.
+        # ``0`` disables the performance gate (always speculate when capacity and
+        # execution mode permit it).
         self._mtp_max_batch = int(getattr(self, "_mtp_max_batch_cfg", 0) or 0)
         self._mtp_spec_decision = None
+        if self._mtp_k > 0 and is_dp_attn() and get_local_rank() == 0:
+            logger.warning(
+                "MTP speculative decoding is disabled under DP-attention: "
+                "bootstrap/draft/verify collective shapes are not yet "
+                "coordinated across DP replicas; using plain decode."
+            )
         if self._mtp_k > 0 and self._mtp_max_batch > 0:
             logger.info(
                 f"MTP batch gate: speculating only while the decode batch is "
@@ -1700,7 +1708,11 @@ class ModelRunner:
         fits_perf_gate = (
             self._mtp_max_batch <= 0 or num_decodes <= self._mtp_max_batch
         )
-        dec = fits_token_budget and fits_perf_gate
+        # DP-attention replicas must agree on the whole multi-forward MTP
+        # cadence and publish different row counts for bootstrap, each draft
+        # step, and verify. That protocol is not wired yet; entering MTP with
+        # the ordinary decode counts can mismatch MoE collectives and deadlock.
+        dec = not is_dp_attn() and fits_token_budget and fits_perf_gate
         self._mtp_spec_decision = (num_decodes, dec)
         return dec
 
@@ -1718,28 +1730,37 @@ class ModelRunner:
             return False
         return self._mtp_decide(num_decodes)
 
-    def _mtp_drop_relay(self) -> None:
-        """Invalidate the fused relay after a step that did not speculate.
+    def _mtp_drop_relay(
+        self, seqs: Optional[List[Sequence]] = None
+    ) -> None:
+        """Invalidate fused relay state after a plain decode advance.
 
         A plain decode step advances every seq by one token without refreshing
         the relay, so the stashed ``(bonus_tok, bonus_hidden)`` no longer
         describes the seq's last position. Reusing it would seed the next draft
-        from a stale hidden. Clearing costs one bootstrap (non-fused) step when
-        the batch drops back below the threshold.
+        from a stale hidden. ``seqs=None`` drops the whole batch (used when a
+        pure-decode step declines speculation); mixed prefill+decode steps pass
+        only the decode rows they actually advanced so unrelated relay entries
+        remain reusable. Every dropped seq takes one padded-bootstrap step when
+        it next enters MTP.
         """
-        if self._mtp_relay:
+        if not self._mtp_relay:
+            return
+        if seqs is None:
             self._mtp_relay = {}
+            return
+        for seq in seqs:
+            self._mtp_relay.pop(seq.seq_id, None)
 
     def mtp_fused_prep_eligible(self, seqs: List[Sequence]) -> bool:
-        """True when :meth:`step_once` will take the fused MTP fast path.
+        """True when :meth:`step_once` owns all input prep for an MTP step.
 
-        The fused path never runs a decode forward -- it goes straight to
-        ``_mtp_decode``, whose draft/verify prep overwrites every input buffer.
-        So building the decode batch's per-token arrays first (``prepare_input``
-        -> ``cal_input``, ~1.5 ms at nd=64, plus the VL mrope/embedding pass) is
-        pure waste. Callers use this to decide between the full prep and
-        :meth:`prepare_input_mtp_fused`. The predicate mirrors the gate in
-        ``step_once`` exactly: same-mode batch, relay present for every seq.
+        A full-relay batch goes straight to draft/verify. A batch with fresh or
+        relay-miss seqs first runs :meth:`_mtp_bootstrap_padded_verify`, which
+        builds its own uniform ``1+k`` input. In both cases the ordinary
+        scheduler-side one-token decode prep would be thrown away, so callers
+        can install only the batch bookkeeping via
+        :meth:`prepare_input_mtp_fused`.
         """
         if not (self._mtp_fused and not is_dp_attn() and is_last_pp_rank()):
             return False
@@ -1747,7 +1768,7 @@ class ModelRunner:
             return False   # prefill / mixed batch
         if not self.mtp_speculate_batch(len(seqs)):
             return False   # batch too large to profit from speculation
-        return all(s.seq_id in self._mtp_relay for s in seqs)
+        return True
 
     def prepare_input_mtp_fused(self, seqs: List[Sequence]) -> None:
         """Minimal prep for a fused MTP step: batch bookkeeping only.
@@ -3167,6 +3188,131 @@ class ModelRunner:
         qsl = [i * qlen for i in range(nd + 1)]
         return v_logits, qsl, v_hidden
 
+    @torch.inference_mode()
+    def _mtp_bootstrap_padded_verify(self, decode_seqs):
+        """Seed relay-miss seqs with a uniform verify-shaped target forward.
+
+        A missing relay needs the ordinary target decode result: the token
+        predicted after the seq's one uncached input and that input's hidden
+        state. Instead of introducing a batch-x-1 forward shape, represent the
+        bootstrap as the same fixed ``1+k`` query used by verify:
+
+        * relay miss: ``[real uncached token, pad, ..., pad]``;
+        * relay hit: a full dummy ``1+k`` query (its existing relay is kept).
+
+        Causal execution makes row zero identical to a one-token decode; later
+        rows cannot affect it. Their speculative KV/state writes are either to
+        dummy storage or are overwritten immediately by the real MTP verify.
+        This keeps every real MTP target forward on one uniform qlen and is the
+        shape needed by a future DP-wide fixed-mode implementation.
+        """
+        nd = len(decode_seqs)
+        qlen = 1 + self._mtp_k
+        missing_pos = [
+            i for i, s in enumerate(decode_seqs) if s.seq_id not in self._mtp_relay
+        ]
+        if not missing_pos:
+            relay = [self._mtp_relay[s.seq_id] for s in decode_seqs]
+            return torch.stack([r[1] for r in relay], dim=0), [r[0] for r in relay]
+
+        # Reuse a captured verify graph when possible. Padding is expressed in
+        # sequence buckets; every row still carries the fixed qlen above.
+        graph_bucket = None
+        if self._mtp_verify_graph and self._verify_size_to_graph:
+            for candidate in sorted(self._verify_size_to_graph):
+                if candidate >= nd:
+                    graph_bucket = candidate
+                    break
+        bucket = graph_bucket or nd
+
+        # Build all dummy rows in one call so their ids/cache stubs are unique.
+        # Relay-hit positions select their corresponding dummy; relay misses
+        # replace that row with the real seq mutated to a padded verify query.
+        dummy_seqs = self._create_dummy_verify_seqs(bucket, qlen)
+        graph_seqs = list(dummy_seqs)
+        saved = {}
+        missing_seqs = []
+        for pos in missing_pos:
+            seq = decode_seqs[pos]
+            saved[pos] = (
+                seq.token_ids,
+                seq.computed_token_num,
+                seq.to_compute_token_num,
+                getattr(seq, "_mtp_verify", False),
+            )
+            # A decode bootstrap must have exactly one committed-but-uncached
+            # input. The scheduler's decode contract provides it; accepting a
+            # different shape here would make row zero no longer equivalent to
+            # the ordinary decode path.
+            uncached = len(seq.token_ids) - seq.computed_token_num
+            if uncached != 1:
+                raise RuntimeError(
+                    f"MTP relay miss for seq {seq.seq_id} has {uncached} "
+                    "uncached tokens; expected exactly one decode token"
+                )
+            seq.token_ids = seq.token_ids + [0] * (qlen - 1)
+            seq.to_compute_token_num = qlen
+            seq._mtp_verify = True
+            self.memory_manager.pre_allocate_page([seq], cacheable=False)
+            graph_seqs[pos] = seq
+            missing_seqs.append(seq)
+
+        try:
+            self.prepare_input(graph_seqs)
+            # VL prepare installs placeholder embeddings for computed-prompt
+            # rows. A verify-shaped bootstrap has bucket*qlen such rows, not
+            # merely ``bucket`` one-token decode rows.
+            if self.use_mm and is_first_pp_rank():
+                self._fixup_vl_decode_embeddings(bucket * qlen)
+            if graph_bucket is not None:
+                self._verify_size_to_graph[graph_bucket].replay()
+            else:
+                self.forward()
+
+            first_rows = torch.tensor(
+                [pos * qlen for pos in missing_pos],
+                dtype=torch.long,
+                device=self.output_hidden_states.device,
+            )
+            # Clone before the following real verify overwrites the persistent
+            # output buffer.
+            missing_hidden = self.output_hidden_states.index_select(
+                0, first_rows
+            ).clone()
+            missing_logits = self.model.logits_from_hidden(missing_hidden)
+        finally:
+            for pos, (tokens, computed, to_compute, was_verify) in saved.items():
+                seq = decode_seqs[pos]
+                seq.token_ids = tokens
+                seq.computed_token_num = computed
+                seq.to_compute_token_num = to_compute
+                seq._mtp_verify = was_verify
+            self._drop_dummy_verify_cache()
+
+        # Sample only the relay misses, using their real histories and sampling
+        # parameters. Then restore the full batch bookkeeping for _mtp_decode.
+        self.input_data.seqs = missing_seqs
+        self.input_data.prepare_sample()
+        missing_x1_gpu = self.sampler.forward_gpu(missing_logits, self.input_data)
+        if get_tp_size() > 1:
+            self._mtp_bcast_tp(missing_x1_gpu)
+        missing_x1 = missing_x1_gpu.tolist()
+        self.prepare_input_mtp_fused(decode_seqs)
+
+        hidden_rows = []
+        x1 = []
+        miss_idx = 0
+        for seq in decode_seqs:
+            relay = self._mtp_relay.get(seq.seq_id)
+            if relay is not None:
+                x1.append(relay[0])
+                hidden_rows.append(relay[1])
+            else:
+                x1.append(missing_x1[miss_idx])
+                hidden_rows.append(missing_hidden[miss_idx])
+                miss_idx += 1
+        return torch.stack(hidden_rows, dim=0), x1
+
     def _mtp_mrope_deltas(self, seqs) -> Optional[List[int]]:
         """Per-seq mrope position delta (Qwen-VL family), or ``None``.
 
@@ -3225,9 +3371,9 @@ class ModelRunner:
     def _mtp_decode(self, hidden: torch.Tensor, x1_tokens: list):
         """MTP speculative decode for a pure-decode batch (greedy, correct-first).
 
-        Returns a list (len == batch size) of per-seq committed-token lists. For
-        decode seqs the list is the accepted prefix + bonus (1..k+1 tokens); any
-        non-decode seq keeps its single ``x1`` token.
+        Returns one committed-token list per seq: ``x1`` plus the accepted draft
+        prefix (1..k+1 tokens). The target bonus is relay-only and becomes the
+        next step's ``x1``; it is never committed in the producing step.
 
         Correctness model (greedy): with a greedy target and greedy draft, the
         accepted tokens are exactly the tokens the target would have produced
@@ -3426,18 +3572,16 @@ class ModelRunner:
         # bonus token is the target prediction at the first rejection (or after
         # the last accepted draft).
         # Commit x1 + the longest prefix of drafts the target agrees with. We do
-        # NOT commit a trailing "bonus"/corrected token: the next normal decode
-        # step produces it through the exact decode path, avoiding any reliance
-        # on the verify forward's prediction at the last (post-drafts) position.
+        # NOT commit a trailing "bonus"/corrected token: relay it as the next
+        # MTP step's x1, where it becomes a verify input and receives valid KV.
         # Every committed token here was a verify INPUT, so its KV is valid.
         # Size to ``nd`` (the real decode seqs captured at entry). The graph path
         # leaves ``self.input_data.seqs`` holding bucket-padded seqs, so it is no
         # longer a reliable count here -- use ``nd`` directly. This batch is pure
         # decode/verify (no real non-decode seqs), so there is no tail to fill.
         results = [None] * nd
-        n_accepted = [0] * nd   # accepted DRAFT tokens per seq (excludes x1/bonus)
-        _fused_stash = self._mtp_fused  # relay bonus+hidden for next step's draft
-        new_relay = {} if _fused_stash else None
+        n_accepted = [0] * nd   # accepted DRAFT tokens per seq (excludes x1)
+        new_relay = {}
 
         if _use_rej:
             # --- 3b. Rejection-sampling accept (distribution-lossless). ---
@@ -3446,15 +3590,11 @@ class ModelRunner:
             # on reject, resample the position from the residual (p-q)+ and stop;
             # if all accepted, sample a bonus from p at the last position.
             #
-            # Bonus handling matches the fused/non-fused split of the GREEDY path:
-            #   * non-fused: append the bonus to ``committed`` (it rides the
-            #     scheduler's uncached-tail path -- reprocessed next decode step).
-            #   * fused: DON'T commit the bonus this step; relay (bonus_tok,
-            #     bonus_hidden) as the NEXT step's x1 (committed there). Committing
-            #     it both here AND as next-step x1 would double-emit it (observed
-            #     as token repetition). ``bonus_hidden`` is the verify hidden at
-            #     the last-accepted position (start+na) -- exactly the state the
-            #     bonus was sampled from, so it correctly seeds the next draft.
+            # DON'T commit the bonus this step; relay (bonus_tok, bonus_hidden)
+            # as the NEXT step's x1. Committing it both here and as next-step x1
+            # would double-emit it. ``bonus_hidden`` is the verify hidden at the
+            # last-accepted position (start+na), exactly the state the bonus was
+            # sampled from, so it correctly seeds the next draft.
             # Fully vectorized on the GPU. The previous per-seq python loop read
             # ``float(q_dists[i,p,d])`` / ``float(px_all[start+p,d])`` -- each of
             # those is a device-scalar sync, up to ``2*nd*kk`` (384 at nd=64) per
@@ -3551,18 +3691,14 @@ class ModelRunner:
             na_cpu = packed_cpu[0].tolist()
             bonus_cpu2 = packed_cpu[1].tolist()
             drafts_cpu = packed_cpu[2:].t().tolist() if d_gpu is not None else None
-            if _fused_stash:
-                # Batch-gather the per-seq draft-seed hidden (verify row
-                # ``i*qlen + na``) in one op instead of nd tiny clones.
-                bonus_hidden_all = v_hidden.index_select(0, seq_ar * qlen + na_l)
+            # Batch-gather the per-seq draft-seed hidden (verify row
+            # ``i*qlen + na``) in one op instead of nd tiny clones.
+            bonus_hidden_all = v_hidden.index_select(0, seq_ar * qlen + na_l)
             for i, s in enumerate(decode_seqs):
                 na = na_cpu[i]
                 committed = [x1[i]] + (drafts_cpu[i][:na] if na else [])
-                if _fused_stash:
-                    # Relay the bonus as next step's x1; do NOT commit it now.
-                    new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
-                else:
-                    committed.append(bonus_cpu2[i])
+                # Relay the bonus as next step's x1; do NOT commit it now.
+                new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
                 n_accepted[i] = na
                 results[i] = committed
             # The accept decisions used per-rank distributions (p/q differ by fp
@@ -3573,9 +3709,8 @@ class ModelRunner:
             # identical state. (Draft tokens were already broadcast; the accept +
             # bonus draws happen here.)
             if get_tp_size() > 1:
-                # ``results`` holds [x1 + accepted_drafts] (+ bonus only when NOT
-                # fused). Max len = x1 + kk drafts + (bonus if not fused).
-                maxlen = kk + 1 + (0 if _fused_stash else 1)
+                # ``results`` holds [x1 + accepted_drafts]; the bonus is relay-only.
+                maxlen = kk + 1
                 grid = torch.full((nd, maxlen), -1, dtype=torch.int64, device=dev)
                 lens = torch.zeros(nd, dtype=torch.int64, device=dev)
                 bonus_t = torch.zeros(nd, dtype=torch.int64, device=dev)
@@ -3584,27 +3719,22 @@ class ModelRunner:
                         c = results[i]
                         lens[i] = len(c)
                         grid[i, : len(c)] = torch.tensor(c, dtype=torch.int64, device=dev)
-                        if _fused_stash:
-                            bonus_t[i] = new_relay[decode_seqs[i].seq_id][0]
+                        bonus_t[i] = new_relay[decode_seqs[i].seq_id][0]
                 src = get_rank() - get_tp_rank()
                 dist.broadcast(lens, src=src, group=get_ipc_tp_group())
                 dist.broadcast(grid, src=src, group=get_ipc_tp_group())
-                if _fused_stash:
-                    dist.broadcast(bonus_t, src=src, group=get_ipc_tp_group())
+                dist.broadcast(bonus_t, src=src, group=get_ipc_tp_group())
                 lens_cpu = lens.cpu().tolist()
                 grid_cpu = grid.cpu().tolist()
                 bonus_cpu = bonus_t.cpu().tolist()
                 for i in range(nd):
                     n = lens_cpu[i]
                     results[i] = grid_cpu[i][:n]
-                    # committed = [x1] + accepted_drafts (+ bonus if not fused).
-                    # n_accepted = accepted drafts = n - x1(1) - (bonus if in results).
-                    n_accepted[i] = max(0, n - (1 if _fused_stash else 2))
-                    if _fused_stash:
-                        # Adopt rank-0's bonus token; keep this rank's own hidden
-                        # (only seeds the next draft, whose token is broadcast).
-                        _, h = new_relay[decode_seqs[i].seq_id]
-                        new_relay[decode_seqs[i].seq_id] = (bonus_cpu[i], h)
+                    n_accepted[i] = max(0, n - 1)
+                    # Adopt rank-0's bonus token; keep this rank's own hidden
+                    # (only seeds the next draft, whose token is broadcast).
+                    _, h = new_relay[decode_seqs[i].seq_id]
+                    new_relay[decode_seqs[i].seq_id] = (bonus_cpu[i], h)
         else:
             # --- 3. Greedy accept per seq (vectorized on GPU). ---
             # Verify inputs per seq are [x1, d1..dk] at positions start..start+k.
@@ -3639,45 +3769,36 @@ class ModelRunner:
                 na_gpu = torch.zeros(nd, device=dev, dtype=torch.int32)
             # ONE D2H per step carries everything the host still needs:
             #   row 0        : n_accepted
-            #   row 1        : the fused bonus token (ignored when not fused)
+            #   row 1        : the relayed bonus token
             #   rows 2..2+kk : the draft token grid (transposed), so the draft
             #                  chain never has to sync mid-step just to give the
             #                  commit loop its token ids.
             rows = [na_gpu.to(torch.int64)]
-            rows.append(
-                vp[seq_ar, na_gpu.to(torch.long)].to(torch.int64)
-                if _fused_stash
-                else na_gpu.to(torch.int64)
-            )
+            rows.append(vp[seq_ar, na_gpu.to(torch.long)].to(torch.int64))
             if drafts_gpu is not None:
                 rows.extend(drafts_gpu.to(torch.int64).t())
             packed_cpu = torch.stack(rows).cpu()   # [2+kk, nd]
             na_cpu = packed_cpu[0].tolist()
-            bonus_cpu2 = packed_cpu[1].tolist() if _fused_stash else None
+            bonus_cpu2 = packed_cpu[1].tolist()
             drafts_cpu = packed_cpu[2:].t().tolist() if drafts_gpu is not None else None
-            if _fused_stash:
-                # Batch-gather every seq's bonus hidden in ONE op (verify row
-                # ``i*qlen + na``) instead of nd separate per-seq ``.clone()``s
-                # (those were 64 tiny D2D copies per step). Row i of this tensor
-                # is seq i's draft-seed hidden for the next step.
-                bonus_rows = seq_ar * qlen + na_gpu.to(torch.long)
-                bonus_hidden_all = v_hidden.index_select(0, bonus_rows)  # [nd, H]
+            # Batch-gather every seq's bonus hidden in ONE op (verify row
+            # ``i*qlen + na``) instead of nd separate per-seq ``.clone()``s.
+            bonus_rows = seq_ar * qlen + na_gpu.to(torch.long)
+            bonus_hidden_all = v_hidden.index_select(0, bonus_rows)  # [nd, H]
             for i, s in enumerate(decode_seqs):
                 na = na_cpu[i]
                 n_accepted[i] = na
                 # committed = x1 + the accepted draft prefix.
                 results[i] = [x1[i]] + (drafts_cpu[i][:na] if na else [])
-                if _fused_stash:
-                    # bonus token from the on-device gather; bonus hidden is row i
-                    # of the batched gather (a GPU view; only seeds the next draft).
-                    new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
+                # bonus token from the on-device gather; bonus hidden is row i
+                # of the batched gather (a GPU view; only seeds the next draft).
+                new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
 
         self._record_mtp_metrics(nd, kk, n_accepted)
 
-        if _fused_stash:
-            # Replace the relay map wholesale so seqs absent from this batch are
-            # evicted (their stale hidden must never seed a later draft).
-            self._mtp_relay = new_relay
+        # Replace the relay map wholesale so seqs absent from this batch are
+        # evicted (their stale hidden must never seed a later draft).
+        self._mtp_relay = new_relay
 
         # --- Hybrid GDN recurrent-state: commit the accepted column to col 0 ---
         # The verify forward wrote token t's post-state into block-table column
@@ -3710,12 +3831,21 @@ class ModelRunner:
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
-        # Fused MTP fast path: when every seq in a pure-decode batch carries relay
-        # state from the immediately-preceding step, skip the leading x1-decode
-        # forward entirely -- the previous verify already produced each seq's
-        # bonus token + hidden, which seed this step's draft. One target forward
-        # (verify) per step instead of two. Falls back to the normal path (which
-        # runs the decode forward and stashes relay) on any relay miss.
+        # A mixed prefill+decode batch deliberately uses the ordinary forward
+        # path below: speculative draft/verify is only legal for pure decode.
+        # Any decode row in this mixed batch nevertheless advances by one token,
+        # invalidating the bonus token + hidden relayed by its previous MTP
+        # verify. Drop exactly those rows before the plain forward; otherwise a
+        # following pure-decode iteration can mistake the stale entry for a full
+        # relay hit and seed its draft from the wrong sequence position.
+        if self.input_data.num_prefills > 0 and self.input_data.num_decodes > 0:
+            self._mtp_drop_relay(
+                self.input_data.seqs[: self.input_data.num_decodes]
+            )
+        # Fused MTP path. Full-relay batches go straight to draft/verify. Fresh
+        # or relay-miss seqs are seeded by a verify-shaped padded bootstrap so
+        # every MTP target forward keeps the same fixed qlen=1+k; the ordinary
+        # batch-x-1 decode path is never used for an enabled MTP step.
         if (
             self._mtp_fused
             and dp_padded_size is None
@@ -3727,15 +3857,16 @@ class ModelRunner:
             and self.check_decode_batch()
         ):
             seqs = self.input_data.seqs[: self.input_data.num_decodes]
-            if seqs and all(s.seq_id in self._mtp_relay for s in seqs):
-                relay = [self._mtp_relay[s.seq_id] for s in seqs]
-                x1 = [r[0] for r in relay]
-                hidden = torch.stack([r[1] for r in relay], dim=0)
+            if seqs:
+                if all(s.seq_id in self._mtp_relay for s in seqs):
+                    relay = [self._mtp_relay[s.seq_id] for s in seqs]
+                    x1 = [r[0] for r in relay]
+                    hidden = torch.stack([r[1] for r in relay], dim=0)
+                else:
+                    hidden, x1 = self._mtp_bootstrap_padded_verify(seqs)
                 # Fused bypasses the sampler/logprobs block below; the relayed
-                # x1 (last step's bonus) is committed by ``_mtp_decode``. Works
-                # for both greedy (bonus = argmax) and sampling (bonus = the
-                # rejection resample), since the sampling accept relays-not-commits
-                # the bonus when fused (no double-commit).
+                # or bootstrapped x1 is committed by ``_mtp_decode``. The next
+                # bonus is relayed, not committed, so it cannot be double-emitted.
                 self._last_logprobs = None
                 return self._mtp_decode(hidden, x1)
         if dp_padded_size is not None:
