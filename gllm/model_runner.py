@@ -1692,7 +1692,15 @@ class ModelRunner:
         return self._mtp_decide(num_decodes)
 
     def _mtp_decide(self, num_decodes: int) -> bool:
-        dec = self._mtp_max_batch <= 0 or num_decodes <= self._mtp_max_batch
+        qlen = 1 + self._mtp_k
+        fits_token_budget = (
+            qlen > 1
+            and num_decodes * qlen <= self.max_num_batched_tokens
+        )
+        fits_perf_gate = (
+            self._mtp_max_batch <= 0 or num_decodes <= self._mtp_max_batch
+        )
+        dec = fits_token_budget and fits_perf_gate
         self._mtp_spec_decision = (num_decodes, dec)
         return dec
 
@@ -3056,14 +3064,26 @@ class ModelRunner:
         + ``get_mla_metadata`` already run inside the captured decode graph).
         """
         qlen = 1 + self._verify_k
-        iterator = self.capture_sizes
+        # ``capture_sizes`` is expressed in decode requests, while the verify
+        # forward consumes ``bucket * (1+k)`` token rows. Keep verify graphs
+        # within the same hard token capacity used by the scheduler and the
+        # persistent activation buffers. Plain decode/draft graphs can still
+        # retain the larger request buckets because their query length is one.
+        verify_capture_sizes = [
+            bucket
+            for bucket in self.capture_sizes
+            if bucket * qlen <= self.max_num_batched_tokens
+        ]
+        iterator = verify_capture_sizes
         if get_local_rank() == 0:
             logger.info(
                 f"Capturing MTP verify CUDA graphs (qlen={qlen}) for bucket sizes: "
-                f"{list(reversed(self.capture_sizes))}"
+                f"{list(reversed(verify_capture_sizes))}"
             )
             iterator = tqdm(
-                self.capture_sizes, desc="Capturing MTP Verify Graphs", ncols=100
+                verify_capture_sizes,
+                desc="Capturing MTP Verify Graphs",
+                ncols=100,
             )
         for bucket in iterator:
             seqs = self._create_dummy_verify_seqs(bucket, qlen)

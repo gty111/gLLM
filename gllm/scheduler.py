@@ -21,6 +21,7 @@ class Scheduler:
         self.schedule_method = schedule_method
         self.maxd = model_runner.maxd
         self.maxp = model_runner.maxp
+        self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.minp = model_runner.minp
         self.iterp = model_runner.iterp
         self.page_size = model_runner.page_size
@@ -421,6 +422,34 @@ class Scheduler:
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
 
+    def _decode_tokens_per_seq(self, num_decode_seqs, mtp_eligible=True):
+        """Return the target-forward token cost of one decode request.
+
+        gLLM drafts and verifies MTP tokens inside ``ModelRunner.step_once``.
+        The scheduler therefore has to reserve the verify query (``1+k``)
+        before the runner expands a decode batch; otherwise a legal B-row
+        decode batch can become a ``B*(1+k)`` forward larger than the shared
+        ``max_num_batched_tokens`` buffers.
+        """
+        if not mtp_eligible or num_decode_seqs <= 0:
+            return 1
+        k = int(getattr(self.model_runner, "_mtp_k", 0) or 0)
+        if k <= 0 or getattr(self.model_runner.model, "mtp", None) is None:
+            return 1
+        # ``mtp_max_batch`` is a performance gate: batches above it execute the
+        # ordinary one-token decode path and must keep their one-token cost.
+        max_mtp_batch = int(
+            getattr(self.model_runner, "_mtp_max_batch", 0) or 0
+        )
+        if max_mtp_batch > 0 and num_decode_seqs > max_mtp_batch:
+            return 1
+        qlen = 1 + k
+        # If even one verify query cannot fit globally, MTP is capacity-gated
+        # off by ModelRunner and the scheduler must keep making plain progress.
+        if qlen > self.max_num_batched_tokens:
+            return 1
+        return qlen
+
     def schedule_prefill_batch(
         self, prefill_token_budget, max_seqs=None, reserve_pages=0
     ):
@@ -558,10 +587,18 @@ class Scheduler:
             self.seqs_to_prefill.appendleft(seq)
         return prefill_batch, prefill_batched_token_nums
 
-    def schedule_decode_batch(self, decode_token_budget):
+    def schedule_decode_batch(
+        self, decode_token_budget, token_budget=None, mtp_eligible=True
+    ):
         decode_batch: List[Sequence] = []
         self.check_preempt(min(decode_token_budget, len(self.seqs_to_decode)))
-        for _ in range(decode_token_budget):
+        num_to_schedule = min(decode_token_budget, len(self.seqs_to_decode))
+        if token_budget is not None and num_to_schedule > 0:
+            tokens_per_seq = self._decode_tokens_per_seq(
+                num_to_schedule, mtp_eligible=mtp_eligible
+            )
+            num_to_schedule = min(num_to_schedule, token_budget // tokens_per_seq)
+        for _ in range(num_to_schedule):
             if len(self.seqs_to_decode) == 0:
                 break
             seq = self.seqs_to_decode.popleft()
@@ -570,6 +607,12 @@ class Scheduler:
 
         self.memory_manager.pre_allocate_page(decode_batch)
         return decode_batch
+
+    def _decode_batch_token_cost(self, decode_batch, mtp_eligible=True):
+        num_decodes = len(decode_batch)
+        return num_decodes * self._decode_tokens_per_seq(
+            num_decodes, mtp_eligible=mtp_eligible
+        )
 
     def chunked_prefill(self):
         num_tokens_budget = self.maxp
@@ -595,8 +638,10 @@ class Scheduler:
         if prefer_prefill:
             decode_token_budget = 0
 
-        decode_batch = self.schedule_decode_batch(decode_token_budget)
-        num_tokens_budget -= len(decode_batch)
+        decode_batch = self.schedule_decode_batch(
+            decode_token_budget, token_budget=num_tokens_budget
+        )
+        num_tokens_budget -= self._decode_batch_token_cost(decode_batch)
 
         # prefill: only admit into the page headroom left *after* reserving for
         # the in-flight decode batch's projected growth (anti-preemption).
@@ -623,7 +668,9 @@ class Scheduler:
                 self.get_balanced_decode_token_budget(num_total_decode_seqs),
                 self.maxp,
             )
-            decode_batch = self.schedule_decode_batch(fallback_budget)
+            decode_batch = self.schedule_decode_batch(
+                fallback_budget, token_budget=self.max_num_batched_tokens
+            )
 
         # Every TP/PP rank runs an identical copy of the scheduler, so logging
         # the batch stats on all of them floods the console with N duplicate
@@ -708,7 +755,17 @@ class Scheduler:
             decode_token_budget, self.maxd - len(prefill_batch)
         )
 
-        decode_batch = self.schedule_decode_batch(decode_token_budget)
+        # ``token_throttling`` permits a prefill+decode batch whose total
+        # capacity is ``maxp + maxd``. MTP is only entered for a pure-decode
+        # batch, so mixed batches retain their ordinary one-token decode cost.
+        decode_token_capacity = max(
+            self.max_num_batched_tokens - prefill_batched_token_nums, 0
+        )
+        decode_batch = self.schedule_decode_batch(
+            decode_token_budget,
+            token_budget=decode_token_capacity,
+            mtp_eligible=not prefill_batch,
+        )
 
         # Every TP/PP rank runs an identical copy of the scheduler, so logging
         # the batch stats on all of them floods the console with N duplicate
