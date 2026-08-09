@@ -5,7 +5,9 @@ transformers >= 5.11.0
 fastapi[standard] >= 0.115.0
 openai >= 1.99.1
 logger
-torch==2.9.1
+# Keep the CUDA build explicit: the unqualified aarch64 wheel on PyPI is CPU-only.
+# pyproject.toml routes uv's PyTorch resolution to the CUDA 12.9 wheel index.
+torch==2.9.1+cu129
 torchvision==0.24.1
 zmq
 aiohttp
