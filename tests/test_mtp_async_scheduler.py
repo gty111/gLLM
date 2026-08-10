@@ -1,10 +1,10 @@
 from collections import deque
 from types import SimpleNamespace
 
-from gllm.input_data import InputData
-from gllm.overlap_worker import OverlapWorker
-from gllm.scheduler import OverlapScheduler
-from gllm.sequence import Sequence
+from gllm.runtime.forward_metadata import ForwardMetadataPlan
+from gllm.workers.overlap import OverlapWorker
+from gllm.scheduling.scheduler import OverlapScheduler
+from gllm.runtime.sequence import GenerationSequence
 
 
 class _Runner:
@@ -33,7 +33,7 @@ def _scheduler():
 
 
 def _decode_seq(seq_id=1, output_len=32):
-    seq = Sequence(
+    seq = GenerationSequence(
         seq_id,
         [10, 11, 12],
         [99],
@@ -124,7 +124,7 @@ def test_mtp_finalize_then_reserve_next_keeps_placeholder_positions_stable():
 def test_mtp_mixed_deferred_finishes_prefill_with_relay_placeholder():
     scheduler = _scheduler()
     decode = _decode_seq(seq_id=11)
-    prefill = Sequence(
+    prefill = GenerationSequence(
         12,
         [50, 51, 52],
         [],
@@ -173,7 +173,7 @@ def test_mtp_mixed_deferred_finishes_prefill_with_relay_placeholder():
 def test_mtp_mixed_deferred_does_not_emit_partial_prefill_sample():
     scheduler = _scheduler()
     decode = _decode_seq(seq_id=21)
-    prefill = Sequence(
+    prefill = GenerationSequence(
         22,
         [80, 81, 82, 83],
         [],
@@ -197,7 +197,7 @@ def test_mtp_mixed_deferred_does_not_emit_partial_prefill_sample():
 
 def test_mtp_relay_only_materializes_before_plain_decode():
     scheduler = _scheduler()
-    prefill = Sequence(
+    prefill = GenerationSequence(
         23,
         [50, 51, 52],
         [],
@@ -229,31 +229,40 @@ def test_mtp_relay_only_materializes_before_plain_decode():
 
 
 def test_mtp_verify_rows_form_a_contiguous_mixed_batch_prefix():
-    holder = SimpleNamespace()
     seqs = [
-        SimpleNamespace(_mtp_verify=True),
-        SimpleNamespace(_mtp_verify=True),
-        SimpleNamespace(_mtp_verify=False),
+        SimpleNamespace(
+            _mtp_verify=True, to_compute_token_num=4, computed_prompt=True
+        ),
+        SimpleNamespace(
+            _mtp_verify=True, to_compute_token_num=4, computed_prompt=True
+        ),
+        SimpleNamespace(
+            _mtp_verify=False, to_compute_token_num=11, computed_prompt=False
+        ),
     ]
-    InputData._cal_mtp_partition(holder, seqs)
-    assert holder.num_mtp_verify_rows == 2
-    assert holder.is_mtp_verify is False
+    plan = ForwardMetadataPlan.from_sequences(seqs)
+    assert plan.num_mtp_verify_rows == 2
+    assert plan.num_decodes == 0
 
-    pure = SimpleNamespace()
-    InputData._cal_mtp_partition(pure, seqs[:2])
+    pure = ForwardMetadataPlan.from_sequences(seqs[:2])
     assert pure.num_mtp_verify_rows == 2
-    assert pure.is_mtp_verify is True
+    assert pure.num_mtp_verify_rows == pure.batch_size
 
 
 def test_mtp_verify_rows_reject_noncontiguous_mixed_layout():
-    holder = SimpleNamespace()
     seqs = [
-        SimpleNamespace(_mtp_verify=True),
-        SimpleNamespace(_mtp_verify=False),
-        SimpleNamespace(_mtp_verify=True),
+        SimpleNamespace(
+            _mtp_verify=True, to_compute_token_num=4, computed_prompt=True
+        ),
+        SimpleNamespace(
+            _mtp_verify=False, to_compute_token_num=11, computed_prompt=False
+        ),
+        SimpleNamespace(
+            _mtp_verify=True, to_compute_token_num=4, computed_prompt=True
+        ),
     ]
     try:
-        InputData._cal_mtp_partition(holder, seqs)
+        ForwardMetadataPlan.from_sequences(seqs)
     except ValueError as exc:
         assert "contiguous batch prefix" in str(exc)
     else:
@@ -277,7 +286,7 @@ def test_overlap_worker_builds_one_mtp_plan_for_pure_and_mixed_batches():
     assert pure.speculate and pure.greedy and pure.use_async
     assert pure.decode_ids == (31, 32)
 
-    prefill = Sequence(33, [1, 2], [], temperature=0, top_k=1)
+    prefill = GenerationSequence(33, [1, 2], [], temperature=0, top_k=1)
     prefill.computed_token_num = 0
     prefill.to_compute_token_num = 2
     worker._prefetched_input = SimpleNamespace(

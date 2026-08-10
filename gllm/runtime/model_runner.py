@@ -20,8 +20,8 @@ from transformers.image_utils import load_images
 from transformers.video_utils import load_video
 from transformers.tokenization_utils_base import VERY_LARGE_INTEGER
 
-from gllm.async_utils import FutureMap, OverlapRuntime
-from gllm.dist_utils import (
+from gllm.runtime.async_runtime import FutureMap, OverlapRuntime
+from gllm.distributed.parallel_state import (
     get_dp_size,
     get_ipc_tp_group,
     get_local_rank,
@@ -36,20 +36,21 @@ from gllm.dist_utils import (
     is_output_rank,
     set_dp_forward_counts,
 )
-from gllm.input_data import InputData
-from gllm.layers.attention_backends import (
-    bind_attention_backend,
-    create_attention_backend,
-    find_attention_layers,
+from gllm.runtime.forward_metadata import ForwardMetadataPlan
+from gllm.runtime.input_data import InputData
+from gllm.layers.attention.qkv_backends import (
+    bind_qkv_attention_backend,
+    create_qkv_attention_backend,
+    find_qkv_attention_layers,
 )
 from gllm.layers.rotary_embedding import MRotaryEmbedding
 from gllm.layers.sampler import Sampler
-from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.model_loader import ModelLoader, propagate_serving_config
-from gllm.mtp_async import MtpAsyncBatchState, MtpAsyncCompletion
-from gllm.mtp_gpu_prep import MtpGpuPrep
-from gllm.piecewise_cuda_graph import PiecewiseGraphRunner
-from gllm.sequence import Sequence
+from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
+from gllm.runtime.model_loader import ModelLoader, propagate_serving_config
+from gllm.speculative.async_state import MtpAsyncBatchState, MtpAsyncCompletion
+from gllm.speculative.gpu_prep import MtpGpuPrep
+from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
+from gllm.runtime.sequence import GenerationSequence
 from gllm.utils import unify_decode
 
 
@@ -100,7 +101,7 @@ class DisaggSeqState:
     """Per-seq encoder-disaggregation overlap state (design §6.2).
 
     Owned by the :class:`ModelRunner` (keyed by ``seq_id``) so it is immune to
-    the scheduler's chunked-prefill ``deepcopy`` of the :class:`Sequence`. The
+    the scheduler's chunked-prefill ``deepcopy`` of the :class:`GenerationSequence`. The
     LM disagg manager fills ``item_embed[i]`` (and flips ``item_ready[i]``) as
     each item's visual embedding lands over NIXL; the scheduler reads
     ``item_ready`` for the two-layer prefill gate and the model runner reads
@@ -676,24 +677,24 @@ class ModelRunner:
             memory_manager=self.memory_manager,
             use_buffer=True,
         )
-        # Detect actual standard MHA/GQA layers instead of treating MLA and
-        # standard attention as model-wide mutually-exclusive modes. The runner
-        # owns the shared backend; each standard attention layer gets an
+        # Detect actual QKV MHA/GQA layers instead of treating MLA and QKV
+        # attention as model-wide mutually-exclusive modes. The runner owns the
+        # shared backend; each QKV attention layer gets an
         # explicit reference, while InputData carries only per-forward metadata.
-        self.standard_attention_backend = None
-        standard_attention_layers = find_attention_layers(self.model)
-        if standard_attention_layers:
-            self.standard_attention_backend = create_attention_backend(
+        self.qkv_attention_backend = None
+        qkv_attention_layers = find_qkv_attention_layers(self.model)
+        if qkv_attention_layers:
+            self.qkv_attention_backend = create_qkv_attention_backend(
                 self.attention_backend,
                 self.model_max_length,
                 self.max_running_seqs,
             )
-            num_bound_attention_layers = bind_attention_backend(
-                standard_attention_layers, self.standard_attention_backend
+            num_bound_attention_layers = bind_qkv_attention_backend(
+                qkv_attention_layers, self.qkv_attention_backend
             )
             logger.info(
-                "Bound standard attention backend %s to %d MHA/GQA layers",
-                self.standard_attention_backend.name,
+                "Bound QKV attention backend %s to %d MHA/GQA/MQA layers",
+                self.qkv_attention_backend.name,
                 num_bound_attention_layers,
             )
         device = torch.device("cuda", torch.cuda.current_device())
@@ -814,7 +815,7 @@ class ModelRunner:
                 f"<= {self._mtp_max_batch} seqs; larger batches take a plain "
                 f"decode step."
             )
-        # GPU-native MTP input prep (see ``gllm/mtp_gpu_prep.py``). It replaces
+        # GPU-native MTP input prep (see ``gllm/speculative/gpu_prep.py``). It replaces
         # the per-step Python rebuild of the
         # draft / verify input arrays with persistent pinned staging + a few
         # vectorized CUDA ops writing straight into the static graph buffers.
@@ -1084,7 +1085,7 @@ class ModelRunner:
         token-id list. ``chat_template_kwargs`` carries per-request chat-template
         variables (e.g. ``{"thinking": False}``) straight from the request.
         """
-        from gllm.mm_common import tokenize_text_only
+        from gllm.multimodal.common import tokenize_text_only
 
         cfg = self.model_loader.config
         skel = tokenize_text_only(
@@ -1098,7 +1099,7 @@ class ModelRunner:
         return skel.token_ids
 
     @torch.inference_mode()
-    def _mm_prepare_cpu(self, seqs: List[Sequence]) -> Dict:
+    def _mm_prepare_cpu(self, seqs: List[GenerationSequence]) -> Dict:
         """CPU phase of :meth:`mm_prepare_inputs`.
 
         Computes mrope positions and collects per-seq prefill work to run in
@@ -1310,7 +1311,7 @@ class ModelRunner:
 
     def _mm_disagg_collect(
         self,
-        seq: Sequence,
+        seq: GenerationSequence,
         st: "DisaggSeqState",
         prefill_works: List[Dict],
         batch_positions: List[torch.Tensor],
@@ -1359,7 +1360,7 @@ class ModelRunner:
         )
 
     def _mm_run_processor(
-        self, seq: Sequence
+        self, seq: GenerationSequence
     ) -> Tuple[Dict, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run image/video processors for ``seq.mm_contents``.
 
@@ -1401,7 +1402,7 @@ class ModelRunner:
         return mm_input, image_grid_thw, video_grid_thw
 
     def _mm_run_processor_kimi(
-        self, seq: Sequence
+        self, seq: GenerationSequence
     ) -> Tuple[Dict, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Kimi-K2.5 image + video preprocessing.
 
@@ -1448,7 +1449,7 @@ class ModelRunner:
         return mm_input, image_grid_thw, None
 
     def _mm_build_is_multimodal_cpu(
-        self, seq: Sequence
+        self, seq: GenerationSequence
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Build (input_ids_cpu, is_multimodal_cpu) for ``seq``.
 
@@ -1467,7 +1468,7 @@ class ModelRunner:
         )
         return input_ids_cpu, is_multimodal_cpu
 
-    def _mm_precompute_hash(self, seq: Sequence) -> None:
+    def _mm_precompute_hash(self, seq: GenerationSequence) -> None:
         """Pre-build ``seq.hash_token_ids`` before the scheduler's prefix
         cache lookup, so distinct multimodal items don't collide on the
         raw ``<|image_pad|>`` placeholder id.
@@ -1772,7 +1773,7 @@ class ModelRunner:
         return torch.concat(batch_embeddings)
 
     @torch.inference_mode()
-    def mm_prepare_inputs(self, seqs: List[Sequence]):
+    def mm_prepare_inputs(self, seqs: List[GenerationSequence]):
         """Single-shot wrapper kept for the non-overlap worker path."""
         ctx = self._mm_prepare_cpu(seqs)
         input_embeddings = self._mm_prepare_gpu(ctx)
@@ -1784,7 +1785,7 @@ class ModelRunner:
             self.input_hidden_states[: hidden_states.shape[0]] = hidden_states
             self.input_data.embedding_size = hidden_states.shape[0]
 
-    def prepare_input(self, seqs: List[Sequence] = None, input_data: InputData = None):
+    def prepare_input(self, seqs: List[GenerationSequence] = None, input_data: InputData = None):
         if input_data is not None:
             self.input_data.set_input_from_prebuilt(input_data)
         else:
@@ -1849,7 +1850,7 @@ class ModelRunner:
         return self._mtp_decide(num_decodes)
 
     def _mtp_drop_relay(
-        self, seqs: Optional[List[Sequence]] = None
+        self, seqs: Optional[List[GenerationSequence]] = None
     ) -> None:
         """Invalidate fused relay state after a plain decode advance.
 
@@ -1886,7 +1887,7 @@ class ModelRunner:
             )
         return int(relay[0])
 
-    def mtp_prep_eligible(self, seqs: List[Sequence]) -> bool:
+    def mtp_prep_eligible(self, seqs: List[GenerationSequence]) -> bool:
         """True when :meth:`step_once` owns all input prep for an MTP step.
 
         A full-relay batch goes straight to draft/verify. A batch with fresh or
@@ -1904,7 +1905,7 @@ class ModelRunner:
             return False   # batch too large to profit from speculation
         return True
 
-    def prepare_input_mtp(self, seqs: List[Sequence]) -> None:
+    def prepare_input_mtp(self, seqs: List[GenerationSequence]) -> None:
         """Minimal prep for a fused MTP step: batch bookkeeping only.
 
         Sets just what ``step_once``'s fused gate and ``_mtp_decode`` read
@@ -1921,8 +1922,11 @@ class ModelRunner:
         idata.num_decode_tokens = len(seqs)
         idata.num_prefills = 0
         idata.max_query_len = 1
+        idata.install_forward_metadata_plan(
+            ForwardMetadataPlan.deferred_mtp(len(seqs))
+        )
 
-    def mtp_async_can_chain(self, seqs: List[Sequence]) -> bool:
+    def mtp_async_can_chain(self, seqs: List[GenerationSequence]) -> bool:
         """Whether ``seqs`` can consume the predecessor wholly on the GPU.
 
         Chaining is a graph/GPU-prep optimization, never a correctness
@@ -1940,7 +1944,7 @@ class ModelRunner:
             and any(b >= n for b in self._verify_size_to_graph)
         )
 
-    def mtp_async_remap(self, seqs: List[Sequence]) -> bool:
+    def mtp_async_remap(self, seqs: List[GenerationSequence]) -> bool:
         """Align persistent MTP state with the successor's scheduler rows."""
         state = self._mtp_async_state
         if state is None:
@@ -1959,7 +1963,7 @@ class ModelRunner:
         ``pad_for_cuda_graph`` already does for the decode-graph padding.
         """
         page = self.memory_manager.dummy_page if runtime else None
-        seqs = [Sequence(idx, [1, 2], [], output_len=1) for idx in range(size)]
+        seqs = [GenerationSequence(idx, [1, 2], [], output_len=1) for idx in range(size)]
         for seq in seqs:
             seq.page_table.append(seq.seq_id if page is None else page)
             seq.prompt_len = 1
@@ -1983,7 +1987,7 @@ class ModelRunner:
         The profiler then over-reserves KV and the first real prefill OOMs.
 
         Attention is skipped during profiling (the KV segment is only built in
-        ``MemoryManager.init`` afterwards -- see ``FlashAttention.forward`` /
+        ``MemoryManager.init`` afterwards -- see ``QKVAttention.forward`` /
         ``MLAAttention.forward``), so the page-table / slot indices below are
         only used to build ``input_data`` and never dereference a real cache.
         """
@@ -1998,7 +2002,7 @@ class ModelRunner:
         idx = 0
         while remaining > 0:
             length = min(per_seq, remaining)
-            seq = Sequence(idx, [1] * length, [], output_len=1)
+            seq = GenerationSequence(idx, [1] * length, [], output_len=1)
             seq.prompt_len = length
             seq.computed_token_num = 0
             seq.to_compute_token_num = length
@@ -2197,7 +2201,7 @@ class ModelRunner:
         with stream_ctx:
             for bucket in iterator:
                 seq_id = -(1_000_000 + bucket)
-                seq = Sequence(seq_id, [1] * bucket, [], output_len=1)
+                seq = GenerationSequence(seq_id, [1] * bucket, [], output_len=1)
                 seq.prompt_len = bucket
                 seq.computed_token_num = 0
                 seq.to_compute_token_num = bucket
@@ -2290,13 +2294,16 @@ class ModelRunner:
             self.output_hidden_states[:num_cal_tokens] = output
 
     def _prepare_attention_metadata(self, input_data: InputData) -> None:
-        """Delegate standard attention metadata construction to its backend."""
-        backend = self.standard_attention_backend
+        """Prepare backend metadata through the current forward-level plan."""
+        backend = self.qkv_attention_backend
         if (
             backend is not None
             and getattr(self.memory_manager, "segment", None) is not None
         ):
-            input_data.attention_metadata = backend.prepare_metadata(input_data)
+            plan = input_data.forward_metadata_plan
+            if plan is None:
+                raise RuntimeError("model forward has no ForwardMetadataPlan")
+            plan.prepare_attention(backend, input_data)
 
     def check_decode_batch(self):
         # Since the scheduler put prefill seqs at the end
@@ -2354,7 +2361,7 @@ class ModelRunner:
         the *actual* next prompt token at each position (plus top-k). Handles
         chunked prefill by filling only the positions this chunk covers;
         prefix-cache-skipped positions stay ``None``. Needs the full prompt
-        ``token_ids`` + ``raw_prompt_len``: works on the real ``Sequence``
+        ``token_ids`` + ``raw_prompt_len``: works on the real ``GenerationSequence``
         (PP=1) and on the ``FollowerSeq`` mirror (PP>1), which carries those
         fields when ``prompt_logprobs_enabled``.
 
@@ -2367,7 +2374,7 @@ class ModelRunner:
         ``tensor_model_parallel_all_gather``, so this MUST be invoked on *every*
         TP rank of the (last-PP) stage, not just the output rank, or it
         deadlocks. That is safe because every TP rank of the stage holds
-        identical seqs (real ``Sequence`` for PP=1, identical ``FollowerSeq``
+        identical seqs (real ``GenerationSequence`` for PP=1, identical ``FollowerSeq``
         mirrors for PP>1), identical ``hidden_states`` and ``query_start_loc``:
         the per-seq ``project`` calls (count + shapes) match bit-for-bit across
         ranks, so the collective is balanced. Each rank computes the same
@@ -2882,11 +2889,18 @@ class ModelRunner:
 
         # Fill the static draft-input buffers IN PLACE for this step (the captured
         # graph reads these exact buffers). Padded rows [nd:bucket] are written
-        # as dummy rows by the GPU prep (no throwaway ``Sequence`` objects); the
+        # as dummy rows by the GPU prep (no throwaway ``GenerationSequence`` objects); the
         # CPU fallback still builds dummy decode seqs.
         gp = self._mtp_gpu_prep_batch(decode_seqs, orig_tokens, x1, bucket)
         if gp is not None:
-            gp.fill_draft(self._draft_input)
+            ForwardMetadataPlan.uniform_gpu(
+                num_rows=bucket,
+                qlen=1,
+                is_mtp_verify=False,
+            ).materialize(
+                self._draft_input,
+                gp.draft_materializer(seqs=decode_seqs),
+            )
         else:
             # CPU fallback: the builders read the seq state, so put it in the
             # draft shape first (one new token at ``ctx``). ``_mtp_decode`` left
@@ -2990,7 +3004,14 @@ class ModelRunner:
         # graph chain does (GPU-native prep, CPU builders as the fallback).
         gp = self._mtp_gpu_prep_batch(decode_seqs, orig_tokens, x1, bucket)
         if gp is not None:
-            gp.fill_draft(self._draft_input)
+            ForwardMetadataPlan.uniform_gpu(
+                num_rows=bucket,
+                qlen=1,
+                is_mtp_verify=False,
+            ).materialize(
+                self._draft_input,
+                gp.draft_materializer(seqs=decode_seqs),
+            )
         else:
             for i, s in enumerate(decode_seqs):
                 s.computed_token_num = len(orig_tokens[i])
@@ -3298,7 +3319,7 @@ class ModelRunner:
         seqs = []
         for i in range(nd):
             sid = base_id + i
-            s = Sequence(sid, [1] * (ctx + qlen), [], output_len=1)
+            s = GenerationSequence(sid, [1] * (ctx + qlen), [], output_len=1)
             # ``prompt_len = ctx`` => computed_prompt True => the seq is
             # decode-classified in the VL mm-prep path (reads a position-delta
             # stub from embedding_cache instead of trying to build image
@@ -3419,9 +3440,17 @@ class ModelRunner:
                     if kk
                     else self.input_data.tokens.new_zeros((nd, 0))
                 )
-            gp.fill_verify(self.input_data, qlen, dg)
-            self.input_data.mark_gpu_prepared(
-                seqs=decode_seqs, num_rows=bucket, qlen=qlen, is_mtp_verify=True
+            plan = ForwardMetadataPlan.uniform_gpu(
+                num_rows=bucket,
+                qlen=qlen,
+                is_mtp_verify=True,
+            )
+            plan.materialize(
+                self.input_data,
+                gp.verify_materializer(
+                    seqs=decode_seqs,
+                    drafts_gpu=dg,
+                ),
             )
         else:
             drafts = self._drafts_host(drafts, nd, kk)
@@ -3680,7 +3709,7 @@ class ModelRunner:
         x1_is_gpu = torch.is_tensor(x1_tokens)
         if x1_is_gpu:
             x1_gpu = x1_tokens[:nd].to(device=dev, dtype=torch.int64)
-            # Sequence mutations below exist only to reserve pages and provide
+            # GenerationSequence mutations below exist only to reserve pages and provide
             # fallback shapes.  The graph fast path consumes x1 directly from
             # ``x1_gpu`` through MtpGpuPrep, so no D2H is needed here.
             x1 = [0] * nd
@@ -3863,8 +3892,8 @@ class ModelRunner:
                 _v_done = True
         if not _v_done:
             # A chained mixed batch must not pull the draft grid back to the
-            # host.  Its CPU Sequence mutations below only establish shapes
-            # and reserve pages; ``MtpGpuPrep.correct_mixed_prefix`` overwrites
+            # host.  Its CPU GenerationSequence mutations below only establish shapes
+            # and reserve pages; the MTP GPU patch materializer overwrites
             # the placeholder token/position/KV metadata from authoritative
             # GPU state after ordinary ragged-prefill preparation.
             mixed_gpu_prep = None
@@ -3892,8 +3921,15 @@ class ModelRunner:
             verify_and_prefill = list(decode_seqs) + extra_prefill_seqs
             self.prepare_input(verify_and_prefill)
             if mixed_gpu_prep is not None:
-                mixed_gpu_prep.correct_mixed_prefix(
-                    self.input_data, 1 + kk, drafts_gpu_for_mixed
+                plan = self.input_data.forward_metadata_plan
+                if plan is None:
+                    raise RuntimeError("mixed MTP forward has no metadata plan")
+                plan = plan.with_gpu_patch(num_rows=nd, qlen=1 + kk)
+                plan.materialize(
+                    self.input_data,
+                    mixed_gpu_prep.mixed_patch_materializer(
+                        drafts_gpu=drafts_gpu_for_mixed
+                    ),
                 )
             total_mixed_tokens = int(self.input_data.tokens_cpu.shape[0])
             all_hidden = None
@@ -4309,7 +4345,7 @@ class ModelRunner:
                         new_state_tokens=new_state_tokens,
                         new_state_hidden=new_state_hidden,
                     )
-                # All speculative Sequence mutations are host bookkeeping only;
+                # All speculative GenerationSequence mutations are host bookkeeping only;
                 # restore them now.  The completion event orders the later CPU
                 # finalize after verify/accept and the D2H record.
                 restore()
@@ -4687,7 +4723,7 @@ class ModelRunner:
         st.item_embed[ordered_idx] = embed
         st.item_ready[ordered_idx] = True
 
-    def disagg_prefill_limit(self, seq: Sequence) -> Optional[int]:
+    def disagg_prefill_limit(self, seq: GenerationSequence) -> Optional[int]:
         """Gate-B upper bound (design §6.2): the largest token position this
         seq may prefill up to this round = the start of the first image span
         whose embedding hasn't landed yet (or ``prompt_len`` if all ready).
@@ -4705,7 +4741,7 @@ class ModelRunner:
             return None
         return self._disagg_ready_len(st)
 
-    def register_decode_page_hash(self, seq: Sequence, pos: int) -> None:
+    def register_decode_page_hash(self, seq: GenerationSequence, pos: int) -> None:
         """Register the prefix-cache page hash for a decode boundary the seq
         just completed with a *real* (finalized) token at ``seq.token_ids[pos]``.
 
@@ -4720,7 +4756,7 @@ class ModelRunner:
         """
         self.memory_manager.register_decode_boundary(seq, pos)
 
-    def free(self, seq: Sequence):
+    def free(self, seq: GenerationSequence):
         # A relay hidden owns a full hidden-size GPU tensor.  Drop it immediately
         # when the request finishes instead of waiting for another MTP iteration
         # to replace the relay map (which may never happen when the batch ends).

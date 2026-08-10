@@ -8,11 +8,11 @@ import torch.multiprocessing as mp
 import tqdm
 from logger import logger
 
-from gllm.comm import IPCPackage, zmqComm
-from gllm.id_allocator import IDAllocator
-from gllm.model_runner import ModelRunner, OverlapModelRunner
-from gllm.overlap_worker import OverlapWorker, run_overlap_worker
-from gllm.sequence import Sequence
+from gllm.distributed.comm import IPCPackage, zmqComm
+from gllm.runtime.id_allocator import IDAllocator
+from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
+from gllm.workers.overlap import OverlapWorker, run_overlap_worker
+from gllm.runtime.sequence import GenerationSequence
 from gllm.utils import (
     StreamOutput,
     find_free_port,
@@ -20,7 +20,7 @@ from gllm.utils import (
     init_logger,
     random_uuid,
 )
-from gllm.worker import Worker, run_worker
+from gllm.workers.worker import Worker, run_worker
 
 
 def _resolve_sampling_param(value, config_value, default):
@@ -175,9 +175,9 @@ class LLM:
             )
 
         # Interact with workers
-        self.wait_lists: List[Sequence] = []
+        self.wait_lists: List[GenerationSequence] = []
         self.abort_ids: List[int] = []
-        self.running_maps: Dict[int, Sequence] = dict()  # seq_id => Sequence
+        self.running_maps: Dict[int, GenerationSequence] = dict()  # seq_id => GenerationSequence
         self.async_streams = None
         # Guards the newly-arrived ``wait_lists`` / ``abort_ids`` hand-off queues.
         # The async server runs both request intake (``add_requests``) and the
@@ -363,7 +363,7 @@ class LLM:
             if i == -1:
                 sys.exit()
 
-    def add_requests(self, requests: List[Sequence]):
+    def add_requests(self, requests: List[GenerationSequence]):
         with self._pending_lock:
             self.wait_lists.extend(requests)
 
@@ -443,7 +443,7 @@ class LLM:
                 # the next step was already launched), so the driver may have
                 # popped ``id`` already. Drop such a stale post-free token
                 # instead of crashing the engine on a missing running_maps key.
-                seq: Sequence = self.running_maps.get(id)
+                seq: GenerationSequence = self.running_maps.get(id)
                 if seq is None:
                     continue
                 if len(ipc_package.next_tokens) != 0:
@@ -596,7 +596,7 @@ class LLM:
         repetition_penalty = _resolve_sampling_param(
             repetition_penalty, gen.repetition_penalty, 1.0
         )
-        seq = Sequence(
+        seq = GenerationSequence(
             self.id_allocator.allocate(),
             token_ids,
             self.finish_tokens,
@@ -633,7 +633,7 @@ class LLM:
         progress_bar: bool = True,
         log_stats: bool = False,
     ):
-        seqs: List[Sequence] = []
+        seqs: List[GenerationSequence] = []
         assert prompts is not None or tokens is not None
         num_seqs = len(prompts) if prompts is not None else len(tokens)
         for idx in range(num_seqs):

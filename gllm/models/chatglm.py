@@ -3,15 +3,16 @@ from copy import deepcopy
 import torch
 from torch import nn
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_pp_layers,
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
 )
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.activation import SiluAndMul
-from gllm.layers.attention import FlashAttention
+from gllm.layers.attention.base import AttentionLayerBase
+from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import (
     MergedColumnParallelLinear,
@@ -20,7 +21,6 @@ from gllm.layers.linear import (
 )
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-from gllm.modules.attention import Attention
 
 from .weight_loader import (
     LoadContext,
@@ -34,7 +34,7 @@ from .weight_loader import (
 )
 
 
-class GLMAttention(Attention):
+class GLMAttention(AttentionLayerBase):
     def __init__(self, layer_id: int, config):
         total_num_kv_heads = (
             config.multi_query_group_num
@@ -52,7 +52,7 @@ class GLMAttention(Attention):
             getattr(config, "rope_theta", 10000),
             False,
         )
-        self.attn = FlashAttention(
+        self.attn = QKVAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim
         )
 

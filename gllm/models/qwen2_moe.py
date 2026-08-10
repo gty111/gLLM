@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_ep_rank,
     get_ep_size,
     get_tp_size,
@@ -12,7 +12,7 @@ from gllm.dist_utils import (
     tensor_model_parallel_all_reduce,
 )
 
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe import FusedMoE, SharedExpertRunner, determine_expert_map
 

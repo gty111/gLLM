@@ -9,7 +9,8 @@ import math
 
 import torch
 
-from gllm.layers.attention_backends import FlashInferAttentionBackend
+from gllm.runtime.forward_metadata import ForwardMetadataPlan
+from gllm.layers.attention.qkv_backends import FlashInferAttentionBackend
 from gllm.layers.ops.cache_kernels import reshape_and_cache_flash
 
 
@@ -26,6 +27,11 @@ class _Input:
         self.block_table = torch.empty(
             batch, max_pages, dtype=torch.int32, device="cuda"
         )
+        self.forward_metadata_plan = ForwardMetadataPlan.uniform_gpu(
+            num_rows=batch,
+            qlen=qlen,
+            is_mtp_verify=qlen > 1,
+        )
 
     def get_seq_lens(self):
         return self.seq_lens
@@ -35,6 +41,9 @@ class _Input:
 
     def get_block_table(self):
         return self.block_table
+
+    def prepare_metadata(self, backend):
+        return backend.prepare_metadata(self, self.forward_metadata_plan)
 
 
 def _reference(q, kc, vc, pages, seq_lens, qlen, scale):
@@ -79,7 +88,7 @@ def main():
     inp.block_table.copy_(torch.arange(batch * max_pages, dtype=torch.int32, device="cuda").view(batch, max_pages))
     q.normal_(); kc.normal_(); vc.normal_()
     for _ in range(11):
-        backend.forward(q, kc, vc, backend.prepare_metadata(inp), scale)
+        backend.forward(q, kc, vc, inp.prepare_metadata(backend), scale)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -88,7 +97,7 @@ def main():
         # workspace. Repeated calls catch workspace/PDL ordering problems that
         # a single isolated invocation cannot expose.
         for _ in range(11):
-            meta = backend.prepare_metadata(inp)
+            meta = inp.prepare_metadata(backend)
             graph_out = backend.forward(q, kc, vc, meta, scale)
 
     cases = [
@@ -119,12 +128,12 @@ def main():
     table1 = [[1, 7, 8, 9], [2, 10, 11, 12], [3, 13, 14, 15], [4, 16, 17, 18]]
     inp1.seq_lens.copy_(torch.tensor(lens1, dtype=torch.int32, device="cuda"))
     inp1.block_table.copy_(torch.tensor(table1, dtype=torch.int32, device="cuda"))
-    backend.forward(q1, kc, vc, backend.prepare_metadata(inp1), scale)
+    backend.forward(q1, kc, vc, inp1.prepare_metadata(backend), scale)
     torch.cuda.synchronize()
     decode_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(decode_graph):
         decode_out = backend.forward(
-            q1, kc, vc, backend.prepare_metadata(inp1), scale
+            q1, kc, vc, inp1.prepare_metadata(backend), scale
         )
     for order in range(2):
         decode_graph.replay()
@@ -156,12 +165,12 @@ def main():
     one = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     q.normal_(); knew.normal_(); vnew.normal_()
     reshape_and_cache_flash(knew, vnew, kc, vc, slots, "auto", one, one)
-    backend.forward(q, kc, vc, backend.prepare_metadata(inp), scale)
+    backend.forward(q, kc, vc, inp.prepare_metadata(backend), scale)
     torch.cuda.synchronize()
     rw_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(rw_graph):
         reshape_and_cache_flash(knew, vnew, kc, vc, slots, "auto", one, one)
-        rw_out = backend.forward(q, kc, vc, backend.prepare_metadata(inp), scale)
+        rw_out = backend.forward(q, kc, vc, inp.prepare_metadata(backend), scale)
     for replay in range(3):
         q.normal_(); knew.normal_(); vnew.normal_()
         # Poison the destination slots first, ensuring success cannot come from

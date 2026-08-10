@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from logger import logger
 
 from gllm.entrypoints import cli_args
-from gllm.async_llm_engine import PipeAsyncLLM
+from gllm.engine.async_llm import AsyncLLM
 from gllm.entrypoints.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -32,7 +32,7 @@ from gllm.utils import find_free_ports, make_async
 
 router = APIRouter()
 
-llm: PipeAsyncLLM = None
+llm: AsyncLLM = None
 # Resolved once at startup (see ``run`` / ``__main__``): turns model-native
 # tool-call markup into structured ``tool_calls``. ``None`` => model has no
 # known tool-call format, raw text passes through as content.
@@ -407,7 +407,7 @@ def main():
 
     args = build_arg_parser().parse_args()
 
-    llm = PipeAsyncLLM(
+    llm = AsyncLLM(
         host=args.host,
         launch_mode=args.launch_mode,
         worker_ranks=args.ranks,

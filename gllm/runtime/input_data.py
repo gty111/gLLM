@@ -4,9 +4,39 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from gllm.memory_manager import MemoryManager
-from gllm.sequence import Sequence
+from gllm.runtime.forward_metadata import (
+    ForwardMetadataPlan,
+    MetadataMaterialization,
+)
+from gllm.runtime.memory_manager import MemoryManager
+from gllm.runtime.sequence import GenerationSequence
 from gllm.utils import async_tensor_h2d, ceil_div, round_down
+
+
+@dataclass(frozen=True)
+class CpuInputMetadataMaterializer:
+    """Build ordinary pinned-CPU metadata for one forward."""
+
+    seqs: List[GenerationSequence]
+    materialization = MetadataMaterialization.CPU
+
+    def materialize_buffers(
+        self, input_data: "InputData", plan: ForwardMetadataPlan
+    ) -> None:
+        input_data._materialize_cpu_metadata(self.seqs, plan)
+
+
+@dataclass(frozen=True)
+class PrebuiltCpuMetadataMaterializer:
+    """Install scheduler-prebuilt CPU metadata without touching GPU buffers."""
+
+    source: "InputData"
+    materialization = MetadataMaterialization.CPU
+
+    def materialize_buffers(
+        self, input_data: "InputData", plan: ForwardMetadataPlan
+    ) -> None:
+        input_data._copy_prebuilt_cpu_metadata(self.source)
 
 
 # Input of model forward
@@ -28,10 +58,11 @@ class InputData:
         self.use_ssm_cache = memory_manager.use_ssm_cache
         self.memory_manager: MemoryManager = memory_manager
         self.use_buffer = use_buffer
-        # Backend-defined metadata for the current standard MHA/GQA forward.
-        # ModelRunner replaces it immediately before each eager/captured model
-        # call. InputData carries the data but does not know how it is built.
-        self.attention_metadata = None
+        # One canonical description of the current forward's batch geometry.
+        # CPU input builders, MTP GPU prep and attention backends all consume
+        # this plan instead of independently inferring decode/verify/prefill
+        # splits from their own staging buffers.
+        self.forward_metadata_plan: Optional[ForwardMetadataPlan] = None
 
         if self.use_mla:
             self.chunked_prefill_workspace_size = 128 * 1024
@@ -147,11 +178,29 @@ class InputData:
         )
         self.needs_repetition_penalty = self.repetition_penalty is not None
 
-    def cal_input(self, seqs: List[Sequence]):
+    def cal_input(self, seqs: List[GenerationSequence]):
+        """Plan and materialize the ordinary pinned-CPU metadata phase."""
+        plan = ForwardMetadataPlan.from_sequences(seqs)
+        plan.materialize(self, CpuInputMetadataMaterializer(seqs))
+
+    def _materialize_cpu_metadata(
+        self,
+        seqs: List[GenerationSequence],
+        plan: ForwardMetadataPlan,
+    ):
         assert len(seqs) != 0
         self.seqs = seqs
         self.embedding_size = 0
-        self._cal_mtp_partition(seqs)
+        # Keep legacy model/scheduler accessors as a projection of the plan;
+        # they must never independently re-classify the same rows.
+        self.num_mtp_verify_rows = plan.num_mtp_verify_rows
+        self.is_mtp_verify = (
+            plan.num_mtp_verify_rows == plan.batch_size
+            and plan.num_mtp_verify_rows > 0
+        )
+        self.num_decodes = plan.num_decodes
+        self.num_decode_tokens = plan.num_decodes
+        self.num_prefills = plan.batch_size - plan.num_decodes
 
         self.tokens_cpu = self._cal_tokens(seqs)
         self.positions_cpu = self._cal_position(seqs)
@@ -186,53 +235,8 @@ class InputData:
 
         if self.use_mla:
             self._cal_mla_metadata(seqs)
-        else:
-            self._cal_batch_split(seqs)
 
-    def _cal_mtp_partition(self, seqs: List[Sequence]) -> None:
-        """Describe the leading MTP-verify partition of a ragged batch.
-
-        Mixed target forwards keep speculative rows contiguous at the front,
-        followed by ordinary prefill rows. Attention may treat both partitions
-        as cached-context prefill, while hybrid recurrent layers need the exact
-        boundary so only MTP rows write their ``1+k`` checkpoint columns.
-
-        ``is_mtp_verify`` remains the all-rows compatibility flag used by the
-        existing pure verify CUDA graphs. New mixed code consumes
-        ``num_mtp_verify_rows`` instead of inferring a batch-wide mode.
-        """
-        flags = [bool(getattr(seq, "_mtp_verify", False)) for seq in seqs]
-        n = 0
-        while n < len(flags) and flags[n]:
-            n += 1
-        if any(flags[n:]):
-            raise ValueError("MTP verify rows must form a contiguous batch prefix")
-        self.num_mtp_verify_rows = n
-        self.is_mtp_verify = bool(n) and n == len(seqs)
-
-    def _cal_batch_split(self, seqs: List[Sequence]):
-        """Set ``num_decodes`` / ``num_decode_tokens`` / ``num_prefills`` for the
-        non-MLA (standard / hybrid) path.
-
-        ``_cal_mla_metadata`` sets these for the MLA path; the flash-attention
-        and hybrid GDN models never called it, so the MTP speculative-decode
-        code (``ModelRunner.step_once`` / ``_mtp_decode``) — which reads these
-        counts to gate the pure-decode fast path — would ``AttributeError``.
-        The scheduler orders decode seqs first and prefill/verify seqs last, so
-        the first non-decode seq marks the split (mirrors the MLA logic). An MTP
-        *verify* seq is a decode seq re-expanded to ``1+k`` query tokens over its
-        cached context and rides the prefill path, so it counts as non-decode.
-        """
-        self.num_decodes = len(seqs)
-        self.num_prefills = 0
-        for idx, seq in enumerate(seqs):
-            if (not seq.computed_prompt) or getattr(seq, "_mtp_verify", False):
-                self.num_decodes = idx
-                self.num_prefills = len(seqs) - idx
-                break
-        self.num_decode_tokens = self.num_decodes
-
-    def _cal_ssm_metadata(self, seqs: List[Sequence]):
+    def _cal_ssm_metadata(self, seqs: List[GenerationSequence]):
         """Build per-seq SSM slot id + initial-state flag + snapshot target.
 
         * ``ssm_state_slot_per_seq[i]`` = ``seqs[i].ssm_state_slot`` (or 0 = the
@@ -273,7 +277,7 @@ class InputData:
             # cacheable page drained the shared block pool and starved sequence
             # admission (see ``PrefixSegment.reserve_ssm_snapshot``). Decode rows
             # skip this branch since ``computed_prompt`` flips True before any
-            # decode token is emitted (see Sequence), and ``reserve`` is None for
+            # decode token is emitted (see GenerationSequence), and ``reserve`` is None for
             # non-prefix-cache runs.
             if reserve is None or seq.computed_prompt:
                 continue
@@ -359,7 +363,7 @@ class InputData:
         # (see its docstring for the bandwidth motivation). The persistent
         # ``self.block_table`` device buffer keeps the full width so the
         # captured-graph kernel signature is stable; only the bytes that are
-        # read by FlashAttention (the first ``max_blocks_used`` cols of each
+        # read by the paged QKV backend (the first ``max_blocks_used`` cols of each
         # row, where ``max_blocks_used >= ceil(cache_seqlens[i]/page_size)``
         # for every row in the current batch) get overwritten this step.
         bs_, used_cols = self.block_table_cpu.shape
@@ -398,22 +402,20 @@ class InputData:
         if self.use_mla:
             self._set_mla_metadata()
 
-    def cal_and_set_input(self, seqs: List[Sequence]):
+    def cal_and_set_input(self, seqs: List[GenerationSequence]):
         self.cal_input(seqs)
         self.copy_to_input_buffer()
 
-    def mark_gpu_prepared(
+    def mark_gpu_buffer_shapes(
         self,
         *,
-        seqs: List[Sequence],
-        num_rows: int,
-        qlen: int,
-        is_mtp_verify: bool = False,
+        seqs: List[GenerationSequence],
+        plan: ForwardMetadataPlan,
     ):
         """Declare that the GPU buffers were filled without the CPU builders.
 
         ``MtpGpuPrep`` writes the device buffers directly (see
-        ``gllm/mtp_gpu_prep.py``), so the ``*_cpu`` staging tensors this class
+        ``gllm/speculative/gpu_prep.py``), so the ``*_cpu`` staging tensors this class
         normally derives its *shapes* from are never built. The ``get_*``
         accessors slice by those shapes, so point them at cached, correctly
         shaped placeholders: the values are not read by the captured graph (it
@@ -421,6 +423,12 @@ class InputData:
         accessor still returns the right view. Cached per (num_rows, qlen); no
         per-step alloc.
         """
+        if plan.materialization is not MetadataMaterialization.GPU_UNIFORM:
+            raise ValueError("GPU shape projection requires a uniform GPU plan")
+        num_rows = plan.batch_size
+        qlen = plan.query_lens[0]
+        if any(width != qlen for width in plan.query_lens[1:]):
+            raise ValueError("GPU shape projection requires uniform query lengths")
         key = (num_rows, qlen, self.use_ssm_cache)
         cache = getattr(self, "_gpu_shape_cache", None)
         if cache is None:
@@ -460,13 +468,49 @@ class InputData:
         # 1-D ``positions`` buffer (``mrope_positions_cpu`` was ``None`` at
         # capture time), so keep ``get_position`` on the same branch.
         self.mrope_positions_cpu = None
-        self.is_mtp_verify = is_mtp_verify
-        self.num_mtp_verify_rows = num_rows if is_mtp_verify else 0
-        self.max_query_len = qlen
-        # Uniform batch: every row contributes ``qlen`` query tokens.
-        self.num_decodes = 0 if is_mtp_verify else len(seqs)
+        self.is_mtp_verify = (
+            plan.num_mtp_verify_rows == num_rows
+            and plan.num_mtp_verify_rows > 0
+        )
+        self.num_mtp_verify_rows = plan.num_mtp_verify_rows
+        self.max_query_len = plan.max_query_len
+        self.num_decodes = plan.num_decodes
         self.num_decode_tokens = self.num_decodes
-        self.num_prefills = len(seqs) if is_mtp_verify else 0
+        self.num_prefills = num_rows - self.num_decodes
+
+    def install_forward_metadata_plan(self, plan: ForwardMetadataPlan) -> None:
+        """Install the sole semantic description of the current buffers."""
+        if plan.device_buffers_ready:
+            self._validate_plan_geometry(plan)
+        self.forward_metadata_plan = plan
+
+    def _validate_plan_geometry(self, plan: ForwardMetadataPlan) -> None:
+        tokens_cpu = getattr(self, "tokens_cpu", None)
+        seq_lens_cpu = getattr(self, "seq_lens_cpu", None)
+        if tokens_cpu is not None and tokens_cpu.shape[0] != plan.num_tokens:
+            raise RuntimeError(
+                "metadata plan/token shape mismatch: "
+                f"plan={plan.num_tokens}, staging={tokens_cpu.shape[0]}"
+            )
+        if seq_lens_cpu is not None and seq_lens_cpu.shape[0] != plan.batch_size:
+            raise RuntimeError(
+                "metadata plan/row shape mismatch: "
+                f"plan={plan.batch_size}, staging={seq_lens_cpu.shape[0]}"
+            )
+        if getattr(self, "num_decodes", plan.num_decodes) != plan.num_decodes:
+            raise RuntimeError(
+                "metadata plan/decode split mismatch: "
+                f"plan={plan.num_decodes}, input={self.num_decodes}"
+            )
+        if (
+            getattr(self, "num_mtp_verify_rows", plan.num_mtp_verify_rows)
+            != plan.num_mtp_verify_rows
+        ):
+            raise RuntimeError(
+                "metadata plan/MTP split mismatch: "
+                f"plan={plan.num_mtp_verify_rows}, "
+                f"input={self.num_mtp_verify_rows}"
+            )
 
     # Attributes copied verbatim from a prebuilt InputData.
     _PREBUILT_COMMON_ATTRS = (
@@ -487,8 +531,8 @@ class InputData:
         "needs_repetition_penalty",
         "is_mtp_verify",
         "num_mtp_verify_rows",
-        # Batch decode/prefill split — set for both MLA (_cal_mla_metadata) and
-        # non-MLA (_cal_batch_split) paths; the MTP fast-path gate reads them.
+        # Compatibility projection of ``ForwardMetadataPlan``; model and
+        # scheduler paths still read these fields directly.
         "num_decodes",
         "num_decode_tokens",
         "num_prefills",
@@ -519,6 +563,14 @@ class InputData:
         :meth:`copy_to_input_buffer` call once the previous forward has
         released the input buffers (see ``OverlapModelRunner``).
         """
+        source_plan = input_data.forward_metadata_plan
+        if source_plan is None:
+            raise RuntimeError("prebuilt InputData has no ForwardMetadataPlan")
+        source_plan.clone_for_runtime().materialize(
+            self, PrebuiltCpuMetadataMaterializer(input_data)
+        )
+
+    def _copy_prebuilt_cpu_metadata(self, input_data):
         for attr in self._PREBUILT_COMMON_ATTRS:
             setattr(self, attr, getattr(input_data, attr, None))
 
@@ -534,7 +586,7 @@ class InputData:
         self.set_input_from_prebuilt_cpu(input_data)
         self.copy_to_input_buffer()
 
-    def _cal_tokens(self, seqs: List[Sequence]):
+    def _cal_tokens(self, seqs: List[GenerationSequence]):
         tokens_list = []
         for seq in seqs:
             tokens_list.extend(
@@ -554,7 +606,7 @@ class InputData:
     def get_tokens(self):
         return self.tokens[: self.tokens_cpu.shape[0]]
 
-    def _cal_position(self, seqs: List[Sequence]):
+    def _cal_position(self, seqs: List[GenerationSequence]):
         # Position ids are just consecutive integers per seq, so we write
         # them straight into a pinned tensor via its numpy view instead of
         # building a Python list and going through ``torch.tensor(list,
@@ -594,7 +646,7 @@ class InputData:
                 self.mrope_positions_cpu, non_blocking=True
             )
 
-    def _cal_seq_lens(self, seqs: List[Sequence]):
+    def _cal_seq_lens(self, seqs: List[GenerationSequence]):
         seq_lens = [seq.seq_len for seq in seqs]
         return max(seq_lens), torch.tensor(
             seq_lens, dtype=torch.int32, device="cpu", pin_memory=True
@@ -603,7 +655,7 @@ class InputData:
     def get_seq_lens(self):
         return self.seq_lens[: self.seq_lens_cpu.shape[0]]
 
-    def _cal_query_start_loc(self, seqs: List[Sequence]):
+    def _cal_query_start_loc(self, seqs: List[GenerationSequence]):
         query_lens = [0] + [seq.to_compute_token_num for seq in seqs]
         # Materialize directly into a pinned tensor so downstream non_blocking
         # H2D doesn't have to fall back to a synchronous staging copy. We
@@ -673,7 +725,7 @@ class InputData:
         n = self.ssm_snapshot_write_slot_per_seq_cpu.shape[0]
         return self.ssm_snapshot_write_slot_per_seq[:n]
 
-    def _cal_block_table(self, seqs: List[Sequence]):
+    def _cal_block_table(self, seqs: List[GenerationSequence]):
         block_tables_list = [seq.page_table for seq in seqs]
         bs = len(block_tables_list)
         # Previously we (1) allocated a temporary ``np.full((bs, max_num_block),
@@ -706,7 +758,7 @@ class InputData:
         # rest is dead padding). Torch-profiler tracing on Qwen3-30B-A3B
         # TP=4 with conc=32 showed this single copy accounting for ~80 ms of
         # ``Memcpy HtoD (Pinned -> Device)`` per 64-prompt run; SGLang at the
-        # same config does ~0 such copies. FlashAttention only reads up to
+        # same config does ~0 such copies. The paged QKV backend only reads up to
         # ``cache_seqlens[i] / page_size`` columns per row in the persistent
         # device-side ``block_table`` buffer, so leaving stale data beyond
         # ``max_blocks_used`` is safe. ``copy_to_input_buffer`` H2Ds only
@@ -731,7 +783,7 @@ class InputData:
     def get_block_table(self):
         return self.block_table[: self.block_table_cpu.shape[0]]
 
-    def _cal_slot_mapping(self, seqs: List[Sequence]):
+    def _cal_slot_mapping(self, seqs: List[GenerationSequence]):
         # Same motivation as ``_cal_position``: write straight into a pinned
         # tensor's numpy view. The original double-Python-loop
         # ("for seq -> for i in range(...)") plus ``slot_mapping.append(...)``
@@ -775,25 +827,9 @@ class InputData:
     def get_slot_mapping(self):
         return self.slot_mapping[: self.slot_mapping_cpu.shape[0]]
 
-    def _cal_mla_metadata(self, seqs: List[Sequence]):
+    def _cal_mla_metadata(self, seqs: List[GenerationSequence]):
         # Construct MLA-related metadata
         self.num_actual_tokens = self.tokens_cpu.shape[0]
-
-        self.num_decodes = len(seqs)
-        self.num_decode_tokens = self.num_decodes
-        self.num_prefills = 0
-        for idx, seq in enumerate(seqs):
-            # A seq takes the PREFILL (multi-query, with-context) attention path
-            # when it is still prefilling its prompt, OR when it is an MTP verify
-            # seq (a decode seq re-expanded to 1+k query tokens over its cached
-            # context). Without the ``_mtp_verify`` override such a seq would be
-            # mis-classified as decode (computed_prompt is True) and run through
-            # the q_len==1 decode kernel with q_len=1+k -> wrong attention.
-            if (not seq.computed_prompt) or getattr(seq, "_mtp_verify", False):
-                self.num_decodes = idx
-                self.num_decode_tokens = idx
-                self.num_prefills = len(seqs) - self.num_decodes
-                break
 
         query_seq_lens = self.query_start_loc_cpu[1:] - self.query_start_loc_cpu[:-1]
         num_computed_tokens = self.seq_lens_cpu - query_seq_lens
@@ -1004,7 +1040,7 @@ class MLACommonPrefillMetadata:
 
     @dataclass
     class ChunkedContextMetadata:
-        # New for MLA (compared to FlashAttention)
+        # New for MLA (compared to the explicit-QKV path)
         # For handling chunked prefill
         cu_seq_lens: torch.Tensor
         starts: torch.Tensor
@@ -1044,7 +1080,7 @@ class MLACommonMetadata:
     num_actual_tokens: int  # Number of tokens excluding padding.
     slot_mapping: torch.Tensor
 
-    # New for MLA (compared to FlashAttention)
+    # New for MLA (compared to the explicit-QKV path)
     # For handling prefill decode split
     num_decodes: int
     num_decode_tokens: int

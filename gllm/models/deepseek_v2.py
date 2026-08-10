@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from logger import logger
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_pp_layers,
     get_tp_size,
     is_dp_attn,
@@ -12,9 +12,11 @@ from gllm.dist_utils import (
     is_last_pp_rank,
     tensor_model_parallel_all_reduce,
 )
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.activation import SiluAndMul
-from gllm.layers.attention import FlashAttention, MLAAttention
+from gllm.layers.attention.base import AttentionLayerBase
+from gllm.layers.attention.mla import MLAAttention
+from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import (
     ColumnParallelLinear,
@@ -25,7 +27,6 @@ from gllm.layers.linear import (
 from gllm.layers.moe import FusedMoE, SharedExpertRunner
 from gllm.layers.rotary_embedding import YaRNScalingRotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from gllm.modules.attention import Attention
 from gllm.utils import yarn_get_mscale
 
 from .qwen2 import Qwen2ForCausalLM
@@ -212,7 +213,7 @@ class DeepseekV2MOE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class DeepseekV2Attention(Attention):
+class DeepseekV2Attention(AttentionLayerBase):
 
     def __init__(self, layer_id: int, config):
         quant_config = getattr(config, "quantization_config", None)
@@ -327,7 +328,7 @@ class DeepseekV2Attention(Attention):
             **extra_kwargs
         )
 
-        self.attn = FlashAttention(
+        self.attn = QKVAttention(
             layer_id, self.scaling, self.num_heads, self.num_heads, self.qk_head_dim
         )
 
@@ -366,7 +367,7 @@ class DeepseekV2Attention(Attention):
         return output
 
 
-class DeepseekV2MLAAttention(Attention):
+class DeepseekV2MLAAttention(AttentionLayerBase):
     def __init__(self, layer_id: int, config):
         quant_config = getattr(config, "quantization_config", None)
         self.hidden_size = config.hidden_size

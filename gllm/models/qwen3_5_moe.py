@@ -35,14 +35,14 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_ep_rank,
     get_ep_size,
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
 )
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.moe import determine_expert_map
 from gllm.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
@@ -219,7 +219,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # NB: ``quantization_config`` is already mirrored from the top-level
         # config onto ``config.text_config`` by
         # ``ModelLoader.load_config`` (see
-        # :func:`gllm.model_loader.propagate_quantization_config`). That
+        # :func:`gllm.runtime.model_loader.propagate_quantization_config`). That
         # mirroring is essential for FP8 checkpoints like Qwen3.5-MoE-FP8,
         # which only carry the quant config at the top level — without it
         # the language sub-model would silently fall back to bf16.

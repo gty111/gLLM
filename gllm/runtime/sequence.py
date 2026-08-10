@@ -5,7 +5,7 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from gllm.utils import unify_decode
 
 
-class Sequence:
+class GenerationSequence:
     def __init__(
         self,
         seq_id,

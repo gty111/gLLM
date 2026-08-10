@@ -1,11 +1,11 @@
 import torch
 
-from gllm.input_data import InputData
-from gllm.layers.attention import FlashAttention
+from gllm.runtime.input_data import InputData
+from gllm.layers.attention.base import AttentionLayerBase
+from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-from gllm.modules.attention import Attention
 
 from .qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 from .qwen2 import Qwen2MLP as Qwen3MLP
@@ -20,7 +20,7 @@ except ImportError:
 from gllm.layers.ops.qk_norm import fused_qk_norm_inplace
 
 
-class Qwen3Attention(Attention):
+class Qwen3Attention(AttentionLayerBase):
     def __init__(self, layer_id, config):
         head_dim = getattr(config, "head_dim", None)
         super().__init__(
@@ -72,7 +72,7 @@ class Qwen3Attention(Attention):
                 True,
                 rope_scaling["mrope_section"],
             )
-        self.attn = FlashAttention(
+        self.attn = QKVAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim
         )
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)

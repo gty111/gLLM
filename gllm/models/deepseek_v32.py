@@ -33,8 +33,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gllm.dist_utils import get_pp_layers, is_first_pp_rank, is_last_pp_rank
-from gllm.input_data import InputData
+from gllm.distributed.parallel_state import get_pp_layers, is_first_pp_rank, is_last_pp_rank
+from gllm.runtime.input_data import InputData
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import ReplicatedLinear
 from gllm.layers.rotary_embedding import YaRNScalingRotaryEmbedding

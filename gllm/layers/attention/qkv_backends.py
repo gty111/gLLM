@@ -1,9 +1,9 @@
-"""Paged attention backends for ordinary MHA/GQA layers.
+"""Paged attention backends for explicit-QKV MHA/GQA/MQA layers.
 
 Each backend owns both its runtime metadata preparation and its kernel call.
 This keeps backend-specific construction and graph-captured metadata updates
-out of ``InputData`` and the scheduler; ``InputData`` only carries the opaque
-metadata object produced for its current forward.
+out of ``InputData`` and the scheduler. ``InputData`` carries the canonical
+forward plan, which retains the backend's transient opaque result.
 """
 
 from abc import ABC, abstractmethod
@@ -14,7 +14,8 @@ import torch
 from logger import logger
 
 if TYPE_CHECKING:
-    from gllm.input_data import InputData
+    from gllm.runtime.forward_metadata import ForwardMetadataPlan
+    from gllm.runtime.input_data import InputData
 
 
 @dataclass
@@ -43,8 +44,8 @@ class FlashInferPagedAttentionMetadata(PagedAttentionMetadata):
     context_max_query_len: int
 
 
-class AttentionBackend(ABC):
-    """Interface shared by standard paged-attention implementations."""
+class QKVAttentionBackend(ABC):
+    """Interface shared by paged explicit-QKV attention implementations."""
 
     name: str
 
@@ -53,7 +54,11 @@ class AttentionBackend(ABC):
         self.max_running_seqs = max_running_seqs
 
     @abstractmethod
-    def prepare_metadata(self, input_data: "InputData") -> PagedAttentionMetadata:
+    def prepare_metadata(
+        self,
+        input_data: "InputData",
+        plan: "ForwardMetadataPlan",
+    ) -> PagedAttentionMetadata:
         """Prepare metadata immediately before a model forward.
 
         GPU operations issued here are intentionally captured as part of CUDA
@@ -73,7 +78,7 @@ class AttentionBackend(ABC):
         """Run paged causal attention with backend-prepared ``metadata``."""
 
 
-class FA3AttentionBackend(AttentionBackend):
+class FA3AttentionBackend(QKVAttentionBackend):
     """sgl-kernel FlashAttention-3 backend for its SM8x/SM9x builds."""
 
     name = "fa3"
@@ -84,14 +89,18 @@ class FA3AttentionBackend(AttentionBackend):
 
         self._flash_attn_with_kvcache = flash_attn_with_kvcache
 
-    def prepare_metadata(self, input_data: "InputData") -> FA3PagedAttentionMetadata:
+    def prepare_metadata(
+        self,
+        input_data: "InputData",
+        plan: "ForwardMetadataPlan",
+    ) -> FA3PagedAttentionMetadata:
         seq_lens = input_data.get_seq_lens()
         return FA3PagedAttentionMetadata(
             block_table=input_data.get_block_table(),
             seq_lens=seq_lens,
             query_start_loc=input_data.get_query_start_loc(),
-            max_query_len=input_data.max_query_len,
-            batch_size=seq_lens.shape[0],
+            max_query_len=plan.max_query_len,
+            batch_size=plan.batch_size,
         )
 
     def forward(
@@ -116,7 +125,7 @@ class FA3AttentionBackend(AttentionBackend):
         )
 
 
-class FlashInferAttentionBackend(AttentionBackend):
+class FlashInferAttentionBackend(QKVAttentionBackend):
     """FlashInfer TRT-LLM generation backend for Blackwell/SM100.
 
     The cumulative KV lengths and workspace have stable addresses. Ragged
@@ -153,10 +162,17 @@ class FlashInferAttentionBackend(AttentionBackend):
         )
 
     def prepare_metadata(
-        self, input_data: "InputData"
+        self,
+        input_data: "InputData",
+        plan: "ForwardMetadataPlan",
     ) -> FlashInferPagedAttentionMetadata:
         seq_lens = input_data.get_seq_lens()
-        batch_size = seq_lens.shape[0]
+        batch_size = plan.batch_size
+        if seq_lens.shape[0] != batch_size:
+            raise RuntimeError(
+                "attention plan/device row mismatch: "
+                f"plan={batch_size}, device={seq_lens.shape[0]}"
+            )
         if batch_size > self.max_running_seqs:
             raise RuntimeError(
                 f"attention batch size {batch_size} exceeds metadata capacity "
@@ -169,32 +185,14 @@ class FlashInferAttentionBackend(AttentionBackend):
         # uniform prefix with the decode kernel and send only the ragged
         # prefill suffix to the context kernel. Sending a mixed
         # decode+prefill batch through context corrupts row metadata on SM100.
-        num_mtp_rows = int(getattr(input_data, "num_mtp_verify_rows", 0))
-        fast_path_rows = num_mtp_rows or int(
-            getattr(input_data, "num_decodes", 0)
-        )
+        fast_path_rows = plan.fast_path_rows
         if not 0 <= fast_path_rows <= batch_size:
             raise RuntimeError(
                 f"invalid FlashInfer fast-path prefix {fast_path_rows}/{batch_size}"
             )
 
-        query_start_loc_cpu = input_data.query_start_loc_cpu
-        fast_path_tokens = int(query_start_loc_cpu[fast_path_rows])
-        if fast_path_rows:
-            fast_q_len_per_req = fast_path_tokens // fast_path_rows
-            prefix_lens = (
-                query_start_loc_cpu[1 : fast_path_rows + 1]
-                - query_start_loc_cpu[:fast_path_rows]
-            )
-            if fast_q_len_per_req <= 0 or not bool(
-                torch.all(prefix_lens == fast_q_len_per_req)
-            ):
-                raise RuntimeError(
-                    "FlashInfer decode/verify prefix must have a uniform query "
-                    f"length, got {prefix_lens.tolist()}"
-                )
-        else:
-            fast_q_len_per_req = 1
+        fast_path_tokens = plan.fast_path_tokens
+        fast_q_len_per_req = plan.fast_q_len_per_req
 
         context_rows = batch_size - fast_path_rows
         cumulative_q = self.cum_seq_lens_q[: context_rows + 1]
@@ -206,11 +204,7 @@ class FlashInferAttentionBackend(AttentionBackend):
                 query_start_loc[fast_path_rows],
                 out=cumulative_q,
             )
-            context_query_lens = (
-                query_start_loc_cpu[fast_path_rows + 1 :]
-                - query_start_loc_cpu[fast_path_rows:-1]
-            )
-            context_max_query_len = int(context_query_lens.max().item())
+            context_max_query_len = plan.context_max_query_len
 
             # TRT-LLM Gen's paged-context API names this argument
             # ``cum_seq_lens_kv``, but for a paged KV cache it is the indptr
@@ -237,7 +231,7 @@ class FlashInferAttentionBackend(AttentionBackend):
             block_table=input_data.get_block_table(),
             seq_lens=seq_lens,
             query_start_loc=input_data.get_query_start_loc(),
-            max_query_len=input_data.max_query_len,
+            max_query_len=plan.max_query_len,
             batch_size=batch_size,
             cum_seq_lens_q=cumulative_q,
             cum_seq_lens_kv=cumulative_kv,
@@ -299,10 +293,10 @@ class FlashInferAttentionBackend(AttentionBackend):
         return out
 
 
-def create_attention_backend(
+def create_qkv_attention_backend(
     requested: str, model_max_length: int, max_running_seqs: int
-) -> AttentionBackend:
-    """Resolve and construct the standard attention backend on this worker."""
+) -> QKVAttentionBackend:
+    """Resolve and construct the QKV attention backend on this worker."""
     requested = (requested or "auto").lower()
     if requested not in ("auto", "fa3", "flashinfer"):
         raise ValueError(
@@ -320,7 +314,7 @@ def create_attention_backend(
             resolved = "fa3"
         else:
             raise RuntimeError(
-                "No automatic standard attention backend for compute "
+                "No automatic QKV attention backend for compute "
                 f"capability SM{capability[0]}{capability[1]}; choose a "
                 "supported backend explicitly."
             )
@@ -338,7 +332,7 @@ def create_attention_backend(
     )
     backend = backend_cls(model_max_length, max_running_seqs)
     logger.info(
-        "Standard attention backend: %s (requested %s, compute capability SM%d%d)",
+        "QKV attention backend: %s (requested %s, compute capability SM%d%d)",
         resolved,
         requested,
         capability[0],
@@ -347,28 +341,30 @@ def create_attention_backend(
     return backend
 
 
-def find_attention_layers(model):
-    """Return the standard attention helpers contained in ``model``.
+def find_qkv_attention_layers(model):
+    """Return the QKV attention helpers contained in ``model``.
 
-    ``FlashAttention`` is deliberately a lightweight helper rather than an
+    ``QKVAttention`` is deliberately a lightweight helper rather than an
     ``nn.Module``, so it is stored as a plain attribute of registered model
     modules. Inspect those direct attributes instead of relying on a model-wide
     ``use_mla`` flag.
     """
-    from gllm.layers.attention import FlashAttention
+    from gllm.layers.attention.qkv import QKVAttention
 
     layers = []
     seen = set()
     for module in model.modules():
         for value in vars(module).values():
-            if isinstance(value, FlashAttention) and id(value) not in seen:
+            if isinstance(value, QKVAttention) and id(value) not in seen:
                 seen.add(id(value))
                 layers.append(value)
     return layers
 
 
-def bind_attention_backend(attention_layers, backend: AttentionBackend) -> int:
-    """Inject one shared backend into discovered standard attention layers."""
+def bind_qkv_attention_backend(
+    attention_layers, backend: QKVAttentionBackend
+) -> int:
+    """Inject one shared backend into discovered QKV attention layers."""
     for layer in attention_layers:
         layer.set_backend(backend)
     return len(attention_layers)

@@ -4,7 +4,7 @@ from typing import Optional, Union
 import torch
 from torch.nn.parameter import Parameter
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     divide,
     get_tp_rank,
     get_tp_size,

@@ -4,7 +4,7 @@ Motivation (measured on Qwen3.5-0.8B, 1×H200, 64 concurrent greedy decodes with
 host-side phase profiling): one fused MTP step cost ~12.4 ms, of which ~4.3 ms was
 **host** time spent rebuilding input arrays in Python -- ``cal_input`` for the
 draft batch (0.5 ms) and for the verify batch (1.5 ms), the per-seq GPU
-context-length bookkeeping (2.1 ms) and the dummy pad-``Sequence`` objects the
+context-length bookkeeping (2.1 ms) and the dummy pad-``GenerationSequence`` objects the
 padded buckets needed. All of that is pure overhead: the arrays are simple
 affine functions of *per-sequence* facts the engine already knows, and the
 verify batch's token ids already live on the GPU (they are the draft chain's
@@ -21,19 +21,21 @@ This module removes that host work by keeping a persistent batch representation:
   **directly into the static input buffers** that the captured draft / verify
   CUDA graphs read, and
 * pads a bucket by writing dummy rows on the GPU instead of building throwaway
-  ``Sequence`` objects on the host.
+  ``GenerationSequence`` objects on the host.
 
 The formulas mirror ``InputData._cal_*`` exactly for the shapes MTP uses (one
 token per seq for a draft step, a uniform ``1+k`` query over a cached context
 for a verify step).
 """
 
+from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
 import torch
 
-from gllm.sequence import Sequence
+from gllm.runtime.forward_metadata import ForwardMetadataPlan, MetadataMaterialization
+from gllm.runtime.sequence import GenerationSequence
 
 # Columns of the per-sequence metadata staging buffer. One row per batch row;
 # a single [bucket, META_W] int64 H2D per prepared batch.
@@ -42,6 +44,60 @@ META_DELTA = 1        # mrope position delta (0 when the model has no mrope)
 META_X1 = 2           # the seq's x1 token id (verify column 0 / draft input)
 META_NUM_ACCEPTED = 3  # SSM resume column selector (``num_accepted``)
 META_W = 4
+
+
+@dataclass(frozen=True)
+class MtpDraftMaterializer:
+    """Per-forward binding for a uniform GPU-native MTP draft batch."""
+
+    prep: "MtpGpuPrep"
+    seqs: List[GenerationSequence]
+    materialization = MetadataMaterialization.GPU_UNIFORM
+
+    def materialize_buffers(
+        self, input_data, plan: ForwardMetadataPlan
+    ) -> None:
+        if plan.num_decodes != plan.batch_size or plan.max_query_len != 1:
+            raise ValueError("MTP draft materializer requires one-token decode rows")
+        self.prep._write_draft_buffers(input_data)
+        input_data.mark_gpu_buffer_shapes(seqs=self.seqs, plan=plan)
+
+
+@dataclass(frozen=True)
+class MtpVerifyMaterializer:
+    """Per-forward binding for a uniform GPU-native MTP verify batch."""
+
+    prep: "MtpGpuPrep"
+    seqs: List[GenerationSequence]
+    drafts_gpu: torch.Tensor
+    materialization = MetadataMaterialization.GPU_UNIFORM
+
+    def materialize_buffers(
+        self, input_data, plan: ForwardMetadataPlan
+    ) -> None:
+        if plan.num_mtp_verify_rows != plan.batch_size:
+            raise ValueError("uniform MTP materializer requires all rows to verify")
+        qlen = plan.fast_q_len_per_req
+        self.prep._write_verify_buffers(input_data, qlen, self.drafts_gpu)
+        input_data.mark_gpu_buffer_shapes(seqs=self.seqs, plan=plan)
+
+
+@dataclass(frozen=True)
+class MtpMixedPatchMaterializer:
+    """Per-forward binding for GPU patching of mixed MTP rows."""
+
+    prep: "MtpGpuPrep"
+    drafts_gpu: torch.Tensor
+    materialization = MetadataMaterialization.CPU_WITH_GPU_PATCH
+
+    def materialize_buffers(
+        self, input_data, plan: ForwardMetadataPlan
+    ) -> None:
+        self.prep._write_mixed_patch_buffers(
+            input_data,
+            plan.fast_q_len_per_req,
+            self.drafts_gpu,
+        )
 
 
 class MtpGpuPrep:
@@ -111,7 +167,7 @@ class MtpGpuPrep:
 
     def push_meta(
         self,
-        seqs: List[Sequence],
+        seqs: List[GenerationSequence],
         bucket: int,
         *,
         epoch: int,
@@ -153,7 +209,7 @@ class MtpGpuPrep:
             getattr(s, "ssm_num_accepted", 1) or 1 for s in seqs
         ]
         if bucket > nd:
-            # Padding rows mirror the throwaway dummy ``Sequence`` objects the
+            # Padding rows mirror the throwaway dummy ``GenerationSequence`` objects the
             # CPU path used (``_create_dummy_verify_seqs`` / ``create_dummy_seqs``):
             # context length 1, token id 1, SSM block 0, page table all
             # ``dummy_page`` -- value-identical to what the CPU path produced.
@@ -179,7 +235,7 @@ class MtpGpuPrep:
                 pt[i, : lens[i]] = seq.page_table
         if bucket > nd:
             # Dummy rows: one page (the reserved dummy page), like the throwaway
-            # pad ``Sequence`` objects had.
+            # pad ``GenerationSequence`` objects had.
             pt[nd:bucket, 0] = dummy_page
         self.pt_cols = cols
 
@@ -220,6 +276,29 @@ class MtpGpuPrep:
     def x1_gpu(self, nd: int) -> torch.Tensor:
         """The staged ``x1`` token ids, already on the device (int64 ``[nd]``)."""
         return self._d_meta[:nd, META_X1]
+
+    def verify_materializer(
+        self,
+        *,
+        seqs: List[GenerationSequence],
+        drafts_gpu: torch.Tensor,
+    ) -> MtpVerifyMaterializer:
+        """Bind this persistent writer to one uniform verify forward."""
+        return MtpVerifyMaterializer(self, seqs, drafts_gpu)
+
+    def draft_materializer(
+        self,
+        *,
+        seqs: List[GenerationSequence],
+    ) -> MtpDraftMaterializer:
+        """Bind this persistent writer to one uniform draft forward."""
+        return MtpDraftMaterializer(self, seqs)
+
+    def mixed_patch_materializer(
+        self, *, drafts_gpu: torch.Tensor
+    ) -> MtpMixedPatchMaterializer:
+        """Bind this persistent writer to one mixed-forward GPU patch."""
+        return MtpMixedPatchMaterializer(self, drafts_gpu)
 
     # ------------------------------------------------------------------
     # device: per-token arrays straight into the static input buffers
@@ -279,7 +358,7 @@ class MtpGpuPrep:
                 self._d_meta[:bucket, META_NUM_ACCEPTED].to(torch.int32)
             )
 
-    def fill_draft(self, input_data) -> None:
+    def _write_draft_buffers(self, input_data) -> None:
         """Prepare a draft-chain step: one query token per row at ``ctx``.
 
         Mirrors the CPU build for ``token_ids = committed + [x1]`` with
@@ -293,7 +372,7 @@ class MtpGpuPrep:
         pos = self._d_meta[:bucket, META_CTX].unsqueeze(1)  # [bucket, 1]
         self._fill_common(input_data, 1, pos)
 
-    def fill_verify(
+    def _write_verify_buffers(
         self,
         input_data,
         qlen: int,
@@ -320,13 +399,13 @@ class MtpGpuPrep:
             # Same filler the dummy pad seqs used (``[1] * (ctx + qlen)``).
             tok[nd:].fill_(1)
 
-    def correct_mixed_prefix(
+    def _write_mixed_patch_buffers(
         self,
         input_data,
         qlen: int,
         drafts_gpu: torch.Tensor,
     ) -> None:
-        """Correct the MTP prefix of a ragged mixed target batch on the GPU.
+        """Patch the MTP verify rows of a ragged mixed target batch on the GPU.
 
         ``InputData.cal_input`` deliberately builds the successor from the
         scheduler's optimistic fixed-width placeholders.  Query widths and

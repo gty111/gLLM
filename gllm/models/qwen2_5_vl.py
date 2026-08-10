@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     divide,
     get_tp_group,
     get_tp_rank,
@@ -15,7 +15,7 @@ from gllm.dist_utils import (
     is_first_pp_rank,
     split_tensor_along_last_dim,
 )
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import (

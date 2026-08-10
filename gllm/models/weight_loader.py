@@ -31,7 +31,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Set
 
 import torch
 
-from gllm.dist_utils import get_local_rank, resolve_pp_layer_idx
+from gllm.distributed.parallel_state import get_local_rank, resolve_pp_layer_idx
 from gllm.utils import get_model_load_pbar
 
 from .weight_utils import (

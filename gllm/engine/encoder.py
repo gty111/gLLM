@@ -1,7 +1,7 @@
 """Encoder-side serving loop: ZMQ EncoderJob intake -> ViT -> NIXL write.
 
-Drives a :class:`gllm.encoder_engine.EncoderEngine` from the disaggregation
-control plane (design §4.2 / §5):
+Coordinates a :class:`gllm.runtime.vision_encoder_runner.VisionEncoderRunner`
+with the disaggregation control and data planes (design §4.2 / §5):
 
     for each EncoderJob(seq, item, modality, content, remote_slots):
         mm_input, grid = processor(content)            # CPU pixel IO
@@ -40,14 +40,16 @@ from gllm.disagg.discovery import (
     payload_nixl_metas,
 )
 from gllm.disagg.protocol import EncoderJob, MmItemMeta, emb_notif
-from gllm.encoder_engine import EncoderEngine
+from gllm.runtime.vision_encoder_runner import VisionEncoderRunner
 from gllm.transfer.nixl_transfer import NixlEndpoint
 
 
-class EncoderRuntime:
+class Encoder:
+    """High-level service for encoder-disaggregated multimodal inference."""
+
     def __init__(
         self,
-        engine: EncoderEngine,
+        runner: VisionEncoderRunner,
         encoder_id: str,
         discovery_endpoint: str,
         *,
@@ -57,7 +59,7 @@ class EncoderRuntime:
         max_vis_tokens: int = 16384,
         nixl_backend: str = "UCX",
     ):
-        self.engine = engine
+        self.runner = runner
         self.encoder_id = encoder_id
         self.discovery_endpoint = discovery_endpoint
         self.processor_config_hash = processor_config_hash
@@ -67,12 +69,12 @@ class EncoderRuntime:
         self.nixl_backend = nixl_backend
 
         self.feat_dim = int(
-            engine.model_loader.config.vision_config.out_hidden_size
+            runner.model_loader.config.vision_config.out_hidden_size
             * (
                 1
                 + len(
                     getattr(
-                        engine.model_loader.config.vision_config,
+                        runner.model_loader.config.vision_config,
                         "deepstack_visual_indexes",
                         [],
                     )
@@ -121,7 +123,7 @@ class EncoderRuntime:
         )
         self.send_buf = torch.empty(
             (self.max_vis_tokens, self.feat_dim),
-            dtype=self.engine.dtype,
+            dtype=self.runner.dtype,
             device="cuda",
         )
         self.send_reg = self.nixl.register(self.send_buf)
@@ -229,9 +231,9 @@ class EncoderRuntime:
 
         Returns the state needed by :meth:`_encode_and_write` (phase B).
         """
-        mm_input, grid_thw = self.engine.run_processor(job.content, job.modality)
-        num_tokens = self.engine.num_vis_tokens(grid_thw)
-        chash = self.engine.content_hash(mm_input, grid_thw)
+        mm_input, grid_thw = self.runner.run_processor(job.content, job.modality)
+        num_tokens = self.runner.num_vis_tokens(grid_thw)
+        chash = self.runner.content_hash(mm_input, grid_thw)
         logger.debug(
             f"[encoder {self.encoder_id}] handling seq={job.seq_id} "
             f"item={job.item_idx} modality={job.modality} "
@@ -269,7 +271,7 @@ class EncoderRuntime:
         num_tokens: int = prep["num_tokens"]
 
         # ViT (with per-replica dedup cache), then stage into the send buf.
-        vis = self.engine.encode(prep["mm_input"], prep["chash"])  # [N, feat_dim]
+        vis = self.runner.encode(prep["mm_input"], prep["chash"])
         assert vis.shape[0] == num_tokens, (
             f"ViT rows {vis.shape[0]} != predicted {num_tokens}"
         )

@@ -9,9 +9,9 @@ from logger import logger
 
 from collections import deque
 
-from gllm.dist_utils import get_pp_size
-from gllm.id_allocator import IDAllocator
-from gllm.sequence import Sequence
+from gllm.distributed.parallel_state import get_pp_size
+from gllm.runtime.id_allocator import IDAllocator
+from gllm.runtime.sequence import GenerationSequence
 from gllm.utils import async_tensor_h2d, get_dtype_bytes
 
 # DeepSeek Sparse Attention FP8 MLA cache: the nope latent is quantized in
@@ -809,7 +809,7 @@ class MemoryManager:
             self.v_scale,
         )
 
-    def pre_allocate_page(self, seqs: List[Sequence], cacheable: bool = True):
+    def pre_allocate_page(self, seqs: List[GenerationSequence], cacheable: bool = True):
         # Base manager has no prefix cache; ``cacheable`` is accepted for a
         # uniform signature with ``PrefixMemoryManager`` and ignored.
         for seq in seqs:
@@ -820,7 +820,7 @@ class MemoryManager:
                 seq.page_table.append(self.segment.allocate())
 
     def pre_allocate_page_for_lengths(
-        self, seqs: List[Sequence], seq_lens: List[int]
+        self, seqs: List[GenerationSequence], seq_lens: List[int]
     ) -> None:
         """Grow page tables to explicit lengths without mutating token lists.
 
@@ -839,11 +839,11 @@ class MemoryManager:
             for _ in range(num_page):
                 seq.page_table.append(self.segment.allocate())
 
-    def register_decode_boundary(self, seq: Sequence, pos: int) -> None:
+    def register_decode_boundary(self, seq: GenerationSequence, pos: int) -> None:
         """No-op without a prefix cache; overridden by ``PrefixMemoryManager``."""
         return
 
-    def free(self, seq: Sequence):
+    def free(self, seq: GenerationSequence):
         for page_num in seq.page_table:
             self.segment.free(page_num)
         self.free_ssm_slot(seq)
@@ -875,7 +875,7 @@ class MemoryManager:
         self._rep_pool = torch.cat([self._rep_pool, new_rows], dim=0)
         self._rep_free_slots.extend(range(old_rows, old_rows + extra))
 
-    def free_rep_slot(self, seq: Sequence) -> None:
+    def free_rep_slot(self, seq: GenerationSequence) -> None:
         if seq.rep_slot is None:
             return
         # Lazy reset: the row is re-filled with ones when the slot is handed
@@ -886,7 +886,7 @@ class MemoryManager:
         seq.rep_slot = None
         seq.rep_filled = 0
 
-    def build_repetition_penalty_mask(self, seqs: List[Sequence]):
+    def build_repetition_penalty_mask(self, seqs: List[GenerationSequence]):
         """Return a ``[batch, vocab]`` scaling-penalty mask, or ``None``.
 
         Incremental + persistent: every seq with ``repetition_penalty != 1.0``
@@ -963,7 +963,7 @@ class MemoryManager:
     # schedule of a sequence (mirroring how KV pages are pre-allocated) and
     # ``free_ssm_slot`` when the sequence finishes or is aborted/preempted.
 
-    def allocate_ssm_slot(self, seq: Sequence) -> None:
+    def allocate_ssm_slot(self, seq: GenerationSequence) -> None:
         if self.ssm_segment is None:
             return
         if self.mtp_k > 0:
@@ -984,7 +984,7 @@ class MemoryManager:
                 return
             seq.ssm_state_slot = self.ssm_segment.allocate_working()
 
-    def free_ssm_slot(self, seq: Sequence) -> None:
+    def free_ssm_slot(self, seq: GenerationSequence) -> None:
         if self.ssm_segment is None:
             return
         if seq.ssm_block_table is not None:
@@ -1020,7 +1020,7 @@ _PREFIX_HASH_SEED = 0x9E3779B97F4A7C15
 _PREFIX_CANARY_LEN = 8
 
 
-def _hash_source(seq: Sequence) -> List[int]:
+def _hash_source(seq: GenerationSequence) -> List[int]:
     """Pick the token list used for prefix-cache hashing.
 
     ``hash_token_ids`` (set by the multimodal pipeline) wins over the raw
@@ -1031,7 +1031,7 @@ def _hash_source(seq: Sequence) -> List[int]:
     return hi if hi is not None else seq.token_ids
 
 
-def _maybe_invalidate_seq_hash_cache(seq: Sequence, src: List[int]) -> None:
+def _maybe_invalidate_seq_hash_cache(seq: GenerationSequence, src: List[int]) -> None:
     """Drop the per-seq incremental hash cache if its source list changed.
 
     The hash source is normally stable for the lifetime of a request --
@@ -1048,7 +1048,7 @@ def _maybe_invalidate_seq_hash_cache(seq: Sequence, src: List[int]) -> None:
         seq._hash_source_ref = id(src)
 
 
-def _ensure_page_hash(seq: Sequence, page_size: int, page_idx: int) -> int:
+def _ensure_page_hash(seq: GenerationSequence, page_size: int, page_idx: int) -> int:
     """Return the chained hash for the first ``(page_idx+1)*page_size`` tokens.
 
     Each new page mixes the previous chain hash with the tuple of token
@@ -1070,7 +1070,7 @@ def _ensure_page_hash(seq: Sequence, page_size: int, page_idx: int) -> int:
     return cache[page_idx]
 
 
-def _ensure_canary(seq: Sequence) -> tuple:
+def _ensure_canary(seq: GenerationSequence) -> tuple:
     """Return the first ``_PREFIX_CANARY_LEN`` ids as a tuple, cached on ``seq``.
 
     Used as a hash-collision sanity check on lookups. Mirrors the original
@@ -1092,7 +1092,7 @@ class PrefixMemoryManager(MemoryManager):
     """KV-page-granular prefix cache with optional SSM snapshot integration.
 
     The cache key is the chained per-page hash built lazily on each
-    ``Sequence`` via ``_ensure_page_hash``: extending the chain by one page
+    ``GenerationSequence`` via ``_ensure_page_hash``: extending the chain by one page
     is O(page_size) instead of O(prefix_len), which keeps long-context
     prefill from spending most of its CPU in tuple/hash construction.
     Multimodal disambiguation is preserved because the hash chain reads
@@ -1156,7 +1156,7 @@ class PrefixMemoryManager(MemoryManager):
         # each is shipped exactly once.
         self._pending_ssm_restores: Dict[int, int] = {}
 
-    def pre_allocate_computed_page(self, seqs: List[Sequence]):
+    def pre_allocate_computed_page(self, seqs: List[GenerationSequence]):
         for seq in seqs:
             assert len(seq.page_table) == 0
             num_page = (len(seq) + self.page_size - 1) // self.page_size
@@ -1176,7 +1176,7 @@ class PrefixMemoryManager(MemoryManager):
         for seq in seqs:
             self._finalize_prefix_cache_hit(seq)
 
-    def _finalize_prefix_cache_hit(self, seq: Sequence) -> None:
+    def _finalize_prefix_cache_hit(self, seq: GenerationSequence) -> None:
         """Post-process a prefix-cache lookup so forward work remains on the prompt.
 
         After a **full** hit (``computed_token_num == len(seq)``) every prompt
@@ -1209,7 +1209,7 @@ class PrefixMemoryManager(MemoryManager):
         elif full_hit:
             seq.computed_token_num = len(seq) - 1
 
-    def _restore_ssm_working_state(self, seq: Sequence) -> None:
+    def _restore_ssm_working_state(self, seq: GenerationSequence) -> None:
         """Copy the deepest *filled* SSM snapshot at/below ``computed_token_num``.
 
         Cached KV pages stay in ``page_table`` and are recomputed in place by
@@ -1239,7 +1239,7 @@ class PrefixMemoryManager(MemoryManager):
         # No usable boundary snapshot: scheduler allocates a fresh (zeroed)
         # working slot and the seq recomputes the whole prompt from h_0.
 
-    def register_decode_boundary(self, seq: Sequence, pos: int) -> None:
+    def register_decode_boundary(self, seq: GenerationSequence, pos: int) -> None:
         """Register the prefix-cache hash for the page completed by the real
         token now at ``seq.token_ids[pos]`` (no-op unless ``pos`` lands on a
         page boundary).
@@ -1264,7 +1264,7 @@ class PrefixMemoryManager(MemoryManager):
         if 0 <= page_idx < len(seq.page_table):
             self.segment.update(seq, n, seq.page_table[page_idx])
 
-    def pre_allocate_page(self, seqs: List[Sequence], cacheable: bool = True):
+    def pre_allocate_page(self, seqs: List[GenerationSequence], cacheable: bool = True):
         """Grow each seq's page table to cover its current ``seq_len``.
 
         ``cacheable`` (default True) registers a prefix-cache hash for any page
@@ -1325,7 +1325,7 @@ class PrefixSegment(Segment):
 
     The cache key for a page is produced by the module-level
     ``_ensure_page_hash(seq, page_size, page_idx)`` which incrementally
-    chains a per-page hash on the ``Sequence`` itself; for VL the
+    chains a per-page hash on the ``GenerationSequence`` itself; for VL the
     sequence's ``hash_token_ids`` view feeds the chain so identical-text +
     different-image prompts no longer collide.
 
@@ -1387,7 +1387,7 @@ class PrefixSegment(Segment):
 
     # --- public API ---------------------------------------------------------
 
-    def update(self, seq: Sequence, n_tokens: int, page_num: int) -> None:
+    def update(self, seq: GenerationSequence, n_tokens: int, page_num: int) -> None:
         """Register a hash for ``page_num`` after its KV was filled in decode."""
         page_idx = n_tokens // self.page_size - 1
         page_hash = _ensure_page_hash(seq, self.page_size, page_idx)
@@ -1396,7 +1396,7 @@ class PrefixSegment(Segment):
             self.hash2page[page_hash] = page_num
             self.page2canary[page_num] = _ensure_canary(seq)
 
-    def has_computed(self, seq: Sequence, n_tokens: int) -> Optional[int]:
+    def has_computed(self, seq: GenerationSequence, n_tokens: int) -> Optional[int]:
         """Look up a cached page. Returns the page id or ``None`` on miss.
 
         Performs a canary equality check so two distinct prefixes that happen
@@ -1416,7 +1416,7 @@ class PrefixSegment(Segment):
         self.page_ref_num[page_num] += 1
         return page_num
 
-    def allocate(self, seq: Optional[Sequence] = None, n_tokens: Optional[int] = None):
+    def allocate(self, seq: Optional[GenerationSequence] = None, n_tokens: Optional[int] = None):
         """Allocate a page; optionally register a prefix hash for it.
 
         Signature is overloaded:

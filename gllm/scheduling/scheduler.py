@@ -7,17 +7,17 @@ from typing import List, Optional
 
 from logger import logger
 
-from gllm.comm import IPCPackage
-from gllm.dist_utils import (
+from gllm.distributed.comm import IPCPackage
+from gllm.distributed.parallel_state import (
     get_pp_rank,
     get_rank,
     get_tp_rank,
     get_world_size,
     is_dp_attn,
 )
-from gllm.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.model_runner import ModelRunner
-from gllm.sequence import Sequence
+from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
+from gllm.runtime.model_runner import ModelRunner
+from gllm.runtime.sequence import GenerationSequence
 
 
 @dataclass
@@ -25,7 +25,7 @@ class _MtpDeferredRow:
     """Host-side reservation for one async MTP output row."""
 
     batch_idx: int
-    seq: Sequence
+    seq: GenerationSequence
     start: int
     placeholder_width: int
     relay_only: bool = False
@@ -64,8 +64,8 @@ class Scheduler:
         self.min_reserve_pages = max(1, self.pp_size)
 
         # seqs to schedule
-        self.seqs_to_prefill: deque[Sequence] = deque()
-        self.seqs_to_decode: deque[Sequence] = deque()
+        self.seqs_to_prefill: deque[GenerationSequence] = deque()
+        self.seqs_to_decode: deque[GenerationSequence] = deque()
         # running batch
         self.batch_running = deque()
         # next tokens
@@ -238,7 +238,7 @@ class Scheduler:
         if len(self.next_tokens_queue) == 0:
             return None
 
-        schedule_seqs: List[Sequence] = self.batch_running.popleft()
+        schedule_seqs: List[GenerationSequence] = self.batch_running.popleft()
         next_tokens, logprobs, prompt_logprobs = self.next_tokens_queue.popleft()
 
         ipc_package = IPCPackage([])
@@ -390,22 +390,22 @@ class Scheduler:
             return None
 
     def schedule_once(self):
-        """Pick a batch from the queues; followers no longer get a Sequence list.
+        """Pick a batch from the queues; followers no longer get a GenerationSequence list.
 
         Previously this method returned a *deep-ish* copy of the batch's
-        ``Sequence`` objects (``post_schedule`` shallow-copied each seq and
+        ``GenerationSequence`` objects (``post_schedule`` shallow-copied each seq and
         stripped token_ids / extracted ``to_compute_tokens``) so that the
         zmq sender thread could safely pickle them while the main thread
         kept mutating the originals.
 
-        With the delta-broadcast (``gllm/dist_schedule.py``) the worker
+        With the delta-broadcast (``gllm/scheduling/distributed.py``) the worker
         snapshots whatever state the followers actually need into a
         :class:`SchedulePayload` at send time, so we just hand back the
-        *real* ``Sequence`` objects -- no copy, no token_ids stripping.
+        *real* ``GenerationSequence`` objects -- no copy, no token_ids stripping.
         The rank-0 paths that still read from the returned list
         (``prepare_input`` for the local ``InputData``, the
         deferred-output processing in :class:`OverlapScheduler`) want
-        the live ``Sequence`` anyway.
+        the live ``GenerationSequence`` anyway.
         """
         if (
             len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0
@@ -472,12 +472,12 @@ class Scheduler:
     def schedule_prefill_batch(
         self, prefill_token_budget, max_seqs=None, reserve_pages=0
     ):
-        prefill_batch: List[Sequence] = []
+        prefill_batch: List[GenerationSequence] = []
         unfinish_prefill_seqs = deque()
         # Encoder-disaggregation overlap (design §6.2): seqs whose next chunk is
         # entirely blocked behind a not-yet-ready image span are parked here and
         # re-queued after this round (no slot/page allocation, no ordering loss).
-        deferred_disagg_seqs: List[Sequence] = []
+        deferred_disagg_seqs: List[GenerationSequence] = []
         prefill_batched_token_nums = 0
         # Hybrid models (Qwen3.5 GDN) cap concurrency at the SSM working
         # pool size; admitting more requests would assertion-crash inside
@@ -608,7 +608,7 @@ class Scheduler:
     def schedule_decode_batch(
         self, decode_token_budget, token_budget=None, mtp_eligible=True
     ):
-        decode_batch: List[Sequence] = []
+        decode_batch: List[GenerationSequence] = []
         self.check_preempt(min(decode_token_budget, len(self.seqs_to_decode)))
         num_to_schedule = min(decode_token_budget, len(self.seqs_to_decode))
         if token_budget is not None and num_to_schedule > 0:
@@ -833,7 +833,7 @@ class OverlapScheduler(Scheduler):
         if len(self.batch_running) == 0:
             return None
 
-        schedule_seqs: List[Sequence] = self.batch_running.popleft()
+        schedule_seqs: List[GenerationSequence] = self.batch_running.popleft()
         deferred_seqs = []
 
         for idx, seq in enumerate(schedule_seqs):
@@ -862,7 +862,7 @@ class OverlapScheduler(Scheduler):
         """
         if not self.batch_running:
             return None
-        schedule_seqs: List[Sequence] = self.batch_running.popleft()
+        schedule_seqs: List[GenerationSequence] = self.batch_running.popleft()
         deferred = []
         to_requeue = []
         decode_rows = int(decode_rows)

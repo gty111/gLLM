@@ -25,7 +25,7 @@ Architectural cheat-sheet (Qwen3.5-0.8B config):
       out     = out_proj(norm)
 
   ``conv_state`` (Cin, kernel) and ``ssm_state`` (Nv, Hk, Hv) live in the
-  :class:`gllm.memory_manager.SSMSegment` working pool; the slot id is
+  :class:`gllm.runtime.memory_manager.SSMSegment` working pool; the slot id is
   ``sequence.ssm_state_slot`` (filled by the scheduler and pushed to GPU
   by :meth:`InputData._cal_ssm_metadata`).
 * Some checkpoints ship an ``mtp.*`` multi-token-prediction head for
@@ -34,7 +34,7 @@ Architectural cheat-sheet (Qwen3.5-0.8B config):
 
 KV-cache layer accounting:
 
-* gllm's ``FlashAttention(layer_id, ...)`` indexes ``segment.k_cache[layer_id]``
+* gllm's ``QKVAttention(layer_id, ...)`` indexes ``segment.k_cache[layer_id]``
   / ``v_cache[layer_id]``. With 24 hybrid layers but only 6 full-attn layers,
   we MUST hand each full-attn layer the dense *kv-layer* index ``0..5``, not
   its global decoder index. The companion ``ssm_layer_id`` (``0..17``)
@@ -49,7 +49,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_local_rank,
     get_pp_layers,
     get_tp_rank,
@@ -58,8 +58,8 @@ from gllm.dist_utils import (
     is_last_pp_rank,
     resolve_pp_layer_idx,
 )
-from gllm.input_data import InputData
-from gllm.layers.attention import FlashAttention
+from gllm.runtime.input_data import InputData
+from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import GemmaRMSNorm, RMSNorm
 from gllm.layers.linear import (
     ColumnParallelLinear,
@@ -83,7 +83,7 @@ from gllm.layers.ops.mamba import (
 )
 from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-from gllm.memory_manager import SSMCacheConfig
+from gllm.runtime.memory_manager import SSMCacheConfig
 from gllm.models.qwen2 import Qwen2MLP
 from gllm.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from gllm.models.weight_utils import (
@@ -107,7 +107,7 @@ from gllm.models.weight_loader import (
     run_vision_loader,
     run_weight_loader,
 )
-from gllm.piecewise_cuda_graph import piecewise_dynamic_tensor
+from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.utils import get_model_load_pbar
 
 
@@ -190,7 +190,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ``A_log``, ``dt_bias``, ``norm``, ``out_proj``. The actual recurrence
     runs on the vendored FLA Triton kernels at
     :mod:`gllm.layers.ops.fla`. State lives in the
-    :class:`gllm.memory_manager.SSMSegment` working pool, addressed via
+    :class:`gllm.runtime.memory_manager.SSMSegment` working pool, addressed via
     ``input_data.get_ssm_state_slot_per_seq()``.
     """
 
@@ -871,7 +871,7 @@ class Qwen3_5FullAttention(nn.Module):
             getattr(config, "max_position_embeddings", 8192),
             config,
         )
-        self.attn = FlashAttention(
+        self.attn = QKVAttention(
             kv_layer_id,
             self.scaling,
             self.num_heads,
@@ -1007,7 +1007,7 @@ class Qwen3_5Model(nn.Module):
 
     * ``self._kv_layer_ids[i] = j``  when layer ``i`` is full-attention and
       this is the j-th full-attention layer (0-indexed). ``j`` is what
-      ``FlashAttention`` uses to address ``segment.k_cache[j]`` /
+      ``QKVAttention`` uses to address ``segment.k_cache[j]`` /
       ``v_cache[j]``.
     * ``self._ssm_layer_ids[i] = j`` when layer ``i`` is linear-attention.
       ``j`` selects ``SSMSegment.conv_state_working[j]`` /

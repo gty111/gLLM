@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 
 from gllm import _custom_ops as ops
-from gllm.dist_utils import get_tp_size
+from gllm.distributed.parallel_state import get_tp_size
 from gllm.utils import cdiv
 from logger import logger
 

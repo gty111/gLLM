@@ -49,7 +49,7 @@ global_rank = pp_rank · S + dp_rank · tp_size + tp_rank,     S = dp_size · tp
 ```
 
 `S` is the **stage size** (ranks per pipeline stage). Group construction lives in
-`gllm/dist_utils.py::init_dp_ep`. Four group families are formed (every rank calls
+`gllm/distributed/parallel_state.py::init_dp_ep`. Four group families are formed (every rank calls
 `dist.new_group` the same number of times in the same order, so the NCCL groups line
 up across ranks):
 
@@ -72,7 +72,7 @@ Example — `pp1 dp2 tp2` (4 GPUs, `S = 4`):
    EP group  : {0,1,2,3}            (expert all-reduce over the whole stage)
 ```
 
-Key accessors in `dist_utils.py`: `is_dp_attn()` (`_DP_SIZE > 1`), `get_dp_size()`,
+Key accessors in `parallel_state.py`: `is_dp_attn()` (`_DP_SIZE > 1`), `get_dp_size()`,
 `get_dp_group()`, `get_ep_group()`, `get_ep_rank()`.
 
 > On the `dp_size == 1` (non-DP) path gLLM keeps its usual TP/PP bookkeeping. On the
@@ -128,7 +128,7 @@ work and others may be idle. But the MoE runs collectives over the DP/EP group, 
 single unconditional all-gather every iteration (`Worker._schedule_forward_dp`):
 
 ```python
-# gllm/worker.py
+# gllm/workers/worker.py
 real_counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)  # over _DP_GROUP
 if sum(real_counts) == 0:
     return                      # every replica idle → all skip in unison
@@ -138,7 +138,7 @@ if real_ntok == 0:              # idle replica rides along with a 1-token dummy
     self.model_runner.prepare_input(dummy_seqs)
 ```
 
-`dp_all_gather_meta` (in `dist_utils.py`) all-gathers each replica's
+`dp_all_gather_meta` (in `parallel_state.py`) all-gathers each replica's
 `(token_count, is_decode)` — a fixed-size collective that doubles as the barrier and
 tells everyone (a) whether anyone has work and (b) whether the *whole world* is a
 pure-decode step (needed for the CUDA-graph decision, §6).
@@ -230,7 +230,7 @@ reset was **discarded** — never sent to any worker, so its `AsyncStream` never
 finished and the HTTP request hung. The DP path (`_send_ipc_package_dp`) has a wider
 window (per-seq zmq sends before the reset), which is why DP+EP tripped it most often.
 
-**Fix** (`gllm/llm_engine.py`, `gllm/async_llm_engine.py`): guard the intake queues
+**Fix** (`gllm/engine/llm.py`, `gllm/engine/async_llm.py`): guard the intake queues
 with `self._pending_lock` and **atomically snapshot-and-clear** them:
 
 ```python

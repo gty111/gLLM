@@ -6,7 +6,7 @@ import numpy as np
 from collections.abc import Callable
 from functools import partial, lru_cache
 
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead
 from gllm.models.utils import _merge_multimodal_embeddings
 from gllm.models.weight_loader import (
@@ -19,7 +19,7 @@ from gllm.models.weight_loader import (
     run_vision_loader,
 )
 from gllm.layers.linear import ColumnParallelLinear, RowParallelLinear
-from gllm.dist_utils import get_tp_size, is_first_pp_rank, is_last_pp_rank
+from gllm.distributed.parallel_state import get_tp_size, is_first_pp_rank, is_last_pp_rank
 
 from .qwen2_5_vl import (MultiModalEmbeddings, Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLVideoInputs, 
                          Qwen2_5_VLVideoPixelInputs, 

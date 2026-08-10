@@ -23,7 +23,7 @@ Determinism (column-driver model): the coordinator runs only on TP0 (== rank
 0), and its per-iteration :class:`DisaggEvents` are fanned out to every PP0 TP
 rank alongside the normal ``broadcast_input_to_tp`` input. Each rank applies the
 *same* events in the *same* iteration -- ``ADMIT`` rebuilds the expanded
-``Sequence`` into the scheduler, ``EMB_READY`` clones the embedding from that
+``GenerationSequence`` into the scheduler, ``EMB_READY`` clones the embedding from that
 rank's *own* slot pool -- so every column's scheduler / model runner stays in
 lockstep. The encoder writes all N rank pools then sends a *single*
 notification to TP0, so TP0's embedding-ready gate implies "every rank's write
@@ -48,7 +48,7 @@ from logger import logger
 from gllm.disagg.discovery import make_discovery, make_payload, payload_nixl_meta
 from gllm.disagg.protocol import EncoderJob, MmItemMeta, parse_emb_notif
 from gllm.layers.rotary_embedding import MRotaryEmbedding
-from gllm.model_runner import DisaggSeqState, ModelRunner
+from gllm.runtime.model_runner import DisaggSeqState, ModelRunner
 from gllm.transfer.nixl_transfer import NixlEndpoint, RemoteRegion
 
 
@@ -135,7 +135,7 @@ class DisaggEvents:
     iteration -- the basis of column-driver determinism under TP>1.
     """
 
-    # (expanded ``Sequence``, freshly-built :class:`DisaggSeqState`):
+    # (expanded ``GenerationSequence``, freshly-built :class:`DisaggSeqState`):
     # register the state + add the seq to the scheduler.
     admits: List[Tuple[object, DisaggSeqState]] = field(default_factory=list)
     # (seq_id, ordered_idx, slot_id, num_tokens): clone the embedding from this

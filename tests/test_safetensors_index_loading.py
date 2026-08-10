@@ -4,7 +4,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from gllm.model_loader import ModelLoader
+from gllm.runtime.model_loader import ModelLoader
 
 
 def _loader() -> ModelLoader:

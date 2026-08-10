@@ -131,7 +131,7 @@ def set_dp_info(dp_rank, dp_size, local_rank=None):
     """Record this replica's DP rank/size (bookkeeping/logging only).
 
     Used on the ``dp_size == 1`` path (and as a fallback) to record
-    ``local_rank`` in dist_utils: with ``pp_size == tp_size == 1`` the engine
+    ``local_rank`` in parallel state: with ``pp_size == tp_size == 1`` the engine
     never calls :func:`init_dist`, so ``_LOCAL_RANK`` would otherwise stay ``0``
     on every process. Several call sites key off ``get_local_rank()`` -- most
     importantly the weight-load progress array (indexed ``rank*2`` /
@@ -591,7 +591,7 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     either, which is exactly the source of its memcpy32_post=0 in our
     side-by-side trace comparison).
     """
-    # Import lazily to avoid a circular import at module init (dist_utils is
+    # Import lazily to avoid a circular import at module init (parallel state is
     # imported by gllm.distributed.cuda_wrapper transitively via ``logger``).
     from gllm.distributed import get_custom_allreduce
 

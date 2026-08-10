@@ -6,7 +6,7 @@ import time
 import torch
 from logger import logger
 
-from gllm.dist_utils import get_world_size
+from gllm.distributed.parallel_state import get_world_size
 
 
 class TorchProfilerMixin:

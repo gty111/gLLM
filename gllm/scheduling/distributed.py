@@ -4,7 +4,7 @@ Why a new module
 ================
 
 Before this module existed, every scheduling iteration rank-0 pickled a
-list of (post-processed) ``Sequence`` objects and shipped it via zmq to
+list of (post-processed) ``GenerationSequence`` objects and shipped it via zmq to
 every other TP / PP follower. Even after ``Scheduler.post_schedule``
 stripped ``token_ids`` for non-VL non-rep-penalty seqs, each iteration
 still re-pickled:
@@ -54,10 +54,10 @@ Design notes
   signaled via :class:`SeqUpdate.page_table_reset` (the only update
   field that's normally ``None``).
 
-* The :class:`FollowerSeq` mirror duck-types ``Sequence`` for every
+* The :class:`FollowerSeq` mirror duck-types ``GenerationSequence`` for every
   attribute that ``InputData.cal_input``, ``InputData.prepare_sample``,
   and ``ModelRunner._mm_prepare_cpu`` actually read on a follower. We
-  did *not* subclass ``Sequence`` -- ``Sequence`` carries fields the
+  did *not* subclass ``GenerationSequence`` -- ``GenerationSequence`` carries fields the
   follower never touches (e.g. ``prompt`` / ``output`` strings, the
   tokenizer-incremental detokenize cursor), and shrinking the mirror
   helps both pickling speed (registers stay small) and per-iteration
@@ -92,7 +92,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from gllm.sequence import Sequence
+from gllm.runtime.sequence import GenerationSequence
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ from gllm.sequence import Sequence
 class SeqRegister:
     """One-time per-seq registration sent to a follower group.
 
-    Carries every field of ``Sequence`` that the follower will need
+    Carries every field of ``GenerationSequence`` that the follower will need
     across the seq's lifetime *and* that is either fully immutable or
     bootstrap-only (the prompt token_ids are mutated only by the
     follower itself if it has to accumulate decode tokens for
@@ -280,7 +280,7 @@ class DriverPayloadBuilder:
 
     def build(
         self,
-        scheduled_seqs: List[Sequence],
+        scheduled_seqs: List[GenerationSequence],
         frees: List[int],
         mrope_positions: Optional[torch.Tensor] = None,
         control_cmd: int = 0,
@@ -292,7 +292,7 @@ class DriverPayloadBuilder:
         """Snapshot ``scheduled_seqs`` into a payload + update cursors.
 
         Must be called from the same thread that mutates the underlying
-        ``Sequence`` objects (i.e. the worker's main loop). All fields
+        ``GenerationSequence`` objects (i.e. the worker's main loop). All fields
         we copy out are either immutable or copied into fresh lists, so
         the payload is safe to hand off to the persistent zmq sender
         thread even if the main thread continues mutating ``seq``
@@ -323,7 +323,7 @@ class DriverPayloadBuilder:
                         seq_id=sid,
                         # ``list(...)`` to materialize a fresh list so
                         # the follower's mirror doesn't accidentally
-                        # alias the driver's ``Sequence.token_ids``
+                        # alias the driver's ``GenerationSequence.token_ids``
                         # (which the driver continues to mutate via
                         # ``seq.append`` / placeholder rewrites in
                         # ``OverlapScheduler``).
@@ -359,7 +359,7 @@ class DriverPayloadBuilder:
             cur_n = len(seq.page_table)
             page_table_reset: Optional[List[int]] = None
             if cur_n < last_n:
-                # Preemption: ``Sequence.preempt`` cleared page_table.
+                # Preemption: ``GenerationSequence.preempt`` cleared page_table.
                 # Re-baseline the follower's mirror from scratch.
                 page_table_reset = []
                 new_page_ids = list(seq.page_table)
@@ -426,11 +426,11 @@ class DriverPayloadBuilder:
 class FollowerSeq:
     """Lightweight per-seq mirror on a TP/PP follower rank.
 
-    Quacks like ``gllm.sequence.Sequence`` for every attribute that
-    :class:`gllm.input_data.InputData` (``cal_input`` /
+    Quacks like ``gllm.runtime.sequence.GenerationSequence`` for every attribute that
+    :class:`gllm.runtime.input_data.InputData` (``cal_input`` /
     ``prepare_sample``) and
-    :meth:`gllm.model_runner.ModelRunner._mm_prepare_cpu` actually read
-    on a follower. Intentionally **not** a subclass of ``Sequence`` --
+    :meth:`gllm.runtime.model_runner.ModelRunner._mm_prepare_cpu` actually read
+    on a follower. Intentionally **not** a subclass of ``GenerationSequence`` --
     we want a tight slot layout and an obvious surface contract
     (anything on this class is a thing followers genuinely consume).
 
@@ -531,7 +531,7 @@ class FollowerSeq:
         # Prompt-logprobs mirror. ``_compute_prompt_logprobs`` reads
         # ``prompt_logprobs_enabled`` / ``num_prompt_logprobs`` / ``raw_prompt_len``
         # and accumulates into ``prompt_logprobs_data`` (same shape as the real
-        # ``Sequence``). No ``_prompt_logprobs_sent`` latch is needed: the
+        # ``GenerationSequence``). No ``_prompt_logprobs_sent`` latch is needed: the
         # follower emits each completed list exactly once via the runner's
         # ``_last_prompt_logprobs`` (keyed on the prefill-completing step), and
         # decode steps are skipped by the ``computed_prompt`` gate.
@@ -540,7 +540,7 @@ class FollowerSeq:
         self.raw_prompt_len = reg.raw_prompt_len
         self.prompt_logprobs_data = None
 
-    # ---- duck-typed Sequence surface --------------------------------------
+    # ---- duck-typed GenerationSequence surface --------------------------------------
 
     @property
     def seq_len(self) -> int:
@@ -554,7 +554,7 @@ class FollowerSeq:
         if self.token_ids is not None:
             return len(self.token_ids)
         # Best-effort fallback for callers that compute "current
-        # position" from ``len(seq)``. The driver-side ``Sequence``
+        # position" from ``len(seq)``. The driver-side ``GenerationSequence``
         # has ``len = prompt_len + #generated``; we mirror that
         # without keeping per-token state.
         return self.seq_len

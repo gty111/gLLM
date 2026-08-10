@@ -6,8 +6,8 @@ import torch
 import torch.distributed as dist
 import zmq
 
-from gllm.dist_schedule import SchedulePayload
-from gllm.dist_utils import (
+from gllm.scheduling.distributed import SchedulePayload
+from gllm.distributed.parallel_state import (
     get_ipc_tp_group,
     get_output_rank,
     get_pp_rank,
@@ -19,7 +19,7 @@ from gllm.dist_utils import (
     recv_obj_list,
     send_obj_list,
 )
-from gllm.sequence import Sequence
+from gllm.runtime.sequence import GenerationSequence
 from gllm.utils import make_socket, make_pull_random
 
 
@@ -27,7 +27,7 @@ _SHUTDOWN = object()  # sentinel pushed onto a sender queue to drain it
 
 
 class IPCPackage:
-    def __init__(self, schedule_lists: List[Sequence]):
+    def __init__(self, schedule_lists: List[GenerationSequence]):
         # front-end => worker
         self.log = True
         self.schedule_lists = schedule_lists

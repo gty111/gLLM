@@ -43,7 +43,7 @@ Compatibility note: this module rejects ``pp_size > 1`` like before.
 The new design generalizes (each column driver would also push its
 own per-column ``SchedulePayload`` to its PP-other followers), but
 :class:`OverlapModelRunner` itself is single-stage; PP > 1 falls back
-to the (also-refactored) :class:`gllm.worker.Worker` path.
+to the (also-refactored) :class:`gllm.workers.worker.Worker` path.
 """
 
 from collections import deque
@@ -51,15 +51,15 @@ from dataclasses import dataclass, field
 
 import torch
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     dp_all_gather_meta,
     is_dp_attn,
     set_dp_forward_counts,
 )
-from gllm.input_data import InputData
-from gllm.model_runner import OverlapModelRunner
-from gllm.scheduler import OverlapScheduler
-from gllm.worker import Worker
+from gllm.runtime.input_data import InputData
+from gllm.runtime.model_runner import OverlapModelRunner
+from gllm.scheduling.scheduler import OverlapScheduler
+from gllm.workers.worker import Worker
 
 
 @dataclass
@@ -238,7 +238,7 @@ class OverlapWorker(Worker):
 
         Every PP-0 TP rank reads its own ``_next_tokens_bufs`` slot (each rank
         did its own D2H copy from the broadcast tokens inside
-        ``run_batch_async``) and updates its local Sequence state / frees pages;
+        ``run_batch_async``) and updates its local GenerationSequence state / frees pages;
         only the frontend poller (rank 0, or each DP group's ``tp_rank == 0``)
         forwards the resulting ``IPCPackage``. ``is_dummy`` batches (idle DP
         groups) and empty ``deferred`` carry no output and are skipped.

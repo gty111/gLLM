@@ -1,7 +1,7 @@
 import torch
 from sgl_kernel import top_k_top_p_sampling_from_probs
 
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.repetition_penalty import apply_scaling_penalties
 
 

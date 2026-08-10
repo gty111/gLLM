@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 from sgl_kernel.scalar_type import scalar_types
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_ep_rank,
     get_ep_size,
     get_tp_size,
@@ -41,7 +41,7 @@ class FusedMoEMethod(torch.nn.Module):
     ):
         # Import lazily so the generic MoE layer does not depend on the model
         # runner unless piecewise capture is actually active.
-        from gllm.piecewise_cuda_graph import PiecewiseRuntime
+        from gllm.runtime.piecewise_cuda_graph import PiecewiseRuntime
 
         runtime = PiecewiseRuntime.current()
         if runtime is None:

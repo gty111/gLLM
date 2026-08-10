@@ -1,17 +1,20 @@
-from typing import TYPE_CHECKING, Optional
+"""Multi-head latent attention execution and decode backend selection."""
+
+from typing import Optional
 
 import torch
 from logger import logger
 
 from gllm import _custom_ops as ops
-from gllm.input_data import InputData, MLACommonMetadata, MLACommonPrefillMetadata
 from gllm.layers.linear import ColumnParallelLinear, LinearBase
 from gllm.layers.ops.merge_attn_states import merge_attn_states
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
+from gllm.runtime.input_data import (
+    InputData,
+    MLACommonMetadata,
+    MLACommonPrefillMetadata,
+)
 from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
-
-if TYPE_CHECKING:
-    from gllm.layers.attention_backends import AttentionBackend
 
 # FA3 MLA decode (sgl_kernel flash_attn with qv=) — same path as SGLang ``fa3``.
 try:
@@ -45,60 +48,6 @@ _FLASHMLA_PAGE_SIZE = 64
 
 # Log the resolved MLA decode backend once per worker at model load.
 _mla_decode_backend_startup_logged = False
-
-
-class FlashAttention:
-
-    def __init__(
-        self,
-        layer_id: int,
-        scale: float,
-        num_heads: int,
-        num_key_value_heads: int,
-        head_dim: int,
-    ):
-        self.scale = scale
-        self.layer_id = layer_id
-        self.num_heads = num_heads
-        self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
-        self.backend: Optional["AttentionBackend"] = None
-
-    def set_backend(self, backend: "AttentionBackend") -> None:
-        self.backend = backend
-
-    def forward(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, input_data: InputData
-    ):
-        # profile run: the KV segment is only built in ``MemoryManager.init``
-        # (after the profiling forward). Guard on ``is None`` rather than
-        # ``hasattr`` so the check still fires now that ``segment`` is declared
-        # as a ``None`` attribute in ``MemoryManager.__init__``.
-        if getattr(input_data.memory_manager, "segment", None) is None:
-            return q
-
-        q = q.view(-1, self.num_heads, self.head_dim)
-        k = k.view(-1, self.num_key_value_heads, self.head_dim)
-        v = v.view(-1, self.num_key_value_heads, self.head_dim)
-
-        input_data.memory_manager.batch_store(
-            self.layer_id, k, v, input_data.get_slot_mapping()
-        )
-
-        k_cache = input_data.memory_manager.segment.k_cache[self.layer_id]
-        v_cache = input_data.memory_manager.segment.v_cache[self.layer_id]
-
-        if self.backend is None:
-            raise RuntimeError(
-                "Standard attention backend was not injected into FlashAttention"
-            )
-        metadata = input_data.attention_metadata
-        if metadata is None:
-            raise RuntimeError(
-                "Standard attention metadata was not prepared before forward"
-            )
-        out = self.backend.forward(q, k_cache, v_cache, metadata, self.scale)
-        return out.view(-1, out.shape[-2] * out.shape[-1])
 
 
 class MLAAttention:
@@ -744,7 +693,9 @@ class MLAAttention:
             # tail; ``cache_seqlens`` = number of valid (>= 0) selected slots
             # per query, so FA3 never walks into the -1 padding.
             flat = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
-            c_kv_cache = flat[..., : self.kv_lora_rank].view(-1, 1, 1, self.kv_lora_rank)
+            c_kv_cache = flat[..., : self.kv_lora_rank].view(
+                -1, 1, 1, self.kv_lora_rank
+            )
             k_rope_cache = flat[..., self.kv_lora_rank :].view(
                 -1, 1, 1, flat.shape[-1] - self.kv_lora_rank
             )
@@ -998,7 +949,7 @@ class MLAAttention:
         """
         assert output is not None, "Output tensor must be provided."
 
-        # profile run (see FlashAttention.forward): guard on ``is None`` so the
+        # profile run (see QKVAttention.forward): guard on ``is None`` so the
         # check survives ``segment`` being a declared ``None`` attribute.
         if getattr(input_data.memory_manager, "segment", None) is None:
             self.process_weights()

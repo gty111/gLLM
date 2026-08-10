@@ -1,4 +1,4 @@
-"""Encoder engine: vision-only ViT inference for encoder disaggregation.
+"""Vision model runner for encoder-disaggregated inference.
 
 A single Encoder replica (one process, one GPU) owns the full visual stack:
 
@@ -12,7 +12,7 @@ worker (wired in later phases); this module is purely the compute side.
 
 Numerical equivalence with the monolith is preserved by reusing the exact
 ``model.embed_multimodal`` code path (via ``embed_multimodal_single``) and the
-exact processor + content-hash helpers from :mod:`gllm.model_runner`.
+exact processor + content-hash helpers from :mod:`gllm.runtime.model_runner`.
 """
 
 from __future__ import annotations
@@ -25,14 +25,14 @@ from transformers import AutoProcessor
 from transformers.image_utils import load_images
 from transformers.video_utils import load_video
 
-from gllm.model_loader import ModelLoader
-from gllm.model_runner import (
+from gllm.runtime.model_loader import ModelLoader
+from gllm.runtime.model_runner import (
     MultiModalEmbeddingCache,
     _build_item_content_hash,
 )
 
 
-class EncoderEngine:
+class VisionEncoderRunner:
     """Loads the vision tower + processor and encodes one mm item at a time."""
 
     def __init__(
@@ -92,7 +92,9 @@ class EncoderEngine:
         assert getattr(self.model, "visual", None) is not None, (
             "encoder model has no vision tower"
         )
-        logger.info("EncoderEngine ready: vision tower loaded, language model skipped")
+        logger.info(
+            "VisionEncoderRunner ready: vision tower loaded, language model skipped"
+        )
 
     # ------------------------------------------------------------------
     # CPU: processor + grid + token count + content hash (per item)

@@ -1,7 +1,7 @@
 """CLI arguments shared by the serving entrypoints.
 
 ``api_server`` and ``lm_server`` configure the *same* engine
-(:class:`gllm.async_llm_engine.PipeAsyncLLM`); they differ only in what sits in
+(:class:`gllm.engine.async_llm.AsyncLLM`); they differ only in what sits in
 front of it (an OpenAI-compatible HTTP app vs an encoder-disaggregated LM node).
 Every engine knob therefore has to exist in both, and duplicating the
 definitions means every new one is added twice, drifts in its default or help
@@ -89,7 +89,7 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
         choices=["auto", "fa3", "flashinfer"],
         default="auto",
         help=(
-            "Paged attention backend for ordinary MHA/GQA layers. 'auto' "
+            "Paged attention backend for explicit-QKV MHA/GQA/MQA layers. 'auto' "
             "selects FlashInfer on Blackwell SM100 and sgl-kernel FA3 on "
             "supported SM8x/SM9x GPUs."
         ),

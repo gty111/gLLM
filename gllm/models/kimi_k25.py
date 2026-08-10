@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from gllm.dist_utils import is_first_pp_rank
+from gllm.distributed.parallel_state import is_first_pp_rank
 from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 from gllm.models.kimi_k25_vision import KimiPatchMerger, KimiVisionTower
 from gllm.models.utils import _merge_multimodal_embeddings
@@ -164,7 +164,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         super().__init__()
         self.full_config = config
         # Language backbone reads ``text_config``; runtime serving flags are
-        # mirrored there by :func:`gllm.model_loader.propagate_serving_config`.
+        # mirrored there by :func:`gllm.runtime.model_loader.propagate_serving_config`.
         self.config = config.text_config
 
         # ``vision_config`` ships as a plain dict on the top-level config.

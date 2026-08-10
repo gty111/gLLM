@@ -46,13 +46,13 @@ import torch
 import torch.distributed as dist
 from logger import logger
 
-from gllm.comm import IPCPackage, zmqComm
-from gllm.dist_schedule import (
+from gllm.distributed.comm import IPCPackage, zmqComm
+from gllm.scheduling.distributed import (
     DriverPayloadBuilder,
     FollowerSeqStore,
     SchedulePayload,
 )
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     dp_all_gather_meta,
     get_last_pp_rank,
     get_next_pp_rank,
@@ -71,13 +71,13 @@ from gllm.dist_utils import (
     send_pp_data,
     set_dp_forward_counts,
 )
-from gllm.input_data import InputData
-from gllm.model_runner import ModelRunner, OverlapModelRunner
-from gllm.profiler_mixin import TorchProfilerMixin
-from gllm.scheduler import Scheduler
+from gllm.runtime.input_data import InputData
+from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
+from gllm.runtime.profiler import TorchProfilerMixin
+from gllm.scheduling.scheduler import Scheduler
 
 
-# Used with PipeAsyncLLM
+# Used with AsyncLLM
 class Worker(TorchProfilerMixin):
 
     def __init__(
@@ -150,7 +150,7 @@ class Worker(TorchProfilerMixin):
         # DP-attention bookkeeping (set as attributes by the engine's
         # build_worker; default to the single-replica case for any other
         # construction path).
-        from gllm.dist_utils import init_dp_ep, set_dp_info
+        from gllm.distributed.parallel_state import init_dp_ep, set_dp_info
 
         self.dp_rank = getattr(self, "dp_rank", 0)
         self.dp_size = getattr(self, "dp_size", 1)
@@ -175,7 +175,7 @@ class Worker(TorchProfilerMixin):
             )
             self.init_logger()
         else:
-            # Record local_rank in dist_utils: the pp=tp=1 path skips init_dist,
+            # Record local_rank in parallel state: the pp=tp=1 path skips init_dist,
             # so without this every process reports get_local_rank()==0 and
             # collides on the weight-load progress slot.
             set_dp_info(self.dp_rank, self.dp_size, local_rank=self.local_rank)
@@ -211,7 +211,7 @@ class Worker(TorchProfilerMixin):
         # skip custom AR under DP to keep the multi-group init simple.
         if self.tp_size > 1 and not is_dp_attn():
             from gllm.distributed import init_custom_allreduce
-            from gllm.dist_utils import get_tp_group
+            from gllm.distributed.parallel_state import get_tp_group
 
             init_custom_allreduce(
                 device=torch.device(f"cuda:{self.local_rank}"),
@@ -276,7 +276,7 @@ class Worker(TorchProfilerMixin):
         # a one-time, non-hot-path all-gather over the TP group.
         handshake = recv.handshake()
         if self.tp_size > 1:
-            from gllm.dist_utils import get_tp_group
+            from gllm.distributed.parallel_state import get_tp_group
 
             gathered: List[Optional[dict]] = [None] * self.tp_size
             dist.all_gather_object(gathered, handshake, group=get_tp_group())
@@ -378,7 +378,7 @@ class Worker(TorchProfilerMixin):
             self.payload_builder = DriverPayloadBuilder()
         else:
             # Per-rank state mirror. Replaces the stateless "rebuild
-            # InputData from a freshly-pickled Sequence list every iter"
+            # InputData from a freshly-pickled GenerationSequence list every iter"
             # pattern with an incremental delta application.
             # VL models need ``seq.token_ids`` on the follower for *every*
             # prefill seq (even text-only ones) because ``_mm_prepare_cpu``'s

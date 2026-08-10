@@ -4,7 +4,7 @@ from typing import Dict, List
 from fastapi import Request
 from logger import logger
 
-from gllm.llm_engine import LLM
+from gllm.engine.llm import LLM
 from gllm.utils import make_async
 
 
@@ -14,7 +14,7 @@ class AsyncStream:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._finished = False
         self._raw_request = raw_request
-        # The owning Sequence, kept so response builders can report accurate
+        # The owning GenerationSequence, kept so response builders can report accurate
         # token usage (prompt_len / generated count) and finish_reason once the
         # stream drains. The engine appends generated ids to this same object,
         # so it holds the final counts by the time the stream finishes.
@@ -57,7 +57,8 @@ def _log_task_completion(task: asyncio.Task) -> None:
         logger.error("Engine background task failed", exc_info=e)
 
 
-class PipeAsyncLLM(LLM):
+class AsyncLLM(LLM):
+    """Asynchronous request and stream facade over :class:`LLM`."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
