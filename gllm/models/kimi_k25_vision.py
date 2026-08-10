@@ -79,10 +79,14 @@ class Learnable2DInterpPosEmbDivided(nn.Module):
         self.num_frames = num_frames
         self.dim = dim
         self.interpolation_mode = interpolation_mode
-        self.weight = nn.Parameter(torch.empty(height, width, dim))
+        self.weight = nn.Parameter(
+            torch.empty(height, width, dim, device="cuda")
+        )
         self.register_buffer(
             "time_weight",
-            torch.from_numpy(_get_1d_sincos_pos_embed(dim, num_frames))
+            torch.as_tensor(
+                _get_1d_sincos_pos_embed(dim, num_frames), device="cuda"
+            )
             .float()
             .unsqueeze(1),
             persistent=False,
@@ -136,7 +140,11 @@ class KimiVisionPatchEmbed(nn.Module):
             patch_size = (patch_size, patch_size)
         self.patch_size = patch_size
         self.proj = nn.Conv2d(
-            in_dim, out_dim, kernel_size=patch_size, stride=patch_size
+            in_dim,
+            out_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            device="cuda",
         )
         self.pos_emb = Learnable2DInterpPosEmbDivided(
             height=pos_emb_height,
@@ -180,10 +188,12 @@ class Rope2DPosEmb(nn.Module):
 
     def _precompute_freqs_cis(self, device: torch.device) -> torch.Tensor:
         N = self.max_height * self.max_width
-        flat_pos = torch.arange(0, N).float().to(device)
+        flat_pos = torch.arange(0, N, device=device).float()
         x_pos = flat_pos % self.max_width
         y_pos = flat_pos // self.max_width
-        dim_range = torch.arange(0, self.dim, 4)[: (self.dim // 4)].float().to(device)
+        dim_range = torch.arange(0, self.dim, 4, device=device)[
+            : (self.dim // 4)
+        ].float()
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
         x_freqs = torch.outer(x_pos, freqs).float()
         y_freqs = torch.outer(y_pos, freqs).float()
@@ -213,8 +223,8 @@ class Rope2DPosEmb(nn.Module):
 class KimiVisionMLP(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
         super().__init__()
-        self.fc0 = nn.Linear(in_dim, hidden_dim, bias=True)
-        self.fc1 = nn.Linear(hidden_dim, out_dim, bias=True)
+        self.fc0 = nn.Linear(in_dim, hidden_dim, bias=True, device="cuda")
+        self.fc1 = nn.Linear(hidden_dim, out_dim, bias=True, device="cuda")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Reference uses PytorchGELUTanh (gelu, approximate="tanh").
@@ -229,11 +239,13 @@ class KimiVisionBlock(nn.Module):
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
         self.head_dim = hidden_dim // num_heads
-        self.norm0 = nn.LayerNorm(hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm0 = nn.LayerNorm(hidden_dim, device="cuda")
+        self.norm1 = nn.LayerNorm(hidden_dim, device="cuda")
         self.mlp = KimiVisionMLP(hidden_dim, mlp_dim, hidden_dim)
-        self.wqkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=True)
-        self.wo = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.wqkv = nn.Linear(
+            hidden_dim, hidden_dim * 3, bias=True, device="cuda"
+        )
+        self.wo = nn.Linear(hidden_dim, hidden_dim, bias=True, device="cuda")
 
     def _attn(self, x, cu_seqlens, max_seqlen, rope_freqs_cis):
         seqlen = x.shape[0]
@@ -277,7 +289,7 @@ class KimiVisionEncoder(nn.Module):
         self.blocks = nn.ModuleList(
             [KimiVisionBlock(num_heads, hidden_dim, mlp_dim) for _ in range(num_layers)]
         )
-        self.final_layernorm = nn.LayerNorm(hidden_dim)
+        self.final_layernorm = nn.LayerNorm(hidden_dim, device="cuda")
 
     def forward(self, hidden_states: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         rope_freqs_cis = self.rope_2d.get_freqs_cis(grid_thws, hidden_states.device)
@@ -360,12 +372,12 @@ class KimiPatchMerger(nn.Module):
         kh, kw = c["merge_kernel_size"]
         self.hidden_size = mm_hidden * (kh * kw)
         text_hidden = c["text_hidden_size"]
-        self.pre_norm = nn.LayerNorm(mm_hidden, eps=eps)
+        self.pre_norm = nn.LayerNorm(mm_hidden, eps=eps, device="cuda")
         # nn.Sequential to keep checkpoint key names ``proj.0`` / ``proj.2``.
         self.proj = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size, device="cuda"),
             nn.GELU(),
-            nn.Linear(self.hidden_size, text_hidden),
+            nn.Linear(self.hidden_size, text_hidden, device="cuda"),
         )
 
     def forward(self, x: List[torch.Tensor]) -> List[torch.Tensor]:

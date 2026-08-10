@@ -240,8 +240,10 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     b_v = tl.load(p_mixed + v_off, mask=mask_v, other=0).to(tl.float32)
 
     if USE_QK_L2NORM_IN_KERNEL:
-        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        # Keep ordinary decode numerically identical to the qlen>1 verify
+        # kernel by normalizing Q/K in the same precision and order.
+        b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+        b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
     b_q = b_q * scale
 
     a_val = tl.load(a + i_n * stride_a_tok + i_hv).to(tl.float32)
@@ -251,9 +253,13 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     x = a_val + dt_bias_val
     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
     g_val = -tl.exp(A_log_val) * softplus_x
-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+    # Keep sigmoid gating in FP32 for both qlen=1 decode and qlen>1 speculative
+    # verify. Rounding sigmoid(beta) through BF16 here
+    # made the bootstrap state numerically different from the qlen=4 state;
+    # that small first-token error compounds across the recurrent verify.
+    beta_val = tl.sigmoid(b_val.to(tl.float32))
 
-    b_h *= exp(g_val)
+    b_h *= tl.exp(g_val)
     b_v -= tl.sum(b_h * b_k[None, :], 1)
     b_v *= beta_val
     b_h += b_v[:, None] * b_k[None, :]
@@ -360,7 +366,10 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         )
     BV = min(triton.next_power_of_2(V), 32)
     num_stages = 3
-    num_warps = 1
+    # Use the same four-warp reduction tree for one-token decode and multi-token
+    # speculative verify; it affects recurrent-state numerics, not just launch
+    # performance.
+    num_warps = 4
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)
@@ -946,14 +955,14 @@ fused_recurrent_gdn = fused_recurrent_gated_delta_rule
 
 
 # ---------------------------------------------------------------------------
-# vLLM-style 2D-block-index + num_accepted spec-decode recurrent kernel.
+# 2D-block-index + num_accepted spec-decode recurrent kernel.
 #
 # Ported from vLLM v0.22.0 fla/ops/fused_recurrent.py (same FLA lineage,
 # Apache-2.0). Unlike the ``_update`` kernel above (which writes per-token
 # checkpoints into a SEPARATE ``intermediate_states_buffer`` at a contiguous
 # ``[row, step]`` layout), this variant reads/writes the ONE shared state pool
 # ``h`` in place, addressed by a 2D ``ssm_state_indices [nseq, 1+K]`` block
-# table. See [[vllm-gdn-spec-decode-mechanism]] for the exact column protocol:
+# table. The complete column protocol is:
 #   * read  init state from column ``i_t = num_accepted[seq]-1``
 #   * for verify token t=0..T-1, write post-state to column t
 # so a verify over [x1,d1..dk] fills columns 0..k, and the next step selects
@@ -969,13 +978,15 @@ fused_recurrent_gdn = fused_recurrent_gated_delta_rule
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
     }
 )
-@triton.jit(do_not_specialize=["N", "T"])
+@triton.jit(do_not_specialize=["N"])
 def fused_recurrent_gdn_spec_fwd_kernel(
+    A_log,
+    a,
+    b,
+    dt_bias,
     q,
     k,
     v,
-    g,
-    beta,
     o,
     h0,
     ht,
@@ -984,7 +995,7 @@ def fused_recurrent_gdn_spec_fwd_kernel(
     num_accepted_tokens,
     scale,
     N: tl.int64,  # num of sequences
-    T: tl.int64,  # num of tokens
+    T: tl.constexpr,  # tokens per sequence (fixed 1+k for MTP verify)
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -996,9 +1007,22 @@ def fused_recurrent_gdn_spec_fwd_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    stride_a_token: tl.constexpr,
+    stride_a_head: tl.constexpr,
+    stride_b_token: tl.constexpr,
+    stride_b_head: tl.constexpr,
+    stride_q_token: tl.constexpr,
+    stride_q_head: tl.constexpr,
+    stride_q_dim: tl.constexpr,
+    stride_k_token: tl.constexpr,
+    stride_k_head: tl.constexpr,
+    stride_k_dim: tl.constexpr,
+    stride_v_token: tl.constexpr,
+    stride_v_head: tl.constexpr,
+    stride_v_dim: tl.constexpr,
+    SOFTPLUS_THRESHOLD: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     INPLACE_FINAL_STATE: tl.constexpr,
-    IS_BETA_HEADWISE: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
@@ -1024,14 +1048,13 @@ def fused_recurrent_gdn_spec_fwd_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     o_v = i_v * BV + tl.arange(0, BV)
 
-    p_q = q + (bos * H + i_h) * K + o_k
-    p_k = k + (bos * H + i_h) * K + o_k
-    p_v = v + (bos * HV + i_hv) * V + o_v
-    if IS_BETA_HEADWISE:
-        p_beta = beta + (bos * HV + i_hv) * V + o_v
-    else:
-        p_beta = beta + bos * HV + i_hv
-    p_g = g + bos * HV + i_hv
+    p_q = q + bos * stride_q_token + i_h * stride_q_head + o_k * stride_q_dim
+    p_k = k + bos * stride_k_token + i_h * stride_k_head + o_k * stride_k_dim
+    p_v = v + bos * stride_v_token + i_hv * stride_v_head + o_v * stride_v_dim
+    p_A_log = A_log + i_hv
+    p_a = a + bos * stride_a_token + i_hv * stride_a_head
+    p_b = b + bos * stride_b_token + i_hv * stride_b_head
+    p_dt_bias = dt_bias + i_hv
     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
@@ -1060,19 +1083,26 @@ def fused_recurrent_gdn_spec_fwd_kernel(
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)
         b_v = tl.load(p_v, mask=mask_v, other=0).to(tl.float32)
-        b_g = tl.load(p_g).to(tl.float32)
+        a_val = tl.load(p_a).to(tl.float32)
+        b_val = tl.load(p_b).to(tl.float32)
+        A_log_val = tl.load(p_A_log).to(tl.float32)
+        dt_bias_val = tl.load(p_dt_bias).to(tl.float32)
+        x = a_val + dt_bias_val
+        softplus_x = tl.where(
+            x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x
+        )
+        g_val = -tl.exp(A_log_val) * softplus_x
+        # Keep sigmoid in FP32 for both ordinary decode and multi-query
+        # speculative verify so their recurrent updates use identical math.
+        beta_val = tl.sigmoid(b_val.to(tl.float32))
 
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+            b_q = b_q * tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k * tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
         b_q = b_q * scale
-        b_h *= exp(b_g)
+        b_h *= tl.exp(g_val)
         b_v -= tl.sum(b_h * b_k[None, :], 1)
-        if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-        else:
-            b_beta = tl.load(p_beta).to(tl.float32)
-        b_v *= b_beta
+        b_v *= beta_val
         b_h += b_v[:, None] * b_k[None, :]
         b_o = tl.sum(b_h * b_q[None, :], 1)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
@@ -1087,20 +1117,22 @@ def fused_recurrent_gdn_spec_fwd_kernel(
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
-        p_q += H * K
-        p_k += H * K
+        p_q += stride_q_token
+        p_k += stride_k_token
         p_o += HV * V
-        p_v += HV * V
-        p_g += HV
-        p_beta += HV * (V if IS_BETA_HEADWISE else 1)
+        p_v += stride_v_token
+        p_a += stride_a_token
+        p_b += stride_b_token
 
 
 def fused_recurrent_gdn_spec(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
     scale: float,
     state_source: torch.Tensor,
     ssm_state_indices: torch.Tensor,
@@ -1108,7 +1140,7 @@ def fused_recurrent_gdn_spec(
     cu_seqlens: Optional[torch.LongTensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> torch.Tensor:
-    """vLLM-style spec-decode GDN recurrence over the shared state pool.
+    """Spec-decode GDN recurrence over the shared state pool.
 
     ``state_source`` is the SSM temporal-state block pool ``[num_blocks, HV, V,
     K]`` (in-place: h0 == ht). ``ssm_state_indices`` is the ``[nseq, 1+K]`` block
@@ -1133,11 +1165,13 @@ def fused_recurrent_gdn_spec(
 
     grid = (NK, triton.cdiv(V, BV), N * HV)
     fused_recurrent_gdn_spec_fwd_kernel[grid](
+        A_log=A_log,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
         q=q,
         k=k,
         v=v,
-        g=g,
-        beta=beta,
         o=o,
         h0=state_source,
         ht=state_source,
@@ -1158,10 +1192,26 @@ def fused_recurrent_gdn_spec(
         stride_final_state_token=stride_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_a_token=a.stride(-2),
+        stride_a_head=a.stride(-1),
+        stride_b_token=b.stride(-2),
+        stride_b_head=b.stride(-1),
+        stride_q_token=q.stride(-3),
+        stride_q_head=q.stride(-2),
+        stride_q_dim=q.stride(-1),
+        stride_k_token=k.stride(-3),
+        stride_k_head=k.stride(-2),
+        stride_k_dim=k.stride(-1),
+        stride_v_token=v.stride(-3),
+        stride_v_head=v.stride(-2),
+        stride_v_dim=v.stride(-1),
+        SOFTPLUS_THRESHOLD=20.0,
         INPLACE_FINAL_STATE=True,
-        IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        num_warps=1,
+        # Keep the four-warp reduction tree used by ordinary decode. A one-warp
+        # launch is faster in isolation on GB200 but changes recurrent FP32
+        # rounding, which can compound over a long generation.
+        num_warps=4,
         num_stages=3,
     )
     return o.squeeze(0)

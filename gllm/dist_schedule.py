@@ -178,7 +178,7 @@ class SeqUpdate:
     # value each iter (it is allocated once but changes on preempt/realloc).
     # ``None`` for non-hybrid models (no SSM segment).
     ssm_state_slot: Optional[int] = None
-    # Hybrid MTP (vLLM-style spec decode): the fixed ``1+k`` SSM state block
+    # Hybrid MTP: the fixed ``1+k`` SSM state block
     # table + persisted accepted-token count, mirrored to followers so their
     # GDN forward resumes from the same column. ``None`` for non-MTP seqs.
     ssm_block_table: Optional[List[int]] = None

@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 import threading
 from typing import Dict, Tuple
@@ -357,7 +358,32 @@ class ModelLoader:
         self.load_format = load_format
 
     def load_safetensors(self, path):
-        weights_path = glob.glob(f"{path}/*.safetensors")
+        index_path = os.path.join(path, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            # A directory may contain stale or alternate shard sets alongside
+            # the one selected by Hugging Face's index.  Scanning every
+            # ``*.safetensors`` file silently mixes those models because the
+            # same parameter names occur in both sets. The index is the
+            # authoritative parameter-to-shard mapping, so load only its files.
+            with open(index_path, encoding="utf-8") as f:
+                weight_map = json.load(f).get("weight_map", {})
+            if not weight_map:
+                raise ValueError(
+                    f"Safetensors index {index_path} has no non-empty weight_map"
+                )
+            index: Dict[str, Tuple[str, str]] = {}
+            for key, shard_name in weight_map.items():
+                shard_path = os.path.join(path, shard_name)
+                if not os.path.isfile(shard_path):
+                    raise FileNotFoundError(
+                        f"Safetensors index maps {key!r} to missing shard "
+                        f"{shard_path!r}"
+                    )
+                index[key] = (shard_path, key)
+            self.weights = LazySafetensors(index)
+            return True
+
+        weights_path = sorted(glob.glob(f"{path}/*.safetensors"))
         if not weights_path:
             return False
         # Build only a key -> (shard, key) index from the shard headers; tensors
@@ -374,6 +400,14 @@ class ModelLoader:
         for weight_path in weights_path:
             with safe_open(weight_path, framework="pt", device="cpu") as f:
                 for k in f.keys():
+                    if k in index:
+                        previous = index[k][0]
+                        raise ValueError(
+                            f"Duplicate tensor key {k!r} in unindexed "
+                            f"safetensors files {previous!r} and "
+                            f"{weight_path!r}; add a model.safetensors.index.json "
+                            "to select the intended shard set"
+                        )
                     index[k] = (weight_path, k)
         if not index:
             return False
@@ -602,11 +636,26 @@ class ModelLoader:
         if self.load_format == "auto":
             self.load_weights()
 
-        torch.set_default_device("cuda")
-
         # Init model whose weights are on GPU memory
         free_gpu_memory_before, _ = torch.cuda.mem_get_info()
         model = model_type(self.config)
+        non_cuda_parameters = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.device.type != "cuda"
+        ]
+        non_cuda_buffers = [
+            name
+            for name, buffer in model.named_buffers()
+            if buffer.device.type != "cuda"
+        ]
+        if non_cuda_parameters or non_cuda_buffers:
+            samples = (non_cuda_parameters + non_cuda_buffers)[:8]
+            raise RuntimeError(
+                "Model construction created tensors outside CUDA after removing "
+                "the process-wide default device. Add an explicit device to "
+                f"their allocation; examples: {samples}"
+            )
         free_gpu_memory_after, _ = torch.cuda.mem_get_info()
         model_size_gb = round(
             (free_gpu_memory_before - free_gpu_memory_after) / (2**30), 2

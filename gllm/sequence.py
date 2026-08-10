@@ -90,16 +90,26 @@ class Sequence:
         # has not yet allocated a slot for this seq. The slot lives for the
         # whole lifetime of the request and is reset on preempt/free.
         self.ssm_state_slot: Optional[int] = None
-        # vLLM-style spec-decode block table for hybrid MTP: a fixed ``1+k``
+        # Spec-decode block table for hybrid MTP: a fixed ``1+k``
         # list of SSM state block ids (column 0 == rolling/committed state,
         # columns 1..k == verify-step per-token checkpoints). ``None`` for
         # non-MTP / non-hybrid seqs (those use the scalar ``ssm_state_slot``).
         # ``ssm_num_accepted`` persists the last accepted-token count so the
         # next verify's recurrent kernel resumes from column ``num_accepted-1``
         # (1 = neutral: resume from column 0). See the column protocol in
-        # memory: vllm-gdn-spec-decode-mechanism.
+        # ``MemoryManager.commit_ssm_checkpoint`` documents the commit protocol.
         self.ssm_block_table: Optional[list] = None
         self.ssm_num_accepted: int = 1
+        # True only between overlap-MTP's optimistic fixed-width reservation
+        # and its variable-width accept finalize.  Prefix-cache allocation must
+        # not hash the temporary ``-1`` token placeholders in that interval.
+        self._mtp_async_pending: bool = False
+        # Mixed async prefill handoff: the sampled x1 lives in GPU relay state
+        # and has no committed token_ids entry yet. The first MTP reservation
+        # must therefore not apply the ordinary decode ``base_compute == 1`` a
+        # second time. This is consumed exactly once by that reservation, or
+        # materialized into token_ids before falling back to ordinary decode.
+        self._mtp_relay_only_next: bool = False
         # Persistent per-seq slot in the repetition-penalty mask pool
         # (``MemoryManager._rep_pool``). ``None`` means no slot yet / the seq
         # has ``repetition_penalty == 1.0`` and needs none. ``rep_filled`` is
@@ -179,6 +189,8 @@ class Sequence:
         self.ssm_state_slot = None
         self.ssm_block_table = None
         self.ssm_num_accepted = 1
+        self._mtp_async_pending = False
+        self._mtp_relay_only_next = False
 
     @property
     def computed_prompt(self):

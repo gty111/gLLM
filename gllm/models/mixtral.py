@@ -39,7 +39,12 @@ class MixtralMoE(nn.Module):
             reduce_results=not is_dp_attn(),
             renormalize=True,
         )
-        self.gate = nn.Linear(config.hidden_size, config.num_local_experts, bias=False)
+        self.gate = nn.Linear(
+            config.hidden_size,
+            config.num_local_experts,
+            bias=False,
+            device="cuda",
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.

@@ -10,7 +10,7 @@ affine functions of *per-sequence* facts the engine already knows, and the
 verify batch's token ids already live on the GPU (they are the draft chain's
 output). Only the sequences' page tables genuinely have to cross the PCIe bus.
 
-So, following vLLM's model-runner-V2 "persistent batch" idea, this module:
+This module removes that host work by keeping a persistent batch representation:
 
 * keeps the per-sequence facts in **persistent pinned staging buffers** (no
   per-step allocation, no ``pin_memory()`` call, no ``torch.tensor(list)``),
@@ -119,6 +119,9 @@ class MtpGpuPrep:
         x1: List[int],
         dummy_page: int,
         mrope_deltas: Optional[List[int]] = None,
+        ctx_lens_gpu: Optional[torch.Tensor] = None,
+        x1_gpu: Optional[torch.Tensor] = None,
+        num_accepted_gpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Stage + H2D this step's per-sequence facts for rows ``[0, bucket)``.
 
@@ -198,6 +201,21 @@ class MtpGpuPrep:
         self._d_pt[:bucket, :cols].copy_(self._h_pt[:bucket, :cols], non_blocking=True)
         if self.bt_width:
             self._d_bt[:bucket].copy_(self._h_bt[:bucket], non_blocking=True)
+
+        # A chained overlap-MTP step is launched before the predecessor's CPU
+        # completion is finalized.  In that case the host values above are
+        # intentionally optimistic placeholders; overwrite the authoritative
+        # fields from the predecessor's GPU-resident state on the same stream.
+        # Page/block tables still come from the CPU allocator, whose optimistic
+        # reservation is a safe upper bound for the real accepted length.
+        if ctx_lens_gpu is not None:
+            self._d_meta[:nd, META_CTX].copy_(ctx_lens_gpu[:nd])
+        if x1_gpu is not None:
+            self._d_meta[:nd, META_X1].copy_(x1_gpu[:nd])
+        if num_accepted_gpu is not None:
+            self._d_meta[:nd, META_NUM_ACCEPTED].copy_(
+                num_accepted_gpu[:nd]
+            )
 
     def x1_gpu(self, nd: int) -> torch.Tensor:
         """The staged ``x1`` token ids, already on the device (int64 ``[nd]``)."""
@@ -301,3 +319,66 @@ class MtpGpuPrep:
         if bucket > nd:
             # Same filler the dummy pad seqs used (``[1] * (ctx + qlen)``).
             tok[nd:].fill_(1)
+
+    def correct_mixed_prefix(
+        self,
+        input_data,
+        qlen: int,
+        drafts_gpu: torch.Tensor,
+    ) -> None:
+        """Correct the MTP prefix of a ragged mixed target batch on the GPU.
+
+        ``InputData.cal_input`` deliberately builds the successor from the
+        scheduler's optimistic fixed-width placeholders.  Query widths and
+        page reservations are already valid, but the predecessor's *accepted*
+        context length, relay x1, GDN resume column and derived per-token
+        metadata only become authoritative on the GPU.  Rewrite just the
+        leading uniform verify rows after the ordinary mixed H2D preparation;
+        the following ragged prefill rows remain untouched.
+        """
+        nd = self.nd
+        if nd == 0:
+            return
+        ntok = nd * qlen
+        pos = self._d_meta[:nd, META_CTX].unsqueeze(1) + self._arange(qlen)
+        pos_flat = pos.reshape(-1)
+        input_data.positions[:ntok].copy_(pos_flat)
+        if self.uses_mrope:
+            mp = (
+                pos
+                + self._d_meta[:nd, META_DELTA].unsqueeze(1)
+            ).reshape(1, -1)
+            input_data.mrope_positions[:, :ntok].copy_(mp.expand(3, ntok))
+
+        page_size = self.page_size
+        pidx = pos // page_size
+        sidx = pos - pidx * page_size
+        phys = torch.gather(
+            self._d_pt[:nd, : self.pt_cols].to(torch.int64), 1, pidx
+        )
+        input_data.slot_mapping[:ntok].copy_(
+            (phys * page_size + sidx).reshape(-1)
+        )
+        input_data.seq_lens[:nd].copy_(
+            (pos[:, -1] + 1).to(input_data.seq_lens.dtype)
+        )
+        input_data.block_table[:nd, : self.pt_cols].copy_(
+            self._d_pt[:nd, : self.pt_cols]
+        )
+
+        tok = input_data.tokens[:ntok].view(nd, qlen)
+        tok[:, 0].copy_(self._d_meta[:nd, META_X1])
+        if qlen > 1:
+            tok[:, 1:].copy_(drafts_gpu[:nd, : qlen - 1])
+
+        if input_data.use_ssm_cache:
+            input_data.ssm_state_slot_per_seq[:nd].copy_(self._d_bt[:nd, 0])
+            input_data.has_initial_state_per_seq[:nd].fill_(True)
+            input_data.ssm_snapshot_write_slot_per_seq[:nd].fill_(-1)
+            if self.bt_width and hasattr(input_data, "ssm_block_table_2d"):
+                input_data.ssm_block_table_2d[:nd, : self.bt_width].copy_(
+                    self._d_bt[:nd, : self.bt_width]
+                )
+                input_data.ssm_num_accepted[:nd].copy_(
+                    self._d_meta[:nd, META_NUM_ACCEPTED].to(torch.int32)
+                )

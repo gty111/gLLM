@@ -84,6 +84,17 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
         "--page-size", type=int, help="Number of tokens in a page", default=16
     )
     p.add_argument(
+        "--attention-backend",
+        type=str,
+        choices=["auto", "fa3", "flashinfer"],
+        default="auto",
+        help=(
+            "Paged attention backend for ordinary MHA/GQA layers. 'auto' "
+            "selects FlashInfer on Blackwell SM100 and sgl-kernel FA3 on "
+            "supported SM8x/SM9x GPUs."
+        ),
+    )
+    p.add_argument(
         "--mla-decode-backend",
         type=str,
         choices=["fa3", "flashmla", "triton"],
@@ -103,12 +114,12 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
         default="auto",
         help=(
             "Recurrent-state (SSM/GDN) cache precision for hybrid "
-            "linear-attention models such as Qwen3.5. 'auto' (default) stores "
-            "the state in the model's activation dtype (bf16 for these "
-            "checkpoints), matching vLLM's --mamba-ssm-cache-dtype default; "
-            "'float32' follows the checkpoint's mamba_ssm_dtype hint instead, "
-            "at 2x the state bytes. The recurrence accumulates in fp32 inside "
-            "the kernels either way. No effect on non-hybrid models."
+            "linear-attention models such as Qwen3.5. 'auto' (default) follows "
+            "the checkpoint's mamba_ssm_dtype hint when present and otherwise "
+            "uses the activation dtype. An explicit dtype overrides that hint; "
+            "float32 uses 2x the state bytes of bf16. The recurrence accumulates "
+            "in fp32 inside the kernels either way. No effect on non-hybrid "
+            "models."
         ),
     )
     p.add_argument(
@@ -143,7 +154,10 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--disable-cuda-graph",
-        help="Enable full cuda graph for decode batch",
+        help=(
+            "Disable all CUDA graphs, including decode, MTP draft/verify, "
+            "and mixed-MTP piecewise graphs."
+        ),
         action="store_true",
     )
     p.add_argument(
@@ -228,7 +242,7 @@ def add_mtp_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=0,
         help="Speculate only while the decode batch has at most this many "
-        "sequences (vLLM's speculative disable-by-batch-size). Speculation "
+        "sequences. Speculation "
         "multiplies per-step target work by 1+k, so it pays off only while the "
         "batch leaves the GPU under-utilized; past the crossover a plain step is "
         "faster. 0 (default) always speculates. Pick the value from a "
@@ -293,6 +307,7 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
         "gpu_memory_util": args.gpu_memory_util,
         "enable_prefix_caching": args.enable_prefix_caching,
         "page_size": args.page_size,
+        "attention_backend": args.attention_backend,
         "mla_decode_backend": args.mla_decode_backend,
         "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
         "ssm_snapshot_stride_tokens": args.ssm_snapshot_stride_tokens,

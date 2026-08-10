@@ -301,7 +301,7 @@ class Qwen2_5_VisionBlock(nn.Module):
     ) -> None:
         super().__init__()
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            norm_layer = partial(nn.LayerNorm, eps=1e-6, device="cuda")
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         self.attn = Qwen2_5_VisionAttention(
@@ -348,6 +348,7 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
             kernel_size=kernel_size,
             stride=kernel_size,
             bias=False,
+            device="cuda",
         )
         self._use_linear = torch.__version__.startswith("2.9.")
         self._input_size = in_channels * temporal_patch_size * patch_size * patch_size
@@ -381,7 +382,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            norm_layer = partial(nn.LayerNorm, eps=1e-6, device="cuda")
         self.ln_q = norm_layer(context_dim)
         self.mlp = nn.ModuleList(
             [
@@ -408,7 +409,12 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.theta = theta
-        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        inv_freq = 1.0 / (
+            theta
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.float, device="cuda") / dim
+            )
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._freqs_cached = None
@@ -500,8 +506,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return self.patch_embed.proj.weight.device
 
     def rotary_pos_emb_thw(self, t, h, w):
-        hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-        wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+        hpos_ids = torch.arange(h, device=self.device).unsqueeze(1).expand(-1, w)
+        wpos_ids = torch.arange(w, device=self.device).unsqueeze(0).expand(h, -1)
         hpos_ids = (
             hpos_ids.reshape(
                 h // self.spatial_merge_size,
@@ -541,7 +547,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         llm_grid_h = grid_h // self.spatial_merge_size
         llm_grid_w = grid_w // self.spatial_merge_size
-        index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
+        index = torch.arange(
+            grid_t * llm_grid_h * llm_grid_w, device=self.device
+        ).reshape(
             grid_t, llm_grid_h, llm_grid_w
         )
         pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
@@ -578,7 +586,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         rotary_pos_emb_thw = rotary_pos_emb_thw[window_index_thw, :, :]
         rotary_pos_emb_thw = rotary_pos_emb_thw.flatten(start_dim=0, end_dim=1)
         cu_seqlens_thw = torch.repeat_interleave(
-            torch.tensor([h * w], dtype=torch.int32), t
+            torch.tensor([h * w], dtype=torch.int32, device=self.device), t
         )
         return (
             rotary_pos_emb_thw,
@@ -603,7 +611,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
         seq_len, _ = x.size()
         rotary_pos_emb = []
         window_index: list = []
-        cu_window_seqlens: list = [torch.tensor([0], dtype=torch.int32)]
+        cu_window_seqlens: list = [
+            torch.tensor([0], dtype=torch.int32, device=self.device)
+        ]
         cu_seqlens: list = []
 
         hidden_states = x.to(device=self.device, dtype=self.dtype)

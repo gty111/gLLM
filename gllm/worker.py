@@ -918,12 +918,12 @@ class Worker(TorchProfilerMixin):
         self.model_runner.mtp_begin_iter(
             len(schedule_seqs) if _pure_decode else None
         )
-        # See ``ModelRunner.mtp_fused_prep_eligible``: a fused MTP step throws
+        # See ``ModelRunner.mtp_prep_eligible``: an MTP step throws
         # this prep's per-token arrays away, so skip building them. The predicate
         # is False under PP>1 (fused needs the last PP rank), so the mrope
         # payload below is unaffected.
-        if self.model_runner.mtp_fused_prep_eligible(schedule_seqs):
-            self.model_runner.prepare_input_mtp_fused(schedule_seqs)
+        if self.model_runner.mtp_prep_eligible(schedule_seqs):
+            self.model_runner.prepare_input_mtp(schedule_seqs)
         else:
             self.model_runner.prepare_input(schedule_seqs)
         if payload is not None and get_pp_size() > 1:

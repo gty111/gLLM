@@ -373,6 +373,8 @@ class LayerNorm(torch.nn.Module):
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
         """
 
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps
@@ -415,6 +417,8 @@ class RMSNorm(torch.nn.Module):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.
         group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
         """
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.eps = eps

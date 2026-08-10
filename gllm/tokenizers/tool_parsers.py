@@ -53,8 +53,8 @@ def _dump_arguments(arguments) -> str:
 # ``<parameter>`` value is raw text. To emit correctly-typed ``tool_calls`` we
 # coerce each value to the type declared in the tool's JSON schema: string-typed
 # params stay strings, while integer/number/boolean/array/object params are
-# converted. This mirrors the reference Qwen3 parser (vLLM) and is what makes
-# native tool-calling scores match: a consumer can turn ``"4"`` into an int when
+# converted. Schema-driven conversion is required for native tool calls: a
+# consumer can turn ``"4"`` into an int when
 # the schema says integer, but a spurious ``json.loads`` that turns a string
 # ``"4"`` into ``int`` unconditionally breaks string-typed params (e.g. BFCL's
 # Java/JS categories, where every value is a string).
@@ -361,8 +361,7 @@ class Qwen3ToolParser(ToolParser):
     information). We type-correct it against the tool's JSON schema via
     :func:`_coerce_args`: ``string`` params stay strings, while
     ``integer``/``number``/``boolean``/``array``/``object`` params are coerced
-    to their real types. This mirrors the reference Qwen3 parser (vLLM). When no
-    schema is supplied the values simply stay strings.
+    to their real types. When no schema is supplied the values stay strings.
 
     Doing schema-*less* ``json.loads`` on every value (turning ``"4"`` into
     ``int`` and ``"true"`` into ``bool`` unconditionally) is wrong -- it breaks
@@ -492,10 +491,10 @@ class DeepSeekToolParser(ToolParser):
         </｜DSML｜invoke>
         </｜DSML｜function_calls>
 
-    Parsing/typing is delegated to the model's own reference decoder
-    (``encoding_dsv32.parse_message_from_completion_text``) when available -- the
-    same code path vLLM uses -- so the OpenAI ``arguments`` JSON matches upstream
-    exactly. ``encoder`` is injected by the server (loaded from the checkpoint's
+    Parsing and typing are delegated to the model's own reference decoder
+    (``encoding_dsv32.parse_message_from_completion_text``) when available, so
+    the OpenAI ``arguments`` JSON follows the checkpoint's native encoding.
+    ``encoder`` is injected by the server (loaded from the checkpoint's
     ``encoding/`` dir). When it's absent we fall back to a lenient regex that
     extracts names + parameters without the reference typing.
     """

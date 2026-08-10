@@ -97,7 +97,10 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+                torch.arange(
+                    0, self.rotary_dim, 2, dtype=torch.float, device="cuda"
+                )
+                / self.rotary_dim
             )
         )
         return inv_freq
@@ -105,7 +108,9 @@ class RotaryEmbedding(nn.Module):
     def _compute_cos_sin_cache(self):
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self.max_position_embeddings, dtype=torch.float, device=inv_freq.device
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()
@@ -178,7 +183,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
             # Thus, the maximum length after applying the rope scaling is
             # self.max_position_embeddings * self.scaling_factor.
             max_len = self.max_position_embeddings * scaling_factor
-            t = torch.arange(max_len, dtype=torch.float)
+            t = torch.arange(max_len, dtype=torch.float, device=inv_freq.device)
             t = t / scaling_factor
 
             freqs = torch.einsum("i,j -> ij", t, inv_freq)
@@ -299,7 +304,9 @@ def yarn_linear_ramp_mask(
     if low == high:
         high += 0.001  # Prevent singularity
 
-    linear_func = (torch.arange(dim, dtype=dtype) - low) / (high - low)
+    linear_func = (
+        torch.arange(dim, dtype=dtype, device="cuda") - low
+    ) / (high - low)
     ramp_func = torch.clamp(linear_func, 0, 1)
     return ramp_func
 
@@ -363,7 +370,10 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
-            torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+            torch.arange(
+                0, self.rotary_dim, 2, dtype=torch.float, device="cuda"
+            )
+            / self.rotary_dim
         )
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
@@ -389,7 +399,9 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
         t = torch.arange(
-            self.max_position_embeddings * self.scaling_factor, dtype=torch.float32
+            self.max_position_embeddings * self.scaling_factor,
+            dtype=torch.float32,
+            device=inv_freq.device,
         )
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos() * self.mscale
@@ -420,7 +432,7 @@ def _triton_qwen2vl_mrope_forward(
 ):
     # Adapted from
     # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/qwen2vl_mrope.py
-    # This version supports flatten input tensors from vllm
+    # Support flattened input tensors used by the batched model runner.
     # and supports cos and sin cache with shape (3, num_tokens, head_dim // 2)
     # instead of (3, bsz, seq_len, head_dim)
     pid = tl.program_id(0)

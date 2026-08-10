@@ -25,7 +25,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
-    num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    num_cache_lines: tl.constexpr,  # cache capacity may exceed the batch size
     # Strides
     stride_x_seq: tl.constexpr,  # stride to get to next sequence,
     stride_x_dim: tl.constexpr,  # stride to get to next feature-value,
@@ -454,11 +454,11 @@ def causal_conv1d_fn(
     stride_istate_token = 0
     num_cache_lines = 0
     if conv_states is not None:
-        # extensions to support vLLM:
-        # 1. conv_states is used to replaced initial_states
-        # 2. conv_states serve as a cache with num cache lines can be larger than batch size
-        # 3. mapping from sequence x[idx] to a cache line at index as specified via cache_indices[idx]
-        # 4. computation can be skipped if cache_indices[idx] == pad_slot_id
+        # Continuous-batching cache contract:
+        # 1. ``conv_states`` supplies and receives recurrent state;
+        # 2. its cache-line capacity may exceed the current batch size;
+        # 3. ``cache_indices[idx]`` maps input row ``idx`` to its cache line;
+        # 4. ``pad_slot_id`` rows skip computation and state updates.
         num_cache_lines = conv_states.size(0)
         assert (
             num_cache_lines == conv_states.shape[0]
@@ -601,7 +601,7 @@ def _causal_conv1d_update_kernel(
     dim: tl.constexpr,
     seqlen: tl.constexpr,
     state_len: tl.constexpr,
-    num_cache_lines: tl.constexpr,  # added to support vLLM larger cache lines
+    num_cache_lines: tl.constexpr,  # cache capacity may exceed the batch size
     # Strides
     stride_x_seq: tl.constexpr,
     stride_x_dim: tl.constexpr,
@@ -990,6 +990,264 @@ def _causal_conv1d_update_kernel(
             )
 
 
+@triton.jit()
+def _causal_conv1d_update_paged_kernel(
+    x_ptr,
+    w_ptr,
+    bias_ptr,
+    conv_state_ptr,
+    block_table_ptr,
+    num_accepted_tokens_ptr,
+    o_ptr,
+    batch: int,
+    dim: tl.constexpr,
+    seqlen: tl.constexpr,
+    stride_x_seq: tl.constexpr,
+    stride_x_dim: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_w_dim: tl.constexpr,
+    stride_w_width: tl.constexpr,
+    stride_state_seq: tl.constexpr,
+    stride_state_dim: tl.constexpr,
+    stride_state_token: tl.constexpr,
+    stride_table_seq: tl.constexpr,
+    stride_table_token: tl.constexpr,
+    stride_o_seq: tl.constexpr,
+    stride_o_dim: tl.constexpr,
+    stride_o_token: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Spec-decode conv that reads and writes the paged checkpoint pool.
+
+    One program owns one ``(request, feature tile)``.  The whole incoming
+    window is loaded into registers before any checkpoint is overwritten, so
+    the source block may also be one of the destination blocks selected by the
+    table.  Each token's post-window is written directly to its table column;
+    no gather buffer, wide intermediate window, or scatter pass is needed.
+    """
+    idx_seq = tl.program_id(0)
+    if idx_seq >= batch:
+        return
+    idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    feat_mask = idx_feats < dim
+
+    accepted = tl.load(num_accepted_tokens_ptr + idx_seq).to(tl.int32)
+    source_col = tl.maximum(accepted - 1, 0)
+    source_col = tl.minimum(source_col, seqlen - 1)
+    source_block = tl.load(
+        block_table_ptr
+        + idx_seq * stride_table_seq
+        + source_col * stride_table_token
+    ).to(tl.int64)
+    if source_block < 0:
+        return
+
+    state_base = (
+        conv_state_ptr
+        + source_block * stride_state_seq
+        + idx_feats * stride_state_dim
+    )
+    if KERNEL_WIDTH >= 2:
+        col0 = tl.load(state_base, mask=feat_mask, other=0.0)
+    if KERNEL_WIDTH >= 3:
+        col1 = tl.load(
+            state_base + stride_state_token, mask=feat_mask, other=0.0
+        )
+    if KERNEL_WIDTH >= 4:
+        col2 = tl.load(
+            state_base + 2 * stride_state_token, mask=feat_mask, other=0.0
+        )
+    if KERNEL_WIDTH >= 5:
+        col3 = tl.load(
+            state_base + 3 * stride_state_token, mask=feat_mask, other=0.0
+        )
+    if KERNEL_WIDTH >= 6:
+        col4 = tl.load(
+            state_base + 4 * stride_state_token, mask=feat_mask, other=0.0
+        )
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + idx_feats, mask=feat_mask, other=0.0).to(
+            tl.float32
+        )
+    else:
+        bias = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    w_base = w_ptr + idx_feats * stride_w_dim
+    if KERNEL_WIDTH >= 2:
+        w0 = tl.load(w_base, mask=feat_mask, other=0.0)
+        w1 = tl.load(
+            w_base + stride_w_width, mask=feat_mask, other=0.0
+        )
+    if KERNEL_WIDTH >= 3:
+        w2 = tl.load(
+            w_base + 2 * stride_w_width, mask=feat_mask, other=0.0
+        )
+    if KERNEL_WIDTH >= 4:
+        w3 = tl.load(
+            w_base + 3 * stride_w_width, mask=feat_mask, other=0.0
+        )
+    if KERNEL_WIDTH >= 5:
+        w4 = tl.load(
+            w_base + 4 * stride_w_width, mask=feat_mask, other=0.0
+        )
+    if KERNEL_WIDTH >= 6:
+        w5 = tl.load(
+            w_base + 5 * stride_w_width, mask=feat_mask, other=0.0
+        )
+
+    x_base = x_ptr + idx_seq * stride_x_seq + idx_feats * stride_x_dim
+    o_base = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
+    for token in tl.static_range(seqlen):
+        current = tl.load(
+            x_base + token * stride_x_token, mask=feat_mask, other=0.0
+        )
+        acc = bias
+        if KERNEL_WIDTH == 2:
+            acc += col0 * w0
+            acc += current * w1
+            col0 = current
+        elif KERNEL_WIDTH == 3:
+            acc += col0 * w0
+            acc += col1 * w1
+            acc += current * w2
+            col0 = col1
+            col1 = current
+        elif KERNEL_WIDTH == 4:
+            acc += col0 * w0
+            acc += col1 * w1
+            acc += col2 * w2
+            acc += current * w3
+            col0 = col1
+            col1 = col2
+            col2 = current
+        elif KERNEL_WIDTH == 5:
+            acc += col0 * w0
+            acc += col1 * w1
+            acc += col2 * w2
+            acc += col3 * w3
+            acc += current * w4
+            col0 = col1
+            col1 = col2
+            col2 = col3
+            col3 = current
+        elif KERNEL_WIDTH == 6:
+            acc += col0 * w0
+            acc += col1 * w1
+            acc += col2 * w2
+            acc += col3 * w3
+            acc += col4 * w4
+            acc += current * w5
+            col0 = col1
+            col1 = col2
+            col2 = col3
+            col3 = col4
+            col4 = current
+
+        if SILU_ACTIVATION:
+            acc = acc / (1.0 + tl.exp(-acc))
+        tl.store(
+            o_base + token * stride_o_token,
+            acc,
+            mask=feat_mask,
+        )
+
+        dest_block = tl.load(
+            block_table_ptr
+            + idx_seq * stride_table_seq
+            + token * stride_table_token
+        ).to(tl.int64)
+        if dest_block >= 0:
+            dest = (
+                conv_state_ptr
+                + dest_block * stride_state_seq
+                + idx_feats * stride_state_dim
+            )
+            if KERNEL_WIDTH >= 2:
+                tl.store(dest, col0, mask=feat_mask)
+            if KERNEL_WIDTH >= 3:
+                tl.store(dest + stride_state_token, col1, mask=feat_mask)
+            if KERNEL_WIDTH >= 4:
+                tl.store(dest + 2 * stride_state_token, col2, mask=feat_mask)
+            if KERNEL_WIDTH >= 5:
+                tl.store(dest + 3 * stride_state_token, col3, mask=feat_mask)
+            if KERNEL_WIDTH >= 6:
+                tl.store(dest + 4 * stride_state_token, col4, mask=feat_mask)
+
+
+def causal_conv1d_update_paged(
+    x: torch.Tensor,
+    conv_state: torch.Tensor,
+    weight: torch.Tensor,
+    block_table: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    activation: Union[bool, str, None] = None,
+) -> torch.Tensor:
+    """Run multi-token conv and checkpoint directly into a paged state pool.
+
+    ``x`` is ``[batch, dim, seqlen]`` and ``block_table`` is
+    ``[batch, >=seqlen]``.  The initial window comes from column
+    ``num_accepted_tokens - 1`` and token ``t`` writes its post-window to
+    column ``t``.  This is the same state-column protocol as the GDN recurrent
+    spec kernel.
+    """
+    if isinstance(activation, bool):
+        activation = "silu" if activation else None
+    elif activation is not None and activation not in ("silu", "swish"):
+        raise ValueError(f"unsupported activation: {activation}")
+    if x.ndim != 3:
+        raise ValueError(f"paged conv expects [batch, dim, seqlen], got {x.shape}")
+    batch, dim, seqlen = x.shape
+    if block_table.ndim != 2 or block_table.shape[0] != batch:
+        raise ValueError((x.shape, block_table.shape))
+    if block_table.shape[1] < seqlen:
+        raise ValueError((block_table.shape, seqlen))
+    if num_accepted_tokens.shape != (batch,):
+        raise ValueError((num_accepted_tokens.shape, batch))
+    width = weight.shape[1]
+    if width < 2 or width > 6:
+        raise ValueError(f"paged conv supports kernel widths 2..6, got {width}")
+    if conv_state.shape[1:] != (dim, width - 1):
+        raise ValueError((conv_state.shape, dim, width))
+
+    out = torch.empty_like(x)
+    grid = (batch, triton.cdiv(dim, 256))
+    _causal_conv1d_update_paged_kernel[grid](
+        x,
+        weight,
+        bias,
+        conv_state,
+        block_table,
+        num_accepted_tokens,
+        out,
+        batch,
+        dim,
+        seqlen,
+        x.stride(0),
+        x.stride(1),
+        x.stride(2),
+        weight.stride(0),
+        weight.stride(1),
+        conv_state.stride(0),
+        conv_state.stride(1),
+        conv_state.stride(2),
+        block_table.stride(0),
+        block_table.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        HAS_BIAS=bias is not None,
+        KERNEL_WIDTH=width,
+        SILU_ACTIVATION=activation in ("silu", "swish"),
+        BLOCK_N=256,
+    )
+    return out
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1033,7 +1291,7 @@ def causal_conv1d_update(
     out: (batch, dim) or (batch, dim, seqlen)
     """
     if validate_data:
-        assert cache_seqlens is None  # not implemented yet - ok for vLLM
+        assert cache_seqlens is None  # variable cache offsets are not implemented
         assert pad_slot_id is not None
         assert x.stride(1) == 1
     if isinstance(activation, bool):
@@ -1066,9 +1324,10 @@ def causal_conv1d_update(
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
-        assert cache_seqlens is None  # not needed for vLLM - circular buffer
+        assert cache_seqlens is None  # state is maintained as a circular buffer
 
-    # adopt the strategy in vLLM that overwrite on 'x' directly, rather than creating a new tensor 'o'
+    # Preserve ``x`` and return a distinct output tensor; recurrent state is the
+    # only buffer updated in place.
     out = torch.empty_like(x)
     stride_w_dim, stride_w_width = weight.stride()
 

@@ -1,4 +1,5 @@
 import hashlib
+import gc
 import os
 from collections import OrderedDict
 from contextlib import nullcontext as _nullcontext
@@ -36,11 +37,18 @@ from gllm.dist_utils import (
     set_dp_forward_counts,
 )
 from gllm.input_data import InputData
+from gllm.layers.attention_backends import (
+    bind_attention_backend,
+    create_attention_backend,
+    find_attention_layers,
+)
 from gllm.layers.rotary_embedding import MRotaryEmbedding
 from gllm.layers.sampler import Sampler
 from gllm.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.model_loader import ModelLoader, propagate_serving_config
+from gllm.mtp_async import MtpAsyncBatchState, MtpAsyncCompletion
 from gllm.mtp_gpu_prep import MtpGpuPrep
+from gllm.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.sequence import Sequence
 from gllm.utils import unify_decode
 
@@ -267,6 +275,7 @@ class ModelRunner:
         mm_processor_max_pixels: int = None,
         skip_visual: bool = False,
         skip_language: bool = False,
+        attention_backend: str = "auto",
         mla_decode_backend: str = "fa3",
         mla_cache_dtype: str = "bf16",
         mamba_ssm_cache_dtype: str = "auto",
@@ -341,6 +350,12 @@ class ModelRunner:
 
         self.use_mm = self.model_loader.use_mm
         self.use_mla = self.model_loader.use_mla
+        self.attention_backend = (attention_backend or "auto").lower()
+        if self.attention_backend not in ("auto", "fa3", "flashinfer"):
+            raise ValueError(
+                "attention_backend must be 'auto', 'fa3', or 'flashinfer', "
+                f"got {self.attention_backend!r}."
+            )
         self.hidden_size = self.model_loader.hidden_size
         # Kimi-K2.5 is multimodal but its DeepSeek-V3 language backbone uses
         # ordinary 1-D RoPE, NOT the 3-D mrope that the Qwen-VL family uses.
@@ -375,15 +390,10 @@ class ModelRunner:
             raise ValueError(
                 f"mla_cache_dtype must be 'bf16' or 'fp8', got {self.mla_cache_dtype!r}."
             )
-        # Recurrent (SSM/GDN) state cache precision for hybrid linear-attention
-        # models, named + defaulted like vLLM's ``--mamba-ssm-cache-dtype``:
-        # "auto" stores the state in the model's activation dtype (bf16 for these
-        # checkpoints), which is what vLLM ships as its default. The Qwen3.5
-        # checkpoints *hint* fp32 via ``mamba_ssm_dtype``; that hint is ignored
-        # unless asked for explicitly, since the recurrence accumulates in fp32
-        # inside the kernels either way and the stored state is 2x the bytes in
-        # fp32 (1 MiB vs 0.5 MiB per layer per block on Qwen3.5-0.8B, and the MTP
-        # verify writes ``1+k`` of them per sequence per layer per step).
+        # Recurrent-state cache precision for hybrid linear-attention models.
+        # "auto" honours the checkpoint's ``mamba_ssm_dtype`` recommendation
+        # when present (Qwen3.5 requires float32), otherwise it falls back to
+        # the activation dtype. Explicit CLI values override that recommendation.
         self.mamba_ssm_cache_dtype = (mamba_ssm_cache_dtype or "auto").lower()
         if self.mamba_ssm_cache_dtype not in (
             "auto", "bfloat16", "float16", "float32"
@@ -425,16 +435,16 @@ class ModelRunner:
             or getattr(_text_cfg, "mtp_num_hidden_layers", 0)
             or 0
         )
-        self._mtp_enabled = (
+        resolved_mtp_enabled = (
             (_num_nextn >= 1) if mtp_enabled is None else bool(mtp_enabled)
         )
         self._mtp_k_cfg = mtp_k
         self._mtp_max_batch_cfg = mtp_max_batch
-        self.model_loader.config.mtp_enabled = self._mtp_enabled
+        self.model_loader.config.mtp_enabled = resolved_mtp_enabled
         # Nested text config (Qwen3.5-VL wrapper) reads ``mtp_enabled`` off its
         # own config object, so mirror the flag there too.
         if _text_cfg is not _cfg:
-            _text_cfg.mtp_enabled = self._mtp_enabled
+            _text_cfg.mtp_enabled = resolved_mtp_enabled
         propagate_serving_config(self.model_loader.config)
 
         # Kimi-K2.5 ships a bespoke processor (``KimiK25Processor``) whose API
@@ -602,6 +612,12 @@ class ModelRunner:
             self._mtp_k_cfg
             if getattr(self.model, "mtp", None) is not None else 0
         )
+        # The one authoritative runtime capability flag. The earlier resolved
+        # preference only controls whether the loader constructs the MTP head;
+        # after loading, availability additionally requires a positive k.
+        self.mtp_enabled = bool(
+            self._mtp_k > 0 and getattr(self.model, "mtp", None) is not None
+        )
         # Hybrid models (Qwen3.5 GDN) advertise a ready-to-use SSM cache
         # config via ``model.ssm_cache_config``. ``num_layers`` for the KV
         # path must then be the count of *full-attention* layers only.
@@ -649,7 +665,7 @@ class ModelRunner:
             ssm_snapshot_stride_tokens=self.ssm_snapshot_stride_tokens,
             mtp_k=(
                 self._mtp_k
-                if (ssm_cache_config is not None and self._mtp_k > 0)
+                if (ssm_cache_config is not None and self.mtp_enabled)
                 else 0
             ),
         )
@@ -660,11 +676,40 @@ class ModelRunner:
             memory_manager=self.memory_manager,
             use_buffer=True,
         )
-        self.input_hidden_states = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
-        self.input_residual = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
+        # Detect actual standard MHA/GQA layers instead of treating MLA and
+        # standard attention as model-wide mutually-exclusive modes. The runner
+        # owns the shared backend; each standard attention layer gets an
+        # explicit reference, while InputData carries only per-forward metadata.
+        self.standard_attention_backend = None
+        standard_attention_layers = find_attention_layers(self.model)
+        if standard_attention_layers:
+            self.standard_attention_backend = create_attention_backend(
+                self.attention_backend,
+                self.model_max_length,
+                self.max_running_seqs,
+            )
+            num_bound_attention_layers = bind_attention_backend(
+                standard_attention_layers, self.standard_attention_backend
+            )
+            logger.info(
+                "Bound standard attention backend %s to %d MHA/GQA layers",
+                self.standard_attention_backend.name,
+                num_bound_attention_layers,
+            )
+        device = torch.device("cuda", torch.cuda.current_device())
+        self.input_hidden_states = torch.zeros(
+            (self.max_num_batched_tokens, self.hidden_size), device=device
+        )
+        self.input_residual = torch.zeros(
+            (self.max_num_batched_tokens, self.hidden_size), device=device
+        )
         # Output buffer
-        self.output_hidden_states = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
-        self.output_residual = torch.zeros((self.max_num_batched_tokens, self.hidden_size))
+        self.output_hidden_states = torch.zeros(
+            (self.max_num_batched_tokens, self.hidden_size), device=device
+        )
+        self.output_residual = torch.zeros(
+            (self.max_num_batched_tokens, self.hidden_size), device=device
+        )
         # MTP draft-step CUDA-graph buffers. A draft step is a batch x 1-token
         # decode of the MTP head; we capture one graph per decode bucket and
         # replay it k times, advancing tok/hidden/positions/seq_lens/slot in
@@ -674,8 +719,7 @@ class ModelRunner:
         # ``_draft_input`` are lazily built in ``_init_draft_graph_state`` after
         # the model + memory manager exist.
         self._mtp_draft_graph = (
-            getattr(self, "_mtp_k", 0) > 0
-            and getattr(self.model, "mtp", None) is not None
+            self.mtp_enabled
             and not is_dp_attn()
             and not self.disable_cuda_graph
             # Works for both MLA (DeepSeek) and non-MLA (Qwen3.5 GDN): the draft
@@ -697,8 +741,7 @@ class ModelRunner:
         # overhead (~250ms, ~constant vs batch size), so graphing it is the main
         # speedup lever. Requires the fp8 decode-sparse verify kernel (graph-safe).
         self._mtp_verify_graph = (
-            getattr(self, "_mtp_k", 0) > 0
-            and getattr(self.model, "mtp", None) is not None
+            self.mtp_enabled
             and not is_dp_attn()
             and not self.disable_cuda_graph
             # Works for MLA (DeepSeek fp8 decode-sparse kernel) and non-MLA
@@ -715,13 +758,43 @@ class ModelRunner:
         # (seed_tok:int, seed_hidden:tensor[H]) across consecutive steps; a seq
         # missing from it (fresh admission / batch reshuffle) is seeded by one
         # padded verify-shaped bootstrap before joining the fused steady state.
-        self._mtp_fused = (
-            getattr(self, "_mtp_k", 0) > 0
-            and getattr(self.model, "mtp", None) is not None
+        # Fused MTP always supports a speculative verify prefix plus a newly
+        # admitted prefill suffix in one target forward. Eager and piecewise
+        # execution share the same scheduler/completion protocol.
+        self._piecewise_cuda_graph_on = (
+            self.mtp_enabled
+            and not self.disable_cuda_graph
+            and is_first_pp_rank()
+            and is_last_pp_rank()
         )
+        from gllm.layers.ops.fla._sgl_compat import (
+            set_piecewise_cuda_graph_enabled,
+        )
+
+        set_piecewise_cuda_graph_enabled(self._piecewise_cuda_graph_on)
+        self._piecewise_runner = None
+        if self._piecewise_cuda_graph_on:
+            piecewise_capture_sizes = PiecewiseGraphRunner.build_capture_sizes(
+                self.max_num_batched_tokens
+            )
+            self._piecewise_runner = PiecewiseGraphRunner(
+                self.model,
+                capture_sizes=piecewise_capture_sizes,
+            )
+            logger.info(
+                "Piecewise CUDA graph enabled for mixed MTP forwards "
+                "(attention/GDN eager breaks, graph-resident MoE, "
+                "bucket_sizes=%s)",
+                piecewise_capture_sizes,
+            )
         self._mtp_relay: Dict[int, tuple] = {}
-        # Batch-adaptive MTP (vLLM's ``disable_by_batch_size`` analogue).
-        # Speculating multiplies the per-step target work by ``1+k``; it wins only
+        # Set only while OverlapWorker launches a greedy MTP step.  The accept
+        # path publishes its fixed-width result into this GPU/pinned-host ring
+        # instead of synchronizing on ``Tensor.cpu()`` in the launch call.
+        self._mtp_async_state: Optional[MtpAsyncBatchState] = None
+        self._mtp_async_publish = False
+        # Batch-adaptive MTP gate. Speculating multiplies the per-step target
+        # work by ``1+k``; it wins only
         # while the decode batch leaves the GPU under-utilized. Past the crossover
         # a plain 1-token step is strictly faster, so skip MTP for that step.
         # Returning to MTP invalidates the relay and takes one padded bootstrap.
@@ -729,27 +802,26 @@ class ModelRunner:
         # execution mode permit it).
         self._mtp_max_batch = int(getattr(self, "_mtp_max_batch_cfg", 0) or 0)
         self._mtp_spec_decision = None
-        if self._mtp_k > 0 and is_dp_attn() and get_local_rank() == 0:
+        if self.mtp_enabled and is_dp_attn() and get_local_rank() == 0:
             logger.warning(
                 "MTP speculative decoding is disabled under DP-attention: "
                 "bootstrap/draft/verify collective shapes are not yet "
                 "coordinated across DP replicas; using plain decode."
             )
-        if self._mtp_k > 0 and self._mtp_max_batch > 0:
+        if self.mtp_enabled and self._mtp_max_batch > 0:
             logger.info(
                 f"MTP batch gate: speculating only while the decode batch is "
                 f"<= {self._mtp_max_batch} seqs; larger batches take a plain "
                 f"decode step."
             )
-        # GPU-native MTP input prep (vLLM model-runner-V2 style; see
-        # ``gllm/mtp_gpu_prep.py``). Replaces the per-step Python rebuild of the
+        # GPU-native MTP input prep (see ``gllm/mtp_gpu_prep.py``). It replaces
+        # the per-step Python rebuild of the
         # draft / verify input arrays with persistent pinned staging + a few
         # vectorized CUDA ops writing straight into the static graph buffers.
         # ``GLLM_MTP_GPUPREP=0`` falls back to the CPU builders (``cal_input``).
         self._mtp_gpu_prep = None
         self._mtp_gpu_prep_on = (
-            getattr(self, "_mtp_k", 0) > 0
-            and getattr(self.model, "mtp", None) is not None
+            self.mtp_enabled
             and os.environ.get("GLLM_MTP_GPUPREP", "1") == "1"
         )
         # Persistent pinned/device staging for the per-seq sampling params (see
@@ -782,16 +854,56 @@ class ModelRunner:
         # (TP-synced per-step
         # seed) + broadcasting drawn tokens, since independent per-rank sampling
         # would otherwise diverge the KV caches.
-        self._mtp_can_sample = (
-            getattr(self, "_mtp_k", 0) > 0
-            and getattr(self.model, "mtp", None) is not None
-        )
+        self._mtp_can_sample = self.mtp_enabled
         self._mtp_rng = None  # lazily built on the compute device
         self._mtp_step = 0
         # Device-side counter of sparse-top-k tie overflows (see
         # ``_mtp_sparse_probs``); read + reported at the 1 Hz metrics log so the
         # hot path never syncs on it.
         self._mtp_tie_overflow = torch.zeros((), dtype=torch.int64, device="cuda")
+        # The overflow counter is relevant only to rejection sampling. Greedy
+        # MTP must never read this CUDA scalar from the periodic metrics path:
+        # ``int(cuda_tensor)`` synchronizes the whole producer stream.
+        self._mtp_sampling_seen = False
+        # Persistent staging for the ragged prefill suffix of a mixed MTP
+        # target. These replace per-forward ``torch.as_tensor(list,
+        # device="cuda")`` calls, whose pageable H2D copies introduce a hidden
+        # cudaStreamSynchronize even for one-element lists.
+        mixed_cap = max(self.max_running_seqs, 1)
+        mixed_device = torch.device("cuda", torch.cuda.current_device())
+        self._mtp_mixed_last_rows = torch.empty(
+            mixed_cap, dtype=torch.int64, device=mixed_device
+        )
+        self._mtp_mixed_new_idx_host = torch.empty(
+            mixed_cap, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._mtp_mixed_new_ctx_host = torch.empty_like(
+            self._mtp_mixed_new_idx_host
+        )
+        self._mtp_mixed_new_idx_host_np = self._mtp_mixed_new_idx_host.numpy()
+        self._mtp_mixed_new_ctx_host_np = self._mtp_mixed_new_ctx_host.numpy()
+        self._mtp_mixed_new_idx = torch.empty(
+            mixed_cap, dtype=torch.int64, device=mixed_device
+        )
+        self._mtp_mixed_new_ctx = torch.empty_like(self._mtp_mixed_new_idx)
+        # Other fixed-capacity MTP hot-path buffers. The target hidden view must
+        # survive draft/verify overwriting ``output_hidden_states``; x1 and row
+        # indices otherwise caused fresh tiny CUDA allocations/H2Ds per step.
+        self._mtp_seed_hidden = torch.empty(
+            (mixed_cap, self.hidden_size),
+            dtype=self.output_hidden_states.dtype,
+            device=mixed_device,
+        )
+        self._mtp_row_idx = torch.arange(
+            mixed_cap, dtype=torch.int64, device=mixed_device
+        )
+        self._mtp_x1_host = torch.empty(
+            mixed_cap, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        self._mtp_x1_host_np = self._mtp_x1_host.numpy()
+        self._mtp_x1_gpu = torch.empty(
+            mixed_cap, dtype=torch.int64, device=mixed_device
+        )
         # Bumped once per ``_mtp_decode`` so the GPU prep can memoize its
         # per-step staging across the draft and verify phases.
         self._mtp_prep_epoch = 0
@@ -1581,6 +1693,14 @@ class ModelRunner:
                 )
             else:
                 embedding_info = work["embedding_info"]
+                if embedding_info.embedding is None:
+                    raise RuntimeError(
+                        "cached multimodal embedding was released before row "
+                        f"preparation: seq={seq.seq_id} computed="
+                        f"{seq.computed_token_num} prompt={seq.prompt_len} "
+                        f"len={seq.seq_len} to_compute={seq.to_compute_token_num} "
+                        f"mtp_verify={getattr(seq, '_mtp_verify', False)}"
+                    )
                 embedding = embedding_info.embedding[
                     seq.computed_token_num : seq.seq_len, :
                 ]
@@ -1688,7 +1808,7 @@ class ModelRunner:
         TP-identical tokens). Callers that decline must also drop the fused
         relay -- see ``_mtp_drop_relay``.
         """
-        if self._mtp_k <= 0 or getattr(self.model, "mtp", None) is None:
+        if not self.mtp_enabled:
             return False
         # The decision is taken ONCE per iteration (``mtp_begin_iter``) and
         # cached: the four gate sites must agree within a step. If they could
@@ -1723,9 +1843,7 @@ class ModelRunner:
         speculates. Called by both worker loops before any prep, so every later
         gate site reads the same decision.
         """
-        if not num_decodes or self._mtp_k <= 0 or (
-            getattr(self.model, "mtp", None) is None
-        ):
+        if not num_decodes or not self.mtp_enabled:
             self._mtp_spec_decision = None
             return False
         return self._mtp_decide(num_decodes)
@@ -1752,7 +1870,23 @@ class ModelRunner:
         for seq in seqs:
             self._mtp_relay.pop(seq.seq_id, None)
 
-    def mtp_fused_prep_eligible(self, seqs: List[Sequence]) -> bool:
+    def take_mtp_relay_token(self, seq_id: int) -> int:
+        """Consume the GPU-relayed x1 when leaving the MTP pipeline.
+
+        A completed mixed prefill normally hands x1 directly to its first MTP
+        verify. If scheduling instead falls back to ordinary decode, x1 must
+        become the request's one committed-but-uncached CPU token. The paired
+        hidden state is no longer reusable after that transition, so removing
+        the whole relay entry is intentional.
+        """
+        relay = self._mtp_relay.pop(seq_id, None)
+        if relay is None:
+            raise RuntimeError(
+                f"missing materialized MTP relay for sequence {seq_id}"
+            )
+        return int(relay[0])
+
+    def mtp_prep_eligible(self, seqs: List[Sequence]) -> bool:
         """True when :meth:`step_once` owns all input prep for an MTP step.
 
         A full-relay batch goes straight to draft/verify. A batch with fresh or
@@ -1760,9 +1894,9 @@ class ModelRunner:
         builds its own uniform ``1+k`` input. In both cases the ordinary
         scheduler-side one-token decode prep would be thrown away, so callers
         can install only the batch bookkeeping via
-        :meth:`prepare_input_mtp_fused`.
+        :meth:`prepare_input_mtp`.
         """
-        if not (self._mtp_fused and not is_dp_attn() and is_last_pp_rank()):
+        if not (self.mtp_enabled and not is_dp_attn() and is_last_pp_rank()):
             return False
         if not seqs or not seqs[-1].computed_prompt:
             return False   # prefill / mixed batch
@@ -1770,7 +1904,7 @@ class ModelRunner:
             return False   # batch too large to profit from speculation
         return True
 
-    def prepare_input_mtp_fused(self, seqs: List[Sequence]) -> None:
+    def prepare_input_mtp(self, seqs: List[Sequence]) -> None:
         """Minimal prep for a fused MTP step: batch bookkeeping only.
 
         Sets just what ``step_once``'s fused gate and ``_mtp_decode`` read
@@ -1782,10 +1916,36 @@ class ModelRunner:
         idata.seqs = seqs
         idata.embedding_size = 0
         idata.is_mtp_verify = False
+        idata.num_mtp_verify_rows = 0
         idata.num_decodes = len(seqs)
         idata.num_decode_tokens = len(seqs)
         idata.num_prefills = 0
         idata.max_query_len = 1
+
+    def mtp_async_can_chain(self, seqs: List[Sequence]) -> bool:
+        """Whether ``seqs`` can consume the predecessor wholly on the GPU.
+
+        Chaining is a graph/GPU-prep optimization, never a correctness
+        requirement.  A bucket miss drains and resumes from the CPU relay so
+        eager fallbacks never see placeholder x1 token ids.
+        """
+        state = self._mtp_async_state
+        n = len(seqs)
+        return bool(
+            n
+            and state is not None
+            and state.can_remap([s.seq_id for s in seqs])
+            and self._mtp_gpu_prep_on
+            and any(b >= n for b in self._draft_size_to_graph)
+            and any(b >= n for b in self._verify_size_to_graph)
+        )
+
+    def mtp_async_remap(self, seqs: List[Sequence]) -> bool:
+        """Align persistent MTP state with the successor's scheduler rows."""
+        state = self._mtp_async_state
+        if state is None:
+            raise RuntimeError("MTP async state is not installed")
+        return state.remap([s.seq_id for s in seqs])
 
     def create_dummy_seqs(self, size, runtime: bool = False):
         """Dummy 1-token decode seqs (graph capture / bucket padding).
@@ -1877,6 +2037,7 @@ class ModelRunner:
             torch.cuda.stream(stream) if stream is not None else _nullcontext()
         )
         with stream_ctx:
+            self._prepare_attention_metadata(self.input_data)
             if is_first_pp_rank():
                 self.model(self.input_data)
             else:
@@ -1989,11 +2150,82 @@ class ModelRunner:
                 # ``_mtp_decode`` collapses the ~250ms eager forward to a graph.
                 if self._mtp_verify_graph:
                     self._capture_verify_graphs(memory_pool, stream)
+                if self._piecewise_runner is not None:
+                    self._capture_piecewise_graphs(stream)
         finally:
             if is_dp_attn():
                 set_dp_forward_counts(None)
         if torch.distributed.is_initialized():
             torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+
+    @torch.inference_mode()
+    def _capture_piecewise_graphs(
+        self, stream: Optional[torch.cuda.Stream]
+    ) -> None:
+        """Capture every configured mixed-forward bucket during startup.
+
+        Unlike decode, a piecewise graph's eager Attention/GDN breaks need real
+        metadata, so each capture uses one temporary prefill request of exactly
+        the bucket size. The graph-resident regions are independent of that
+        request type; replay calls the eager breaks against the current mixed
+        batch and its freshly prepared metadata.
+        """
+        runner = self._piecewise_runner
+        if runner is None or not runner.capture_sizes:
+            return
+
+        sizes = list(reversed(runner.capture_sizes))
+        iterator = sizes
+        if get_local_rank() == 0:
+            logger.info(
+                "Capturing piecewise CUDA graphs for token bucket sizes: %s",
+                list(reversed(sizes)),
+            )
+            iterator = tqdm(
+                sizes,
+                desc="Capturing Piecewise Graphs",
+                ncols=100,
+            )
+
+        # Do allocator cleanup once. Per-bucket empty_cache/gc defeats graph
+        # pool reuse and makes startup scale linearly with Python GC work.
+        gc.collect()
+        torch.cuda.empty_cache()
+        stream_ctx = (
+            torch.cuda.stream(stream) if stream is not None else _nullcontext()
+        )
+        with stream_ctx:
+            for bucket in iterator:
+                seq_id = -(1_000_000 + bucket)
+                seq = Sequence(seq_id, [1] * bucket, [], output_len=1)
+                seq.prompt_len = bucket
+                seq.computed_token_num = 0
+                seq.to_compute_token_num = bucket
+                self.memory_manager.pre_allocate_page(
+                    [seq], cacheable=False
+                )
+                self.memory_manager.allocate_ssm_slot(seq)
+                try:
+                    self.prepare_input([seq])
+                    if self.input_data.embedding_size != bucket:
+                        raise RuntimeError(
+                            "piecewise initialization requires explicit input "
+                            f"embeddings, got {self.input_data.embedding_size}/"
+                            f"{bucket} rows"
+                        )
+                    self._prepare_attention_metadata(self.input_data)
+                    runner.capture_bucket(
+                        self.input_data,
+                        self.input_hidden_states[:bucket],
+                    )
+                finally:
+                    self.memory_manager.free(seq)
+                    self.embedding_cache.pop(seq_id, None)
+                    self.disagg_embeds.pop(seq_id, None)
+        if stream is not None:
+            stream.synchronize()
+        else:
+            torch.cuda.synchronize()
 
     def _fixup_vl_decode_embeddings(self, num_decode_tokens: int) -> None:
         """Re-embed decode-token IDs into the front of ``input_hidden_states``.
@@ -2020,12 +2252,15 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self):
+        self._prepare_attention_metadata(self.input_data)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         if is_first_pp_rank() and self.use_mm:
             # See ``_fixup_vl_decode_embeddings`` for why this is required
             # without overlap scheduling.
             num_decode_tokens = sum(
-                1 for s in self.input_data.seqs if s.computed_prompt
+                s.to_compute_token_num
+                for s in self.input_data.seqs
+                if s.computed_prompt
             )
             self._fixup_vl_decode_embeddings(num_decode_tokens)
             output = self.model(
@@ -2053,6 +2288,15 @@ class ModelRunner:
         else:
             assert isinstance(output, torch.Tensor)
             self.output_hidden_states[:num_cal_tokens] = output
+
+    def _prepare_attention_metadata(self, input_data: InputData) -> None:
+        """Delegate standard attention metadata construction to its backend."""
+        backend = self.standard_attention_backend
+        if (
+            backend is not None
+            and getattr(self.memory_manager, "segment", None) is not None
+        ):
+            input_data.attention_metadata = backend.prepare_metadata(input_data)
 
     def check_decode_batch(self):
         # Since the scheduler put prefill seqs at the end
@@ -2238,21 +2482,27 @@ class ModelRunner:
             "MTP metrics: Mean acceptance length: %.2f, Accepted: %d tokens, "
             "Drafted: %d tokens, Per-position acceptance rate: %s, "
             "Draft acceptance rate: %.1f%%",
-            mean_len, acc, drafted_tokens, per_pos, rate,
+            mean_len,
+            acc,
+            drafted_tokens,
+            per_pos,
+            rate,
         )
         # Sparse top-k window overflow (see ``_mtp_sparse_probs``). Read at most
         # once per log window so the hot path never syncs; a nonzero count means
         # probability ties spilled past ``top_k + _SPARSE_TIE_MARGIN`` and a few
         # tied tokens were dropped from p's support (tiny distribution skew, not a
         # correctness break) -- raise the margin if it ever shows up.
-        n_of = int(self._mtp_tie_overflow)
-        if n_of:
-            logger.warning(
-                "MTP sparse top-k tie overflow on %d rows (margin=%d); "
-                "consider raising ModelRunner._SPARSE_TIE_MARGIN",
-                n_of, self._SPARSE_TIE_MARGIN,
-            )
-            self._mtp_tie_overflow.zero_()
+        if self._mtp_sampling_seen:
+            n_of = int(self._mtp_tie_overflow)
+            if n_of:
+                logger.warning(
+                    "MTP sparse top-k tie overflow on %d rows (margin=%d); "
+                    "consider raising ModelRunner._SPARSE_TIE_MARGIN",
+                    n_of, self._SPARSE_TIE_MARGIN,
+                )
+                self._mtp_tie_overflow.zero_()
+        self._mtp_sampling_seen = False
         # reset window
         self._mtp_m_drafts = 0
         self._mtp_m_accepted = 0
@@ -2521,10 +2771,11 @@ class ModelRunner:
             k_pad = self._mtp_kpad(decode_seqs)
         for j in range(k):
             for i, s in enumerate(decode_seqs):
-                s.token_ids = orig_tokens[i] + [x1[i]] + drafts_cols[i]
-                s.computed_token_num = len(s.token_ids) - 1
+                s.computed_token_num = len(orig_tokens[i]) + j
                 s.to_compute_token_num = 1
-            self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+                s.to_compute_tokens = [
+                    x1[i] if j == 0 else drafts_cols[i][-1]
+                ]
             self.prepare_input(decode_seqs)
             out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
             logits = mtp.logits_from_hidden(out_hidden)
@@ -2571,21 +2822,19 @@ class ModelRunner:
         """
         mtp = self.model.mtp
         dev = hidden.device
-        drafts_cols = [[] for _ in range(nd)]   # per-seq python (for token_ids mutation)
+        drafts_cols = [[] for _ in range(nd)]
         tok = torch.tensor(x1, device=dev, dtype=torch.int64)
         cur_hidden = hidden
-        step_toks = []  # list of [nd] GPU tensors
         for j in range(k):
-            cols = [drafts_cols[i] for i in range(nd)]
             for i, s in enumerate(decode_seqs):
-                s.token_ids = orig_tokens[i] + [x1[i]] + cols[i]
-                s.computed_token_num = len(s.token_ids) - 1
+                s.computed_token_num = len(orig_tokens[i]) + j
                 s.to_compute_token_num = 1
-            self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+                s.to_compute_tokens = [
+                    x1[i] if j == 0 else drafts_cols[i][-1]
+                ]
             self.prepare_input(decode_seqs)
             out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
             tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
-            step_toks.append(tok)
             # Need python token_ids for the next step's slot bookkeeping, so this
             # step's tokens must be materialized before building step j+1. Keep a
             # single per-step D2H (unavoidable in the eager path since positions/
@@ -2644,9 +2893,9 @@ class ModelRunner:
             # the seqs in the *verify* shape (1+k speculative tokens) for the
             # one-shot page allocation.
             for i, s in enumerate(decode_seqs):
-                s.token_ids = orig_tokens[i] + [x1[i]]
-                s.computed_token_num = len(s.token_ids) - 1
+                s.computed_token_num = len(orig_tokens[i])
                 s.to_compute_token_num = 1
+                s.to_compute_tokens = [x1[i]]
             pad_seqs = (
                 self.create_dummy_seqs(bucket - nd, runtime=True) if bucket > nd else []
             )
@@ -2665,14 +2914,15 @@ class ModelRunner:
         if bucket > nd:
             self._d_hidden[nd:bucket].zero_()
 
-        base_pos = self._draft_input.positions[:bucket].clone()
+        base_pos = self._d_base_pos[:bucket]
+        base_pos.copy_(self._draft_input.positions[:bucket])
         block_table = self._draft_input.block_table[:bucket]
+        row_idx = self._d_row_idx[:bucket]
 
         def _slot_for(pos):
-            blk = block_table[torch.arange(bucket, device=dev), (pos // page_sz)]
+            blk = block_table[row_idx, (pos // page_sz)]
             return (blk.to(torch.int64) * page_sz + (pos % page_sz))
 
-        step_next = []
         for j in range(k):
             if j > 0:
                 self._d_tok[:bucket].copy_(self._d_next_tok[:bucket])
@@ -2687,15 +2937,14 @@ class ModelRunner:
                     self._draft_input.decode_seq_lens[:bucket].add_(1)
                 self._draft_input.seq_lens[:bucket].add_(1)
             g.replay()
-            step_next.append(self._d_next_tok[:nd].clone())
+            self._d_drafts[:nd, j].copy_(self._d_next_tok[:nd])
 
-        drafts_gpu = torch.stack(step_next, dim=1)  # [nd, k] on GPU
         # Stash the GPU draft tensor and return ``None`` for the host copy:
         # ``.tolist()`` here is a blocking D2H that stalls the host on the whole
         # draft chain (~0.55 ms at nd=64) only to hand the accept loop token ids
         # it now gets from the single end-of-step packed D2H. Paths that truly
         # need host-side drafts go through :meth:`_drafts_host`.
-        self._drafts_gpu = drafts_gpu
+        self._drafts_gpu = self._d_drafts[:nd, :k]
         return None
 
     @torch.inference_mode()
@@ -2744,9 +2993,9 @@ class ModelRunner:
             gp.fill_draft(self._draft_input)
         else:
             for i, s in enumerate(decode_seqs):
-                s.token_ids = orig_tokens[i] + [x1[i]]
-                s.computed_token_num = len(s.token_ids) - 1
+                s.computed_token_num = len(orig_tokens[i])
                 s.to_compute_token_num = 1
+                s.to_compute_tokens = [x1[i]]
             pad_seqs = (
                 self.create_dummy_seqs(bucket - nd, runtime=True) if bucket > nd else []
             )
@@ -2780,14 +3029,15 @@ class ModelRunner:
             self._d_topk[nd:bucket].fill_(1)
             self._d_topp[nd:bucket].fill_(1.0)
 
-        base_pos = self._draft_input.positions[:bucket].clone()
+        base_pos = self._d_base_pos[:bucket]
+        base_pos.copy_(self._draft_input.positions[:bucket])
         block_table = self._draft_input.block_table[:bucket]
+        row_idx = self._d_row_idx[:bucket]
 
         def _slot_for(pos):
-            blk = block_table[torch.arange(bucket, device=dev), (pos // page_sz)]
+            blk = block_table[row_idx, (pos // page_sz)]
             return (blk.to(torch.int64) * page_sz + (pos % page_sz))
 
-        step_next = []
         step_q, step_qv, step_qi, step_qd = [], [], [], []
         for j in range(k):
             if j > 0:
@@ -2806,7 +3056,7 @@ class ModelRunner:
             # TP-sync the drawn token (Gumbel RNG isn't guaranteed identical
             # across ranks); broadcast BEFORE it seeds the next step's forward.
             self._mtp_bcast_tp(self._d_next_tok[:bucket])
-            step_next.append(self._d_next_tok[:nd].clone())
+            self._d_drafts[:nd, j].copy_(self._d_next_tok[:nd])
             if sparse:
                 step_qv.append(self._d_qv[:nd].clone())
                 step_qi.append(self._d_qi[:nd].clone())
@@ -2822,7 +3072,7 @@ class ModelRunner:
             else:
                 step_q.append(self._d_q[:nd].clone())
 
-        drafts_gpu = torch.stack(step_next, dim=1)     # [nd, k] on GPU
+        drafts_gpu = self._d_drafts[:nd, :k]
         if sparse:
             q = self._q_sparse(
                 torch.stack(step_qv, dim=1),           # [nd, k, k_pad]
@@ -2852,6 +3102,15 @@ class ModelRunner:
         self._d_hidden = torch.zeros((B, H), dtype=dt, device=dev)
         self._d_next_tok = torch.zeros(B, dtype=torch.int64, device=dev)
         self._d_out_hidden = torch.zeros((B, H), dtype=dt, device=dev)
+        # Host orchestration replays one captured draft step ``k`` times. Keep
+        # the chain outputs and position helpers persistent so the hot path does
+        # not allocate k clones, a stack output, a base-position clone, or a new
+        # arange tensor on every speculative step.
+        self._d_drafts = torch.empty(
+            (B, self._mtp_k), dtype=torch.int64, device=dev
+        )
+        self._d_base_pos = torch.empty(B, dtype=torch.long, device=dev)
+        self._d_row_idx = torch.arange(B, dtype=torch.int64, device=dev)
         # Sampled-draft (rejection sampling) static buffers: per-seq sampling
         # params + the drawn q distribution the accept step reads. Vocab-wide q
         # is the only large one (B*vocab); allocated once, reused across replays.
@@ -2946,6 +3205,7 @@ class ModelRunner:
         """
         nd = self._d_nd
         mtp = self.model.mtp
+        self._prepare_attention_metadata(self._draft_input)
         out_hidden = mtp.forward(self._draft_input, self._d_hidden[:nd], self._d_tok[:nd])
         self._d_out_hidden[:nd].copy_(out_hidden)
         tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
@@ -2967,6 +3227,7 @@ class ModelRunner:
         """
         nd = self._d_nd
         mtp = self.model.mtp
+        self._prepare_attention_metadata(self._draft_input)
         out_hidden = mtp.forward(self._draft_input, self._d_hidden[:nd], self._d_tok[:nd])
         self._d_out_hidden[:nd].copy_(out_hidden)
         logits = mtp.logits_from_hidden(out_hidden)
@@ -2992,6 +3253,7 @@ class ModelRunner:
         """
         nd = self._d_nd
         mtp = self.model.mtp
+        self._prepare_attention_metadata(self._draft_input)
         out_hidden = mtp.forward(self._draft_input, self._d_hidden[:nd], self._d_tok[:nd])
         self._d_out_hidden[:nd].copy_(out_hidden)
         logits = mtp.logits_from_hidden(out_hidden)
@@ -3057,7 +3319,9 @@ class ModelRunner:
             # but ONLY if this id isn't already a live entry (never clobber).
             if self.use_mm and self.uses_mrope and sid not in self.embedding_cache:
                 self.embedding_cache[sid] = EmbeddingInfo(
-                    None, None, torch.zeros(1, dtype=torch.long)
+                    None,
+                    None,
+                    torch.zeros(1, dtype=torch.long, device="cuda"),
                 )
                 seeded_ids.append(sid)
             seqs.append(s)
@@ -3162,9 +3426,9 @@ class ModelRunner:
         else:
             drafts = self._drafts_host(drafts, nd, kk)
             for i, s in enumerate(decode_seqs):
-                s.token_ids = orig_tokens[i] + [x1[i]] + drafts[i]
                 s.computed_token_num = len(orig_tokens[i])
                 s.to_compute_token_num = qlen
+                s.to_compute_tokens = [x1[i]] + drafts[i]
                 s._mtp_verify = True
             pad_seqs = (
                 self._create_dummy_verify_seqs(bucket - nd, qlen) if bucket > nd else []
@@ -3297,7 +3561,7 @@ class ModelRunner:
         if get_tp_size() > 1:
             self._mtp_bcast_tp(missing_x1_gpu)
         missing_x1 = missing_x1_gpu.tolist()
-        self.prepare_input_mtp_fused(decode_seqs)
+        self.prepare_input_mtp(decode_seqs)
 
         hidden_rows = []
         x1 = []
@@ -3341,14 +3605,28 @@ class ModelRunner:
         gp = self._mtp_gpu_prep
         if gp is None or not self._mtp_gpu_prep_on:
             return None
+        async_state = None
+        if torch.is_tensor(x1):
+            candidate = self._mtp_async_state
+            if candidate is not None and candidate.matches(
+                [s.seq_id for s in decode_seqs]
+            ):
+                async_state = candidate
         gp.push_meta(
             decode_seqs,
             bucket,
             epoch=self._mtp_prep_epoch,
             ctx_lens=[len(t) for t in orig_tokens],
-            x1=x1,
+            # Host values are only staging fallbacks for a chained step; the
+            # authoritative context/x1/resume column is overwritten D2D below.
+            x1=([0] * len(decode_seqs) if torch.is_tensor(x1) else x1),
             dummy_page=self.memory_manager.dummy_page,
             mrope_deltas=self._mtp_mrope_deltas(decode_seqs),
+            ctx_lens_gpu=(async_state.context_lens if async_state else None),
+            x1_gpu=(async_state.relay_tokens if async_state else None),
+            num_accepted_gpu=(
+                async_state.resume_num_accepted if async_state else None
+            ),
         )
         return gp
 
@@ -3368,8 +3646,13 @@ class ModelRunner:
         return dg[:nd, :kk].tolist()
 
     @torch.inference_mode()
-    def _mtp_decode(self, hidden: torch.Tensor, x1_tokens: list):
-        """MTP speculative decode for a pure-decode batch (greedy, correct-first).
+    def _mtp_decode(
+        self,
+        hidden: torch.Tensor,
+        x1_tokens: list,
+        extra_prefill_seqs=None,
+    ):
+        """MTP speculative decode, optionally sharing verify with prefill.
 
         Returns one committed-token list per seq: ``x1`` plus the accepted draft
         prefix (1..k+1 tokens). The target bonus is relay-only and becomes the
@@ -3382,6 +3665,7 @@ class ModelRunner:
         the seqs' real slots; rejected-tail slots are simply overwritten next
         step (seq length only advances by the accepted count).
         """
+        extra_prefill_seqs = list(extra_prefill_seqs or ())
         nd = self.input_data.num_decodes
         k = self._mtp_k
         mtp = self.model.mtp
@@ -3389,9 +3673,22 @@ class ModelRunner:
         dev = hidden.device
         # ``hidden`` is a view into the persistent output_hidden_states buffer;
         # clone so subsequent forwards (draft/verify) can't mutate it underfoot.
-        hidden = hidden[:nd].clone()
+        seed_hidden = self._mtp_seed_hidden[:nd]
+        seed_hidden.copy_(hidden[:nd])
+        hidden = seed_hidden
 
-        x1 = [int(x1_tokens[i]) for i in range(nd)]
+        x1_is_gpu = torch.is_tensor(x1_tokens)
+        if x1_is_gpu:
+            x1_gpu = x1_tokens[:nd].to(device=dev, dtype=torch.int64)
+            # Sequence mutations below exist only to reserve pages and provide
+            # fallback shapes.  The graph fast path consumes x1 directly from
+            # ``x1_gpu`` through MtpGpuPrep, so no D2H is needed here.
+            x1 = [0] * nd
+        else:
+            x1 = [int(x1_tokens[i]) for i in range(nd)]
+            self._mtp_x1_host_np[:nd] = x1
+            x1_gpu = self._mtp_x1_gpu[:nd]
+            x1_gpu.copy_(self._mtp_x1_host[:nd], non_blocking=True)
         # x1 is already TP-synchronized by ``step_once`` (it broadcasts the
         # sampled x1 from TP-rank-0 before calling this method whenever sampling
         # is active), so no broadcast here. Runtime dispatch: if ANY seq in the
@@ -3402,16 +3699,20 @@ class ModelRunner:
             (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5) or s.top_k != 1
             for s in decode_seqs
         )
-        # Original committed token_ids / lengths (pre spec-mutation). These are
-        # REFERENCES, not copies: every spec mutation below rebinds
-        # ``seq.token_ids`` to a freshly concatenated list and never mutates the
-        # committed one in place, so ``restore()`` can just rebind the original
-        # object back. Copying them cost O(context) per seq per step -- ~1-2 ms at
-        # 64x2k context, i.e. the step got more expensive the longer the requests
-        # ran, for nothing.
+        self._mtp_sampling_seen |= _rej_active
+        # Greedy mixed batches use the same GPU completion as pure decode.  The
+        # completion carries variable-width decode commits followed by the
+        # one-token prefill samples, while freshly completed prefills are also
+        # appended to the live request-id keyed relay state.
+        _async_accept = self._mtp_async_publish and not _rej_active
+        # Preserve the scheduler-owned sequence view while draft/verify uses
+        # compact ``to_compute_tokens`` suffixes. ``token_ids`` itself remains
+        # untouched: copying every request's full context each step made host
+        # preparation slower as generation progressed.
         orig_tokens = [s.token_ids for s in decode_seqs]
         orig_ctn = [s.computed_token_num for s in decode_seqs]
         orig_tctn = [s.to_compute_token_num for s in decode_seqs]
+        orig_compute_tokens = [s.to_compute_tokens for s in decode_seqs]
         self._mtp_prep_epoch += 1
         # Pre-allocate the KV pages for the WHOLE speculative window once: the
         # draft chain writes tokens at ctx .. ctx+k-1 and the verify forward at
@@ -3419,11 +3720,9 @@ class ModelRunner:
         # Doing it here (instead of once per phase) also freezes every seq's page
         # table for the rest of the step, which is what lets the GPU-native prep
         # stage the page tables a single time (see ``_mtp_gpu_prep_batch``).
-        for i, s in enumerate(decode_seqs):
-            s.token_ids = orig_tokens[i] + [x1[i]] + [0] * k
-            s.computed_token_num = len(orig_tokens[i])
-            s.to_compute_token_num = 1 + k
-        self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+        self.memory_manager.pre_allocate_page_for_lengths(
+            decode_seqs, [len(tokens) + 1 + k for tokens in orig_tokens]
+        )
 
         # --- Hybrid GDN recurrent-state: block-table column commit ---
         # The verify forward (GDN ``_forward_mtp_verify``) wrote each of the
@@ -3431,7 +3730,7 @@ class ModelRunner:
         # block table (column 0 held the committed pre-x1 state on entry). After
         # the accept step decides how many drafts each seq kept (``na``), the
         # exact post-acceptance state (after ``1+na`` committed tokens) sits at
-        # column ``na``. We copy it back into column 0 so the plain decode /
+        # column ``na``. We promote it to column 0 so the plain decode /
         # snapshot paths keep reading column 0. Pure-attention models (DeepSeek
         # MTP) have no SSM segment and skip this.
         _ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
@@ -3439,6 +3738,14 @@ class ModelRunner:
             _ssm_seg is not None
             and all(s.ssm_block_table is not None for s in decode_seqs)
         )
+        # A target bonus is not a verify INPUT, so it has no KV/GDN state yet.
+        # Its draft seed, however, is the target hidden at the accepted verify
+        # row, and the recurrent state *before* the bonus is the checkpoint in
+        # column ``na``.  The accept path below promotes that checkpoint to
+        # column zero.  Relaying (bonus, hidden) then lets the next qlen=1+k
+        # verify consume the bonus exactly once. Together with the accepted
+        # state-column promotion, this removes the steady-state qlen=1
+        # full-model bootstrap.
 
         def restore():
             # NOTE: deliberately do NOT restore page_table. The verify forward
@@ -3448,11 +3755,11 @@ class ModelRunner:
             # page_table here would orphan the verify pages and let the scheduler
             # hand out different physical slots (garbage KV) -> divergence.
             for i, s in enumerate(decode_seqs):
-                # Rebind the original list object (see the ``orig_tokens``
-                # comment above -- it was never mutated in place).
+                # Restore the scheduler-owned view; token_ids was never mutated.
                 s.token_ids = orig_tokens[i]
                 s.computed_token_num = orig_ctn[i]
                 s.to_compute_token_num = orig_tctn[i]
+                s.to_compute_tokens = orig_compute_tokens[i]
                 s._mtp_verify = False
 
         # --- 1. Draft k tokens per seq by looping the MTP head. ---
@@ -3476,62 +3783,240 @@ class ModelRunner:
         # Reset the GPU-draft stash; only the greedy graph draft chain fills it
         # (the accept step reads it to skip an H2D of the host drafts list).
         self._drafts_gpu = None
-        if _use_rej:
-            # Sampling draft chain: prefer the captured Gumbel-max graph (draft
-            # forward + sampling in-graph, token broadcast between replays); fall
-            # back to eager when graphs are off or the batch exceeds the max
-            # bucket. Both draw from q and keep the per-step q dist for accept.
-            _sg = (
-                self._draft_size_to_graph_sampled_sparse
-                if _sparse
-                else self._draft_size_to_graph_sampled
-            )
-            if self._mtp_draft_graph and _sg and nd <= max(_sg.keys()):
-                drafts, q_dists = self._draft_chain_graph_sampled(
-                    decode_seqs, orig_tokens, x1, hidden, k, nd, sparse=_sparse
+        with torch.profiler.record_function("gllm::mtp_draft_chain"):
+            if _use_rej:
+                # Sampling draft chain: prefer the captured Gumbel-max graph
+                # (draft forward + sampling in-graph, token broadcast between
+                # replays); fall back to eager when graphs are off or the batch
+                # exceeds the max bucket. Both draw from q and keep the per-step
+                # q dist for accept.
+                _sg = (
+                    self._draft_size_to_graph_sampled_sparse
+                    if _sparse
+                    else self._draft_size_to_graph_sampled
+                )
+                if self._mtp_draft_graph and _sg and nd <= max(_sg.keys()):
+                    drafts, q_dists = self._draft_chain_graph_sampled(
+                        decode_seqs,
+                        orig_tokens,
+                        x1_tokens,
+                        hidden,
+                        k,
+                        nd,
+                        sparse=_sparse,
+                    )
+                else:
+                    drafts, q_dists = self._draft_chain_eager_sampled(
+                        decode_seqs,
+                        orig_tokens,
+                        x1,
+                        hidden,
+                        k,
+                        nd,
+                        gen,
+                        sparse=_sparse,
+                    )
+            elif (
+                self._mtp_draft_graph
+                and self.capture_sizes
+                and nd <= max(self.capture_sizes)
+            ):
+                drafts = self._draft_chain_graph(
+                    decode_seqs, orig_tokens, x1_tokens, hidden, k, nd
                 )
             else:
-                drafts, q_dists = self._draft_chain_eager_sampled(
-                    decode_seqs, orig_tokens, x1, hidden, k, nd, gen, sparse=_sparse
+                drafts = self._draft_chain_eager(
+                    decode_seqs, orig_tokens, x1, hidden, k, nd
                 )
-        elif self._mtp_draft_graph and self.capture_sizes and nd <= max(self.capture_sizes):
-            drafts = self._draft_chain_graph(decode_seqs, orig_tokens, x1, hidden, k, nd)
-        else:
-            drafts = self._draft_chain_eager(decode_seqs, orig_tokens, x1, hidden, k, nd)
         restore()
 
         # --- 2. Verify: one base forward over [x1, d1..dk] per seq. ---
         # ``drafts is None`` == the graph draft chain kept its output on the GPU
         # (``self._drafts_gpu``); it always drafts the full ``k``.
         kk = (k if drafts is None else len(drafts[0])) if nd else 0
+        prefill_tokens = []
+        prefill_tokens_gpu = None
+        prefill_hidden = None
+        new_state_seq_ids = ()
+        new_state_context_lens = None
+        new_state_tokens = None
+        new_state_hidden = None
         # Fast path: replay the captured verify graph (collapses the eager
         # per-layer launch overhead). Only when MTP verify graphs are captured
         # and the batch fits a bucket; falls back to the eager forward otherwise.
         _v_done = False
+        # Hybrid and attention-only models use the same single qlen=1+k target
+        # verify graph, so serving never replays once per candidate.
         if (
+            not extra_prefill_seqs
+            and
             self._mtp_verify_graph
             and self._verify_size_to_graph
             and nd <= max(self._verify_size_to_graph.keys())
         ):
-            _res = self._verify_forward_graph(decode_seqs, orig_tokens, x1, drafts, nd, kk)
+            with torch.profiler.record_function("gllm::mtp_target_verify_graph"):
+                _res = self._verify_forward_graph(
+                    decode_seqs, orig_tokens, x1_tokens, drafts, nd, kk
+                )
             if _res is not None:
                 v_logits, qsl, v_hidden = _res
                 _v_done = True
         if not _v_done:
-            drafts = self._drafts_host(drafts, nd, kk)
+            # A chained mixed batch must not pull the draft grid back to the
+            # host.  Its CPU Sequence mutations below only establish shapes
+            # and reserve pages; ``MtpGpuPrep.correct_mixed_prefix`` overwrites
+            # the placeholder token/position/KV metadata from authoritative
+            # GPU state after ordinary ragged-prefill preparation.
+            mixed_gpu_prep = None
+            drafts_gpu_for_mixed = getattr(self, "_drafts_gpu", None)
+            if (
+                extra_prefill_seqs
+                and drafts is None
+                and drafts_gpu_for_mixed is not None
+                and self._mtp_gpu_prep is not None
+                and self._mtp_gpu_prep._staged[0] == self._mtp_prep_epoch
+            ):
+                mixed_gpu_prep = self._mtp_gpu_prep
+                drafts = [[0] * kk for _ in range(nd)]
+            else:
+                drafts = self._drafts_host(drafts, nd, kk)
             for i, s in enumerate(decode_seqs):
-                s.token_ids = orig_tokens[i] + [x1[i]] + drafts[i]  # +1+kk new
                 s.computed_token_num = len(orig_tokens[i])          # context cached
                 s.to_compute_token_num = 1 + kk
+                # InputData consumes this compact suffix directly. Keeping the
+                # committed token_ids list untouched removes an O(context)
+                # Python list copy from every mixed verify forward.
+                s.to_compute_tokens = [x1[i]] + drafts[i]
                 s._mtp_verify = True   # force the prefill-with-context attn path
             self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
-            self.prepare_input(decode_seqs)
-            v_out = self.model(self.input_data)
-            v_hidden = v_out[0] if isinstance(v_out, tuple) else v_out
+            verify_and_prefill = list(decode_seqs) + extra_prefill_seqs
+            self.prepare_input(verify_and_prefill)
+            if mixed_gpu_prep is not None:
+                mixed_gpu_prep.correct_mixed_prefix(
+                    self.input_data, 1 + kk, drafts_gpu_for_mixed
+                )
+            total_mixed_tokens = int(self.input_data.tokens_cpu.shape[0])
+            all_hidden = None
+            if (
+                self._piecewise_runner is not None
+                and self.input_data.embedding_size == total_mixed_tokens
+                and all(s.mm_contents is None for s in verify_and_prefill)
+                and self._piecewise_runner.can_run(total_mixed_tokens)
+            ):
+                # Metadata and every attention/GDN core stay eager. Static
+                # regions consume a bucket-padded embedding buffer and are
+                # replayed as graph segments around those eager breaks.
+                self._prepare_attention_metadata(self.input_data)
+                # Qwen-VL-compatible input preparation deliberately leaves
+                # decode rows as uninitialized placeholders: the ordinary
+                # ``forward()`` wrapper overwrites them immediately before
+                # entering the model.  Piecewise execution bypasses that
+                # wrapper, so perform the identical fixup here before copying
+                # embeddings into the graph's static input.  MTP verify rows
+                # are computed-prompt rows with qlen=1+k and all sit at the
+                # front of this mixed batch.
+                num_decode_tokens = sum(
+                    s.to_compute_token_num
+                    for s in self.input_data.seqs
+                    if s.computed_prompt
+                )
+                self._fixup_vl_decode_embeddings(num_decode_tokens)
+                mixed_embeddings = self.input_hidden_states[:total_mixed_tokens]
+                with torch.profiler.record_function(
+                    "gllm::mtp_target_mixed_piecewise"
+                ):
+                    all_hidden = self._piecewise_runner.run(
+                        self.input_data, mixed_embeddings
+                    )
+            if all_hidden is None:
+                # Go through the normal runner wrapper: it prepares attention
+                # metadata and supplies Qwen-VL-compatible input embeddings.
+                with torch.profiler.record_function(
+                    "gllm::mtp_target_mixed_eager"
+                ):
+                    self.forward()
+                all_hidden = self.output_hidden_states[:total_mixed_tokens]
             # Verify seqs are uniform ``1+kk`` query length, so ``qsl`` is the
             # uniform stride. Logits stay raw (see ``_verify_forward_graph``).
-            v_logits = self.model.logits_from_hidden(v_hidden)
+            num_verify_tokens = nd * (1 + kk)
+            v_hidden = all_hidden[:num_verify_tokens]
             qsl = [i * (1 + kk) for i in range(nd + 1)]
+
+            if extra_prefill_seqs:
+                # The model emits one row per query token.  A prefill request's
+                # next-token distribution is its final query row, not the first
+                # row of the suffix.  query_start_loc describes the complete
+                # [verify-prefix | ragged-prefill-suffix] layout.
+                num_extra = len(extra_prefill_seqs)
+                last_rows_gpu = self._mtp_mixed_last_rows[:num_extra]
+                last_rows_gpu.copy_(
+                    self.input_data.query_start_loc[
+                        nd + 1 : nd + num_extra + 1
+                    ]
+                )
+                last_rows_gpu.sub_(1)
+                prefill_hidden = all_hidden.index_select(0, last_rows_gpu)
+                # The full-vocab LM head is the largest temporary in a mixed
+                # prefill.  Only verify rows and each prefill's final row need
+                # logits; projecting every prompt token can allocate multiple
+                # GiB on large-vocab models (3.8 GiB for the 35B test batch).
+                selected_hidden = torch.cat((v_hidden, prefill_hidden), dim=0)
+                selected_logits = self.model.logits_from_hidden(selected_hidden)
+                v_logits = selected_logits[:num_verify_tokens]
+                prefill_logits = selected_logits[num_verify_tokens:]
+                self.input_data.seqs = extra_prefill_seqs
+                # Argmax reads only ``seqs``. Avoid allocating/copying three
+                # sampling-parameter tensors for the overwhelmingly common
+                # greedy, no-repetition-penalty path.
+                mixed_greedy = all(
+                    s.top_k == 1 and s.repetition_penalty == 1.0
+                    for s in extra_prefill_seqs
+                )
+                if mixed_greedy:
+                    self.input_data.needs_repetition_penalty = False
+                else:
+                    self.input_data.prepare_sample()
+                prefill_tokens_gpu = self.sampler.forward_gpu(
+                    prefill_logits, self.input_data
+                )
+                if get_tp_size() > 1:
+                    self._mtp_bcast_tp(prefill_tokens_gpu)
+                if _async_accept:
+                    completed = [
+                        i
+                        for i, s in enumerate(extra_prefill_seqs)
+                        if s.computed_token_num + s.to_compute_token_num
+                        >= s.prompt_len
+                    ]
+                    if completed:
+                        nc = len(completed)
+                        completed_gpu = self._mtp_mixed_new_idx[:nc]
+                        new_state_context_lens = self._mtp_mixed_new_ctx[:nc]
+                        idx_host = self._mtp_mixed_new_idx_host[:nc]
+                        ctx_host = self._mtp_mixed_new_ctx_host[:nc]
+                        self._mtp_mixed_new_idx_host_np[:nc] = completed
+                        new_state_seq_ids = tuple(
+                            extra_prefill_seqs[i].seq_id for i in completed
+                        )
+                        self._mtp_mixed_new_ctx_host_np[:nc] = [
+                            extra_prefill_seqs[i].computed_token_num
+                            + extra_prefill_seqs[i].to_compute_token_num
+                            for i in completed
+                        ]
+                        completed_gpu.copy_(idx_host, non_blocking=True)
+                        new_state_context_lens.copy_(
+                            ctx_host, non_blocking=True
+                        )
+                        new_state_tokens = prefill_tokens_gpu.index_select(
+                            0, completed_gpu
+                        )
+                        new_state_hidden = prefill_hidden.index_select(
+                            0, completed_gpu
+                        )
+                else:
+                    prefill_tokens = prefill_tokens_gpu.cpu().tolist()
+            else:
+                v_logits = self.model.logits_from_hidden(v_hidden)
 
         # Rejection mode: the target dist ``p`` at each of the 1+kk verify
         # positions, in the SAME transformed space as the draft dist ``q``
@@ -3603,7 +4088,7 @@ class ModelRunner:
             # step. Here every decision is a batched tensor op and the host learns
             # the outcome through ONE packed D2H at the end.
             qlen = 1 + kk
-            seq_ar = torch.arange(nd, device=dev)
+            seq_ar = self._mtp_row_idx[:nd]
             sparse = p_sparse is not None
             if sparse:
                 p3_vals, p3_idx = p_sparse          # [nd, qlen, k_pad] each
@@ -3750,7 +4235,7 @@ class ModelRunner:
             # Greedy target: one argmax over the verify logits (the rejection
             # branch instead transforms the same logits into ``p``).
             vp = v_logits[: nd * qlen].argmax(dim=-1).view(nd, qlen)
-            seq_ar = torch.arange(nd, device=dev)
+            seq_ar = self._mtp_row_idx[:nd]
             if kk > 0:
                 # Prefer the GPU draft tensor threaded from the draft chain (the
                 # graph chain never materializes the drafts on the host at all).
@@ -3763,16 +4248,79 @@ class ModelRunner:
                 match = (vp[:, :kk] == drafts_gpu)                    # [nd,kk] bool
                 # cumprod over the bool prefix: 1 until the first mismatch, 0 after
                 # -> sum = length of the leading all-accept prefix.
-                na_gpu = torch.cumprod(match.to(torch.int32), dim=1).sum(dim=1)  # [nd]
+                na_gpu = torch.cumprod(
+                    match.to(torch.int32), dim=1
+                ).sum(dim=1)  # [nd]
             else:
                 drafts_gpu = None
                 na_gpu = torch.zeros(nd, device=dev, dtype=torch.int32)
-            # ONE D2H per step carries everything the host still needs:
+            na_l = na_gpu.to(torch.long)
+            # Batch-gather every seq's bonus hidden in ONE op (verify row
+            # ``i*qlen + na``) instead of nd separate per-seq ``.clone()``s.
+            bonus_rows = seq_ar * qlen + na_l
+            bonus_hidden_all = v_hidden.index_select(0, bonus_rows)  # [nd, H]
+            if _async_accept:
+                state = self._mtp_async_state
+                seq_ids = tuple(s.seq_id for s in decode_seqs)
+                if state is None:
+                    state = MtpAsyncBatchState(
+                        max_batch_size=self.max_running_seqs,
+                        k=kk,
+                        hidden_size=bonus_hidden_all.shape[-1],
+                        hidden_dtype=bonus_hidden_all.dtype,
+                        device=dev,
+                    )
+                    self._mtp_async_state = state
+                if not state.matches(seq_ids):
+                    if any(state._busy):
+                        raise RuntimeError(
+                            "MTP async cohort changed before pending completion was collected"
+                        )
+                    state.install(
+                        seq_ids,
+                        torch.as_tensor(
+                            [len(t) for t in orig_tokens],
+                            dtype=torch.int64,
+                            device=dev,
+                        ),
+                        x1_gpu,
+                        hidden,
+                    )
+                with torch.profiler.record_function("gllm::mtp_accept_publish"):
+                    completion = state.publish(
+                        current_x1=x1_gpu,
+                        drafts=(
+                            drafts_gpu
+                            if drafts_gpu is not None
+                            else torch.empty(
+                                (nd, 0), dtype=torch.int64, device=dev
+                            )
+                        ),
+                        num_accepted_drafts=na_gpu,
+                        next_bonus=vp[seq_ar, na_l],
+                        next_hidden=bonus_hidden_all,
+                        producer_stream=torch.cuda.current_stream(),
+                        extra_tokens=prefill_tokens_gpu,
+                        extra_seq_ids=tuple(
+                            s.seq_id for s in extra_prefill_seqs
+                        ),
+                        new_state_seq_ids=new_state_seq_ids,
+                        new_state_context_lens=new_state_context_lens,
+                        new_state_tokens=new_state_tokens,
+                        new_state_hidden=new_state_hidden,
+                    )
+                # All speculative Sequence mutations are host bookkeeping only;
+                # restore them now.  The completion event orders the later CPU
+                # finalize after verify/accept and the D2H record.
+                restore()
+                return completion
+
+            # Synchronous fallback: ONE D2H per step carries everything the
+            # host still needs.  This must stay after the async early return;
+            # doing it before that branch silently serialized overlap MTP.
             #   row 0        : n_accepted
             #   row 1        : the relayed bonus token
-            #   rows 2..2+kk : the draft token grid (transposed), so the draft
-            #                  chain never has to sync mid-step just to give the
-            #                  commit loop its token ids.
+            #   rows 2..2+kk : the draft token grid (transposed)
             rows = [na_gpu.to(torch.int64)]
             rows.append(vp[seq_ar, na_gpu.to(torch.long)].to(torch.int64))
             if drafts_gpu is not None:
@@ -3780,25 +4328,28 @@ class ModelRunner:
             packed_cpu = torch.stack(rows).cpu()   # [2+kk, nd]
             na_cpu = packed_cpu[0].tolist()
             bonus_cpu2 = packed_cpu[1].tolist()
-            drafts_cpu = packed_cpu[2:].t().tolist() if drafts_gpu is not None else None
-            # Batch-gather every seq's bonus hidden in ONE op (verify row
-            # ``i*qlen + na``) instead of nd separate per-seq ``.clone()``s.
-            bonus_rows = seq_ar * qlen + na_gpu.to(torch.long)
-            bonus_hidden_all = v_hidden.index_select(0, bonus_rows)  # [nd, H]
+            drafts_cpu = (
+                packed_cpu[2:].t().tolist() if drafts_gpu is not None else None
+            )
             for i, s in enumerate(decode_seqs):
                 na = na_cpu[i]
                 n_accepted[i] = na
                 # committed = x1 + the accepted draft prefix.
                 results[i] = [x1[i]] + (drafts_cpu[i][:na] if na else [])
-                # bonus token from the on-device gather; bonus hidden is row i
-                # of the batched gather (a GPU view; only seeds the next draft).
+                # Bonus token from the on-device gather; bonus hidden is row i of
+                # the batched gather and only seeds the next draft.
                 new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
 
         self._record_mtp_metrics(nd, kk, n_accepted)
 
-        # Replace the relay map wholesale so seqs absent from this batch are
-        # evicted (their stale hidden must never seed a later draft).
-        self._mtp_relay = new_relay
+        # Update only rows that actually ran. A seq absent from this MTP batch
+        # has not advanced, so its relay remains position-correct and must be
+        # retained. Relay invalidation belongs to the paths that really advance
+        # a seq without MTP (``_mtp_drop_relay``) and to request cleanup. The
+        # old wholesale replacement turned harmless scheduling gaps into relay
+        # misses; the bootstrap then consumed an already-verified token again
+        # and double-advanced hybrid GDN state.
+        self._mtp_relay.update(new_relay)
 
         # --- Hybrid GDN recurrent-state: commit the accepted column to col 0 ---
         # The verify forward wrote token t's post-state into block-table column
@@ -3826,7 +4377,134 @@ class ModelRunner:
                 decode_seqs[i].ssm_num_accepted = 1
 
         restore()
-        return results
+        return results + prefill_tokens
+
+    def step_once_mtp_async(self) -> MtpAsyncCompletion:
+        """Enqueue one greedy fused-MTP step without waiting for its D2H result.
+
+        Sampling/rejection MTP intentionally falls back to the synchronous path:
+        its TP-authoritative accept broadcast currently materializes CPU lists.
+        """
+        seqs = self.input_data.seqs[: self.input_data.num_decodes]
+        if any(
+            (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5)
+            or s.top_k != 1
+            for s in seqs
+        ):
+            raise RuntimeError("async MTP currently requires greedy requests")
+        self._mtp_async_publish = True
+        try:
+            completion = self.step_once()
+        finally:
+            self._mtp_async_publish = False
+        if not isinstance(completion, MtpAsyncCompletion):
+            raise RuntimeError("fused MTP did not produce an async completion")
+        return completion
+
+    @torch.inference_mode()
+    def step_once_mtp_mixed(
+        self, decode_seqs, prefill_seqs, *, async_publish: bool = False
+    ):
+        """Run one mixed verify+prefill step with exactly one input prepare.
+
+        The overlap worker calls this directly from its prefetched sequence
+        list.  Going through ordinary ``prepare_input`` first would build and
+        release Qwen-VL-compatible prompt embeddings, only for ``_mtp_decode``
+        to request the same prefill rows again.
+        """
+        decode_seqs = list(decode_seqs)
+        prefill_seqs = list(prefill_seqs)
+        if not decode_seqs or not prefill_seqs:
+            raise ValueError("mixed MTP requires both decode and prefill rows")
+        if not all(s.computed_prompt for s in decode_seqs):
+            raise ValueError("mixed MTP decode prefix contains a prefill row")
+        async_state = self._mtp_async_state
+        if (
+            async_publish
+            and async_state is not None
+            and async_state.matches([s.seq_id for s in decode_seqs])
+        ):
+            # The predecessor has published its acceptance/relay entirely on
+            # the forward stream.  Consume those tensors directly; collecting
+            # its host completion before this launch would break the pipeline.
+            x1 = async_state.relay_tokens[: len(decode_seqs)]
+            hidden = async_state.relay_hidden[: len(decode_seqs)]
+            self.prepare_input_mtp(decode_seqs)
+        elif all(s.seq_id in self._mtp_relay for s in decode_seqs):
+            relay = [self._mtp_relay[s.seq_id] for s in decode_seqs]
+            x1 = [r[0] for r in relay]
+            hidden = torch.stack([r[1] for r in relay], dim=0)
+            self.prepare_input_mtp(decode_seqs)
+        else:
+            # Bootstrap finishes by restoring the fused decode bookkeeping.
+            hidden, x1 = self._mtp_bootstrap_padded_verify(decode_seqs)
+        self._last_logprobs = None
+        old_publish = self._mtp_async_publish
+        self._mtp_async_publish = async_publish
+        try:
+            result = self._mtp_decode(
+                hidden, x1, extra_prefill_seqs=prefill_seqs
+            )
+        finally:
+            self._mtp_async_publish = old_publish
+        if async_publish and not isinstance(result, MtpAsyncCompletion):
+            raise RuntimeError("mixed MTP did not produce an async completion")
+        return result
+
+    def finalize_mtp_async(
+        self,
+        completion: MtpAsyncCompletion,
+        seqs,
+        *,
+        materialize_state=True,
+        materialize_seqs=None,
+    ):
+        """Collect one result; publish CPU relay/GDN mirrors only at a drain.
+
+        Stable overlap cohorts collect older user-visible outputs after their
+        successor has already launched.  Mutating the CPU block table for such
+        an intermediate completion would make it describe an obsolete GPU
+        checkpoint.  The latest completion is materialized only when the MTP
+        pipeline drains or changes cohort.
+        """
+        valid, committed = completion.collect()
+        if tuple(s.seq_id for s in seqs) != completion.seq_ids:
+            raise RuntimeError("MTP async completion no longer matches its cohort")
+        state = completion.owner
+        if materialize_state:
+            # One batched copy is paid only at a real drain boundary, not once
+            # per speculative iteration.
+            state_n = state.batch_size
+            relay_hidden = state.relay_hidden[:state_n].clone()
+            relay_tokens = state.relay_tokens[:state_n].cpu().tolist()
+            resume = state.resume_num_accepted[:state_n].cpu().tolist()
+            candidates = list(materialize_seqs or seqs)
+            by_id = {s.seq_id: s for s in candidates}
+            missing = [seq_id for seq_id in state.seq_ids if seq_id not in by_id]
+            if missing:
+                raise RuntimeError(
+                    f"cannot materialize MTP async state; missing seq ids {missing}"
+                )
+            for i, seq_id in enumerate(state.seq_ids):
+                seq = by_id[seq_id]
+                if getattr(seq, "_overlap_freed", False):
+                    continue
+                self._mtp_relay[seq.seq_id] = (
+                    int(relay_tokens[i]), relay_hidden[i]
+                )
+                na = int(resume[i]) - 1
+                if seq.ssm_block_table is not None:
+                    if na > 0:
+                        bt = seq.ssm_block_table
+                        bt[0], bt[na] = bt[na], bt[0]
+                        seq.ssm_state_slot = bt[0]
+                    seq.ssm_num_accepted = 1
+            # The GPU state used the pre-materialization block-table ordering.
+            # Invalidate it so a later async run starts from the CPU column-0
+            # view installed above instead of mixing the two conventions.
+            state.reset()
+        self._record_mtp_metrics(len(seqs), self._mtp_k, [v - 1 for v in valid])
+        return committed
 
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
@@ -3847,7 +4525,7 @@ class ModelRunner:
         # every MTP target forward keeps the same fixed qlen=1+k; the ordinary
         # batch-x-1 decode path is never used for an enabled MTP step.
         if (
-            self._mtp_fused
+            self.mtp_enabled
             and dp_padded_size is None
             and not is_dp_attn()
             and is_last_pp_rank()
@@ -3858,7 +4536,17 @@ class ModelRunner:
         ):
             seqs = self.input_data.seqs[: self.input_data.num_decodes]
             if seqs:
-                if all(s.seq_id in self._mtp_relay for s in seqs):
+                async_state = self._mtp_async_state
+                if (
+                    self._mtp_async_publish
+                    and async_state is not None
+                    and async_state.matches([s.seq_id for s in seqs])
+                ):
+                    # True chained MTP: predecessor acceptance, relay token,
+                    # hidden state and real context length stay on the GPU.
+                    x1 = async_state.relay_tokens[: len(seqs)]
+                    hidden = async_state.relay_hidden[: len(seqs)]
+                elif all(s.seq_id in self._mtp_relay for s in seqs):
                     relay = [self._mtp_relay[s.seq_id] for s in seqs]
                     x1 = [r[0] for r in relay]
                     hidden = torch.stack([r[1] for r in relay], dim=0)
@@ -3931,8 +4619,7 @@ class ModelRunner:
             # MTP speculative decoding: on a pure-decode batch, draft k tokens
             # per seq with the MTP head and verify them with one base forward,
             # committing the accepted prefix. Returns per-seq token LISTS.
-            if (getattr(self.model, "mtp", None) is not None
-                    and self._mtp_k > 0
+            if (self.mtp_enabled
                     and self.input_data.num_prefills == 0
                     and self.input_data.num_decodes > 0
                     and not self.mtp_speculate_batch(self.input_data.num_decodes)):
@@ -3940,8 +4627,7 @@ class ModelRunner:
                 # sampled one token per seq the plain way, which is the answer.
                 # The relay it leaves behind is stale (see ``_mtp_drop_relay``).
                 self._mtp_drop_relay()
-            elif (getattr(self.model, "mtp", None) is not None
-                    and self._mtp_k > 0
+            elif (self.mtp_enabled
                     and self.input_data.num_prefills == 0
                     and self.input_data.num_decodes > 0):
                 # x1 (this decode batch's first target token) was just sampled by
@@ -4035,6 +4721,10 @@ class ModelRunner:
         self.memory_manager.register_decode_boundary(seq, pos)
 
     def free(self, seq: Sequence):
+        # A relay hidden owns a full hidden-size GPU tensor.  Drop it immediately
+        # when the request finishes instead of waiting for another MTP iteration
+        # to replace the relay map (which may never happen when the batch ends).
+        self._mtp_relay.pop(seq.seq_id, None)
         self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq.seq_id, None)
@@ -4056,6 +4746,7 @@ class ModelRunner:
         was stateless about seq lifetimes pre-refactor, which leaked
         a multimodal-embedding tensor per finished VL request.
         """
+        self._mtp_relay.pop(seq_id, None)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq_id, None)
             self.disagg_embeds.pop(seq_id, None)
@@ -4287,7 +4978,9 @@ class OverlapModelRunner(ModelRunner):
             )
 
             num_decode_tokens = sum(
-                1 for s in self.input_data.seqs if s.computed_prompt
+                s.to_compute_token_num
+                for s in self.input_data.seqs
+                if s.computed_prompt
             )
             self._fixup_vl_decode_embeddings(num_decode_tokens)
 

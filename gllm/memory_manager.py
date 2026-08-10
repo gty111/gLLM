@@ -113,8 +113,8 @@ class SSMSegment:
         # prefix-cached prefix keeps its state in a ref-counted block borrowed
         # from THIS SAME pool (there is no separate snapshot pool anymore -- the
         # cached-state block lives here and is copied into a fresh working block
-        # on a cache hit, so GDN's in-place updates never touch the cached copy;
-        # vLLM-style). The pool size is derived from the memory budget, NOT from
+        # on a cache hit, so GDN's in-place updates never touch the cached copy).
+        # The pool size is derived from the memory budget, NOT from
         # ``maxd``; max concurrency is *bounded by* ``num_blocks``.
         # +1 keeps block 0 reserved as the CUDA-graph dummy block.
         self.num_blocks = num_blocks + 1
@@ -123,6 +123,7 @@ class SSMSegment:
 
         conv_shape = cfg.conv_state_shape_per_slot()
         temp_shape = cfg.temporal_state_shape_per_slot()
+        device = torch.device("cuda", torch.cuda.current_device())
 
         # Layout: ``[num_layers, num_blocks, *per_block]`` as a single stacked
         # tensor (not a Python list of per-layer tensors). ``conv_state[layer_id]``
@@ -137,9 +138,12 @@ class SSMSegment:
         self.conv_state = torch.zeros(
             (cfg.num_layers, self.num_blocks, *conv_shape),
             dtype=cfg.conv_state_dtype,
+            device=device,
         )
         self.temporal_state = torch.zeros(
-            (cfg.num_layers, self.num_blocks, *temp_shape), dtype=cfg.dtype
+            (cfg.num_layers, self.num_blocks, *temp_shape),
+            dtype=cfg.dtype,
+            device=device,
         )
 
         # Block 0 reserved as the CUDA-graph dummy.
@@ -187,9 +191,9 @@ class SSMSegment:
     def allocate_block_table(self, n: int) -> Optional[list]:
         """Borrow ``n`` blocks for a sequence's SSM state block table.
 
-        vLLM-style spec decode gives each sequence a fixed ``1+k`` block table
-        (column 0 the rolling/committed state, columns 1..k the verify-step
-        checkpoint scratch). Returns a list of ``n`` block ids, or ``None`` if
+        Speculative decode gives each sequence a fixed ``1+k`` block table:
+        column 0 holds the rolling/committed state and columns 1..k hold verify
+        checkpoints. Returns a list of ``n`` block ids, or ``None`` if
         the pool cannot satisfy the whole request (caller must not partially
         allocate -- the scheduler gates admission on ``num_free_blocks``).
         """
@@ -298,10 +302,9 @@ class SSMSegment:
     # ``1+na`` tokens, we copy the step-``na`` checkpoint block's contents into
     # the sequence's rolling block -- the exact post-commit recurrent state,
     # with no rollback and no recompute forward. The transient blocks are then
-    # freed back to the shared pool. vLLM keeps the 1+K blocks live across steps
-    # and selects via ``num_accepted_tokens``; gLLM keeps one rolling block as
-    # the source of truth (so the plain decode path is untouched) and commits
-    # the chosen checkpoint here, freeing the rest.
+    # freed back to the shared pool. One rolling block remains the source of
+    # truth so ordinary one-token decode is unchanged; the selected checkpoint
+    # is committed there before the transient blocks are released.
 
     def commit_blocks(self, commit) -> None:
         """Copy chosen checkpoint blocks into rolling blocks (batched).
@@ -365,6 +368,7 @@ class Segment:
         # bf16 latent cache + dense decode, which is exact for prompts <=
         # index_topk. Every non-DSA model keeps its bf16 latent cache unchanged.
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
+        device = torch.device("cuda", torch.cuda.current_device())
         # Packed FP8 layout size: kv_lora_rank(=kv_head_dim - qk_rope) FP8 bytes
         # + (kv_lora_rank/128) fp32 scale bytes + qk_rope_head_dim bf16 bytes.
         # For MLA, kv_head_dim = kv_lora_rank + qk_rope_head_dim.
@@ -372,11 +376,15 @@ class Segment:
         if not use_mla:
             # We don't need zero initialization here
             self.k_cache = [
-                torch.ones((num_pages, page_size, kv_head_num, kv_head_dim))
+                torch.ones(
+                    (num_pages, page_size, kv_head_num, kv_head_dim), device=device
+                )
                 for _ in range(num_layers)
             ]
             self.v_cache = [
-                torch.ones((num_pages, page_size, kv_head_num, kv_head_dim))
+                torch.ones(
+                    (num_pages, page_size, kv_head_num, kv_head_dim), device=device
+                )
                 for _ in range(num_layers)
             ]
         elif self.mla_cache_fp8:
@@ -393,12 +401,13 @@ class Segment:
                 torch.zeros(
                     (num_pages, page_size, 1, self.mla_fp8_dim),
                     dtype=torch.float8_e4m3fn,
+                    device=device,
                 )
                 for _ in range(num_layers)
             ]
         else:
             self.kv_cache = [
-                torch.ones((num_pages, page_size, kv_head_dim))
+                torch.ones((num_pages, page_size, kv_head_dim), device=device)
                 for _ in range(num_layers)
             ]
         # DeepSeek Sparse Attention: parallel indexer key cache (bf16, one
@@ -406,7 +415,9 @@ class Segment:
         # allocated when index_head_dim > 0.
         if index_head_dim > 0:
             self.index_k_cache = [
-                torch.zeros((num_pages, page_size, index_head_dim))
+                torch.zeros(
+                    (num_pages, page_size, index_head_dim), device=device
+                )
                 for _ in range(num_layers)
             ]
             # DSA FP8 indexer scoring: a parallel paged FP8 index-K cache in the
@@ -422,6 +433,7 @@ class Segment:
                     torch.zeros(
                         (num_pages, page_size * self.index_fp8_bytes),
                         dtype=torch.uint8,
+                        device=device,
                     )
                     for _ in range(num_layers)
                 ]
@@ -606,15 +618,15 @@ class MemoryManager:
         self.dummy_page: int = self.segment.allocate() if reserve_dummy_page else None
 
         self.kv_cache_dtype = "auto"
-        self.k_scale = torch.tensor(1.0, dtype=torch.float32)
+        self.k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
         self.v_scale = self.k_scale
 
     def _init_ssm_segment_if_needed(self) -> None:
         """Allocate the SSM block pool + snapshot pool when the model needs them.
 
         For hybrid GDN/Mamba models each pool block holds the full per-layer
-        recurrent state. We size ONE shared block pool from the memory budget
-        (vLLM-style), decoupled from ``maxd``. Every consumer borrows from it:
+        recurrent state. We size one shared block pool from the memory budget,
+        decoupled from ``maxd``. Every consumer borrows from it:
 
         * a running seq borrows 1 rolling block; an MTP verify step borrows a
           few transient checkpoint blocks; a prefix-cached prefix keeps its
@@ -691,13 +703,15 @@ class MemoryManager:
         logger.info(
             "SSM cache: %d state blocks (max decode concurrency ~%d, prefix-cache "
             "headroom ~%d blocks), %.2f KB/block, %.2f GB total (linear-attn "
-            "layers: %d)",
+            "layers: %d, temporal dtype: %s, conv dtype: %s)",
             self.ssm_segment.num_blocks,
             num_ssm_blocks // per_seq_blocks if per_seq_blocks else num_ssm_blocks,
             cache_headroom,
             per_block / 1024,
             total / (1 << 30),
             cfg.num_layers,
+            cfg.dtype,
+            cfg.conv_state_dtype,
         )
 
     def get_sizeof_KV_per_page(self):  # Bytes
@@ -801,6 +815,26 @@ class MemoryManager:
         for seq in seqs:
             num_page = (seq.seq_len + self.page_size - 1) // self.page_size - len(
                 seq.page_table
+            )
+            for _ in range(num_page):
+                seq.page_table.append(self.segment.allocate())
+
+    def pre_allocate_page_for_lengths(
+        self, seqs: List[Sequence], seq_lens: List[int]
+    ) -> None:
+        """Grow page tables to explicit lengths without mutating token lists.
+
+        MTP reserves its whole speculative window before draft/verify. Those
+        tokens are not committed and must not enter prefix-cache hashing, so
+        allocation only needs the target lengths and can avoid constructing an
+        O(context) temporary ``token_ids`` list for every sequence.
+        """
+        if len(seqs) != len(seq_lens):
+            raise ValueError((len(seqs), len(seq_lens)))
+        for seq, seq_len in zip(seqs, seq_lens):
+            num_page = (
+                (int(seq_len) + self.page_size - 1) // self.page_size
+                - len(seq.page_table)
             )
             for _ in range(num_page):
                 seq.page_table.append(self.segment.allocate())
@@ -933,8 +967,8 @@ class MemoryManager:
         if self.ssm_segment is None:
             return
         if self.mtp_k > 0:
-            # MTP on: give the seq a fixed 1+k block table (column 0 rolling
-            # state + k verify checkpoint columns). vLLM-style spec decode.
+            # MTP on: give the sequence a fixed 1+k block table (column 0 is
+            # rolling state; the remaining columns are verify checkpoints).
             if seq.ssm_block_table is not None:
                 return
             bt = self.ssm_segment.allocate_block_table(1 + self.mtp_k)
@@ -1244,12 +1278,15 @@ class PrefixMemoryManager(MemoryManager):
         ``register_decode_boundary`` (from the scheduler's finalize hook).
         """
         for seq in seqs:
+            seq_cacheable = cacheable and not getattr(
+                seq, "_mtp_async_pending", False
+            )
             len_page_table = len(seq.page_table)
             num_page = (
                 seq.seq_len + self.page_size - 1
             ) // self.page_size - len_page_table
             for i in range(len_page_table, len_page_table + num_page):
-                if cacheable and (i + 1) * self.page_size <= len(seq):
+                if seq_cacheable and (i + 1) * self.page_size <= len(seq):
                     page_num = self.segment.allocate(seq, (i + 1) * self.page_size)
                 else:
                     page_num = self.segment.allocate()
@@ -1325,8 +1362,8 @@ class PrefixSegment(Segment):
     # rejected on the SSM half -> 0% cache hit rate. Coarse + lazy (see
     # ``reserve_ssm_snapshot``) fixes both: ~10 blocks per prompt, and only
     # for boundaries a chunk actually lands on. Restoring from a coarse
-    # boundary means recomputing at most ``stride`` pages of tail, which is
-    # the same trade vLLM makes with ``mamba_block_size``.
+    # boundary means recomputing at most ``stride`` pages of tail, trading a
+    # bounded amount of recompute for a much smaller snapshot pool.
     ssm_snapshot_stride: int = 1
 
     def __init__(self, *args, **kwargs):

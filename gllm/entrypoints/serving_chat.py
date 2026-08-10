@@ -105,8 +105,8 @@ async def chat_completion_stream_generator(
 ):
     # When a parser is available and the request offered tools, run the
     # incremental streaming tool-call parser: it accumulates the full text and
-    # emits content fragments + tool-call name/argument fragments (tied by
-    # ``index``), mirroring vLLM / SGLang. Otherwise stream raw text deltas.
+    # emits content fragments plus tool-call name/argument fragments tied by
+    # ``index``. Otherwise stream raw text deltas.
     streaming = tool_parser is not None and bool(request.tools)
     sp = tool_parser.stream_parser(request.tools) if streaming else None
     full_text = ""

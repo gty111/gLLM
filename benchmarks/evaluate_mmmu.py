@@ -178,8 +178,8 @@ async def query_one(
     }
     if no_thinking:
         # Kimi-K2.5's chat template gates its reasoning block on a ``thinking``
-        # variable; vllm exposes per-request template vars via
-        # ``chat_template_kwargs``. Disabling it makes the model answer
+        # variable supplied through ``chat_template_kwargs``. Disabling it makes
+        # the model answer
         # directly (matching a server launched with thinking off), so the
         # ``max_tokens`` budget isn't consumed by an unfinished reasoning
         # trace that never reaches the final "Answer: X".
@@ -425,7 +425,7 @@ def main():
         "--no-thinking",
         action="store_true",
         help="Send chat_template_kwargs={'thinking': False} so reasoning models "
-        "(e.g. Kimi-K2.5 on vllm) answer directly instead of emitting a long "
+        "such as Kimi-K2.5 answer directly instead of emitting a long "
         "reasoning trace that gets truncated by --max-tokens.",
     )
     args = parser.parse_args()

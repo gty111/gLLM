@@ -239,6 +239,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -410,7 +411,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         )
         if bias:
             self.bias = Parameter(
-                torch.empty(self.num_embeddings_per_partition, dtype=params_dtype)
+                torch.empty(
+                    self.num_embeddings_per_partition,
+                    dtype=params_dtype,
+                    device="cuda",
+                )
             )
         else:
             self.register_parameter("bias", None)

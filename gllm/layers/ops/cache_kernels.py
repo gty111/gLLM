@@ -1,7 +1,7 @@
 """
 Triton kernels for KV cache operations.
 
-These kernels replace the vllm CUDA cache ops:
+These kernels provide the paged-cache operations needed by the engine:
 - reshape_and_cache_flash: Store K/V tensors into paged KV cache
 - concat_and_cache_mla: Store MLA (kv_c + k_pe) into a single paged cache
 - gather_and_maybe_dequant_cache: Load from paged cache with optional dequantization
@@ -735,8 +735,8 @@ def _store_index_k_fp8_kernel(
     amax = tl.maximum(tl.max(tl.abs(x)), 1e-4)
     scale = amax / 448.0
     if USE_UE8M0:
-        # Round the scale up to a power of two (UE8M0), matching vLLM's
-        # per_token_group_quant_fp8(use_ue8m0=True) for the indexer key.
+        # UE8M0 represents the per-token-group indexer-key scale as the next
+        # power of two.
         scale = tl.exp2(tl.ceil(tl.log2(scale)))
     # Quantize to e4m3 and store the fp8 BYTE PATTERN into the uint8 cache: cast
     # the write pointer to float8 so the fp8 bits are written verbatim (a plain

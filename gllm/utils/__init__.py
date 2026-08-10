@@ -223,7 +223,7 @@ def direct_register_custom_op(
     See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
     for more details.
 
-    By default, the custom op is registered to the vLLM library. If you
+    By default, the custom op is registered to the gLLM library. If you
     want to register it to a different library, you can pass the library
     object to the `target_lib` argument.
 

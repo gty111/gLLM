@@ -99,10 +99,9 @@ class _ServerArgsShim:
 
     The vendored ``layernorm_gated.py`` only reads
     ``disable_piecewise_cuda_graph`` to decide whether to register the kernel
-    as a custom op. gllm does not have piecewise-CUDA-graph mode, so the
-    safe default is "True" — i.e. always go through the eager path and skip
-    the custom-op registration. This matches the behaviour you'd get from
-    sglang with ``--disable-piecewise-cuda-graph``.
+    as a custom op. The model runner updates this shim from its effective
+    piecewise CUDA Graph setting before any profile, capture, or serving
+    forward. Keep the import-time default disabled for standalone kernel tests.
     """
 
     disable_piecewise_cuda_graph: bool = True
@@ -113,3 +112,8 @@ _SHIM_INSTANCE = _ServerArgsShim()
 
 def get_global_server_args() -> _ServerArgsShim:
     return _SHIM_INSTANCE
+
+
+def set_piecewise_cuda_graph_enabled(enabled: bool) -> None:
+    """Publish gLLM's effective piecewise mode to vendored FLA kernels."""
+    _SHIM_INSTANCE.disable_piecewise_cuda_graph = not enabled

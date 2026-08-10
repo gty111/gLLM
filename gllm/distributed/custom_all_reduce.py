@@ -87,10 +87,10 @@ class CustomAllreduce:
       exchange happens via byte tensors over this group so we don't
       need a separate gloo group.
     - ``rank`` / ``world_size``: TP rank/size within ``group``.
-    - ``max_size``: maximum AR message size in bytes that we'll handle
-      via the custom kernel. Larger messages fall back to NCCL. Default
-      8 MB matches sglang/vLLM and is well above typical TP small-AR
-      sizes (per-layer hidden tensor in Qwen3-0.6B = 64 KB).
+    - ``max_size``: maximum AR message size in bytes handled by the custom
+      kernel. Larger messages fall back to NCCL. The 8 MB default is well above
+      typical TP small-AR sizes (a Qwen3-0.6B per-layer hidden tensor is 64 KB)
+      while keeping the IPC staging allocation bounded.
 
     The instance is ``disabled = True`` whenever any precondition fails
     (missing sgl-kernel, unsupported world size, no NVLink, P2P access
@@ -361,9 +361,8 @@ class CustomAllreduce:
         ``handles`` or a packed byte-list; sgl-kernel changed this once
         already), so rather than reaching into the structure we pickle
         the whole ``(handles, offsets)`` tuple and exchange the pickled
-        bytes across ranks via byte-tensor all-gather. This mirrors how
-        vLLM/sglang use ``broadcast_object_list`` (which is just pickle
-        under the hood) and is robust to layout changes in the kernel.
+        bytes across ranks via byte-tensor all-gather. Treating the metadata as
+        an opaque pickle makes the exchange robust to kernel layout changes.
         """
         local_handles, local_offsets = _kernel_get_graph_buffer_ipc_meta(
             self._handle

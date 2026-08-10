@@ -222,9 +222,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
         device = self.vision_tower.patch_embed.proj.weight.device
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         if not isinstance(pixel_values, torch.Tensor):
-            pixel_values = torch.as_tensor(pixel_values)
+            pixel_values = torch.as_tensor(
+                pixel_values, device=device, dtype=dtype
+            )
         if not isinstance(grid_thws, torch.Tensor):
-            grid_thws = torch.as_tensor(grid_thws)
+            grid_thws = torch.as_tensor(
+                grid_thws, device=device, dtype=torch.int64
+            )
         pixel_values = pixel_values.to(device=device, dtype=dtype)
         grid_thws = grid_thws.to(device=device, dtype=torch.int64)
 

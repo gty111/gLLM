@@ -12,7 +12,12 @@ from gllm.dist_utils import (
 )
 from gllm import _custom_ops as ops
 from gllm.layers.moe.moe_align_block_size import moe_align_block_size
-from gllm.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from gllm.layers.moe.fused_moe_triton.fused_moe import (
+    fused_experts,
+    get_config_dtype_str,
+    make_fused_moe_workspace,
+    use_fused_moe_workspace,
+)
 from gllm.layers.moe.topk import select_experts
 from gllm.utils import set_weight_attrs
 
@@ -20,6 +25,64 @@ from gllm.utils import set_weight_attrs
 class FusedMoEMethod(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        self._piecewise_workspaces = {}
+
+    def _piecewise_workspace(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        top_k: int,
+        global_num_experts: int,
+        *,
+        use_fp8_w8a8: bool = False,
+        use_int8_w8a16: bool = False,
+        use_int4_w4a16: bool = False,
+        block_shape=None,
+    ):
+        # Import lazily so the generic MoE layer does not depend on the model
+        # runner unless piecewise capture is actually active.
+        from gllm.piecewise_cuda_graph import PiecewiseRuntime
+
+        runtime = PiecewiseRuntime.current()
+        if runtime is None:
+            return None
+        workspace_tokens = runtime.workspace_tokens
+        key = (
+            workspace_tokens,
+            x.shape[-1],
+            x.dtype,
+            x.device,
+            use_fp8_w8a8,
+            use_int8_w8a16,
+            use_int4_w4a16,
+            tuple(block_shape or ()),
+            runtime.workspace_token_sizes,
+        )
+        workspace = self._piecewise_workspaces.get(key)
+        if workspace is None:
+            workspace_input = x
+            if x.shape[0] != workspace_tokens:
+                workspace_input = x.new_empty(
+                    (workspace_tokens, x.shape[-1])
+                )
+            config_dtype = get_config_dtype_str(
+                dtype=x.dtype,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+            )
+            workspace = make_fused_moe_workspace(
+                workspace_input,
+                layer.w13_weight,
+                layer.w2_weight,
+                top_k,
+                global_num_experts=global_num_experts,
+                config_dtype=config_dtype,
+                block_shape=block_shape,
+                token_counts=runtime.workspace_token_sizes,
+            )
+            self._piecewise_workspaces[key] = workspace
+        return workspace
 
     def create_weights(
         self,
@@ -37,6 +100,7 @@ class FusedMoEMethod(torch.nn.Module):
                 2 * intermediate_size_per_partition,
                 hidden_size,
                 dtype=params_dtype,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -50,6 +114,7 @@ class FusedMoEMethod(torch.nn.Module):
                 hidden_size,
                 intermediate_size_per_partition,
                 dtype=params_dtype,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -85,18 +150,22 @@ class FusedMoEMethod(torch.nn.Module):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        return fused_experts(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=True,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
+        workspace = self._piecewise_workspace(
+            layer, x, top_k, global_num_experts
         )
+        with use_fused_moe_workspace(workspace):
+            return fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=layer.inplace,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+            )
 
 
 class Fp8MoEMethod(FusedMoEMethod):
@@ -137,6 +206,7 @@ class Fp8MoEMethod(FusedMoEMethod):
                 2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                 (hidden_size + block_k - 1) // block_k,
                 dtype=torch.float32,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -146,6 +216,7 @@ class Fp8MoEMethod(FusedMoEMethod):
                 (hidden_size + block_n - 1) // block_n,
                 (intermediate_size_per_partition + block_k - 1) // block_k,
                 dtype=torch.float32,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -182,23 +253,32 @@ class Fp8MoEMethod(FusedMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        return fused_experts(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=True,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
+        workspace = self._piecewise_workspace(
+            layer,
+            x,
+            top_k,
+            global_num_experts,
             use_fp8_w8a8=True,
-            w1_scale=layer.w13_weight_scale_inv,
-            w2_scale=layer.w2_weight_scale_inv,
             block_shape=self.weight_block_size,
-            use_ue8m0=self.use_ue8m0,
         )
+        with use_fused_moe_workspace(workspace):
+            return fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=layer.inplace,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                use_fp8_w8a8=True,
+                w1_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                block_shape=self.weight_block_size,
+                use_ue8m0=self.use_ue8m0,
+            )
 
 
 def _get_scale_perms():
@@ -280,6 +360,7 @@ class Int4MarlinMoEMethod(FusedMoEMethod):
                 2 * intermediate_size_per_partition,
                 hidden_size // self.pack_factor,
                 dtype=torch.int32,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -292,6 +373,7 @@ class Int4MarlinMoEMethod(FusedMoEMethod):
                 hidden_size,
                 intermediate_size_per_partition // self.pack_factor,
                 dtype=torch.int32,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -304,6 +386,7 @@ class Int4MarlinMoEMethod(FusedMoEMethod):
                 2 * intermediate_size_per_partition,
                 hidden_size // self.group_size,
                 dtype=params_dtype,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -316,6 +399,7 @@ class Int4MarlinMoEMethod(FusedMoEMethod):
                 hidden_size,
                 intermediate_size_per_partition // self.group_size,
                 dtype=params_dtype,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -324,17 +408,17 @@ class Int4MarlinMoEMethod(FusedMoEMethod):
 
         layer.register_buffer(
             "workspace",
-            torch.zeros(1, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
             persistent=False,
         )
         layer.register_buffer(
             "w13_g_idx",
-            torch.empty((num_experts, 0), dtype=torch.int32),
+            torch.empty((num_experts, 0), dtype=torch.int32, device="cuda"),
             persistent=False,
         )
         layer.register_buffer(
             "w2_g_idx",
-            torch.empty((num_experts, 0), dtype=torch.int32),
+            torch.empty((num_experts, 0), dtype=torch.int32, device="cuda"),
             persistent=False,
         )
         layer._int4_marlin_ready = False
@@ -627,6 +711,11 @@ class FusedMoE(torch.nn.Module):
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
+        # In-place output is the fast default for routed-only MoE blocks. A
+        # caller that also consumes the original input (most notably a shared
+        # expert running concurrently) must opt out before the first forward;
+        # otherwise the routed moe_sum overwrites that branch's GEMM input.
+        self.inplace = True
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError(
@@ -758,18 +847,25 @@ def determine_expert_map(
     local_num_experts = global_num_experts // ep_size
 
     # Create a tensor of size num_experts filled with -1
-    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
+    expert_map = torch.full(
+        (global_num_experts,), -1, dtype=torch.int32, device="cuda"
+    )
     # Create a expert map for the local experts
     if ep_rank < (ep_size - 1):
         # Each non-last rank gets local_num_experts experts.
         expert_map[ep_rank * local_num_experts : (ep_rank + 1) * local_num_experts] = (
-            torch.arange(0, local_num_experts, dtype=torch.int32)
+            torch.arange(
+                0, local_num_experts, dtype=torch.int32, device=expert_map.device
+            )
         )
     else:
         # All remaining experts are assigned to the last rank.
         local_num_experts = global_num_experts - ep_rank * local_num_experts
 
         expert_map[-local_num_experts:] = torch.arange(
-            0, local_num_experts, dtype=torch.int32
+            0,
+            local_num_experts,
+            dtype=torch.int32,
+            device=expert_map.device,
         )
     return (local_num_experts, expert_map)

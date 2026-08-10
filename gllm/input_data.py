@@ -28,23 +28,42 @@ class InputData:
         self.use_ssm_cache = memory_manager.use_ssm_cache
         self.memory_manager: MemoryManager = memory_manager
         self.use_buffer = use_buffer
+        # Backend-defined metadata for the current standard MHA/GQA forward.
+        # ModelRunner replaces it immediately before each eager/captured model
+        # call. InputData carries the data but does not know how it is built.
+        self.attention_metadata = None
 
         if self.use_mla:
             self.chunked_prefill_workspace_size = 128 * 1024
 
         if use_buffer:
             assert max_running_seqs is not None and max_seq_length is not None
-            self.tokens = torch.zeros(max_seq_length, dtype=torch.long)
-            self.positions = torch.zeros(max_seq_length, dtype=torch.long)
-            self.mrope_positions = torch.zeros((3, max_seq_length), dtype=torch.long)
+            device = torch.device("cuda", torch.cuda.current_device())
+            self.tokens = torch.zeros(
+                max_seq_length, dtype=torch.long, device=device
+            )
+            self.positions = torch.zeros(
+                max_seq_length, dtype=torch.long, device=device
+            )
+            self.mrope_positions = torch.zeros(
+                (3, max_seq_length), dtype=torch.long, device=device
+            )
             self.slot_mapping = torch.zeros(
-                max_seq_length * max_running_seqs, dtype=torch.int64
+                max_seq_length * max_running_seqs,
+                dtype=torch.int64,
+                device=device,
             )
             self.block_table = torch.zeros(
-                (max_running_seqs, self.max_num_block), dtype=torch.int32
+                (max_running_seqs, self.max_num_block),
+                dtype=torch.int32,
+                device=device,
             )
-            self.seq_lens = torch.zeros(max_running_seqs, dtype=torch.int32)
-            self.query_start_loc = torch.zeros(max_running_seqs + 1, dtype=torch.int32)
+            self.seq_lens = torch.zeros(
+                max_running_seqs, dtype=torch.int32, device=device
+            )
+            self.query_start_loc = torch.zeros(
+                max_running_seqs + 1, dtype=torch.int32, device=device
+            )
 
             if self.use_ssm_cache:
                 # Per-seq SSM working slot id, indexed by the row in the
@@ -52,14 +71,14 @@ class InputData:
                 # argument. Slot 0 is the CUDA-graph dummy slot, so padded
                 # decode rows go there harmlessly.
                 self.ssm_state_slot_per_seq = torch.zeros(
-                    max_running_seqs, dtype=torch.int32
+                    max_running_seqs, dtype=torch.int32, device=device
                 )
                 # 1 for sequences whose prefix-state already lives in
                 # ``ssm_state[ssm_state_slot_per_seq[i]]`` (either chunked-
                 # prefill continuation or prefix-cache hit). Passed to the
                 # conv1d / chunk-GDN kernels as ``has_initial_state``.
                 self.has_initial_state_per_seq = torch.zeros(
-                    max_running_seqs, dtype=torch.bool
+                    max_running_seqs, dtype=torch.bool, device=device
                 )
                 # Snapshot-pool slot id the GDN layer should write into AT
                 # END OF THIS FORWARD for each seq, or -1 to skip. Populated
@@ -69,10 +88,10 @@ class InputData:
                 # slot. Decode steps never snapshot — they would only
                 # produce duplicate states with the working slot.
                 self.ssm_snapshot_write_slot_per_seq = torch.full(
-                    (max_running_seqs,), -1, dtype=torch.int32
+                    (max_running_seqs,), -1, dtype=torch.int32, device=device
                 )
-                # MTP verify (vLLM-style 2D block table): static GPU buffers so
-                # the verify forward can run inside a CUDA graph (the values are
+                # MTP verify 2D block table: static GPU buffers let the verify
+                # forward run inside a CUDA graph (the values are
                 # refilled via ``copy_to_input_buffer`` before each replay; the
                 # buffer address stays fixed across capture/replay). Width is
                 # ``1 + mtp_k`` (rolling col + k checkpoint cols); 0 when MTP off.
@@ -80,19 +99,24 @@ class InputData:
                 self._mtp_bt_width = 1 + _mtp_k
                 if _mtp_k > 0:
                     self.ssm_block_table_2d = torch.zeros(
-                        (max_running_seqs, self._mtp_bt_width), dtype=torch.int32
+                        (max_running_seqs, self._mtp_bt_width),
+                        dtype=torch.int32,
+                        device=device,
                     )
                     self.ssm_num_accepted = torch.ones(
-                        max_running_seqs, dtype=torch.int32
+                        max_running_seqs, dtype=torch.int32, device=device
                     )
 
             if self.use_mla:
                 self.workspace = torch.empty(
-                    (self.chunked_prefill_workspace_size, memory_manager.kv_head_dim)
+                    (self.chunked_prefill_workspace_size, memory_manager.kv_head_dim),
+                    device=device,
                 )
-                self.decode_seq_lens = torch.zeros(max_running_seqs, dtype=torch.int32)
+                self.decode_seq_lens = torch.zeros(
+                    max_running_seqs, dtype=torch.int32, device=device
+                )
                 self.prefill_query_start_loc = torch.zeros(
-                    max_running_seqs + 1, dtype=torch.int32
+                    max_running_seqs + 1, dtype=torch.int32, device=device
                 )
 
     def prepare_sample(self):
@@ -127,17 +151,31 @@ class InputData:
         assert len(seqs) != 0
         self.seqs = seqs
         self.embedding_size = 0
-        # MTP verify batch: every seq is a decode seq re-expanded to a uniform
-        # 1+k query over its cached context (flagged in ModelRunner._mtp_decode).
-        # Lets the DSA attention pick the batched verify top-k selector.
-        self.is_mtp_verify = bool(seqs) and all(
-            getattr(s, "_mtp_verify", False) for s in seqs
-        )
+        self._cal_mtp_partition(seqs)
 
         self.tokens_cpu = self._cal_tokens(seqs)
         self.positions_cpu = self._cal_position(seqs)
         self.mrope_positions_cpu = None
-        assert self.tokens_cpu.shape == self.positions_cpu.shape
+        if self.tokens_cpu.shape != self.positions_cpu.shape:
+            rows = [
+                {
+                    "seq_id": s.seq_id,
+                    "tokens": len(s.token_ids),
+                    "computed": s.computed_token_num,
+                    "to_compute": s.to_compute_token_num,
+                    "seq_len": s.seq_len,
+                    "prompt_len": s.prompt_len,
+                    "computed_prompt": s.computed_prompt,
+                    "mtp_pending": getattr(s, "_mtp_async_pending", False),
+                    "tail": s.token_ids[-6:],
+                }
+                for s in seqs
+            ]
+            raise RuntimeError(
+                "input token/position shape mismatch: "
+                f"tokens={tuple(self.tokens_cpu.shape)} "
+                f"positions={tuple(self.positions_cpu.shape)} rows={rows}"
+            )
         self.slot_mapping_cpu = self._cal_slot_mapping(seqs)
         self.block_table_cpu = self._cal_block_table(seqs)
         self.max_seq_len, self.seq_lens_cpu = self._cal_seq_lens(seqs)
@@ -150,6 +188,27 @@ class InputData:
             self._cal_mla_metadata(seqs)
         else:
             self._cal_batch_split(seqs)
+
+    def _cal_mtp_partition(self, seqs: List[Sequence]) -> None:
+        """Describe the leading MTP-verify partition of a ragged batch.
+
+        Mixed target forwards keep speculative rows contiguous at the front,
+        followed by ordinary prefill rows. Attention may treat both partitions
+        as cached-context prefill, while hybrid recurrent layers need the exact
+        boundary so only MTP rows write their ``1+k`` checkpoint columns.
+
+        ``is_mtp_verify`` remains the all-rows compatibility flag used by the
+        existing pure verify CUDA graphs. New mixed code consumes
+        ``num_mtp_verify_rows`` instead of inferring a batch-wide mode.
+        """
+        flags = [bool(getattr(seq, "_mtp_verify", False)) for seq in seqs]
+        n = 0
+        while n < len(flags) and flags[n]:
+            n += 1
+        if any(flags[n:]):
+            raise ValueError("MTP verify rows must form a contiguous batch prefix")
+        self.num_mtp_verify_rows = n
+        self.is_mtp_verify = bool(n) and n == len(seqs)
 
     def _cal_batch_split(self, seqs: List[Sequence]):
         """Set ``num_decodes`` / ``num_decode_tokens`` / ``num_prefills`` for the
@@ -238,13 +297,17 @@ class InputData:
                 # after this write completes.
                 segment.page2ssm_snapshot_valid[page_num] = True
 
-        self.ssm_state_slot_per_seq_cpu = torch.from_numpy(slots).pin_memory()
-        self.has_initial_state_per_seq_cpu = torch.from_numpy(has_init).pin_memory()
+        self.ssm_state_slot_per_seq_cpu = torch.as_tensor(
+            slots, device="cpu"
+        ).pin_memory()
+        self.has_initial_state_per_seq_cpu = torch.as_tensor(
+            has_init, device="cpu"
+        ).pin_memory()
         self.ssm_snapshot_write_slot_per_seq_cpu = (
-            torch.from_numpy(snap_targets).pin_memory()
+            torch.as_tensor(snap_targets, device="cpu").pin_memory()
         )
 
-        # vLLM-style spec-decode 2D block table + accepted-count (MTP hybrid).
+        # Spec-decode 2D block table plus accepted count for hybrid MTP.
         # Built only when at least one seq carries a ``ssm_block_table`` (MTP on).
         # ``ssm_block_table_2d[i]`` = the seq's ``1+k`` state block ids; the GDN
         # verify kernel writes each verify token's post-state to its column and
@@ -263,8 +326,12 @@ class InputData:
                     # Shouldn't happen in a homogeneous MTP batch; fall back to
                     # the scalar slot in column 0 so the kernel still resolves.
                     bt2d[i, 0] = seq.ssm_state_slot or 0
-            self.ssm_block_table_2d_cpu = torch.from_numpy(bt2d).pin_memory()
-            self.ssm_num_accepted_cpu = torch.from_numpy(nacc).pin_memory()
+            self.ssm_block_table_2d_cpu = torch.as_tensor(
+                bt2d, device="cpu"
+            ).pin_memory()
+            self.ssm_num_accepted_cpu = torch.as_tensor(
+                nacc, device="cpu"
+            ).pin_memory()
         else:
             self.ssm_block_table_2d_cpu = None
             self.ssm_num_accepted_cpu = None
@@ -394,6 +461,7 @@ class InputData:
         # capture time), so keep ``get_position`` on the same branch.
         self.mrope_positions_cpu = None
         self.is_mtp_verify = is_mtp_verify
+        self.num_mtp_verify_rows = num_rows if is_mtp_verify else 0
         self.max_query_len = qlen
         # Uniform batch: every row contributes ``qlen`` query tokens.
         self.num_decodes = 0 if is_mtp_verify else len(seqs)
@@ -418,6 +486,7 @@ class InputData:
         "repetition_penalty",
         "needs_repetition_penalty",
         "is_mtp_verify",
+        "num_mtp_verify_rows",
         # Batch decode/prefill split — set for both MLA (_cal_mla_metadata) and
         # non-MLA (_cal_batch_split) paths; the MTP fast-path gate reads them.
         "num_decodes",
@@ -825,7 +894,13 @@ class InputData:
         # as 1 query token, so the padded entries are last_loc+1, last_loc+2, ...
         last_loc = self.query_start_loc[len(self.seqs)]
         self.query_start_loc[len(self.seqs) + 1:len(self.seqs) + num_pad + 1].copy_(
-            last_loc + torch.arange(1, num_pad + 1, dtype=torch.int32)
+            last_loc
+            + torch.arange(
+                1,
+                num_pad + 1,
+                dtype=torch.int32,
+                device=self.query_start_loc.device,
+            )
         )
 
         if self.use_mla:

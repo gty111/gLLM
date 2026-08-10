@@ -1,7 +1,10 @@
 import functools
 import json
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import triton
@@ -14,6 +17,92 @@ from gllm.layers.quantization.fp8 import _fp8_quantize
 from gllm.utils import direct_register_custom_op, get_device_name
 
 padding_size = 128 if bool(int(os.getenv("GLLM_MOE_PADDING", "0"))) else 0
+
+
+@dataclass
+class FusedMoEWorkspace:
+    """Stable scratch buffers used by CUDA-graph captured MoE calls.
+
+    Piecewise CUDA graph capture requires every scratch tensor to retain a
+    stable address across capture and replay, so these buffers are owned by
+    the layer rather than allocated inside each ``moe_forward`` invocation.
+    """
+
+    cache13: torch.Tensor
+    cache2: torch.Tensor
+    sorted_token_ids: torch.Tensor
+    expert_ids: torch.Tensor
+    num_tokens_post_padded: torch.Tensor
+
+
+_workspace_tls = threading.local()
+
+
+@contextmanager
+def use_fused_moe_workspace(workspace: Optional[FusedMoEWorkspace]):
+    previous = getattr(_workspace_tls, "current", None)
+    _workspace_tls.current = workspace
+    try:
+        yield
+    finally:
+        _workspace_tls.current = previous
+
+
+def make_fused_moe_workspace(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    top_k: int,
+    *,
+    global_num_experts: int = -1,
+    config_dtype: Optional[str] = None,
+    block_shape: Optional[List[int]] = None,
+    token_counts: Optional[Iterable[int]] = None,
+) -> FusedMoEWorkspace:
+    """Allocate the maximum scratch required by one static-shape MoE call."""
+    num_tokens = hidden_states.shape[0]
+    E, N, _ = w1.shape
+    K = w2.shape[1]
+    if global_num_experts == -1:
+        global_num_experts = E
+    M = min(num_tokens, 64 * 1024)
+    num_experts_sgl = global_num_experts + 1
+    # Tuning may choose a smaller BLOCK_SIZE_M for a smaller token bucket, so
+    # the largest M and its config do not necessarily need the most expert-id
+    # blocks.  Take the independent maxima over every bucket that shares this
+    # persistent workspace.
+    max_sorted = 0
+    max_blocks = 0
+    for token_count in token_counts or (M,):
+        candidate_m = min(int(token_count), 64 * 1024)
+        config = try_get_optimal_moe_config(
+            w1.shape,
+            w2.shape,
+            top_k,
+            config_dtype,
+            candidate_m,
+            block_shape=block_shape,
+        )
+        block_m = config["BLOCK_SIZE_M"]
+        candidate_sorted = (
+            candidate_m * top_k + num_experts_sgl * (block_m - 1)
+        )
+        max_sorted = max(max_sorted, candidate_sorted)
+        max_blocks = max(
+            max_blocks, triton.cdiv(candidate_sorted, block_m)
+        )
+    device = hidden_states.device
+    return FusedMoEWorkspace(
+        cache13=torch.empty(
+            M * top_k * max(N, K), device=device, dtype=hidden_states.dtype
+        ),
+        cache2=torch.empty(
+            (M * top_k, N // 2), device=device, dtype=hidden_states.dtype
+        ),
+        sorted_token_ids=torch.empty(max_sorted, device=device, dtype=torch.int32),
+        expert_ids=torch.empty(max_blocks, device=device, dtype=torch.int32),
+        num_tokens_post_padded=torch.empty(1, device=device, dtype=torch.int32),
+    )
 
 
 def get_config_dtype_str(
@@ -42,10 +131,12 @@ def get_config_file_name(
     E: int, N: int, dtype: Optional[str], block_shape: Optional[int] = None
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
+    if "H200" in device_name.split("_"):
+        device_name = "NVIDIA_H200"
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
-    )
+    ).replace(" ", "")
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}.json"
 
 
@@ -81,8 +172,11 @@ def get_moe_configs(
             # To achieve the best performance, consider re-tuning the Triton fused MOE kernel in your environment.
             # For the tuning method, refer to: https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
             logger.debug("Using MoE kernel config from %s.", config_file_path)
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
+            # ``triton_version`` records the tuning environment; kernel
+            # configurations themselves remain keyed by token count.
+            tuned_config = json.load(f)
+            tuned_config.pop("triton_version", None)
+            return {int(key): val for key, val in tuned_config.items()}
 
     # If no optimized configuration is available, we will use the default
     # configuration
@@ -821,8 +915,8 @@ def fused_experts_impl(
     if global_num_experts == -1:
         global_num_experts = E
     top_k_num = topk_ids.shape[1]
-    # We execute the fused_moe kernel in chunks to circumvent this issue:
-    # https://github.com/vllm-project/vllm/issues/5938
+    # Bound each fused-MoE launch to keep temporary routing/index buffers and
+    # kernel grid dimensions within their supported range.
     CHUNK_SIZE = 64 * 1024
     M = min(num_tokens, CHUNK_SIZE)
     config_dtype = get_config_dtype_str(
@@ -847,18 +941,38 @@ def fused_experts_impl(
 
     # We can reuse the memory between these because by the time we need
     # cache3, we're done with cache1
-    cache13 = torch.empty(
-        M * top_k_num * max(N, K),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    workspace = getattr(_workspace_tls, "current", None)
+    if workspace is None:
+        cache13 = torch.empty(
+            M * top_k_num * max(N, K),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    else:
+        required = M * top_k_num * max(N, K)
+        if workspace.cache13.numel() < required:
+            raise ValueError("Fused MoE cache13 workspace is too small")
+        cache13 = workspace.cache13[:required]
     intermediate_cache1 = cache13[: M * top_k_num * N].view(M, top_k_num, N)
     intermediate_cache3 = cache13[: M * top_k_num * K].view(M, top_k_num, K)
 
     # This needs separate memory since it's used concurrently with cache1
-    intermediate_cache2 = torch.empty(
-        (M * top_k_num, N // 2), device=hidden_states.device, dtype=hidden_states.dtype
-    )
+    if workspace is None:
+        intermediate_cache2 = torch.empty(
+            (M * top_k_num, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    else:
+        required = M * top_k_num * (N // 2)
+        if workspace.cache2.numel() < required:
+            raise ValueError("Fused MoE cache2 workspace is too small")
+        # Take an element prefix from the maximum-bucket 2-D buffer.  Slicing
+        # it directly would slice rows and retain the full allocation, which
+        # cannot be reshaped for a smaller token bucket.
+        intermediate_cache2 = workspace.cache2.view(-1)[:required].view(
+            M * top_k_num, N // 2
+        )
 
     if hidden_states.dtype == torch.bfloat16:
         compute_type = tl.bfloat16
@@ -908,8 +1022,19 @@ def fused_experts_impl(
             use_ue8m0=use_ue8m0,
         )
 
+        align_workspace = None
+        if workspace is not None:
+            align_workspace = (
+                workspace.sorted_token_ids,
+                workspace.expert_ids,
+                workspace.num_tokens_post_padded,
+            )
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            curr_topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
+            curr_topk_ids,
+            config["BLOCK_SIZE_M"],
+            global_num_experts,
+            expert_map,
+            workspace=align_workspace,
         )
 
         invoke_fused_moe_kernel(

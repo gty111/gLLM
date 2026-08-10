@@ -350,6 +350,8 @@ class FusedRMSNormGated(nn.Module):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 

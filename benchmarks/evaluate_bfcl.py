@@ -1,6 +1,5 @@
 """BFCL-V4 (Berkeley Function-Calling Leaderboard) accuracy against any
-OpenAI-compatible ``/v1/chat/completions`` endpoint (e.g. a gLLM / vLLM /
-SGLang server).
+OpenAI-compatible ``/v1/chat/completions`` endpoint.
 
 Why this design
 ---------------
@@ -147,8 +146,7 @@ def build_chat_payload(entry, mode, model, max_tokens, temperature, no_thinking)
         # convert_to_tool sanitizes names to satisfy OpenAI's
         # ^[a-zA-Z0-9_-]{1,64}$ rule (e.g. ``math.factorial`` -> ``math_factorial``).
         # Keep the sanitized names: this is the portable convention shared by
-        # all OpenAI-compatible servers and their native tool parsers (vLLM's
-        # ``kimi_k2`` parser, etc.), and it matches how BFCL's native-FC
+        # OpenAI-compatible native tool parsers, and it matches how BFCL's native-FC
         # handlers talk to the model. The scoring side symmetrically maps the
         # gold names via ``convert_func_name`` whenever the chosen
         # ``--bfcl-model-name`` config has ``underscore_to_dot=True``, so the
@@ -158,10 +156,8 @@ def build_chat_payload(entry, mode, model, max_tokens, temperature, no_thinking)
         )
         payload["messages"] = messages
         payload["tools"] = tools
-        # NB: don't send tool_choice="auto" -- gLLM only accepts "none" or a
-        # named-tool dict, and rejects "auto" with HTTP 422. Omitting it lets
-        # the model freely decide whether/which tool to call (what BFCL wants,
-        # including the relevance/irrelevance categories).
+        # Omit ``tool_choice`` so the model can freely decide whether and which
+        # tool to call, including BFCL's relevance/irrelevance categories.
     else:
         # Prompt mode: embed the official BFCL function-calling system prompt.
         messages = system_prompt_pre_processing_chat_model(
@@ -170,8 +166,7 @@ def build_chat_payload(entry, mode, model, max_tokens, temperature, no_thinking)
         payload["messages"] = messages
 
     if no_thinking:
-        # gLLM / vLLM forward these per-request to the chat template; the var
-        # name differs across models so send both.
+        # Models use different template-variable names, so send both aliases.
         payload["chat_template_kwargs"] = {
             "enable_thinking": False,
             "thinking": False,
