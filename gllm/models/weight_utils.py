@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Optional
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_tp_rank,
     get_tp_size,
     is_use_ep,

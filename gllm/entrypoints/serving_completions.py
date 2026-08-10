@@ -1,4 +1,4 @@
-from gllm.async_llm_engine import AsyncStream
+from gllm.engine.async_llm import AsyncStream
 from gllm.entrypoints.protocol import (
     CompletionLogProbs,
     CompletionRequest,

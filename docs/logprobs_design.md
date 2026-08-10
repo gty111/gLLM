@@ -116,7 +116,7 @@ token at each position (plus top-k). It:
   right semantics for scoring given text;
 - handles **chunked prefill** by filling only the positions the current chunk
   covers; prefix-cache-skipped positions stay `null`;
-- accumulates into `Sequence.prompt_logprobs_data`, a list of length
+- accumulates into `GenerationSequence.prompt_logprobs_data`, a list of length
   `raw_prompt_len` (`None` or `(token_id, logprob, top_ids, top_vals)`).
 
 ### 3.3 `logits_from_hidden`
@@ -206,7 +206,7 @@ latching `_prompt_logprobs_sent` so later decode steps don't resend it.
   `tensor_model_parallel_all_gather`. This collective must be balanced, so the
   helper is invoked on **every** TP rank of the last PP stage — not just the
   output rank. That is safe because every TP rank of the stage holds identical
-  seqs (real `Sequence` for PP=1, identical `FollowerSeq` mirrors for PP>1) with
+  seqs (real `GenerationSequence` for PP=1, identical `FollowerSeq` mirrors for PP>1) with
   full `token_ids`, `raw_prompt_len`, `computed_token_num`, and identical
   `hidden_states` / `query_start_loc`. The per-seq `project` calls therefore
   match count and
@@ -322,12 +322,12 @@ curl -s localhost:8200/v1/chat/completions -H 'Content-Type: application/json' -
 | `gllm/entrypoints/api_server.py` | parse + clamp request params |
 | `gllm/entrypoints/serving_chat.py`, `serving_completions.py` | build OpenAI logprob objects |
 | `gllm/layers/sampler.py` | `compute_logprobs` on GPU |
-| `gllm/model_runner.py` | `_build_logprob_rows`, `_compute_prompt_logprobs`, overlap staging |
+| `gllm/runtime/model_runner.py` | `_build_logprob_rows`, `_compute_prompt_logprobs`, overlap staging |
 | `gllm/models/*.py` | `logits_from_hidden` (LM-head projection) |
-| `gllm/scheduler.py` | queue logprobs with tokens, `_attach_prompt_logprobs` |
-| `gllm/comm.py` | `IPCPackage.logprobs` / `prompt_logprobs`, token socket tuple |
-| `gllm/worker.py`, `overlap_worker.py` | carry logprobs alongside tokens (incl. PP>1) |
-| `gllm/dist_schedule.py` | `SeqRegister` / `FollowerSeq` logprob flags (PP>1) |
-| `gllm/sequence.py` | per-seq logprob flags + `prompt_logprobs_data` |
-| `gllm/llm_engine.py`, `async_llm_engine.py` | decode ids → entries, plumb params |
+| `gllm/scheduling/scheduler.py` | queue logprobs with tokens, `_attach_prompt_logprobs` |
+| `gllm/distributed/comm.py` | `IPCPackage.logprobs` / `prompt_logprobs`, token socket tuple |
+| `gllm/workers/worker.py`, `workers/overlap.py` | carry logprobs alongside tokens (incl. PP>1) |
+| `gllm/scheduling/distributed.py` | `SeqRegister` / `FollowerSeq` logprob flags (PP>1) |
+| `gllm/runtime/sequence.py` | per-seq logprob flags + `prompt_logprobs_data` |
+| `gllm/engine/llm.py`, `engine/async_llm.py` | decode ids → entries, plumb params |
 | `gllm/utils/__init__.py` | `StreamOutput` |

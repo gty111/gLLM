@@ -81,7 +81,9 @@ def prepare_chunk_indices(
             )
         else:
             out_cpu = torch.tensor(
-                rows, dtype=cu_seqlens.dtype,
+                rows,
+                dtype=cu_seqlens.dtype,
+                device="cpu",
                 pin_memory=cu_seqlens.is_cuda,
             )
             out = out_cpu.to(cu_seqlens.device, non_blocking=True) \
@@ -91,7 +93,7 @@ def prepare_chunk_indices(
 
     indices = torch.cat(
         [
-            torch.arange(n)
+            torch.arange(n, device="cpu")
             for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
         ]
     )
@@ -115,7 +117,9 @@ def prepare_chunk_offsets(
             acc += nc
             offsets.append(acc)
         out_cpu = torch.tensor(
-            offsets, dtype=cu_seqlens.dtype,
+            offsets,
+            dtype=cu_seqlens.dtype,
+            device="cpu",
             pin_memory=cu_seqlens.is_cuda,
         )
         out = out_cpu.to(cu_seqlens.device, non_blocking=True) \

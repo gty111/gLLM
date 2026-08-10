@@ -13,6 +13,10 @@ from tqdm import tqdm
 API_KEY = "EMPTY"
 random.seed(12345)
 
+_ANSWER_IS_RE = re.compile(r"answer is \(?([A-J])\)?")
+_ANSWER_LINE_RE = re.compile(r"[aA]nswer:\s*([A-J])")
+_STANDALONE_CHOICE_RE = re.compile(r"\b[A-J]\b")
+
 
 def load_mmlu_pro():
     # ``--data-path`` points at a local copy of MMLU-Pro for offline / air-gapped
@@ -102,8 +106,7 @@ def format_answer(cot_content):
 
 
 def extract_answer(text):
-    pattern = r"answer is \(?([A-J])\)?"
-    match = re.search(pattern, text)
+    match = _ANSWER_IS_RE.search(text)
     if match:
         return match.group(1)
     else:
@@ -112,20 +115,23 @@ def extract_answer(text):
 
 
 def extract_again(text):
-    match = re.search(r".*[aA]nswer:\s*([A-J])", text)
-    if match:
-        return match.group(1)
-    else:
-        return extract_final(text)
+    # Preserve the old ``.*Answer:`` semantics exactly: choose the first line
+    # containing a marker and, if that line has several, the final marker on
+    # that line. Scanning linearly avoids the old regex backtracking cost.
+    for line in text.splitlines():
+        last_on_line = None
+        for match in _ANSWER_LINE_RE.finditer(line):
+            last_on_line = match.group(1)
+        if last_on_line is not None:
+            return last_on_line
+    return extract_final(text)
 
 
 def extract_final(text):
-    pattern = r"\b[A-J]\b(?!.*\b[A-J]\b)"
-    match = re.search(pattern, text, re.DOTALL)
-    if match:
-        return match.group(0)
-    else:
-        return None
+    last = None
+    for match in _STANDALONE_CHOICE_RE.finditer(text):
+        last = match.group(0)
+    return last
 
 
 def single_request(api_url, single_question, cot_examples_dict, pbar):
@@ -163,7 +169,9 @@ def single_request(api_url, single_question, cot_examples_dict, pbar):
         no_thinking=args.no_thinking,
     )
     return async_request_openai_chat_completions(
-        request_func_input=request_func_input, pbar=pbar
+        # The evaluator advances the bar only after this response has also
+        # been parsed and scored, keeping its count and live score atomic.
+        request_func_input=request_func_input, pbar=None
     )
 
 
@@ -185,9 +193,10 @@ async def evaluate(subjects):
     # (no page-exhaustion throttling) and makes the run reproducible.
     sem = asyncio.Semaphore(args.concurrency)
 
-    async def bounded_request(api_url, each):
+    async def bounded_request(api_url, index, each):
         async with sem:
-            return await single_request(api_url, each, dev_df, pbar)
+            completion = await single_request(api_url, each, dev_df, pbar)
+        return index, each, completion
 
     print(f"Sending requests (concurrency={args.concurrency}) ...")
     pbar = tqdm()
@@ -202,42 +211,62 @@ async def evaluate(subjects):
         # identically; shuffling measures that noise floor, which is what any
         # A/B difference has to be compared against.
         random.Random(args.shuffle_seed).shuffle(test_data_total)
-    for each in test_data_total:
-        api_url = api_urls[len(tasks) % len(api_urls)]
-        tasks.append(bounded_request(api_url, each))
+    for index, each in enumerate(test_data_total):
+        api_url = api_urls[index % len(api_urls)]
+        tasks.append(asyncio.create_task(bounded_request(api_url, index, each)))
     pbar.total = len(tasks)
-    completions = await asyncio.gather(*tasks)
-    pbar.close()
-    print(f"Processing completions ...")
     n_empty = 0
-    saved_rows = []
-    for idx, each in tqdm(enumerate(test_data_total), total=len(tasks)):
-        label = each["answer"]
-        response = completions[idx].generated_text
-        if not response:
-            n_empty += 1
-        response = (response or "").replace("**", "")
-        pred = extract_answer(response)
-        category = each["category"]
-        if category not in category_record:
-            category_record[category] = {"#correct": 0, "#wrong": 0}
-        each["pred"] = pred
-        each["model_outputs"] = response
-        if pred is not None and pred == label:
-            category_record[category]["#correct"] += 1
-            category_record["total"]["#correct"] += 1
-        else:
-            category_record[category]["#wrong"] += 1
-            category_record["total"]["#wrong"] += 1
-        if args.save:
-            saved_rows.append({
-                "qid": each.get("question_id", idx),
-                "category": category,
-                "gold": label,
-                "pred": pred,
-                "correct": (pred == label),
-                "response": response,
-            })
+    processed = 0
+    output = open(args.save, "w", buffering=1) if args.save else None
+    try:
+        # Score and persist each response as soon as it arrives. Besides making
+        # live accuracy visible, this bounds retained response memory and removes
+        # the old multi-minute, post-request "Processing completions" phase.
+        for task in asyncio.as_completed(tasks):
+            idx, each, completion = await task
+            label = each["answer"]
+            response = completion.generated_text
+            if not response:
+                n_empty += 1
+            response = (response or "").replace("**", "")
+            pred = extract_answer(response)
+            category = each["category"]
+            if category not in category_record:
+                category_record[category] = {"#correct": 0, "#wrong": 0}
+            each["pred"] = pred
+            each["model_outputs"] = response
+            correct = pred is not None and pred == label
+            if correct:
+                category_record[category]["#correct"] += 1
+                category_record["total"]["#correct"] += 1
+            else:
+                category_record[category]["#wrong"] += 1
+                category_record["total"]["#wrong"] += 1
+            if output is not None:
+                import json as _json
+                output.write(_json.dumps({
+                    "qid": each.get("question_id", idx),
+                    "category": category,
+                    "gold": label,
+                    "pred": pred,
+                    "correct": correct,
+                    "response": response,
+                }, ensure_ascii=False) + "\n")
+
+            processed += 1
+            correct_so_far = category_record["total"]["#correct"]
+            live_score = 100 * correct_so_far / processed
+            pbar.set_postfix(
+                score=f"{live_score:.2f}",
+                correct=correct_so_far,
+                empty=n_empty,
+                refresh=False,
+            )
+            pbar.update(1)
+    finally:
+        if output is not None:
+            output.close()
+        pbar.close()
     total = category_record["total"]
     total["score"] = round(
         100 * total["#correct"] / (total["#correct"] + total["#wrong"]), 2
@@ -255,11 +284,7 @@ async def evaluate(subjects):
         f"({total['#correct']}/{total['#correct'] + total['#wrong']})"
     )
     if args.save:
-        import json as _json
-        with open(args.save, "w") as _f:
-            for row in saved_rows:
-                _f.write(_json.dumps(row, ensure_ascii=False) + "\n")
-        print(f"Saved {len(saved_rows)} per-question rows to {args.save}")
+        print(f"Saved {processed} per-question rows to {args.save}")
 
 
 if __name__ == "__main__":

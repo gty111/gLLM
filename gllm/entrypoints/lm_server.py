@@ -112,7 +112,7 @@ def main():
     disagg_config = DisaggConfig(skip_visual=bool(args.skip_visual))
     if args.skip_visual and args.discovery_endpoint:
         from gllm.disagg.discovery import resolve_advertise_host
-        from gllm.mm_common import processor_config_hash
+        from gllm.multimodal.common import processor_config_hash
 
         advertise_host = resolve_advertise_host(
             args.nixl_advertise_host, args.discovery_endpoint
@@ -128,9 +128,9 @@ def main():
         disagg_config.encoder_dp = max(1, args.encoder_dp)
 
     import gllm.entrypoints.api_server as api
-    from gllm.async_llm_engine import PipeAsyncLLM
+    from gllm.engine.async_llm import AsyncLLM
 
-    api.llm = PipeAsyncLLM(
+    api.llm = AsyncLLM(
         host=args.host,
         launch_mode="normal",
         worker_ranks=None,

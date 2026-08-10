@@ -73,7 +73,7 @@ def main():
     args = build_arg_parser().parse_args()
 
     # The vision-only role flags (skip_language=True / skip_visual=False) are
-    # passed explicitly to the model loader inside EncoderEngine; see
+    # passed explicitly to the model loader inside VisionEncoderRunner; see
     # gllm.disagg.config.DisaggConfig.
 
     # Pin this process to its single physical GPU by selecting the device
@@ -92,7 +92,7 @@ def main():
 
     init_logger()
 
-    from gllm.encoder_engine import EncoderEngine
+    from gllm.runtime.vision_encoder_runner import VisionEncoderRunner
 
     encoder_id = args.encoder_id or default_encoder_id(args.encoder_gpu)
     logger.info(
@@ -100,14 +100,14 @@ def main():
         f"service={args.service_name} discovery={args.discovery_endpoint}"
     )
 
-    engine = EncoderEngine(
+    runner = VisionEncoderRunner(
         model_path=args.model_path,
         load_format=args.load_format,
         mm_processor_min_pixels=args.mm_processor_min_pixels,
         mm_processor_max_pixels=args.mm_processor_max_pixels,
         mm_embed_cache_mb=args.mm_embed_cache_size,
     )
-    engine.init()
+    runner.init()
 
     if not args.discovery_endpoint:
         raise SystemExit(
@@ -116,8 +116,8 @@ def main():
         )
 
     from gllm.disagg.discovery import resolve_advertise_host
-    from gllm.disagg.encoder_runtime import EncoderRuntime
-    from gllm.mm_common import processor_config_hash
+    from gllm.engine.encoder import Encoder
+    from gllm.multimodal.common import processor_config_hash
 
     advertise_host = resolve_advertise_host(
         args.advertise_host, args.discovery_endpoint
@@ -127,8 +127,8 @@ def main():
         f"(--advertise-host={args.advertise_host})"
     )
 
-    runtime = EncoderRuntime(
-        engine,
+    encoder = Encoder(
+        runner,
         encoder_id=encoder_id,
         discovery_endpoint=args.discovery_endpoint,
         processor_config_hash=processor_config_hash(args.model_path),
@@ -139,7 +139,7 @@ def main():
         max_vis_tokens=args.max_vis_tokens,
         nixl_backend=args.nixl_backend,
     )
-    runtime.setup()
+    encoder.setup()
     logger.info(f"Encoder {encoder_id} READY; entering job loop")
 
     def _sig(_signum, _frame):
@@ -150,7 +150,7 @@ def main():
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
 
-    runtime.serve_forever()
+    encoder.serve_forever()
 
 
 if __name__ == "__main__":

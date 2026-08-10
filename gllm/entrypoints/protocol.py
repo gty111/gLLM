@@ -195,7 +195,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ]
     ] = "none"
 
-    # NOTE this will be ignored by vLLM -- the model determines the behavior
+    # Accepted for OpenAI schema compatibility; the model and tool parser
+    # determine whether calls are emitted in parallel.
     parallel_tool_calls: Optional[bool] = False
     user: Optional[str] = None
 
@@ -364,20 +365,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "environments. The salt should be random, protected from "
             "access by 3rd parties, and long enough to be "
             "unpredictable (e.g., 43 characters base64-encoded, corresponding "
-            "to 256 bit). Not supported by vLLM engine V0."
+            "to 256 bit)."
         ),
     )
     kv_transfer_params: Optional[dict[str, Any]] = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
-    )
-
-    vllm_xargs: Optional[dict[str, Union[str, int, float]]] = Field(
-        default=None,
-        description=(
-            "Additional request parameters with string or "
-            "numeric values, used by custom extensions."
-        ),
     )
 
     # --8<-- [end:chat-completion-extra-params]

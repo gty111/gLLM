@@ -1,5 +1,5 @@
-from gllm.dist_utils import is_first_pp_rank, is_last_pp_rank
-from gllm.input_data import InputData
+from gllm.distributed.parallel_state import is_first_pp_rank, is_last_pp_rank
+from gllm.runtime.input_data import InputData
 
 from .qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
 from .qwen3_vl import Qwen3VLForConditionalGeneration

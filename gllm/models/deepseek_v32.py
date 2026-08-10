@@ -33,8 +33,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gllm.dist_utils import get_pp_layers, is_first_pp_rank, is_last_pp_rank
-from gllm.input_data import InputData
+from gllm.distributed.parallel_state import get_pp_layers, is_first_pp_rank, is_last_pp_rank
+from gllm.runtime.input_data import InputData
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import ReplicatedLinear
 from gllm.layers.rotary_embedding import YaRNScalingRotaryEmbedding
@@ -65,15 +65,15 @@ _INDEX_QUERY_CHUNK = 512
 
 # DSA prefill indexer scoring backend. Default: SGLang's FP8 path (Hadamard ->
 # e4m3 quant -> deep_gemm ``fp8_mqa_logits`` / ``fp8_paged_mqa_logits``):
-# ~10-50x faster indexer scoring at long context, verified bit-aligned with
-# vLLM's indexer quant and within noise of fp32 on RULER. Set
+# ~10-50x faster indexer scoring at long context and within the measured noise
+# of the fp32 selector on RULER. Set
 # ``GLLM_DSA_FP8_SCORE=0`` to fall back to the exact fp32 einsum selector
 # (``_select_topk_prefill`` / ``_select_topk_decode``).
 _DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "1") == "1"
 
-# Whether to Hadamard-transform the indexer q/k before FP8 quantization (SGLang's
-# NSA recipe: H decorrelates activations so e4m3 quant is more accurate). vLLM's
-# indexer does NOT apply Hadamard at all. Default OFF: measured net-negative on
+# Whether to Hadamard-transform the indexer q/k before FP8 quantization. The
+# transform decorrelates activations but measured net-negative on this model, so
+# it defaults OFF:
 # this model -- on RULER 4096 it systematically lost the ``vt`` (variable
 # tracking) task (15/20 vs 19/20 without it) by flattening the output logits at
 # greedy tie-break points, and the fp8 quant is already accurate enough via
@@ -116,8 +116,8 @@ class DeepseekV32Indexer(nn.Module):
         self.q_lora_rank: int = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         # FP8 indexer scoring uses UE8M0 (power-of-2) group scales when the
-        # checkpoint declares ``scale_fmt="ue8m0"`` (DeepSeek-V3.2), matching the
-        # reference / vLLM. Plain amax/448 otherwise.
+        # checkpoint declares ``scale_fmt="ue8m0"`` (DeepSeek-V3.2). Use plain
+        # amax/448 otherwise.
         self.scale_fmt = (
             quant_config.get("scale_fmt") if quant_config is not None else None
         )
@@ -141,7 +141,9 @@ class DeepseekV32Indexer(nn.Module):
         # k_norm is a LayerNorm (has bias), unlike the RMSNorms elsewhere in the
         # model. weights_proj stays bf16/unquantized (the reference keeps it in
         # fp32; we compute the head-weighting in fp32 in ``forward``).
-        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
+        self.k_norm = nn.LayerNorm(
+            self.head_dim, eps=1e-6, device="cuda"
+        )
         self.weights_proj = ReplicatedLinear(
             self.hidden_size,
             self.n_heads,
@@ -399,9 +401,9 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         device = q_idx.device
         max_L = block_table.shape[1] * page_sz
 
-        # Hadamard + FP8-quant the query (matches the stored key path). UE8M0
-        # scale (round to power of two) matches vLLM's indexer q quant when the
-        # checkpoint declares scale_fmt="ue8m0".
+        # Apply the same optional Hadamard transform as the stored-key path,
+        # then FP8-quantize the query. ``scale_fmt="ue8m0"`` selects a
+        # power-of-two scale; other formats use the exact amax-derived scale.
         qh = (
             hadamard_transform(q_idx.contiguous(), scale=dim ** -0.5)
             if _DSA_HADAMARD
@@ -580,7 +582,7 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             xf = x.float().reshape(*x.shape[:-1], hdim // 128, 128)
             amax = xf.abs().amax(-1, keepdim=True).clamp_min(1e-4)
             s = amax / 448.0
-            if use_ue8m0:  # power-of-2 scale, matches vLLM when scale_fmt=ue8m0
+            if use_ue8m0:  # UE8M0 encodes the scale as a power of two.
                 s = torch.exp2(torch.ceil(torch.log2(s)))
             q = (xf / s).clamp(-448, 448).to(torch.float8_e4m3fn).reshape(x.shape)
             return q, s.reshape(*x.shape[:-1], hdim // 128).squeeze(-1)
@@ -831,7 +833,7 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
                 )
 
         output_shape = (hidden_states.shape[0], self.num_heads * self.v_head_dim)
-        output = torch.zeros(output_shape, dtype=q.dtype)
+        output = torch.zeros(output_shape, dtype=q.dtype, device=q.device)
 
         attn_out = self.mla_attn.forward(
             q,
@@ -966,5 +968,3 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         # model's own rule table + load context (see DeepseekMTP.load_weights).
         if self.mtp is not None:
             self.mtp.load_weights(weights, self, mp_load_progress)
-
-

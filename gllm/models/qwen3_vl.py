@@ -6,7 +6,7 @@ import numpy as np
 from collections.abc import Callable
 from functools import partial, lru_cache
 
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead
 from gllm.models.utils import _merge_multimodal_embeddings
 from gllm.models.weight_loader import (
@@ -19,7 +19,7 @@ from gllm.models.weight_loader import (
     run_vision_loader,
 )
 from gllm.layers.linear import ColumnParallelLinear, RowParallelLinear
-from gllm.dist_utils import get_tp_size, is_first_pp_rank, is_last_pp_rank
+from gllm.distributed.parallel_state import get_tp_size, is_first_pp_rank, is_last_pp_rank
 
 from .qwen2_5_vl import (MultiModalEmbeddings, Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLVideoInputs, 
                          Qwen2_5_VLVideoPixelInputs, 
@@ -49,6 +49,7 @@ class Qwen3_VisionPatchEmbed(nn.Module):
             kernel_size=kernel_size,
             stride=kernel_size,
             bias=True,
+            device="cuda",
         )
         self._use_linear = torch.__version__.startswith("2.9.")
         self._input_size = in_channels * temporal_patch_size * patch_size * patch_size
@@ -111,7 +112,7 @@ class Qwen3_VisionBlock(nn.Module):
     ) -> None:
         super().__init__()
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            norm_layer = partial(nn.LayerNorm, eps=1e-6, device="cuda")
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         self.attn = Qwen2_5_VisionAttention(
@@ -163,7 +164,7 @@ class Qwen3_VisionPatchMerger(nn.Module):
             context_dim = self.hidden_size
 
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            norm_layer = partial(nn.LayerNorm, eps=1e-6, device="cuda")
         self.norm = norm_layer(context_dim)
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
@@ -227,9 +228,11 @@ class Qwen3_VisionTransformer(nn.Module):
             hidden_size=self.hidden_size,
         )
 
-        self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
+        self.pos_embed = nn.Embedding(
+            self.num_position_embeddings, self.hidden_size, device="cuda"
+        )
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        norm_layer = partial(nn.LayerNorm, eps=norm_eps, device="cuda")
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
@@ -309,7 +312,9 @@ class Qwen3_VisionTransformer(nn.Module):
         wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
         wpos_ids = wpos_ids.flatten()
 
-        return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
+        return torch.as_tensor(
+            np.stack([hpos_ids, wpos_ids], axis=-1), device="cpu"
+        )
 
     def rot_pos_emb(self, grid_thw: list[list[int]]):
         max_grid_size = max(max(h, w) for _, h, w in grid_thw)
@@ -410,7 +415,7 @@ class Qwen3_VisionTransformer(nn.Module):
         )
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
         max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
-        cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
+        cu_seqlens = torch.as_tensor(cu_seqlens, device=self.device)
         hidden_states = hidden_states.unsqueeze(1)
 
         deepstack_feature_lists = []
@@ -541,6 +546,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 torch.zeros(
                     config.max_num_batched_tokens,
                     config.text_config.hidden_size,
+                    device="cuda",
                 )
                 for _ in range(self.deepstack_num_level)
             ]

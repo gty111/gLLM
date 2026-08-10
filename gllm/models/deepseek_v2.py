@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from logger import logger
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_pp_layers,
     get_tp_size,
     is_dp_attn,
@@ -12,9 +12,11 @@ from gllm.dist_utils import (
     is_last_pp_rank,
     tensor_model_parallel_all_reduce,
 )
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.activation import SiluAndMul
-from gllm.layers.attention import FlashAttention, MLAAttention
+from gllm.layers.attention.base import AttentionLayerBase
+from gllm.layers.attention.mla import MLAAttention
+from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import (
     ColumnParallelLinear,
@@ -22,10 +24,9 @@ from gllm.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from gllm.layers.moe import FusedMoE
+from gllm.layers.moe import FusedMoE, SharedExpertRunner
 from gllm.layers.rotary_embedding import YaRNScalingRotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from gllm.modules.attention import Attention
 from gllm.utils import yarn_get_mscale
 
 from .qwen2 import Qwen2ForCausalLM
@@ -85,7 +86,11 @@ class DeepseekV2MOE(nn.Module):
         )
         if config.topk_method == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32)
+                torch.empty(
+                    config.n_routed_experts,
+                    dtype=torch.float32,
+                    device="cuda",
+                )
             )
         else:
             self.gate.e_score_correction_bias = None
@@ -113,28 +118,37 @@ class DeepseekV2MOE(nn.Module):
                 reduce_results=False,
                 quant_config=dense_quant_config,
             )
+            self.shared_expert_runner = SharedExpertRunner()
+            # The shared branch reads ``hidden_states`` concurrently. Routed
+            # MoE must not publish its result by overwriting that tensor.
+            self.experts.inplace = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if is_dp_attn():
             return self._forward_dp_ep(hidden_states, num_tokens, hidden_dim)
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
 
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states = (
-                self.experts(hidden_states=hidden_states, router_logits=router_logits)
-                * self.routed_scaling_factor
-            )
-        else:
-            # Fix FP16 overflow
-            # See DeepseekV2DecoderLayer for more details.
-            final_hidden_states = self.experts(
+        def routed_forward():
+            router_logits = self.gate(hidden_states)
+            return self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
+
+        shared_output = None
+        if self.n_shared_experts is not None:
+            final_hidden_states, shared_output = self.shared_expert_runner.run(
+                hidden_states,
+                routed_forward,
+                lambda: self.shared_experts(hidden_states),
+            )
+        else:
+            final_hidden_states = routed_forward()
+
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = final_hidden_states * self.routed_scaling_factor
+        # FP16 deliberately leaves the routed result unscaled to avoid overflow
+        # (see DeepseekV2DecoderLayer).
         if shared_output is not None:
             if hidden_states.dtype != torch.float16:
                 final_hidden_states = final_hidden_states + shared_output
@@ -199,7 +213,7 @@ class DeepseekV2MOE(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 
-class DeepseekV2Attention(Attention):
+class DeepseekV2Attention(AttentionLayerBase):
 
     def __init__(self, layer_id: int, config):
         quant_config = getattr(config, "quantization_config", None)
@@ -314,7 +328,7 @@ class DeepseekV2Attention(Attention):
             **extra_kwargs
         )
 
-        self.attn = FlashAttention(
+        self.attn = QKVAttention(
             layer_id, self.scaling, self.num_heads, self.num_heads, self.qk_head_dim
         )
 
@@ -353,7 +367,7 @@ class DeepseekV2Attention(Attention):
         return output
 
 
-class DeepseekV2MLAAttention(Attention):
+class DeepseekV2MLAAttention(AttentionLayerBase):
     def __init__(self, layer_id: int, config):
         quant_config = getattr(config, "quantization_config", None)
         self.hidden_size = config.hidden_size
@@ -528,7 +542,7 @@ class DeepseekV2MLAAttention(Attention):
         )
 
         output_shape = (hidden_states.shape[0], self.num_heads * self.v_head_dim)
-        output = torch.zeros(output_shape, dtype=q.dtype)
+        output = torch.zeros(output_shape, dtype=q.dtype, device=q.device)
 
         attn_out = self.mla_attn.forward(
             q,

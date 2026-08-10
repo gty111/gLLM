@@ -1,9 +1,8 @@
 """
 Custom Triton kernel for batched rotary embedding with per-token cos_sin_cache offsets.
 
-This replaces vllm's batched_rotary_embedding CUDA kernel which supports
-multiple RoPE scaling factors applied simultaneously to different tokens
-within a batch (each token uses a different offset into the cos_sin_cache).
+It supports multiple RoPE scaling factors in one batch: each token selects its
+own offset into ``cos_sin_cache``.
 """
 
 import torch

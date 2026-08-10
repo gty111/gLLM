@@ -4,7 +4,7 @@ from typing import Union
 import torch
 from typing_extensions import TypeAlias
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     dp_gather_hidden,
     dp_local_slice,
     ep_all_reduce,

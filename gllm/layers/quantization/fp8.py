@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 
 from gllm import _custom_ops as ops
-from gllm.dist_utils import get_tp_size
+from gllm.distributed.parallel_state import get_tp_size
 from gllm.utils import cdiv
 from logger import logger
 
@@ -16,8 +16,8 @@ def _sgl_group_quant_fp8():
 
     The Triton ``_per_token_group_quant_fp8`` launches one program per token and
     is dominated by launch overhead at decode batch sizes (thousands of tiny
-    calls). sgl-kernel ships a compiled CUDA kernel (the same one vLLM/SGLang
-    use) that is markedly cheaper per launch; resolved once, lazily, and falls
+    calls). sgl-kernel ships a compiled CUDA implementation that is markedly
+    cheaper per launch; it is resolved once, lazily, and falls
     back to Triton when sgl-kernel is unavailable.
     """
     try:
@@ -88,9 +88,9 @@ def _deepgemm_shape_supported(
     return output_dtype == torch.bfloat16 and N % block_n == 0 and K % block_k == 0
 
 
-# Only small-M (decode) matmuls benefit from FlashInfer's swapAB kernel; vLLM
-# gates on the same M<32 threshold, and there it is a *correctness* requirement
-# too (the swapAB path loses accuracy at M>=32), not merely a perf choice.
+# Only small-M decode matmuls benefit from FlashInfer's swapAB kernel. The
+# measured M<32 threshold is also a correctness guard: the swapAB path loses
+# accuracy at M>=32, so larger matrices must use the regular backend.
 _FLASHINFER_SWAPAB_MAX_M = 32
 
 

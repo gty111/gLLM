@@ -5,8 +5,7 @@ This module provides the kernel operation interface used throughout gllm.
 All kernel calls go through this abstraction, making it the single point
 where we can swap backends (sgl-kernel, Triton, etc.).
 
-Previously used vllm's compiled _C.so and _moe_C.so;
-now uses sgl-kernel + custom Triton kernels.
+The current backends are sgl-kernel plus in-tree Triton kernels.
 """
 
 from typing import Optional
@@ -16,6 +15,8 @@ import torch
 # sgl-kernel imports
 from sgl_kernel import (
     fused_add_rmsnorm as _sgl_fused_add_rmsnorm,
+    gemma_fused_add_rmsnorm as _sgl_gemma_fused_add_rmsnorm,
+    gemma_rmsnorm as _sgl_gemma_rmsnorm,
     moe_align_block_size as _sgl_moe_align_block_size,
     moe_fused_gate as _sgl_moe_fused_gate,
     moe_sum as _sgl_moe_sum,
@@ -325,6 +326,27 @@ def fused_add_rms_norm(
         _sgl_fused_add_rmsnorm(input_2d, residual_2d, weight, eps=epsilon)
     else:
         _sgl_fused_add_rmsnorm(input, residual, weight, eps=epsilon)
+
+
+def gemma_rms_norm(
+    out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> None:
+    """Gemma RMSNorm, applying ``weight + 1`` in fp32 inside the kernel."""
+    input = input.contiguous()
+    if input.ndim != 2:
+        input = input.view(-1, input.shape[-1])
+        out = out.view(-1, out.shape[-1])
+    _sgl_gemma_rmsnorm(input, weight, eps=epsilon, out=out)
+
+
+def gemma_fused_add_rms_norm(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> None:
+    """In-place residual add followed by accurate Gemma RMSNorm."""
+    if input.ndim != 2:
+        input = input.view(-1, input.shape[-1])
+        residual = residual.view(-1, residual.shape[-1])
+    _sgl_gemma_fused_add_rmsnorm(input, residual, weight, eps=epsilon)
 
 
 # =============================================================================

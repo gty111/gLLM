@@ -25,7 +25,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import ReplicatedLinear
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding

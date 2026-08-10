@@ -3,8 +3,9 @@ from typing import Optional
 import torch
 from torch import nn
 
-from gllm.input_data import InputData
-from gllm.layers.attention import FlashAttention
+from gllm.runtime.input_data import InputData
+from gllm.layers.attention.base import AttentionLayerBase
+from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from gllm.layers.rotary_embedding import (
@@ -12,7 +13,6 @@ from gllm.layers.rotary_embedding import (
     Llama3RotaryEmbedding,
     RotaryEmbedding,
 )
-from gllm.modules.attention import Attention
 
 from .qwen2 import Qwen2ForCausalLM, Qwen2MLP, Qwen2Model
 from .utils import extract_rope_config
@@ -24,7 +24,7 @@ class LlamaMLP(Qwen2MLP):
         super().__init__(config, False)
 
 
-class LlamaAttention(Attention):
+class LlamaAttention(AttentionLayerBase):
 
     def __init__(self, layer_id: int, config):
         super().__init__(
@@ -87,7 +87,7 @@ class LlamaAttention(Attention):
                 True,
             )
 
-        self.attn = FlashAttention(
+        self.attn = QKVAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim
         )
 

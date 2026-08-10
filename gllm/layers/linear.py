@@ -4,7 +4,7 @@ from typing import Optional, Union
 import torch
 from torch.nn.parameter import Parameter
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     divide,
     get_tp_rank,
     get_tp_size,
@@ -55,12 +55,14 @@ class LinearBase(torch.nn.Module):
         output_partition_sizes: list[int],
         params_dtype: torch.dtype,
     ):
+        device = torch.device("cuda", torch.cuda.current_device())
         if self.quant_config is None:
             weight = Parameter(
                 torch.rand(
                     sum(output_partition_sizes),
                     input_size_per_partition,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -89,15 +91,21 @@ class LinearBase(torch.nn.Module):
                 )
             weight_dtype = torch.float8_e4m3fn
             weight = Parameter(
-                torch.rand(sum(output_partition_sizes), input_size_per_partition).to(
-                    weight_dtype
-                ),
+                torch.rand(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    device=device,
+                ).to(weight_dtype),
                 requires_grad=False,
             )
             self.register_parameter("weight", weight)
             if not self.block_quant:
                 scale = Parameter(
-                    torch.rand(len(output_partition_sizes), dtype=torch.float32),
+                    torch.rand(
+                        len(output_partition_sizes),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
                     requires_grad=False,
                 )
                 scale[:] = torch.finfo(torch.float32).min
@@ -109,6 +117,7 @@ class LinearBase(torch.nn.Module):
                         (sum(output_partition_sizes) + block_n - 1) // block_n,
                         (input_size_per_partition + block_k - 1) // block_k,
                         dtype=torch.float32,
+                        device=device,
                     ),
                     requires_grad=False,
                 )
@@ -117,7 +126,11 @@ class LinearBase(torch.nn.Module):
 
             if self.activation_scheme == "static":
                 scale = Parameter(
-                    torch.rand(len(output_partition_sizes), dtype=torch.float32),
+                    torch.rand(
+                        len(output_partition_sizes),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
                     requires_grad=False,
                 )
                 scale[:] = torch.finfo(torch.float32).min
@@ -226,7 +239,9 @@ class RowParallelLinear(LinearBase):
             )
 
         if bias:
-            self.bias = Parameter(torch.rand(self.output_size, dtype=params_dtype))
+            self.bias = Parameter(
+                torch.rand(self.output_size, dtype=params_dtype, device="cuda")
+            )
         else:
             self.register_parameter("bias", None)
 
@@ -328,7 +343,11 @@ class ColumnParallelLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.rand(self.output_size_per_partition, dtype=params_dtype)
+                torch.rand(
+                    self.output_size_per_partition,
+                    dtype=params_dtype,
+                    device="cuda",
+                )
             )
         else:
             self.register_parameter("bias", None)
@@ -523,7 +542,9 @@ class ReplicatedLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size, dtype=self.params_dtype)
+                torch.empty(
+                    self.output_size, dtype=self.params_dtype, device="cuda"
+                )
             )
         else:
             self.register_parameter("bias", None)

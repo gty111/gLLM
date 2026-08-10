@@ -1,3 +1,3 @@
-from gllm.llm_engine import LLM
+from gllm.engine.llm import LLM
 
 __all__ = ["LLM"]

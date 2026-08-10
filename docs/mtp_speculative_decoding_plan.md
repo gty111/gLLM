@@ -213,7 +213,7 @@ accept/reject scan directly. Keep it separate from `forward_gpu`.
   proposer (store them in the chain loop).
 * Returns per-seq `num_accepted ∈ [1, k+1]` and the committed token ids.
 
-### 4.4 Scheduler + sequence state — `gllm/scheduler.py`, `gllm/sequence.py`
+### 4.4 Scheduler + sequence state — `gllm/scheduling/scheduler.py`, `gllm/runtime/sequence.py`
 
 * When spec is on, for each decode seq **pre-allocate `k` extra KV slots** (so the
   draft chain has somewhere to write): `to_compute_token_num` becomes `1+k` on the
@@ -231,7 +231,7 @@ accept/reject scan directly. Keep it separate from `forward_gpu`.
   * finish / logprob / stream handling as today, but possibly emitting multiple
     tokens per step.
 
-### 4.5 Memory manager — `gllm/memory_manager.py` (extend)
+### 4.5 Memory manager — `gllm/runtime/memory_manager.py` (extend)
 
 Verified API: a sequence's page list is `seq.page_table` (list of page ids); pages
 are freed via `segment.free(page_num)` → `IDAllocator.free` (a FIFO free-list).
@@ -512,35 +512,42 @@ LLM(model, tp_size=8, mtp_k=2)            # shorter draft chain
 
 ### 10.2 Environment variables
 
-Only **one** MTP env var remains (down from ~11 during development):
-
-| env var | default | purpose |
-| --- | --- | --- |
-| `GLLM_MTP_FUSED` | `1` (on) | escape hatch to disable fused mode (`=0`). Fused is correct in every validated combo; the flag only exists for debugging. |
-
-Everything else is automatic: draft/verify CUDA graphs capture whenever CUDA
-graphs are on (respect `--disable-cuda-graph`); rejection sampling activates
-per-batch by runtime detection (see 10.4). `GLLM_DSA_FP8_SCORE` / `GLLM_DSA_HADAMARD`
-are pre-existing DSA knobs, unrelated to MTP.
+MTP has no environment-variable mode switches. Fused relay is always used when
+MTP is active; draft/verify CUDA graphs capture whenever CUDA graphs are on
+(respecting `--disable-cuda-graph`), and rejection sampling activates per batch
+by runtime detection (see 10.4). `GLLM_DSA_FP8_SCORE` /
+`GLLM_DSA_HADAMARD` are pre-existing DSA knobs, unrelated to MTP.
 
 ### 10.3 Fused MTP (the default)
 
 The plan's two-forward step (decode `x1` → draft → verify) collapses to **one
-target forward per step**. After verify, the accept step stashes each seq's
-*bonus* token + its verify hidden into `self._mtp_relay[seq_id]`. The next step's
+target forward per steady-state step**. After verify, the accept step stashes
+each seq's *bonus* token + its verify hidden into `self._mtp_relay[seq_id]`. The next step's
 fused fast-path (`step_once`, gated on `_mtp_fused and not is_dp_attn and
-is_last_pp_rank and pure-decode and all seqs have relay`) skips the `x1`-decode
-forward entirely — the relayed `(bonus, hidden)` seed the draft directly.
+is_last_pp_rank and pure-decode`) skips the `x1`-decode forward entirely for
+relay hits — the relayed `(bonus, hidden)` seed the draft directly.
 
 Bonus discipline (the subtle correctness point): the bonus is **relayed, not
 committed**, when fused (it is committed once as the *next* step's `x1`).
-Committing it both places double-emits it (observed as token repetition). The
-non-fused path instead appends the bonus to the committed list. Both the greedy
-and rejection accept branches honor this split.
+Committing it both places double-emits it (observed as token repetition). Both
+the greedy and rejection accept branches relay the bonus.
 
-The non-fused code path is retained (not dead): it is the fallback for
-bootstrap (a seq's first decode step has no relay), DP+EP (fused is gated off
-under DP-attn), and any relay miss.
+Fresh sequences, relay misses, and the first speculative step after a plain
+batch-gated step have no usable relay. They are bootstrapped with a fixed
+`1+k` verify-shaped query: row zero is the real uncached decode token and the
+remaining rows are padding. Relay-hit positions use a full dummy query. Only
+row zero's hidden/logits are consumed; causal execution makes them identical to
+one-token decode, while the later speculative KV/state writes are overwritten
+by the real verify. There is no independently selectable non-fused MTP mode.
+
+Prefill itself remains on the ordinary base-model path. When the scheduler
+forms a mixed prefill+decode batch, its decode rows also take one ordinary
+single-token step because MTP only expands pure-decode batches. Before that
+plain forward, `step_once` removes the relay entries for exactly those decode
+rows: their sequence positions are about to advance without a matching MTP
+verify, so retaining the old `(bonus_tok, bonus_hidden)` would make the next
+pure-decode step draft from stale state. Relay entries for decode requests not
+scheduled in the mixed batch remain valid.
 
 ### 10.4 Greedy vs rejection sampling
 
@@ -595,8 +602,11 @@ in-flight overlapped batch is drained first so committed token_ids have no
 `-future_slot_id` placeholders. Seqs freed under us mid-step (EOS/max_len from
 the drained batch) are marked `_overlap_freed` and filtered out of both the
 forward batch and the `batch_running` entry (double-free fix). DP+EP is out of
-scope for the sync path (variable per-step token count breaks the cross-DP
-collective lockstep) → plain TP only.
+scope for the sync path: replicas still need a global MTP/bootstrap decision, a
+common sequence bucket, and phase-specific collective row counts for padded
+bootstrap (`B*(1+k)`), each draft step (`B`), and verify (`B*(1+k)`). Until that
+protocol is implemented, ModelRunner explicitly declines MTP under DP-attention
+and runs ordinary decode instead.
 
 ### 10.8 Validation results (auto-detect path, no MTP env vars)
 
@@ -605,25 +615,26 @@ collective lockstep) → plain TP only.
 | greedy MMLU-Pro 28q | **82.14%** (= baseline) | bit-exact; mean accept len ~3.14 (k=3) |
 | sampling MMLU-Pro 140q (T=1.0, top_p=0.95, top_k=40) | 75.71% | rejection; mean accept len ~2.5, per-pos accept 0.79/0.51/0.17 |
 
-Full matrix validated: greedy/sampling × fused/non-fused × overlap/non-overlap ×
-draft-graph/verify-graph. Fused C=1 speedup ~2.09×.
+The original implementation validated greedy/sampling × fused/non-fused ×
+overlap/non-overlap × draft-graph/verify-graph before the non-fused debug switch
+was removed. Fused C=1 speedup ~2.09×.
 
 ### 10.9 Key files (as-built)
 
 * `gllm/models/deepseek_mtp.py` — `DeepseekMTP` head (layer-61 nextn block).
-* `gllm/model_runner.py` — `_mtp_decode` (draft→verify→accept), `_draft_chain_*`,
+* `gllm/runtime/model_runner.py` — `_mtp_decode` (draft→verify→accept), `_draft_chain_*`,
   `_capture_{draft,verify}_graphs`, `_gumbel_argmax`, `_mtp_probs_static`,
   `step_once` fused fast-path, `_record_mtp_metrics`.
 * `gllm/layers/attention.py` — `_forward_verify_sparse` (fp8 verify kernel).
-* `gllm/input_data.py` — `is_mtp_verify` metadata + verify prefill-with-context path.
-* `gllm/overlap_worker.py` — `_run_mtp_sync`, all-rank sampling in `run_batch_async`.
-* `gllm/worker.py` — hard-exit (`os._exit`) crash/shutdown handlers (avoids NCCL
+* `gllm/runtime/input_data.py` — `is_mtp_verify` metadata + verify prefill-with-context path.
+* `gllm/workers/overlap.py` — `_run_mtp_sync`, all-rank sampling in `run_batch_async`.
+* `gllm/workers/worker.py` — hard-exit (`os._exit`) crash/shutdown handlers (avoids NCCL
   destroy deadlock), MTP token-list broadcast skip.
 
 Removed during cleanup: `gllm/spec_decode/mtp_proposer.py` (superseded by the
 `_draft_chain_*` methods) and its `spec_decode/` package.
 
-### 10.10 GPU-native input prep (`gllm/mtp_gpu_prep.py`)
+### 10.10 GPU-native input prep (`gllm/speculative/gpu_prep.py`)
 
 An MTP step prepares **two** batches (the draft chain's batch×1 and the verify
 batch's uniform `1+k`) on top of whatever the scheduler already prepared. Doing
@@ -642,7 +653,7 @@ host-side prep**.
   the static buffers the captured graphs read -- the verify token ids come from
   the draft chain's GPU tensor and never round-trip through the host;
 * CUDA-graph bucket padding writes dummy rows on the GPU instead of building
-  throwaway `Sequence` objects.
+  throwaway `GenerationSequence` objects.
 
 Supporting changes in `ModelRunner`: one page pre-allocation per step for the
 whole `1+k` speculative window (was one per phase); `orig_tokens` kept by
@@ -896,8 +907,8 @@ It is a *scheduling* decision, not a second code path: a declined step takes the
 plain decode path that already exists as MTP's bootstrap path. Three details:
 
 * the decision is taken **once per iteration** (`mtp_begin_iter`, called by both
-  workers) and cached for the four sites that consult it (fused-prep eligibility
-  in each worker, `step_once`'s fused and non-fused gates). If they could
+  workers) and cached for the sites that consult it (fused-prep eligibility in
+  each worker and `step_once`'s MTP gates). If they could
   disagree within a step, a step whose prep was skipped as "fused MTP" could then
   take the plain path — running the plain forward on minimal input prep;
 * it is a pure function of `num_decodes` and of state each rank derives from its
@@ -905,8 +916,8 @@ plain decode path that already exists as MTP's bootstrap path. Three details:
   design requires TP-identical tokens;
 * a declined step advances every seq by one token *without* refreshing the fused
   relay, so the stashed `(bonus_tok, bonus_hidden)` no longer describes the seq's
-  last position. `_mtp_drop_relay()` invalidates it, costing one bootstrap
-  (non-fused) step when the batch falls back below the threshold.
+  last position. `_mtp_drop_relay()` invalidates it, costing one padded-bootstrap
+  step when the batch falls back below the threshold.
 
 Default is `0` (always speculate): the crossover depends on the model, `k`, the
 GPU and the acceptance rate, and a baked-in default would silently disable
@@ -954,7 +965,7 @@ worth recording, because they are properties of the measurement and not of the
 particular controller:
 
 * **the switch step is not a sample of the mode it switches to.** The first
-  speculating step after a plain one is the non-fused bootstrap step (a second
+  speculating step after a plain one is the padded bootstrap step (a second
   target forward) and it also drains/refills the overlap pipeline. Timing
   speculation there is self-fulfilling: it reads slow, the gate picks plain, and
   the estimate is never revisited. Skipping the first few steps of each streak

@@ -3,16 +3,13 @@
 The V3.2 checkpoint does NOT ship a usable ``chat_template`` (neither in
 ``tokenizer_config.json`` nor a root ``chat_template.jinja`` from upstream).
 Instead it bundles the reference message encoder at
-``<model_path>/encoding/encoding_dsv32.py`` -- the same file vLLM vendors as
-``vllm/tokenizers/deepseek_v32_encoding.py`` and drives via
-``--tokenizer-mode deepseek_v32``. It renders the DeepSeek DSML prompt format
+``<model_path>/encoding/encoding_dsv32.py``. It renders the DeepSeek DSML prompt format
 (``<｜User｜>...<｜Assistant｜>``, ``<think>`` gating, ``<｜DSML｜invoke>`` tool
 calls) that a hand-written Jinja template cannot express.
 
-This module loads that official encoder at runtime (zero-maintenance: it always
-tracks whatever the checkpoint ships) and adapts gLLM's OpenAI-style call site to
-it, mirroring vLLM's ``get_deepseek_v32_tokenizer`` glue. When the encoder file is
-absent we return ``None`` so the caller falls back to ``apply_chat_template``.
+This module loads that official encoder at runtime, so behavior tracks the
+checkpoint, and adapts gLLM's OpenAI-style call site to it. When the encoder file
+is absent it returns ``None`` so the caller falls back to ``apply_chat_template``.
 """
 
 import importlib.util
@@ -64,9 +61,6 @@ def apply_dsv32_chat_template(
 ):
     """Render ``messages`` with the official DeepSeek-V3.2 encoder.
 
-    Mirrors vLLM's ``_DeepseekV32Tokenizer.apply_chat_template``
-    (``vllm/tokenizers/deepseek_v32.py``):
-
     - ``thinking`` / ``enable_thinking`` (from the request's
       ``chat_template_kwargs``) select ``thinking_mode`` (``"thinking"`` vs the
       default ``"chat"``).
@@ -97,7 +91,7 @@ def apply_dsv32_chat_template(
         messages.insert(0, {"role": "system", "tools": tools})
 
     # Reasoning from prior turns is only kept mid-thinking; a fresh user turn
-    # resets it (matches vLLM's drop_thinking heuristic).
+    # starts a new reasoning context and therefore drops it.
     drop_thinking = bool(messages) and messages[-1].get("role") == "user"
 
     prompt_str = encoder.encode_messages(

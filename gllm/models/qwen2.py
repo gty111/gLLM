@@ -3,14 +3,15 @@ from typing import Optional
 import torch
 from torch import nn
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_pp_layers,
     is_first_pp_rank,
     is_last_pp_rank,
 )
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.activation import SiluAndMul
-from gllm.layers.attention import FlashAttention
+from gllm.layers.attention.base import AttentionLayerBase
+from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import (
     MergedColumnParallelLinear,
@@ -19,7 +20,6 @@ from gllm.layers.linear import (
 )
 from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-from gllm.modules.attention import Attention
 
 from .utils import extract_rope_config
 from .weight_loader import (
@@ -60,7 +60,7 @@ class Qwen2MLP(nn.Module):
         return self.down_proj(self.act_fn(self.gate_up_proj(x)))
 
 
-class Qwen2Attention(Attention):
+class Qwen2Attention(AttentionLayerBase):
     def __init__(self, layer_id: int, config, qkv_bias=True):
         super().__init__(
             config.num_attention_heads, config.num_key_value_heads, config.hidden_size
@@ -106,7 +106,7 @@ class Qwen2Attention(Attention):
                 True,
                 rope_scaling["mrope_section"],
             )
-        self.attn = FlashAttention(
+        self.attn = QKVAttention(
             layer_id, self.scaling, self.num_heads, self.num_kv_heads, self.head_dim
         )
 

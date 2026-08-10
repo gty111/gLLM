@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     get_ep_rank,
     get_ep_size,
     get_tp_size,
@@ -12,9 +12,9 @@ from gllm.dist_utils import (
     tensor_model_parallel_all_reduce,
 )
 
-from gllm.input_data import InputData
+from gllm.runtime.input_data import InputData
 from gllm.layers.layernorm import RMSNorm
-from gllm.layers.moe import FusedMoE, determine_expert_map
+from gllm.layers.moe import FusedMoE, SharedExpertRunner, determine_expert_map
 
 from .qwen2 import Qwen2Attention as Qwen2MoeAttention
 from .qwen2 import Qwen2ForCausalLM
@@ -50,10 +50,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
         )
-        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.gate = nn.Linear(
+            config.hidden_size, config.num_experts, bias=False, device="cuda"
+        )
 
         if getattr(config, "shared_expert_intermediate_size", 0) > 0:
             self.shared_expert = Qwen2MoeMLP(config, shared_expert=True)
+            self.shared_expert_runner = SharedExpertRunner()
+            # The shared branch consumes the same input, potentially on an
+            # auxiliary stream. Keep the routed result out-of-place so it
+            # cannot overwrite that input before the shared GEMMs finish.
+            self.experts.inplace = False
             # ``Qwen2MoeMLP.down_proj`` is a ``RowParallelLinear`` that
             # all-reduces by default. We defer the all-reduce to this
             # block's tail (after summing the FusedMoE and shared-expert
@@ -66,7 +73,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
         if hasattr(config, "shared_expert_intermediate_size"):
-            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+            self.shared_expert_gate = torch.nn.Linear(
+                config.hidden_size, 1, bias=False, device="cuda"
+            )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -75,15 +84,23 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         if is_dp_attn():
             return self._forward_dp_ep(hidden_states, orig_shape)
-        shared_output = self._shared_output(hidden_states)
+        if self.shared_expert is not None:
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
-        if shared_output is not None:
+            def routed_forward():
+                router_logits = self.gate(hidden_states)
+                return self.experts(
+                    hidden_states=hidden_states, router_logits=router_logits
+                )
+
+            final_hidden_states, shared_output = self.shared_expert_runner.run(
+                hidden_states, routed_forward, lambda: self._shared_output(hidden_states)
+            )
             final_hidden_states = final_hidden_states + shared_output
+        else:
+            router_logits = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)

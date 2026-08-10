@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from gllm.dist_utils import (
+from gllm.distributed.parallel_state import (
     divide,
     get_tp_rank,
     get_tp_size,
@@ -239,6 +239,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
+                device="cuda",
             ),
             requires_grad=False,
         )
@@ -410,7 +411,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         )
         if bias:
             self.bias = Parameter(
-                torch.empty(self.num_embeddings_per_partition, dtype=params_dtype)
+                torch.empty(
+                    self.num_embeddings_per_partition,
+                    dtype=params_dtype,
+                    device="cuda",
+                )
             )
         else:
             self.register_parameter("bias", None)
