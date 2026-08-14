@@ -200,6 +200,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         num_heads: int,
         projection_size: int,
         quant_config = None,
+        attention_backend: str = "flashinfer",
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
@@ -207,6 +208,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         self.tp_rank = get_tp_rank()
         self.hidden_size_per_attention_head = divide(projection_size, num_heads)
         self.num_attention_heads_per_partition = divide(num_heads, self.tp_size)
+        self.attention_backend = attention_backend
 
         self.qkv = QKVParallelLinear(
             hidden_size=embed_dim,
@@ -269,7 +271,7 @@ class Qwen2_5_VisionAttention(nn.Module):
 
         q, k, v = (rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
         
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
+        from gllm.layers.ops.flash_attn_compat import flash_attn_varlen_func
 
         output = flash_attn_varlen_func(
             q,
@@ -280,6 +282,7 @@ class Qwen2_5_VisionAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
+            backend=self.attention_backend,
         )
 
         context_layer = rearrange(output, "(b s) ... -> b s ...", b=batch_size)
@@ -298,6 +301,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         mlp_hidden_dim: int,
         act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
+        attention_backend: str = "flashinfer",
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -305,7 +309,10 @@ class Qwen2_5_VisionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
         self.attn = Qwen2_5_VisionAttention(
-            embed_dim=dim, num_heads=num_heads, projection_size=dim
+            embed_dim=dim,
+            num_heads=num_heads,
+            projection_size=dim,
+            attention_backend=attention_backend,
         )
         self.mlp = Qwen2_5_VisionMLP(dim, mlp_hidden_dim, act_fn=act_fn, bias=True)
 
@@ -449,6 +456,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self,
         vision_config,
         norm_eps: float = 1e-6,
+        attention_backend: str = "flashinfer",
     ) -> None:
         super().__init__()
 
@@ -486,6 +494,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                     mlp_hidden_dim=vision_config.intermediate_size,
                     act_fn=SiluAndMul(),
                     norm_layer=norm_layer,
+                    attention_backend=attention_backend,
                 )
                 for layer_idx in range(depth)
             ]
@@ -726,6 +735,9 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             self.visual = Qwen2_5_VisionTransformer(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                attention_backend=getattr(
+                    config, "attention_backend", "flashinfer"
+                ),
             )
 
         self.skip_language = getattr(config, "skip_language", False)

@@ -2,22 +2,28 @@ pydantic >= 2.11.7
 numpy
 tqdm
 transformers >= 5.11.0
+tiktoken >= 0.13.0 # Kimi K2.x tokenizer
 fastapi[standard] >= 0.115.0
 openai >= 1.99.1
 logger
 # Keep the CUDA build explicit: the unqualified aarch64 wheel on PyPI is CPU-only.
-# pyproject.toml routes uv's PyTorch resolution to the CUDA 12.9 wheel index.
-torch==2.9.1+cu129
-torchvision==0.24.1
+# pyproject.toml routes uv's PyTorch resolution to the CUDA 13.0 wheel index.
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130
+cuda-python>=13
 zmq
 aiohttp
 datasets
 pillow
 einops # qwen2_5_vl
 av # video
-sgl-kernel==0.3.21
-flashinfer-python==0.6.12 # Hopper FP8 block-scale GEMM with auto-swapAB (fast decode)
-flashinfer-cubin==0.6.12 # prebuilt cubins for flashinfer (avoids first-run JIT)
-# sgl-kernel's vendored FA4 (flash_attn_origin.cute) still uses nvvm.RoundingModeKind,
-# which cutlass-dsl 4.6.0 removed; >=4.5.0 keeps flashinfer happy
-nvidia-cutlass-dsl>=4.5.0,<4.6.0
+# Install the +cu130 wheel from https://docs.sglang.ai/whl/cu130/.
+sglang-kernel==0.4.6.post1
+sgl-deep-gemm==0.1.5.post2 # DeepSeek V3.2 DSA FP8 index scoring
+flashinfer-python[cu13]==0.6.17 # Blackwell kernels aligned with the SGLang stack
+flashinfer-cubin==0.6.17 # prebuilt cubins for flashinfer (avoids first-run JIT)
+flashinfer-jit-cache==0.6.17+cu130
+flash-attn-4[cu13]==4.0.0b26
+nvidia-cutlass-dsl[cu13]==4.6.0.dev0 # exact version required by flash-attn-4
+quack-kernels==0.5.3
+torch-c-dlpack-ext==0.1.5

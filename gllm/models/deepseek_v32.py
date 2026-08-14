@@ -27,8 +27,6 @@ Reference: HuggingFace ``transformers>=5.11`` ``modeling_deepseek_v32`` /
 
 from typing import Optional
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,24 +61,9 @@ _INDEX_SCORE_TILE = 512
 # eagerly (never CUDA-graph captured), so a Python loop here is fine.
 _INDEX_QUERY_CHUNK = 512
 
-# DSA prefill indexer scoring backend. Default: SGLang's FP8 path (Hadamard ->
-# e4m3 quant -> deep_gemm ``fp8_mqa_logits`` / ``fp8_paged_mqa_logits``):
-# ~10-50x faster indexer scoring at long context and within the measured noise
-# of the fp32 selector on RULER. Set
-# ``GLLM_DSA_FP8_SCORE=0`` to fall back to the exact fp32 einsum selector
-# (``_select_topk_prefill`` / ``_select_topk_decode``).
-_DSA_FP8_SCORE = os.environ.get("GLLM_DSA_FP8_SCORE", "1") == "1"
-
-# Whether to Hadamard-transform the indexer q/k before FP8 quantization. The
-# transform decorrelates activations but measured net-negative on this model, so
-# it defaults OFF:
-# this model -- on RULER 4096 it systematically lost the ``vt`` (variable
-# tracking) task (15/20 vs 19/20 without it) by flattening the output logits at
-# greedy tie-break points, and the fp8 quant is already accurate enough via
-# UE8M0. Set ``GLLM_DSA_HADAMARD=1`` to re-enable -- MUST toggle q and stored-k
-# together, since the score is (Hq)·(Hk)=q·k only when both sides are transformed
-# (H orthogonal; (Hq)·k != q·k). Only affects the FP8 score path.
-_DSA_HADAMARD = os.environ.get("GLLM_DSA_HADAMARD", "0") == "1"
+# DSA indexer scoring always uses the e4m3 deep_gemm FP8 MQA-logits kernels.
+# The fp32 selectors below remain as explicit correctness/reference helpers,
+# but are not selected by the serving path.
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -382,8 +365,6 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         softmax_scale) + the cache's per-token scale.
         """
         import deep_gemm
-        from sgl_kernel import hadamard_transform
-
         meta = input_data.metadata
         if meta is None or meta.num_decodes == 0:
             return None
@@ -401,15 +382,11 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         device = q_idx.device
         max_L = block_table.shape[1] * page_sz
 
-        # Apply the same optional Hadamard transform as the stored-key path,
-        # then FP8-quantize the query. ``scale_fmt="ue8m0"`` selects a
-        # power-of-two scale; other formats use the exact amax-derived scale.
-        qh = (
-            hadamard_transform(q_idx.contiguous(), scale=dim ** -0.5)
-            if _DSA_HADAMARD
-            else q_idx
+        # FP8-quantize the query. UE8M0 selects a power-of-two scale; other
+        # formats use the exact amax-derived scale.
+        qf = q_idx.float().reshape(
+            num_decode, self.indexer.n_heads, dim // 128, 128
         )
-        qf = qh.float().reshape(num_decode, self.indexer.n_heads, dim // 128, 128)
         q_scale = (qf.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448.0)
         if self.indexer.use_ue8m0:
             q_scale = torch.exp2(torch.ceil(torch.log2(q_scale)))
@@ -421,12 +398,17 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
 
         kv = fp8_cache.view(pages, page_sz, 1, fp8_bytes)
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        sched = deep_gemm.get_paged_mqa_logits_metadata(seq_lens, page_sz, sm_count)
+        # The paged kernel uses one context length per speculative position.
+        # This path has next_n=1, so retain that dimension explicitly.
+        kernel_seq_lens = seq_lens.unsqueeze(-1)
+        sched = deep_gemm.get_paged_mqa_logits_metadata(
+            kernel_seq_lens, page_sz, sm_count
+        )
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8.unsqueeze(1),   # [num_decode, next_n=1, H, D]
             kv,
             w,
-            seq_lens,
+            kernel_seq_lens,
             block_table,
             sched,
             max_L,
@@ -542,8 +524,8 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         """FP8 variant of :meth:`_select_topk_prefill` using ``fp8_mqa_logits``.
 
         Per prefill sequence: gather its cached index-key history (physical
-        slots), Hadamard-transform + FP8-quantize both the indexer query and key
-        (SGLang's NSA recipe), score with ``deep_gemm.fp8_mqa_logits`` under the
+        slots), FP8-quantize both the indexer query and key, score with
+        ``deep_gemm.fp8_mqa_logits`` under the
         per-query causal bounds ``ks/ke``, top-k, and map back to physical slots.
         ``fp8_mqa_logits`` applies ReLU internally and folds the per-head
         ``weights`` (which carry ``q_scale * softmax_scale``), matching the exact
@@ -555,8 +537,6 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         cache is a later perf optimization.
         """
         import deep_gemm
-        from sgl_kernel import hadamard_transform
-
         meta = input_data.metadata
         prefill = meta.prefill
         seg = input_data.memory_manager.segment
@@ -603,15 +583,8 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             q_seq = q_idx[q0:q1]  # [qlen, n_heads, D]
             w_seq = weights[q0:q1]  # [qlen, n_heads]
 
-            # Hadamard + FP8 quant (SGLang NSA recipe). Skipped when
-            # GLLM_DSA_HADAMARD=0 (q and k toggled together so (Hq)·(Hk)=q·k holds).
-            if _DSA_HADAMARD:
-                qh = hadamard_transform(q_seq.contiguous(), scale=hdim ** -0.5)
-                kh = hadamard_transform(k_bf16.contiguous(), scale=hdim ** -0.5)
-            else:
-                qh, kh = q_seq, k_bf16
-            q_fp8, q_scale = _quant(qh)  # [qlen,H,D], [qlen,H]
-            k_fp8, k_scale = _quant(kh)  # [seq_len,D], [seq_len]
+            q_fp8, q_scale = _quant(q_seq)  # [qlen,H,D], [qlen,H]
+            k_fp8, k_scale = _quant(k_bf16)  # [seq_len,D], [seq_len]
             w_folded = w_seq.float() * q_scale * scale  # [qlen, n_heads]
 
             # Per-query causal bounds: query at intra-seq offset j (abs pos
@@ -654,8 +627,6 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         matching the ``prefill_topk`` contract (row-major over seq then query).
         """
         import deep_gemm
-        from sgl_kernel import hadamard_transform
-
         meta = input_data.metadata
         prefill = meta.prefill
         seg = input_data.memory_manager.segment
@@ -682,12 +653,8 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
         H = self.indexer.n_heads
         max_L = block_table.shape[1] * page_sz
 
-        # Hadamard + FP8-quant the query (matches the stored key path / decode).
-        qh = (
-            hadamard_transform(q_idx.contiguous(), scale=dim ** -0.5)
-            if _DSA_HADAMARD else q_idx
-        )
-        qf = qh.float().reshape(num_q, H, dim // 128, 128)
+        # FP8-quantize the query, matching the stored-key format.
+        qf = q_idx.float().reshape(num_q, H, dim // 128, 128)
         q_scale = (qf.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448.0)
         if self.indexer.use_ue8m0:
             q_scale = torch.exp2(torch.ceil(torch.log2(q_scale)))
@@ -712,10 +679,13 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
 
         kv = fp8_cache.view(pages, page_sz, 1, fp8_bytes)
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        sched = deep_gemm.get_paged_mqa_logits_metadata(per_q_seqlen, page_sz, sm_count)
+        kernel_seq_lens = per_q_seqlen.unsqueeze(-1)
+        sched = deep_gemm.get_paged_mqa_logits_metadata(
+            kernel_seq_lens, page_sz, sm_count
+        )
         logits = deep_gemm.fp8_paged_mqa_logits(
             q_fp8.unsqueeze(1),   # [num_q, next_n=1, H, D]
-            kv, w, per_q_seqlen, bt, sched, max_L, clean_logits=False,
+            kv, w, kernel_seq_lens, bt, sched, max_L, clean_logits=False,
         )  # [num_q, max_L] fp32 (positions >= per_q_seqlen already invalid)
 
         pos = torch.arange(max_L, device=device)
@@ -772,39 +742,19 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             )
             # DSA FP8 scoring also needs the key in the persistent paged FP8
             # index cache (block-contiguous 132B layout for fp8_paged_mqa_logits).
-            # The FP8 score path scores Hadamard(q)·Hadamard(k) (the Hadamard
-            # transform decorrelates activations so FP8 quant is accurate); the
-            # decode query is Hadamard'd in ``_select_topk_decode_fp8``, so the
-            # stored key MUST be Hadamard'd here to match -- otherwise the score
-            # is Hadamard(q)·k, which is wrong (H is orthogonal: (Hq)·(Hk)=q·k
-            # but (Hq)·k != q·k).
-            if _DSA_FP8_SCORE and mm.segment.index_k_fp8_cache is not None:
-                if _DSA_HADAMARD:
-                    from sgl_kernel import hadamard_transform
-
-                    idx_k_had = hadamard_transform(
-                        idx_k.contiguous(), scale=idx_k.shape[-1] ** -0.5
-                    )
-                else:
-                    idx_k_had = idx_k
-                mm.store_index_k_fp8(
-                    self.layer_id, idx_k_had, input_data.get_slot_mapping(),
-                    use_ue8m0=self.indexer.use_ue8m0,
-                )
+            mm.store_index_k_fp8(
+                self.layer_id, idx_k, input_data.get_slot_mapping(),
+                use_ue8m0=self.indexer.use_ue8m0,
+            )
             num_dec = meta.num_decode_tokens
             # DeepSeek Sparse Attention: feed the indexer's top-k selection into
             # the sparse decode kernel. MLAAttention routes by cache dtype:
             # FP8-packed cache -> FlashMLA sparse ``fwd_kvcache_mla``; bf16 cache
-            # -> FA3 with the top-k physical slots as a page_size=1 page table
+            # -> FA4 with the top-k physical slots as gather indices
             # (paged bf16 sparse is rejected by FlashMLA on SM90). Either way
             # sparse decode runs regardless of cache precision.
             if meta.num_decodes > 0:
-                sel_decode = (
-                    self._select_topk_decode_fp8
-                    if _DSA_FP8_SCORE
-                    else self._select_topk_decode
-                )
-                decode_topk = sel_decode(
+                decode_topk = self._select_topk_decode_fp8(
                     input_data, idx_q[:num_dec], weights[:num_dec]
                 )
             # DeepSeek Sparse Attention (prefill): per-query causal top-k over the
@@ -817,17 +767,11 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
                 # BATCHED paged selector (one kernel over all seqs+positions)
                 # instead of the per-seq Python-loop prefill selector -- the
                 # latter's nd x 61-layer launches/syncs are the verify hot spot.
-                is_mtp_verify = _DSA_FP8_SCORE and getattr(
-                    input_data, "is_mtp_verify", False
-                )
+                is_mtp_verify = getattr(input_data, "is_mtp_verify", False)
                 if is_mtp_verify:
                     sel_prefill = self._select_topk_verify_fp8
                 else:
-                    sel_prefill = (
-                        self._select_topk_prefill_fp8
-                        if _DSA_FP8_SCORE
-                        else self._select_topk_prefill
-                    )
+                    sel_prefill = self._select_topk_prefill_fp8
                 prefill_topk = sel_prefill(
                     input_data, idx_q[num_dec:], weights[num_dec:]
                 )

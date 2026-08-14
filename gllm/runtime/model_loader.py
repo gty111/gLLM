@@ -296,6 +296,7 @@ def propagate_quantization_config(
 # their language backbone from ``text_config``, so each field here must be
 # propagated explicitly (see :func:`propagate_serving_config`).
 SERVING_CONFIG_FIELDS: Tuple[str, ...] = (
+    "attention_backend",
     "mla_decode_backend",
     "page_size",
     "use_mla",

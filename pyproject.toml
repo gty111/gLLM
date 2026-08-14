@@ -6,7 +6,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
-# sgl-kernel 0.3.21 links against CUDA 12 (libnvrtc.so.12), so do not let
+# Keep the PyTorch and kernel stack on CUDA 13.0; do not let
 # `uv pip install -e .` fall back to PyPI's CPU-only aarch64 torch wheel or
-# auto-select a CUDA 13 backend from the host driver.
-torch-backend = "cu129"
+# select a different CUDA backend from the host driver.
+torch-backend = "cu130"

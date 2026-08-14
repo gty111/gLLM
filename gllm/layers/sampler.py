@@ -1,5 +1,5 @@
 import torch
-from sgl_kernel import top_k_top_p_sampling_from_probs
+from flashinfer.sampling import top_k_top_p_sampling_from_probs
 
 from gllm.runtime.input_data import InputData
 from gllm.layers.repetition_penalty import apply_scaling_penalties
@@ -10,7 +10,7 @@ def _fused_top_k_top_p_sample(
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused top-k / top-p sampling via sgl_kernel."""
+    """Fused top-k / top-p sampling via FlashInfer."""
     return top_k_top_p_sampling_from_probs(
         probs.float().contiguous(),
         top_ks.to(torch.int32),

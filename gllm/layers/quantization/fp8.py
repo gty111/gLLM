@@ -42,7 +42,12 @@ def deepgemm_available() -> bool:
     """
     if not torch.cuda.is_available():
         return False
-    if torch.cuda.get_device_capability()[0] < 9:
+    # This W8A8 block-scale integration targets DeepGEMM's Hopper API.  The
+    # Blackwell package aliases ``fp8_gemm_nt`` to its FP8/FP4 implementation,
+    # whose UE8M0 scale contract is different from the raw FP32 block scales
+    # passed below.  A failed device assertion cannot be recovered by the
+    # Python fallback, because it poisons the CUDA context.
+    if torch.cuda.get_device_capability() != (9, 0):
         return False
     try:
         import deep_gemm  # noqa: F401
@@ -65,6 +70,19 @@ def deepgemm_available() -> bool:
     # once from the actual FP8 GEMM path (see ``_log_deepgemm_enabled_once``) so
     # it only appears when the model really runs DeepGEMM FP8 kernels.
     return True
+
+
+def fp8_backend_requires_bucket_warmup(quant_config) -> bool:
+    """Whether an FP8 model needs eager per-bucket backend warmup.
+
+    Backend probes may launch CUDA kernels, so they must never run merely
+    because CUDA graphs are enabled on an unquantized model.
+    """
+    if not isinstance(quant_config, dict):
+        return False
+    if quant_config.get("quant_method") != "fp8":
+        return False
+    return deepgemm_available() or flashinfer_swapab_available()
 
 
 _deepgemm_logged = False

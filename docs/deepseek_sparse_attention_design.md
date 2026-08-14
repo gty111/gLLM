@@ -56,8 +56,7 @@ sequence) against its entire cached history, top-k's, and returns
 `[num_decode, index_topk]` int32 physical slots (−1 padded). `MLAAttention`
 routes by cache dtype (`_forward_decode`):
 
-- **bf16 cache** → FA3 `flash_attn_with_kvcache` with the top-k slots as a
-  `page_size=1` page table (paged bf16 sparse is rejected by FlashMLA on SM90).
+- **bf16 cache** → FA4 `gather_kv_indices` with the top-k physical slots.
 - **fp8 cache** → FlashMLA sparse `flash_mla_with_kvcache(..., indices=..., is_fp8_kvcache=True)`.
 
 The scorer is shared with prefill via `_topk_slots` (see §4).
@@ -264,13 +263,13 @@ Findings from the alignment deep-dive:
 - **UE8M0 matters, and gLLM matches vLLM's use of it.** Enabling UE8M0 lifted
   gLLM full-fp8 from 93.85 → 95.38. (A `sgl_kernel==0.3.21` build was found to have
   a no-op `scale_ue8m0` flag — that is a build bug, not the reference semantics.)
-- **Hadamard is net-negative on this model → default OFF.** gLLM applied a
-  Hadamard transform to q/k before fp8 quant (SGLang's NSA recipe); vLLM does not.
+- **The historical Hadamard experiment was net-negative and has been removed.**
+  gLLM tested a transform on q/k before fp8 quant; vLLM does not use it.
   Per-question diffing showed the only task systematically lost was `vt` (variable
   tracking): 15/20 with Hadamard vs 19/20 without, matching vLLM's 20/20. Logprob
   analysis: Hadamard flattens the output distribution at the answer's opening
   greedy tie-break, so the model takes a different narrative path and drops a
-  variable from the long answer. Disabling it recovered all 5 lost `vt` questions
+  variable from the long answer. Removing it recovered all 5 lost `vt` questions
   and moved logprobs toward vLLM (identical top-3 at the first generated token,
   Δlp≈0.008). See §9.
 - **chat template is identical**: the model ships a standalone `chat_template.jinja`
@@ -300,16 +299,15 @@ python -m gllm.entrypoints.api_server --model-path <V3.2> \
 DSA (decode + prefill) is always on for V3.2; it is a no-op for prompts ≤
 `index_topk` and only diverges from dense beyond that.
 
-## 9. FP8 indexer scoring (default ON, `GLLM_DSA_FP8_SCORE=1`)
+## 9. FP8 indexer scoring (always on)
 
-The indexer scores via SGLang's FP8 path by default (`GLLM_DSA_FP8_SCORE=1`) —
-10-50× faster indexer scoring at long context, verified bit-aligned with vLLM's
-quant (§7.1). Set `GLLM_DSA_FP8_SCORE=0` to fall back to the exact fp32 einsum
-selector (`_select_topk_prefill` / `_select_topk_decode`).
+The indexer always scores through the FP8 path. It is 10-50× faster at long
+context and was verified against the fp32 selector and vLLM's quantization
+layout (§7.1). There is no runtime environment-variable switch.
 
 - **prefill** (`_select_topk_prefill_fp8`): reads the fp32 index-K cache, applies
-  Hadamard to q and k, quantizes to e4m3 + per-token scale, scores with
-  `deep_gemm.fp8_mqa_logits` (ragged, per-query causal `ks/ke`). No cache change.
+  e4m3 + per-token quantization directly to q and k, then scores with
+  `deep_gemm.fp8_mqa_logits` (ragged, per-query causal `ks/ke`).
 - **decode** (`_select_topk_decode_fp8`): scores with `deep_gemm.fp8_paged_mqa_logits`
   over a **persistent paged FP8 index-K cache** (`index_k_fp8_cache`, 132-byte
   block-contiguous layout: per page `[page_size*128 fp8][page_size*4 scale]`),
@@ -320,18 +318,12 @@ Key correctness rules (both learned the hard way):
 - `fp8_mqa_logits` / `fp8_paged_mqa_logits` apply ReLU internally and fold the
   per-head weights (carrying `q_scale * softmax_scale`) + cache scale — matching
   `Σ_h w·ReLU(scale·q·k)`.
-- **Hadamard is OFF by default** (`GLLM_DSA_HADAMARD=0`): it was net-negative on
-  RULER (§7.1). When re-enabled, the FP8 path scores `Hadamard(q)·Hadamard(k)`, so
-  BOTH q and k must be Hadamard'd: H is orthogonal so `(Hq)·(Hk)=q·k`, but
-  `(Hq)·k ≠ q·k`. Hadamard-ing only q (and storing the raw key) silently corrupts
-  selection (RULER 84% vs 94%). The two sides are toggled together by the flag.
 - `store_index_k_fp8` must write the fp8 **byte pattern** via a `float8e4nv`-cast
   pointer, not `.to(uint8)` (which truncates the fp8 value to an integer).
 
-**Accuracy (RULER 4096, retrieval):** fp32 96.15% · full-fp8 + UE8M0, Hadamard off
-(default) 95.38% (248/260) · full-fp8 + UE8M0, Hadamard on 94.23–95.77% (run-to-run)
-· full-fp8 without UE8M0 93.85%. vLLM reference 96.15–96.54%. UE8M0 is required for
-alignment; Hadamard hurts (default off). See §7.1 for the full comparison.
+**Accuracy (RULER 4096, retrieval):** fp32 96.15% · current full-fp8 + UE8M0
+95.38% (248/260) · full-fp8 without UE8M0 93.85%. vLLM reference 96.15–96.54%.
+UE8M0 is required for alignment. See §7.1 for the full comparison.
 
 ## 10. Known limitations / follow-ups
 

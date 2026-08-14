@@ -515,8 +515,8 @@ LLM(model, tp_size=8, mtp_k=2)            # shorter draft chain
 MTP has no environment-variable mode switches. Fused relay is always used when
 MTP is active; draft/verify CUDA graphs capture whenever CUDA graphs are on
 (respecting `--disable-cuda-graph`), and rejection sampling activates per batch
-by runtime detection (see 10.4). `GLLM_DSA_FP8_SCORE` /
-`GLLM_DSA_HADAMARD` are pre-existing DSA knobs, unrelated to MTP.
+by runtime detection (see 10.4). DSA indexer scoring is also fixed to FP8 and
+has no environment-variable switch.
 
 ### 10.3 Fused MTP (the default)
 
