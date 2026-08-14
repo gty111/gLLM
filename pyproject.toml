@@ -10,3 +10,14 @@ build-backend = "setuptools.build_meta"
 # `uv pip install -e .` fall back to PyPI's CPU-only aarch64 torch wheel or
 # select a different CUDA backend from the host driver.
 torch-backend = "cu130"
+# sgl-deep-gemm pins 0.1.11, but its TVM-FFI ABI works with the newer 0.1.x
+# required by upstream FlashAttention-4. Resolve both against the shared ABI.
+override-dependencies = ["apache-tvm-ffi>=0.1.12,<0.2"]
+
+[[tool.uv.index]]
+name = "flashinfer-cubin"
+url = "https://flashinfer.ai/whl"
+
+[[tool.uv.index]]
+name = "flashinfer-jit-cache-cu130"
+url = "https://flashinfer.ai/whl/cu130"
