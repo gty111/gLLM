@@ -185,7 +185,12 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = None
             self.mm_projector = None
         else:
-            self.vision_tower = KimiVisionTower(self.vision_config)
+            self.vision_tower = KimiVisionTower(
+                self.vision_config,
+                attention_backend=getattr(
+                    config, "attention_backend", "flashinfer"
+                ),
+            )
             self.mm_projector = KimiPatchMerger(self.vision_config)
 
         self.skip_language = getattr(config, "skip_language", False)

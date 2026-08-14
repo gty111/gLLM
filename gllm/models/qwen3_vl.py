@@ -109,6 +109,7 @@ class Qwen3_VisionBlock(nn.Module):
         act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
         norm_layer: Callable[[int], nn.Module] | None = None,
         quant_config = None,
+        attention_backend: str = "flashinfer",
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -120,6 +121,7 @@ class Qwen3_VisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             quant_config=quant_config,
+            attention_backend=attention_backend,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -197,6 +199,7 @@ class Qwen3_VisionTransformer(nn.Module):
         vision_config,
         norm_eps: float = 1e-6,
         quant_config = None,
+        attention_backend: str = "flashinfer",
     ) -> None:
         super().__init__()
         self.hidden_size = vision_config.hidden_size
@@ -253,6 +256,7 @@ class Qwen3_VisionTransformer(nn.Module):
                     use_postshuffle_norm=True,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
+                    attention_backend=attention_backend,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
@@ -538,6 +542,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
+                attention_backend=getattr(
+                    config, "attention_backend", "flashinfer"
+                ),
             )
 
         # register buffer for deepstack

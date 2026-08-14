@@ -488,10 +488,10 @@ class DeepseekV2MLAAttention(AttentionLayerBase):
         if mla_decode_backend is None:
             logger.warning(
                 "mla_decode_backend not set on language config; defaulting MLA "
-                "decode to 'fa3'. For multimodal models ensure "
+                "decode to 'fa4'. For multimodal models ensure "
                 "propagate_serving_config() ran before load_model."
             )
-            mla_decode_backend = "fa3"
+            mla_decode_backend = "fa4"
 
         self.mla_attn = MLAAttention(
             layer_id=layer_id,
@@ -506,6 +506,7 @@ class DeepseekV2MLAAttention(AttentionLayerBase):
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             kv_b_proj=self.kv_b_proj,
+            attention_backend=getattr(config, "attention_backend", "flashinfer"),
             decode_backend=mla_decode_backend,
             page_size=getattr(config, "page_size", None),
         )

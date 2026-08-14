@@ -86,25 +86,25 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--attention-backend",
         type=str,
-        choices=["auto", "fa3", "flashinfer"],
-        default="auto",
+        choices=["auto", "fa4", "flashinfer"],
+        default="flashinfer",
         help=(
-            "Paged attention backend for explicit-QKV MHA/GQA/MQA layers. 'auto' "
-            "selects FlashInfer on Blackwell SM100 and sgl-kernel FA3 on "
-            "supported SM8x/SM9x GPUs."
+            "Attention backend for paged-QKV attention and varlen prefill "
+            "paths. FlashInfer is used by default; startup config validation "
+            "resolves the selected backend before model construction."
         ),
     )
     p.add_argument(
         "--mla-decode-backend",
         type=str,
-        choices=["fa3", "flashmla", "triton"],
-        default="fa3",
+        choices=["fa4", "flashmla", "triton"],
+        default="fa4",
         help=(
-            "MLA decode attention backend. 'fa3' (default) uses FA3 absorbed "
-            "MLA decode via sgl_kernel (SGLang-compatible); 'flashmla' uses "
+            "MLA decode attention backend. 'fa4' (default) uses upstream "
+            "FlashAttention-4 absorbed MLA; 'flashmla' uses "
             "DeepSeek FlashMLA (auto-bumps page_size to 64); 'triton' uses "
-            "the in-tree Triton kernel. Unavailable backends fall back "
-            "automatically."
+            "the in-tree Triton kernel. Startup config validation resolves "
+            "unavailable backends before model construction."
         ),
     )
     p.add_argument(

@@ -276,8 +276,8 @@ class ModelRunner:
         mm_processor_max_pixels: int = None,
         skip_visual: bool = False,
         skip_language: bool = False,
-        attention_backend: str = "auto",
-        mla_decode_backend: str = "fa3",
+        attention_backend: str = "flashinfer",
+        mla_decode_backend: str = "fa4",
         mla_cache_dtype: str = "bf16",
         mamba_ssm_cache_dtype: str = "auto",
         mtp_enabled: Optional[bool] = None,
@@ -351,10 +351,10 @@ class ModelRunner:
 
         self.use_mm = self.model_loader.use_mm
         self.use_mla = self.model_loader.use_mla
-        self.attention_backend = (attention_backend or "auto").lower()
-        if self.attention_backend not in ("auto", "fa3", "flashinfer"):
+        self.attention_backend = (attention_backend or "flashinfer").lower()
+        if self.attention_backend not in ("auto", "fa4", "flashinfer"):
             raise ValueError(
-                "attention_backend must be 'auto', 'fa3', or 'flashinfer', "
+                "attention_backend must be 'auto', 'fa4', or 'flashinfer', "
                 f"got {self.attention_backend!r}."
             )
         self.hidden_size = self.model_loader.hidden_size
@@ -368,19 +368,13 @@ class ModelRunner:
         )
         self.uses_mrope = self.use_mm and not self.is_kimi_mm
 
-        # Resolve the MLA decode backend at this (upper) layer and thread the
-        # decision down to the attention layers through the model config. The
-        # default is FA3 (SGLang-compatible absorbed MLA decode). FlashMLA
-        # requires a KV page size of 64; bump page_size automatically when
-        # that backend is selected. The attention layer performs the final
-        # availability check and falls back when the kernel cannot run.
-        # 64 == required FlashMLA block size (kept as a literal to avoid
-        # importing the CUDA-heavy attention module in the parent process).
-        _FLASHMLA_PAGE_SIZE = 64
-        self.mla_decode_backend = (mla_decode_backend or "fa3").lower()
-        if self.mla_decode_backend not in ("triton", "flashmla", "fa3"):
+        # Backend names are syntax-checked here in the parent process. Their
+        # hardware/import compatibility is resolved once per worker by
+        # ``verify_config`` after that worker selects its CUDA device.
+        self.mla_decode_backend = (mla_decode_backend or "fa4").lower()
+        if self.mla_decode_backend not in ("triton", "flashmla", "fa4"):
             raise ValueError(
-                "mla_decode_backend must be 'fa3', 'flashmla', or 'triton', "
+                "mla_decode_backend must be 'fa4', 'flashmla', or 'triton', "
                 f"got {self.mla_decode_backend!r}."
             )
         # MLA latent KV cache precision (DeepSeek Sparse Attention). "bf16"
@@ -404,19 +398,12 @@ class ModelRunner:
                 f"'float32', got {self.mamba_ssm_cache_dtype!r}."
             )
         self.model_loader.config.mamba_ssm_cache_dtype = self.mamba_ssm_cache_dtype
-        if self.use_mla and self.mla_decode_backend == "flashmla":
-            if self.page_size != _FLASHMLA_PAGE_SIZE:
-                logger.info(
-                    f"MLA FlashMLA decode backend requires page_size="
-                    f"{_FLASHMLA_PAGE_SIZE}; overriding page_size "
-                    f"{self.page_size} -> {_FLASHMLA_PAGE_SIZE}."
-                )
-                self.page_size = _FLASHMLA_PAGE_SIZE
         # Stamp the resolved preference + final page size onto the model config
         # so ``MLAAttention`` can pick them up at construction time.
         self.model_loader.config.mla_decode_backend = (
             self.mla_decode_backend if self.use_mla else None
         )
+        self.model_loader.config.attention_backend = self.attention_backend
         self.model_loader.config.page_size = self.page_size
         # MTP (multi-token prediction) config. ``mtp_enabled=None`` auto-detects:
         # enable iff the checkpoint declares nextn-predict layers. Stamped onto
@@ -585,6 +572,124 @@ class ModelRunner:
         logger.info(f"Model max length: {model_max_length}")
         return model_max_length
 
+    def verify_config(self) -> None:
+        """Resolve hardware-dependent backend preferences once per worker."""
+        requested = self.attention_backend
+        capability = torch.cuda.get_device_capability()
+
+        fa4_error = None
+
+        if requested in ("auto", "fa4"):
+            if capability[0] not in (9, 10, 11):
+                fa4_error = (
+                    f"paged KV is unsupported on SM{capability[0]}{capability[1]}"
+                )
+            else:
+                try:
+                    from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
+                except Exception as exc:
+                    fa4_error = str(exc)
+
+        resolved = requested
+        if requested == "auto" or (requested == "fa4" and fa4_error is not None):
+            resolved = "fa4" if fa4_error is None else "flashinfer"
+
+        if resolved == "flashinfer":
+            try:
+                from flashinfer.decode import (  # noqa: F401
+                    trtllm_batch_decode_with_kv_cache,
+                )
+                from flashinfer.prefill import (  # noqa: F401
+                    BatchPrefillWithRaggedKVCacheWrapper,
+                    trtllm_batch_context_with_kv_cache,
+                )
+            except Exception as exc:
+                detail = f" after FA4 was rejected ({fa4_error})" if fa4_error else ""
+                raise RuntimeError(
+                    "attention backend resolved to 'flashinfer'"
+                    f"{detail}, but FlashInfer could not be imported: {exc}"
+                ) from exc
+
+        if requested == "auto":
+            logger.info(
+                "Attention backend 'auto' resolved to %r during startup "
+                "configuration validation.",
+                resolved,
+            )
+        elif resolved != requested:
+            logger.warning(
+                "Attention backend %r is unavailable (%s); resolved startup "
+                "configuration to %r.",
+                requested,
+                fa4_error,
+                resolved,
+            )
+
+        self.attention_backend = resolved
+        self.model_loader.config.attention_backend = resolved
+
+        if self.use_mla:
+            requested_mla = self.mla_decode_backend
+            resolved_mla = requested_mla
+            mla_error = None
+            if requested_mla == "fa4":
+                if capability[0] not in (10, 11):
+                    mla_error = (
+                        "absorbed MLA is unsupported on "
+                        f"SM{capability[0]}{capability[1]}"
+                    )
+                else:
+                    try:
+                        from flash_attn.cute import (  # noqa: F401
+                            flash_attn_varlen_func,
+                        )
+                    except Exception as exc:
+                        mla_error = str(exc)
+                if mla_error is not None:
+                    resolved_mla = "triton"
+            elif requested_mla == "flashmla":
+                try:
+                    from sgl_kernel.flash_mla import (  # noqa: F401
+                        flash_mla_with_kvcache,
+                        get_mla_metadata,
+                    )
+                except Exception as exc:
+                    mla_error = str(exc)
+                    resolved_mla = "triton"
+                else:
+                    flashmla_page_size = 64
+                    if self.page_size != flashmla_page_size:
+                        logger.info(
+                            "MLA FlashMLA decode backend requires page_size=%d; "
+                            "overriding page_size %d -> %d.",
+                            flashmla_page_size,
+                            self.page_size,
+                            flashmla_page_size,
+                        )
+                        self.page_size = flashmla_page_size
+
+            if resolved_mla != requested_mla:
+                logger.warning(
+                    "MLA decode backend %r is unavailable (%s); resolved "
+                    "startup configuration to %r.",
+                    requested_mla,
+                    mla_error,
+                    resolved_mla,
+                )
+            self.mla_decode_backend = resolved_mla
+            self.model_loader.config.mla_decode_backend = resolved_mla
+
+        self.model_loader.config.page_size = self.page_size
+        propagate_serving_config(self.model_loader.config)
+        logger.info(
+            "Verified attention backend: %s (requested %s, compute capability "
+            "SM%d%d)",
+            resolved,
+            requested,
+            capability[0],
+            capability[1],
+        )
+
     @staticmethod
     def _build_capture_sizes(max_bs: int):
         """Return power-of-two bucket sizes up to max_bs, in descending order.
@@ -606,6 +711,7 @@ class ModelRunner:
         return list(reversed(sizes))
 
     def init(self, mp_load_progress=None):
+        self.verify_config()
         self.model = self.model_loader.load_model(mp_load_progress)
         # MTP speculative decoding: number of draft tokens per step (k). Active
         # only when the model built an MTP head (mtp_enabled + nextn layers).
@@ -2104,12 +2210,11 @@ class ModelRunner:
         # eager forward per bucket (outside the capture context) so every such
         # kernel is compiled *before* we capture it.
         try:
-            from gllm.layers.quantization.fp8 import (
-                deepgemm_available,
-                flashinfer_swapab_available,
-            )
+            from gllm.layers.quantization.fp8 import fp8_backend_requires_bucket_warmup
 
-            warmup_per_bucket = deepgemm_available() or flashinfer_swapab_available()
+            warmup_per_bucket = fp8_backend_requires_bucket_warmup(
+                self.model_loader.quantization_config
+            )
         except Exception:  # noqa: BLE001
             warmup_per_bucket = False
         # In DP+EP every group captures each bucket with a uniform global batch
@@ -2565,7 +2670,7 @@ class ModelRunner:
         and target dist ``p`` live on the SAME transformed space, which is what
         rejection sampling requires. ``seqs`` is aligned row-for-row with logits.
         """
-        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+        from flashinfer.sampling import top_k_renorm_prob, top_p_renorm_prob
 
         dev = logits.device
         temps = torch.tensor(
@@ -2631,7 +2736,7 @@ class ModelRunner:
         top_p=1, which the kernels treat as no-ops). ``temps`` [n,1], ``top_ks``
         [n] int32, ``top_ps`` [n] float32.
         """
-        from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+        from flashinfer.sampling import top_k_renorm_prob, top_p_renorm_prob
 
         probs = torch.softmax(logits.float() / temps, dim=-1)
         probs = top_k_renorm_prob(probs, top_ks)

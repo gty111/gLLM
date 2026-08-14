@@ -1,4 +1,4 @@
-"""Multi-head latent attention execution and decode backend selection."""
+"""Multi-head latent attention execution with pre-validated backends."""
 
 from typing import Optional
 
@@ -8,24 +8,21 @@ from logger import logger
 from gllm import _custom_ops as ops
 from gllm.layers.linear import ColumnParallelLinear, LinearBase
 from gllm.layers.ops.merge_attn_states import merge_attn_states
+from gllm.layers.ops.flash_attn_compat import flash_attn_varlen_func
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 from gllm.runtime.input_data import (
     InputData,
     MLACommonMetadata,
     MLACommonPrefillMetadata,
 )
-from sgl_kernel.flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
-
-# FA3 MLA decode (sgl_kernel flash_attn with qv=) — same path as SGLang ``fa3``.
+# Upstream FA4 provides the absorbed MLA ``qv`` and paged-KV interfaces.
 try:
-    from sgl_kernel.flash_attn import is_fa3_supported
+    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func
 
-    _FA3_AVAILABLE = bool(is_fa3_supported())
-    _FA3_IMPORT_ERROR: Optional[Exception] = None
+    _FA4_IMPORT_ERROR: Optional[Exception] = None
 except Exception as _e:  # pragma: no cover - depends on hardware / build
-    is_fa3_supported = None  # type: ignore[misc, assignment]
-    _FA3_AVAILABLE = False
-    _FA3_IMPORT_ERROR = _e
+    _fa4_varlen_func = None
+    _FA4_IMPORT_ERROR = _e
 
 # FlashMLA (DeepSeek SM90 MLA decode kernel) is optional: the extension only
 # loads on Hopper with a recent CUDA driver. Import lazily so the default
@@ -33,15 +30,10 @@ except Exception as _e:  # pragma: no cover - depends on hardware / build
 try:
     from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
     from sgl_kernel.flash_mla import flash_mla_sparse_fwd
-
-    _FLASHMLA_AVAILABLE = True
-    _FLASHMLA_IMPORT_ERROR: Optional[Exception] = None
 except Exception as _e:  # pragma: no cover - depends on hardware / build
     flash_mla_with_kvcache = None
     get_mla_metadata = None
     flash_mla_sparse_fwd = None
-    _FLASHMLA_AVAILABLE = False
-    _FLASHMLA_IMPORT_ERROR = _e
 
 # FlashMLA only supports a KV page/block size of 64.
 _FLASHMLA_PAGE_SIZE = 64
@@ -66,9 +58,10 @@ class MLAAttention:
         qk_head_dim: int,
         v_head_dim: int,
         kv_b_proj: ColumnParallelLinear,
-        # Decode backend is selected by the upper layer (ModelRunner) and
-        # threaded down through the model config; see ``_resolve_decode_backend``.
-        decode_backend: str = "triton",
+        # Both backend values are resolved by ModelRunner config validation and
+        # threaded down through the model config.
+        attention_backend: str = "flashinfer",
+        decode_backend: str = "fa4",
         page_size: Optional[int] = None,
     ):
         self.scale = scale
@@ -94,90 +87,35 @@ class MLAAttention:
 
         self.kv_cache_dtype = "auto"
 
-        self.decode_backend = self._resolve_decode_backend(decode_backend, page_size)
-        self._log_startup_decode_backend(
-            decode_backend, page_size, self.decode_backend
-        )
+        self.attention_backend = (attention_backend or "").lower()
+        if self.attention_backend not in ("fa4", "flashinfer"):
+            raise ValueError(
+                "attention_backend must already be resolved to 'fa4' or "
+                f"'flashinfer', got {self.attention_backend!r}."
+            )
+
+        self.decode_backend = (decode_backend or "").lower()
+        if self.decode_backend not in ("triton", "flashmla", "fa4"):
+            raise ValueError(
+                "mla_decode_backend must already be resolved to 'fa4', "
+                f"'flashmla', or 'triton', got {self.decode_backend!r}."
+            )
+        self._log_startup_decode_backend(self.decode_backend, page_size)
 
     @staticmethod
     def _log_startup_decode_backend(
-        requested: str, page_size: Optional[int], resolved: str
+        resolved: str, page_size: Optional[int]
     ) -> None:
         global _mla_decode_backend_startup_logged
         if _mla_decode_backend_startup_logged:
             return
         _mla_decode_backend_startup_logged = True
-        req = (requested or "fa3").lower()
         ps = page_size if page_size is not None else "default"
-        if resolved == req:
-            logger.info(
-                "MLA decode attention backend: %s (page_size=%s)",
-                resolved,
-                ps,
-            )
-        else:
-            logger.info(
-                "MLA decode attention backend: %s (requested %r, page_size=%s)",
-                resolved,
-                req,
-                ps,
-            )
-
-    @staticmethod
-    def _flashmla_available(page_size: Optional[int]) -> Optional[str]:
-        if not _FLASHMLA_AVAILABLE:
-            return f"sgl_kernel.flash_mla unavailable ({_FLASHMLA_IMPORT_ERROR})"
-        if page_size is not None and page_size != _FLASHMLA_PAGE_SIZE:
-            return f"page_size={page_size} != required {_FLASHMLA_PAGE_SIZE}"
-        return None
-
-    def _resolve_decode_backend(
-        self, requested: str, page_size: Optional[int]
-    ) -> str:
-        """Pick the decode backend with hardware-aware fallbacks.
-
-        The choice is made by the upper layer (default ``fa3``), but the final
-        availability check happens here in the worker where ``sgl_kernel`` is
-        loaded. ``triton`` is always valid; ``fa3`` needs Hopper FA3;
-        ``flashmla`` needs the FlashMLA extension and ``page_size == 64``.
-        """
-        requested = (requested or "fa3").lower()
-        if requested not in ("triton", "flashmla", "fa3"):
-            raise ValueError(
-                "mla_decode_backend must be 'fa3', 'flashmla', or 'triton', "
-                f"got {requested!r}."
-            )
-        if requested == "triton":
-            return "triton"
-
-        if requested == "fa3":
-            if _FA3_AVAILABLE:
-                return "fa3"
-            reason = f"sgl_kernel FA3 unavailable ({_FA3_IMPORT_ERROR})"
-            flashmla_reason = self._flashmla_available(page_size)
-            if flashmla_reason is None:
-                logger.warning(
-                    "MLA decode backend 'fa3' is unavailable (%s); "
-                    "falling back to 'flashmla'.",
-                    reason,
-                )
-                return "flashmla"
-            logger.warning(
-                "MLA decode backend 'fa3' is unavailable (%s); "
-                "falling back to 'triton'.",
-                reason,
-            )
-            return "triton"
-
-        flashmla_reason = self._flashmla_available(page_size)
-        if flashmla_reason is not None:
-            logger.warning(
-                "MLA decode backend 'flashmla' is unavailable (%s); "
-                "falling back to 'triton'.",
-                flashmla_reason,
-            )
-            return "triton"
-        return "flashmla"
+        logger.info(
+            "MLA decode attention backend: %s (page_size=%s)",
+            resolved,
+            ps,
+        )
 
     def process_weights(self):
         def get_and_maybe_dequant_weights(layer: LinearBase):
@@ -205,23 +143,19 @@ class MLAAttention:
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, softmax_scale, return_softmax_lse, **kwargs
     ):
-        maybe_padded_v = v
-        if self._pad_v:
-            maybe_padded_v = torch.nn.functional.pad(
-                v, [0, q.shape[-1] - v.shape[-1]], value=0
-            )
-
         attn_out = flash_attn_varlen_func(
             q=q,
             k=k,
-            v=maybe_padded_v,
+            # FlashInfer accepts a value head dimension distinct from Q/K, so
+            # The value head dimension may differ from Q/K for MLA.
+            v=v,
             return_softmax_lse=return_softmax_lse,
             softmax_scale=softmax_scale,
+            backend=self.attention_backend,
             **kwargs,
         )
 
-        # Unpack the output if there are multiple results
-        # sgl_kernel returns (output, softmax_lse) if return_softmax_lse=True
+        # Unpack the output if there are multiple results.
         rest = None
         if isinstance(attn_out, tuple):
             attn_out, *rest = attn_out
@@ -230,9 +164,8 @@ class MLAAttention:
         # is only one output tensor if `return_softmax_lse` is False.
         if return_softmax_lse:
             assert rest is not None
-            # sgl_kernel.flash_attn_varlen_func returns softmax_lse with shape
-            # (num_heads, total_seq_len), but sgl_kernel.merge_state_v2
-            # (used by merge_attn_states) expects (total_seq_len, num_heads).
+            # FA4 returns (num_heads, total_seq_len), while state merging expects
+            # (total_seq_len, num_heads).
             softmax_lse = rest[0].transpose(0, 1).contiguous()
             return attn_out, softmax_lse
         return attn_out
@@ -628,105 +561,106 @@ class MLAAttention:
         topk_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if topk_indices is not None:
-            # DeepSeek Sparse Attention decode. Two viable kernels on SM90:
-            #   * FP8-packed KV cache -> FlashMLA sparse ``fwd_kvcache_mla``
-            #     (takes ``indices`` + ``is_fp8_kvcache=True``); paged bf16 sparse
-            #     is rejected by that kernel ("Sparse BF16 MLA not supported").
-            #   * bf16 KV cache -> FA3 ``flash_attn_with_kvcache`` fed the top-k
-            #     physical slots as a ``page_size=1`` page table (SGLang's NSA
-            #     ``fa3`` decode path). FA3 has no ``indices`` arg, but a
-            #     per-query page table of length ``index_topk`` with
-            #     ``cache_seqlens`` clamped to the selected count is exactly
-            #     equivalent, and FA3 reads bf16 natively.
+            # FA4 reads bf16 sparse slots directly. The packed FP8 layout still
+            # requires FlashMLA's native dequantizing sparse kernel.
             if kv_c_and_k_pe_cache.dtype == torch.float8_e4m3fn:
                 return self._forward_decode_flashmla(
                     q, kv_c_and_k_pe_cache, attn_metadata, topk_indices=topk_indices
                 )
-            return self._forward_decode_fa3(
+            return self._forward_decode_fa4(
                 q, kv_c_and_k_pe_cache, attn_metadata, topk_indices=topk_indices
             )
-        if self.decode_backend == "fa3":
-            return self._forward_decode_fa3(q, kv_c_and_k_pe_cache, attn_metadata)
+        if self.decode_backend == "fa4":
+            return self._forward_decode_fa4(q, kv_c_and_k_pe_cache, attn_metadata)
         if self.decode_backend == "flashmla":
             return self._forward_decode_flashmla(
                 q, kv_c_and_k_pe_cache, attn_metadata
             )
         return self._forward_decode_triton(q, kv_c_and_k_pe_cache, attn_metadata)
 
-    def _forward_decode_fa3(
+    def _forward_decode_fa4(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         topk_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Absorbed MLA decode via FA3 (SGLang ``FlashAttentionBackend`` path).
-
-        When ``topk_indices`` is supplied (DeepSeek Sparse Attention), the
-        indexer's per-query top-k **physical KV slots** are fed to FA3 as a
-        ``page_size == 1`` page table with ``cache_seqlens`` clamped to the
-        selected count -- exactly SGLang's NSA ``fa3`` decode path. FA3 has no
-        sparse ``indices`` argument, but a length-``index_topk`` per-query page
-        table of physical slots is equivalent and reads bf16 KV natively (unlike
-        FlashMLA's paged sparse kernel, which rejects bf16 on SM90).
-        """
+        """Absorbed MLA decode via upstream FlashAttention-4."""
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError(
-                "FP8 KV cache is not yet supported by the FA3 MLA decode backend."
+                "FP8 KV cache is not supported by the FA4 MLA decode backend."
             )
         if type(q) is not tuple:
-            raise ValueError(
-                "FA3 MLA decode expects absorbed (q_nope, q_pe) tuple."
-            )
+            raise ValueError("FA4 MLA decode expects absorbed (q_nope, q_pe) tuple.")
+        if _fa4_varlen_func is None:
+            raise RuntimeError(f"flash-attn-4 is unavailable: {_FA4_IMPORT_ERROR}")
 
         q_nope, q_rope = q
         decode_meta = attn_metadata.decode
 
         sparse = topk_indices is not None
         if sparse:
-            # Sparse: view the cache flat over physical slots (page_size == 1)
-            # so each page-table entry is one selected slot. ``topk_indices``
-            # are absolute physical slots front-packed with -1 padding at the
-            # tail; ``cache_seqlens`` = number of valid (>= 0) selected slots
-            # per query, so FA3 never walks into the -1 padding.
             flat = kv_c_and_k_pe_cache.reshape(-1, kv_c_and_k_pe_cache.shape[-1])
             c_kv_cache = flat[..., : self.kv_lora_rank].view(
-                -1, 1, 1, self.kv_lora_rank
+                1, -1, 1, self.kv_lora_rank
             )
             k_rope_cache = flat[..., self.kv_lora_rank :].view(
-                -1, 1, 1, flat.shape[-1] - self.kv_lora_rank
+                1, -1, 1, flat.shape[-1] - self.kv_lora_rank
             )
-            if topk_indices.dim() == 3:
-                topk_indices = topk_indices.squeeze(1)
-            page_table = topk_indices.to(torch.int32)
-            cache_seqlens = (page_table >= 0).sum(dim=1).to(torch.int32)
+            num_q, num_heads = q_rope.shape[:2]
+            required_heads = 128
+            if num_heads != required_heads:
+                assert required_heads % num_heads == 0, (
+                    f"num_heads {num_heads} cannot be padded to {required_heads}"
+                )
+                q_rope_in = q_rope.new_zeros(
+                    (num_q, required_heads, q_rope.shape[-1])
+                )
+                q_nope_in = q_nope.new_zeros(
+                    (num_q, required_heads, q_nope.shape[-1])
+                )
+                q_rope_in[:, :num_heads] = q_rope
+                q_nope_in[:, :num_heads] = q_nope
+            else:
+                q_rope_in, q_nope_in = q_rope, q_nope
+            gather_indices = topk_indices.to(torch.int32).reshape(num_q, -1)
+            result = _fa4_varlen_func(
+                q_rope_in.unsqueeze(0),
+                k_rope_cache,
+                c_kv_cache,
+                qv=q_nope_in.unsqueeze(0),
+                gather_kv_indices=gather_indices.unsqueeze(0),
+                min_seqlen_k=flat.shape[0],
+                softmax_scale=self.scale,
+                causal=False,
+                return_lse=True,
+            )
         else:
-            # Paged latent cache: rope on k, compressed latent on v (MQA head 1).
-            c_kv_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank].unsqueeze(2)
-            k_rope_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank :].unsqueeze(2)
-            page_table = decode_meta.block_table
-            cache_seqlens = decode_meta.seq_lens
-
-        cu_seqlens_q = decode_meta.query_start_loc
-        max_seqlen_q = max(1, decode_meta.max_query_len)
-
-        result = flash_attn_with_kvcache(
-            q=q_rope,
-            k_cache=k_rope_cache,
-            v_cache=c_kv_cache,
-            qv=q_nope,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            softmax_scale=self.scale,
-            causal=True,
-            return_softmax_lse=True,
-            num_splits=0,
-        )
+            cache = (
+                kv_c_and_k_pe_cache
+                if kv_c_and_k_pe_cache.dim() == 4
+                else kv_c_and_k_pe_cache.unsqueeze(-2)
+            )
+            c_kv_cache = cache[..., : self.kv_lora_rank]
+            k_rope_cache = cache[..., self.kv_lora_rank :]
+            result = _fa4_varlen_func(
+                q_rope,
+                k_rope_cache,
+                c_kv_cache,
+                qv=q_nope,
+                page_table=decode_meta.block_table,
+                cu_seqlens_q=decode_meta.query_start_loc,
+                seqused_k=decode_meta.seq_lens,
+                max_seqlen_q=max(1, decode_meta.max_query_len),
+                max_seqlen_k=decode_meta.block_table.shape[1] * cache.shape[1],
+                softmax_scale=self.scale,
+                causal=True,
+                return_lse=True,
+                num_splits=1,
+            )
 
         if isinstance(result, tuple):
             o, softmax_lse, *_ = result
@@ -734,16 +668,17 @@ class MLAAttention:
             o = result
             softmax_lse = None
 
-        if o.dim() == 2:
+        if sparse:
+            o = o.squeeze(0)[:, : self.num_heads]
+            if softmax_lse is not None:
+                softmax_lse = softmax_lse.squeeze(0)[:, : self.num_heads]
+        elif o.dim() == 2:
             o = o.view(-1, self.num_heads, self.kv_lora_rank)
         elif o.dim() == 3 and o.shape[1] != self.num_heads:
             o = o.view(-1, self.num_heads, self.kv_lora_rank)
 
         if softmax_lse is not None:
-            if softmax_lse.dim() == 3:
-                softmax_lse = softmax_lse.squeeze(-1)
-            if softmax_lse.shape[0] == self.num_heads:
-                softmax_lse = softmax_lse.transpose(0, 1).contiguous()
+            softmax_lse = softmax_lse.reshape(-1, self.num_heads)
         else:
             softmax_lse = torch.zeros(
                 o.shape[0],

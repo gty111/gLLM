@@ -234,11 +234,18 @@ class KimiVisionMLP(nn.Module):
 
 
 class KimiVisionBlock(nn.Module):
-    def __init__(self, num_heads: int, hidden_dim: int, mlp_dim: int):
+    def __init__(
+        self,
+        num_heads: int,
+        hidden_dim: int,
+        mlp_dim: int,
+        attention_backend: str = "flashinfer",
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
         self.head_dim = hidden_dim // num_heads
+        self.attention_backend = attention_backend
         self.norm0 = nn.LayerNorm(hidden_dim, device="cuda")
         self.norm1 = nn.LayerNorm(hidden_dim, device="cuda")
         self.mlp = KimiVisionMLP(hidden_dim, mlp_dim, hidden_dim)
@@ -254,7 +261,7 @@ class KimiVisionBlock(nn.Module):
         xq, xk, xv = torch.unbind(xqkv, dim=1)
         xq, xk = _apply_rope(xq, xk, rope_freqs_cis)
 
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
+        from gllm.layers.ops.flash_attn_compat import flash_attn_varlen_func
 
         out = flash_attn_varlen_func(
             xq,
@@ -265,6 +272,7 @@ class KimiVisionBlock(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
+            backend=self.attention_backend,
         )
         out = out.reshape(seqlen, -1)
         return self.wo(out)
@@ -283,11 +291,23 @@ class KimiVisionBlock(nn.Module):
 
 
 class KimiVisionEncoder(nn.Module):
-    def __init__(self, hidden_dim: int, num_layers: int, num_heads: int, mlp_dim: int):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_layers: int,
+        num_heads: int,
+        mlp_dim: int,
+        attention_backend: str = "flashinfer",
+    ):
         super().__init__()
         self.rope_2d = Rope2DPosEmb(hidden_dim // num_heads, 512, 512)
         self.blocks = nn.ModuleList(
-            [KimiVisionBlock(num_heads, hidden_dim, mlp_dim) for _ in range(num_layers)]
+            [
+                KimiVisionBlock(
+                    num_heads, hidden_dim, mlp_dim, attention_backend
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.final_layernorm = nn.LayerNorm(hidden_dim, device="cuda")
 
@@ -328,7 +348,7 @@ class KimiVisionTower(nn.Module):
     image, ready for :class:`KimiPatchMerger`.
     """
 
-    def __init__(self, vision_config):
+    def __init__(self, vision_config, attention_backend: str = "flashinfer"):
         super().__init__()
         c = vision_config
         self.hidden_size = c["vt_hidden_size"]
@@ -349,6 +369,7 @@ class KimiVisionTower(nn.Module):
             num_layers=c["vt_num_hidden_layers"],
             num_heads=self.num_heads,
             mlp_dim=c["vt_intermediate_size"],
+            attention_backend=attention_backend,
         )
 
     def forward(self, pixel_values: torch.Tensor, grid_thws: torch.Tensor) -> List[torch.Tensor]:

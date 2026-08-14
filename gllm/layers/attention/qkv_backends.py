@@ -28,8 +28,8 @@ class PagedAttentionMetadata:
 
 
 @dataclass
-class FA3PagedAttentionMetadata(PagedAttentionMetadata):
-    """Metadata consumed by sgl-kernel FA3."""
+class FA4PagedAttentionMetadata(PagedAttentionMetadata):
+    """Metadata consumed by upstream FlashAttention-4."""
 
 
 @dataclass
@@ -78,24 +78,26 @@ class QKVAttentionBackend(ABC):
         """Run paged causal attention with backend-prepared ``metadata``."""
 
 
-class FA3AttentionBackend(QKVAttentionBackend):
-    """sgl-kernel FlashAttention-3 backend for its SM8x/SM9x builds."""
+class FA4AttentionBackend(QKVAttentionBackend):
+    """Upstream FlashAttention-4 paged-KV backend."""
 
-    name = "fa3"
+    name = "fa4"
 
     def __init__(self, model_max_length: int, max_running_seqs: int):
         super().__init__(model_max_length, max_running_seqs)
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+        from flash_attn.cute import flash_attn_varlen_func
 
-        self._flash_attn_with_kvcache = flash_attn_with_kvcache
+        self._flash_attn_varlen_func = flash_attn_varlen_func
+        capability = torch.cuda.get_device_capability()
+        self._num_splits = 0 if capability[0] in (10, 11) else 1
 
     def prepare_metadata(
         self,
         input_data: "InputData",
         plan: "ForwardMetadataPlan",
-    ) -> FA3PagedAttentionMetadata:
+    ) -> FA4PagedAttentionMetadata:
         seq_lens = input_data.get_seq_lens()
-        return FA3PagedAttentionMetadata(
+        return FA4PagedAttentionMetadata(
             block_table=input_data.get_block_table(),
             seq_lens=seq_lens,
             query_start_loc=input_data.get_query_start_loc(),
@@ -108,25 +110,28 @@ class FA3AttentionBackend(QKVAttentionBackend):
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        metadata: FA3PagedAttentionMetadata,
+        metadata: FA4PagedAttentionMetadata,
         softmax_scale: float,
     ) -> torch.Tensor:
-        return self._flash_attn_with_kvcache(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            cache_seqlens=metadata.seq_lens,
+        result = self._flash_attn_varlen_func(
+            q,
+            k_cache,
+            v_cache,
             page_table=metadata.block_table,
             cu_seqlens_q=metadata.query_start_loc,
+            seqused_k=metadata.seq_lens,
             max_seqlen_q=metadata.max_query_len,
+            max_seqlen_k=self.model_max_length,
             softmax_scale=softmax_scale,
             causal=True,
-            return_softmax_lse=False,
+            return_lse=False,
+            num_splits=self._num_splits,
         )
+        return result[0] if isinstance(result, tuple) else result
 
 
 class FlashInferAttentionBackend(QKVAttentionBackend):
-    """FlashInfer TRT-LLM generation backend for Blackwell/SM100.
+    """FlashInfer TRT-LLM generation backend.
 
     The cumulative KV lengths and workspace have stable addresses. Ragged
     context graphs capture the cumulative-length refresh, while uniform decode
@@ -184,7 +189,7 @@ class FlashInferAttentionBackend(QKVAttentionBackend):
         # TRT-LLM Gen exposes separate decode and context kernels. Run the
         # uniform prefix with the decode kernel and send only the ragged
         # prefill suffix to the context kernel. Sending a mixed
-        # decode+prefill batch through context corrupts row metadata on SM100.
+        # decode+prefill batch through context can corrupt row metadata.
         fast_path_rows = plan.fast_path_rows
         if not 0 <= fast_path_rows <= batch_size:
             raise RuntimeError(
@@ -294,47 +299,24 @@ class FlashInferAttentionBackend(QKVAttentionBackend):
 
 
 def create_qkv_attention_backend(
-    requested: str, model_max_length: int, max_running_seqs: int
+    resolved: str, model_max_length: int, max_running_seqs: int
 ) -> QKVAttentionBackend:
-    """Resolve and construct the QKV attention backend on this worker."""
-    requested = (requested or "auto").lower()
-    if requested not in ("auto", "fa3", "flashinfer"):
+    """Construct the QKV backend selected by configuration validation."""
+    resolved = (resolved or "").lower()
+    if resolved not in ("fa4", "flashinfer"):
         raise ValueError(
-            "attention_backend must be 'auto', 'fa3', or 'flashinfer', "
-            f"got {requested!r}."
+            "attention_backend must already be resolved to 'fa4' or "
+            f"'flashinfer', got {resolved!r}."
         )
 
     capability = torch.cuda.get_device_capability()
-    if requested == "auto":
-        if capability[0] == 10:
-            resolved = "flashinfer"
-        elif capability[0] in (8, 9):
-            # sgl-kernel's FA3 extension is built for SM80/86/89/90a. This is
-            # broader than the upstream FA3 project's Hopper-focused support.
-            resolved = "fa3"
-        else:
-            raise RuntimeError(
-                "No automatic QKV attention backend for compute "
-                f"capability SM{capability[0]}{capability[1]}; choose a "
-                "supported backend explicitly."
-            )
-    else:
-        resolved = requested
-
-    if resolved == "fa3" and capability[0] not in (8, 9):
-        raise RuntimeError(
-            "sgl-kernel FA3 requires an SM8x or SM9x GPU, but this worker is "
-            f"SM{capability[0]}{capability[1]}."
-        )
-
     backend_cls = (
-        FlashInferAttentionBackend if resolved == "flashinfer" else FA3AttentionBackend
+        FlashInferAttentionBackend if resolved == "flashinfer" else FA4AttentionBackend
     )
     backend = backend_cls(model_max_length, max_running_seqs)
     logger.info(
-        "QKV attention backend: %s (requested %s, compute capability SM%d%d)",
+        "QKV attention backend: %s (compute capability SM%d%d)",
         resolved,
-        requested,
         capability[0],
         capability[1],
     )

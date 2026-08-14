@@ -80,7 +80,9 @@ class RotaryEmbedding(nn.Module):
 
         cache = self._compute_cos_sin_cache()
 
-        cache = cache.to(dtype=torch.get_default_dtype())
+        # FlashInfer's precomputed-cache RoPE kernel requires FP32 cosine and
+        # sine values even when the query/key tensors use a lower precision.
+        cache = cache.to(dtype=torch.float32)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base):

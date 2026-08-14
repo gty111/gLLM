@@ -83,7 +83,7 @@ def fused_grouped_topk(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
-    # ``ops.grouped_topk`` (sgl_kernel.moe_fused_gate) applies the sigmoid score
+    # ``ops.grouped_topk`` applies the sigmoid score
     # function internally, so it must receive the RAW router logits and the RAW
     # correction bias. Do NOT pre-sigmoid here -- doing so double-applies the
     # nonlinearity and shifts expert selection off the reference.
@@ -116,19 +116,28 @@ def grouped_topk(
     routed_scaling_factor: float = 1.0,
     e_score_correction_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Fast path 1: sgl_kernel.moe_fused_gate
-    # Constraints: num_expert_group <= 32, topk <= 32,
-    # and per-group experts (num_experts / num_expert_group) <= 32.
+    # Fast path 1: FlashInfer for normalized grouped routing.
     num_experts = gating_output.size(-1)
     per_group_experts = (
         num_experts // num_expert_group if num_expert_group > 0 else num_experts
     )
-    if (
-        num_expert_group <= 32
-        and topk <= 32
-        and per_group_experts <= 32
-        and e_score_correction_bias is not None
-    ):
+    flashinfer_supported = renormalize and topk <= 8 and (
+        (
+            num_expert_group == 1
+            and topk_group == 1
+            and topk == 1
+            and num_experts <= 384
+        )
+        or (
+            1 < num_expert_group <= 32
+            and num_experts % num_expert_group == 0
+            and topk_group <= num_expert_group
+            and topk_group * num_expert_group >= topk
+            and per_group_experts <= 32
+            and per_group_experts * topk_group <= 128
+        )
+    )
+    if e_score_correction_bias is not None and flashinfer_supported:
         return fused_grouped_topk(
             hidden_states=hidden_states,
             gating_output=gating_output,
@@ -141,8 +150,8 @@ def grouped_topk(
             routed_scaling_factor=routed_scaling_factor,
         )
 
-    # Fast path 2: sgl_kernel.topk_sigmoid for the no-grouping case (e.g. Moonlight,
-    # which has n_group=1 with 64 experts, exceeding moe_fused_gate's per-group limit).
+    # Fast path 2: sgl_kernel.topk_sigmoid for the no-grouping case (e.g.
+    # Moonlight configurations not covered by FlashInfer's grouped router).
     # When num_expert_group == topk_group == 1, no group filtering happens, so a flat
     # topk over (sigmoid + bias) is mathematically equivalent.
     if (
