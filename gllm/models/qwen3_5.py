@@ -25,7 +25,7 @@ Architectural cheat-sheet (Qwen3.5-0.8B config):
       out     = out_proj(norm)
 
   ``conv_state`` (Cin, kernel) and ``ssm_state`` (Nv, Hk, Hv) live in the
-  :class:`gllm.runtime.memory_manager.SSMSegment` working pool; the slot id is
+  :class:`gllm.runtime.memory_manager.SSMSegment` arena view; the slot id is
   ``sequence.ssm_state_slot`` (filled by the scheduler and pushed to GPU
   by :meth:`InputData._cal_ssm_metadata`).
 * Some checkpoints ship an ``mtp.*`` multi-token-prediction head for
@@ -190,7 +190,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ``A_log``, ``dt_bias``, ``norm``, ``out_proj``. The actual recurrence
     runs on the vendored FLA Triton kernels at
     :mod:`gllm.layers.ops.fla`. State lives in the
-    :class:`gllm.runtime.memory_manager.SSMSegment` working pool, addressed via
+    :class:`gllm.runtime.memory_manager.SSMSegment` arena view, addressed via
     ``input_data.get_ssm_state_slot_per_seq()``.
     """
 
@@ -306,7 +306,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """Return the per-layer ``conv_state`` and ``ssm_state`` views.
 
         ``SSMSegment`` packs all linear-attention layers into a single
-        ``[L, working_pool_size, ...]`` tensor (slot 0 == CUDA-graph dummy);
+        ``[L, num_state_slots, ...]`` arena view (slot 0 == CUDA-graph dummy);
         the runtime-only ``self.ssm_layer_id`` selects this layer's slice.
         """
         seg = input_data.memory_manager.ssm_segment
@@ -322,7 +322,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         ssm_state_working: torch.Tensor,
         row_start: int = 0,
     ) -> None:
-        """Copy this layer's working state into the snapshot pool slots
+        """Copy this layer's working state into reclaimable snapshot slots
         designated by ``input_data.get_ssm_snapshot_write_slot_per_seq``.
 
         Indexed copy is vectorized via ``index_select`` + ``index_copy_``
@@ -365,17 +365,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         src_idx = src_slots.index_select(0, valid_idx).to(torch.long)
         dst_idx = snap_targets.index_select(0, valid_idx).to(torch.long)
 
-        # Capture = copy this layer's working block -> the page's cached block,
-        # both in the SAME shared pool (``conv_state_working`` /
+        # Capture = copy this layer's working entry -> the page's cached entry;
+        # both address the same arena view (``conv_state_working`` /
         # ``ssm_state_working`` are ``seg.conv_state[ssm_layer_id]`` /
-        # ``seg.temporal_state[ssm_layer_id]``). ``src_idx`` (live rolling block)
-        # and ``dst_idx`` (cached block) are distinct block ids -> no alias.
+        # ``seg.temporal_state[ssm_layer_id]``). ``src_idx`` (live rolling entry)
+        # and ``dst_idx`` (cached entry) have distinct live ownership -> no alias.
         conv_state_working.index_copy_(
             0, dst_idx, conv_state_working.index_select(0, src_idx)
         )
         ssm_state_working.index_copy_(
             0, dst_idx, ssm_state_working.index_select(0, src_idx)
         )
+        # CPU metadata for overlap batches is speculative. Make the snapshot
+        # visible to prefix lookup only after the actual device copies have
+        # been enqueued. The worker cannot schedule the next batch until this
+        # Python forward returns, and all recurrent-state work shares the same
+        # forward stream, so publication here closes the zero-snapshot window.
+        input_data.mark_ssm_snapshot_writes_enqueued()
 
     def _is_decode_batch(self, input_data: InputData) -> bool:
         """All-decode batches have exactly one query token per sequence and
@@ -438,8 +444,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         state block table; column 0 holds its committed (pre-x1) rolling state.
         We run the recurrent GDN kernel token-by-token starting from column 0 and
         write each token ``t``'s post-state into column ``t`` of the block table
-        (both temporal state and conv window). The blocks are the SAME shared
-        pool the rolling state lives in -- no separate intermediate buffer. After
+        (both temporal state and conv window). The entries use the same arena
+        view as rolling state -- no separate intermediate buffer. After
         sampling, the accept step copies the committed column (``na``) back to
         column 0 (see ``model_runner._mtp_decode``), so the plain decode/snapshot
         paths keep reading column 0.
@@ -485,7 +491,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # Temporal state: recurrent kernel reads column ``num_accepted-1`` and
         # writes each verify token t's post-state into column t (in the shared
-        # ``ssm_state`` pool, addressed by the 2D block table).
+        # ``ssm_state`` arena view, addressed by the 2D block table).
         core_attn_out = fused_recurrent_gdn_spec(
             A_log=self.A_log,
             a=a,
@@ -628,13 +634,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         q, k, v, z, b, a = self._split_qkvzba(qkvz, ba)
 
         seq_len = hidden_states.shape[0]
-        # Flatten per-head dims into one channel dim for ``causal_conv1d_*``;
-        # the kernels expect ``mixed_qkv`` as ``[T, C_in]`` (prefill) or
-        # ``[B, C_in]`` (decode).
-        mixed_qkv = torch.cat(
-            (q.reshape(seq_len, -1), k.reshape(seq_len, -1), v.reshape(seq_len, -1)),
-            dim=-1,
+        # ``in_proj_qkvz`` already lays out Q, K and V as one adjacent prefix.
+        # Keep that strided view instead of materializing the same bytes with a
+        # per-layer ``cat``.  All causal-conv paths consume explicit strides
+        # and produce their own contiguous output, so the trailing Z columns
+        # in the projection's physical row stride are harmless.
+        qkv_width = (
+            2 * (self.key_dim // get_tp_size())
+            + self.value_dim // get_tp_size()
         )
+        mixed_qkv = qkvz[:, :qkv_width]
         conv_state, ssm_state = self._ssm_state_tensors(input_data)
         cache_indices = input_data.get_ssm_state_slot_per_seq()
         has_initial_state = input_data.get_has_initial_state_per_seq()
@@ -784,9 +793,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 query_start_loc,
                 getattr(input_data, "seq_lens_cpu", None),
             )
-            # Phase G.3: persist the just-computed state into the snapshot
-            # pool for seqs whose chunk ended on a page boundary that
-            # ``PrefixSegment`` pre-reserved a snapshot slot for. This is
+            # Phase G.3: persist the just-computed state into a snapshot arena
+            # entry for seqs whose chunk ended on an eligible page boundary.
+            # ``InputData`` borrows the entry lazily for this forward. This is
             # how cross-seq prefix-cache hits later restore the GDN
             # recurrent state into a fresh working slot. ``-1`` slots are a
             # no-op so non-PrefixSegment runs / non-cacheable boundaries
@@ -1015,7 +1024,7 @@ class Qwen3_5Model(nn.Module):
 
     ``self.num_kv_layers`` and ``self.ssm_layer_global_ids`` are then read by
     ``model_runner.init`` and surfaced to :class:`MemoryManager` so the KV
-    page budget and the SSM pool match the model's real shape.
+    page and recurrent-state arena layouts match the model's real shape.
     """
 
     def __init__(self, config, decoder_layer_type=None):
@@ -1044,7 +1053,7 @@ class Qwen3_5Model(nn.Module):
         # Build dense KV / SSM layer indices for the layers that belong to
         # this pipeline rank. The model only allocates the slice
         # ``[start_layer, end_layer)`` so the local indices reset at the PP
-        # boundary — KV cache and SSM pool are also sized per-rank.
+        # boundary — KV and recurrent cache views are also sized per-rank.
         self._layer_types: List[str] = []
         self._kv_layer_ids: List[Optional[int]] = []
         self._ssm_layer_ids: List[Optional[int]] = []
@@ -1086,7 +1095,7 @@ class Qwen3_5Model(nn.Module):
         self.num_kv_layers = kv_counter
         self.num_ssm_layers = ssm_counter
         # Global linear-attn layer indices (for diagnostics / config); the
-        # PrefixSegment uses a dense pool so we just need the count.
+        # SSMSegment uses a dense layer axis, so we just need the count.
         self.ssm_layer_global_ids = [
             self.start_layer + i
             for i, lt in enumerate(self._layer_types)

@@ -292,7 +292,7 @@ class ModelRunner:
             else maxp + maxd
         )
         
-        # Concurrent decode slots (SSM working pool, input buffers, CUDA
+        # Concurrent decode slots (SSM arena entries, input buffers, CUDA
         # graph capture). Bounded by ``maxd`` for all schedule methods.
         self.max_running_seqs = maxd
         
@@ -499,7 +499,7 @@ class ModelRunner:
         #
         #   * ``maxd`` — the decode batch is hard-capped at ``maxd`` (scheduler)
         #     and several device buffers (``InputData.block_table``,
-        #     ``slot_mapping``, the SSM working pool, ...) are sized at ``maxd``
+        #     ``slot_mapping``, SSM metadata, ...) are sized at ``maxd``
         #     rows.
         #   * ``max_num_batched_tokens`` — a captured decode graph of ``B``
         #     sequences writes ``B`` token-rows into the shared activation
@@ -749,12 +749,6 @@ class ModelRunner:
             vocab_size=self.model_loader.vocab_size,
             use_mla=self.model_loader.use_mla,
             ssm_cache_config=ssm_cache_config,
-            max_working_ssm_slots=self.max_running_seqs if ssm_cache_config else 0,
-            max_snapshot_ssm_slots=(
-                4 * self.max_running_seqs
-                if ssm_cache_config and self.enable_prefix_caching
-                else 0
-            ),
             max_running_seqs=self.max_running_seqs,
             # DeepSeek Sparse Attention (V3.2): non-zero => allocate a parallel
             # paged indexer key cache. 0 for every other model.
@@ -765,8 +759,8 @@ class ModelRunner:
             # requested (drives SM90 sparse decode); default bf16 + dense decode.
             mla_cache_fp8=(self.mla_cache_dtype == "fp8"),
             # MTP draft-chain length for hybrid GDN models: each running seq may
-            # borrow up to mtp_k transient checkpoint blocks from the shared SSM
-            # block pool during a verify step. 0 for non-MTP or non-hybrid.
+            # claim 1+mtp_k working/checkpoint entries from the cache arena.
+            # 0 for non-MTP or non-hybrid.
             # Recurrent-state prefix-cache granularity (tokens). Rounded to
             # whole pages by ``PrefixMemoryManager.init``.
             ssm_snapshot_stride_tokens=self.ssm_snapshot_stride_tokens,
@@ -3295,6 +3289,7 @@ class ModelRunner:
             with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
                 self._draft_step_forward()
             self._draft_size_to_graph[bucket] = g
+
             # Also capture the sampled (rejection) draft step when enabled, so
             # sampling requests get a graphed draft too (Gumbel-max, graph-safe).
             if self._mtp_can_sample:

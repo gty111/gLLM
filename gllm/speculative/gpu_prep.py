@@ -128,14 +128,29 @@ class MtpGpuPrep:
         # --- persistent host staging (pinned; filled through numpy views) ---
         self._h_meta = torch.zeros((max_bs, META_W), dtype=torch.int64, device="cpu", pin_memory=True)
         self._h_meta_np = self._h_meta.numpy()
-        self._h_pt = torch.zeros((max_bs, max_blocks), dtype=torch.int32, device="cpu", pin_memory=True)
-        self._h_pt_np = self._h_pt.numpy()
+        # The active page-table width changes as requests grow. A rectangular
+        # ``[max_bs, max_blocks]`` allocation sliced as ``[:bucket, :cols]`` is
+        # not contiguous when ``cols < max_blocks``. Passing that view to
+        # ``copy_(..., non_blocking=True)`` makes PyTorch pack it through a
+        # pageable temporary, turning a nominally asynchronous H2D into a host
+        # synchronization. Keep the host payload densely packed instead, then
+        # scatter it into the stable-stride device table with a cheap D2D copy.
+        self._h_pt_packed = torch.zeros(
+            max_bs * max_blocks,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        self._h_pt_packed_np = self._h_pt_packed.numpy()
         self._h_bt = torch.zeros((max_bs, max(bt_width, 1)), dtype=torch.int32, device="cpu", pin_memory=True)
         self._h_bt_np = self._h_bt.numpy()
 
         # --- persistent device mirrors ---
         self._d_meta = torch.zeros((max_bs, META_W), dtype=torch.int64, device=device)
         self._d_pt = torch.zeros((max_bs, max_blocks), dtype=torch.int32, device=device)
+        self._d_pt_packed = torch.zeros(
+            max_bs * max_blocks, dtype=torch.int32, device=device
+        )
         self._d_bt = torch.zeros(
             (max_bs, max(bt_width, 1)), dtype=torch.int32, device=device
         )
@@ -226,10 +241,11 @@ class MtpGpuPrep:
         # id -- the attention kernels never look past ``ceil(seq_len/P)`` columns,
         # but matching ``_cal_block_table`` byte for byte keeps the assert honest
         # (and a stale page id in a debug dump is deeply confusing).
-        pt = self._h_pt_np
         lens = [len(s.page_table) for s in seqs]
         cols = max(max(lens, default=1), 1)
-        pt[:bucket, :cols] = 0
+        packed_elems = bucket * cols
+        pt = self._h_pt_packed_np[:packed_elems].reshape(bucket, cols)
+        pt[:, :] = 0
         for i, seq in enumerate(seqs):
             if lens[i]:
                 pt[i, : lens[i]] = seq.page_table
@@ -254,7 +270,10 @@ class MtpGpuPrep:
                 bt[nd:bucket, :w] = 0
 
         self._d_meta[:bucket].copy_(self._h_meta[:bucket], non_blocking=True)
-        self._d_pt[:bucket, :cols].copy_(self._h_pt[:bucket, :cols], non_blocking=True)
+        h_pt = self._h_pt_packed[:packed_elems].view(bucket, cols)
+        d_pt = self._d_pt_packed[:packed_elems].view(bucket, cols)
+        d_pt.copy_(h_pt, non_blocking=True)
+        self._d_pt[:bucket, :cols].copy_(d_pt)
         if self.bt_width:
             self._d_bt[:bucket].copy_(self._h_bt[:bucket], non_blocking=True)
 

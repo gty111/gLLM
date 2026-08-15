@@ -51,8 +51,10 @@ def _fwd_kernel_stage1(
     stride_req_to_tokens_b,
     stride_qbs,
     stride_qh,
+    stride_buf_kblock,
     stride_buf_kbs,
     stride_buf_kh,
+    stride_buf_vblock,
     stride_buf_vbs,
     stride_buf_vh,
     stride_mid_ob,
@@ -102,9 +104,10 @@ def _fwd_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+            kv_token = offs_n % PAGE_SIZE
             offs_buf_k = (
-                kv_loc[:, None] * stride_buf_kbs
+                kv_page_number[:, None] * stride_buf_kblock
+                + kv_token[:, None] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
                 + offs_d[None, :]
             )
@@ -122,7 +125,8 @@ def _fwd_kernel_stage1(
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
             offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
+                kv_page_number[:, None] * stride_buf_vblock
+                + kv_token[:, None] * stride_buf_vbs
                 + cur_kv_head * stride_buf_vh
                 + offs_dv[None, :]
             )
@@ -208,8 +212,10 @@ def _decode_att_m_fwd(
         Req_to_tokens.stride(0),
         q.stride(0),
         q.stride(1),
+        k_buffer.stride(0),
         k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+        v_buffer.stride(0),
         v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         att_out.stride(0),
@@ -241,8 +247,10 @@ def _fwd_grouped_kernel_stage1(
     stride_req_to_tokens_b,
     stride_qbs,
     stride_qh,
+    stride_buf_kblock,
     stride_buf_kbs,
     stride_buf_kh,
+    stride_buf_vblock,
     stride_buf_vbs,
     stride_buf_vh,
     stride_mid_ob,
@@ -312,9 +320,10 @@ def _fwd_grouped_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+            kv_token = offs_n % PAGE_SIZE
             offs_buf_k = (
-                kv_loc[None, :] * stride_buf_kbs
+                kv_page_number[None, :] * stride_buf_kblock
+                + kv_token[None, :] * stride_buf_kbs
                 + cur_kv_head * stride_buf_kh
                 + offs_d[:, None]
             )
@@ -326,7 +335,8 @@ def _fwd_grouped_kernel_stage1(
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
-                    kv_loc[None, :] * stride_buf_kbs
+                    kv_page_number[None, :] * stride_buf_kblock
+                    + kv_token[None, :] * stride_buf_kbs
                     + cur_kv_head * stride_buf_kh
                     + offs_dpe[:, None]
                 )
@@ -346,7 +356,8 @@ def _fwd_grouped_kernel_stage1(
             )
 
             offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
+                kv_page_number[:, None] * stride_buf_vblock
+                + kv_token[:, None] * stride_buf_vbs
                 + cur_kv_head * stride_buf_vh
                 + offs_dv[None, :]
             )
@@ -444,8 +455,10 @@ def _decode_grouped_att_m_fwd(
         Req_to_tokens.stride(0),
         q.stride(0),
         q.stride(1),
+        k_buffer.stride(0),
         k_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         k_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
+        v_buffer.stride(0),
         v_buffer.stride(-3),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         v_buffer.stride(-2),  # Assume (..., PAGE_SIZE, NUM_HEADS, HEAD_DIM)
         att_out.stride(0),

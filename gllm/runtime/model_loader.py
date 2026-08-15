@@ -687,6 +687,25 @@ class ModelLoader:
             if isinstance(self.weights, LazySafetensors):
                 self.weights.close()
 
+        # Backend-specific weight layouts are materialized only after every
+        # checkpoint tensor has reached its final parameter. Unsupported
+        # layers keep their native layout and continue through their existing
+        # backend.
+        moe_backends: dict[str, int] = {}
+        for module in model.modules():
+            quant_method = getattr(module, "quant_method", None)
+            process = getattr(quant_method, "process_weights_after_loading", None)
+            if process is not None:
+                process(module)
+            backend = getattr(quant_method, "backend", None)
+            if backend is not None:
+                moe_backends[backend] = moe_backends.get(backend, 0) + 1
+        if moe_backends:
+            summary = ", ".join(
+                f"{backend}={count}" for backend, count in sorted(moe_backends.items())
+            )
+            logger.info("MoE backend selection: %s", summary)
+
         # Best-effort validation that ``quantization_config["ignored_layers"]``
         # is honored. gllm does not consume the field directly (no per-layer
         # ``prefix`` plumbing through the Linear/MoE classes); instead every

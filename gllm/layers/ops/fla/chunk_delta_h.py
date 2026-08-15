@@ -42,6 +42,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     initial_state_indices,
     cu_seqlens,
     chunk_offsets,
+    stride_state_token: tl.constexpr,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -87,13 +88,21 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     if SAVE_NEW_VALUE:
         v_new += ((bos * H + i_h) * V).to(tl.int64)
     stride_v = H * V
+    # ``h`` is a compact per-chunk workspace, while ``initial_state`` may be
+    # an arena view whose logical slot stride includes padding and other
+    # layers. These strides are not interchangeable. The old compact
+    # ``H*V*K`` addressing silently read/wrote a different arena extent for
+    # every non-zero slot id.
     stride_h = H * V * K
     stride_k = Hg * K
     stride_w = H * K
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
-    h0 = initial_state + index * stride_h
-    ht = initial_state + index * stride_h
+    # Arena slot ids are small, but ``slot * frame_stride`` can exceed 2 Gi
+    # on large hybrid models. Promote before multiplying so pointer arithmetic
+    # cannot wrap at int32 (the decode/verify kernels already do the same).
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
+    h0 = initial_state + index * stride_state_token
+    ht = initial_state + index * stride_state_token
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
@@ -321,6 +330,7 @@ def chunk_gated_delta_rule_fwd_h(
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        stride_state_token=initial_state.stride(0),
         T=T,
         H=H,
         Hg=Hg,

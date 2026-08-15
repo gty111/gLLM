@@ -57,6 +57,9 @@ from gllm.layers.ops.cache_kernels import (
 from gllm.layers.ops.batched_rotary_kernel import (
     batched_rotary_embedding as _triton_batched_rotary_embedding,
 )
+from gllm.layers.ops.gemma_rmsnorm import (
+    gemma_rms_norm_reference_reduction as _triton_gemma_rms_norm,
+)
 
 
 # =============================================================================
@@ -345,14 +348,10 @@ def gemma_rms_norm(
 ) -> None:
     """Gemma RMSNorm with the learned ``weight + 1`` applied in fp32.
 
-    sglang-kernel 0.4.6's SM100 kernel accumulates differently from the fp32
-    checkpoint reference, so retain the established gLLM numerical contract.
+    Keep the established FP32 ``aten::mean`` reduction order while fusing the
+    surrounding casts and pointwise work into compact Triton kernels.
     """
-    input_fp32 = input.float()
-    normalized = input_fp32 * torch.rsqrt(
-        input_fp32.square().mean(dim=-1, keepdim=True) + epsilon
-    )
-    out.copy_((normalized * (weight.float() + 1.0)).to(input.dtype))
+    _triton_gemma_rms_norm(out, input, weight, epsilon)
 
 
 def gemma_fused_add_rms_norm(
@@ -360,11 +359,7 @@ def gemma_fused_add_rms_norm(
 ) -> None:
     """In-place residual add followed by fp32-reference Gemma RMSNorm."""
     residual.add_(input)
-    residual_fp32 = residual.float()
-    normalized = residual_fp32 * torch.rsqrt(
-        residual_fp32.square().mean(dim=-1, keepdim=True) + epsilon
-    )
-    input.copy_((normalized * (weight.float() + 1.0)).to(input.dtype))
+    _triton_gemma_rms_norm(input, residual, weight, epsilon)
 
 
 # =============================================================================

@@ -1140,9 +1140,9 @@ def fused_recurrent_gdn_spec(
     cu_seqlens: Optional[torch.LongTensor] = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> torch.Tensor:
-    """Spec-decode GDN recurrence over the shared state pool.
+    """Spec-decode GDN recurrence over the shared state arena view.
 
-    ``state_source`` is the SSM temporal-state block pool ``[num_blocks, HV, V,
+    ``state_source`` is the SSM temporal-state view ``[num_blocks, HV, V,
     K]`` (in-place: h0 == ht). ``ssm_state_indices`` is the ``[nseq, 1+K]`` block
     table; each token's post-state is written to its column, the initial state
     is read from column ``num_accepted-1`` (or 0 when ``num_accepted`` is None).
