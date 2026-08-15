@@ -198,13 +198,13 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
 @router.post("/start_profile")
 async def start_profile():
-    await make_async(llm.start_profile)()
+    await llm.start_profile_async()
     return JSONResponse(content={"message": "Profiler started", "success": True})
 
 
 @router.post("/stop_profile")
 async def stop_profile():
-    await make_async(llm.stop_profile)()
+    await llm.stop_profile_async()
     return JSONResponse(content={"message": "Profiler stopped", "success": True})
 
 

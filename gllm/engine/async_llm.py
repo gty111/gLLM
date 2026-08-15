@@ -1,4 +1,6 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Dict, List
 
 from fastapi import Request
@@ -61,10 +63,37 @@ class AsyncLLM(LLM):
     """Asynchronous request and stream facade over :class:`LLM`."""
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        # The executor must exist before ``LLM.__init__`` reaches
+        # ``_init_frontend_comm``: ZeroMQ requires a socket to be created and
+        # subsequently used by the same owner thread.
+        self._engine_io_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="gllm-engine-io",
+        )
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            self._engine_io_executor.shutdown(wait=True)
+            raise
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
+
+    def _init_frontend_comm(self):
+        # LLM's synchronous constructor waits for this short task. The same
+        # persistent executor later owns every frontend-side send and receive.
+        self._engine_io_executor.submit(super()._init_frontend_comm).result()
+
+    async def _run_engine_io(self, func, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        call = partial(func, *args, **kwargs)
+        return await loop.run_in_executor(self._engine_io_executor, call)
+
+    async def start_profile_async(self):
+        await self._run_engine_io(self.start_profile)
+
+    async def stop_profile_async(self):
+        await self._run_engine_io(self.stop_profile)
 
     async def add_requests_async(
         self,
@@ -129,7 +158,7 @@ class AsyncLLM(LLM):
     async def schedule(self):
         while True:
             await self.check_abort_seqs()
-            await make_async(super().schedule)()
+            await self._run_engine_io(super().schedule)
             await asyncio.sleep(0)
 
     def start_schedule_engine(self):

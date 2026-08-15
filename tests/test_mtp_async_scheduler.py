@@ -295,3 +295,28 @@ def test_overlap_worker_builds_one_mtp_plan_for_pure_and_mixed_batches():
     mixed = worker._plan_mtp_batch()
     assert mixed.speculate and mixed.decode_ids == (31,)
     assert decisions == [2, 1]
+
+
+def test_filter_prefetched_freed_releases_empty_inflight_batch_slot():
+    worker = OverlapWorker.__new__(OverlapWorker)
+    freed = SimpleNamespace(seq_id=41, _overlap_freed=True)
+    scheduled = [freed]
+    worker.scheduler = SimpleNamespace(batch_running=deque([scheduled]))
+
+    kept = worker._filter_prefetched_freed(scheduled)
+
+    assert kept == []
+    assert list(worker.scheduler.batch_running) == []
+
+
+def test_filter_prefetched_freed_keeps_surviving_inflight_rows():
+    worker = OverlapWorker.__new__(OverlapWorker)
+    freed = SimpleNamespace(seq_id=42, _overlap_freed=True)
+    live = SimpleNamespace(seq_id=43, _overlap_freed=False)
+    scheduled = [freed, live]
+    worker.scheduler = SimpleNamespace(batch_running=deque([scheduled]))
+
+    kept = worker._filter_prefetched_freed(scheduled)
+
+    assert kept == [live]
+    assert list(worker.scheduler.batch_running) == [[live]]
