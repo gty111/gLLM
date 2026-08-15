@@ -328,7 +328,14 @@ class OverlapWorker(Worker):
             return schedule_seqs
         kept = [s for s in schedule_seqs if not getattr(s, "_overlap_freed", False)]
         if self.scheduler.batch_running and self.scheduler.batch_running[-1] is schedule_seqs:
-            self.scheduler.batch_running[-1] = kept
+            if kept:
+                self.scheduler.batch_running[-1] = kept
+            else:
+                # ``schedule_once`` uses the number of in-flight batches as a
+                # hard PP-capacity gate. Leaving ``[]`` behind consumes that
+                # slot forever (especially visible at pp_size=1), so later
+                # requests can be admitted but never scheduled.
+                self.scheduler.batch_running.pop()
         return kept
 
     def _refresh_prefetched_input(self) -> None:

@@ -5,7 +5,7 @@ import re
 from openai import OpenAI
 
 parser = argparse.ArgumentParser(description="Chat client")
-parser.add_argument("--num-tokens", type=int, default=2048)
+parser.add_argument("--num-tokens", type=int, default=8192)
 parser.add_argument("--port", type=int)
 parser.add_argument(
     "--thinking",

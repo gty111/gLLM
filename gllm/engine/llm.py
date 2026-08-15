@@ -233,6 +233,15 @@ class LLM:
         self.output_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_output"
         self.token_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_token"
 
+        self._init_frontend_comm()
+
+        logger.info(
+            f"Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size}"
+        )
+        self._launch_workers()
+
+    def _init_frontend_comm(self):
+        """Create the frontend ZeroMQ sockets on their owning thread."""
         self.comm = zmqComm(
             self.host,
             self.launch_mode,
@@ -245,9 +254,7 @@ class LLM:
         )
         self.comm.init()
 
-        logger.info(
-            f"Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size}"
-        )
+    def _launch_workers(self):
         # Build every worker process object first (cheap), then fire all the
         # ``process.start()`` calls concurrently. For the spawn start method
         # ``start()`` blocks the parent while it pickles the worker and writes
