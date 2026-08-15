@@ -1,6 +1,7 @@
 from typing import Optional
 
 import torch
+from logger import logger
 
 from gllm.distributed.parallel_state import (
     get_ep_rank,
@@ -24,6 +25,39 @@ class FusedMoEMethod(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self._piecewise_workspaces = {}
+        self.backend = "triton"
+        self._weights_processed = False
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._weights_processed:
+            return
+        self._weights_processed = True
+
+        from gllm.layers.moe.flashinfer_trtllm import (
+            bf16_moe_support_reason,
+            convert_bf16_moe_weights,
+        )
+
+        reason = bf16_moe_support_reason(layer)
+        if reason is not None:
+            return
+
+        try:
+            w13, w2 = convert_bf16_moe_weights(
+                layer.w13_weight.data,
+                layer.w2_weight.data,
+            )
+        except Exception as exc:
+            logger.warning(
+                "FlashInfer TRT-LLM BF16 MoE weight conversion failed; "
+                "using Triton: %s",
+                exc,
+            )
+            return
+
+        layer.w13_weight.data = w13
+        layer.w2_weight.data = w2
+        self.backend = "flashinfer_trtllm_bf16"
 
     def _piecewise_workspace(
         self,
@@ -136,6 +170,12 @@ class FusedMoEMethod(torch.nn.Module):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        self.process_weights_after_loading(layer)
+        if self.backend == "flashinfer_trtllm_bf16":
+            from gllm.layers.moe.flashinfer_trtllm import trtllm_bf16_moe
+
+            return trtllm_bf16_moe(layer, x, router_logits)
+
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,

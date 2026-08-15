@@ -484,7 +484,7 @@ class Worker(TorchProfilerMixin):
                 page2snap[page_num] = snap if snap >= 0 else None
 
     def _apply_ssm_restores(self, seqs) -> None:
-        """Replay driver prefix-cache-hit restores on this stage's GDN pools.
+        """Replay driver prefix-cache-hit restores on this stage's GDN arena view.
 
         Each PP stage owns a different slice of the GDN layers, so the
         snapshot->working ``copy_state`` the driver ran on rank-0 must be redone

@@ -43,13 +43,10 @@ class LLM:
         gpu_memory_util=0.9,
         page_size=16,
         # ``maxd`` caps the number of concurrently running (decode) sequences,
-        # which also sizes ``max_running_seqs`` and -- for hybrid GDN/Mamba
-        # models -- the SSM working pool (``maxd`` slots) plus the prefix-cache
-        # snapshot pool (``4*maxd`` slots, each holding the full per-layer
-        # recurrent state). The previous default of 2048 made those pools tens
-        # of GiB on linear-attention models and OOM'd before the KV cache was
-        # even allocated. 512 matches the api/lm server ``--maxd`` default;
-        # lower it if the SSM/snapshot pools are too large for a given model.
+        # which also sizes ``max_running_seqs``. Hybrid GDN/Mamba models claim
+        # their working/checkpoint state dynamically from the same physical
+        # cache arena as KV; ``maxd`` is therefore an admission/buffer bound,
+        # not a separately preallocated SSM cache size.
         maxd=512,
         maxp=2048,
         minp=32,

@@ -250,14 +250,19 @@ one goes away, the LM watchdog re-dispatches its in-flight items to the others.
 
 ## 8. Memory tuning (hybrid models with SSM cache)
 
-Qwen3.5-family models have hybrid linear-attention. The LM's SSM snapshot pool
-scales as `~4 × maxd + 1` slots, so with the default `--maxd 512` the SSM cache
-can reach ~39 GB on a single TP1 GPU and OOM on top of the weights.
+Qwen3.5-family models have hybrid linear attention. KV pages, live recurrent
+state, MTP checkpoints and prefix-state snapshots all borrow physical bytes
+from one cache arena. There is no fixed SSM sub-pool or snapshot-count limit:
+the active workload determines the mix, and prefix snapshots are reclaimed in
+LRU order when KV or live recurrent state needs space.
 
-- If concurrency is moderate, lower `--maxd` (e.g. 64): SSM cache drops from
-  ~39 GB to ~5 GB.
-- Still OOM? Lower `--gpu-memory-util` or `--model-max-length`.
-- Dense models (Qwen2.5-VL) have no SSM cache and need no special handling.
+- `--gpu-memory-util` controls the total arena budget.
+- `--maxd` remains the scheduling concurrency bound, but does not preallocate
+  or reserve `maxd` SSM entries.
+- `--ssm-snapshot-stride-tokens` controls snapshot granularity, not capacity.
+  A larger stride reduces snapshot-copy work at the cost of recomputing a
+  longer prefix tail after a cache hit.
+- Dense models use the existing KV-only allocation path.
 
 ---
 

@@ -85,7 +85,7 @@ class GenerationSequence:
         self.mm_contents = mm_contents
         # used to remove redundant token_ids
         self.to_compute_tokens = None
-        # SSM working-pool slot for hybrid (Mamba/GDN) models. ``None`` means
+        # SSM working arena slot for hybrid (Mamba/GDN) models. ``None`` means
         # either the model has no linear-attention layers or the scheduler
         # has not yet allocated a slot for this seq. The slot lives for the
         # whole lifetime of the request and is reset on preempt/free.
@@ -185,7 +185,7 @@ class GenerationSequence:
         # SSM state is recurrent, so preempting (= recomputing from scratch)
         # invalidates whatever was in the working slot. The actual slot is
         # released by the scheduler via ``MemoryManager.free_ssm_slot`` so
-        # that ``SSMSegment.free_working`` can also zero the tensors.
+        # that ``SSMSegment.free_block`` can also zero the tensors.
         self.ssm_state_slot = None
         self.ssm_block_table = None
         self.ssm_num_accepted = 1

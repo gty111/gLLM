@@ -183,7 +183,7 @@ class SeqUpdate:
     # GDN forward resumes from the same column. ``None`` for non-MTP seqs.
     ssm_block_table: Optional[List[int]] = None
     ssm_num_accepted: int = 1
-    # Hybrid/SSM + prefix caching under PP>1 only: the snapshot-pool slot id
+    # Hybrid/SSM + prefix caching under PP>1 only: the snapshot arena slot id
     # assigned to each page in ``new_page_ids`` (``-1`` = no snapshot slot).
     # The follower mirrors these into its own ``page2ssm_snapshot`` table so its
     # ``_cal_ssm_metadata`` picks the same snapshot WRITE targets the driver
@@ -191,9 +191,9 @@ class SeqUpdate:
     # mirror (non-hybrid, no prefix cache, or no new pages).
     new_page_snap_slots: Optional[List[int]] = None
     # Hybrid/SSM + prefix caching under PP>1 only: when a prefix-cache hit
-    # restored recurrent state on the driver, the snapshot-pool slot to copy
+    # restored recurrent state on the driver, the snapshot arena slot to copy
     # into this seq's working slot BEFORE its next forward. The follower
-    # replays the identical ``copy_state`` on its own GDN-layer pools. A
+    # replays the identical ``copy_state`` on its own GDN-layer arena view. A
     # one-shot per-iteration signal (``None`` on every other iteration).
     ssm_restore_src_slot: Optional[int] = None
 

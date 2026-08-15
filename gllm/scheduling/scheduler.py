@@ -479,11 +479,9 @@ class Scheduler:
         # re-queued after this round (no slot/page allocation, no ordering loss).
         deferred_disagg_seqs: List[GenerationSequence] = []
         prefill_batched_token_nums = 0
-        # Hybrid models (Qwen3.5 GDN) cap concurrency at the SSM working
-        # pool size; admitting more requests would assertion-crash inside
-        # ``IDAllocator.allocate``. ``ssm_segment`` is None for plain
-        # softmax-attn models, in which case the slot check below is a
-        # no-op.
+        # Hybrid models (Qwen3.5 GDN) claim working/checkpoint entries from the
+        # shared arena. ``ssm_segment`` is None for plain softmax-attention
+        # models, in which case the slot check below is a no-op.
         ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
         # Cap the number of prefill seqs so the *combined* batch
         # (decode + prefill) never exceeds ``max_running_seqs`` rows, which
@@ -497,13 +495,15 @@ class Scheduler:
             and (max_seqs is None or len(prefill_batch) < max_seqs)
         ):
             seq = self.seqs_to_prefill.popleft()
-            # If this seq hasn't taken its SSM state block(s) yet AND the pool
-            # cannot fit a whole per-seq allocation (1 block, or 1+k for MTP),
-            # put the request back on the wait queue and stop admitting fresh
-            # prefills this round. In-flight prefill seqs keep their blocks.
+            # A new hybrid request atomically claims its whole per-seq state
+            # allocation (1 entry, or 1+k for MTP) from the shared arena.
             if ssm_seg is not None and seq.ssm_state_slot is None:
-                need = 1 + getattr(self.memory_manager, "mtp_k", 0)
-                if ssm_seg.num_free_blocks() < need:
+                # Claim recurrent-state extents before prefix lookup pins KV
+                # slots. Both cache types share one physical arena, so doing
+                # this in the opposite order can consume the last aligned SSM
+                # slots. The arena may reclaim evictable snapshots here; there
+                # is intentionally no fixed SSM reserve or admission watermark.
+                if not self.memory_manager.allocate_ssm_slot(seq):
                     self.seqs_to_prefill.appendleft(seq)
                     break
             if (
@@ -536,6 +536,7 @@ class Scheduler:
                 # Nothing prefillable this round; park and re-queue. No SSM slot
                 # / page allocation so freeing stays simple if it never runs.
                 deferred_disagg_seqs.append(seq)
+                self.memory_manager.free_ssm_slot(seq)
                 continue
             prefill_avail = len(seq) - seq.computed_token_num
             if gate_limit is not None:
@@ -545,7 +546,9 @@ class Scheduler:
             # the first schedule, freed when ``model_runner.free(seq)`` is
             # called from ``process_output`` / ``check_abort_seqs`` /
             # ``check_preempt``). No-op for non-hybrid models.
-            self.memory_manager.allocate_ssm_slot(seq)
+            if not self.memory_manager.allocate_ssm_slot(seq):
+                self.seqs_to_prefill.appendleft(seq)
+                break
             if prefill_avail <= prefill_token_budget:
                 seq.to_compute_token_num = prefill_avail
             else:
@@ -954,19 +957,42 @@ class OverlapScheduler(Scheduler):
             if not row:
                 raise RuntimeError("MTP async completion committed an empty row")
 
-            kept = 0
-            for token in row:
-                seq.append(int(token))
-                kept += 1
-                if kept > 1:
-                    seq.computed_token_num += 1
-                self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
-                if seq.is_finish:
-                    break
+            # Commit the accepted prefix in one list operation.  Calling
+            # ``append``/``is_finish``/the page-boundary hook once per token is
+            # disproportionately expensive at large decode batches, while the
+            # stopping rule depends only on the first EOS and remaining output
+            # budget.
+            # An overlapped successor may already have launched when its
+            # predecessor reaches the output limit. Preserve the old finalize
+            # semantics in that case: commit exactly the first completed token
+            # and retire the request immediately afterwards.
+            remaining = max(
+                1, seq.output_len - (len(seq) - seq.raw_prompt_len)
+            )
+            kept = min(len(row), remaining)
+            if not seq.ignore_eos:
+                for idx, token in enumerate(row[:kept]):
+                    if int(token) in seq.finish_tokens:
+                        kept = idx + 1
+                        break
+            committed_tokens = [int(token) for token in row[:kept]]
+            append_start = len(seq.token_ids)
+            seq.token_ids.extend(committed_tokens)
+            seq.computed_token_num += max(kept - 1, 0)
+
+            # Prefix registration is a no-op away from page boundaries.  Jump
+            # directly between the boundaries crossed by this accepted span.
+            memory_manager = getattr(self.model_runner, "memory_manager", None)
+            page_size = getattr(memory_manager, "page_size", 1)
+            first_boundary = ((append_start // page_size) + 1) * page_size
+            for n_tokens in range(
+                first_boundary, append_start + kept + 1, page_size
+            ):
+                self.model_runner.register_decode_page_hash(seq, n_tokens - 1)
 
             if seq.computed_prompt:
                 ipc_package.act_schedule_ids.append(seq.seq_id)
-                ipc_package.next_tokens.append([int(t) for t in row[:kept]])
+                ipc_package.next_tokens.append(committed_tokens)
                 ipc_package.logprobs.append(None)
                 self._attach_prompt_logprobs(ipc_package, seq)
 

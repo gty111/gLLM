@@ -1,3 +1,4 @@
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
@@ -5,10 +6,13 @@ import torch
 import torch.distributed as dist
 from logger import logger
 
-from collections import deque
-
 from gllm.distributed.parallel_state import get_pp_size
-from gllm.runtime.id_allocator import IDAllocator
+from gllm.runtime.cache_arena import (
+    CacheArena,
+    CacheLayout,
+    CacheTensorLayout,
+    RegisteredCache,
+)
 from gllm.runtime.sequence import GenerationSequence
 from gllm.utils import async_tensor_h2d, get_dtype_bytes
 
@@ -34,13 +38,14 @@ class SSMCacheConfig:
 
     Shapes (per layer, after TP sharding on the head dim):
 
-    * ``conv_state``  : ``(pool_size, conv_dim, conv_kernel - 1)``
-    * ``temporal_state``: ``(pool_size, num_v_heads, head_v_dim, head_k_dim)``
+    * ``conv_state``  : ``(num_slots, conv_dim, conv_kernel - 1)``
+    * ``temporal_state``: ``(num_slots, num_v_heads, head_v_dim, head_k_dim)``
 
-    Slot 0 in the working pool is reserved as the CUDA-graph dummy slot
+    Slot 0 in the working-state arena view is reserved as the CUDA-graph dummy
     (mirrors how :class:`MemoryManager` reserves a dummy KV page) so a padded
     decode row can write into it without polluting any real request's state.
     """
+
     num_layers: int
     conv_dim: int
     conv_kernel: int
@@ -68,81 +73,71 @@ class SSMCacheConfig:
     def temporal_state_shape_per_slot(self):
         return (self.num_v_heads, self.head_v_dim, self.head_k_dim)
 
-    def per_slot_bytes(self) -> int:
-        """Memory footprint of a *single* pool slot, summed across all linear
-        layers, post TP sharding. Used for SSM cache sizing logs.
-        """
-        conv_bytes = get_dtype_bytes(self.conv_state_dtype) * \
-            self.conv_dim * (self.conv_kernel - 1)
-        temp_bytes = get_dtype_bytes(self.dtype) * \
-            self.num_v_heads * self.head_v_dim * self.head_k_dim
-        return self.num_layers * (conv_bytes + temp_bytes)
-
-
 class SSMSegment:
-    """Twin tensor banks for the GDN/Mamba recurrent state.
+    """GDN/Mamba tensor views and lifecycle over the shared cache arena.
 
-    Two independent pools share the same per-slot tensor layout:
+    Working state and prefix snapshots register separate allocation types so
+    the arena can treat snapshots as pressure-reclaimable, but both types use
+    the same aligned slot grid and the same conv/temporal tensor views. Their
+    slot ids are therefore directly usable by the existing GDN kernels. Slot 0
+    of the working type is reserved for CUDA-graph padding.
 
-    * **Working pool**: one slot per *live* request. Holds the conv + temporal
-      state that gets mutated in place by every forward.
-    * **Snapshot pool**: one slot per *cached prefix page*. Holds a frozen copy
-      of the working state at a page boundary so a future prefix-cache hit can
-      restore it into a fresh working slot via :meth:`copy_state`.
-
-    Each pool exposes its own :class:`IDAllocator`; slot ids are independent
-    across the two pools. Both pools always reserve slot 0 as a CUDA-graph
-    padding dummy.
+    The segment never allocates storage itself. Both working state and prefix
+    snapshots are registered cache layouts over the process-wide arena.
     """
 
     def __init__(
         self,
         cfg: SSMCacheConfig,
-        num_blocks: int,
+        *,
+        state_cache: RegisteredCache,
+        snapshot_cache: RegisteredCache,
     ):
         self.cfg = cfg
-        # Shared recurrent-state block pool. Each block holds ONE full per-layer
+        if state_cache.arena is not snapshot_cache.arena:
+            raise ValueError("SSM working state and snapshots must share one arena")
+        if state_cache.layout.tensors != snapshot_cache.layout.tensors:
+            raise ValueError("SSM working state and snapshot layouts must match")
+        self.cache_arena = state_cache.arena
+        self.arena_type = state_cache.name
+        self.snapshot_arena_type = snapshot_cache.name
+        # Each logical block holds ONE full per-layer
         # GDN recurrent state (conv window + temporal state). A running sequence
         # borrows one block for its rolling state; an MTP verify step transiently
         # borrows ``k`` extra blocks per seq for the per-token checkpoints; a
-        # prefix-cached prefix keeps its state in a ref-counted block borrowed
-        # from THIS SAME pool (there is no separate snapshot pool anymore -- the
-        # cached-state block lives here and is copied into a fresh working block
-        # on a cache hit, so GDN's in-place updates never touch the cached copy).
-        # The pool size is derived from the memory budget, NOT from
-        # ``maxd``; max concurrency is *bounded by* ``num_blocks``.
-        # +1 keeps block 0 reserved as the CUDA-graph dummy block.
-        self.num_blocks = num_blocks + 1
-        # Back-compat alias: some call sites / logs still read working_pool_size.
-        self.working_pool_size = self.num_blocks
-
+        # prefix-cached prefix keeps its state in a reclaimable arena slot. The
+        # cached state is copied into a fresh working slot on a hit, so GDN's
+        # in-place updates never touch the cached copy.
+        self.num_blocks = state_cache.num_slots
         conv_shape = cfg.conv_state_shape_per_slot()
         temp_shape = cfg.temporal_state_shape_per_slot()
-        device = torch.device("cuda", torch.cuda.current_device())
 
         # Layout: ``[num_layers, num_blocks, *per_block]`` as a single stacked
-        # tensor (not a Python list of per-layer tensors). ``conv_state[layer_id]``
-        # still returns that layer's ``[num_blocks, *per_block]`` slice -- a
-        # contiguous view -- so every per-layer call site (kernels, ``copy_state``,
-        # ``zero_``) is unchanged. The stacked layout lets ``commit_blocks`` copy
+        # tensor view. ``conv_state[layer_id]`` still returns that layer's
+        # ``[num_blocks, *per_block]`` slice, now with an arena entry stride.
+        # Kernels consume the explicit stride. The stacked view lets
+        # ``commit_blocks`` copy
         # the checkpoint across ALL layers in one ``index_copy_`` (2 kernel
         # launches total) instead of ``2 * num_layers`` per-layer launches.
-        # ``torch.zeros`` (not ``empty``) because the SSM kernels read from
-        # block 0 / freshly-allocated blocks before the first write and require a
-        # clean initial state (h_0 = 0).
-        self.conv_state = torch.zeros(
-            (cfg.num_layers, self.num_blocks, *conv_shape),
-            dtype=cfg.conv_state_dtype,
-            device=device,
-        )
-        self.temporal_state = torch.zeros(
-            (cfg.num_layers, self.num_blocks, *temp_shape),
-            dtype=cfg.dtype,
-            device=device,
-        )
+        # Registered tensors are slot-major; recurrent kernels use layer-major
+        # views. ``movedim`` changes only metadata and retains the stable arena
+        # entry stride required by CUDA Graph replay.
+        self.conv_state = state_cache.tensor("conv_state").movedim(1, 0)
+        self.temporal_state = state_cache.tensor("temporal_state").movedim(1, 0)
+        if self.conv_state.shape != (cfg.num_layers, self.num_blocks, *conv_shape):
+            raise ValueError(self.conv_state.shape)
+        if self.temporal_state.shape != (
+            cfg.num_layers,
+            self.num_blocks,
+            *temp_shape,
+        ):
+            raise ValueError(self.temporal_state.shape)
 
-        # Block 0 reserved as the CUDA-graph dummy.
-        self.working_alloc = IDAllocator(1, self.num_blocks - 1)
+        dummy = self.cache_arena.allocator.allocate(self.arena_type, slot=0)
+        if dummy != [0]:
+            raise RuntimeError(f"cache arena did not reserve SSM frame 0: {dummy}")
+        self.conv_state[:, 0].zero_()
+        self.temporal_state[:, 0].zero_()
 
         # Dummy slot that padded rows / unused pointers can refer to without
         # aliasing any real state.
@@ -160,15 +155,30 @@ class SSMSegment:
         # where it is already serialized with the forward.
         self.restore_stream: Optional["torch.cuda.Stream"] = None
 
-    # --- block pool -----------------------------------------------------
+    # --- block lifecycle ------------------------------------------------
     #
     # A "block" holds one full per-layer GDN recurrent state. Sequences borrow
     # one block for their rolling state; MTP verify borrows extra transient
-    # blocks for per-token checkpoints. ``allocate_working`` / ``free_working``
-    # are kept as aliases so pre-existing call sites keep working.
+    # blocks for per-token checkpoints.
 
-    def allocate_block(self) -> int:
-        return self.working_alloc.allocate()
+    def allocate_block(self) -> Optional[int]:
+        blocks = self.cache_arena.allocator.allocate(self.arena_type, 1)
+        if blocks is None:
+            return None
+        block = blocks[0]
+        self._zero_block(block)
+        return block
+
+    def _zero_block(self, block: int) -> None:
+        def _zero():
+            self.conv_state[:, block].zero_()
+            self.temporal_state[:, block].zero_()
+
+        if self.restore_stream is not None:
+            with torch.cuda.stream(self.restore_stream):
+                _zero()
+        else:
+            _zero()
 
     def free_block(self, block: int) -> None:
         if block is None or block == self.dummy_working_slot:
@@ -176,12 +186,11 @@ class SSMSegment:
         # Zero before returning so the next borrower starts from h_0 = 0
         # without needing an explicit "reset state" pass through every layer.
         # Stacked layout -> one ``zero_`` per state covers all layers.
-        self.conv_state[:, block].zero_()
-        self.temporal_state[:, block].zero_()
-        self.working_alloc.free(block)
+        self._zero_block(block)
+        self.cache_arena.allocator.free(self.arena_type, [block])
 
     def num_free_blocks(self) -> int:
-        return self.working_alloc.get_num_free_ids()
+        return self.cache_arena.allocator.num_available_slots(self.arena_type)
 
     def allocate_block_table(self, n: int) -> Optional[list]:
         """Borrow ``n`` blocks for a sequence's SSM state block table.
@@ -189,48 +198,45 @@ class SSMSegment:
         Speculative decode gives each sequence a fixed ``1+k`` block table:
         column 0 holds the rolling/committed state and columns 1..k hold verify
         checkpoints. Returns a list of ``n`` block ids, or ``None`` if
-        the pool cannot satisfy the whole request (caller must not partially
-        allocate -- the scheduler gates admission on ``num_free_blocks``).
+        the arena cannot satisfy the whole request. Allocation is atomic.
         """
-        if self.working_alloc.get_num_free_ids() < n:
+        blocks = self.cache_arena.allocator.allocate(self.arena_type, n)
+        if blocks is None:
             return None
-        return [self.working_alloc.allocate() for _ in range(n)]
+        for block in blocks:
+            self._zero_block(block)
+        return blocks
 
     def free_block_table(self, blocks) -> None:
-        """Return a sequence's whole SSM block table to the pool (zeroing each)."""
+        """Return a sequence's whole SSM block table to the arena."""
         if not blocks:
             return
-        for blk in blocks:
-            self.free_block(blk)
-
-    # Back-compat aliases (one working slot == one borrowed block).
-    def allocate_working(self) -> int:
-        return self.allocate_block()
-
-    def free_working(self, slot: int) -> None:
-        self.free_block(slot)
-
-    def num_free_working(self) -> int:
-        return self.num_free_blocks()
+        real_blocks = [
+            int(blk) for blk in blocks
+            if blk is not None and int(blk) != self.dummy_working_slot
+        ]
+        for blk in real_blocks:
+            self._zero_block(blk)
+        self.cache_arena.allocator.free(self.arena_type, real_blocks)
 
     # --- prefix-cache cached-state blocks ------------------------------
-    #
-    # A prefix-cached prefix keeps its recurrent state in a block borrowed from
-    # the SAME main pool (no separate snapshot pool). ``allocate_snapshot`` /
-    # ``free_snapshot`` are thin aliases over the block allocator so the
-    # PrefixSegment lifecycle code (which reserves a cached-state block per
-    # cacheable page and frees it on re-mint) reads naturally. Returns None when
-    # the pool is exhausted -> the caller degrades to "KV-cached but no SSM".
 
     def allocate_snapshot(self) -> Optional[int]:
-        if self.working_alloc.get_num_free_ids() == 0:
+        # Snapshot allocations are best effort. The allocator may use any free
+        # aligned extent, but does not evict one snapshot merely to create a
+        # different snapshot of the same type.
+        blocks = self.cache_arena.allocator.allocate(self.snapshot_arena_type, 1)
+        if blocks is None:
             return None
-        return self.working_alloc.allocate()
+        block = blocks[0]
+        self._zero_block(block)
+        return block
 
     def free_snapshot(self, slot: int) -> None:
         if slot is None or slot == self.dummy_working_slot:
             return
-        self.free_block(slot)
+        self._zero_block(slot)
+        self.cache_arena.allocator.free(self.snapshot_arena_type, [slot])
 
     def num_free_snapshot(self) -> int:
         return self.num_free_blocks()
@@ -244,9 +250,10 @@ class SSMSegment:
         dst_kind: str,
         dst_slot: int,
     ) -> None:
-        """Copy a full multi-layer recurrent state between two blocks of the
-        shared pool. ``src_kind``/``dst_kind`` ("working"/"snapshot") are only
-        semantic labels for the copy direction; both index the same pool.
+        """Copy a full multi-layer recurrent state between two arena entries.
+
+        ``src_kind``/``dst_kind`` ("working"/"snapshot") are semantic labels
+        for the copy direction; both index the same strided tensor view.
 
         * Prefill capture: ``copy_state("working", req_block, "snapshot",
           cached_block)`` after the GDN layer crosses a cacheable page boundary.
@@ -278,26 +285,24 @@ class SSMSegment:
             _do_copies()
 
     def _pool(self, kind: str):
-        # Both "working" and "snapshot" now live in the SAME block pool -- the
-        # kind is just a semantic label for the copy direction (capture vs
-        # restore). Cached-state ("snapshot") blocks and live rolling
-        # ("working") blocks are distinct block ids in ``conv_state`` /
-        # ``temporal_state``; the copy is always between different block ids.
+        # Working state and snapshots use the same logical grid over the same
+        # physical arena. The kind only documents capture vs restore; the two
+        # entries always have distinct live ownership.
         if kind in ("working", "snapshot"):
             return self.conv_state, self.temporal_state
-        raise ValueError(f"unknown ssm pool kind: {kind!r}")
+        raise ValueError(f"unknown SSM state kind: {kind!r}")
 
     # --- MTP verify checkpoint commit ----------------------------------
     #
     # An MTP verify forward runs the GDN recurrent kernel over [x1, d1..dk] and
-    # checkpoints the state after each token into a set of transient blocks
-    # borrowed from this same pool (one block per verify step, per sequence).
+    # checkpoints the state after each token into transient arena entries (one
+    # entry per verify step, per sequence).
     # The verify forward does NOT write the sequence's rolling block (it passes
     # ``disable_state_update``). After the accept step knows each seq committed
     # ``1+na`` tokens, we copy the step-``na`` checkpoint block's contents into
     # the sequence's rolling block -- the exact post-commit recurrent state,
     # with no rollback and no recompute forward. The transient blocks are then
-    # freed back to the shared pool. One rolling block remains the source of
+    # returned to the arena. One rolling block remains the source of
     # truth so ordinary one-token decode is unchanged; the selected checkpoint
     # is committed there before the transient blocks are released.
 
@@ -315,9 +320,7 @@ class SSMSegment:
         dev = self.conv_state.device
         dst = torch.as_tensor([c[0] for c in commit], dtype=torch.long, device=dev)
         src = torch.as_tensor([c[1] for c in commit], dtype=torch.long, device=dev)
-        self.conv_state.index_copy_(
-            1, dst, self.conv_state.index_select(1, src)
-        )
+        self.conv_state.index_copy_(1, dst, self.conv_state.index_select(1, src))
         self.temporal_state.index_copy_(
             1, dst, self.temporal_state.index_select(1, src)
         )
@@ -327,11 +330,11 @@ class Segment:
     def __init__(
         self,
         num_layers: int,
-        num_pages: int,
         page_size: int,
         kv_head_num: int,
         kv_head_dim: int,
         use_mla: bool,
+        cache: RegisteredCache,
         index_head_dim: int = 0,
         qk_rope_head_dim: int = 0,
         mla_cache_fp8: bool = False,
@@ -351,7 +354,7 @@ class Segment:
         the same ``slot_mapping`` as the MLA latent.
         """
         self.num_layers = num_layers
-        self.num_pages = num_pages
+        self.num_pages = cache.num_slots
         self.page_size = page_size
         self.kv_head_num = kv_head_num
         self.kv_head_dim = kv_head_dim
@@ -363,78 +366,45 @@ class Segment:
         # bf16 latent cache + dense decode, which is exact for prompts <=
         # index_topk. Every non-DSA model keeps its bf16 latent cache unchanged.
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
-        device = torch.device("cuda", torch.cuda.current_device())
-        # Packed FP8 layout size: kv_lora_rank(=kv_head_dim - qk_rope) FP8 bytes
-        # + (kv_lora_rank/128) fp32 scale bytes + qk_rope_head_dim bf16 bytes.
-        # For MLA, kv_head_dim = kv_lora_rank + qk_rope_head_dim.
-
         if not use_mla:
-            # We don't need zero initialization here
-            self.k_cache = [
-                torch.ones(
-                    (num_pages, page_size, kv_head_num, kv_head_dim), device=device
-                )
-                for _ in range(num_layers)
-            ]
-            self.v_cache = [
-                torch.ones(
-                    (num_pages, page_size, kv_head_num, kv_head_dim), device=device
-                )
-                for _ in range(num_layers)
-            ]
-        elif self.mla_cache_fp8:
-            # kv_head_dim is kv_lora_rank + qk_rope_head_dim (e.g. 512 + 64).
-            qk_rope = qk_rope_head_dim
-            kv_lora = kv_head_dim - qk_rope
-            assert kv_lora % _DSA_FP8_TILE == 0, (
-                f"kv_lora_rank {kv_lora} must be divisible by FP8 tile "
-                f"{_DSA_FP8_TILE} for the DSA FP8 MLA cache"
+            keys = cache.tensor("key")
+            values = cache.tensor("value")
+            expected = (
+                self.num_pages,
+                num_layers,
+                page_size,
+                kv_head_num,
+                kv_head_dim,
             )
-            num_tiles = kv_lora // _DSA_FP8_TILE
-            self.mla_fp8_dim = kv_lora + num_tiles * 4 + qk_rope * 2  # 656
-            self.kv_cache = [
-                torch.zeros(
-                    (num_pages, page_size, 1, self.mla_fp8_dim),
-                    dtype=torch.float8_e4m3fn,
-                    device=device,
-                )
-                for _ in range(num_layers)
-            ]
+            if keys.shape != expected or values.shape != expected:
+                raise ValueError((keys.shape, values.shape, expected))
+            self.k_cache = [keys[:, layer] for layer in range(num_layers)]
+            self.v_cache = [values[:, layer] for layer in range(num_layers)]
         else:
-            self.kv_cache = [
-                torch.ones((num_pages, page_size, kv_head_dim), device=device)
-                for _ in range(num_layers)
-            ]
+            latent = cache.tensor("mla")
+            if self.mla_cache_fp8:
+                self.mla_fp8_dim = latent.shape[-1]
+            self.kv_cache = [latent[:, layer] for layer in range(num_layers)]
         # DeepSeek Sparse Attention: parallel indexer key cache (bf16, one
         # single-head index_head_dim vector per token per layer). Only
         # allocated when index_head_dim > 0.
         if index_head_dim > 0:
-            self.index_k_cache = [
-                torch.zeros(
-                    (num_pages, page_size, index_head_dim), device=device
-                )
-                for _ in range(num_layers)
-            ]
+            index = cache.tensor("index_key")
+            self.index_k_cache = [index[:, layer] for layer in range(num_layers)]
             # DSA FP8 indexer scoring: a parallel paged FP8 index-K cache in the
             # 132-byte block-contiguous layout the deep_gemm paged-MQA-logits
             # kernel reads (per page: [page_size*index_head_dim fp8][page_size*
             # (index_head_dim/128)*4 scale]). ``index_head_dim`` (128) => 128 fp8
             # + 4 scale = 132 bytes/token.
-            assert index_head_dim % _DSA_FP8_TILE == 0
-            n_sf = index_head_dim // _DSA_FP8_TILE  # scales per token (=1)
-            self.index_fp8_bytes = index_head_dim + n_sf * 4  # 132
+            index_fp8 = cache.tensor("index_key_fp8")
+            self.index_fp8_bytes = index_fp8.shape[-1] // page_size
             self.index_k_fp8_cache = [
-                torch.zeros(
-                    (num_pages, page_size * self.index_fp8_bytes),
-                    dtype=torch.uint8,
-                    device=device,
-                )
-                for _ in range(num_layers)
+                index_fp8[:, layer] for layer in range(num_layers)
             ]
         else:
             self.index_k_cache = None
             self.index_k_fp8_cache = None
-        self.id_allocator = IDAllocator(0, num_pages - 1)
+        self.id_allocator = cache.slot_allocator()
 
     def allocate(self):
         pagenum = self.id_allocator.allocate()
@@ -442,6 +412,9 @@ class Segment:
 
     def free(self, page_num: int):
         self.id_allocator.free(page_num)
+
+    def free_many(self, page_nums) -> None:
+        self.id_allocator.free_many(int(page) for page in page_nums)
 
     def get_num_free_pages(self):
         return self.id_allocator.get_num_free_ids()
@@ -465,8 +438,6 @@ class MemoryManager:
         vocab_size: int,
         use_mla: bool = False,
         ssm_cache_config: Optional[SSMCacheConfig] = None,
-        max_working_ssm_slots: int = 0,
-        max_snapshot_ssm_slots: int = 0,
         max_running_seqs: int = 256,
         index_head_dim: int = 0,
         qk_rope_head_dim: int = 0,
@@ -483,22 +454,11 @@ class MemoryManager:
             kv_head_num: number of k/v heads (post-TP-shard).
             kv_head_dim: dimension of one k/v head.
             ssm_cache_config: layout for the recurrent (Mamba/GDN) state
-                cache. ``None`` disables the SSM segment entirely; the rest
-                of gllm behaves exactly as before (this is the path used by
-                every non-hybrid model).
-            max_working_ssm_slots: number of live request slots in the SSM
-                working pool. Should be ``>= max_running_seqs`` so the
-                scheduler always finds room.
-            max_snapshot_ssm_slots: number of cached-prefix slots in the SSM
-                snapshot pool. Set to 0 to disable SSM prefix caching while
-                keeping per-request SSM state. Otherwise this is the budget
-                for cross-request state reuse (mirrors sglang's
-                ``--max-mamba-cache-size``).
+                cache. ``None`` registers only the attention cache in the arena.
             ssm_snapshot_stride_tokens: token granularity of recurrent-state
                 prefix caching, rounded down to whole KV pages (see
                 ``PrefixSegment.ssm_snapshot_stride``). Smaller = finer restore
-                points but more snapshot blocks per prompt; the pool is shared
-                with the working state, so too small starves admission.
+                points but more reclaimable arena entries per prompt.
         """
         self.gpu_memory_util = gpu_memory_util
         self.num_layers = num_layers
@@ -519,8 +479,6 @@ class MemoryManager:
         # for prompts <= index_topk (the sparse top-k would select every key).
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
         self.ssm_cache_config = ssm_cache_config
-        self.max_working_ssm_slots = max_working_ssm_slots
-        self.max_snapshot_ssm_slots = max_snapshot_ssm_slots
         # Draft-chain length (mtp_k); a running seq borrows up to this many
         # transient checkpoint blocks during an MTP verify step (0 = MTP off).
         self.mtp_k = mtp_k
@@ -528,14 +486,9 @@ class MemoryManager:
         # whole pages and installed on the segment by
         # ``PrefixMemoryManager.init``; ignored without prefix caching.
         self.ssm_snapshot_stride_tokens = ssm_snapshot_stride_tokens
-        # Upper bound on the share of util-scaled free memory the SSM pools may
-        # occupy before the KV cache is sized. The snapshot pool (best-effort)
-        # is clamped to fit; the working pool (mandatory) is always honored.
-        # TODO: replace with a derived formula based on per_slot_bytes vs
-        #       kv_bytes_per_page so the split is model-aware.
-        self.ssm_pool_budget_frac: float = 0.5
         # Populated by :meth:`init`; ``None`` when the model is not hybrid.
         self.ssm_segment: Optional[SSMSegment] = None
+        self.cache_arena: Optional[CacheArena] = None
         self.segment: Union[Segment, PrefixSegment] = None
 
         # --- Persistent repetition-penalty mask pool --------------------
@@ -558,179 +511,192 @@ class MemoryManager:
         return self.ssm_cache_config is not None
 
     def consume_pending_ssm_restores(self) -> Dict[int, int]:
-        """No SSM prefix caching without a snapshot pool (base manager)."""
+        """No SSM prefix caching without prefix metadata (base manager)."""
         return {}
 
     def init(self, segment_cls=Segment, reserve_dummy_page: bool = False):
-        # Allocate SSM pools before sizing the KV cache so ``mem_get_info``
-        # reflects the true post-SSM free memory. Do not subtract an estimated
-        # byte count again afterward -- the tensors are already on CUDA.
-        self._init_ssm_segment_if_needed()
+        """Allocate one arena and register every persistent model cache."""
+        kv_layout = self._kv_cache_layout()
+        free_mem, _ = torch.cuda.mem_get_info()
+        kv_page_bytes = kv_layout.entry_bytes
+        arena_budget = int(free_mem * self.gpu_memory_util)
+        num_physical_pages = arena_budget // kv_page_bytes
+        if dist.is_initialized():
+            gathered = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(gathered, num_physical_pages)
+            num_physical_pages = min(gathered)
+        if num_physical_pages <= 0:
+            raise RuntimeError("not enough GPU memory for one cache arena page")
 
-        free_mem_size, _ = torch.cuda.mem_get_info()
-        num_max_pages = free_mem_size // self.get_sizeof_KV_per_page()
-        num_pages = int(num_max_pages * self.gpu_memory_util)
-
-        if not dist.is_initialized():
-            self.num_pages = num_pages
-        else:
-            num_pages_all = [None for _ in range(dist.get_world_size())]
-            dist.all_gather_object(num_pages_all, num_pages)
-            self.num_pages = min(num_pages_all)
-
-        # KV cache element precision: native FP8 for DeepSeek Sparse Attention
-        # (packed 656-byte MLA latent), otherwise the model dtype (e.g. bf16).
-        if self.mla_cache_fp8:
-            kv_dtype_str = "fp8_e4m3 (nope) + bf16 (rope)"
-        else:
-            kv_dtype_str = str(self.dtype).replace("torch.", "")
-        logger.info(
-            f"KV cache: {self.num_pages} pages ({self.page_size} tokens/page), "
-            f"dtype {kv_dtype_str}, "
-            f"{round(self.get_sizeof_KV_per_page()/(2**10*self.page_size),2)} KB (per token), "
-            f"{round(self.num_pages*self.get_sizeof_KV_per_page()/(2**30),2)} GB (total)"
+        device = torch.device("cuda", torch.cuda.current_device())
+        backing = torch.empty(
+            num_physical_pages * kv_page_bytes,
+            dtype=torch.uint8,
+            device=device,
         )
-
+        arena = CacheArena(backing, physical_page_bytes=kv_page_bytes)
+        kv_cache = arena.register_cache(kv_layout)
+        self.cache_arena = arena
+        self.num_pages = kv_cache.num_slots
         self.segment = segment_cls(
             self.num_layers,
-            self.num_pages,
             self.page_size,
             self.kv_head_num,
             self.kv_head_dim,
             self.use_mla,
+            kv_cache,
             index_head_dim=self.index_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
             mla_cache_fp8=self.mla_cache_fp8,
         )
 
-        # Reserve a dedicated dummy page for CUDA graph padding only when
-        # CUDA graphs are enabled.  This page is never returned to normal use,
-        # so real sequences will never overwrite it, and padding dummy tokens
-        # can safely write here.
-        self.dummy_page: int = self.segment.allocate() if reserve_dummy_page else None
+        if self.ssm_cache_config is not None:
+            cfg = self.ssm_cache_config
+            state_cache = arena.register_cache(self._ssm_cache_layout("ssm_state"))
+            snapshot_cache = arena.register_cache(
+                self._ssm_cache_layout("ssm_snapshot")
+            )
+            per_seq_blocks = 1 + self.mtp_k
+            # Slot 0 is the graph-padding state and is never allocatable. This
+            # checks viability only; it does not reserve a separate SSM pool.
+            usable_ssm_slots = max(0, state_cache.num_slots - 1)
+            if usable_ssm_slots < per_seq_blocks:
+                need = (per_seq_blocks + 1) * state_cache.entry_bytes
+                raise RuntimeError(
+                    f"cache arena needs >= {need / (1 << 30):.1f} GB to run "
+                    f"one request with MTP k={self.mtp_k}, but its total budget "
+                    f"is {backing.numel() / (1 << 30):.1f} GB. Raise "
+                    "--gpu-memory-util or --tp."
+                )
+            self.ssm_segment = SSMSegment(
+                cfg,
+                state_cache=state_cache,
+                snapshot_cache=snapshot_cache,
+            )
+        else:
+            usable_ssm_slots = None
+
+        self.dummy_page = self.segment.allocate() if reserve_dummy_page else None
+
+        cache_names = ", ".join(arena.allocator.cache_type_names)
+        logger.info(
+            "Cache arena: %.2f GB, physical page %.2f KB; registered caches: "
+            "%s; KV=%d pages (%d tokens/page, %.2f KB/token)",
+            backing.numel() / (1 << 30),
+            kv_page_bytes / 1024,
+            cache_names,
+            self.num_pages,
+            self.page_size,
+            kv_page_bytes / (1024 * self.page_size),
+        )
+        if usable_ssm_slots is not None:
+            logger.info(
+                "Shared SSM capacity: %d slots, MTP state demand=%d slots/request",
+                usable_ssm_slots,
+                1 + self.mtp_k,
+            )
 
         self.kv_cache_dtype = "auto"
         self.k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
         self.v_scale = self.k_scale
 
-    def _init_ssm_segment_if_needed(self) -> None:
-        """Allocate the SSM block pool + snapshot pool when the model needs them.
-
-        For hybrid GDN/Mamba models each pool block holds the full per-layer
-        recurrent state. We size one shared block pool from the memory budget,
-        decoupled from ``maxd``. Every consumer borrows from it:
-
-        * a running seq borrows 1 rolling block; an MTP verify step borrows a
-          few transient checkpoint blocks; a prefix-cached prefix keeps its
-          state in a ref-counted block borrowed from this same pool.
-        * ``num_ssm_blocks = min(budget/per_block, working_cap + cache_cap)``
-          where ``working_cap = maxd * (1 + mtp_k)`` (max blocks live seqs can
-          borrow at once) and ``cache_cap`` (== requested prefix-cache blocks)
-          is best-effort headroom for cached-prefix reuse. Floored at ``maxd``
-          (>=1 rolling block per running seq) or we raise a clear error.
-        """
-        if self.ssm_cache_config is None:
-            return
-        cfg = self.ssm_cache_config
-        per_block = cfg.per_slot_bytes()
-
-        free_mem, _ = torch.cuda.mem_get_info()
-        budget = int(free_mem * self.gpu_memory_util * self.ssm_pool_budget_frac)
-
-        maxd = self.max_working_ssm_slots
-        # Blocks a single running seq may hold at once: 1 rolling + mtp_k
-        # transient checkpoint blocks during an MTP verify (0 extra when MTP off).
-        per_seq_blocks = 1 + self.mtp_k
-        working_cap = maxd * per_seq_blocks
-        # Best-effort headroom for prefix-cached-prefix state blocks (borrowed
-        # from the same pool, ref-counted alongside their KV page).
-        cache_cap = max(self.max_snapshot_ssm_slots, 0)
-        block_cap = working_cap + cache_cap
-        # Budget-derived block count (like KV pages = free_mem*util / kv_page).
-        affordable_blocks = int(budget // per_block)
-        num_ssm_blocks = min(block_cap, affordable_blocks)
-        # Floor: at least one rolling block per concurrently-running seq, else
-        # the scheduler could admit a seq with no state block. If even that
-        # doesn't fit, fail early with an actionable message.
-        if num_ssm_blocks < maxd:
-            need = maxd * per_block
-            raise RuntimeError(
-                f"SSM block pool needs >= {need / (1 << 30):.1f} GB for {maxd} "
-                f"concurrent sequences ({maxd} blocks x "
-                f"{per_block / (1 << 20):.1f} MB) but only "
-                f"{budget / (1 << 30):.1f} GB SSM budget is available. Lower "
-                f"--maxd (currently {maxd}) or raise --tp to shrink per-rank state."
-            )
-
-        # Keep every TP rank's pool layout identical (state is sharded, not
-        # replicated, but the block *count* must match across ranks); free
-        # memory can differ slightly per rank, so agree on the minimum.
-        if dist.is_initialized():
-            gathered = [None for _ in range(dist.get_world_size())]
-            dist.all_gather_object(gathered, num_ssm_blocks)
-            num_ssm_blocks = min(gathered)
-
-        # Prefix-cache headroom actually available after the mandatory working
-        # capacity (informational; the pool is shared so cache borrows compete
-        # with live seqs at runtime and degrade gracefully when tight).
-        cache_headroom = max(0, num_ssm_blocks - working_cap)
-        if cache_headroom < cache_cap:
-            logger.warning(
-                "SSM prefix-cache headroom %d -> %d blocks to fit the memory "
-                "budget (%.1f GB free, %.0f%% util, %.0f%% SSM share); prefix-cache "
-                "state reuse is %s. Lower --maxd or raise --tp for the full pool.",
-                cache_cap,
-                cache_headroom,
-                free_mem / (1 << 30),
-                self.gpu_memory_util * 100,
-                self.ssm_pool_budget_frac * 100,
-                "reduced" if cache_headroom > 0 else "disabled",
-            )
-
-        self.ssm_segment = SSMSegment(
-            cfg,
-            num_blocks=num_ssm_blocks,
-        )
-        total = per_block * self.ssm_segment.num_blocks
-        logger.info(
-            "SSM cache: %d state blocks (max decode concurrency ~%d, prefix-cache "
-            "headroom ~%d blocks), %.2f KB/block, %.2f GB total (linear-attn "
-            "layers: %d, temporal dtype: %s, conv dtype: %s)",
-            self.ssm_segment.num_blocks,
-            num_ssm_blocks // per_seq_blocks if per_seq_blocks else num_ssm_blocks,
-            cache_headroom,
-            per_block / 1024,
-            total / (1 << 30),
-            cfg.num_layers,
-            cfg.dtype,
-            cfg.conv_state_dtype,
-        )
-
-    def get_sizeof_KV_per_page(self):  # Bytes
+    def _kv_cache_layout(self) -> CacheLayout:
+        """Describe all tensor banks that share one attention-cache page id."""
+        tensors = []
         if not self.use_mla:
-            # 2: K cache and V cache
-            return (
-                2
-                * self.num_layers
-                * self.page_size
-                * self.kv_head_num
-                * self.kv_head_dim
-                * get_dtype_bytes(self.dtype)
+            shape = (
+                self.num_layers,
+                self.page_size,
+                self.kv_head_num,
+                self.kv_head_dim,
+            )
+            tensors.extend(
+                (
+                    CacheTensorLayout("key", self.dtype, shape),
+                    CacheTensorLayout("value", self.dtype, shape),
+                )
             )
         else:
-            # Per-token MLA latent bytes. Native FP8 (DSA) uses the packed
-            # 656-byte layout (1 byte/elem, computed in Segment as mla_fp8_dim);
-            # otherwise bf16 kv_head_dim. The index key cache adds its own
-            # per-token bytes (bf16) on top.
             if self.mla_cache_fp8:
                 qk_rope = self.qk_rope_head_dim
                 kv_lora = self.kv_head_dim - qk_rope
-                num_tiles = kv_lora // _DSA_FP8_TILE
-                mla_bytes = kv_lora + num_tiles * 4 + qk_rope * 2  # 656, 1 B/elem
+                if kv_lora % _DSA_FP8_TILE:
+                    raise ValueError(
+                        f"kv_lora_rank {kv_lora} must be divisible by "
+                        f"{_DSA_FP8_TILE} for the DSA FP8 MLA cache"
+                    )
+                mla_dim = (
+                    kv_lora
+                    + (kv_lora // _DSA_FP8_TILE) * 4
+                    + qk_rope * get_dtype_bytes(self.dtype)
+                )
+                tensors.append(
+                    CacheTensorLayout(
+                        "mla",
+                        torch.float8_e4m3fn,
+                        (self.num_layers, self.page_size, 1, mla_dim),
+                    )
+                )
             else:
-                mla_bytes = self.kv_head_dim * get_dtype_bytes(self.dtype)
-            index_bytes = self.index_head_dim * get_dtype_bytes(self.dtype)
-            return self.num_layers * self.page_size * (mla_bytes + index_bytes)
+                tensors.append(
+                    CacheTensorLayout(
+                        "mla",
+                        self.dtype,
+                        (self.num_layers, self.page_size, self.kv_head_dim),
+                    )
+                )
+
+        if self.index_head_dim > 0:
+            if self.index_head_dim % _DSA_FP8_TILE:
+                raise ValueError(
+                    f"index_head_dim {self.index_head_dim} must be divisible by "
+                    f"{_DSA_FP8_TILE}"
+                )
+            index_fp8_bytes = self.index_head_dim + (
+                self.index_head_dim // _DSA_FP8_TILE
+            ) * 4
+            tensors.extend(
+                (
+                    CacheTensorLayout(
+                        "index_key",
+                        self.dtype,
+                        (self.num_layers, self.page_size, self.index_head_dim),
+                    ),
+                    CacheTensorLayout(
+                        "index_key_fp8",
+                        torch.uint8,
+                        (
+                            self.num_layers,
+                            self.page_size * index_fp8_bytes,
+                        ),
+                    ),
+                )
+            )
+        return CacheLayout("kv_cache", tuple(tensors))
+
+    def _ssm_cache_layout(self, name: str) -> CacheLayout:
+        cfg = self.ssm_cache_config
+        if cfg is None:
+            raise RuntimeError("cannot register SSM cache without its config")
+        return CacheLayout(
+            name,
+            (
+                CacheTensorLayout(
+                    "conv_state",
+                    cfg.conv_state_dtype,
+                    (cfg.num_layers, *cfg.conv_state_shape_per_slot()),
+                ),
+                CacheTensorLayout(
+                    "temporal_state",
+                    cfg.dtype,
+                    (cfg.num_layers, *cfg.temporal_state_shape_per_slot()),
+                ),
+            ),
+            prefer_high=True,
+        )
+
+    def get_sizeof_KV_per_page(self):  # Bytes
+        return self._kv_cache_layout().entry_bytes
 
     def store_index_k(
         self,
@@ -823,9 +789,8 @@ class MemoryManager:
         if len(seqs) != len(seq_lens):
             raise ValueError((len(seqs), len(seq_lens)))
         for seq, seq_len in zip(seqs, seq_lens):
-            num_page = (
-                (int(seq_len) + self.page_size - 1) // self.page_size
-                - len(seq.page_table)
+            num_page = (int(seq_len) + self.page_size - 1) // self.page_size - len(
+                seq.page_table
             )
             for _ in range(num_page):
                 seq.page_table.append(self.segment.allocate())
@@ -835,8 +800,7 @@ class MemoryManager:
         return
 
     def free(self, seq: GenerationSequence):
-        for page_num in seq.page_table:
-            self.segment.free(page_num)
+        self.segment.free_many(seq.page_table)
         self.free_ssm_slot(seq)
         self.free_rep_slot(seq)
 
@@ -860,9 +824,7 @@ class MemoryManager:
         safety valve rather than a steady-state path.
         """
         old_rows = self._rep_pool.shape[0]
-        new_rows = torch.ones(
-            (extra, self.vocab_size), dtype=self.dtype, device="cuda"
-        )
+        new_rows = torch.ones((extra, self.vocab_size), dtype=self.dtype, device="cuda")
         self._rep_pool = torch.cat([self._rep_pool, new_rows], dim=0)
         self._rep_free_slots.extend(range(old_rows, old_rows + extra))
 
@@ -936,12 +898,14 @@ class MemoryManager:
         # 2) Gather the per-batch rows in a single op. Seqs with penalty 1.0
         #    (or no slot) map to the row-0 all-ones sentinel.
         batch_slots = [
-            seq.rep_slot
-            if (
-                getattr(seq, "repetition_penalty", 1.0) != 1.0
-                and seq.rep_slot is not None
+            (
+                seq.rep_slot
+                if (
+                    getattr(seq, "repetition_penalty", 1.0) != 1.0
+                    and seq.rep_slot is not None
+                )
+                else 0
             )
-            else 0
             for seq in seqs
         ]
         batch_slots_t = async_tensor_h2d(batch_slots, torch.long, "cuda", True)
@@ -954,26 +918,31 @@ class MemoryManager:
     # schedule of a sequence (mirroring how KV pages are pre-allocated) and
     # ``free_ssm_slot`` when the sequence finishes or is aborted/preempted.
 
-    def allocate_ssm_slot(self, seq: GenerationSequence) -> None:
+    def allocate_ssm_slot(self, seq: GenerationSequence) -> bool:
         if self.ssm_segment is None:
-            return
+            return True
         if self.mtp_k > 0:
             # MTP on: give the sequence a fixed 1+k block table (column 0 is
             # rolling state; the remaining columns are verify checkpoints).
             if seq.ssm_block_table is not None:
-                return
+                return True
             bt = self.ssm_segment.allocate_block_table(1 + self.mtp_k)
             if bt is None:
-                return  # pool exhausted; scheduler gates admission on this
+                return False  # arena exhausted; scheduler gates admission
             seq.ssm_block_table = bt
-            # Mirror column 0 into the scalar slot so any legacy single-slot
-            # reader (e.g. prefix-cache snapshot restore) still works.
+            # Column 0 is also the sequence's committed-state slot, shared by
+            # ordinary decode and prefix-cache snapshot restore.
             seq.ssm_state_slot = bt[0]
             seq.ssm_num_accepted = 1
+            return True
         else:
             if seq.ssm_state_slot is not None:
-                return
-            seq.ssm_state_slot = self.ssm_segment.allocate_working()
+                return True
+            slot = self.ssm_segment.allocate_block()
+            if slot is None:
+                return False
+            seq.ssm_state_slot = slot
+            return True
 
     def free_ssm_slot(self, seq: GenerationSequence) -> None:
         if self.ssm_segment is None:
@@ -986,7 +955,7 @@ class MemoryManager:
             return
         if seq.ssm_state_slot is None:
             return
-        self.ssm_segment.free_working(seq.ssm_state_slot)
+        self.ssm_segment.free_block(seq.ssm_state_slot)
         seq.ssm_state_slot = None
 
     def get_num_free_pages(self):
@@ -1056,7 +1025,7 @@ def _ensure_page_hash(seq: GenerationSequence, page_size: int, page_idx: int) ->
     while len(cache) <= page_idx:
         i = len(cache)
         prev = cache[i - 1] if i > 0 else _PREFIX_HASH_SEED
-        page_tokens = tuple(src[i * page_size:(i + 1) * page_size])
+        page_tokens = tuple(src[i * page_size : (i + 1) * page_size])
         cache.append(hash((prev, page_tokens)))
     return cache[page_idx]
 
@@ -1099,34 +1068,28 @@ class PrefixMemoryManager(MemoryManager):
     def init(self, reserve_dummy_page: bool = False):
         super().init(segment_cls=PrefixSegment, reserve_dummy_page=reserve_dummy_page)
         self.segment.ssm_segment = self.ssm_segment
-        # Watermark for lazy cached-state reservation: the cache may only use
-        # blocks *beyond* the full concurrency budget (``maxd * (1 + mtp_k)``),
-        # which is exactly how the pool was sized (``block_cap = working_cap +
-        # cache_cap`` in ``_init_ssm_segment_if_needed``). Without this the
-        # cache eats the working budget, the scheduler's admission gate (needs
-        # ``1 + mtp_k`` free blocks per new sequence) starves, and the running
-        # batch collapses to one sequence with a full wait queue.
-        self.segment.ssm_reserve_floor = (
-            self.max_working_ssm_slots * (1 + self.mtp_k)
-            if self.ssm_segment is not None
-            else 0
+        self.cache_arena.allocator.set_evictor(
+            "kv_cache", self.segment.evict_arena_slot
         )
+        if self.ssm_segment is not None:
+            self.cache_arena.allocator.set_reclaimer(
+                "ssm_snapshot", self.segment.reclaim_one_ssm_snapshot
+            )
         # Recurrent-state caching granularity for this run. Rounded DOWN to
         # whole pages (only page boundaries can carry a snapshot) with a floor
-        # of one page; a request below ``page_size`` therefore degrades to
-        # per-page snapshots, which is the configuration that drained the block
-        # pool (see ``PrefixSegment.ssm_snapshot_stride``), so say so out loud.
+        # of one page. A request below ``page_size`` therefore degrades to
+        # per-page snapshots, which increases state-copy work and arena churn.
         stride_tokens = int(self.ssm_snapshot_stride_tokens)
         if stride_tokens < self.page_size:
             logger.warning(
                 "ssm_snapshot_stride_tokens=%d is below page_size=%d; clamping to "
-                "one page. Per-page recurrent-state caching reserves a state block "
-                "per %d tokens of prompt and can starve sequence admission.",
-                stride_tokens, self.page_size, self.page_size,
+                "one page. Recurrent-state caching may materialize a reclaimable "
+                "snapshot every %d prompt tokens.",
+                stride_tokens,
+                self.page_size,
+                self.page_size,
             )
-        self.segment.ssm_snapshot_stride = max(
-            1, stride_tokens // self.page_size
-        )
+        self.segment.ssm_snapshot_stride = max(1, stride_tokens // self.page_size)
         if self.ssm_segment is not None:
             logger.info(
                 "SSM snapshot stride: %d tokens (%d pages)",
@@ -1139,9 +1102,9 @@ class PrefixMemoryManager(MemoryManager):
         self.num_hit_pages = 0
 
         # PP>1 only: SSM snapshot restores performed this scheduling iteration,
-        # keyed by seq_id -> snapshot-pool slot. Each PP follower owns a
+        # keyed by seq_id -> snapshot arena slot. Each PP follower owns a
         # *different* slice of the GDN layers on its own GPU, so the restore
-        # (snapshot->working ``copy_state``) the driver runs on rank-0's pools
+        # (snapshot->working ``copy_state``) the driver runs on rank-0's views
         # must be replayed on every stage. The driver records the restores here
         # and the payload builder ships them; ``consume`` clears the buffer so
         # each is shipped exactly once.
@@ -1209,12 +1172,16 @@ class PrefixMemoryManager(MemoryManager):
         them.
         """
         while seq.computed_token_num > 0:
-            boundary_page = seq.page_table[
-                seq.computed_token_num // self.page_size - 1
-            ]
+            boundary_page = seq.page_table[seq.computed_token_num // self.page_size - 1]
             snap_slot = self._valid_snapshot_slot(boundary_page)
             if snap_slot is not None:
-                self.allocate_ssm_slot(seq)
+                if not self.allocate_ssm_slot(seq):
+                    # The prefix remains cached, but without a private mutable
+                    # state slot this request must wait for arena capacity.
+                    hit_pages = seq.computed_token_num // self.page_size
+                    seq.computed_token_num = 0
+                    self.num_hit_pages = max(0, self.num_hit_pages - hit_pages)
+                    return
                 self.ssm_segment.copy_state(
                     "snapshot", snap_slot, "working", seq.ssm_state_slot
                 )
@@ -1269,9 +1236,7 @@ class PrefixMemoryManager(MemoryManager):
         ``register_decode_boundary`` (from the scheduler's finalize hook).
         """
         for seq in seqs:
-            seq_cacheable = cacheable and not getattr(
-                seq, "_mtp_async_pending", False
-            )
+            seq_cacheable = cacheable and not getattr(seq, "_mtp_async_pending", False)
             len_page_table = len(seq.page_table)
             num_page = (
                 seq.seq_len + self.page_size - 1
@@ -1302,6 +1267,8 @@ class PrefixMemoryManager(MemoryManager):
         zeros and must never be restored onto a non-empty prefix."""
         if not self.segment.page2ssm_snapshot_valid[page_num]:
             return None
+        if page_num in self.segment._ssm_snapshot_lru:
+            self.segment._ssm_snapshot_lru.move_to_end(page_num)
         return self.segment.page2ssm_snapshot[page_num]
 
     def get_cache_hit_rate(self):
@@ -1326,12 +1293,11 @@ class PrefixSegment(Segment):
     implementation could silently share KV across two distinct prefixes
     whose ``hash()`` happened to match.
 
-    SSM extension: for every cached page we keep an optional snapshot slot
-    in the partner :class:`SSMSegment`. When a sequence allocates a page
-    in :meth:`PrefixMemoryManager.pre_allocate_page`, a snapshot slot is
-    reserved alongside; the GDN layer fills it after the page boundary is
-    crossed during prefill. On a cache hit the snapshot is copied back into
-    the requesting sequence's working slot.
+    SSM extension: every cached page may reference a snapshot entry in the
+    partner :class:`SSMSegment`. The entry is borrowed lazily only when a
+    prefill forward reaches an eligible page boundary, and remains reclaimable
+    under arena pressure. On a cache hit the snapshot is copied back into the
+    requesting sequence's working entry.
     """
 
     # Set by :class:`PrefixMemoryManager.init`.
@@ -1342,19 +1308,11 @@ class PrefixSegment(Segment):
     # :meth:`PrefixMemoryManager.init` from ``--ssm-snapshot-stride-tokens``;
     # the value here is only a floor for a segment built outside that path.
     #
-    # This used to be every cacheable page: ``allocate`` reserved one state
-    # block per 16-token page, so a single 2.5k-token prompt reserved ~156
-    # blocks out of a ~1800-block pool. Ten such requests drained it, and
-    # since new admissions need ``1 + mtp_k`` blocks from the same pool the
-    # scheduler then stalled with #run=1 and 120+ queued (observed on
-    # MMLU-Pro 5-shot). Worse, those reservations were nearly all dead
-    # weight: a state is only ever *written* at a chunk end, so the interior
-    # boundaries kept a reserved-but-zeroed block forever and every hit was
-    # rejected on the SSM half -> 0% cache hit rate. Coarse + lazy (see
-    # ``reserve_ssm_snapshot``) fixes both: ~10 blocks per prompt, and only
-    # for boundaries a chunk actually lands on. Restoring from a coarse
-    # boundary means recomputing at most ``stride`` pages of tail, trading a
-    # bounded amount of recompute for a much smaller snapshot pool.
+    # Only boundaries that a prefill chunk actually reaches are materialized;
+    # reserving entries at allocation time would leave most of them unwritten.
+    # A coarse stride reduces state-copy traffic and metadata. It is not a
+    # capacity partition: every materialized snapshot freely borrows an arena
+    # extent and remains pressure-reclaimable.
     ssm_snapshot_stride: int = 1
 
     def __init__(self, *args, **kwargs):
@@ -1368,15 +1326,46 @@ class PrefixSegment(Segment):
         # SSM snapshot slot id per physical page; ``None`` if no snapshot
         # was captured (e.g. when the SSM cache is disabled or the boundary
         # never had a chance to snapshot during prefill).
-        self.page2ssm_snapshot: List[Optional[int]] = [None for _ in range(self.num_pages)]
+        self.page2ssm_snapshot: List[Optional[int]] = [
+            None for _ in range(self.num_pages)
+        ]
         # Whether the snapshot slot actually holds a *written* recurrent state.
         # A slot only ever gets written for the boundary a prefill chunk *ends*
         # on (see ``InputData._cal_ssm_metadata``); this flag separates
         # "reserved" from "filled" so the restore path never grafts a zeroed
         # state (== h_0) onto a non-empty prefix.
-        self.page2ssm_snapshot_valid: List[bool] = [False for _ in range(self.num_pages)]
+        self.page2ssm_snapshot_valid: List[bool] = [
+            False for _ in range(self.num_pages)
+        ]
+        self._ssm_snapshot_lru: "OrderedDict[int, None]" = OrderedDict()
 
     # --- public API ---------------------------------------------------------
+
+    def evict_arena_slot(self, page_num: int) -> None:
+        """Invalidate an unpinned KV entry before another arena type reuses it."""
+        if self.page_ref_num[page_num] != 0:
+            raise RuntimeError(
+                f"arena attempted to evict pinned KV page {page_num} "
+                f"(refs={self.page_ref_num[page_num]})"
+            )
+        page_hash = self.page2hash[page_num]
+        if page_hash and self.hash2page.get(page_hash) == page_num:
+            del self.hash2page[page_hash]
+        self._release_snapshot_for(page_num)
+        self.page2hash[page_num] = 0
+        self.page2canary[page_num] = None
+        self.page2ssm_snapshot[page_num] = None
+        self.page2ssm_snapshot_valid[page_num] = False
+
+    def reclaim_one_ssm_snapshot(self) -> bool:
+        """Release the least-recently-used snapshot under arena pressure."""
+        while self._ssm_snapshot_lru:
+            page_num, _ = self._ssm_snapshot_lru.popitem(last=False)
+            if self.page2ssm_snapshot[page_num] is None:
+                continue
+            self._release_snapshot_for(page_num)
+            return True
+        return False
 
     def update(self, seq: GenerationSequence, n_tokens: int, page_num: int) -> None:
         """Register a hash for ``page_num`` after its KV was filled in decode."""
@@ -1407,7 +1396,9 @@ class PrefixSegment(Segment):
         self.page_ref_num[page_num] += 1
         return page_num
 
-    def allocate(self, seq: Optional[GenerationSequence] = None, n_tokens: Optional[int] = None):
+    def allocate(
+        self, seq: Optional[GenerationSequence] = None, n_tokens: Optional[int] = None
+    ):
         """Allocate a page; optionally register a prefix hash for it.
 
         Signature is overloaded:
@@ -1460,24 +1451,36 @@ class PrefixSegment(Segment):
             # the ref-count hitting zero (its ``hash2page`` entry stays
             # registered until the page is re-minted for a *different*
             # prompt by :meth:`allocate`). The SSM snapshot must follow
-            # the same lifetime — otherwise a serial re-use of a cached
+            # the same lifetime — otherwise serial reuse of a cached
             # prompt would always lose the snapshot half of the hit and
-            # ``_rollback_to_last_ssm_hit`` would drop the KV half too.
+            # ``_restore_ssm_working_state`` would drop the KV half too.
             self.id_allocator.free(page_num)
 
+    def free_many(self, page_nums) -> None:
+        """Drop a request's KV references and batch-release newly unpinned pages."""
+        released = []
+        for value in page_nums:
+            page_num = int(value)
+            assert self.page_ref_num[page_num] > 0
+            self.page_ref_num[page_num] -= 1
+            if self.page_ref_num[page_num] == 0:
+                released.append(page_num)
+        if not released:
+            return
+        self.id_allocator.free_many(released)
+
     def reserve_ssm_snapshot(self, page_num: int, n_tokens: int) -> Optional[int]:
-        """Lazily reserve the cached-state block for ``page_num``, or ``None``.
+        """Lazily borrow a cached-state entry for ``page_num``, or ``None``.
 
         Called from the *write* path (``InputData._cal_ssm_metadata``) for the
-        boundary a prefill chunk just landed on, so a block is only ever taken
+        boundary a prefill chunk just landed on, so an entry is only ever taken
         for a boundary that will actually hold a state. Returns ``None`` when:
 
         * the boundary is not on the coarse ``ssm_snapshot_stride`` grid,
         * the page is not cacheable (nothing could ever hit it), or
-        * the pool is at its watermark -- cached states must never eat the
-          blocks that live sequences need for their rolling state, otherwise
-          the scheduler's admission gate (which needs ``1 + mtp_k`` free blocks
-          per new sequence) starves and the batch collapses to one sequence.
+        * no arena extent is currently available. Snapshots are reclaimable;
+          live KV/working-state pressure can evict them later without a fixed
+          watermark or reserved sub-pool.
         """
         if self.ssm_segment is None:
             return None
@@ -1488,13 +1491,12 @@ class PrefixSegment(Segment):
         slot = self.page2ssm_snapshot[page_num]
         if slot is not None:
             return slot
-        if self.ssm_segment.num_free_blocks() <= self.ssm_reserve_floor:
-            return None
         slot = self.ssm_segment.allocate_snapshot()
         if slot is None:
             return None
         self.page2ssm_snapshot[page_num] = slot
         self.page2ssm_snapshot_valid[page_num] = False
+        self._ssm_snapshot_lru[page_num] = None
         return slot
 
     def _release_snapshot_for(self, page_num: int) -> None:
@@ -1504,4 +1506,5 @@ class PrefixSegment(Segment):
         if snap_slot is not None:
             self.ssm_segment.free_snapshot(snap_slot)
             self.page2ssm_snapshot[page_num] = None
+            self._ssm_snapshot_lru.pop(page_num, None)
         self.page2ssm_snapshot_valid[page_num] = False

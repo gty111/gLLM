@@ -18,7 +18,6 @@ from gllm.layers.ops.fla.l2norm import l2norm_fwd
 from gllm.layers.ops.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
-    input_guard,
 )
 
 CHUNK_SIZE = 64
@@ -75,7 +74,6 @@ def chunk_gated_delta_rule_fwd(
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
     @staticmethod
-    @input_guard
     @autocast_custom_fwd
     def forward(
         ctx,
@@ -194,6 +192,24 @@ def chunk_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
+    # The autograd function used to carry ``@input_guard``, which calls
+    # ``contiguous()`` on *every* tensor argument. That is invalid for the
+    # arena-backed ``initial_state``: the recurrent kernel updates it in place,
+    # so materializing a compact temporary silently discards every state update
+    # and also erases its physical slot stride. Keep the read-only compute
+    # tensors contiguous as before, but preserve the state view itself.
+    q, k, v, g, beta = (
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g.contiguous(),
+        beta.contiguous(),
+    )
+    if initial_state_indices is not None:
+        initial_state_indices = initial_state_indices.contiguous()
+    if cu_seqlens is not None:
+        cu_seqlens = cu_seqlens.contiguous()
+
     assert q.dtype == k.dtype == v.dtype
     assert (
         q.dtype != torch.float32

@@ -4,6 +4,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
+from gllm.distributed.parallel_state import get_pp_size
 from gllm.runtime.forward_metadata import (
     ForwardMetadataPlan,
     MetadataMaterialization,
@@ -111,7 +112,7 @@ class InputData:
                 self.has_initial_state_per_seq = torch.zeros(
                     max_running_seqs, dtype=torch.bool, device=device
                 )
-                # Snapshot-pool slot id the GDN layer should write into AT
+                # Snapshot arena slot the GDN layer should write into AT
                 # END OF THIS FORWARD for each seq, or -1 to skip. Populated
                 # by ``_cal_ssm_metadata`` from ``PrefixSegment.
                 # page2ssm_snapshot`` whenever the seq's prefill ends
@@ -247,7 +248,7 @@ class InputData:
           0``. This covers both chunked-prefill continuation and prefix-cache
           hits where ``PrefixMemoryManager`` already copied the snapshot back
           into the working slot.
-        * ``ssm_snapshot_write_slot_per_seq[i]`` = snapshot-pool slot id to
+        * ``ssm_snapshot_write_slot_per_seq[i]`` = snapshot arena slot id to
           which the GDN layer should copy this seq's working state at the
           end of this forward, or -1 if no snapshot is wanted. Populated
           only for prefill rows whose chunk ends exactly on a page boundary
@@ -258,6 +259,7 @@ class InputData:
         slots = np.empty(bs, dtype=np.int32)
         has_init = np.empty(bs, dtype=np.bool_)
         snap_targets = np.full(bs, -1, dtype=np.int32)
+        snapshot_candidates = []
 
         # Pull the snapshot pointer table once; ``PrefixSegment`` is the
         # only Segment subclass that owns ``page2ssm_snapshot``. The
@@ -273,9 +275,9 @@ class InputData:
             has_init[i] = seq.computed_token_num > 0
             # Snapshot timing: prefill chunk landing on a page boundary. The
             # state block is reserved HERE, lazily, and only for boundaries on
-            # the coarse ``ssm_snapshot_stride`` grid -- reserving one per
-            # cacheable page drained the shared block pool and starved sequence
-            # admission (see ``PrefixSegment.reserve_ssm_snapshot``). Decode rows
+            # the coarse ``ssm_snapshot_stride`` grid. Entries are borrowed
+            # dynamically from the shared arena and can later be reclaimed
+            # under KV/working-state pressure. Decode rows
             # skip this branch since ``computed_prompt`` flips True before any
             # decode token is emitted (see GenerationSequence), and ``reserve`` is None for
             # non-prefix-cache runs.
@@ -288,18 +290,23 @@ class InputData:
             if page_idx < 0 or page_idx >= len(seq.page_table):
                 continue
             page_num = seq.page_table[page_idx]
-            snap_slot = reserve(page_num, end_tokens)
-            if snap_slot is not None:
-                snap_targets[i] = snap_slot
-                # This forward WILL write the recurrent state for ``page_num``
-                # into ``snap_slot`` (see ``Qwen3_5GatedDeltaNet.
-                # _maybe_snapshot_state``). Mark the boundary as carrying a
-                # real snapshot so later prefix-cache hits may restore it.
-                # CPU bookkeeping is safe even under overlap scheduling: every
-                # SSM read/write is serialized on the GPU stream, so the
-                # restore copy for any future request is necessarily enqueued
-                # after this write completes.
-                segment.page2ssm_snapshot_valid[page_num] = True
+            if get_pp_size() == 1:
+                # Overlap scheduling prebuilds CPU metadata for a future batch.
+                # That batch may subsequently be compacted or discarded after
+                # the preceding async completion retires some rows. Reserving a
+                # snapshot here would therefore publish storage for a forward
+                # that might never launch. Keep only the allocation-free intent;
+                # ``copy_to_input_buffer`` materializes it immediately before
+                # H2D, after the prefetched batch is known to be executable.
+                snapshot_candidates.append((i, page_num, end_tokens))
+            else:
+                # PP followers need the driver's slot assignment in the
+                # scheduling payload, so retain the synchronous preparation
+                # protocol until PP supports overlap scheduling.
+                snap_slot = reserve(page_num, end_tokens)
+                if snap_slot is not None:
+                    snap_targets[i] = snap_slot
+                    segment.page2ssm_snapshot_valid[page_num] = True
 
         self.ssm_state_slot_per_seq_cpu = torch.as_tensor(
             slots, device="cpu"
@@ -310,6 +317,8 @@ class InputData:
         self.ssm_snapshot_write_slot_per_seq_cpu = (
             torch.as_tensor(snap_targets, device="cpu").pin_memory()
         )
+        self._ssm_snapshot_candidates = tuple(snapshot_candidates)
+        self._ssm_snapshot_writes_pending = ()
 
         # Spec-decode 2D block table plus accepted count for hybrid MTP.
         # Built only when at least one seq carries a ``ssm_block_table`` (MTP on).
@@ -342,6 +351,7 @@ class InputData:
 
     def copy_to_input_buffer(self):
         assert self.use_buffer
+        self._materialize_ssm_snapshot_targets()
         self.tokens[: self.tokens_cpu.shape[0]].copy_(
             self.tokens_cpu, non_blocking=True
         )
@@ -406,6 +416,51 @@ class InputData:
         self.cal_input(seqs)
         self.copy_to_input_buffer()
 
+    def _materialize_ssm_snapshot_targets(self) -> None:
+        """Reserve snapshot slots only for a batch that will really launch.
+
+        CPU metadata may live speculatively in the overlap worker. Allocation
+        and cache-validity are stateful, so they cannot happen during that
+        speculative phase. This method runs at the H2D boundary: no scheduler
+        allocation can interleave before the model forward is enqueued.
+        """
+        candidates = getattr(self, "_ssm_snapshot_candidates", ())
+        if not self.use_ssm_cache or not candidates:
+            return
+        segment = getattr(self.memory_manager, "segment", None)
+        reserve = getattr(segment, "reserve_ssm_snapshot", None)
+        if reserve is None:
+            self._ssm_snapshot_candidates = ()
+            return
+
+        targets = self.ssm_snapshot_write_slot_per_seq_cpu
+        pending = []
+        for row, page_num, end_tokens in candidates:
+            slot = reserve(page_num, end_tokens)
+            if slot is None:
+                continue
+            targets[row] = slot
+            pending.append((page_num, slot))
+        self._ssm_snapshot_candidates = ()
+        self._ssm_snapshot_writes_pending = tuple(pending)
+
+    def mark_ssm_snapshot_writes_enqueued(self) -> None:
+        """Publish snapshot validity after the GDN copy has been enqueued."""
+        pending = getattr(self, "_ssm_snapshot_writes_pending", ())
+        if not pending:
+            return
+        segment = getattr(self.memory_manager, "segment", None)
+        if segment is None:
+            self._ssm_snapshot_writes_pending = ()
+            return
+        for page_num, slot in pending:
+            # A mapping mismatch means arena pressure reclaimed the intent
+            # before launch. Never publish a different tenant as this page's
+            # recurrent state.
+            if segment.page2ssm_snapshot[page_num] == slot:
+                segment.page2ssm_snapshot_valid[page_num] = True
+        self._ssm_snapshot_writes_pending = ()
+
     def mark_gpu_buffer_shapes(
         self,
         *,
@@ -462,6 +517,8 @@ class InputData:
             cache[key] = shapes
         for name, tensor in shapes.items():
             setattr(self, name, tensor)
+        self._ssm_snapshot_candidates = ()
+        self._ssm_snapshot_writes_pending = ()
         self.seqs = seqs
         self.embedding_size = 0
         # mrope buffer is filled by the prep, but the captured graphs read the
@@ -541,6 +598,8 @@ class InputData:
         "ssm_state_slot_per_seq_cpu",
         "has_initial_state_per_seq_cpu",
         "ssm_snapshot_write_slot_per_seq_cpu",
+        "_ssm_snapshot_candidates",
+        "_ssm_snapshot_writes_pending",
     )
     _PREBUILT_MLA_ATTRS = (
         "num_actual_tokens",
@@ -712,7 +771,7 @@ class InputData:
         return self.ssm_num_accepted[: cpu.shape[0]]
 
     def get_ssm_snapshot_write_slot_per_seq(self):
-        """Per-seq snapshot-pool slot id to write at end of forward (-1=skip).
+        """Per-seq snapshot arena slot to write at end of forward (-1=skip).
 
         Returns ``None`` when SSM cache is disabled or when there are no
         rows to write (no enable_prefix_caching, no hybrid model). Layers
