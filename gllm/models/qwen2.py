@@ -9,6 +9,7 @@ from gllm.distributed.parallel_state import (
     is_last_pp_rank,
 )
 from gllm.runtime.input_data import InputData
+from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.attention.base import AttentionLayerBase
 from gllm.layers.attention.qkv import QKVAttention
@@ -120,6 +121,8 @@ class Qwen2Attention(AttentionLayerBase):
 
 
 class Qwen2DecoderLayer(nn.Module):
+    supports_piecewise_cuda_graph = True
+
     def __init__(
         self, layer_id: int, config, attention_type=Qwen2Attention, mlp_type=Qwen2MLP
     ):
@@ -140,7 +143,9 @@ class Qwen2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(input_data, hidden_states)
+        hidden_states, residual = piecewise_dynamic_tensor(
+            lambda x: self.self_attn(input_data, x), hidden_states, residual
+        )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)

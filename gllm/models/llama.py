@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from gllm.runtime.input_data import InputData
+from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.attention.base import AttentionLayerBase
 from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import RMSNorm
@@ -101,6 +102,7 @@ class LlamaAttention(AttentionLayerBase):
 
 
 class LlamaDecoderLayer(nn.Module):
+    supports_piecewise_cuda_graph = True
 
     def __init__(self, layer_id: int, config):
         super().__init__()
@@ -123,7 +125,9 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # self attention
-        hidden_states = self.self_attn(input_data, hidden_states)
+        hidden_states, residual = piecewise_dynamic_tensor(
+            lambda x: self.self_attn(input_data, x), hidden_states, residual
+        )
 
         # post attention layernorm
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)

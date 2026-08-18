@@ -272,6 +272,8 @@ class ModelRunner:
         disable_cuda_graph: bool,
         max_cuda_graph_bs: int,
         model_max_length: int,
+        piecewise_cuda_graph: Optional[bool] = True,
+        max_piecewise_cuda_graph_tokens: Optional[int] = None,
         mm_processor_min_pixels: int = None,
         mm_processor_max_pixels: int = None,
         skip_visual: bool = False,
@@ -307,6 +309,10 @@ class ModelRunner:
         self.enable_prefix_caching = enable_prefix_caching
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size
+        self._piecewise_cuda_graph_cfg = piecewise_cuda_graph
+        self._max_piecewise_cuda_graph_tokens_cfg = (
+            max_piecewise_cuda_graph_tokens
+        )
         # Recurrent-state (GDN/Mamba) prefix-cache granularity, in tokens.
         # Only meaningful for hybrid models with prefix caching on.
         self.ssm_snapshot_stride_tokens = ssm_snapshot_stride_tokens
@@ -577,51 +583,65 @@ class ModelRunner:
         requested = self.attention_backend
         capability = torch.cuda.get_device_capability()
 
-        fa4_error = None
-
-        if requested in ("auto", "fa4"):
-            if capability[0] not in (9, 10, 11):
-                fa4_error = (
+        # Instantiate the preferred backend and, for FlashInfer, launch both
+        # TRT-LLM Gen kernels. Some wheels import successfully but contain no
+        # cubin for the current GPU; only a real launch detects that condition.
+        preference = {
+            "auto": ("fa4", "flashinfer"),
+            "fa4": ("fa4", "flashinfer"),
+            "flashinfer": ("flashinfer", "fa4"),
+        }[requested]
+        backend_errors = {}
+        validated_backend = None
+        resolved = None
+        for candidate in preference:
+            if candidate == "fa4" and capability[0] not in (9, 10, 11):
+                backend_errors[candidate] = (
                     f"paged KV is unsupported on SM{capability[0]}{capability[1]}"
                 )
-            else:
-                try:
-                    from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
-                except Exception as exc:
-                    fa4_error = str(exc)
-
-        resolved = requested
-        if requested == "auto" or (requested == "fa4" and fa4_error is not None):
-            resolved = "fa4" if fa4_error is None else "flashinfer"
-
-        if resolved == "flashinfer":
+                continue
+            candidate_backend = None
             try:
-                from flashinfer.decode import (  # noqa: F401
-                    trtllm_batch_decode_with_kv_cache,
+                candidate_backend = create_qkv_attention_backend(
+                    candidate,
+                    self.model_max_length,
+                    self.max_running_seqs,
                 )
-                from flashinfer.prefill import (  # noqa: F401
-                    BatchPrefillWithRaggedKVCacheWrapper,
-                    trtllm_batch_context_with_kv_cache,
-                )
-            except Exception as exc:
-                detail = f" after FA4 was rejected ({fa4_error})" if fa4_error else ""
-                raise RuntimeError(
-                    "attention backend resolved to 'flashinfer'"
-                    f"{detail}, but FlashInfer could not be imported: {exc}"
-                ) from exc
+                if candidate == "flashinfer":
+                    candidate_backend.smoke_test(self.page_size)
+            except Exception as exc:  # noqa: BLE001 - backend probe boundary
+                backend_errors[candidate] = str(exc)
+                del candidate_backend
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+            validated_backend = candidate_backend
+            resolved = candidate
+            break
 
+        if validated_backend is None or resolved is None:
+            details = "; ".join(
+                f"{name}: {backend_errors.get(name, 'not attempted')}"
+                for name in preference
+            )
+            raise RuntimeError(
+                "No runnable paged-QKV attention backend was found "
+                f"(requested {requested!r}; {details})"
+            )
+
+        self._validated_qkv_attention_backend = validated_backend
         if requested == "auto":
             logger.info(
                 "Attention backend 'auto' resolved to %r during startup "
-                "configuration validation.",
+                "kernel validation.",
                 resolved,
             )
         elif resolved != requested:
             logger.warning(
-                "Attention backend %r is unavailable (%s); resolved startup "
-                "configuration to %r.",
+                "Attention backend %r failed startup kernel validation (%s); "
+                "falling back to %r.",
                 requested,
-                fa4_error,
+                backend_errors.get(requested),
                 resolved,
             )
 
@@ -784,11 +804,15 @@ class ModelRunner:
         self.qkv_attention_backend = None
         qkv_attention_layers = find_qkv_attention_layers(self.model)
         if qkv_attention_layers:
-            self.qkv_attention_backend = create_qkv_attention_backend(
-                self.attention_backend,
-                self.model_max_length,
-                self.max_running_seqs,
+            self.qkv_attention_backend = getattr(
+                self, "_validated_qkv_attention_backend", None
             )
+            if self.qkv_attention_backend is None:
+                self.qkv_attention_backend = create_qkv_attention_backend(
+                    self.attention_backend,
+                    self.model_max_length,
+                    self.max_running_seqs,
+                )
             num_bound_attention_layers = bind_qkv_attention_backend(
                 qkv_attention_layers, self.qkv_attention_backend
             )
@@ -859,15 +883,40 @@ class ModelRunner:
         # (seed_tok:int, seed_hidden:tensor[H]) across consecutive steps; a seq
         # missing from it (fresh admission / batch reshuffle) is seeded by one
         # padded verify-shaped bootstrap before joining the fused steady state.
-        # Fused MTP always supports a speculative verify prefix plus a newly
-        # admitted prefill suffix in one target forward. Eager and piecewise
-        # execution share the same scheduler/completion protocol.
-        self._piecewise_cuda_graph_on = (
+        # Piecewise graphs split a dynamic forward at model-declared
+        # Attention/SSM boundaries. ``auto`` (None) preserves the historical
+        # behavior by enabling them only for MTP mixed forwards; explicit True
+        # promotes the same runner to ordinary prefill and mixed batches.
+        # PP and DP need a coordinated cross-rank segment protocol, so they
+        # remain eager until that protocol exists.
+        piecewise_requested = (
             self.mtp_enabled
+            if self._piecewise_cuda_graph_cfg is None
+            else bool(self._piecewise_cuda_graph_cfg)
+        )
+        piecewise_model_supported = any(
+            getattr(module, "supports_piecewise_cuda_graph", False)
+            for module in self.model.modules()
+        )
+        self._piecewise_cuda_graph_on = (
+            piecewise_requested
+            and piecewise_model_supported
             and not self.disable_cuda_graph
+            and not is_dp_attn()
             and is_first_pp_rank()
             and is_last_pp_rank()
         )
+        self._piecewise_generic_on = (
+            self._piecewise_cuda_graph_on
+            and self._piecewise_cuda_graph_cfg is True
+        )
+        if piecewise_requested and not piecewise_model_supported:
+            logger.warning(
+                "Piecewise CUDA graph requested, but model %s declares no "
+                "dynamic Attention/SSM boundaries; using eager prefill/mixed "
+                "forwards.",
+                type(self.model).__name__,
+            )
         from gllm.layers.ops.fla._sgl_compat import (
             set_piecewise_cuda_graph_enabled,
         )
@@ -875,17 +924,36 @@ class ModelRunner:
         set_piecewise_cuda_graph_enabled(self._piecewise_cuda_graph_on)
         self._piecewise_runner = None
         if self._piecewise_cuda_graph_on:
+            piecewise_capture_limit = self.max_num_batched_tokens
+            if self._max_piecewise_cuda_graph_tokens_cfg is not None:
+                configured_limit = int(
+                    self._max_piecewise_cuda_graph_tokens_cfg
+                )
+                if configured_limit <= 0:
+                    raise ValueError(
+                        "max_piecewise_cuda_graph_tokens must be positive, got "
+                        f"{configured_limit}"
+                    )
+                piecewise_capture_limit = min(
+                    piecewise_capture_limit, configured_limit
+                )
             piecewise_capture_sizes = PiecewiseGraphRunner.build_capture_sizes(
-                self.max_num_batched_tokens
+                piecewise_capture_limit
             )
             self._piecewise_runner = PiecewiseGraphRunner(
                 self.model,
                 capture_sizes=piecewise_capture_sizes,
             )
             logger.info(
-                "Piecewise CUDA graph enabled for mixed MTP forwards "
-                "(attention/GDN eager breaks, graph-resident MoE, "
+                "Piecewise CUDA graph enabled (mode=%s, max_tokens=%d; "
+                "attention/GDN eager breaks, graph-resident MoE, "
                 "bucket_sizes=%s)",
+                (
+                    "auto-mtp"
+                    if self._piecewise_cuda_graph_cfg is None
+                    else "generic"
+                ),
+                piecewise_capture_limit,
                 piecewise_capture_sizes,
             )
         self._mtp_relay: Dict[int, tuple] = {}
@@ -2171,6 +2239,20 @@ class ModelRunner:
         replay on a known stream (e.g. ``OverlapModelRunner.forward_stream``)
         should pass that same stream here so capture and replay agree.
         """
+        # Raw ``CUDAGraph.capture_begin`` (used by the piecewise segment
+        # runner) is illegal on CUDA's default stream. The overlap runner
+        # supplies its persistent forward stream; the ordinary runner creates
+        # one persistent capture stream and reuses it for every graph family.
+        # Replaying the resulting graphs on the caller's current stream is
+        # supported by PyTorch.
+        if stream is None:
+            stream = getattr(self, "_cuda_graph_capture_stream", None)
+            if stream is None:
+                stream = torch.cuda.Stream(
+                    device=torch.cuda.current_device()
+                )
+                self._cuda_graph_capture_stream = stream
+
         iterator = self.capture_sizes
         if get_local_rank() == 0:
             logger.info(f"Capturing decode full CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}")
@@ -2309,17 +2391,16 @@ class ModelRunner:
                 )
                 self.memory_manager.allocate_ssm_slot(seq)
                 try:
-                    self.prepare_input([seq])
-                    if self.input_data.embedding_size != bucket:
-                        raise RuntimeError(
-                            "piecewise initialization requires explicit input "
-                            f"embeddings, got {self.input_data.embedding_size}/"
-                            f"{bucket} rows"
-                        )
-                    self._prepare_attention_metadata(self.input_data)
+                    # Dynamic Attention/SSM boundaries are not executed while
+                    # capturing, so graph-resident regions only need a correctly
+                    # shaped activation. Skip token embedding, multimodal prep,
+                    # and backend metadata construction for the synthetic row.
+                    self.input_data.cal_and_set_input([seq])
+                    capture_hidden = self.input_hidden_states[:bucket]
+                    capture_hidden.zero_()
                     runner.capture_bucket(
                         self.input_data,
-                        self.input_hidden_states[:bucket],
+                        capture_hidden,
                     )
                 finally:
                     self.memory_manager.free(seq)
@@ -2329,6 +2410,15 @@ class ModelRunner:
             stream.synchronize()
         else:
             torch.cuda.synchronize()
+
+        # Bucket capture creates short-lived warmup activations and temporary
+        # allocator blocks.  The graph-owned blocks remain pinned by the
+        # shared graph pool, but returning unrelated cached blocks here avoids
+        # charging one-time capture scratch to the steady-state server.  Do
+        # this once after the whole family (never per bucket), so startup time
+        # and graph-pool reuse are unaffected in the hot capture loop.
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def _fixup_vl_decode_embeddings(self, num_decode_tokens: int) -> None:
         """Re-embed decode-token IDs into the front of ``input_hidden_states``.
@@ -2403,6 +2493,75 @@ class ModelRunner:
             if plan is None:
                 raise RuntimeError("model forward has no ForwardMetadataPlan")
             plan.prepare_attention(backend, input_data)
+
+    def _piecewise_input_embeddings(
+        self, num_tokens: int
+    ) -> Optional[torch.Tensor]:
+        """Return explicit model inputs for a piecewise forward.
+
+        Piecewise capture starts immediately after token embedding so every
+        graph bucket has a single ``[bucket, hidden]`` input address. VL input
+        preparation already materializes the exact embeddings in the shared
+        runner buffer. Text-only models use their common ``embed_input_ids``
+        API here; embedding remains eager because its row count is dynamic and
+        it is a negligible fraction of prefill execution.
+        """
+        num_tokens = int(num_tokens)
+        embedding_size = int(self.input_data.embedding_size)
+        if embedding_size:
+            if embedding_size != num_tokens:
+                return None
+            num_decode_tokens = sum(
+                s.to_compute_token_num
+                for s in self.input_data.seqs
+                if s.computed_prompt
+            )
+            self._fixup_vl_decode_embeddings(num_decode_tokens)
+            return self.input_hidden_states[:num_tokens]
+
+        embed = getattr(self.model, "embed_input_ids", None)
+        if embed is None:
+            return None
+        hidden_states = embed(self.input_data.tokens[:num_tokens])
+        # Some VL wrappers return ``(text_embeddings, deepstack_embeddings)``.
+        # The latter is published into a stable model-owned buffer by their
+        # normal input-preparation path; only the primary embedding enters the
+        # piecewise runner.
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        if not isinstance(hidden_states, torch.Tensor):
+            return None
+        if hidden_states.shape[0] != num_tokens:
+            return None
+        return hidden_states
+
+    def _run_generic_piecewise_forward(self, num_tokens: int) -> bool:
+        """Run an ordinary prefill/mixed batch through piecewise graphs.
+
+        Returns ``True`` only after producing ``output_hidden_states``. Every
+        unsupported shape or request type is a non-fatal eager fallback.
+        """
+        runner = self._piecewise_runner
+        if not self._piecewise_generic_on or runner is None or num_tokens <= 0:
+            return False
+        if not runner.can_run(num_tokens):
+            return False
+        # Visual embeddings and deepstack residuals have request-dependent
+        # side buffers. Text-only traffic on a VL checkpoint is supported, but
+        # actual media stays eager until those side buffers are bucketed too.
+        if any(s.mm_contents is not None for s in self.input_data.seqs):
+            return False
+
+        self._prepare_attention_metadata(self.input_data)
+        hidden_states = self._piecewise_input_embeddings(num_tokens)
+        if hidden_states is None:
+            return False
+        with torch.profiler.record_function("gllm::generic_piecewise_forward"):
+            output = runner.run(self.input_data, hidden_states)
+        if output is None:
+            return False
+        self.output_hidden_states[:num_tokens].copy_(output)
+        return True
 
     def check_decode_batch(self):
         # Since the scheduler put prefill seqs at the end
@@ -4722,7 +4881,8 @@ class ModelRunner:
             else:
                 self.forward()
         else:
-            self.forward()
+            if not self._run_generic_piecewise_forward(num_cal_tokens):
+                self.forward()
         if is_last_pp_rank():
             hidden = self.output_hidden_states[:num_cal_tokens]
             logits = self.model.compute_logits(self.input_data, hidden)
@@ -5067,7 +5227,8 @@ class OverlapModelRunner(ModelRunner):
             else:
                 self.forward()
         else:
-            self.forward()
+            if not self._run_generic_piecewise_forward(num_cal_tokens):
+                self.forward()
         return num_cal_tokens
 
     @torch.inference_mode()
