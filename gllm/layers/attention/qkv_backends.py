@@ -166,6 +166,83 @@ class FlashInferAttentionBackend(QKVAttentionBackend):
             max_running_seqs + 1, dtype=torch.int32, device=device
         )
 
+    @torch.inference_mode()
+    def smoke_test(self, page_size: int) -> None:
+        """Launch minimal decode and context kernels on the current device.
+
+        Importability is not enough for FlashInfer's TRT-LLM Gen backend: a
+        wheel can expose the Python symbols while its embedded cubins do not
+        support the host GPU architecture. Exercising both entry points during
+        startup catches that mismatch before model loading and CUDA graph
+        capture.
+        """
+        device = self.workspace.device
+        dtype = torch.bfloat16
+        num_q_heads = 8
+        num_kv_heads = 1
+        head_dim = 128
+        page_size = int(page_size)
+        if page_size <= 0:
+            raise ValueError(f"page_size must be positive, got {page_size}")
+
+        kv_cache = (
+            torch.zeros(
+                (1, page_size, num_kv_heads, head_dim),
+                dtype=dtype,
+                device=device,
+            ),
+            torch.zeros(
+                (1, page_size, num_kv_heads, head_dim),
+                dtype=dtype,
+                device=device,
+            ),
+        )
+        block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+
+        decode_q = torch.zeros(
+            (1, num_q_heads, head_dim), dtype=dtype, device=device
+        )
+        self._decode_attention(
+            query=decode_q,
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace,
+            block_tables=block_table,
+            seq_lens=torch.ones(1, dtype=torch.int32, device=device),
+            max_seq_len=max(page_size, self.model_max_length),
+            bmm1_scale=head_dim**-0.5,
+            bmm2_scale=1.0,
+            out=torch.empty_like(decode_q),
+            kv_layout="NHD",
+            enable_pdl=True,
+            backend="auto",
+            q_len_per_req=1,
+            uses_shared_paged_kv_idx=True,
+        )
+
+        context_q = torch.zeros(
+            (2, num_q_heads, head_dim), dtype=dtype, device=device
+        )
+        self._context_attention(
+            context_q,
+            kv_cache,
+            self.workspace,
+            block_table,
+            torch.tensor([2], dtype=torch.int32, device=device),
+            2,
+            max(page_size, self.model_max_length),
+            head_dim**-0.5,
+            1.0,
+            1,
+            torch.tensor([0, 2], dtype=torch.int32, device=device),
+            torch.tensor([0, 1], dtype=torch.int32, device=device),
+            out=torch.empty_like(context_q),
+            kv_layout="NHD",
+            enable_pdl=True,
+            uses_shared_paged_kv_idx=True,
+            causal=True,
+        )
+        torch.cuda.synchronize(device)
+
     def prepare_metadata(
         self,
         input_data: "InputData",
@@ -314,8 +391,12 @@ def create_qkv_attention_backend(
         FlashInferAttentionBackend if resolved == "flashinfer" else FA4AttentionBackend
     )
     backend = backend_cls(model_max_length, max_running_seqs)
-    logger.info(
-        "QKV attention backend: %s (compute capability SM%d%d)",
+    # Construction is also used by startup probing and may be followed by a
+    # real-kernel rejection plus fallback. Keep candidate attempts out of the
+    # default INFO stream; ModelRunner emits one authoritative "Verified"
+    # line after smoke testing has selected the runnable backend.
+    logger.debug(
+        "Probing QKV attention backend: %s (compute capability SM%d%d)",
         resolved,
         capability[0],
         capability[1],

@@ -9,6 +9,7 @@ from gllm.distributed.parallel_state import (
     is_dp_attn,
 )
 from gllm.runtime.input_data import InputData
+from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe import FusedMoE, determine_expert_map
 
@@ -74,6 +75,7 @@ class MixtralAttention(Qwen2Attention):
 
 
 class MixtralDecoderLayer(nn.Module):
+    supports_piecewise_cuda_graph = True
 
     def __init__(self, layer_id, config):
         super().__init__()
@@ -94,7 +96,9 @@ class MixtralDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(input_data, hidden_states)
+        hidden_states, residual = piecewise_dynamic_tensor(
+            lambda x: self.self_attn(input_data, x), hidden_states, residual
+        )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)

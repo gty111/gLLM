@@ -161,6 +161,29 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
     )
     p.add_argument(
+        "--piecewise-cuda-graph",
+        choices=["auto", "on", "off"],
+        default="on",
+        help=(
+            "Piecewise CUDA graphs for prefill and mixed forwards (default: "
+            "'on'). 'auto' preserves only the historical MTP mixed-forward "
+            "optimization, 'on' enables the "
+            "generic path for supported models, and 'off' disables only "
+            "piecewise graphs. --disable-cuda-graph still disables all graph "
+            "families."
+        ),
+    )
+    p.add_argument(
+        "--max-piecewise-cuda-graph-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Maximum token bucket captured for piecewise CUDA graphs. The "
+            "default uses the runtime max batched-token budget; larger batches "
+            "safely fall back to eager execution."
+        ),
+    )
+    p.add_argument(
         "--max-cuda-graph-bs",
         type=int,
         help=(
@@ -313,6 +336,12 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
         "ssm_snapshot_stride_tokens": args.ssm_snapshot_stride_tokens,
         "mla_cache_dtype": args.mla_cache_dtype,
         "disable_cuda_graph": args.disable_cuda_graph,
+        "piecewise_cuda_graph": {
+            "auto": None,
+            "on": True,
+            "off": False,
+        }[args.piecewise_cuda_graph],
+        "max_piecewise_cuda_graph_tokens": args.max_piecewise_cuda_graph_tokens,
         "max_cuda_graph_bs": args.max_cuda_graph_bs,
         "maxd": args.maxd,
         "maxp": args.maxp,

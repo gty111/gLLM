@@ -13,6 +13,7 @@ from gllm.distributed.parallel_state import (
     tensor_model_parallel_all_reduce,
 )
 from gllm.runtime.input_data import InputData
+from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.attention.base import AttentionLayerBase
 from gllm.layers.attention.mla import MLAAttention
@@ -556,6 +557,7 @@ class DeepseekV2MLAAttention(AttentionLayerBase):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
+    supports_piecewise_cuda_graph = True
 
     def __init__(self, glb_layer_id: int, layer_id: int, config):
         super().__init__()
@@ -595,7 +597,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(input_data, hidden_states)
+        hidden_states, residual = piecewise_dynamic_tensor(
+            lambda x: self.self_attn(input_data, x), hidden_states, residual
+        )
 
         if hidden_states.dtype == torch.float16:
             # Fix FP16 overflow

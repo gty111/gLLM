@@ -10,6 +10,7 @@ from gllm.distributed.parallel_state import (
     is_last_pp_rank,
 )
 from gllm.runtime.input_data import InputData
+from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.attention.base import AttentionLayerBase
 from gllm.layers.attention.qkv import QKVAttention
@@ -109,6 +110,8 @@ class GLMMLP(nn.Module):
 
 
 class GLMBlock(nn.Module):
+    supports_piecewise_cuda_graph = True
+
     def __init__(self, layer_id, config):
         super().__init__()
         self.apply_residual_connection_post_layernorm = (
@@ -132,14 +135,18 @@ class GLMBlock(nn.Module):
         # hidden_states: [num_tokens, h]
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
-        # Self attention.
-        attention_output = self.self_attention(input_data, layernorm_output)
-
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
         else:
             residual = hidden_states
+        # Self attention. Residual bypasses attention but remains live across
+        # the eager boundary, so bridge it into stable piecewise storage too.
+        attention_output, residual = piecewise_dynamic_tensor(
+            lambda x: self.self_attention(input_data, x),
+            layernorm_output,
+            residual,
+        )
 
         layernorm_input = residual + attention_output
 
@@ -255,6 +262,10 @@ class ChatGLMForCausalLM(nn.Module):
         selecting each seq's last position.
         """
         return self.lm_head(hidden_states)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed explicit inputs for the generic piecewise graph runner."""
+        return self.transformer.embedding(input_ids)
 
     def _chatglm_rules(self):
         return [

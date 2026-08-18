@@ -84,13 +84,29 @@ class FusedMoEMethod(torch.nn.Module):
             x.shape[-1],
             x.dtype,
             x.device,
+            tuple(layer.w13_weight.shape),
+            tuple(layer.w2_weight.shape),
+            layer.w13_weight.dtype,
+            layer.w13_weight.device,
+            layer.w2_weight.dtype,
+            layer.w2_weight.device,
+            top_k,
+            global_num_experts,
             use_fp8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
             tuple(block_shape or ()),
             runtime.workspace_token_sizes,
         )
-        workspace = self._piecewise_workspaces.get(key)
+        # Piecewise segments and transformer layers replay serially on one
+        # stream. A shape-compatible MoE scratch allocation can therefore be
+        # shared across layers instead of retaining one maximum-token workspace
+        # per layer. Standalone callers without a runner-owned registry keep
+        # the historical per-layer cache.
+        workspace_cache = getattr(
+            runtime, "workspaces", self._piecewise_workspaces
+        )
+        workspace = workspace_cache.get(key)
         if workspace is None:
             workspace_input = x
             if x.shape[0] != workspace_tokens:
@@ -113,7 +129,7 @@ class FusedMoEMethod(torch.nn.Module):
                 block_shape=block_shape,
                 token_counts=runtime.workspace_token_sizes,
             )
-            self._piecewise_workspaces[key] = workspace
+            workspace_cache[key] = workspace
         return workspace
 
     def create_weights(

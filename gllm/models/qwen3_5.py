@@ -930,6 +930,8 @@ def _is_moe_text_config(config) -> bool:
 class Qwen3_5DecoderLayer(nn.Module):
     """Dispatches between the linear-attn and full-attn block."""
 
+    supports_piecewise_cuda_graph = True
+
     def __init__(
         self,
         config,
@@ -990,12 +992,12 @@ class Qwen3_5DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if self.self_attn is not None:
-            hidden_states = piecewise_dynamic_tensor(
-                lambda x: self.self_attn(input_data, x), hidden_states
+            hidden_states, residual = piecewise_dynamic_tensor(
+                lambda x: self.self_attn(input_data, x), hidden_states, residual
             )
         else:
-            hidden_states = piecewise_dynamic_tensor(
-                lambda x: self.linear_attn(input_data, x), hidden_states
+            hidden_states, residual = piecewise_dynamic_tensor(
+                lambda x: self.linear_attn(input_data, x), hidden_states, residual
             )
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual
