@@ -4,7 +4,7 @@ tqdm
 transformers >= 5.11.0
 tiktoken >= 0.13.0 # Kimi K2.x tokenizer
 fastapi[standard] >= 0.115.0
-openai >= 1.99.1
+openai >= 2.53.0
 logger
 # Keep the CUDA build explicit: the unqualified aarch64 wheel on PyPI is CPU-only.
 # pyproject.toml routes uv's PyTorch resolution to the CUDA 13.0 wheel index.

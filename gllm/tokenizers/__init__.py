@@ -4,19 +4,22 @@
   (loaded from the checkpoint's ``encoding/`` dir; replaces a hand-written Jinja
   chat template).
 - :mod:`gllm.tokenizers.tool_parsers` -- model-native tool-call markup parsers
-  (Qwen / Kimi / DeepSeek) that turn generated text into structured
-  ``tool_calls``.
+  (Qwen / Kimi / DeepSeek) and OpenAI tool-call message normalization.
 """
 
-from gllm.tokenizers.deepseek_v32 import (
-    apply_dsv32_chat_template,
-    load_dsv32_encoder,
+from gllm.tokenizers.deepseek_v32 import apply_dsv32_chat_template, load_dsv32_encoder
+from gllm.tokenizers.tool_parsers import (
+    ToolParser,
+    get_tool_parser,
+    normalize_chat_template_messages,
+    normalize_chat_template_tool_arguments,
 )
-from gllm.tokenizers.tool_parsers import ToolParser, get_tool_parser
 
 __all__ = [
     "apply_dsv32_chat_template",
     "load_dsv32_encoder",
+    "normalize_chat_template_tool_arguments",
+    "normalize_chat_template_messages",
     "ToolParser",
     "get_tool_parser",
 ]
