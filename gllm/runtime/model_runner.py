@@ -1,5 +1,5 @@
-import hashlib
 import gc
+import hashlib
 import os
 from collections import OrderedDict
 from contextlib import nullcontext as _nullcontext
@@ -17,10 +17,9 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 from transformers.image_utils import load_images
-from transformers.video_utils import load_video
 from transformers.tokenization_utils_base import VERY_LARGE_INTEGER
+from transformers.video_utils import load_video
 
-from gllm.runtime.async_runtime import FutureMap, OverlapRuntime
 from gllm.distributed.parallel_state import (
     get_dp_size,
     get_ipc_tp_group,
@@ -36,8 +35,6 @@ from gllm.distributed.parallel_state import (
     is_output_rank,
     set_dp_forward_counts,
 )
-from gllm.runtime.forward_metadata import ForwardMetadataPlan
-from gllm.runtime.input_data import InputData
 from gllm.layers.attention.qkv_backends import (
     bind_qkv_attention_backend,
     create_qkv_attention_backend,
@@ -45,12 +42,16 @@ from gllm.layers.attention.qkv_backends import (
 )
 from gllm.layers.rotary_embedding import MRotaryEmbedding
 from gllm.layers.sampler import Sampler
+from gllm.runtime.async_runtime import FutureMap, OverlapRuntime
+from gllm.runtime.forward_metadata import ForwardMetadataPlan
+from gllm.runtime.input_data import InputData
 from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.runtime.model_loader import ModelLoader, propagate_serving_config
-from gllm.speculative.async_state import MtpAsyncBatchState, MtpAsyncCompletion
-from gllm.speculative.gpu_prep import MtpGpuPrep
 from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.runtime.sequence import GenerationSequence
+from gllm.speculative.async_state import MtpAsyncBatchState, MtpAsyncCompletion
+from gllm.speculative.gpu_prep import MtpGpuPrep
+from gllm.tokenizers.tool_parsers import normalize_chat_template_messages
 from gllm.utils import unify_decode
 
 
@@ -114,15 +115,15 @@ class DisaggSeqState:
     """
 
     num_items: int
-    item_span: List[Tuple[int, int]]          # ordered: (start, end) in tokens
+    item_span: List[Tuple[int, int]]  # ordered: (start, end) in tokens
     item_modality: List[str]
     item_ready: List[bool]
     item_embed: List[Optional[torch.Tensor]]  # ordered, filled on NIXL notif
     image_grid_thw: Optional[torch.Tensor]
     video_grid_thw: Optional[torch.Tensor]
-    input_ids_cpu: torch.Tensor               # full expanded prompt ids (cpu)
-    is_multimodal_cpu: torch.Tensor           # full mask (cpu)
-    prompt_positions: torch.Tensor            # full-prompt mrope positions
+    input_ids_cpu: torch.Tensor  # full expanded prompt ids (cpu)
+    is_multimodal_cpu: torch.Tensor  # full mask (cpu)
+    prompt_positions: torch.Tensor  # full-prompt mrope positions
     mrope_position_delta: torch.Tensor
     prompt_len: int
 
@@ -289,15 +290,13 @@ class ModelRunner:
     ):
 
         self.max_num_batched_tokens = (
-            maxp
-            if schedule_method in ["chunked_prefill", "split_pd"]
-            else maxp + maxd
+            maxp if schedule_method in ["chunked_prefill", "split_pd"] else maxp + maxd
         )
-        
+
         # Concurrent decode slots (SSM arena entries, input buffers, CUDA
         # graph capture). Bounded by ``maxd`` for all schedule methods.
         self.max_running_seqs = maxd
-        
+
         self.model_path = model_path
         self.model_loader = ModelLoader(
             load_format,
@@ -310,9 +309,7 @@ class ModelRunner:
         self.gpu_memory_util = gpu_memory_util
         self.page_size = page_size
         self._piecewise_cuda_graph_cfg = piecewise_cuda_graph
-        self._max_piecewise_cuda_graph_tokens_cfg = (
-            max_piecewise_cuda_graph_tokens
-        )
+        self._max_piecewise_cuda_graph_tokens_cfg = max_piecewise_cuda_graph_tokens
         # Recurrent-state (GDN/Mamba) prefix-cache granularity, in tokens.
         # Only meaningful for hybrid models with prefix caching on.
         self.ssm_snapshot_stride_tokens = ssm_snapshot_stride_tokens
@@ -327,8 +324,7 @@ class ModelRunner:
         # runner is pickled to spawn TP workers); the encoder itself is
         # lazy-loaded per process inside ``encode`` via a module-level cache.
         self._use_dsv32_encoder = (
-            getattr(self.model_loader, "architecture", None)
-            == "DeepseekV32ForCausalLM"
+            getattr(self.model_loader, "architecture", None) == "DeepseekV32ForCausalLM"
         )
         self.maxp = maxp
         self.maxd = maxd
@@ -396,9 +392,7 @@ class ModelRunner:
         # when present (Qwen3.5 requires float32), otherwise it falls back to
         # the activation dtype. Explicit CLI values override that recommendation.
         self.mamba_ssm_cache_dtype = (mamba_ssm_cache_dtype or "auto").lower()
-        if self.mamba_ssm_cache_dtype not in (
-            "auto", "bfloat16", "float16", "float32"
-        ):
+        if self.mamba_ssm_cache_dtype not in ("auto", "bfloat16", "float16", "float32"):
             raise ValueError(
                 "mamba_ssm_cache_dtype must be 'auto', 'bfloat16', 'float16' or "
                 f"'float32', got {self.mamba_ssm_cache_dtype!r}."
@@ -469,7 +463,6 @@ class ModelRunner:
                 self.image_processor.size["longest_edge"] = mm_processor_max_pixels
                 self.video_processor.size["longest_edge"] = mm_processor_max_pixels
                 logger.info(f"Max pixels: {mm_processor_max_pixels}")
-            
 
         # lazy init
         self.model: torch.nn.Module = None
@@ -495,9 +488,7 @@ class ModelRunner:
         # seq_id) so it survives across requests. Disabled cheaply when the
         # model isn't multimodal: the put/get paths are guarded by
         # ``self.use_mm`` callers.
-        self.mm_embed_cache = MultiModalEmbeddingCache(
-            max_entries=64, max_mb=256.0
-        )
+        self.mm_embed_cache = MultiModalEmbeddingCache(max_entries=64, max_mb=256.0)
 
         # cuda graph
         self.disable_cuda_graph = disable_cuda_graph
@@ -660,9 +651,7 @@ class ModelRunner:
                     )
                 else:
                     try:
-                        from flash_attn.cute import (  # noqa: F401
-                            flash_attn_varlen_func,
-                        )
+                        from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
                     except Exception as exc:
                         mla_error = str(exc)
                 if mla_error is not None:
@@ -736,8 +725,7 @@ class ModelRunner:
         # MTP speculative decoding: number of draft tokens per step (k). Active
         # only when the model built an MTP head (mtp_enabled + nextn layers).
         self._mtp_k = (
-            self._mtp_k_cfg
-            if getattr(self.model, "mtp", None) is not None else 0
+            self._mtp_k_cfg if getattr(self.model, "mtp", None) is not None else 0
         )
         # The one authoritative runtime capability flag. The earlier resolved
         # preference only controls whether the loader constructs the MTP head;
@@ -907,8 +895,7 @@ class ModelRunner:
             and is_last_pp_rank()
         )
         self._piecewise_generic_on = (
-            self._piecewise_cuda_graph_on
-            and self._piecewise_cuda_graph_cfg is True
+            self._piecewise_cuda_graph_on and self._piecewise_cuda_graph_cfg is True
         )
         if piecewise_requested and not piecewise_model_supported:
             logger.warning(
@@ -917,26 +904,20 @@ class ModelRunner:
                 "forwards.",
                 type(self.model).__name__,
             )
-        from gllm.layers.ops.fla._sgl_compat import (
-            set_piecewise_cuda_graph_enabled,
-        )
+        from gllm.layers.ops.fla._sgl_compat import set_piecewise_cuda_graph_enabled
 
         set_piecewise_cuda_graph_enabled(self._piecewise_cuda_graph_on)
         self._piecewise_runner = None
         if self._piecewise_cuda_graph_on:
             piecewise_capture_limit = self.max_num_batched_tokens
             if self._max_piecewise_cuda_graph_tokens_cfg is not None:
-                configured_limit = int(
-                    self._max_piecewise_cuda_graph_tokens_cfg
-                )
+                configured_limit = int(self._max_piecewise_cuda_graph_tokens_cfg)
                 if configured_limit <= 0:
                     raise ValueError(
                         "max_piecewise_cuda_graph_tokens must be positive, got "
                         f"{configured_limit}"
                     )
-                piecewise_capture_limit = min(
-                    piecewise_capture_limit, configured_limit
-                )
+                piecewise_capture_limit = min(piecewise_capture_limit, configured_limit)
             piecewise_capture_sizes = PiecewiseGraphRunner.build_capture_sizes(
                 piecewise_capture_limit
             )
@@ -948,11 +929,7 @@ class ModelRunner:
                 "Piecewise CUDA graph enabled (mode=%s, max_tokens=%d; "
                 "attention/GDN eager breaks, graph-resident MoE, "
                 "bucket_sizes=%s)",
-                (
-                    "auto-mtp"
-                    if self._piecewise_cuda_graph_cfg is None
-                    else "generic"
-                ),
+                ("auto-mtp" if self._piecewise_cuda_graph_cfg is None else "generic"),
                 piecewise_capture_limit,
                 piecewise_capture_sizes,
             )
@@ -990,8 +967,7 @@ class ModelRunner:
         # ``GLLM_MTP_GPUPREP=0`` falls back to the CPU builders (``cal_input``).
         self._mtp_gpu_prep = None
         self._mtp_gpu_prep_on = (
-            self.mtp_enabled
-            and os.environ.get("GLLM_MTP_GPUPREP", "1") == "1"
+            self.mtp_enabled and os.environ.get("GLLM_MTP_GPUPREP", "1") == "1"
         )
         # Persistent pinned/device staging for the per-seq sampling params (see
         # ``_mtp_sample_params``); lazily allocated on first use.
@@ -1003,11 +979,7 @@ class ModelRunner:
             self._mtp_gpu_prep = MtpGpuPrep(
                 max_bs=max(self.max_running_seqs, 1),
                 max_blocks=self.input_data.max_num_block,
-                bt_width=(
-                    1 + self._mtp_k
-                    if self.memory_manager.use_ssm_cache
-                    else 0
-                ),
+                bt_width=(1 + self._mtp_k if self.memory_manager.use_ssm_cache else 0),
                 page_size=self.page_size,
                 uses_mrope=self.uses_mrope,
                 device=torch.device("cuda", torch.cuda.current_device()),
@@ -1046,9 +1018,7 @@ class ModelRunner:
         self._mtp_mixed_new_idx_host = torch.empty(
             mixed_cap, dtype=torch.int64, device="cpu", pin_memory=True
         )
-        self._mtp_mixed_new_ctx_host = torch.empty_like(
-            self._mtp_mixed_new_idx_host
-        )
+        self._mtp_mixed_new_ctx_host = torch.empty_like(self._mtp_mixed_new_idx_host)
         self._mtp_mixed_new_idx_host_np = self._mtp_mixed_new_idx_host.numpy()
         self._mtp_mixed_new_ctx_host_np = self._mtp_mixed_new_ctx_host.numpy()
         self._mtp_mixed_new_idx = torch.empty(
@@ -1110,6 +1080,7 @@ class ModelRunner:
         if tools:
             template_kwargs["tools"] = tools
         if chat:
+            normalize_chat_template_messages(messages)
             # OpenAI-style requests may send ``content: null`` (e.g. an assistant
             # turn that only carries ``tool_calls``). Many chat templates assume
             # ``content`` is a str or list and iterate it in the non-string
@@ -1126,9 +1097,7 @@ class ModelRunner:
             if dsv32_encoder is not None and (not self.use_mm or not has_mm):
                 # DeepSeek-V3.2: render with the model's official encoder
                 # (reference DSML format) instead of a Jinja chat template.
-                from gllm.tokenizers.deepseek_v32 import (
-                    apply_dsv32_chat_template,
-                )
+                from gllm.tokenizers.deepseek_v32 import apply_dsv32_chat_template
 
                 out = apply_dsv32_chat_template(
                     dsv32_encoder,
@@ -1221,7 +1190,11 @@ class ModelRunner:
                         data = data["url"]
                     content["video"] = data
                     mm_contents["video"].append(data)
-        return mm_contents if len(mm_contents["image"]) + len(mm_contents["video"]) != 0 else None
+        return (
+            mm_contents
+            if len(mm_contents["image"]) + len(mm_contents["video"]) != 0
+            else None
+        )
 
     def extract_mm_items_ordered(self, messages: List[Dict]):
         """Return the mm items as an ordered ``[(modality, content), ...]`` list.
@@ -1319,9 +1292,7 @@ class ModelRunner:
                     # and a text-only prompt may never have created an entry --
                     # touching it would raise ``KeyError`` and crash the engine.
                     batch_positions.append(
-                        torch.arange(
-                            seq.computed_token_num, seq.seq_len, device="cpu"
-                        )
+                        torch.arange(seq.computed_token_num, seq.seq_len, device="cpu")
                     )
                 num_decode_tokens += seq.to_compute_token_num
                 continue
@@ -1366,16 +1337,14 @@ class ModelRunner:
                     seq._mm_precomputed = None
                 else:
                     mm_embeddings = None
-                    mm_input, image_grid_thw, video_grid_thw = (
-                        self._mm_run_processor(seq)
+                    mm_input, image_grid_thw, video_grid_thw = self._mm_run_processor(
+                        seq
                     )
-                    input_ids_cpu, is_multimodal_cpu = (
-                        self._mm_build_is_multimodal_cpu(seq)
+                    input_ids_cpu, is_multimodal_cpu = self._mm_build_is_multimodal_cpu(
+                        seq
                     )
-                    mm_bundle_key, item_hashes = (
-                        self._build_mm_content_hashes(
-                            mm_input, image_grid_thw, video_grid_thw
-                        )
+                    mm_bundle_key, item_hashes = self._build_mm_content_hashes(
+                        mm_input, image_grid_thw, video_grid_thw
                     )
                     if item_hashes:
                         seq.hash_token_ids = self._splice_mm_pad_ids(
@@ -1403,9 +1372,7 @@ class ModelRunner:
                     # Kimi: plain 1-D positions over the full prompt. Stored in
                     # EmbeddingInfo so decode can extrapolate; ``mrope_position
                     # _delta`` is unused (decode uses ``torch.arange``).
-                    prompt_positions = torch.arange(
-                        len(seq.token_ids), device="cpu"
-                    )
+                    prompt_positions = torch.arange(len(seq.token_ids), device="cpu")
                     mrope_position_delta = None
                     batch_positions.append(
                         prompt_positions[seq.computed_token_num : seq.seq_len]
@@ -1500,9 +1467,7 @@ class ModelRunner:
             info.coverage_len is not None and seq.seq_len > info.coverage_len
         )
         if not need_build:
-            prefill_works.append(
-                {"kind": "cached", "seq": seq, "embedding_info": info}
-            )
+            prefill_works.append({"kind": "cached", "seq": seq, "embedding_info": info})
             return
         ready_len = self._disagg_ready_len(st)
         # Gather the ready-prefix items in token-span order so the concatenated
@@ -1631,9 +1596,7 @@ class ModelRunner:
         placeholder_token_id_cpu = torch.tensor(
             self.model.get_mm_placeholder_token_ids(), device="cpu"
         )
-        is_multimodal_cpu = torch.isin(
-            input_ids_cpu, placeholder_token_id_cpu
-        )
+        is_multimodal_cpu = torch.isin(input_ids_cpu, placeholder_token_id_cpu)
         return input_ids_cpu, is_multimodal_cpu
 
     def _mm_precompute_hash(self, seq: GenerationSequence) -> None:
@@ -1663,15 +1626,14 @@ class ModelRunner:
             return
         if seq.mm_contents is None:
             return
-        if seq.hash_token_ids is not None or getattr(
-            seq, "_mm_precomputed", None
-        ) is not None:
+        if (
+            seq.hash_token_ids is not None
+            or getattr(seq, "_mm_precomputed", None) is not None
+        ):
             return  # already built (e.g. preemption + re-schedule).
 
         mm_input, image_grid_thw, video_grid_thw = self._mm_run_processor(seq)
-        input_ids_cpu, is_multimodal_cpu = self._mm_build_is_multimodal_cpu(
-            seq
-        )
+        input_ids_cpu, is_multimodal_cpu = self._mm_build_is_multimodal_cpu(seq)
         mm_bundle_key, item_hashes = self._build_mm_content_hashes(
             mm_input, image_grid_thw, video_grid_thw
         )
@@ -1752,7 +1714,11 @@ class ModelRunner:
         sglang's ``pad_input_tokens`` trick adapted to gllm's flat-page
         cache layout.
         """
-        mask = is_multimodal_cpu.tolist() if isinstance(is_multimodal_cpu, torch.Tensor) else list(is_multimodal_cpu)
+        mask = (
+            is_multimodal_cpu.tolist()
+            if isinstance(is_multimodal_cpu, torch.Tensor)
+            else list(is_multimodal_cpu)
+        )
         out = list(token_ids)
         n = len(out)
         i = 0
@@ -1824,9 +1790,7 @@ class ModelRunner:
                 # (one prompt's worth of ids) so a synchronous H2D is cheap
                 # and avoids the pageable-memory caveats of non_blocking.
                 input_ids = work["input_ids_cpu"].to(device, non_blocking=True)
-                is_multimodal = work["is_multimodal_cpu"].to(
-                    device, non_blocking=True
-                )
+                is_multimodal = work["is_multimodal_cpu"].to(device, non_blocking=True)
                 embed_result = self.model.embed_input_ids(
                     input_ids,
                     mm_embeddings,
@@ -1850,13 +1814,9 @@ class ModelRunner:
                     coverage_len=work.get("coverage_len"),
                 )
                 self.embedding_cache[seq.seq_id] = embedding_info
-                embedding = prompt_embeddings[
-                    seq.computed_token_num : seq.seq_len, :
-                ]
+                embedding = prompt_embeddings[seq.computed_token_num : seq.seq_len, :]
                 deepstack_chunk = (
-                    prompt_deepstack[
-                        :, seq.computed_token_num : seq.seq_len, :
-                    ]
+                    prompt_deepstack[:, seq.computed_token_num : seq.seq_len, :]
                     if prompt_deepstack is not None
                     else None
                 )
@@ -1933,9 +1893,7 @@ class ModelRunner:
             for chunk, emb in zip(batch_deepstack, batch_embeddings):
                 n = emb.shape[0]
                 if chunk is not None:
-                    self.model._set_deepstack_input_embeds(
-                        chunk, offset=offset
-                    )
+                    self.model._set_deepstack_input_embeds(chunk, offset=offset)
                 offset += n
 
         return torch.concat(batch_embeddings)
@@ -1953,7 +1911,9 @@ class ModelRunner:
             self.input_hidden_states[: hidden_states.shape[0]] = hidden_states
             self.input_data.embedding_size = hidden_states.shape[0]
 
-    def prepare_input(self, seqs: List[GenerationSequence] = None, input_data: InputData = None):
+    def prepare_input(
+        self, seqs: List[GenerationSequence] = None, input_data: InputData = None
+    ):
         if input_data is not None:
             self.input_data.set_input_from_prebuilt(input_data)
         else:
@@ -1991,12 +1951,9 @@ class ModelRunner:
     def _mtp_decide(self, num_decodes: int) -> bool:
         qlen = 1 + self._mtp_k
         fits_token_budget = (
-            qlen > 1
-            and num_decodes * qlen <= self.max_num_batched_tokens
+            qlen > 1 and num_decodes * qlen <= self.max_num_batched_tokens
         )
-        fits_perf_gate = (
-            self._mtp_max_batch <= 0 or num_decodes <= self._mtp_max_batch
-        )
+        fits_perf_gate = self._mtp_max_batch <= 0 or num_decodes <= self._mtp_max_batch
         # DP-attention replicas must agree on the whole multi-forward MTP
         # cadence and publish different row counts for bootstrap, each draft
         # step, and verify. That protocol is not wired yet; entering MTP with
@@ -2017,9 +1974,7 @@ class ModelRunner:
             return False
         return self._mtp_decide(num_decodes)
 
-    def _mtp_drop_relay(
-        self, seqs: Optional[List[GenerationSequence]] = None
-    ) -> None:
+    def _mtp_drop_relay(self, seqs: Optional[List[GenerationSequence]] = None) -> None:
         """Invalidate fused relay state after a plain decode advance.
 
         A plain decode step advances every seq by one token without refreshing
@@ -2050,9 +2005,7 @@ class ModelRunner:
         """
         relay = self._mtp_relay.pop(seq_id, None)
         if relay is None:
-            raise RuntimeError(
-                f"missing materialized MTP relay for sequence {seq_id}"
-            )
+            raise RuntimeError(f"missing materialized MTP relay for sequence {seq_id}")
         return int(relay[0])
 
     def mtp_prep_eligible(self, seqs: List[GenerationSequence]) -> bool:
@@ -2068,9 +2021,9 @@ class ModelRunner:
         if not (self.mtp_enabled and not is_dp_attn() and is_last_pp_rank()):
             return False
         if not seqs or not seqs[-1].computed_prompt:
-            return False   # prefill / mixed batch
+            return False  # prefill / mixed batch
         if not self.mtp_speculate_batch(len(seqs)):
-            return False   # batch too large to profit from speculation
+            return False  # batch too large to profit from speculation
         return True
 
     def prepare_input_mtp(self, seqs: List[GenerationSequence]) -> None:
@@ -2090,9 +2043,7 @@ class ModelRunner:
         idata.num_decode_tokens = len(seqs)
         idata.num_prefills = 0
         idata.max_query_len = 1
-        idata.install_forward_metadata_plan(
-            ForwardMetadataPlan.deferred_mtp(len(seqs))
-        )
+        idata.install_forward_metadata_plan(ForwardMetadataPlan.deferred_mtp(len(seqs)))
 
     def mtp_async_can_chain(self, seqs: List[GenerationSequence]) -> bool:
         """Whether ``seqs`` can consume the predecessor wholly on the GPU.
@@ -2131,7 +2082,9 @@ class ModelRunner:
         ``pad_for_cuda_graph`` already does for the decode-graph padding.
         """
         page = self.memory_manager.dummy_page if runtime else None
-        seqs = [GenerationSequence(idx, [1, 2], [], output_len=1) for idx in range(size)]
+        seqs = [
+            GenerationSequence(idx, [1, 2], [], output_len=1) for idx in range(size)
+        ]
         for seq in seqs:
             seq.page_table.append(seq.seq_id if page is None else page)
             seq.prompt_len = 1
@@ -2205,9 +2158,7 @@ class ModelRunner:
             self.input_data.set_mrope_position(
                 torch.zeros((3, num_cal_tokens), device="cpu")
             )
-        stream_ctx = (
-            torch.cuda.stream(stream) if stream is not None else _nullcontext()
-        )
+        stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullcontext()
         with stream_ctx:
             self._prepare_attention_metadata(self.input_data)
             if is_first_pp_rank():
@@ -2248,15 +2199,17 @@ class ModelRunner:
         if stream is None:
             stream = getattr(self, "_cuda_graph_capture_stream", None)
             if stream is None:
-                stream = torch.cuda.Stream(
-                    device=torch.cuda.current_device()
-                )
+                stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 self._cuda_graph_capture_stream = stream
 
         iterator = self.capture_sizes
         if get_local_rank() == 0:
-            logger.info(f"Capturing decode full CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}")
-            iterator = tqdm(self.capture_sizes, desc="Capturing Decode Full Graphs", ncols=100)
+            logger.info(
+                f"Capturing decode full CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}"
+            )
+            iterator = tqdm(
+                self.capture_sizes, desc="Capturing Decode Full Graphs", ncols=100
+            )
         memory_pool = torch.cuda.graph_pool_handle()
 
         # If the custom NVLink-P2P all-reduce is active, wrap the whole
@@ -2308,7 +2261,9 @@ class ModelRunner:
                     seqs = self.create_dummy_seqs(size)
                     self.input_data.cal_and_set_input(seqs=seqs)
                     if self.uses_mrope:
-                        self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
+                        self.input_data.set_mrope_position(
+                            torch.zeros((3, size), device="cpu")
+                        )
                     _set_dp_counts(size)
                     self.forward()
                 torch.cuda.synchronize()
@@ -2319,10 +2274,14 @@ class ModelRunner:
                     seqs = self.create_dummy_seqs(size)
                     self.input_data.cal_and_set_input(seqs=seqs)
                     if self.uses_mrope:
-                        self.input_data.set_mrope_position(torch.zeros((3, size), device="cpu"))
+                        self.input_data.set_mrope_position(
+                            torch.zeros((3, size), device="cpu")
+                        )
                     _set_dp_counts(size)
                     g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
+                    with torch.cuda.graph(
+                        cuda_graph=g, pool=memory_pool, stream=stream
+                    ):
                         self.forward()
                     self.size_to_graph[size] = g
                 # MTP: capture the draft-step graph per bucket on the same
@@ -2344,9 +2303,7 @@ class ModelRunner:
             torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     @torch.inference_mode()
-    def _capture_piecewise_graphs(
-        self, stream: Optional[torch.cuda.Stream]
-    ) -> None:
+    def _capture_piecewise_graphs(self, stream: Optional[torch.cuda.Stream]) -> None:
         """Capture every configured mixed-forward bucket during startup.
 
         Unlike decode, a piecewise graph's eager Attention/GDN breaks need real
@@ -2376,9 +2333,7 @@ class ModelRunner:
         # pool reuse and makes startup scale linearly with Python GC work.
         gc.collect()
         torch.cuda.empty_cache()
-        stream_ctx = (
-            torch.cuda.stream(stream) if stream is not None else _nullcontext()
-        )
+        stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullcontext()
         with stream_ctx:
             for bucket in iterator:
                 seq_id = -(1_000_000 + bucket)
@@ -2386,9 +2341,7 @@ class ModelRunner:
                 seq.prompt_len = bucket
                 seq.computed_token_num = 0
                 seq.to_compute_token_num = bucket
-                self.memory_manager.pre_allocate_page(
-                    [seq], cacheable=False
-                )
+                self.memory_manager.pre_allocate_page([seq], cacheable=False)
                 self.memory_manager.allocate_ssm_slot(seq)
                 try:
                     # Dynamic Attention/SSM boundaries are not executed while
@@ -2494,9 +2447,7 @@ class ModelRunner:
                 raise RuntimeError("model forward has no ForwardMetadataPlan")
             plan.prepare_attention(backend, input_data)
 
-    def _piecewise_input_embeddings(
-        self, num_tokens: int
-    ) -> Optional[torch.Tensor]:
+    def _piecewise_input_embeddings(self, num_tokens: int) -> Optional[torch.Tensor]:
         """Return explicit model inputs for a piecewise forward.
 
         Piecewise capture starts immediately after token embedding so every
@@ -2720,9 +2671,9 @@ class ModelRunner:
         import time as _time
 
         if not hasattr(self, "_mtp_m_drafts"):
-            self._mtp_m_drafts = 0            # number of (seq,step) drafts
-            self._mtp_m_accepted = 0          # total accepted draft tokens
-            self._mtp_m_pos = [0] * k         # per-position accept counts
+            self._mtp_m_drafts = 0  # number of (seq,step) drafts
+            self._mtp_m_accepted = 0  # total accepted draft tokens
+            self._mtp_m_pos = [0] * k  # per-position accept counts
             self._mtp_m_t0 = _time.time()
         self._mtp_m_drafts += nd
         for na in n_accepted:
@@ -2764,7 +2715,8 @@ class ModelRunner:
                 logger.warning(
                     "MTP sparse top-k tie overflow on %d rows (margin=%d); "
                     "consider raising ModelRunner._SPARSE_TIE_MARGIN",
-                    n_of, self._SPARSE_TIE_MARGIN,
+                    n_of,
+                    self._SPARSE_TIE_MARGIN,
                 )
                 self._mtp_tie_overflow.zero_()
         self._mtp_sampling_seen = False
@@ -2789,7 +2741,9 @@ class ModelRunner:
             self._mtp_rng = torch.Generator(device=device)
         # A fixed base keeps runs reproducible; the counter advances in lockstep
         # across ranks. 0x9E3779B9 (golden-ratio) spreads consecutive seeds.
-        self._mtp_rng.manual_seed(0x9E3779B9 * (self._mtp_step + 1) & 0x7FFFFFFFFFFFFFFF)
+        self._mtp_rng.manual_seed(
+            0x9E3779B9 * (self._mtp_step + 1) & 0x7FFFFFFFFFFFFFFF
+        )
         self._mtp_step += 1
         return self._mtp_rng
 
@@ -2828,16 +2782,19 @@ class ModelRunner:
         dev = logits.device
         temps = torch.tensor(
             [s.temperature if s.temperature > 1e-5 else 1.0 for s in seqs],
-            device=dev, dtype=torch.float32,
+            device=dev,
+            dtype=torch.float32,
         ).unsqueeze(1)
         probs = torch.softmax(logits.float() / temps, dim=-1)
         top_ks = torch.tensor(
-            [s.top_k if s.top_k != -1 else self.memory_manager.vocab_size for s in seqs],
-            device=dev, dtype=torch.int32,
+            [
+                s.top_k if s.top_k != -1 else self.memory_manager.vocab_size
+                for s in seqs
+            ],
+            device=dev,
+            dtype=torch.int32,
         )
-        top_ps = torch.tensor(
-            [s.top_p for s in seqs], device=dev, dtype=torch.float32
-        )
+        top_ps = torch.tensor([s.top_p for s in seqs], device=dev, dtype=torch.float32)
         # Only renorm when some seq actually restricts (cheap guard).
         if int(top_ks.min().item()) < self.memory_manager.vocab_size:
             probs = top_k_renorm_prob(probs, top_ks)
@@ -2963,16 +2920,12 @@ class ModelRunner:
         0.16 ms at n=64, 1.01 -> 0.55 ms at n=256). Bit-identical to selecting on
         the widened logits -- the cast is lossless and order preserving.
         """
-        vals, idx = torch.topk(logits, k_pad, dim=-1)            # descending
+        vals, idx = torch.topk(logits, k_pad, dim=-1)  # descending
         vals = vals.float()
         # Tie-inclusive top-k: keep everything >= the top_k-th largest value.
-        kth = vals.gather(
-            1, (top_ks.long() - 1).clamp_(0, k_pad - 1).unsqueeze(1)
-        )
+        kth = vals.gather(1, (top_ks.long() - 1).clamp_(0, k_pad - 1).unsqueeze(1))
         keep = vals >= kth
-        probs = torch.softmax(
-            vals.masked_fill(~keep, float("-inf")) / temps, dim=-1
-        )
+        probs = torch.softmax(vals.masked_fill(~keep, float("-inf")) / temps, dim=-1)
         # top-p over the descending probs: keep the shortest prefix that reaches
         # ``top_p`` (exclusive cumsum < top_p), then renormalize.
         csum = probs.cumsum(dim=-1)
@@ -3038,9 +2991,7 @@ class ModelRunner:
             for i, s in enumerate(decode_seqs):
                 s.computed_token_num = len(orig_tokens[i]) + j
                 s.to_compute_token_num = 1
-                s.to_compute_tokens = [
-                    x1[i] if j == 0 else drafts_cols[i][-1]
-                ]
+                s.to_compute_tokens = [x1[i] if j == 0 else drafts_cols[i][-1]]
             self.prepare_input(decode_seqs)
             out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
             logits = mtp.logits_from_hidden(out_hidden)
@@ -3062,7 +3013,8 @@ class ModelRunner:
                 q = self._mtp_probs_from_logits(logits, decode_seqs)  # [nd, vocab]
                 tok = (
                     torch.multinomial(q, num_samples=1, generator=gen)
-                    .squeeze(1).to(torch.int64)
+                    .squeeze(1)
+                    .to(torch.int64)
                 )
                 tok = self._mtp_bcast_tp(tok)
                 q_steps.append(q)
@@ -3094,9 +3046,7 @@ class ModelRunner:
             for i, s in enumerate(decode_seqs):
                 s.computed_token_num = len(orig_tokens[i]) + j
                 s.to_compute_token_num = 1
-                s.to_compute_tokens = [
-                    x1[i] if j == 0 else drafts_cols[i][-1]
-                ]
+                s.to_compute_tokens = [x1[i] if j == 0 else drafts_cols[i][-1]]
             self.prepare_input(decode_seqs)
             out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
             tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
@@ -3193,7 +3143,7 @@ class ModelRunner:
 
         def _slot_for(pos):
             blk = block_table[row_idx, (pos // page_sz)]
-            return (blk.to(torch.int64) * page_sz + (pos % page_sz))
+            return blk.to(torch.int64) * page_sz + (pos % page_sz)
 
         for j in range(k):
             if j > 0:
@@ -3315,7 +3265,7 @@ class ModelRunner:
 
         def _slot_for(pos):
             blk = block_table[row_idx, (pos // page_sz)]
-            return (blk.to(torch.int64) * page_sz + (pos % page_sz))
+            return blk.to(torch.int64) * page_sz + (pos % page_sz)
 
         step_q, step_qv, step_qi, step_qd = [], [], [], []
         for j in range(k):
@@ -3354,12 +3304,12 @@ class ModelRunner:
         drafts_gpu = self._d_drafts[:nd, :k]
         if sparse:
             q = self._q_sparse(
-                torch.stack(step_qv, dim=1),           # [nd, k, k_pad]
+                torch.stack(step_qv, dim=1),  # [nd, k, k_pad]
                 torch.stack(step_qi, dim=1),
-                torch.stack(step_qd, dim=1),           # [nd, k]
+                torch.stack(step_qd, dim=1),  # [nd, k]
             )
         else:
-            q = self._q_dense(torch.stack(step_q, dim=1))   # [nd, k, vocab]
+            q = self._q_dense(torch.stack(step_q, dim=1))  # [nd, k, vocab]
         # Stash the GPU copy so the verify prep can take the tokens straight from
         # the device. The rejection accept still walks the drafts host-side (it
         # slices the committed prefix per seq), so materialize them here -- one
@@ -3385,9 +3335,7 @@ class ModelRunner:
         # the chain outputs and position helpers persistent so the hot path does
         # not allocate k clones, a stack output, a base-position clone, or a new
         # arange tensor on every speculative step.
-        self._d_drafts = torch.empty(
-            (B, self._mtp_k), dtype=torch.int64, device=dev
-        )
+        self._d_drafts = torch.empty((B, self._mtp_k), dtype=torch.int64, device=dev)
         self._d_base_pos = torch.empty(B, dtype=torch.long, device=dev)
         self._d_row_idx = torch.arange(B, dtype=torch.int64, device=dev)
         # Sampled-draft (rejection sampling) static buffers: per-seq sampling
@@ -3465,8 +3413,9 @@ class ModelRunner:
                 # the batch restricts top_k (the common serving case). Captured
                 # separately because ``k_pad`` is baked in; the dense graph above
                 # stays as the fallback for unrestricted-top_k batches.
-                self._d_topk[:bucket].fill_(self._sparse_kpad_capture
-                                            - self._SPARSE_TIE_MARGIN)
+                self._d_topk[:bucket].fill_(
+                    self._sparse_kpad_capture - self._SPARSE_TIE_MARGIN
+                )
                 self._draft_step_forward_sampled_sparse()
                 torch.cuda.synchronize()
                 gsp = torch.cuda.CUDAGraph()
@@ -3486,7 +3435,9 @@ class ModelRunner:
         nd = self._d_nd
         mtp = self.model.mtp
         self._prepare_attention_metadata(self._draft_input)
-        out_hidden = mtp.forward(self._draft_input, self._d_hidden[:nd], self._d_tok[:nd])
+        out_hidden = mtp.forward(
+            self._draft_input, self._d_hidden[:nd], self._d_tok[:nd]
+        )
         self._d_out_hidden[:nd].copy_(out_hidden)
         tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
         self._d_next_tok[:nd].copy_(tok)
@@ -3508,7 +3459,9 @@ class ModelRunner:
         nd = self._d_nd
         mtp = self.model.mtp
         self._prepare_attention_metadata(self._draft_input)
-        out_hidden = mtp.forward(self._draft_input, self._d_hidden[:nd], self._d_tok[:nd])
+        out_hidden = mtp.forward(
+            self._draft_input, self._d_hidden[:nd], self._d_tok[:nd]
+        )
         self._d_out_hidden[:nd].copy_(out_hidden)
         logits = mtp.logits_from_hidden(out_hidden)
         q = self._mtp_probs_static(
@@ -3534,7 +3487,9 @@ class ModelRunner:
         nd = self._d_nd
         mtp = self.model.mtp
         self._prepare_attention_metadata(self._draft_input)
-        out_hidden = mtp.forward(self._draft_input, self._d_hidden[:nd], self._d_tok[:nd])
+        out_hidden = mtp.forward(
+            self._draft_input, self._d_hidden[:nd], self._d_tok[:nd]
+        )
         self._d_out_hidden[:nd].copy_(out_hidden)
         logits = mtp.logits_from_hidden(out_hidden)
         qv, qi = self._mtp_sparse_probs(
@@ -3912,9 +3867,7 @@ class ModelRunner:
             mrope_deltas=self._mtp_mrope_deltas(decode_seqs),
             ctx_lens_gpu=(async_state.context_lens if async_state else None),
             x1_gpu=(async_state.relay_tokens if async_state else None),
-            num_accepted_gpu=(
-                async_state.resume_num_accepted if async_state else None
-            ),
+            num_accepted_gpu=(async_state.resume_num_accepted if async_state else None),
         )
         return gp
 
@@ -4022,9 +3975,8 @@ class ModelRunner:
         # snapshot paths keep reading column 0. Pure-attention models (DeepSeek
         # MTP) have no SSM segment and skip this.
         _ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
-        _has_gdn = (
-            _ssm_seg is not None
-            and all(s.ssm_block_table is not None for s in decode_seqs)
+        _has_gdn = _ssm_seg is not None and all(
+            s.ssm_block_table is not None for s in decode_seqs
         )
         # A target bonus is not a verify INPUT, so it has no KV/GDN state yet.
         # Its draft seed, however, is the target hidden at the accepted verify
@@ -4137,8 +4089,7 @@ class ModelRunner:
         # verify graph, so serving never replays once per candidate.
         if (
             not extra_prefill_seqs
-            and
-            self._mtp_verify_graph
+            and self._mtp_verify_graph
             and self._verify_size_to_graph
             and nd <= max(self._verify_size_to_graph.keys())
         ):
@@ -4169,13 +4120,13 @@ class ModelRunner:
             else:
                 drafts = self._drafts_host(drafts, nd, kk)
             for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i])          # context cached
+                s.computed_token_num = len(orig_tokens[i])  # context cached
                 s.to_compute_token_num = 1 + kk
                 # InputData consumes this compact suffix directly. Keeping the
                 # committed token_ids list untouched removes an O(context)
                 # Python list copy from every mixed verify forward.
                 s.to_compute_tokens = [x1[i]] + drafts[i]
-                s._mtp_verify = True   # force the prefill-with-context attn path
+                s._mtp_verify = True  # force the prefill-with-context attn path
             self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
             verify_and_prefill = list(decode_seqs) + extra_prefill_seqs
             self.prepare_input(verify_and_prefill)
@@ -4217,18 +4168,14 @@ class ModelRunner:
                 )
                 self._fixup_vl_decode_embeddings(num_decode_tokens)
                 mixed_embeddings = self.input_hidden_states[:total_mixed_tokens]
-                with torch.profiler.record_function(
-                    "gllm::mtp_target_mixed_piecewise"
-                ):
+                with torch.profiler.record_function("gllm::mtp_target_mixed_piecewise"):
                     all_hidden = self._piecewise_runner.run(
                         self.input_data, mixed_embeddings
                     )
             if all_hidden is None:
                 # Go through the normal runner wrapper: it prepares attention
                 # metadata and supplies Qwen-VL-compatible input embeddings.
-                with torch.profiler.record_function(
-                    "gllm::mtp_target_mixed_eager"
-                ):
+                with torch.profiler.record_function("gllm::mtp_target_mixed_eager"):
                     self.forward()
                 all_hidden = self.output_hidden_states[:total_mixed_tokens]
             # Verify seqs are uniform ``1+kk`` query length, so ``qsl`` is the
@@ -4245,9 +4192,7 @@ class ModelRunner:
                 num_extra = len(extra_prefill_seqs)
                 last_rows_gpu = self._mtp_mixed_last_rows[:num_extra]
                 last_rows_gpu.copy_(
-                    self.input_data.query_start_loc[
-                        nd + 1 : nd + num_extra + 1
-                    ]
+                    self.input_data.query_start_loc[nd + 1 : nd + num_extra + 1]
                 )
                 last_rows_gpu.sub_(1)
                 prefill_hidden = all_hidden.index_select(0, last_rows_gpu)
@@ -4280,8 +4225,7 @@ class ModelRunner:
                     completed = [
                         i
                         for i, s in enumerate(extra_prefill_seqs)
-                        if s.computed_token_num + s.to_compute_token_num
-                        >= s.prompt_len
+                        if s.computed_token_num + s.to_compute_token_num >= s.prompt_len
                     ]
                     if completed:
                         nc = len(completed)
@@ -4299,15 +4243,11 @@ class ModelRunner:
                             for i in completed
                         ]
                         completed_gpu.copy_(idx_host, non_blocking=True)
-                        new_state_context_lens.copy_(
-                            ctx_host, non_blocking=True
-                        )
+                        new_state_context_lens.copy_(ctx_host, non_blocking=True)
                         new_state_tokens = prefill_tokens_gpu.index_select(
                             0, completed_gpu
                         )
-                        new_state_hidden = prefill_hidden.index_select(
-                            0, completed_gpu
-                        )
+                        new_state_hidden = prefill_hidden.index_select(0, completed_gpu)
                 else:
                     prefill_tokens = prefill_tokens_gpu.cpu().tolist()
             else:
@@ -4320,8 +4260,8 @@ class ModelRunner:
         # [seq0: x1,d1..dk | seq1: ...]; the per-seq sampling params are expanded
         # on-device with ``repeat_interleave`` instead of building a 256-entry
         # python seq list per step.
-        p_dists = None          # dense [num_v, vocab] (unrestricted-top_k batches)
-        p_sparse = None         # (vals, idx) [nd, 1+kk, k_pad] (top_k-restricted)
+        p_dists = None  # dense [num_v, vocab] (unrestricted-top_k batches)
+        p_sparse = None  # (vals, idx) [nd, 1+kk, k_pad] (top_k-restricted)
         if _use_rej:
             num_v = nd * (1 + kk)
             temps, top_ks, top_ps = self._mtp_sample_params(decode_seqs, dev)
@@ -4335,9 +4275,7 @@ class ModelRunner:
                 # renorm passes over ``[nd*(1+k), vocab]`` (3.1 ms -> 0.6 ms at
                 # nd=64, and 254 MB of dense probs never materialized).
                 k_pad = self._mtp_kpad(decode_seqs)
-                pv, pi = self._mtp_sparse_probs(
-                    v_logits[:num_v], t_r, k_r, p_r, k_pad
-                )
+                pv, pi = self._mtp_sparse_probs(v_logits[:num_v], t_r, k_r, p_r, k_pad)
                 p_sparse = (pv.view(nd, rep, -1), pi.view(nd, rep, -1))
             else:
                 p_dists = self._mtp_probs_static(
@@ -4360,7 +4298,7 @@ class ModelRunner:
         # longer a reliable count here -- use ``nd`` directly. This batch is pure
         # decode/verify (no real non-decode seqs), so there is no tail to fill.
         results = [None] * nd
-        n_accepted = [0] * nd   # accepted DRAFT tokens per seq (excludes x1)
+        n_accepted = [0] * nd  # accepted DRAFT tokens per seq (excludes x1)
         new_relay = {}
 
         if _use_rej:
@@ -4386,7 +4324,7 @@ class ModelRunner:
             seq_ar = self._mtp_row_idx[:nd]
             sparse = p_sparse is not None
             if sparse:
-                p3_vals, p3_idx = p_sparse          # [nd, qlen, k_pad] each
+                p3_vals, p3_idx = p_sparse  # [nd, qlen, k_pad] each
             else:
                 p3 = p_dists.view(nd, qlen, p_dists.shape[-1])
             if kk > 0:
@@ -4401,21 +4339,22 @@ class ModelRunner:
                     # (pick its value) or outside it, where p is exactly 0 -- the
                     # same value the dense gather would return.
                     hit = (p3_idx[:, :kk] == idx).to(p3_vals.dtype)
-                    p_d = (p3_vals[:, :kk] * hit).sum(dim=-1)      # [nd,kk] p(d_p)
+                    p_d = (p3_vals[:, :kk] * hit).sum(dim=-1)  # [nd,kk] p(d_p)
                     # q(d_p) was recorded by the draft step that drew it.
                     q_d = q_dists.drawn
                 else:
-                    p_d = p3[:, :kk].gather(2, idx).squeeze(-1)    # [nd,kk] p(d_p)
+                    p_d = p3[:, :kk].gather(2, idx).squeeze(-1)  # [nd,kk] p(d_p)
                     q_d = q_dists.dense.gather(2, idx).squeeze(-1)  # [nd,kk] q(d_p)
                 # accept d_p with prob min(1, p/q); q<=0 can only happen for a
                 # token q never proposes, so treat it as certain acceptance
                 # (matches the old scalar branch).
                 ratio = torch.where(
-                    q_d > 0, (p_d / q_d.clamp_min(1e-30)).clamp_max(1.0),
+                    q_d > 0,
+                    (p_d / q_d.clamp_min(1e-30)).clamp_max(1.0),
                     torch.ones_like(p_d),
                 )
                 u = torch.rand((nd, kk), generator=gen, device=dev)
-                accept = u < ratio                                 # [nd,kk] bool
+                accept = u < ratio  # [nd,kk] bool
                 # Leading all-accept prefix length (same cumprod trick as greedy).
                 na_gpu = torch.cumprod(accept.to(torch.int32), dim=1).sum(dim=1)
             else:
@@ -4430,22 +4369,22 @@ class ModelRunner:
                 # ``(p-q)+`` is supported inside p's kept set (outside it p == 0,
                 # so the clamp is 0 there), which is why the residual only needs
                 # p's ``k_pad`` columns plus q's values at those same token ids.
-                p_row = p3_vals[seq_ar, na_l]                      # [nd, k_pad]
-                p_row_idx = p3_idx[seq_ar, na_l]                   # [nd, k_pad]
+                p_row = p3_vals[seq_ar, na_l]  # [nd, k_pad]
+                p_row_idx = p3_idx[seq_ar, na_l]  # [nd, k_pad]
             else:
-                p_row = p3[seq_ar, na_l]                           # [nd, V]
+                p_row = p3[seq_ar, na_l]  # [nd, V]
             if kk > 0:
                 sel = na_l.clamp(max=kk - 1)
                 if sparse:
                     # q's values at p's kept token ids. Everything outside q's own
                     # support is q == 0, so matching the two id lists (k_pad x
                     # k_pad per row, ~16k comparisons) is all that's needed.
-                    q_row_v = q_dists.vals[seq_ar, sel]            # [nd, k_pad]
-                    q_row_i = q_dists.idx[seq_ar, sel]             # [nd, k_pad]
-                    match = (q_row_i.unsqueeze(1) == p_row_idx.unsqueeze(2))
+                    q_row_v = q_dists.vals[seq_ar, sel]  # [nd, k_pad]
+                    q_row_i = q_dists.idx[seq_ar, sel]  # [nd, k_pad]
+                    match = q_row_i.unsqueeze(1) == p_row_idx.unsqueeze(2)
                     q_at_p = (match.to(q_row_v.dtype) * q_row_v.unsqueeze(1)).sum(-1)
                 else:
-                    q_at_p = q_dists.dense[seq_ar, sel]            # [nd, V]
+                    q_at_p = q_dists.dense[seq_ar, sel]  # [nd, V]
                 resid = torch.where(
                     (na_gpu < kk).unsqueeze(1),
                     (p_row - q_at_p).clamp_min(0),
@@ -4467,7 +4406,7 @@ class ModelRunner:
             rows = [na_gpu.to(torch.int64), bonus_gpu.to(torch.int64)]
             if d_gpu is not None:
                 rows.extend(d_gpu.t())
-            packed_cpu = torch.stack(rows).cpu()                   # [2+kk, nd]
+            packed_cpu = torch.stack(rows).cpu()  # [2+kk, nd]
             na_cpu = packed_cpu[0].tolist()
             bonus_cpu2 = packed_cpu[1].tolist()
             drafts_cpu = packed_cpu[2:].t().tolist() if d_gpu is not None else None
@@ -4498,7 +4437,9 @@ class ModelRunner:
                     for i in range(nd):
                         c = results[i]
                         lens[i] = len(c)
-                        grid[i, : len(c)] = torch.tensor(c, dtype=torch.int64, device=dev)
+                        grid[i, : len(c)] = torch.tensor(
+                            c, dtype=torch.int64, device=dev
+                        )
                         bonus_t[i] = new_relay[decode_seqs[i].seq_id][0]
                 src = get_rank() - get_tp_rank()
                 dist.broadcast(lens, src=src, group=get_ipc_tp_group())
@@ -4540,12 +4481,10 @@ class ModelRunner:
                     drafts_gpu = dg.to(vp.dtype)
                 else:
                     drafts_gpu = torch.tensor(drafts, device=dev, dtype=vp.dtype)
-                match = (vp[:, :kk] == drafts_gpu)                    # [nd,kk] bool
+                match = vp[:, :kk] == drafts_gpu  # [nd,kk] bool
                 # cumprod over the bool prefix: 1 until the first mismatch, 0 after
                 # -> sum = length of the leading all-accept prefix.
-                na_gpu = torch.cumprod(
-                    match.to(torch.int32), dim=1
-                ).sum(dim=1)  # [nd]
+                na_gpu = torch.cumprod(match.to(torch.int32), dim=1).sum(dim=1)  # [nd]
             else:
                 drafts_gpu = None
                 na_gpu = torch.zeros(nd, device=dev, dtype=torch.int32)
@@ -4587,18 +4526,14 @@ class ModelRunner:
                         drafts=(
                             drafts_gpu
                             if drafts_gpu is not None
-                            else torch.empty(
-                                (nd, 0), dtype=torch.int64, device=dev
-                            )
+                            else torch.empty((nd, 0), dtype=torch.int64, device=dev)
                         ),
                         num_accepted_drafts=na_gpu,
                         next_bonus=vp[seq_ar, na_l],
                         next_hidden=bonus_hidden_all,
                         producer_stream=torch.cuda.current_stream(),
                         extra_tokens=prefill_tokens_gpu,
-                        extra_seq_ids=tuple(
-                            s.seq_id for s in extra_prefill_seqs
-                        ),
+                        extra_seq_ids=tuple(s.seq_id for s in extra_prefill_seqs),
                         new_state_seq_ids=new_state_seq_ids,
                         new_state_context_lens=new_state_context_lens,
                         new_state_tokens=new_state_tokens,
@@ -4620,12 +4555,10 @@ class ModelRunner:
             rows.append(vp[seq_ar, na_gpu.to(torch.long)].to(torch.int64))
             if drafts_gpu is not None:
                 rows.extend(drafts_gpu.to(torch.int64).t())
-            packed_cpu = torch.stack(rows).cpu()   # [2+kk, nd]
+            packed_cpu = torch.stack(rows).cpu()  # [2+kk, nd]
             na_cpu = packed_cpu[0].tolist()
             bonus_cpu2 = packed_cpu[1].tolist()
-            drafts_cpu = (
-                packed_cpu[2:].t().tolist() if drafts_gpu is not None else None
-            )
+            drafts_cpu = packed_cpu[2:].t().tolist() if drafts_gpu is not None else None
             for i, s in enumerate(decode_seqs):
                 na = na_cpu[i]
                 n_accepted[i] = na
@@ -4682,8 +4615,7 @@ class ModelRunner:
         """
         seqs = self.input_data.seqs[: self.input_data.num_decodes]
         if any(
-            (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5)
-            or s.top_k != 1
+            (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5) or s.top_k != 1
             for s in seqs
         ):
             raise RuntimeError("async MTP currently requires greedy requests")
@@ -4737,9 +4669,7 @@ class ModelRunner:
         old_publish = self._mtp_async_publish
         self._mtp_async_publish = async_publish
         try:
-            result = self._mtp_decode(
-                hidden, x1, extra_prefill_seqs=prefill_seqs
-            )
+            result = self._mtp_decode(hidden, x1, extra_prefill_seqs=prefill_seqs)
         finally:
             self._mtp_async_publish = old_publish
         if async_publish and not isinstance(result, MtpAsyncCompletion):
@@ -4784,9 +4714,7 @@ class ModelRunner:
                 seq = by_id[seq_id]
                 if getattr(seq, "_overlap_freed", False):
                     continue
-                self._mtp_relay[seq.seq_id] = (
-                    int(relay_tokens[i]), relay_hidden[i]
-                )
+                self._mtp_relay[seq.seq_id] = (int(relay_tokens[i]), relay_hidden[i])
                 na = int(resume[i]) - 1
                 if seq.ssm_block_table is not None:
                     if na > 0:
@@ -4812,9 +4740,7 @@ class ModelRunner:
         # following pure-decode iteration can mistake the stale entry for a full
         # relay hit and seed its draft from the wrong sequence position.
         if self.input_data.num_prefills > 0 and self.input_data.num_decodes > 0:
-            self._mtp_drop_relay(
-                self.input_data.seqs[: self.input_data.num_decodes]
-            )
+            self._mtp_drop_relay(self.input_data.seqs[: self.input_data.num_decodes])
         # Fused MTP path. Full-relay batches go straight to draft/verify. Fresh
         # or relay-miss seqs are seeded by a verify-shaped padded bootstrap so
         # every MTP target forward keeps the same fixed qlen=1+k; the ordinary
@@ -4915,17 +4841,21 @@ class ModelRunner:
             # MTP speculative decoding: on a pure-decode batch, draft k tokens
             # per seq with the MTP head and verify them with one base forward,
             # committing the accepted prefix. Returns per-seq token LISTS.
-            if (self.mtp_enabled
-                    and self.input_data.num_prefills == 0
-                    and self.input_data.num_decodes > 0
-                    and not self.mtp_speculate_batch(self.input_data.num_decodes)):
+            if (
+                self.mtp_enabled
+                and self.input_data.num_prefills == 0
+                and self.input_data.num_decodes > 0
+                and not self.mtp_speculate_batch(self.input_data.num_decodes)
+            ):
                 # Batch too large to profit from speculation: this step already
                 # sampled one token per seq the plain way, which is the answer.
                 # The relay it leaves behind is stale (see ``_mtp_drop_relay``).
                 self._mtp_drop_relay()
-            elif (self.mtp_enabled
-                    and self.input_data.num_prefills == 0
-                    and self.input_data.num_decodes > 0):
+            elif (
+                self.mtp_enabled
+                and self.input_data.num_prefills == 0
+                and self.input_data.num_decodes > 0
+            ):
                 # x1 (this decode batch's first target token) was just sampled by
                 # the per-rank sampler above. Under GREEDY (top_k==1 -> argmax) it
                 # is TP-deterministic, but under SAMPLING each TP rank draws
@@ -5270,9 +5200,7 @@ class OverlapModelRunner(ModelRunner):
         with torch.cuda.stream(self.forward_stream):
             self.forward_stream.wait_event(self.overlap_runtime.input_ready_event)
             self.forward_stream.wait_stream(default_stream)
-            self.future_map.resolve_future(
-                self.input_data.tokens[:num_cal_tokens]
-            )
+            self.future_map.resolve_future(self.input_data.tokens[:num_cal_tokens])
 
             num_decode_tokens = sum(
                 s.to_compute_token_num
@@ -5360,9 +5288,7 @@ class OverlapModelRunner(ModelRunner):
                 # (``get_rank() - get_tp_rank()``), not the world's output rank
                 # 0 (which isn't even a member of group>0's TP subgroup).
                 tp_src = (
-                    get_rank() - get_tp_rank()
-                    if is_dp_attn()
-                    else get_output_rank()
+                    get_rank() - get_tp_rank() if is_dp_attn() else get_output_rank()
                 )
                 dist.broadcast(
                     next_tokens_gpu,
@@ -5394,12 +5320,12 @@ class OverlapModelRunner(ModelRunner):
                             sampled, non_blocking=True
                         )
                         if lp_k > 0:
-                            self._lp_topval_bufs[buf_idx][
-                                :batch_size, :lp_k
-                            ].copy_(top_vals, non_blocking=True)
-                            self._lp_topid_bufs[buf_idx][
-                                :batch_size, :lp_k
-                            ].copy_(top_ids, non_blocking=True)
+                            self._lp_topval_bufs[buf_idx][:batch_size, :lp_k].copy_(
+                                top_vals, non_blocking=True
+                            )
+                            self._lp_topid_bufs[buf_idx][:batch_size, :lp_k].copy_(
+                                top_ids, non_blocking=True
+                            )
 
             self.overlap_runtime.input_consumed_event.record(self.forward_stream)
 

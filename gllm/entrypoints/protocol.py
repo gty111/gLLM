@@ -55,12 +55,17 @@ class OpenAIBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ErrorResponse(OpenAIBaseModel):
-    object: str = "error"
+class ErrorDetail(OpenAIBaseModel):
     message: str
     type: str
     param: Optional[str] = None
-    code: int
+    code: Optional[Union[str, int]] = None
+
+
+class ErrorResponse(OpenAIBaseModel):
+    """OpenAI error envelope returned for every HTTP/API error."""
+
+    error: ErrorDetail
 
 
 class ModelPermission(OpenAIBaseModel):
@@ -98,6 +103,8 @@ class UsageInfo(OpenAIBaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+    prompt_tokens_details: Optional[Dict[str, int]] = None
+    completion_tokens_details: Optional[Dict[str, int]] = None
 
 
 class StructuralTag(OpenAIBaseModel):
@@ -117,27 +124,48 @@ class StructuralTagResponseFormat(OpenAIBaseModel):
 
 
 class ResponseFormat(OpenAIBaseModel):
-    # type must be "json_object" or "text"
     type: Literal["text", "json_object"]
 
 
-AnyResponseFormat = Union[ResponseFormat, StructuralTagResponseFormat]
+class JSONSchemaDefinition(OpenAIBaseModel):
+    name: str
+    description: Optional[str] = None
+    schema_: Dict[str, Any] = Field(alias="schema")
+    strict: Optional[bool] = None
+
+
+class JSONSchemaResponseFormat(OpenAIBaseModel):
+    type: Literal["json_schema"]
+    json_schema: JSONSchemaDefinition
+
+
+AnyResponseFormat = Union[
+    ResponseFormat, JSONSchemaResponseFormat, StructuralTagResponseFormat
+]
 
 
 class StreamOptions(OpenAIBaseModel):
-    include_usage: Optional[bool] = True
-    continuous_usage_stats: Optional[bool] = True
+    include_usage: Optional[bool] = False
+    include_obfuscation: Optional[bool] = None
+    # gLLM extension retained for backwards compatibility.
+    continuous_usage_stats: Optional[bool] = False
 
 
 class FunctionDefinition(OpenAIBaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
     function: FunctionDefinition
+
+
+class ChatCompletionCustomToolParam(OpenAIBaseModel):
+    type: Literal["custom"]
+    custom: Dict[str, Any]
 
 
 class ChatCompletionNamedFunction(OpenAIBaseModel):
@@ -147,6 +175,16 @@ class ChatCompletionNamedFunction(OpenAIBaseModel):
 class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     function: ChatCompletionNamedFunction
     type: Literal["function"] = "function"
+
+
+class ChatCompletionAllowedTools(OpenAIBaseModel):
+    mode: Literal["auto", "required"]
+    tools: List[ChatCompletionNamedToolChoiceParam]
+
+
+class ChatCompletionAllowedToolChoiceParam(OpenAIBaseModel):
+    type: Literal["allowed_tools"]
+    allowed_tools: ChatCompletionAllowedTools
 
 
 # extra="forbid" is a workaround to have kwargs as a field,
@@ -166,8 +204,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
-    model: Optional[str] = None
+    model: str
+    audio: Optional[Dict[str, Any]] = None
     frequency_penalty: Optional[float] = 0.0
+    function_call: Optional[Union[Literal["none", "auto"], Dict[str, str]]] = None
+    functions: Optional[List[FunctionDefinition]] = None
     logit_bias: Optional[dict[str, float]] = None
     logprobs: Optional[bool] = False
     top_logprobs: Optional[int] = 0
@@ -177,28 +218,49 @@ class ChatCompletionRequest(OpenAIBaseModel):
     )
     max_completion_tokens: Optional[int] = None
     n: Optional[int] = 1
+    modalities: Optional[List[Literal["text", "audio"]]] = None
+    metadata: Optional[Dict[str, str]] = None
+    moderation: Optional[Dict[str, Any]] = None
     presence_penalty: Optional[float] = 0.0
+    prediction: Optional[Dict[str, Any]] = None
+    prompt_cache_key: Optional[str] = None
+    prompt_cache_options: Optional[Dict[str, Any]] = None
+    prompt_cache_retention: Optional[Literal["in_memory", "24h"]] = None
+    reasoning_effort: Optional[
+        Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+    ] = None
     response_format: Optional[AnyResponseFormat] = None
+    safety_identifier: Optional[str] = None
     seed: Optional[int] = Field(None, ge=_LONG_INFO.min, le=_LONG_INFO.max)
+    service_tier: Optional[
+        Literal["auto", "default", "flex", "scale", "priority", "fast"]
+    ] = None
     stop: Optional[Union[str, list[str]]] = []
+    store: Optional[bool] = False
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    tools: Optional[list[ChatCompletionToolsParam]] = None
+    tools: Optional[
+        list[Union[ChatCompletionToolsParam, ChatCompletionCustomToolParam]]
+    ] = None
     tool_choice: Optional[
         Union[
             Literal["none"],
             Literal["auto"],
             Literal["required"],
             ChatCompletionNamedToolChoiceParam,
+            ChatCompletionAllowedToolChoiceParam,
+            Dict[str, Any],
         ]
-    ] = "none"
+    ] = None
 
     # Accepted for OpenAI schema compatibility; the model and tool parser
     # determine whether calls are emitted in parallel.
-    parallel_tool_calls: Optional[bool] = False
+    parallel_tool_calls: Optional[bool] = True
     user: Optional[str] = None
+    verbosity: Optional[Literal["low", "medium", "high"]] = None
+    web_search_options: Optional[Dict[str, Any]] = None
 
     # --8<-- [start:chat-completion-sampling-params]
     best_of: Optional[int] = None
@@ -384,6 +446,31 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def translate_legacy_functions(cls, values):
+        """Accept the deprecated functions/function_call wire format."""
+        if not isinstance(values, dict):
+            return values
+        if values.get("functions") is not None and values.get("tools") is None:
+            values = dict(values)
+            values["tools"] = [
+                {"type": "function", "function": function}
+                for function in values["functions"]
+            ]
+        if (
+            values.get("function_call") is not None
+            and values.get("tool_choice") is None
+        ):
+            values = dict(values)
+            function_call = values["function_call"]
+            values["tool_choice"] = (
+                function_call
+                if isinstance(function_call, str)
+                else {"type": "function", "function": function_call}
+            )
+        return values
+
+    @model_validator(mode="before")
+    @classmethod
     def check_guided_decoding_count(cls, data):
         guide_count = sum(
             [
@@ -399,7 +486,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "('guided_json', 'guided_regex' or 'guided_choice')."
             )
         # you can only either use guided decoding or tools, not both
-        if guide_count > 1 and "tool_choice" in data and data["tool_choice"] != "none":
+        if guide_count > 0 and "tool_choice" in data and data["tool_choice"] != "none":
             raise ValueError(
                 "You can only either use guided decoding or tools, not both."
             )
@@ -408,11 +495,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_tool_choice(cls, data):
-        if "tool_choice" in data and data["tool_choice"] != "none":
-            if not isinstance(data["tool_choice"], dict):
-                raise ValueError("Currently only named tools are supported.")
-            if "tools" not in data or data["tools"] is None:
-                raise ValueError("When using `tool_choice`, `tools` must be set.")
+        if not isinstance(data, dict):
+            return data
+        tool_choice = data.get("tool_choice")
+        if tool_choice not in (None, "none") and not data.get("tools"):
+            raise ValueError("When using `tool_choice`, `tools` must be set.")
         return data
 
     @model_validator(mode="before")
@@ -657,8 +744,12 @@ class ToolCall(OpenAIBaseModel):
 
 class ChatMessage(OpenAIBaseModel):
     role: str
-    content: str
-    tool_calls: List[ToolCall] = Field(default_factory=list)
+    content: Optional[str] = None
+    refusal: Optional[str] = None
+    annotations: Optional[List[Dict[str, Any]]] = None
+    audio: Optional[Dict[str, Any]] = None
+    function_call: Optional[FunctionCall] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):
@@ -691,6 +782,8 @@ class ChatCompletionResponse(OpenAIBaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
+    service_tier: Optional[str] = None
+    system_fingerprint: Optional[str] = "gllm"
 
 
 class DeltaFunctionCall(OpenAIBaseModel):
@@ -711,7 +804,8 @@ class DeltaToolCall(OpenAIBaseModel):
 class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
-    tool_calls: List[DeltaToolCall] = Field(default_factory=list)
+    refusal: Optional[str] = None
+    tool_calls: Optional[List[DeltaToolCall]] = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -730,6 +824,48 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
+    service_tier: Optional[str] = None
+    system_fingerprint: Optional[str] = "gllm"
+    obfuscation: Optional[str] = None
+
+
+class ResponseRequest(OpenAIBaseModel):
+    """Core current Responses API request supported by the local runtime.
+
+    Complex input and tool unions are validated semantically by the endpoint so
+    the wire schema can evolve without coupling the server to an SDK release.
+    """
+
+    model: str
+    input: Union[str, List[Any]]
+    instructions: Optional[Union[str, List[Any]]] = None
+    background: Optional[bool] = False
+    conversation: Optional[Union[str, Dict[str, Any]]] = None
+    include: Optional[List[str]] = None
+    max_output_tokens: Optional[int] = None
+    max_tool_calls: Optional[int] = None
+    metadata: Optional[Dict[str, str]] = None
+    moderation: Optional[Dict[str, Any]] = None
+    parallel_tool_calls: Optional[bool] = True
+    previous_response_id: Optional[str] = None
+    prompt: Optional[Dict[str, Any]] = None
+    prompt_cache_key: Optional[str] = None
+    prompt_cache_options: Optional[Dict[str, Any]] = None
+    prompt_cache_retention: Optional[Literal["in_memory", "24h"]] = None
+    reasoning: Optional[Dict[str, Any]] = None
+    safety_identifier: Optional[str] = None
+    service_tier: Optional[str] = None
+    store: Optional[bool] = False
+    stream: Optional[bool] = False
+    stream_options: Optional[Dict[str, Any]] = None
+    temperature: Optional[float] = None
+    text: Optional[Dict[str, Any]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    top_logprobs: Optional[int] = None
+    top_p: Optional[float] = None
+    truncation: Optional[Literal["auto", "disabled"]] = "disabled"
+    user: Optional[str] = None
 
 
 class BatchRequestInput(OpenAIBaseModel):

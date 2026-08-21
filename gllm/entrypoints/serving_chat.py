@@ -1,3 +1,6 @@
+import secrets
+import time
+
 from gllm.engine.async_llm import AsyncStream
 from gllm.entrypoints.protocol import (
     ChatCompletionLogProb,
@@ -67,7 +70,7 @@ async def chat_completion_generator(
     # parser (unknown model) or tools, the raw text passes through as content.
     content = full_text
     tool_calls = []
-    if tool_parser is not None and request.tools:
+    if tool_parser is not None and request.tools and request.tool_choice != "none":
         parsed_content, tool_calls = tool_parser.parse(full_text, request.tools)
         content = parsed_content if parsed_content is not None else ""
 
@@ -80,15 +83,13 @@ async def chat_completion_generator(
     choice_data = ChatCompletionResponseChoice(
         index=0,
         message=ChatMessage(
-            role="assistant", content=content, tool_calls=tool_calls
+            role="assistant", content=content, tool_calls=tool_calls or None
         ),
         logprobs=logprobs,
         prompt_logprobs=prompt_logprobs,
         # OpenAI sets finish_reason="tool_calls" when the model chose to call a
         # tool; clients (and benchmarks) branch on this.
-        finish_reason=(
-            "tool_calls" if tool_calls else get_finish_reason(stream.seq)
-        ),
+        finish_reason=("tool_calls" if tool_calls else get_finish_reason(stream.seq)),
     )
     response = ChatCompletionResponse(
         choices=[choice_data],
@@ -108,9 +109,34 @@ async def chat_completion_stream_generator(
     # emits content fragments plus tool-call name/argument fragments tied by
     # ``index``. Otherwise stream raw text deltas.
     streaming = tool_parser is not None and bool(request.tools)
+    streaming = streaming and request.tool_choice != "none"
     sp = tool_parser.stream_parser(request.tools) if streaming else None
     full_text = ""
     as_token_ids = bool(request.return_tokens_as_token_ids)
+    response_id = f"chatcmpl-{request.request_id}"
+    created = int(time.time())
+    options = request.stream_options
+    include_usage = bool(options and options.include_usage)
+    continuous_usage = bool(options and options.continuous_usage_stats)
+    include_obfuscation = bool(options and options.include_obfuscation)
+
+    def make_chunk(choices, usage=None):
+        return ChatCompletionStreamResponse(
+            id=response_id,
+            created=created,
+            choices=choices,
+            model=request.model,
+            usage=usage,
+            service_tier=request.service_tier,
+            obfuscation=secrets.token_urlsafe(8) if include_obfuscation else None,
+        )
+
+    # The first OpenAI chat stream delta establishes the assistant role.
+    role_choice = ChatCompletionResponseStreamChoice(
+        index=0, delta=DeltaMessage(role="assistant")
+    )
+    role_chunk = make_chunk([role_choice])
+    yield f"data: {role_chunk.model_dump_json(exclude_none=True)}\n\n"
 
     async for item in stream:
         text = item.text
@@ -141,13 +167,16 @@ async def chat_completion_stream_generator(
                 logprobs=logprobs,
                 prompt_logprobs=prompt_logprobs,
             )
-        chunk = ChatCompletionStreamResponse(choices=[choice_data], model=request.model)
-        data = chunk.model_dump_json(exclude_unset=True)
+        chunk = make_chunk(
+            [choice_data],
+            build_usage(stream.seq) if continuous_usage else None,
+        )
+        data = chunk.model_dump_json(exclude_none=True)
         yield f"data: {data}\n\n"
 
     # Final chunk: empty delta carrying the finish_reason, mirroring the OpenAI
-    # streaming protocol. Usage is attached when the client opted in via
-    # ``stream_options.include_usage`` (default on in our schema).
+    # streaming protocol. OpenAI sends opted-in usage in a separate final
+    # chunk with an empty choices array.
     final_reason = get_finish_reason(stream.seq)
     if streaming and sp.has_tool_calls():
         final_reason = "tool_calls"
@@ -156,14 +185,9 @@ async def chat_completion_stream_generator(
         delta=DeltaMessage(),
         finish_reason=final_reason,
     )
-    include_usage = (
-        request.stream_options is None
-        or request.stream_options.include_usage
-    )
-    final_chunk = ChatCompletionStreamResponse(
-        choices=[final_choice],
-        model=request.model,
-        usage=build_usage(stream.seq) if include_usage else None,
-    )
-    yield f"data: {final_chunk.model_dump_json(exclude_unset=True)}\n\n"
+    final_chunk = make_chunk([final_choice])
+    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
+    if include_usage:
+        usage_chunk = make_chunk([], build_usage(stream.seq))
+        yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
     yield "data: [DONE]\n\n"

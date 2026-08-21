@@ -37,6 +37,59 @@ from gllm.entrypoints.protocol import (
 )
 
 
+def normalize_chat_template_tool_arguments(messages) -> None:
+    """Convert OpenAI wire-format tool arguments for chat templates.
+
+    OpenAI assistant messages carry ``function.arguments`` as a JSON string,
+    while several Hugging Face chat templates (including Qwen3.5/3.8) iterate
+    the arguments as a mapping. Requests have already passed protocol
+    validation by this point, so decode valid JSON objects in place before
+    rendering. Invalid or non-object JSON is left untouched rather than
+    changing its meaning.
+    """
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if tool_calls is None or isinstance(tool_calls, (str, bytes, dict)):
+            continue
+        if not isinstance(tool_calls, list):
+            try:
+                tool_calls = list(tool_calls)
+            except TypeError:
+                continue
+            message["tool_calls"] = tool_calls
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                continue
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                function["arguments"] = parsed
+
+
+def normalize_chat_template_messages(messages) -> None:
+    """Normalize modern OpenAI messages for model-native chat templates.
+
+    ``developer`` is the current OpenAI instruction role, while many local
+    templates still only recognize the equivalent legacy ``system`` role.
+    Tool-call arguments also need conversion from their JSON wire string to the
+    mapping expected by several templates.
+    """
+    normalize_chat_template_tool_arguments(messages)
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "developer":
+            message["role"] = "system"
+
+
 def _dump_arguments(arguments) -> str:
     """Tool-call arguments are always serialized as a JSON *string* in the
     OpenAI schema; pass through strings, JSON-encode everything else."""
@@ -60,12 +113,27 @@ def _dump_arguments(arguments) -> str:
 # Java/JS categories, where every value is a string).
 
 _TYPE_ALIASES: Dict[str, str] = {
-    "str": "string", "text": "string", "varchar": "string", "char": "string",
-    "enum": "string", "int": "integer", "int32": "integer", "int64": "integer",
-    "uint": "integer", "long": "integer", "short": "integer", "float": "number",
-    "float32": "number", "float64": "number", "double": "number",
-    "bool": "boolean", "dict": "object", "arr": "array", "list": "array",
-    "sequence": "array", "tuple": "array",
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "int": "integer",
+    "int32": "integer",
+    "int64": "integer",
+    "uint": "integer",
+    "long": "integer",
+    "short": "integer",
+    "float": "number",
+    "float32": "number",
+    "float64": "number",
+    "double": "number",
+    "bool": "boolean",
+    "dict": "object",
+    "arr": "array",
+    "list": "array",
+    "sequence": "array",
+    "tuple": "array",
 }
 
 
@@ -124,11 +192,17 @@ def _coerce_to_schema_type(value: str, schema_types) -> Any:
     if isinstance(schema_types, str):
         schema_types = [schema_types]
     normalized = {
-        _TYPE_ALIASES.get(k, k)
-        for t in schema_types
-        for k in [str(t).strip().lower()]
+        _TYPE_ALIASES.get(k, k) for t in schema_types for k in [str(t).strip().lower()]
     }
-    for candidate in ("null", "integer", "number", "boolean", "object", "array", "string"):
+    for candidate in (
+        "null",
+        "integer",
+        "number",
+        "boolean",
+        "object",
+        "array",
+        "string",
+    ):
         if candidate not in normalized:
             continue
         if candidate == "null":
@@ -240,9 +314,7 @@ class ToolParser:
 
     name: str = "base"
 
-    def parse(
-        self, full_text: str, tools=None
-    ) -> Tuple[Optional[str], List[ToolCall]]:
+    def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
         raise NotImplementedError
 
     def stream_parser(self, tools=None) -> "StreamToolParser":
@@ -310,9 +382,7 @@ class QwenToolParser(ToolParser):
     def content_prefix(self, full_text: str) -> str:
         return full_text.split(self._START, 1)[0]
 
-    def parse(
-        self, full_text: str, tools=None
-    ) -> Tuple[Optional[str], List[ToolCall]]:
+    def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
         if self._START not in full_text:
             return full_text, []
 
@@ -388,9 +458,7 @@ class Qwen3ToolParser(ToolParser):
     def content_prefix(self, full_text: str) -> str:
         return full_text.split(self._START, 1)[0]
 
-    def parse(
-        self, full_text: str, tools=None
-    ) -> Tuple[Optional[str], List[ToolCall]]:
+    def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
         if self._START not in full_text:
             return full_text, []
 
@@ -412,9 +480,7 @@ class Qwen3ToolParser(ToolParser):
             args = _coerce_args(args, tools, name)
             tool_calls.append(
                 ToolCall(
-                    function=FunctionCall(
-                        name=name, arguments=_dump_arguments(args)
-                    )
+                    function=FunctionCall(name=name, arguments=_dump_arguments(args))
                 )
             )
 
@@ -451,9 +517,7 @@ class KimiToolParser(ToolParser):
             fid = fid[len("functions.") :]
         return fid
 
-    def parse(
-        self, full_text: str, tools=None
-    ) -> Tuple[Optional[str], List[ToolCall]]:
+    def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
         if self._SECTION_START not in full_text:
             return full_text, []
 
@@ -593,9 +657,7 @@ class DeepSeekToolParser(ToolParser):
             )
         return self.content_prefix(full_text).strip() or None, calls
 
-    def parse(
-        self, full_text: str, tools=None
-    ) -> Tuple[Optional[str], List[ToolCall]]:
+    def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
         if self._block_start(full_text) == -1:
             return full_text, []
 
@@ -625,7 +687,14 @@ def _qwen_parser_for_arch(architecture: Optional[str]) -> ToolParser:
 # Explicit ``--tool-call-parser`` names. The qwen-family names defer to the
 # architecture to pick the markup variant; "hermes"/"qwen3" force a variant.
 _AVAILABLE_NAMES = (
-    "qwen", "qwen2", "qwen2.5", "qwen3", "qwen3.5", "hermes", "kimi", "deepseek",
+    "qwen",
+    "qwen2",
+    "qwen2.5",
+    "qwen3",
+    "qwen3.5",
+    "hermes",
+    "kimi",
+    "deepseek",
 )
 
 

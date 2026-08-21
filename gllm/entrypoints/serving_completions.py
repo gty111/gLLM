@@ -1,3 +1,5 @@
+import time
+
 from gllm.engine.async_llm import AsyncStream
 from gllm.entrypoints.protocol import (
     CompletionLogProbs,
@@ -7,7 +9,7 @@ from gllm.entrypoints.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
 )
-from gllm.utils import build_usage, get_finish_reason
+from gllm.utils import build_usage, get_finish_reason, random_uuid
 
 
 def _build_completion_logprobs(entries, text_offset_start=0):
@@ -56,6 +58,8 @@ async def completion_generator(stream: AsyncStream, request: CompletionRequest):
 
 async def completion_stream_generator(stream: AsyncStream, request: CompletionRequest):
     text_offset = 0
+    response_id = f"cmpl-{random_uuid()}"
+    created = int(time.time())
     async for item in stream:
         # Keep chunks that carry text OR a logprob (a multi-byte token can
         # produce an empty text delta whose logprob must still be reported) OR
@@ -72,23 +76,34 @@ async def completion_stream_generator(stream: AsyncStream, request: CompletionRe
             logprobs=logprobs,
             prompt_logprobs=item.prompt_logprobs,
         )
-        chunk = CompletionStreamResponse(choices=[choice_data], model=request.model)
-        data = chunk.model_dump_json(exclude_unset=False)
+        chunk = CompletionStreamResponse(
+            id=response_id,
+            created=created,
+            choices=[choice_data],
+            model=request.model,
+        )
+        data = chunk.model_dump_json(exclude_none=True)
         yield f"data: {data}\n\n"
 
     # Final chunk: empty text carrying the finish_reason; usage attached when
-    # the client opted in via ``stream_options.include_usage`` (default on).
+    # the client opted in via ``stream_options.include_usage``.
     final_choice = CompletionResponseStreamChoice(
         index=0, text="", finish_reason=get_finish_reason(stream.seq)
     )
-    include_usage = (
-        request.stream_options is None
-        or request.stream_options.include_usage
-    )
     final_chunk = CompletionStreamResponse(
+        id=response_id,
+        created=created,
         choices=[final_choice],
         model=request.model,
-        usage=build_usage(stream.seq) if include_usage else None,
     )
-    yield f"data: {final_chunk.model_dump_json(exclude_unset=False)}\n\n"
+    yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
+    if request.stream_options and request.stream_options.include_usage:
+        usage_chunk = CompletionStreamResponse(
+            id=response_id,
+            created=created,
+            choices=[],
+            model=request.model,
+            usage=build_usage(stream.seq),
+        )
+        yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n"
     yield "data: [DONE]\n\n"
