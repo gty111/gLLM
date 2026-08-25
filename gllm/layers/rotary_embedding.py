@@ -38,10 +38,15 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, inte
     o1 = x1 * cos - x2 * sin
     o2 = x2 * cos + x1 * sin
     if not interleaved:
-        out_rot = torch.cat((o1, o2), dim=-1)
-    else:
-        out_rot = torch.stack((o1, o2), dim=-1).flatten(-2)
+        # Partial NeoX RoPE used to concatenate ``o1``/``o2`` first and then
+        # concatenate that temporary with ``x_pass``.  A single three-input
+        # cat has the identical byte layout and removes one allocation and one
+        # CUDA cat kernel from every Q and K rotation.
+        if x_pass.shape[-1] > 0:
+            return torch.cat((o1, o2, x_pass), dim=-1)
+        return torch.cat((o1, o2), dim=-1)
 
+    out_rot = torch.stack((o1, o2), dim=-1).flatten(-2)
     if x_pass.shape[-1] > 0:
         return torch.cat((out_rot, x_pass), dim=-1)
     return out_rot
@@ -431,6 +436,7 @@ def _triton_qwen2vl_mrope_forward(
     pad_hd: tl.constexpr,
     mrope_section_t: tl.constexpr,
     mrope_section_h: tl.constexpr,
+    NUM_AXES: tl.constexpr,
 ):
     # Adapted from
     # https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/qwen2vl_mrope.py
@@ -448,33 +454,41 @@ def _triton_qwen2vl_mrope_forward(
     # ####################################################################
     # Note: cos and sin now have shape (3, num_tokens, head_dim // 2)
 
-    t_end = mrope_section_t
-    h_end = t_end + mrope_section_h
-
-    # Updated stride calculation for half head_dim
     half_rd = rd // 2
-    t_cos = cos + pid * half_rd
-    h_cos = t_cos + num_tokens * half_rd
-    w_cos = h_cos + num_tokens * half_rd
-    t_sin = sin + pid * half_rd
-    h_sin = t_sin + num_tokens * half_rd
-    w_sin = h_sin + num_tokens * half_rd
-
-    # Updated offsets for half head_dim
     cos_offsets = tl.arange(0, pad_hd // 2)
-    t_mask = cos_offsets < t_end
-    h_mask = (t_end <= cos_offsets) & (cos_offsets < h_end)
-    w_mask = (h_end <= cos_offsets) & (cos_offsets < half_rd)
 
-    t_cos_row = tl.load(t_cos + cos_offsets, mask=t_mask, other=0)
-    h_cos_row = tl.load(h_cos + cos_offsets, mask=h_mask, other=0)
-    w_cos_row = tl.load(w_cos + cos_offsets, mask=w_mask, other=0)
-    t_sin_row = tl.load(t_sin + cos_offsets, mask=t_mask, other=0)
-    h_sin_row = tl.load(h_sin + cos_offsets, mask=h_mask, other=0)
-    w_sin_row = tl.load(w_sin + cos_offsets, mask=w_mask, other=0)
+    if NUM_AXES == 1:
+        # Interleaved MRoPE (and plain 1-D RoPE) resolve the frequency axis
+        # per pair BEFORE the kernel, so ``cos``/``sin`` arrive as a single
+        # ``[num_tokens, rd // 2]`` row and there is no section to select.
+        rd_mask = cos_offsets < half_rd
+        cos_row = tl.load(cos + pid * half_rd + cos_offsets, mask=rd_mask, other=0)
+        sin_row = tl.load(sin + pid * half_rd + cos_offsets, mask=rd_mask, other=0)
+    else:
+        t_end = mrope_section_t
+        h_end = t_end + mrope_section_h
 
-    cos_row = t_cos_row + h_cos_row + w_cos_row
-    sin_row = t_sin_row + h_sin_row + w_sin_row
+        # Updated stride calculation for half head_dim
+        t_cos = cos + pid * half_rd
+        h_cos = t_cos + num_tokens * half_rd
+        w_cos = h_cos + num_tokens * half_rd
+        t_sin = sin + pid * half_rd
+        h_sin = t_sin + num_tokens * half_rd
+        w_sin = h_sin + num_tokens * half_rd
+
+        t_mask = cos_offsets < t_end
+        h_mask = (t_end <= cos_offsets) & (cos_offsets < h_end)
+        w_mask = (h_end <= cos_offsets) & (cos_offsets < half_rd)
+
+        t_cos_row = tl.load(t_cos + cos_offsets, mask=t_mask, other=0)
+        h_cos_row = tl.load(h_cos + cos_offsets, mask=h_mask, other=0)
+        w_cos_row = tl.load(w_cos + cos_offsets, mask=w_mask, other=0)
+        t_sin_row = tl.load(t_sin + cos_offsets, mask=t_mask, other=0)
+        h_sin_row = tl.load(h_sin + cos_offsets, mask=h_mask, other=0)
+        w_sin_row = tl.load(w_sin + cos_offsets, mask=w_mask, other=0)
+
+        cos_row = t_cos_row + h_cos_row + w_cos_row
+        sin_row = t_sin_row + h_sin_row + w_sin_row
 
     # ####################################################################
     # Load the left and right half of q and k for the current
@@ -482,7 +496,8 @@ def _triton_qwen2vl_mrope_forward(
     # ####################################################################
     # left half of the head
     first_half_q_offsets = (
-        tl.arange(0, pad_n_qh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
+        tl.arange(0, pad_n_qh)[:, None] * hd
+        + tl.arange(0, pad_hd // 2)[None, :]
     )
     first_half_k_offsets = (
         tl.arange(0, pad_n_kh)[:, None] * hd + tl.arange(0, pad_hd // 2)[None, :]
@@ -533,20 +548,20 @@ def triton_mrope(
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    mrope_section: list[int],
+    mrope_section: Optional[list[int]],
     head_size: int,
     rotary_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Qwen2VL mrope kernel.
+    """Qwen2VL mrope kernel. Rotates ``q``/``k`` IN PLACE and returns them.
 
     Args:
         query: [num_tokens, num_heads * head_size]
         key: [num_tokens, num_kv_heads * head_size]
-        cos: [3, num_tokens, head_size //2 ]
-            (T/H/W positions with multimodal inputs)
-        sin: [3, num_tokens, head_size //2 ]
-            (T/H/W positions with multimodal inputs)
-        mrope_section: [t, h, w]
+        cos: [3, num_tokens, rotary_dim // 2] when ``mrope_section`` selects a
+            T/H/W split, else [num_tokens, rotary_dim // 2] with the axis
+            already resolved per pair (interleaved MRoPE, plain 1-D RoPE).
+        sin: same shape as ``cos``
+        mrope_section: [t, h, w], or ``None`` for pre-resolved cos/sin
         head_size: int
     """
     n_row, n_q_head_head_dim = q.shape
@@ -576,8 +591,9 @@ def triton_mrope(
         pad_n_q_head,
         pad_n_kv_head,
         pad_hd,
-        mrope_section[0],
-        mrope_section[1],
+        mrope_section[0] if mrope_section else 0,
+        mrope_section[1] if mrope_section else 0,
+        3 if mrope_section else 1,
     )
     return q, k
 
@@ -662,6 +678,22 @@ class MRotaryEmbedding(RotaryEmbedding):
         self.mrope_interleaved = mrope_interleaved
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
+        if self.mrope_section and self.mrope_interleaved:
+            # Axis selector for Qwen3.5's interleaved T/H/W frequency layout.
+            # Build it once and gather the combined cosine+sine cache in one
+            # kernel in ``forward``. The previous path cloned T and applied two
+            # strided assignments separately for cosine and sine (six kernels).
+            half_axis = torch.zeros(rotary_dim // 2, dtype=torch.int64)
+            half_axis[1 : self.mrope_section[1] * 3 : 3] = 1
+            half_axis[2 : self.mrope_section[2] * 3 : 3] = 2
+            interleaved_axis = torch.cat((half_axis, half_axis)).to(
+                self.cos_sin_cache.device
+            )
+        else:
+            interleaved_axis = None
+        self.register_buffer(
+            "interleaved_axis", interleaved_axis, persistent=False
+        )
 
     def forward(
         self,
@@ -683,20 +715,34 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
         query_shape = query.shape
         key_shape = key.shape
         if positions.ndim == 2:
             assert self.mrope_section
 
             if self.mrope_interleaved:
-                # Reduce the per-axis (T/H/W) cos/sin to a single per-token
-                # vector that already encodes the interleaved pair layout,
-                # then fall through to the vanilla rotary path. Same shape
-                # as the non-MRoPE branch below.
-                cos = apply_interleaved_rope(cos, self.mrope_section)
-                sin = apply_interleaved_rope(sin, self.mrope_section)
+                # Select T/H/W for the combined cosine+sine cache in one
+                # gather. This is byte-identical to cloning T and patching the
+                # H/W strided columns independently for cosine and sine.
+                axis = self.interleaved_axis.view(1, -1, 1).expand(
+                    num_tokens, -1, 1
+                )
+                cos_sin = cos_sin.permute(1, 2, 0).gather(2, axis).squeeze(2)
+                cos, sin = cos_sin.chunk(2, dim=-1)
+                if self.is_neox_style:
+                    # The gather already resolved the per-pair frequency axis,
+                    # so what is left is plain partial RoPE -- which the mrope
+                    # kernel does IN PLACE.  The PyTorch tail below instead has
+                    # to ``cat`` the untouched dims back on: at
+                    # ``partial_rotary_factor=0.25`` that copies all of q and k
+                    # to rewrite a quarter of them.
+                    q, k = triton_mrope(
+                        query, key, cos, sin, None,
+                        self.head_size, self.rotary_dim,
+                    )
+                    return q.reshape(query_shape), k.reshape(key_shape)
             else:
+                cos, sin = cos_sin.chunk(2, dim=-1)
                 q, k = triton_mrope(
                     query,
                     key,
@@ -705,6 +751,15 @@ class MRotaryEmbedding(RotaryEmbedding):
                     self.mrope_section,
                     self.head_size,
                     self.rotary_dim,
+                )
+                return q.reshape(query_shape), k.reshape(key_shape)
+        else:
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            if self.is_neox_style:
+                # Same in-place path; 1-D positions need no axis selection at
+                # all.
+                q, k = triton_mrope(
+                    query, key, cos, sin, None, self.head_size, self.rotary_dim
                 )
                 return q.reshape(query_shape), k.reshape(key_shape)
 

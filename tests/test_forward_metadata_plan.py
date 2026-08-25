@@ -1,9 +1,12 @@
 from types import SimpleNamespace
 
+import torch
+
 from gllm.runtime.forward_metadata import (
     ForwardMetadataPlan,
     MetadataMaterialization,
 )
+from gllm.runtime.input_data import InputData
 
 
 def _seq(qlen, *, computed_prompt=True, mtp_verify=False):
@@ -55,6 +58,45 @@ def test_uniform_gpu_plan_includes_cuda_graph_padding_rows():
     assert plan.fast_path_rows == 8
     assert plan.fast_q_len_per_req == 4
     assert plan.context_max_query_len == 0
+
+
+def test_uniform_gpu_snapshot_cpu_mirror_matches_device_skip_sentinel():
+    """GPU MTP prep disables snapshots, so its CPU mirror must be all -1.
+
+    Qwen checks this mirror before touching the device snapshot-target tensor;
+    an uninitialized shape placeholder can spuriously take the synchronizing
+    ``nonzero`` path once per GDN layer.
+    """
+    data = InputData.__new__(InputData)
+    data.use_ssm_cache = True
+    data.max_num_block = 8
+    plan = ForwardMetadataPlan.uniform_gpu(
+        num_rows=32,
+        qlen=4,
+        is_mtp_verify=True,
+    )
+
+    data.mark_gpu_buffer_shapes(seqs=[object()] * 32, plan=plan)
+
+    mirror = data.ssm_snapshot_write_slot_per_seq_cpu
+    assert mirror.device.type == "cpu"
+    assert mirror.dtype is torch.int32
+    assert mirror.tolist() == [-1] * 32
+    assert data.ssm_snapshot_src_idx_cpu.numel() == 0
+    assert data.ssm_snapshot_dst_idx_cpu.numel() == 0
+    assert data._ssm_snapshot_valid_rows == ()
+
+
+def test_snapshot_copy_indices_reuse_uploaded_slots_and_honor_row_start():
+    data = InputData.__new__(InputData)
+    data._ssm_snapshot_valid_rows = (1, 3, 7)
+    data.ssm_snapshot_src_idx = torch.tensor([11, 13, 17])
+    data.ssm_snapshot_dst_idx = torch.tensor([21, 23, 27])
+
+    src, dst = data.get_ssm_snapshot_copy_indices(row_start=3)
+    assert src.tolist() == [13, 17]
+    assert dst.tolist() == [23, 27]
+    assert data.get_ssm_snapshot_copy_indices(row_start=8) is None
 
 
 def test_plan_rejects_nonuniform_attention_fast_prefix():

@@ -348,6 +348,15 @@ class OverlapWorker(Worker):
             return
         self._prefetched_input = self._make_scheduled_input(seqs)
 
+    def _publish_mtp_relay_only(self) -> bool:
+        """Publish relay-only x1 tokens required by ordinary decode."""
+        relay_package = self.scheduler.materialize_mtp_relay_only()
+        if relay_package is None:
+            return False
+        if self._polls_frontend():
+            self.comm.send_output(relay_package)
+        return True
+
     def _mtp_decode_prefix(self, input_data) -> list:
         """Return the legal leading decode partition, or an empty list.
 
@@ -611,8 +620,12 @@ class OverlapWorker(Worker):
         if self._mtp_pending and not mtp_plan.speculate:
             # Mixed/prefill/plain-decode metadata is CPU-derived, so leaving a
             # stable MTP cohort first materializes its newest GPU checkpoint and
-            # compacts the optimistic token placeholders.
+            # compacts the optimistic token placeholders. A completed mixed
+            # prefill may then own x1 only in the GPU relay; publish it before
+            # rebuilding ordinary input, otherwise token and position shapes
+            # disagree during an MTP batch-size crossover.
             self._drain_mtp_pending()
+            self._publish_mtp_relay_only()
             self._refresh_prefetched_input()
             if self._prefetched_input is None:
                 self._build_prefetched_input()
@@ -626,10 +639,7 @@ class OverlapWorker(Worker):
         # materialized MTP relay. Ordinary decode cannot consume that protocol:
         # publish x1 to token_ids/frontend as its one uncached input, then
         # rebuild any batch that was prepared against the relay-only shape.
-        relay_package = self.scheduler.materialize_mtp_relay_only()
-        if relay_package is not None:
-            if self._polls_frontend():
-                self.comm.send_output(relay_package)
+        if self._publish_mtp_relay_only():
             self._refresh_prefetched_input()
             if self._prefetched_input is None:
                 self._build_prefetched_input()

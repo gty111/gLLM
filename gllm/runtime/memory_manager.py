@@ -1154,7 +1154,19 @@ class PrefixMemoryManager(MemoryManager):
 
         is_hybrid = self.ssm_segment is not None
         full_hit = seq.computed_token_num >= len(seq)
-
+        # KNOWN RESIDUAL (MTP): a draft head sharing these pages stores a
+        # SHIFTED entry -- position ``p`` holds
+        # ``(target_hidden[p], embed(token[p+1]))``.  At the deepest cached
+        # position ``C-1`` that next token is this request's first token
+        # OUTSIDE the shared prefix, so exactly ONE reused head entry was
+        # written for someone else's continuation (every shallower entry is
+        # genuinely reusable).  Handing a token back would repair it, but on a
+        # hybrid model ``computed_token_num`` is pinned to an SSM *snapshot*
+        # boundary: giving back one page makes ``_restore_ssm_working_state``
+        # walk to the previous snapshot and discard a whole
+        # ``ssm_snapshot_stride_tokens`` window.  Measured on Qwen3.8-27B with
+        # a prefix-repetition workload that is -36% output throughput to buy
+        # +0.01 acceptance length, so the stale entry is deliberately kept.
         if is_hybrid:
             if full_hit:
                 seq.computed_token_num -= self.page_size

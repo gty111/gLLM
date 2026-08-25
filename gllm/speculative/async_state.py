@@ -166,7 +166,7 @@ class MtpAsyncBatchState:
             raise RuntimeError("cannot replace MTP async batch with pending completions")
         self.seq_ids = tuple(int(x) for x in seq_ids)
         self.batch_size = n
-        self.context_lens[:n].copy_(context_lens[:n])
+        self.context_lens[:n].copy_(context_lens[:n], non_blocking=True)
         self.relay_tokens[:n].copy_(relay_tokens[:n])
         self.relay_hidden[:n].copy_(relay_hidden[:n])
         self.resume_num_accepted[:n].fill_(1)

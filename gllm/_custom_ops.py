@@ -58,8 +58,10 @@ from gllm.layers.ops.batched_rotary_kernel import (
     batched_rotary_embedding as _triton_batched_rotary_embedding,
 )
 from gllm.layers.ops.gemma_rmsnorm import (
+    gemma_fused_add_rms_norm_reference_reduction as _triton_gemma_fused_add_rms_norm,
     gemma_rms_norm_reference_reduction as _triton_gemma_rms_norm,
 )
+from gllm.layers.ops.silu_and_mul import silu_and_mul as _triton_silu_and_mul
 
 
 # =============================================================================
@@ -247,6 +249,9 @@ def silu_and_mul(out: torch.Tensor, x: torch.Tensor) -> None:
         out_flat = out.view(-1, d)
         out_flat.copy_(torch.nn.functional.silu(x_flat[..., :d]) * x_flat[..., d:])
         return
+    if x.dtype == torch.bfloat16 and x.is_contiguous() and out.is_contiguous():
+        _triton_silu_and_mul(out, x)
+        return
     _flashinfer_silu_and_mul(x, out=out)
 
 
@@ -358,8 +363,7 @@ def gemma_fused_add_rms_norm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float
 ) -> None:
     """In-place residual add followed by fp32-reference Gemma RMSNorm."""
-    residual.add_(input)
-    _triton_gemma_rms_norm(input, residual, weight, epsilon)
+    _triton_gemma_fused_add_rms_norm(input, residual, weight, epsilon)
 
 
 # =============================================================================

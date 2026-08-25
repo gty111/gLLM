@@ -198,13 +198,15 @@ def chunk_gated_delta_rule(
     # so materializing a compact temporary silently discards every state update
     # and also erases its physical slot stride. Keep the read-only compute
     # tensors contiguous as before, but preserve the state view itself.
-    q, k, v, g, beta = (
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        g.contiguous(),
-        beta.contiguous(),
-    )
+    # Q/K normalization emits compact tensors for downstream chunk kernels, so
+    # let l2norm_fwd read compatible fused-projection views directly.
+    if not use_qk_l2norm_in_kernel:
+        q = q.contiguous()
+        k = k.contiguous()
+    # The recompute-W/U kernel consumes V with its explicit token/head strides,
+    # so the V slice of a fused QKV projection no longer needs a full compact
+    # materialization. Gating tensors still use their compact H stride.
+    g, beta = g.contiguous(), beta.contiguous()
     if initial_state_indices is not None:
         initial_state_indices = initial_state_indices.contiguous()
     if cu_seqlens is not None:

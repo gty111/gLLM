@@ -45,6 +45,9 @@ def test_overlap_snapshot_is_reserved_and_published_at_launch(monkeypatch):
     data._materialize_ssm_snapshot_targets()
     assert segment.calls == [(15, 256)]
     assert data.ssm_snapshot_write_slot_per_seq_cpu.tolist() == [7]
+    assert data._ssm_snapshot_valid_rows == (0,)
+    assert data.ssm_snapshot_src_idx_cpu.tolist() == [3]
+    assert data.ssm_snapshot_dst_idx_cpu.tolist() == [7]
     assert not any(segment.page2ssm_snapshot_valid)
 
     # Publication is a separate post-enqueue transition.

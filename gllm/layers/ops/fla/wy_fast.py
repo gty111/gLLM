@@ -30,6 +30,8 @@ def recompute_w_u_fwd_kernel(
     g,
     cu_seqlens,
     chunk_indices,
+    stride_v_token: tl.constexpr,
+    stride_v_head: tl.constexpr,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -65,9 +67,9 @@ def recompute_w_u_fwd_kernel(
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
+            v + bos * stride_v_token + i_h * stride_v_head,
             (T, V),
-            (H * V, 1),
+            (stride_v_token, 1),
             (i_t * BT, i_v * BV),
             (BT, BV),
             (1, 0),
@@ -126,7 +128,11 @@ def recompute_w_u_fwd(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK = 64
     BV = 64
-    u = torch.empty_like(v)
+    if v.stride(-1) != 1:
+        raise ValueError("recompute_w_u_fwd requires contiguous V columns")
+    # Always keep U compact: downstream recurrent/output kernels own this
+    # workspace and intentionally use the standard H*V token stride.
+    u = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
@@ -138,6 +144,8 @@ def recompute_w_u_fwd(
         g=g_cumsum,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        stride_v_token=v.stride(-3),
+        stride_v_head=v.stride(-2),
         T=T,
         H=H,
         Hg=Hg,

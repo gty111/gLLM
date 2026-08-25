@@ -81,6 +81,9 @@ from gllm.layers.ops.mamba import (
     causal_conv1d_update,
     causal_conv1d_update_paged,
 )
+from gllm.layers.ops.mtp_embed_norm import (
+    fused_mtp_embed_hidden_gemma_norm,
+)
 from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from gllm.runtime.memory_manager import SSMCacheConfig
@@ -112,6 +115,36 @@ from gllm.utils import get_model_load_pbar
 
 
 _GLOBAL_LAYER_TYPE_ATTRS = ("layer_types", "layers_block_type")
+
+
+def _partition_query_start_loc(
+    query_start_loc: torch.Tensor,
+    query_start_loc_cpu: Optional[torch.Tensor],
+    row_start: int,
+) -> torch.Tensor:
+    """Rebase a packed suffix while preserving its CPU boundary mirror.
+
+    Mixed decode/prefill forwards split the packed query after the decode rows.
+    The CUDA slice/subtraction below necessarily creates a new tensor, so the
+    private ``_cpu_view`` attached by ``InputData.get_query_start_loc`` does not
+    survive. FLA then falls back to a GPU ``.tolist()`` in every GDN layer to
+    rebuild identical chunk metadata. Attach the equivalently rebased CPU
+    boundaries to the derived tensor so the metadata paths avoid that sync.
+    """
+    partition = query_start_loc[row_start:] - query_start_loc[row_start]
+    if query_start_loc_cpu is not None:
+        cpu_partition = query_start_loc_cpu[row_start:]
+        partition._cpu_view = cpu_partition - cpu_partition[0]
+    return partition
+
+
+def _apply_strided_attention_output_gate(
+    attn_out: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """Apply a fused-projection gate without first compacting its view."""
+    gated = attn_out.view_as(gate) * torch.sigmoid(gate)
+    return gated.reshape(*gate.shape[:-2], -1)
 
 
 def _get_layer_types(text_config) -> List[str]:
@@ -325,45 +358,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """Copy this layer's working state into reclaimable snapshot slots
         designated by ``input_data.get_ssm_snapshot_write_slot_per_seq``.
 
-        Indexed copy is vectorized via ``index_select`` + ``index_copy_``
-        so the cost is one small kernel per linear-attn layer per forward,
-        not a Python loop over sequences. ``valid_mask`` filters out the
-        ``-1`` rows (decode steps, non-cacheable boundaries, CUDA-graph
-        padding) cheaply on-device, so the indices passed to the copy
-        kernel only contain real snapshot targets.
+        InputData derives the valid source/destination slots once per forward
+        on the host and uploads them once.  All GDN layers reuse those device
+        indices, avoiding a synchronizing ``nonzero`` and repeated index/cast
+        kernels for identical metadata in every layer.
         """
-        snap_targets = input_data.get_ssm_snapshot_write_slot_per_seq()
-        if snap_targets is None:
+        copy_indices = input_data.get_ssm_snapshot_copy_indices(row_start)
+        if copy_indices is None:
             return
-        if row_start:
-            snap_targets = snap_targets[row_start:]
         seg = input_data.memory_manager.ssm_segment
-        # Host-side early-exit: the original ``bool(valid_mask.any())`` check
-        # forced one ``cudaStreamSynchronize`` per linear-attn layer per
-        # prefill step (18 layers × 32 prefill steps in the 16k/c8 profile
-        # contributed ~1.2s of host wait). The CPU mirror
-        # ``ssm_snapshot_write_slot_per_seq_cpu`` is already populated in
-        # ``InputData`` and lags the GPU tensor by 0 steps, so we can decide
-        # whether any target is non-negative without touching the GPU stream.
-        snap_cpu = getattr(
-            input_data, "ssm_snapshot_write_slot_per_seq_cpu", None
-        )
-        if snap_cpu is not None:
-            if row_start:
-                snap_cpu = snap_cpu[row_start:]
-            if int(snap_cpu.amax()) < 0:
-                return
-            valid_mask = snap_targets >= 0
-        else:
-            valid_mask = snap_targets >= 0
-            if not bool(valid_mask.any()):
-                return
-        src_slots = input_data.get_ssm_state_slot_per_seq()
-        if row_start:
-            src_slots = src_slots[row_start:]
-        valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(-1)
-        src_idx = src_slots.index_select(0, valid_idx).to(torch.long)
-        dst_idx = snap_targets.index_select(0, valid_idx).to(torch.long)
+        src_idx, dst_idx = copy_indices
 
         # Capture = copy this layer's working entry -> the page's cached entry;
         # both address the same arena view (``conv_state_working`` /
@@ -684,9 +688,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 cache_indices[:num_mtp_rows],
             )
             if num_mtp_tokens < seq_len:
-                prefill_qsl = (
-                    query_start_loc[num_mtp_rows:]
-                    - query_start_loc[num_mtp_rows]
+                prefill_qsl = _partition_query_start_loc(
+                    query_start_loc,
+                    getattr(input_data, "query_start_loc_cpu", None),
+                    num_mtp_rows,
                 )
                 seq_lens_cpu = getattr(input_data, "seq_lens_cpu", None)
                 if seq_lens_cpu is not None:
@@ -734,9 +739,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 conv_bias,
                 cache_indices[:num_decode_rows],
             )
-            prefill_qsl = (
-                query_start_loc[num_decode_rows:]
-                - query_start_loc[num_decode_rows]
+            prefill_qsl = _partition_query_start_loc(
+                query_start_loc,
+                getattr(input_data, "query_start_loc_cpu", None),
+                num_decode_rows,
             )
             seq_lens_cpu = getattr(input_data, "seq_lens_cpu", None)
             if seq_lens_cpu is not None:
@@ -803,13 +809,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self._maybe_snapshot_state(input_data, conv_state, ssm_state)
 
         z_shape = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
         if core_attn_out.shape != z.shape:
             pad = torch.zeros_like(z)
-            pad[: core_attn_out.shape[0], :] = core_attn_out
+            pad.reshape(-1, pad.shape[-1])[
+                : core_attn_out.numel() // core_attn_out.shape[-1]
+            ].copy_(core_attn_out.reshape(-1, core_attn_out.shape[-1]))
             core_attn_out = pad
 
+        # Preserve token/head strides so the fused gate view does not need to
+        # be materialized before the gated RMSNorm kernel.
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
@@ -890,28 +898,29 @@ class Qwen3_5FullAttention(nn.Module):
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         qkv = self.qkv_proj(hidden_states)
+        orig_shape = qkv.shape[:-1]
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
             )
-            orig_shape = q_gate.shape[:-1]
             q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
             q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
 
-        q_shape, k_shape = q.shape, k.shape
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q_shape)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k_shape)
+        q_shape = (*orig_shape, self.q_size)
+        k_shape = (*orig_shape, self.kv_size)
+        q = q.view(*orig_shape, self.num_heads, self.head_dim)
+        k = k.view(*orig_shape, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q).reshape(q_shape)
+        k = self.k_norm(k).reshape(k_shape)
         q, k = self.rotary_emb(input_data.get_position(), q, k)
 
         attn_out = self.attn.forward(q, k, v, input_data)
 
         if gate is not None:
-            attn_out = attn_out * torch.sigmoid(gate)
+            attn_out = _apply_strided_attention_output_gate(attn_out, gate)
         return self.o_proj(attn_out)
 
 
@@ -1131,6 +1140,9 @@ class Qwen3_5Model(nn.Module):
 
         if not is_last_pp_rank():
             return hidden_states, residual
+        # The MTP head consumes this POST-norm output, matching vLLM
+        # (``target_hidden_states = hidden_states``) and sglang
+        # (``spec_info.hidden_states``); the pre-norm residual is not it.
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -1279,9 +1291,9 @@ class Qwen3_5MTP(nn.Module):
     ``kv_layer_id`` is the dense full-attention slot the head's attention uses
     to index the shared paged KV cache (it is ``num_kv_layers`` of the base
     model — one past the last base full-attn layer). The head shares the target
-    model's KV cache the same way DeepSeek's does; its slot is only ever written
-    during draft steps (the verify forward runs the base model, so correctness
-    does not depend on the head's KV — only acceptance rate does).
+    model's paged arena the same way DeepSeek's does. Draft steps extend its
+    slot, while target prefill/verify passes replay the head to replace accepted
+    positions with KV derived from authoritative target hidden states.
     """
 
     def __init__(self, config, kv_layer_id: int, parent_model: "Qwen3_5Model"):
@@ -1324,13 +1336,35 @@ class Qwen3_5MTP(nn.Module):
     ) -> torch.Tensor:
         """Return the MTP block's post-norm hidden state ``[num_tokens, hidden]``.
 
-        ``prev_hidden``: hidden state (pre-final-norm) of the position whose
+        ``prev_hidden``: post-final-norm target hidden state of the position whose
         *next* token we are drafting. ``input_ids``: the already-known token id
         at each of those positions (the token the draft is conditioned on).
         """
-        e = self.pre_fc_norm_embedding(self._embed(input_ids))
-        h = self.pre_fc_norm_hidden(prev_hidden)
-        x = self.fc(torch.cat([e, h], dim=-1))
+        embed = self._embed
+        if (
+            getattr(embed, "tp_size", 1) == 1
+            and input_ids.is_cuda
+            and input_ids.is_contiguous()
+            and prev_hidden.is_cuda
+            and prev_hidden.stride(-1) == 1
+            and embed.weight.stride(-1) == 1
+        ):
+            # TP=1 owns the complete table. Gather both MTP inputs, preserve
+            # the established FP32 Gemma reduction, and write directly into
+            # the FC input layout.
+            eh = fused_mtp_embed_hidden_gemma_norm(
+                input_ids,
+                embed.weight,
+                prev_hidden,
+                self.pre_fc_norm_embedding.weight,
+                self.pre_fc_norm_hidden.weight,
+                self.pre_fc_norm_embedding.variance_epsilon,
+            )
+        else:
+            e = self.pre_fc_norm_embedding(embed(input_ids))
+            h = self.pre_fc_norm_hidden(prev_hidden)
+            eh = torch.cat([e, h], dim=-1)
+        x = self.fc(eh)
         # mtp_block is a standard decoder layer: (input_data, hidden, residual).
         x, residual = self.mtp_block(input_data, x, None)
         x, _ = self.norm(x, residual)
