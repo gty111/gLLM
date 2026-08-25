@@ -50,6 +50,9 @@ setup(
     python_requires=">=3.9",
     install_requires=get_requirements(),
     package_data={
-        "gllm": ["layers/moe/fused_moe_triton/configs/*.json"],
+        "gllm": [
+            "layers/moe/fused_moe_triton/configs/*.json",
+            "layers/ops/csrc/*.cu",
+        ],
     },
 )

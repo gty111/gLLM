@@ -50,7 +50,8 @@ from gllm.runtime.model_loader import ModelLoader, propagate_serving_config
 from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.async_state import MtpAsyncBatchState, MtpAsyncCompletion
-from gllm.speculative.gpu_prep import MtpGpuPrep
+from gllm.speculative.gpu_prep import MTP_DRAFT_POS_OFFSET, MtpGpuPrep
+from gllm.speculative.staging import MtpStagingBuffers
 from gllm.tokenizers.tool_parsers import normalize_chat_template_messages
 from gllm.utils import unify_decode
 
@@ -75,6 +76,21 @@ class MtpQDist:
     @property
     def is_sparse(self) -> bool:
         return self.dense is None
+
+
+@dataclass
+class MtpVerifyResult:
+    """Outputs carried from target verification into draft acceptance."""
+
+    logits: torch.Tensor
+    hidden: torch.Tensor
+    drafts: object
+    prefill_tokens: list
+    prefill_tokens_gpu: Optional[torch.Tensor] = None
+    new_state_seq_ids: tuple = ()
+    new_state_context_lens: Optional[torch.Tensor] = None
+    new_state_tokens: Optional[torch.Tensor] = None
+    new_state_hidden: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -140,6 +156,36 @@ class DisaggSeqState:
 # with overwhelming probability.
 _MM_PAD_ID_BASE = 1 << 30
 _MM_PAD_ID_MASK = _MM_PAD_ID_BASE - 1
+
+
+def _concat_mrope_positions_pinned(
+    positions: List[torch.Tensor],
+) -> torch.Tensor:
+    """Concatenate ``[3, tokens]`` MRoPE positions into pinned CPU memory.
+
+    ``torch.concat`` returns pageable memory even when every input is on the
+    CPU.  The following H2D copy is therefore synchronizing despite being
+    requested with ``non_blocking=True``.  Materializing the final layout
+    directly in pinned memory keeps that metadata upload asynchronous with the
+    preceding model forward.
+    """
+    if not positions:
+        return torch.empty(
+            (3, 0), dtype=torch.long, device="cpu", pin_memory=True
+        )
+    total_tokens = sum(int(position.shape[1]) for position in positions)
+    output = torch.empty(
+        (3, total_tokens),
+        dtype=positions[0].dtype,
+        device="cpu",
+        pin_memory=True,
+    )
+    offset = 0
+    for position in positions:
+        num_tokens = int(position.shape[1])
+        output[:, offset : offset + num_tokens].copy_(position)
+        offset += num_tokens
+    return output
 
 
 def _mm_pad_id_from_hash(mm_hash: bytes) -> int:
@@ -939,6 +985,10 @@ class ModelRunner:
         # instead of synchronizing on ``Tensor.cpu()`` in the launch call.
         self._mtp_async_state: Optional[MtpAsyncBatchState] = None
         self._mtp_async_publish = False
+        # One-shot warning when a multimodal prompt has to skip the head KV
+        # pass (image placeholder ids do not embed to the prompt's real
+        # features, so replaying the head over them would poison its cache).
+        self._mtp_kv_sync_mm_warned = False
         # Batch-adaptive MTP gate. Speculating multiplies the per-step target
         # work by ``1+k``; it wins only
         # while the decode batch leaves the GPU under-utilized. Past the crossover
@@ -1012,36 +1062,14 @@ class ModelRunner:
         # cudaStreamSynchronize even for one-element lists.
         mixed_cap = max(self.max_running_seqs, 1)
         mixed_device = torch.device("cuda", torch.cuda.current_device())
-        self._mtp_mixed_last_rows = torch.empty(
-            mixed_cap, dtype=torch.int64, device=mixed_device
-        )
-        self._mtp_mixed_new_idx_host = torch.empty(
-            mixed_cap, dtype=torch.int64, device="cpu", pin_memory=True
-        )
-        self._mtp_mixed_new_ctx_host = torch.empty_like(self._mtp_mixed_new_idx_host)
-        self._mtp_mixed_new_idx_host_np = self._mtp_mixed_new_idx_host.numpy()
-        self._mtp_mixed_new_ctx_host_np = self._mtp_mixed_new_ctx_host.numpy()
-        self._mtp_mixed_new_idx = torch.empty(
-            mixed_cap, dtype=torch.int64, device=mixed_device
-        )
-        self._mtp_mixed_new_ctx = torch.empty_like(self._mtp_mixed_new_idx)
-        # Other fixed-capacity MTP hot-path buffers. The target hidden view must
-        # survive draft/verify overwriting ``output_hidden_states``; x1 and row
-        # indices otherwise caused fresh tiny CUDA allocations/H2Ds per step.
-        self._mtp_seed_hidden = torch.empty(
-            (mixed_cap, self.hidden_size),
-            dtype=self.output_hidden_states.dtype,
+        # Persistent pinned/device staging avoids per-step allocation and
+        # pageable transfers across draft, verify, and head-KV maintenance.
+        self._mtp_staging = MtpStagingBuffers(
+            capacity=mixed_cap,
+            max_tokens=self.max_num_batched_tokens,
+            hidden_size=self.hidden_size,
+            hidden_dtype=self.output_hidden_states.dtype,
             device=mixed_device,
-        )
-        self._mtp_row_idx = torch.arange(
-            mixed_cap, dtype=torch.int64, device=mixed_device
-        )
-        self._mtp_x1_host = torch.empty(
-            mixed_cap, dtype=torch.int64, device="cpu", pin_memory=True
-        )
-        self._mtp_x1_host_np = self._mtp_x1_host.numpy()
-        self._mtp_x1_gpu = torch.empty(
-            mixed_cap, dtype=torch.int64, device=mixed_device
         )
         # Bumped once per ``_mtp_decode`` so the GPU prep can memoize its
         # per-step staging across the draft and verify phases.
@@ -1418,7 +1446,7 @@ class ModelRunner:
         # by callers (``set_mrope_position`` is skipped) but we still build a
         # well-formed tensor.
         if self.uses_mrope:
-            mrope_positions = torch.concat(batch_positions, dim=1)
+            mrope_positions = _concat_mrope_positions_pinned(batch_positions)
         elif batch_positions:
             mrope_positions = torch.concat(batch_positions, dim=0)
         else:
@@ -2989,10 +3017,17 @@ class ModelRunner:
             k_pad = self._mtp_kpad(decode_seqs)
         for j in range(k):
             for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i]) + j
+                s.computed_token_num = (
+                    len(orig_tokens[i]) + j + MTP_DRAFT_POS_OFFSET
+                )
                 s.to_compute_token_num = 1
                 s.to_compute_tokens = [x1[i] if j == 0 else drafts_cols[i][-1]]
             self.prepare_input(decode_seqs)
+            # ``mtp.forward`` reaches the same attention backend as an ordinary
+            # model forward.  The graph path prepares its static draft plan in
+            # ``_draft_step_forward*``; eager fallback must prepare the dynamic
+            # plan after every ``prepare_input`` as well.
+            self._prepare_attention_metadata(self.input_data)
             out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
             logits = mtp.logits_from_hidden(out_hidden)
             # Sample one draft token per seq from q (TP-synced generator), then
@@ -3044,10 +3079,13 @@ class ModelRunner:
         cur_hidden = hidden
         for j in range(k):
             for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i]) + j
+                s.computed_token_num = (
+                    len(orig_tokens[i]) + j + MTP_DRAFT_POS_OFFSET
+                )
                 s.to_compute_token_num = 1
                 s.to_compute_tokens = [x1[i] if j == 0 else drafts_cols[i][-1]]
             self.prepare_input(decode_seqs)
+            self._prepare_attention_metadata(self.input_data)
             out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
             tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
             # Need python token_ids for the next step's slot bookkeeping, so this
@@ -3088,7 +3126,9 @@ class ModelRunner:
                 bucket = b
                 break
         if bucket is None:
-            return self._draft_chain_eager(decode_seqs, orig_tokens, x1, hidden, k, nd)
+            return self._draft_chain_eager(
+                decode_seqs, orig_tokens, x1, hidden, k, nd
+            )
         g = self._draft_size_to_graph[bucket]
 
         # KV pages for the whole speculative window were pre-allocated once by
@@ -3115,7 +3155,7 @@ class ModelRunner:
             # the seqs in the *verify* shape (1+k speculative tokens) for the
             # one-shot page allocation.
             for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i])
+                s.computed_token_num = len(orig_tokens[i]) + MTP_DRAFT_POS_OFFSET
                 s.to_compute_token_num = 1
                 s.to_compute_tokens = [x1[i]]
             pad_seqs = (
@@ -3222,7 +3262,7 @@ class ModelRunner:
             )
         else:
             for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i])
+                s.computed_token_num = len(orig_tokens[i]) + MTP_DRAFT_POS_OFFSET
                 s.to_compute_token_num = 1
                 s.to_compute_tokens = [x1[i]]
             pad_seqs = (
@@ -3614,8 +3654,38 @@ class ModelRunner:
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(cuda_graph=g, pool=memory_pool, stream=stream):
                 self.forward()
+                self._capture_verify_head_kv(bucket, qlen)
             self._verify_size_to_graph[bucket] = g
             self._drop_dummy_verify_cache()
+
+    def _capture_verify_head_kv(self, bucket: int, qlen: int) -> None:
+        """Fold the post-verify MTP head KV pass into the verify graph.
+
+        Running it eagerly costs a full extra decoder-layer launch sequence
+        plus an attention re-plan on every speculative step -- measurably more
+        than the acceptance it buys.  Everything it needs is already static:
+        the verify token buffer, the target hidden buffer ``self.forward()``
+        just wrote, and the batch's own attention metadata.  So capture it as
+        part of the same graph and pay only its arithmetic.
+
+        The shift is exact inside a row; the value landing on each row's last
+        column is a don't-care (that position is at or past the acceptance
+        point and the next draft chain rewrites it before reading it).
+        """
+        if qlen < 2:
+            return
+        ntok = bucket * qlen
+        if ntok > self._mtp_staging.refresh_tokens.numel():
+            return
+        src = self.input_data.tokens[:ntok].view(bucket, qlen)
+        shifted = self._mtp_staging.refresh_tokens[:ntok].view(bucket, qlen)
+        shifted[:, :-1].copy_(src[:, 1:])
+        shifted[:, -1].fill_(1)
+        self.model.mtp.forward(
+            self.input_data,
+            self.output_hidden_states[:ntok],
+            shifted.reshape(-1),
+        )
 
     @torch.inference_mode()
     def _verify_forward_graph(self, decode_seqs, orig_tokens, x1, drafts, nd, kk):
@@ -3776,16 +3846,18 @@ class ModelRunner:
             else:
                 self.forward()
 
-            first_rows = torch.tensor(
-                [pos * qlen for pos in missing_pos],
-                dtype=torch.long,
-                device=self.output_hidden_states.device,
+            num_missing = len(missing_pos)
+            self._mtp_staging.bootstrap_rows_host_np[:num_missing] = [
+                pos * qlen for pos in missing_pos
+            ]
+            first_rows = self._mtp_staging.bootstrap_rows_gpu[:num_missing]
+            first_rows.copy_(
+                self._mtp_staging.bootstrap_rows_host[:num_missing], non_blocking=True
             )
             # Clone before the following real verify overwrites the persistent
             # output buffer.
-            missing_hidden = self.output_hidden_states.index_select(
-                0, first_rows
-            ).clone()
+            bootstrap_hidden = self.output_hidden_states[: bucket * qlen]
+            missing_hidden = bootstrap_hidden.index_select(0, first_rows).clone()
             missing_logits = self.model.logits_from_hidden(missing_hidden)
         finally:
             for pos, (tokens, computed, to_compute, was_verify) in saved.items():
@@ -3866,10 +3938,140 @@ class ModelRunner:
             dummy_page=self.memory_manager.dummy_page,
             mrope_deltas=self._mtp_mrope_deltas(decode_seqs),
             ctx_lens_gpu=(async_state.context_lens if async_state else None),
-            x1_gpu=(async_state.relay_tokens if async_state else None),
+            x1_gpu=(
+                async_state.relay_tokens
+                if async_state
+                else (x1 if torch.is_tensor(x1) else None)
+            ),
             num_accepted_gpu=(async_state.resume_num_accepted if async_state else None),
         )
         return gp
+
+    # ------------------------------------------------------------------
+    # MTP draft-head KV synchronization
+    # ------------------------------------------------------------------
+    # The Qwen3.5 MTP head is a full-attention decoder layer that owns one KV
+    # layer (``kv_layer_id == num_kv_layers``) of the SHARED paged arena and
+    # attends over the sequence's whole context.  The arena is allocated with
+    # ``torch.empty`` and its pages are recycled between requests, so any
+    # position the head never wrote returns a previous tenant's KV -- a state
+    # validity bug, not merely a weak draft.  Every target forward therefore
+    # replays the head over the tokens it just consumed (vLLM's drafter "first
+    # pass"), which also rewrites the entries of accepted draft tokens from the
+    # target's hidden states instead of the draft chain's own.
+    #
+    # Entry convention (EAGLE / vLLM): the entry at position ``p`` is the pair
+    # ``(target_hidden[p], embed(token[p+1]))`` and its output predicts
+    # ``token[p+2]``.  The head therefore consumes the token stream shifted
+    # left by one, and a draft step for a context of length ``ctx`` writes at
+    # ``ctx-1`` (``MTP_DRAFT_POS_OFFSET``).
+
+    def _mtp_kv_sync_active(self, input_data) -> bool:
+        """Whether a head KV pass may run over ``input_data`` this forward."""
+        if not self.mtp_enabled or not is_last_pp_rank():
+            return False
+        if is_dp_attn():
+            # DP-attention never enters the speculative path, so nothing ever
+            # reads the head's KV -- and the idle-group dummy rows here are not
+            # real requests.
+            return False
+        if getattr(self.model, "mtp", None) is None:
+            return False
+        if any(getattr(s, "mm_contents", None) is not None for s in input_data.seqs):
+            # A placeholder image token id does not embed to the feature the
+            # target actually consumed, so replaying the head over it would
+            # write KV the draft must not read.  Skip (and say so once).
+            if not self._mtp_kv_sync_mm_warned:
+                self._mtp_kv_sync_mm_warned = True
+                logger.warning(
+                    "MTP head KV sync skips multimodal prompts; speculative "
+                    "acceptance for those requests stays degraded."
+                )
+            return False
+        return True
+
+    @torch.inference_mode()
+    def _mtp_sync_kv(
+        self,
+        input_data,
+        target_hidden,
+        *,
+        tail_seqs=(),
+        tail_next_tokens=None,
+        num_verify_rows: int = 0,
+    ) -> None:
+        """Replay the MTP head over a target batch to refresh its KV layer.
+
+        The head reuses the batch's existing positions / ``slot_mapping`` /
+        page tables, so the only thing rebuilt is the token stream it consumes:
+        a global left shift, plus a per-row boundary fixup.
+
+        * ``num_verify_rows`` leading rows are uniform MTP verify rows.  Their
+          shift is exact inside the row; the value that lands on each row's
+          LAST position is a don't-care because that position is at or past the
+          step's acceptance point, and the next draft chain overwrites it
+          before any attention reads it.
+        * ``tail_seqs`` are the ordinary (prefill / decode) rows that follow.
+          Their last position takes the next prompt token at a chunk boundary,
+          or the token the target just sampled once the prompt is finished.
+          ``tail_next_tokens`` may be a host list or a device tensor.
+
+        The head's logits are discarded; the sole effect is its KV write.
+        """
+        if not self._mtp_kv_sync_active(input_data):
+            return
+        plan = input_data.forward_metadata_plan
+        if plan is None:
+            return
+        ntok = int(plan.num_tokens)
+        if ntok <= 0 or ntok > self._mtp_staging.refresh_tokens.numel():
+            return
+        if target_hidden.shape[0] < ntok:
+            return
+        qsl_cpu = input_data.query_start_loc_cpu
+        tail_seqs = list(tail_seqs)
+        if tail_seqs:
+            if qsl_cpu is None or qsl_cpu.shape[0] < num_verify_rows + len(tail_seqs) + 1:
+                return
+            if len(tail_seqs) > self._mtp_staging.capacity:
+                return
+
+        shifted = self._mtp_staging.refresh_tokens[:ntok]
+        tokens = input_data.tokens[:ntok]
+        if ntok > 1:
+            shifted[:-1].copy_(tokens[1:])
+        shifted[-1:].fill_(1)
+
+        if tail_seqs:
+            gpu_next = tail_next_tokens if torch.is_tensor(tail_next_tokens) else None
+            host_next = None
+            if gpu_next is None:
+                host_next = (
+                    list(tail_next_tokens) if tail_next_tokens is not None else []
+                )
+            patches = []
+            gpu_pairs = []
+            for j, seq in enumerate(tail_seqs):
+                row = num_verify_rows + j
+                last = int(qsl_cpu[row + 1]) - 1
+                if not 0 <= last < ntok:
+                    return
+                end = seq.computed_token_num + seq.to_compute_token_num
+                if end < seq.prompt_len:
+                    # Chunk boundary: the next token is a known prompt token.
+                    patches.append((last, int(seq.token_ids[end])))
+                elif gpu_next is not None:
+                    gpu_pairs.append((last, j))
+                else:
+                    patches.append((last, int(host_next[j])))
+            self._mtp_staging.patch_shifted_tokens(
+                shifted, patches, gpu_next, gpu_pairs
+            )
+
+        # A replayed CUDA graph leaves the plan's python-side attention object
+        # empty; re-prepare it before this eager single-layer pass.
+        self._prepare_attention_metadata(input_data)
+        self.model.mtp.forward(input_data, target_hidden[:ntok], shifted)
 
     def _drafts_host(self, drafts, nd: int, kk: int):
         """Host-side ``[nd][kk]`` draft token ids, materializing on demand.
@@ -3885,6 +4087,195 @@ class ModelRunner:
         if dg is None or nd == 0 or kk == 0:
             return [[] for _ in range(nd)]
         return dg[:nd, :kk].tolist()
+
+    @torch.inference_mode()
+    def _mtp_verify_target(
+        self,
+        decode_seqs,
+        orig_tokens,
+        x1_tokens,
+        x1,
+        drafts,
+        nd: int,
+        kk: int,
+        extra_prefill_seqs,
+        async_accept: bool,
+    ) -> MtpVerifyResult:
+        """Verify a draft batch, optionally fused with a ragged prefill suffix."""
+        if (
+            not extra_prefill_seqs
+            and self._mtp_verify_graph
+            and self._verify_size_to_graph
+            and nd <= max(self._verify_size_to_graph.keys())
+        ):
+            with torch.profiler.record_function("gllm::mtp_target_verify_graph"):
+                graph_result = self._verify_forward_graph(
+                    decode_seqs, orig_tokens, x1_tokens, drafts, nd, kk
+                )
+            if graph_result is not None:
+                logits, _, hidden = graph_result
+                # Verify capture includes ``_capture_verify_head_kv``.
+                return MtpVerifyResult(logits, hidden, drafts, [])
+
+        # A chained mixed batch keeps graph-produced drafts on the GPU. CPU
+        # sequence mutations below establish shapes only; the materializer
+        # overwrites their token/position/KV metadata from device state.
+        mixed_gpu_prep = None
+        drafts_gpu_for_mixed = getattr(self, "_drafts_gpu", None)
+        if (
+            extra_prefill_seqs
+            and drafts is None
+            and drafts_gpu_for_mixed is not None
+            and self._mtp_gpu_prep is not None
+            and self._mtp_gpu_prep._staged[0] == self._mtp_prep_epoch
+        ):
+            mixed_gpu_prep = self._mtp_gpu_prep
+            drafts = [[0] * kk for _ in range(nd)]
+        else:
+            drafts = self._drafts_host(drafts, nd, kk)
+
+        for i, seq in enumerate(decode_seqs):
+            seq.computed_token_num = len(orig_tokens[i])
+            seq.to_compute_token_num = 1 + kk
+            seq.to_compute_tokens = [x1[i]] + drafts[i]
+            seq._mtp_verify = True
+
+        self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
+        verify_and_prefill = list(decode_seqs) + extra_prefill_seqs
+        self.prepare_input(verify_and_prefill)
+        if mixed_gpu_prep is not None:
+            plan = self.input_data.forward_metadata_plan
+            if plan is None:
+                raise RuntimeError("mixed MTP forward has no metadata plan")
+            plan = plan.with_gpu_patch(num_rows=nd, qlen=1 + kk)
+            plan.materialize(
+                self.input_data,
+                mixed_gpu_prep.mixed_patch_materializer(
+                    drafts_gpu=drafts_gpu_for_mixed
+                ),
+            )
+
+        total_tokens = int(self.input_data.tokens_cpu.shape[0])
+        all_hidden = None
+        if (
+            self._piecewise_runner is not None
+            and self.input_data.embedding_size == total_tokens
+            and all(seq.mm_contents is None for seq in verify_and_prefill)
+            and self._piecewise_runner.can_run(total_tokens)
+        ):
+            self._prepare_attention_metadata(self.input_data)
+            num_decode_tokens = sum(
+                seq.to_compute_token_num
+                for seq in self.input_data.seqs
+                if seq.computed_prompt
+            )
+            self._fixup_vl_decode_embeddings(num_decode_tokens)
+            mixed_embeddings = self.input_hidden_states[:total_tokens]
+            with torch.profiler.record_function("gllm::mtp_target_mixed_piecewise"):
+                all_hidden = self._piecewise_runner.run(
+                    self.input_data, mixed_embeddings
+                )
+        if all_hidden is None:
+            with torch.profiler.record_function("gllm::mtp_target_mixed_eager"):
+                self.forward()
+            all_hidden = self.output_hidden_states[:total_tokens]
+
+        num_verify_tokens = nd * (1 + kk)
+        verify_hidden = all_hidden[:num_verify_tokens]
+        prefill_tokens = []
+        prefill_tokens_gpu = None
+        new_state_seq_ids = ()
+        new_state_context_lens = None
+        new_state_tokens = None
+        new_state_hidden = None
+
+        if extra_prefill_seqs:
+            num_extra = len(extra_prefill_seqs)
+            last_rows = self._mtp_staging.mixed_last_rows[:num_extra]
+            last_rows.copy_(
+                self.input_data.query_start_loc[nd + 1 : nd + num_extra + 1]
+            )
+            last_rows.sub_(1)
+            prefill_hidden = all_hidden.index_select(0, last_rows)
+
+            # Project only verify rows and each prefill's final row. Projecting
+            # every prompt token can otherwise allocate several GiB of logits.
+            selected_hidden = torch.cat((verify_hidden, prefill_hidden), dim=0)
+            selected_logits = self.model.logits_from_hidden(selected_hidden)
+            verify_logits = selected_logits[:num_verify_tokens]
+            prefill_logits = selected_logits[num_verify_tokens:]
+
+            self.input_data.seqs = extra_prefill_seqs
+            mixed_greedy = all(
+                seq.top_k == 1 and seq.repetition_penalty == 1.0
+                for seq in extra_prefill_seqs
+            )
+            if mixed_greedy:
+                self.input_data.needs_repetition_penalty = False
+            else:
+                self.input_data.prepare_sample()
+            prefill_tokens_gpu = self.sampler.forward_gpu(
+                prefill_logits, self.input_data
+            )
+            if get_tp_size() > 1:
+                self._mtp_bcast_tp(prefill_tokens_gpu)
+
+            if async_accept:
+                completed = [
+                    i
+                    for i, seq in enumerate(extra_prefill_seqs)
+                    if seq.computed_token_num + seq.to_compute_token_num
+                    >= seq.prompt_len
+                ]
+                if completed:
+                    nc = len(completed)
+                    completed_gpu = self._mtp_staging.mixed_new_idx[:nc]
+                    new_state_context_lens = self._mtp_staging.mixed_new_ctx[:nc]
+                    idx_host = self._mtp_staging.mixed_new_idx_host[:nc]
+                    ctx_host = self._mtp_staging.mixed_new_ctx_host[:nc]
+                    self._mtp_staging.mixed_new_idx_host_np[:nc] = completed
+                    new_state_seq_ids = tuple(
+                        extra_prefill_seqs[i].seq_id for i in completed
+                    )
+                    self._mtp_staging.mixed_new_ctx_host_np[:nc] = [
+                        extra_prefill_seqs[i].computed_token_num
+                        + extra_prefill_seqs[i].to_compute_token_num
+                        for i in completed
+                    ]
+                    completed_gpu.copy_(idx_host, non_blocking=True)
+                    new_state_context_lens.copy_(ctx_host, non_blocking=True)
+                    new_state_tokens = prefill_tokens_gpu.index_select(
+                        0, completed_gpu
+                    )
+                    new_state_hidden = prefill_hidden.index_select(0, completed_gpu)
+            else:
+                prefill_tokens = prefill_tokens_gpu.cpu().tolist()
+        else:
+            verify_logits = self.model.logits_from_hidden(verify_hidden)
+
+        # Sampling above temporarily narrows ``input_data.seqs`` to prefill
+        # rows. Restore the real mixed layout for the head KV replay.
+        self.input_data.seqs = verify_and_prefill
+        with torch.profiler.record_function("gllm::mtp_head_kv_sync"):
+            self._mtp_sync_kv(
+                self.input_data,
+                all_hidden,
+                tail_seqs=extra_prefill_seqs,
+                tail_next_tokens=prefill_tokens_gpu,
+                num_verify_rows=nd,
+            )
+
+        return MtpVerifyResult(
+            logits=verify_logits,
+            hidden=verify_hidden,
+            drafts=drafts,
+            prefill_tokens=prefill_tokens,
+            prefill_tokens_gpu=prefill_tokens_gpu,
+            new_state_seq_ids=new_state_seq_ids,
+            new_state_context_lens=new_state_context_lens,
+            new_state_tokens=new_state_tokens,
+            new_state_hidden=new_state_hidden,
+        )
 
     @torch.inference_mode()
     def _mtp_decode(
@@ -3914,7 +4305,7 @@ class ModelRunner:
         dev = hidden.device
         # ``hidden`` is a view into the persistent output_hidden_states buffer;
         # clone so subsequent forwards (draft/verify) can't mutate it underfoot.
-        seed_hidden = self._mtp_seed_hidden[:nd]
+        seed_hidden = self._mtp_staging.seed_hidden[:nd]
         seed_hidden.copy_(hidden[:nd])
         hidden = seed_hidden
 
@@ -3927,9 +4318,9 @@ class ModelRunner:
             x1 = [0] * nd
         else:
             x1 = [int(x1_tokens[i]) for i in range(nd)]
-            self._mtp_x1_host_np[:nd] = x1
-            x1_gpu = self._mtp_x1_gpu[:nd]
-            x1_gpu.copy_(self._mtp_x1_host[:nd], non_blocking=True)
+            self._mtp_staging.x1_host_np[:nd] = x1
+            x1_gpu = self._mtp_staging.x1_gpu[:nd]
+            x1_gpu.copy_(self._mtp_staging.x1_host[:nd], non_blocking=True)
         # x1 is already TP-synchronized by ``step_once`` (it broadcasts the
         # sampled x1 from TP-rank-0 before calling this method whenever sampling
         # is active), so no broadcast here. Runtime dispatch: if ANY seq in the
@@ -4071,188 +4462,30 @@ class ModelRunner:
         restore()
 
         # --- 2. Verify: one base forward over [x1, d1..dk] per seq. ---
-        # ``drafts is None`` == the graph draft chain kept its output on the GPU
-        # (``self._drafts_gpu``); it always drafts the full ``k``.
         kk = (k if drafts is None else len(drafts[0])) if nd else 0
-        prefill_tokens = []
-        prefill_tokens_gpu = None
-        prefill_hidden = None
-        new_state_seq_ids = ()
-        new_state_context_lens = None
-        new_state_tokens = None
-        new_state_hidden = None
-        # Fast path: replay the captured verify graph (collapses the eager
-        # per-layer launch overhead). Only when MTP verify graphs are captured
-        # and the batch fits a bucket; falls back to the eager forward otherwise.
-        _v_done = False
-        # Hybrid and attention-only models use the same single qlen=1+k target
-        # verify graph, so serving never replays once per candidate.
-        if (
-            not extra_prefill_seqs
-            and self._mtp_verify_graph
-            and self._verify_size_to_graph
-            and nd <= max(self._verify_size_to_graph.keys())
-        ):
-            with torch.profiler.record_function("gllm::mtp_target_verify_graph"):
-                _res = self._verify_forward_graph(
-                    decode_seqs, orig_tokens, x1_tokens, drafts, nd, kk
-                )
-            if _res is not None:
-                v_logits, qsl, v_hidden = _res
-                _v_done = True
-        if not _v_done:
-            # A chained mixed batch must not pull the draft grid back to the
-            # host.  Its CPU GenerationSequence mutations below only establish shapes
-            # and reserve pages; the MTP GPU patch materializer overwrites
-            # the placeholder token/position/KV metadata from authoritative
-            # GPU state after ordinary ragged-prefill preparation.
-            mixed_gpu_prep = None
-            drafts_gpu_for_mixed = getattr(self, "_drafts_gpu", None)
-            if (
-                extra_prefill_seqs
-                and drafts is None
-                and drafts_gpu_for_mixed is not None
-                and self._mtp_gpu_prep is not None
-                and self._mtp_gpu_prep._staged[0] == self._mtp_prep_epoch
-            ):
-                mixed_gpu_prep = self._mtp_gpu_prep
-                drafts = [[0] * kk for _ in range(nd)]
-            else:
-                drafts = self._drafts_host(drafts, nd, kk)
-            for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i])  # context cached
-                s.to_compute_token_num = 1 + kk
-                # InputData consumes this compact suffix directly. Keeping the
-                # committed token_ids list untouched removes an O(context)
-                # Python list copy from every mixed verify forward.
-                s.to_compute_tokens = [x1[i]] + drafts[i]
-                s._mtp_verify = True  # force the prefill-with-context attn path
-            self.memory_manager.pre_allocate_page(decode_seqs, cacheable=False)
-            verify_and_prefill = list(decode_seqs) + extra_prefill_seqs
-            self.prepare_input(verify_and_prefill)
-            if mixed_gpu_prep is not None:
-                plan = self.input_data.forward_metadata_plan
-                if plan is None:
-                    raise RuntimeError("mixed MTP forward has no metadata plan")
-                plan = plan.with_gpu_patch(num_rows=nd, qlen=1 + kk)
-                plan.materialize(
-                    self.input_data,
-                    mixed_gpu_prep.mixed_patch_materializer(
-                        drafts_gpu=drafts_gpu_for_mixed
-                    ),
-                )
-            total_mixed_tokens = int(self.input_data.tokens_cpu.shape[0])
-            all_hidden = None
-            if (
-                self._piecewise_runner is not None
-                and self.input_data.embedding_size == total_mixed_tokens
-                and all(s.mm_contents is None for s in verify_and_prefill)
-                and self._piecewise_runner.can_run(total_mixed_tokens)
-            ):
-                # Metadata and every attention/GDN core stay eager. Static
-                # regions consume a bucket-padded embedding buffer and are
-                # replayed as graph segments around those eager breaks.
-                self._prepare_attention_metadata(self.input_data)
-                # Qwen-VL-compatible input preparation deliberately leaves
-                # decode rows as uninitialized placeholders: the ordinary
-                # ``forward()`` wrapper overwrites them immediately before
-                # entering the model.  Piecewise execution bypasses that
-                # wrapper, so perform the identical fixup here before copying
-                # embeddings into the graph's static input.  MTP verify rows
-                # are computed-prompt rows with qlen=1+k and all sit at the
-                # front of this mixed batch.
-                num_decode_tokens = sum(
-                    s.to_compute_token_num
-                    for s in self.input_data.seqs
-                    if s.computed_prompt
-                )
-                self._fixup_vl_decode_embeddings(num_decode_tokens)
-                mixed_embeddings = self.input_hidden_states[:total_mixed_tokens]
-                with torch.profiler.record_function("gllm::mtp_target_mixed_piecewise"):
-                    all_hidden = self._piecewise_runner.run(
-                        self.input_data, mixed_embeddings
-                    )
-            if all_hidden is None:
-                # Go through the normal runner wrapper: it prepares attention
-                # metadata and supplies Qwen-VL-compatible input embeddings.
-                with torch.profiler.record_function("gllm::mtp_target_mixed_eager"):
-                    self.forward()
-                all_hidden = self.output_hidden_states[:total_mixed_tokens]
-            # Verify seqs are uniform ``1+kk`` query length, so ``qsl`` is the
-            # uniform stride. Logits stay raw (see ``_verify_forward_graph``).
-            num_verify_tokens = nd * (1 + kk)
-            v_hidden = all_hidden[:num_verify_tokens]
-            qsl = [i * (1 + kk) for i in range(nd + 1)]
+        verify = self._mtp_verify_target(
+            decode_seqs=decode_seqs,
+            orig_tokens=orig_tokens,
+            x1_tokens=x1_tokens,
+            x1=x1,
+            drafts=drafts,
+            nd=nd,
+            kk=kk,
+            extra_prefill_seqs=extra_prefill_seqs,
+            async_accept=_async_accept,
+        )
+        v_logits = verify.logits
+        v_hidden = verify.hidden
+        drafts = verify.drafts
+        prefill_tokens = verify.prefill_tokens
+        prefill_tokens_gpu = verify.prefill_tokens_gpu
+        new_state_seq_ids = verify.new_state_seq_ids
+        new_state_context_lens = verify.new_state_context_lens
+        new_state_tokens = verify.new_state_tokens
+        new_state_hidden = verify.new_state_hidden
 
-            if extra_prefill_seqs:
-                # The model emits one row per query token.  A prefill request's
-                # next-token distribution is its final query row, not the first
-                # row of the suffix.  query_start_loc describes the complete
-                # [verify-prefix | ragged-prefill-suffix] layout.
-                num_extra = len(extra_prefill_seqs)
-                last_rows_gpu = self._mtp_mixed_last_rows[:num_extra]
-                last_rows_gpu.copy_(
-                    self.input_data.query_start_loc[nd + 1 : nd + num_extra + 1]
-                )
-                last_rows_gpu.sub_(1)
-                prefill_hidden = all_hidden.index_select(0, last_rows_gpu)
-                # The full-vocab LM head is the largest temporary in a mixed
-                # prefill.  Only verify rows and each prefill's final row need
-                # logits; projecting every prompt token can allocate multiple
-                # GiB on large-vocab models (3.8 GiB for the 35B test batch).
-                selected_hidden = torch.cat((v_hidden, prefill_hidden), dim=0)
-                selected_logits = self.model.logits_from_hidden(selected_hidden)
-                v_logits = selected_logits[:num_verify_tokens]
-                prefill_logits = selected_logits[num_verify_tokens:]
-                self.input_data.seqs = extra_prefill_seqs
-                # Argmax reads only ``seqs``. Avoid allocating/copying three
-                # sampling-parameter tensors for the overwhelmingly common
-                # greedy, no-repetition-penalty path.
-                mixed_greedy = all(
-                    s.top_k == 1 and s.repetition_penalty == 1.0
-                    for s in extra_prefill_seqs
-                )
-                if mixed_greedy:
-                    self.input_data.needs_repetition_penalty = False
-                else:
-                    self.input_data.prepare_sample()
-                prefill_tokens_gpu = self.sampler.forward_gpu(
-                    prefill_logits, self.input_data
-                )
-                if get_tp_size() > 1:
-                    self._mtp_bcast_tp(prefill_tokens_gpu)
-                if _async_accept:
-                    completed = [
-                        i
-                        for i, s in enumerate(extra_prefill_seqs)
-                        if s.computed_token_num + s.to_compute_token_num >= s.prompt_len
-                    ]
-                    if completed:
-                        nc = len(completed)
-                        completed_gpu = self._mtp_mixed_new_idx[:nc]
-                        new_state_context_lens = self._mtp_mixed_new_ctx[:nc]
-                        idx_host = self._mtp_mixed_new_idx_host[:nc]
-                        ctx_host = self._mtp_mixed_new_ctx_host[:nc]
-                        self._mtp_mixed_new_idx_host_np[:nc] = completed
-                        new_state_seq_ids = tuple(
-                            extra_prefill_seqs[i].seq_id for i in completed
-                        )
-                        self._mtp_mixed_new_ctx_host_np[:nc] = [
-                            extra_prefill_seqs[i].computed_token_num
-                            + extra_prefill_seqs[i].to_compute_token_num
-                            for i in completed
-                        ]
-                        completed_gpu.copy_(idx_host, non_blocking=True)
-                        new_state_context_lens.copy_(ctx_host, non_blocking=True)
-                        new_state_tokens = prefill_tokens_gpu.index_select(
-                            0, completed_gpu
-                        )
-                        new_state_hidden = prefill_hidden.index_select(0, completed_gpu)
-                else:
-                    prefill_tokens = prefill_tokens_gpu.cpu().tolist()
-            else:
-                v_logits = self.model.logits_from_hidden(v_hidden)
-
+        # Target verification returns post-final-norm hidden states, matching
+        # vLLM and sglang's MTP conditioning contract.
         # Rejection mode: the target dist ``p`` at each of the 1+kk verify
         # positions, in the SAME transformed space as the draft dist ``q``
         # (temperature + top-k/top-p renorm) -- that equality is what makes the
@@ -4321,7 +4554,7 @@ class ModelRunner:
             # step. Here every decision is a batched tensor op and the host learns
             # the outcome through ONE packed D2H at the end.
             qlen = 1 + kk
-            seq_ar = self._mtp_row_idx[:nd]
+            seq_ar = self._mtp_staging.row_idx[:nd]
             sparse = p_sparse is not None
             if sparse:
                 p3_vals, p3_idx = p_sparse  # [nd, qlen, k_pad] each
@@ -4471,7 +4704,7 @@ class ModelRunner:
             # Greedy target: one argmax over the verify logits (the rejection
             # branch instead transforms the same logits into ``p``).
             vp = v_logits[: nd * qlen].argmax(dim=-1).view(nd, qlen)
-            seq_ar = self._mtp_row_idx[:nd]
+            seq_ar = self._mtp_staging.row_idx[:nd]
             if kk > 0:
                 # Prefer the GPU draft tensor threaded from the draft chain (the
                 # graph chain never materializes the drafts on the host at all).
@@ -4510,13 +4743,12 @@ class ModelRunner:
                         raise RuntimeError(
                             "MTP async cohort changed before pending completion was collected"
                         )
+                    self._mtp_staging.install_ctx_host_np[:nd] = [
+                        len(t) for t in orig_tokens
+                    ]
                     state.install(
                         seq_ids,
-                        torch.as_tensor(
-                            [len(t) for t in orig_tokens],
-                            dtype=torch.int64,
-                            device=dev,
-                        ),
+                        self._mtp_staging.install_ctx_host[:nd],
                         x1_gpu,
                         hidden,
                     )
@@ -4669,7 +4901,9 @@ class ModelRunner:
         old_publish = self._mtp_async_publish
         self._mtp_async_publish = async_publish
         try:
-            result = self._mtp_decode(hidden, x1, extra_prefill_seqs=prefill_seqs)
+            result = self._mtp_decode(
+                hidden, x1, extra_prefill_seqs=prefill_seqs
+            )
         finally:
             self._mtp_async_publish = old_publish
         if async_publish and not isinstance(result, MtpAsyncCompletion):
@@ -4838,6 +5072,16 @@ class ModelRunner:
             # the collective balanced; every rank has the same real seqs, so
             # they compute identical data and only tp0's copy is shipped.
             self._compute_prompt_logprobs(seqs, hidden)
+            # Keep the MTP head's KV layer in lockstep with the target for
+            # every batch that does NOT go through the speculative path
+            # (prefill, chunked prefill, mixed, and plain decode).  Without
+            # this the head attends over recycled pages it never wrote.
+            self._mtp_sync_kv(
+                self.input_data,
+                hidden,
+                tail_seqs=self.input_data.seqs,
+                tail_next_tokens=next_tokens,
+            )
             # MTP speculative decoding: on a pure-decode batch, draft k tokens
             # per seq with the MTP head and verify them with one base forward,
             # committing the accepted prefix. Returns per-seq token LISTS.
@@ -5295,6 +5539,23 @@ class OverlapModelRunner(ModelRunner):
                     src=tp_src,
                     group=get_tp_group(),
                 )
+            # Same MTP head KV maintenance as the synchronous ``step_once``:
+            # this is the non-speculative overlap step (pure prefill, an MTP
+            # batch-size crossover, ...), and without it those tokens leave a
+            # gap the draft would later read off a recycled page.  It must run
+            # AFTER the broadcast -- a rank that wrote different head KV would
+            # propose different drafts and diverge -- and BEFORE
+            # ``input_consumed_event``, which releases the input buffers it
+            # reads.  ``next_tokens_gpu`` stays on the device; ``_mtp_sync_kv``
+            # scatters it without a host round-trip.
+            if next_tokens_gpu is not None:
+                with torch.profiler.record_function("gllm::mtp_head_kv_sync"):
+                    self._mtp_sync_kv(
+                        self.input_data,
+                        hidden,
+                        tail_seqs=self.input_data.seqs,
+                        tail_next_tokens=next_tokens_gpu,
+                    )
             self.future_map.store_to_map(future_indices, next_tokens_gpu)
             # Every PP-0 TP rank D2H-copies the broadcast tokens into
             # its own pinned ``_next_tokens_bufs`` slot. Pre-refactor

@@ -778,6 +778,15 @@ concurrency, T=0.8 / top_k=20, k=3 — warmed up first with *disjoint* prompts s
 the window contains neither first-use JIT nor prefix-cache hits on the measured
 requests. Two things came out of it and are fixed:
 
+Profiler configuration is process-local:
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `GLLM_TORCH_PROFILER_DIR` | `/tmp` | Trace/session output root. |
+| `GLLM_TORCH_PROFILER_RECORD_SHAPES` | `1` | Record operator input shapes. |
+| `GLLM_TORCH_PROFILER_WITH_STACK` | `1` | Record Python/C++ stacks. |
+| `GLLM_TORCH_PROFILER_SUMMARY_MAX_TRACE_BYTES` | `2147483648` | Skip the extra `key_averages` materialization above this raw-trace size. |
+
 * **`_mtp_sample_params` was 3 device syncs per step, 558 ms of the 2 s window.**
   `torch.tensor(list, device="cuda")` copies from pageable memory, which torch
   serializes with a `cudaStreamSynchronize`; sitting right after the verify graph

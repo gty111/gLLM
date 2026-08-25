@@ -320,3 +320,30 @@ def test_filter_prefetched_freed_keeps_surviving_inflight_rows():
 
     assert kept == [live]
     assert list(worker.scheduler.batch_running) == [[live]]
+
+
+def test_plain_decode_transition_publishes_mtp_relay_before_input_refresh():
+    worker = OverlapWorker.__new__(OverlapWorker)
+    worker._dp = False
+    worker._mtp_pending = deque([object()])
+    worker._prefetched_input = SimpleNamespace(seqs=[object()])
+    calls = []
+
+    worker.check_abort_seqs = lambda: None
+    worker.recv_ipc_package = lambda: None
+    worker._plan_mtp_batch = lambda: SimpleNamespace(speculate=False)
+    worker._drain_mtp_pending = lambda: (
+        calls.append("drain"), worker._mtp_pending.clear()
+    )
+    worker._publish_mtp_relay_only = lambda: calls.append("publish") or True
+
+    def refresh():
+        calls.append("refresh")
+        worker._prefetched_input = None
+
+    worker._refresh_prefetched_input = refresh
+    worker._build_prefetched_input = lambda: calls.append("build")
+
+    worker.run_pp0()
+
+    assert calls == ["drain", "publish", "refresh", "build"]

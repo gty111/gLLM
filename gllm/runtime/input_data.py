@@ -1,3 +1,4 @@
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -121,6 +122,16 @@ class InputData:
                 # produce duplicate states with the working slot.
                 self.ssm_snapshot_write_slot_per_seq = torch.full(
                     (max_running_seqs,), -1, dtype=torch.int32, device=device
+                )
+                # Snapshot source/destination slots are derived once on the
+                # host and reused by every GDN layer.  Keeping stable device
+                # buffers avoids a synchronizing ``nonzero`` plus repeated
+                # index/cast kernels in each layer.
+                self.ssm_snapshot_src_idx = torch.empty(
+                    max_running_seqs, dtype=torch.long, device=device
+                )
+                self.ssm_snapshot_dst_idx = torch.empty(
+                    max_running_seqs, dtype=torch.long, device=device
                 )
                 # MTP verify 2D block table: static GPU buffers let the verify
                 # forward run inside a CUDA graph (the values are
@@ -317,6 +328,13 @@ class InputData:
         self.ssm_snapshot_write_slot_per_seq_cpu = (
             torch.as_tensor(snap_targets, device="cpu").pin_memory()
         )
+        self.ssm_snapshot_src_idx_cpu = torch.empty(
+            0, dtype=torch.long, device="cpu", pin_memory=True
+        )
+        self.ssm_snapshot_dst_idx_cpu = torch.empty(
+            0, dtype=torch.long, device="cpu", pin_memory=True
+        )
+        self._ssm_snapshot_valid_rows = ()
         self._ssm_snapshot_candidates = tuple(snapshot_candidates)
         self._ssm_snapshot_writes_pending = ()
 
@@ -398,6 +416,14 @@ class InputData:
             self.ssm_snapshot_write_slot_per_seq[:n_seqs].copy_(
                 self.ssm_snapshot_write_slot_per_seq_cpu, non_blocking=True
             )
+            n_snapshot = self.ssm_snapshot_src_idx_cpu.shape[0]
+            if n_snapshot:
+                self.ssm_snapshot_src_idx[:n_snapshot].copy_(
+                    self.ssm_snapshot_src_idx_cpu, non_blocking=True
+                )
+                self.ssm_snapshot_dst_idx[:n_snapshot].copy_(
+                    self.ssm_snapshot_dst_idx_cpu, non_blocking=True
+                )
             # MTP verify 2D block table + accepted-count into the static GPU
             # buffers (present only when MTP is on). Refilled every step so a
             # captured verify graph replays against the same buffer address.
@@ -425,24 +451,42 @@ class InputData:
         allocation can interleave before the model forward is enqueued.
         """
         candidates = getattr(self, "_ssm_snapshot_candidates", ())
-        if not self.use_ssm_cache or not candidates:
+        if not self.use_ssm_cache:
             return
-        segment = getattr(self.memory_manager, "segment", None)
-        reserve = getattr(segment, "reserve_ssm_snapshot", None)
-        if reserve is None:
+        if candidates:
+            segment = getattr(self.memory_manager, "segment", None)
+            reserve = getattr(segment, "reserve_ssm_snapshot", None)
+            if reserve is not None:
+                targets = self.ssm_snapshot_write_slot_per_seq_cpu
+                pending = []
+                for row, page_num, end_tokens in candidates:
+                    slot = reserve(page_num, end_tokens)
+                    if slot is None:
+                        continue
+                    targets[row] = slot
+                    pending.append((page_num, slot))
+                self._ssm_snapshot_writes_pending = tuple(pending)
             self._ssm_snapshot_candidates = ()
-            return
 
+        self._materialize_ssm_snapshot_copy_indices()
+
+    def _materialize_ssm_snapshot_copy_indices(self) -> None:
+        """Build layer-independent snapshot source/destination slot lists."""
         targets = self.ssm_snapshot_write_slot_per_seq_cpu
-        pending = []
-        for row, page_num, end_tokens in candidates:
-            slot = reserve(page_num, end_tokens)
-            if slot is None:
-                continue
-            targets[row] = slot
-            pending.append((page_num, slot))
-        self._ssm_snapshot_candidates = ()
-        self._ssm_snapshot_writes_pending = tuple(pending)
+        valid_rows = torch.nonzero(targets >= 0, as_tuple=False).flatten()
+        self._ssm_snapshot_valid_rows = tuple(valid_rows.tolist())
+        count = valid_rows.numel()
+        src_idx = torch.empty(
+            count, dtype=torch.long, device="cpu", pin_memory=True
+        )
+        dst_idx = torch.empty_like(src_idx, pin_memory=True)
+        if count:
+            src_idx.copy_(
+                self.ssm_state_slot_per_seq_cpu.index_select(0, valid_rows)
+            )
+            dst_idx.copy_(targets.index_select(0, valid_rows))
+        self.ssm_snapshot_src_idx_cpu = src_idx
+        self.ssm_snapshot_dst_idx_cpu = dst_idx
 
     def mark_ssm_snapshot_writes_enqueued(self) -> None:
         """Publish snapshot validity after the GDN copy has been enqueued."""
@@ -506,8 +550,22 @@ class InputData:
             if self.use_ssm_cache:
                 shapes["ssm_state_slot_per_seq_cpu"] = _e(num_rows, dtype=torch.int32)
                 shapes["has_initial_state_per_seq_cpu"] = _e(num_rows, dtype=torch.bool)
-                shapes["ssm_snapshot_write_slot_per_seq_cpu"] = _e(
-                    num_rows, dtype=torch.int32
+                # GPU-uniform preparation never creates prefix-cache
+                # snapshots: gpu_prep fills the matching device buffer with
+                # -1.  This CPU tensor is normally only a shape placeholder,
+                # but Qwen's snapshot fast path also uses it as an exact
+                # host-side "any writes?" mirror.  Leaving it uninitialized
+                # can therefore spuriously enter torch.nonzero on the device,
+                # synchronizing once per GDN layer, even though every device
+                # target is -1.  Keep both sides semantically identical.
+                shapes["ssm_snapshot_write_slot_per_seq_cpu"] = torch.full(
+                    (num_rows,), -1, dtype=torch.int32, device="cpu"
+                )
+                shapes["ssm_snapshot_src_idx_cpu"] = _e(
+                    0, dtype=torch.long
+                )
+                shapes["ssm_snapshot_dst_idx_cpu"] = _e(
+                    0, dtype=torch.long
                 )
                 if hasattr(self, "ssm_block_table_2d"):
                     shapes["ssm_block_table_2d_cpu"] = _e(
@@ -519,6 +577,7 @@ class InputData:
             setattr(self, name, tensor)
         self._ssm_snapshot_candidates = ()
         self._ssm_snapshot_writes_pending = ()
+        self._ssm_snapshot_valid_rows = ()
         self.seqs = seqs
         self.embedding_size = 0
         # mrope buffer is filled by the prep, but the captured graphs read the
@@ -598,6 +657,9 @@ class InputData:
         "ssm_state_slot_per_seq_cpu",
         "has_initial_state_per_seq_cpu",
         "ssm_snapshot_write_slot_per_seq_cpu",
+        "ssm_snapshot_src_idx_cpu",
+        "ssm_snapshot_dst_idx_cpu",
+        "_ssm_snapshot_valid_rows",
         "_ssm_snapshot_candidates",
         "_ssm_snapshot_writes_pending",
     )
@@ -783,6 +845,20 @@ class InputData:
             return None
         n = self.ssm_snapshot_write_slot_per_seq_cpu.shape[0]
         return self.ssm_snapshot_write_slot_per_seq[:n]
+
+    def get_ssm_snapshot_copy_indices(self, row_start: int = 0):
+        """Return reusable GPU source/destination slot ids for snapshots."""
+        valid_rows = getattr(self, "_ssm_snapshot_valid_rows", ())
+        if not valid_rows:
+            return None
+        first = bisect_left(valid_rows, row_start)
+        count = len(valid_rows) - first
+        if count <= 0:
+            return None
+        return (
+            self.ssm_snapshot_src_idx[first : first + count],
+            self.ssm_snapshot_dst_idx[first : first + count],
+        )
 
     def _cal_block_table(self, seqs: List[GenerationSequence]):
         block_tables_list = [seq.page_table for seq in seqs]

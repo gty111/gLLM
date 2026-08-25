@@ -73,14 +73,18 @@ def _layer_norm_fwd_1pass_kernel(
     Z,  # pointer to the other branch
     Mean,  # pointer to the mean
     Rstd,  # pointer to the 1/std
-    stride_x_row,  # how much to increase the pointer when moving by 1 row
-    stride_y_row,
-    stride_z_row,
+    stride_x_outer,
+    stride_x_inner,
+    stride_y_outer,
+    stride_y_inner,
+    stride_z_outer,
+    stride_z_inner,
     M,  # number of rows in X
     N: tl.constexpr,  # number of columns in X
     eps,  # epsilon to avoid division by zero
     BLOCK_N: tl.constexpr,
     ROWS_PER_BLOCK: tl.constexpr,
+    ROWS_PER_OUTER: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_Z: tl.constexpr,
     NORM_BEFORE_GATE: tl.constexpr,
@@ -95,13 +99,25 @@ def _layer_norm_fwd_1pass_kernel(
     rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
     cols = tl.arange(0, BLOCK_N)
 
-    # Compute offsets for 2D tile
-    row_offsets = rows[:, None] * stride_x_row
+    # A logical norm row may come from a 2-D tensor or from the last two
+    # dimensions of a 3-D ``[token, head, dim]`` tensor. Keeping the two
+    # physical row strides avoids materializing fused-projection slices.
+    outer_rows = rows // ROWS_PER_OUTER
+    inner_rows = rows - outer_rows * ROWS_PER_OUTER
+    row_offsets = (
+        outer_rows[:, None] * stride_x_outer
+        + inner_rows[:, None] * stride_x_inner
+    )
     col_offsets = cols[None, :] + group * N
 
     # Base pointers
     X_base = X + row_offsets + col_offsets
-    Y_base = Y + rows[:, None] * stride_y_row + col_offsets
+    Y_base = (
+        Y
+        + outer_rows[:, None] * stride_y_outer
+        + inner_rows[:, None] * stride_y_inner
+        + col_offsets
+    )
 
     # Create mask for valid rows and columns
     row_mask = rows[:, None] < M
@@ -112,7 +128,12 @@ def _layer_norm_fwd_1pass_kernel(
     x = tl.load(X_base, mask=mask, other=0.0).to(tl.float32)
 
     if HAS_Z and not NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+        Z_base = (
+            Z
+            + outer_rows[:, None] * stride_z_outer
+            + inner_rows[:, None] * stride_z_inner
+            + col_offsets
+        )
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             x *= z * tl.sigmoid(z)
@@ -158,7 +179,12 @@ def _layer_norm_fwd_1pass_kernel(
     y = x_hat * w[None, :] + b[None, :] if HAS_BIAS else x_hat * w[None, :]
 
     if HAS_Z and NORM_BEFORE_GATE:
-        Z_base = Z + rows[:, None] * stride_z_row + col_offsets
+        Z_base = (
+            Z
+            + outer_rows[:, None] * stride_z_outer
+            + inner_rows[:, None] * stride_z_inner
+            + col_offsets
+        )
         z = tl.load(Z_base, mask=mask, other=0.0).to(tl.float32)
         if ACTIVATION == "swish" or ACTIVATION == "silu":
             y *= z * tl.sigmoid(z)
@@ -203,7 +229,16 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
 ):
-    M, N = x.shape
+    if x.ndim == 2:
+        M, N = x.shape
+        rows_per_outer = 1
+        stride_x_outer, stride_x_inner = x.stride(0), 0
+    elif x.ndim == 3:
+        outer, rows_per_outer, N = x.shape
+        M = outer * rows_per_outer
+        stride_x_outer, stride_x_inner = x.stride(0), x.stride(1)
+    else:
+        raise ValueError(f"expected a 2-D or 3-D input, got shape {tuple(x.shape)}")
     if group_size is None:
         group_size = N
     assert N % group_size == 0
@@ -211,7 +246,7 @@ def _layer_norm_fwd(
     assert x.stride(-1) == 1
     if z is not None:
         assert z.stride(-1) == 1
-        assert z.shape == (M, N)
+        assert z.shape == x.shape
     assert weight.shape == (N,)
     assert weight.stride(-1) == 1
     if bias is not None:
@@ -223,6 +258,16 @@ def _layer_norm_fwd(
     else:
         out = torch.empty_like(x)
     assert out.stride(-1) == 1
+    if out.ndim == 2:
+        stride_y_outer, stride_y_inner = out.stride(0), 0
+    else:
+        stride_y_outer, stride_y_inner = out.stride(0), out.stride(1)
+    if z is None:
+        stride_z_outer = stride_z_inner = 0
+    elif z.ndim == 2:
+        stride_z_outer, stride_z_inner = z.stride(0), 0
+    else:
+        stride_z_outer, stride_z_inner = z.stride(0), z.stride(1)
     mean = (
         torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
         if not is_rms_norm
@@ -249,14 +294,18 @@ def _layer_norm_fwd(
             z,
             mean,
             rstd,
-            x.stride(0),
-            out.stride(0),
-            z.stride(0) if z is not None else 0,
+            stride_x_outer,
+            stride_x_inner,
+            stride_y_outer,
+            stride_y_inner,
+            stride_z_outer,
+            stride_z_inner,
             M,
             group_size,
             eps,
             BLOCK_N=BLOCK_N,
             ROWS_PER_BLOCK=rows_per_block,
+            ROWS_PER_OUTER=rows_per_outer,
             HAS_BIAS=bias is not None,
             HAS_Z=z is not None,
             NORM_BEFORE_GATE=norm_before_gate,
@@ -286,15 +335,22 @@ def rms_norm_gated(
     """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
 
     x_shape_og = x.shape
-    # reshape input data into 2D tensor
-    x = x.reshape(-1, x.shape[-1])
-    if x.stride(-1) != 1:
-        x = x.contiguous()
-    if z is not None:
+    direct_3d = (
+        x.ndim == 3
+        and x.stride(-1) == 1
+        and (z is None or (z.ndim == 3 and z.stride(-1) == 1))
+    )
+    if not direct_3d:
+        x = x.reshape(-1, x.shape[-1])
+        if x.stride(-1) != 1:
+            x = x.contiguous()
+        if z is not None:
+            assert z.shape == x_shape_og
+            z = z.reshape(-1, z.shape[-1])
+            if z.stride(-1) != 1:
+                z = z.contiguous()
+    elif z is not None:
         assert z.shape == x_shape_og
-        z = z.reshape(-1, z.shape[-1])
-        if z.stride(-1) != 1:
-            z = z.contiguous()
     weight = weight.contiguous()
     if bias is not None:
         bias = bias.contiguous()

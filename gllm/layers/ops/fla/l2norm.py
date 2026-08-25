@@ -49,15 +49,17 @@ def l2norm_fwd_kernel1(
 #         for num_warps in [1, 2, 4, 8, 16]
 #         for BT in BT_LIST
 #     ],
-#     key=["D", "NB"],
+#     key=["D"],
 # )
 @triton.jit
 def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    T,  # runtime: the row count changes with every ragged batch, and a
+        # ``tl.constexpr`` here made each new token count a fresh Triton
+        # specialization (~640 ms of JIT on the first launch).  It only bounds
+        # the block pointers below, which accept runtime extents.
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
@@ -71,18 +73,70 @@ def l2norm_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit
+def l2norm_fwd_4d_strided_kernel(
+    x,
+    y,
+    eps,
+    T,  # runtime: token count. Only feeds ``T * H`` below, and specializing on
+        # it costs a Triton compile per distinct ragged batch size.
+    H: tl.constexpr,
+    D: tl.constexpr,
+    SX0,
+    SX1,
+    SX2,
+    R,  # runtime: total logical rows (``T * H`` per batch entry). Only feeds
+        # the ``rows < R`` mask.
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    """L2-normalize logical rows of a last-dimension-contiguous 4D view."""
+    rows = tl.program_id(0) * BT + tl.arange(0, BT)
+    cols = tl.arange(0, BD)
+    row_mask = rows < R
+    col_mask = cols < D
+
+    rows_per_batch = T * H
+    batch = rows // rows_per_batch
+    batch_row = rows - batch * rows_per_batch
+    token = batch_row // H
+    head = batch_row - token * H
+    x_offsets = batch * SX0 + token * SX1 + head * SX2
+
+    b_x = tl.load(
+        x + x_offsets[:, None] + cols[None, :],
+        mask=row_mask[:, None] & col_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    b_var = tl.sum(b_x * b_x, axis=1)
+    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    tl.store(
+        y + rows[:, None] * D + cols[None, :],
+        b_y,
+        mask=row_mask[:, None] & col_mask[None, :],
+    )
+
+
 def l2norm_fwd(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
 ):
     x_shape_og = x.shape
-    x = x.view(-1, x.shape[-1])
+    use_4d_strided_kernel = (
+        x.ndim == 4
+        and x.shape[-1] <= 512
+        and x.stride(-1) == 1
+        and not x.is_contiguous()
+    )
+    if not use_4d_strided_kernel:
+        # Preserve the historical compact-input path for all other layouts.
+        x = x.contiguous().view(-1, x.shape[-1])
     # allocate output
     if output_dtype is None:
-        y = torch.empty_like(x)
+        y = torch.empty(x_shape_og, dtype=x.dtype, device=x.device)
     else:
-        y = torch.empty_like(x, dtype=output_dtype)
+        y = torch.empty(x_shape_og, dtype=output_dtype, device=x.device)
     assert y.stride(-1) == 1
-    T, D = x.shape[0], x.shape[-1]
+    R, D = x.numel() // x.shape[-1], x.shape[-1]
     # rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
@@ -91,25 +145,41 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
 
         def grid(meta):
-            return (triton.cdiv(T, meta["BT"]),)
+            return (triton.cdiv(R, meta["BT"]),)
 
-        l2norm_fwd_kernel[grid](
-            x,
-            y,
-            eps,
-            NB=NB,
-            T=T,
-            D=D,
-            BD=BD,
-            BT=16,
-            num_warps=8,
-            num_stages=3,
-        )
+        if use_4d_strided_kernel:
+            l2norm_fwd_4d_strided_kernel[grid](
+                x,
+                y,
+                eps,
+                T=x.shape[1],
+                H=x.shape[2],
+                D=D,
+                SX0=x.stride(0),
+                SX1=x.stride(1),
+                SX2=x.stride(2),
+                R=R,
+                BT=16,
+                BD=BD,
+                num_warps=8,
+                num_stages=3,
+            )
+        else:
+            l2norm_fwd_kernel[grid](
+                x,
+                y,
+                eps,
+                T=R,
+                D=D,
+                BD=BD,
+                BT=16,
+                num_warps=8,
+                num_stages=3,
+            )
     else:
-        l2norm_fwd_kernel1[(T,)](
+        l2norm_fwd_kernel1[(R,)](
             x,
             y,
             eps=eps,
@@ -119,7 +189,7 @@ def l2norm_fwd(
             num_stages=3,
         )
 
-    return y.view(x_shape_og)
+    return y
 
 
 class L2NormFunction(torch.autograd.Function):

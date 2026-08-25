@@ -45,6 +45,13 @@ META_X1 = 2           # the seq's x1 token id (verify column 0 / draft input)
 META_NUM_ACCEPTED = 3  # SSM resume column selector (``num_accepted``)
 META_W = 4
 
+# A draft step's query sits at the position of the TARGET HIDDEN STATE it
+# consumes, not at the context length.  The MTP/EAGLE head stores the entry at
+# position ``p`` as ``(target_hidden[p], embed(token[p+1]))``, so a context of
+# ``ctx`` committed tokens drafts from ``ctx - 1`` while feeding ``token[ctx]``.
+# ``model_runner``'s CPU builders must agree with this exactly.
+MTP_DRAFT_POS_OFFSET = -1
+
 
 @dataclass(frozen=True)
 class MtpDraftMaterializer:
@@ -306,9 +313,7 @@ class MtpGpuPrep:
         return MtpVerifyMaterializer(self, seqs, drafts_gpu)
 
     def draft_materializer(
-        self,
-        *,
-        seqs: List[GenerationSequence],
+        self, *, seqs: List[GenerationSequence]
     ) -> MtpDraftMaterializer:
         """Bind this persistent writer to one uniform draft forward."""
         return MtpDraftMaterializer(self, seqs)
@@ -378,17 +383,20 @@ class MtpGpuPrep:
             )
 
     def _write_draft_buffers(self, input_data) -> None:
-        """Prepare a draft-chain step: one query token per row at ``ctx``.
+        """Prepare a draft-chain step: one query token per row.
 
-        Mirrors the CPU build for ``token_ids = committed + [x1]`` with
-        ``computed_token_num = ctx`` and ``to_compute_token_num = 1``. The token
-        ids themselves are not written here -- the captured draft graph feeds
-        the MTP head from ``ModelRunner._d_tok`` instead. The SSM metadata is
-        also skipped: the MTP head is a single *full-attention* block (Qwen3.5)
-        or an MLA block (DeepSeek), so no GDN layer reads it during a draft.
+        The query lands at ``ctx + MTP_DRAFT_POS_OFFSET`` -- the position of the
+        target hidden state the head consumes -- and carries ``token[ctx]``.
+        The token ids themselves are not written here: the captured draft graph
+        feeds the MTP head from ``ModelRunner._d_tok`` instead. The SSM
+        metadata is also skipped: the MTP head is a single *full-attention*
+        block (Qwen3.5) or an MLA block (DeepSeek), so no GDN layer reads it
+        during a draft.
         """
         bucket = self.bucket
-        pos = self._d_meta[:bucket, META_CTX].unsqueeze(1)  # [bucket, 1]
+        pos = (
+            self._d_meta[:bucket, META_CTX].unsqueeze(1) + MTP_DRAFT_POS_OFFSET
+        )  # [bucket, 1]
         self._fill_common(input_data, 1, pos)
 
     def _write_verify_buffers(

@@ -4,3 +4,4 @@
 **/guoty_scripts
 **/__pycache__
 **/*.so
+/runs/
