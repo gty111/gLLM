@@ -69,8 +69,19 @@ def test_capture_registers_eager_break_without_executing_it(monkeypatch):
     assert eager_calls == []
     assert capture.num_eager_breaks == 1
     capture._end()
+    # Capture must not replay graph segments before the outer custom-AR
+    # context has registered their cross-rank buffers.
+    assert [event[0] for event in events] == ["begin", "end", "begin", "end"]
     capture.replay()
     assert eager_calls == ["eager"]
+    assert [event[0] for event in events] == [
+        "begin",
+        "end",
+        "begin",
+        "end",
+        "graph",
+        "graph",
+    ]
 
 
 def test_piecewise_segments_and_buckets_share_one_externalized_pool(monkeypatch):

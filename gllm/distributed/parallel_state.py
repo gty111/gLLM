@@ -281,7 +281,7 @@ def dp_all_gather_num_tokens(local_ntok: int):
     """
     t = torch.tensor([local_ntok], dtype=torch.long, device="cuda")
     out = torch.empty(_DP_SIZE, dtype=torch.long, device="cuda")
-    dist.all_gather_into_tensor(out, t, group=_DP_GROUP)
+    dist.all_gather_single(out, t, group=_DP_GROUP)
     return out.tolist()
 
 
@@ -299,7 +299,7 @@ def dp_all_gather_meta(local_ntok: int, is_decode: bool):
         [local_ntok, 1 if is_decode else 0], dtype=torch.long, device="cuda"
     )
     out = torch.empty(_DP_SIZE, 2, dtype=torch.long, device="cuda")
-    dist.all_gather_into_tensor(out, t, group=_DP_GROUP)
+    dist.all_gather_single(out, t, group=_DP_GROUP)
     out = out.tolist()
     counts = [row[0] for row in out]
     decode_flags = [row[1] for row in out]
@@ -328,7 +328,7 @@ def dp_gather_hidden(x: torch.Tensor, counts) -> torch.Tensor:
     padded = x.new_zeros((max_n, hidden))
     padded[: x.shape[0]] = x
     gathered = x.new_empty((_DP_SIZE * max_n, hidden))
-    dist.all_gather_into_tensor(gathered, padded, group=_DP_GROUP)
+    dist.all_gather_single(gathered, padded, group=_DP_GROUP)
     if _dp_counts_uniform(counts):
         return gathered
     gathered = gathered.view(_DP_SIZE, max_n, hidden)
@@ -356,8 +356,15 @@ def ep_all_reduce(x: torch.Tensor) -> torch.Tensor:
     """Sum expert-shard contributions across the EP group (one pipeline stage).
 
     EP spans the ``dp_size * tp_size`` ranks of a single stage (``_EP_GROUP``).
-    For ``pp_size == 1`` that is the whole world.
+    Without DP-attention, EP and TP contain exactly the same ranks.  Reuse the
+    ordinary TP collective in that case so eligible decode-sized messages take
+    the repository's custom NVLink all-reduce path instead of paying NCCL
+    RING_LL launch latency once per MoE layer.  Under DP-attention EP expands
+    across ``dp_size * tp_size`` ranks, while custom all-reduce is initialized
+    only for a TP subgroup, so that topology continues to use NCCL.
     """
+    if not is_dp_attn():
+        return tensor_model_parallel_all_reduce(x)
     dist.all_reduce(x, group=_EP_GROUP)
     return x
 
@@ -559,7 +566,7 @@ def tensor_model_parallel_all_gather(input_: torch.Tensor, dim=-1) -> torch.Tens
     # Allocate output tensor.
     output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
     # All-gather.
-    dist.all_gather_into_tensor(output_tensor, input_, group=get_tp_group())
+    dist.all_gather_single(output_tensor, input_, group=get_tp_group())
     # Reshape
     output_tensor = output_tensor.reshape((get_tp_size(),) + input_size)
     output_tensor = output_tensor.movedim(0, dim)
@@ -598,6 +605,25 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     car = get_custom_allreduce()
     if car is not None and car.should_custom_ar(input_):
         return car.all_reduce(input_)
+    # The custom kernel vectorizes 16-byte loads. Tiny score reductions (for
+    # example DeepSeek sparse-index scores) often contain an odd number of
+    # FP32 elements when online arrivals produce batch sizes such as 25 or 7.
+    # Falling all the way back to NCCL for those few bytes costs one RING_LL
+    # launch per sparse layer. Zero-pad a contiguous eligible message to the
+    # next vector boundary, reduce it with the same common custom-AR path, then
+    # return a view of the real prefix. Padding is algebraically neutral for a
+    # sum and keeps this optimization model-agnostic.
+    if car is not None and input_.is_contiguous() and input_.numel() > 0:
+        element_size = input_.element_size()
+        if 16 % element_size == 0:
+            alignment = 16 // element_size
+            pad_elements = (-input_.numel()) % alignment
+            if pad_elements:
+                flat = input_.view(-1)
+                padded = torch.nn.functional.pad(flat, (0, pad_elements))
+                if car.should_custom_ar(padded):
+                    reduced = car.all_reduce(padded)
+                    return reduced[: input_.numel()].view_as(input_)
     dist.all_reduce(input_, group=get_tp_group())
     return input_
 

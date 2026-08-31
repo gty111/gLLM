@@ -232,8 +232,8 @@ def moe_expert_load_pool(num_experts: int):
         pool.shutdown(wait=True)
 
 
-def _iter_experts(num_experts: int, body: Callable[[int], None],
-                  pool: Optional[ThreadPoolExecutor]):
+def iter_experts(num_experts: int, body: Callable[[int], None],
+                 pool: Optional[ThreadPoolExecutor]):
     """Run ``body(expert_idx)`` for every expert, optionally in parallel."""
     if pool is None:
         for i in range(num_experts):
@@ -286,7 +286,7 @@ def load_fused_w13_per_expert(
             partition_tp,
         )
 
-    _iter_experts(num_experts, _one, pool)
+    iter_experts(num_experts, _one, pool)
 
 
 def load_w2_per_expert(
@@ -315,7 +315,7 @@ def load_w2_per_expert(
             partition_tp,
         )
 
-    _iter_experts(num_experts, _one, pool)
+    iter_experts(num_experts, _one, pool)
 
 
 def load_fused_w13_stacked(
@@ -365,7 +365,7 @@ def load_fused_w13_stacked(
         # so we just need a permute, no further slicing.
         dst[local_expert_idx].copy_(w13_weight[expert_idx].permute(1, 0))
 
-    _iter_experts(num_experts, _one, pool)
+    iter_experts(num_experts, _one, pool)
 
 
 def load_w2_stacked(
@@ -399,7 +399,7 @@ def load_w2_stacked(
             return
         dst[local_expert_idx].copy_(w2_weight[expert_idx].permute(1, 0))
 
-    _iter_experts(num_experts, _one, pool)
+    iter_experts(num_experts, _one, pool)
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +454,7 @@ def load_fused_w13_stacked_natural(
         # EP-on (full intermediate per rank) or TP==1: copy the slot verbatim.
         dst[local_expert_idx].copy_(w13_weight[expert_idx])
 
-    _iter_experts(num_experts, _one, pool)
+    iter_experts(num_experts, _one, pool)
 
 
 def load_w2_stacked_natural(
@@ -482,5 +482,5 @@ def load_w2_stacked_natural(
             return
         dst[local_expert_idx].copy_(w2_weight[expert_idx])
 
-    _iter_experts(num_experts, _one, pool)
+    iter_experts(num_experts, _one, pool)
 

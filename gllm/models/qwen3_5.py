@@ -26,7 +26,7 @@ Architectural cheat-sheet (Qwen3.5-0.8B config):
 
   ``conv_state`` (Cin, kernel) and ``ssm_state`` (Nv, Hk, Hv) live in the
   :class:`gllm.runtime.memory_manager.SSMSegment` arena view; the slot id is
-  ``sequence.ssm_state_slot`` (filled by the scheduler and pushed to GPU
+  ``sequence.recurrent_state_slot`` (filled by the scheduler and pushed to GPU
   by :meth:`InputData._cal_ssm_metadata`).
 * Some checkpoints ship an ``mtp.*`` multi-token-prediction head for
   speculative decoding; gllm does not load or run it yet (only ``model.*``
@@ -224,7 +224,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     runs on the vendored FLA Triton kernels at
     :mod:`gllm.layers.ops.fla`. State lives in the
     :class:`gllm.runtime.memory_manager.SSMSegment` arena view, addressed via
-    ``input_data.get_ssm_state_slot_per_seq()``.
+    ``input_data.get_recurrent_state_slot_per_seq()``.
     """
 
     def __init__(self, config, layer_id: int, ssm_layer_id: int,
@@ -649,7 +649,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         mixed_qkv = qkvz[:, :qkv_width]
         conv_state, ssm_state = self._ssm_state_tensors(input_data)
-        cache_indices = input_data.get_ssm_state_slot_per_seq()
+        cache_indices = input_data.get_recurrent_state_slot_per_seq()
         has_initial_state = input_data.get_has_initial_state_per_seq()
         query_start_loc = input_data.get_query_start_loc()
         # ``conv1d.weight`` is stored as ``(C_in, 1, kernel)`` so the kernel

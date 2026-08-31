@@ -52,12 +52,19 @@ class RMSNorm(nn.Module):
         self,
         hidden_size: int,
         eps: float,
+        params_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
         self.variance_epsilon = eps
         self.variance_size_override = None
         self.hidden_size = hidden_size
-        self.weight = nn.Parameter(torch.ones(hidden_size, device="cuda"))
+        # ``params_dtype`` lets a checkpoint whose norms are not the default
+        # dtype say so at construction. Without it every caller has to reach
+        # into ``.weight.data`` afterwards, which is easy to forget and easy to
+        # get wrong on only some of a model's norms.
+        self.weight = nn.Parameter(
+            torch.ones(hidden_size, device="cuda", dtype=params_dtype)
+        )
         self.has_weight = True
 
     def forward(

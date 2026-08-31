@@ -49,10 +49,13 @@ class PiecewiseCapture:
         self._graph.capture_end()
         if not self.graph_pool:
             self.graph_pool.append(self._graph.pool())
-        # Raw stream capture records kernels but does not execute them. Replay
-        # the just-closed segment once to initialize its graph-owned outputs;
-        # eager boundaries use persistent placeholder buffers during capture.
-        self._graph.replay()
+        # Do not replay during capture. TP graph segments may contain the
+        # repository's registered custom all-reduce, whose cross-rank graph
+        # buffers are exchanged only after the outer capture context closes.
+        # Replaying here dereferences unregistered peer pointers and can
+        # segfault. Adjacent segments are connected through persistent
+        # placeholder/boundary buffers, so their values need not be initialized
+        # while kernels are merely being recorded.
         self.segments.append(self._graph.replay)
         self.num_graphs += 1
         self._graph = None

@@ -5,6 +5,79 @@ import torch
 from gllm import _custom_ops as ops
 
 
+def deepseek_v4_topk(
+    router_logits: torch.Tensor,
+    topk: int,
+    *,
+    renormalize: bool = True,
+    routed_scaling_factor: float = 1.0,
+    correction_bias: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor] = None,
+    hash_indices_table: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """DeepSeek-V4 ``sqrtsoftplus`` expert routing.
+
+    V4 selects experts from ``sqrt(softplus(router_logits))``.  Its first
+    ``num_hash_layers`` do not run score-based top-k selection: the checkpoint
+    supplies a token-id-to-expert table (``tid2eid``), but the selected routing
+    weights still come from the same ``sqrtsoftplus`` scores.
+
+    Routing is deliberately evaluated in fp32, matching the checkpoint's
+    reference implementation.  The returned ids use int32, which is the dtype
+    consumed by gLLM's fused-MoE paths.
+    """
+    if router_logits.ndim != 2:
+        raise ValueError(
+            "DeepSeek-V4 router logits must be 2D [tokens, experts], got "
+            f"shape={tuple(router_logits.shape)}."
+        )
+    num_tokens, num_experts = router_logits.shape
+    if not 0 < topk <= num_experts:
+        raise ValueError(
+            f"DeepSeek-V4 topk must be in [1, {num_experts}], got {topk}."
+        )
+
+    scores = torch.sqrt(torch.nn.functional.softplus(router_logits.float()))
+
+    if hash_indices_table is None:
+        selection_scores = scores
+        if correction_bias is not None:
+            if correction_bias.shape != (num_experts,):
+                raise ValueError(
+                    "DeepSeek-V4 correction bias must have shape [experts], got "
+                    f"{tuple(correction_bias.shape)} for {num_experts} experts."
+                )
+            selection_scores = selection_scores + correction_bias.float().unsqueeze(0)
+        # Keep the reference's default sorted=True ordering.  The expert set is
+        # unchanged with sorted=False, but native MoE staging consumes the
+        # ordered (id, weight) pairs and must see the exact checkpoint order.
+        topk_ids = torch.topk(selection_scores, topk, dim=-1).indices
+        topk_weights = scores.gather(1, topk_ids)
+    else:
+        if input_ids is None:
+            raise ValueError("DeepSeek-V4 hash routing requires input_ids.")
+        flat_ids = input_ids.reshape(-1)
+        if flat_ids.numel() != num_tokens:
+            raise ValueError(
+                "DeepSeek-V4 hash routing needs one input id per router row: "
+                f"got {flat_ids.numel()} ids for {num_tokens} rows."
+            )
+        if hash_indices_table.ndim != 2 or hash_indices_table.shape[1] != topk:
+            raise ValueError(
+                "DeepSeek-V4 tid2eid must have shape [vocab_size, topk], got "
+                f"{tuple(hash_indices_table.shape)} for topk={topk}."
+            )
+        topk_ids = hash_indices_table[flat_ids].to(torch.int64)
+        topk_weights = scores.gather(1, topk_ids)
+
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if routed_scaling_factor != 1.0:
+        topk_weights = topk_weights * routed_scaling_factor
+
+    return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
