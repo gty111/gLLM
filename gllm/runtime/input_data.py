@@ -54,9 +54,13 @@ class InputData:
         self.page_size = memory_manager.page_size
         self.max_num_block = (max_seq_length + self.page_size - 1) // self.page_size
         self.use_mla = memory_manager.use_mla
-        # Hybrid models (Qwen3.5 GDN / Mamba) expose a per-request SSM state
-        # slot in addition to their KV pages. ``use_ssm_cache`` mirrors how
-        # ``use_mla`` gates the alternate KV layout above.
+        # Some models carry a per-request recurrent state alongside their KV
+        # pages: a hybrid (Qwen3.5 GDN / Mamba) conv+temporal state, or
+        # DeepSeek-V4's learned KV-compressor windows. ``use_recurrent_state``
+        # gates the per-seq slot buffer both families need; ``use_ssm_cache``
+        # additionally gates the GDN-only snapshot / MTP-block-table buffers.
+        # Both mirror how ``use_mla`` gates the alternate KV layout above.
+        self.use_recurrent_state = memory_manager.use_recurrent_state
         self.use_ssm_cache = memory_manager.use_ssm_cache
         self.memory_manager: MemoryManager = memory_manager
         self.use_buffer = use_buffer
@@ -98,16 +102,19 @@ class InputData:
                 max_running_seqs + 1, dtype=torch.int32, device=device
             )
 
-            if self.use_ssm_cache:
-                # Per-seq SSM working slot id, indexed by the row in the
-                # batch. The GDN kernels read this as their ``cache_indices``
-                # argument. Slot 0 is the CUDA-graph dummy slot, so padded
+            if self.use_recurrent_state:
+                # Per-seq recurrent working-slot id, indexed by the row in the
+                # batch. The GDN kernels read it as their ``cache_indices``
+                # argument; DeepSeek-V4 gathers/stores its compressor windows
+                # with it. Slot 0 is the CUDA-graph dummy slot, so padded
                 # decode rows go there harmlessly.
-                self.ssm_state_slot_per_seq = torch.zeros(
+                self.recurrent_state_slot_per_seq = torch.zeros(
                     max_running_seqs, dtype=torch.int32, device=device
                 )
+
+            if self.use_ssm_cache:
                 # 1 for sequences whose prefix-state already lives in
-                # ``ssm_state[ssm_state_slot_per_seq[i]]`` (either chunked-
+                # ``ssm_state[recurrent_state_slot_per_seq[i]]`` (either chunked-
                 # prefill continuation or prefix-cache hit). Passed to the
                 # conv1d / chunk-GDN kernels as ``has_initial_state``.
                 self.has_initial_state_per_seq = torch.zeros(
@@ -242,19 +249,33 @@ class InputData:
         self.max_seq_len, self.seq_lens_cpu = self._cal_seq_lens(seqs)
         self.max_query_len, self.query_start_loc_cpu = self._cal_query_start_loc(seqs)
 
+        if self.use_recurrent_state:
+            self._cal_recurrent_state_metadata(seqs)
+
         if self.use_ssm_cache:
             self._cal_ssm_metadata(seqs)
 
         if self.use_mla:
             self._cal_mla_metadata(seqs)
 
-    def _cal_ssm_metadata(self, seqs: List[GenerationSequence]):
-        """Build per-seq SSM slot id + initial-state flag + snapshot target.
+    def _cal_recurrent_state_metadata(self, seqs: List[GenerationSequence]):
+        """Build the per-seq recurrent working-slot ids for this batch.
 
-        * ``ssm_state_slot_per_seq[i]`` = ``seqs[i].ssm_state_slot`` (or 0 = the
-          dummy slot if the seq somehow has no slot yet, which should never
-          happen because the scheduler allocates one before this method is
-          called).
+        ``recurrent_state_slot_per_seq[i]`` = ``seqs[i].recurrent_state_slot``,
+        or 0 (the dummy slot) if the seq somehow has none, which should never
+        happen because the scheduler allocates one before this method is
+        called. Shared by GDN/Mamba and DeepSeek-V4.
+        """
+        slots = np.asarray(
+            [seq.recurrent_state_slot or 0 for seq in seqs], dtype=np.int32
+        )
+        self.recurrent_state_slot_per_seq_cpu = torch.as_tensor(
+            slots, device="cpu"
+        ).pin_memory()
+
+    def _cal_ssm_metadata(self, seqs: List[GenerationSequence]):
+        """Build the GDN-only initial-state flag + snapshot target.
+
         * ``has_initial_state_per_seq[i]`` = True when ``computed_token_num >
           0``. This covers both chunked-prefill continuation and prefix-cache
           hits where ``PrefixMemoryManager`` already copied the snapshot back
@@ -267,7 +288,6 @@ class InputData:
           page (i.e. enable_prefix_caching=True + the page is cacheable).
         """
         bs = len(seqs)
-        slots = np.empty(bs, dtype=np.int32)
         has_init = np.empty(bs, dtype=np.bool_)
         snap_targets = np.full(bs, -1, dtype=np.int32)
         snapshot_candidates = []
@@ -282,7 +302,6 @@ class InputData:
         page_size = self.memory_manager.page_size
 
         for i, seq in enumerate(seqs):
-            slots[i] = seq.ssm_state_slot if seq.ssm_state_slot is not None else 0
             has_init[i] = seq.computed_token_num > 0
             # Snapshot timing: prefill chunk landing on a page boundary. The
             # state block is reserved HERE, lazily, and only for boundaries on
@@ -319,9 +338,6 @@ class InputData:
                     snap_targets[i] = snap_slot
                     segment.page2ssm_snapshot_valid[page_num] = True
 
-        self.ssm_state_slot_per_seq_cpu = torch.as_tensor(
-            slots, device="cpu"
-        ).pin_memory()
         self.has_initial_state_per_seq_cpu = torch.as_tensor(
             has_init, device="cpu"
         ).pin_memory()
@@ -343,7 +359,7 @@ class InputData:
         # ``ssm_block_table_2d[i]`` = the seq's ``1+k`` state block ids; the GDN
         # verify kernel writes each verify token's post-state to its column and
         # reads the resume state from column ``num_accepted-1``. Non-MTP runs
-        # leave these ``None`` and keep the scalar ``ssm_state_slot_per_seq``.
+        # leave these ``None`` and keep the scalar ``recurrent_state_slot_per_seq``.
         bt0 = next((s.ssm_block_table for s in seqs if s.ssm_block_table), None)
         if bt0 is not None:
             width = len(bt0)
@@ -356,7 +372,7 @@ class InputData:
                 else:
                     # Shouldn't happen in a homogeneous MTP batch; fall back to
                     # the scalar slot in column 0 so the kernel still resolves.
-                    bt2d[i, 0] = seq.ssm_state_slot or 0
+                    bt2d[i, 0] = seq.recurrent_state_slot or 0
             self.ssm_block_table_2d_cpu = torch.as_tensor(
                 bt2d, device="cpu"
             ).pin_memory()
@@ -405,11 +421,14 @@ class InputData:
             self.query_start_loc_cpu, non_blocking=True
         )
 
-        if self.use_ssm_cache:
-            n_seqs = self.ssm_state_slot_per_seq_cpu.shape[0]
-            self.ssm_state_slot_per_seq[:n_seqs].copy_(
-                self.ssm_state_slot_per_seq_cpu, non_blocking=True
+        if self.use_recurrent_state:
+            n_seqs = self.recurrent_state_slot_per_seq_cpu.shape[0]
+            self.recurrent_state_slot_per_seq[:n_seqs].copy_(
+                self.recurrent_state_slot_per_seq_cpu, non_blocking=True
             )
+
+        if self.use_ssm_cache:
+            n_seqs = self.has_initial_state_per_seq_cpu.shape[0]
             self.has_initial_state_per_seq[:n_seqs].copy_(
                 self.has_initial_state_per_seq_cpu, non_blocking=True
             )
@@ -482,7 +501,7 @@ class InputData:
         dst_idx = torch.empty_like(src_idx, pin_memory=True)
         if count:
             src_idx.copy_(
-                self.ssm_state_slot_per_seq_cpu.index_select(0, valid_rows)
+                self.recurrent_state_slot_per_seq_cpu.index_select(0, valid_rows)
             )
             dst_idx.copy_(targets.index_select(0, valid_rows))
         self.ssm_snapshot_src_idx_cpu = src_idx
@@ -528,7 +547,12 @@ class InputData:
         qlen = plan.query_lens[0]
         if any(width != qlen for width in plan.query_lens[1:]):
             raise ValueError("GPU shape projection requires uniform query lengths")
-        key = (num_rows, qlen, self.use_ssm_cache)
+        key = (
+            num_rows,
+            qlen,
+            self.use_recurrent_state,
+            self.use_ssm_cache,
+        )
         cache = getattr(self, "_gpu_shape_cache", None)
         if cache is None:
             cache = self._gpu_shape_cache = {}
@@ -547,8 +571,11 @@ class InputData:
                 "seq_lens_cpu": _e(num_rows, dtype=torch.int32),
                 "query_start_loc_cpu": _e(num_rows + 1, dtype=torch.int32),
             }
+            if self.use_recurrent_state:
+                shapes["recurrent_state_slot_per_seq_cpu"] = _e(
+                    num_rows, dtype=torch.int32
+                )
             if self.use_ssm_cache:
-                shapes["ssm_state_slot_per_seq_cpu"] = _e(num_rows, dtype=torch.int32)
                 shapes["has_initial_state_per_seq_cpu"] = _e(num_rows, dtype=torch.bool)
                 # GPU-uniform preparation never creates prefix-cache
                 # snapshots: gpu_prep fills the matching device buffer with
@@ -653,8 +680,8 @@ class InputData:
         "num_decode_tokens",
         "num_prefills",
     )
+    _PREBUILT_RECURRENT_ATTRS = ("recurrent_state_slot_per_seq_cpu",)
     _PREBUILT_SSM_ATTRS = (
-        "ssm_state_slot_per_seq_cpu",
         "has_initial_state_per_seq_cpu",
         "ssm_snapshot_write_slot_per_seq_cpu",
         "ssm_snapshot_src_idx_cpu",
@@ -694,6 +721,10 @@ class InputData:
     def _copy_prebuilt_cpu_metadata(self, input_data):
         for attr in self._PREBUILT_COMMON_ATTRS:
             setattr(self, attr, getattr(input_data, attr, None))
+
+        if self.use_recurrent_state:
+            for attr in self._PREBUILT_RECURRENT_ATTRS:
+                setattr(self, attr, getattr(input_data, attr, None))
 
         if self.use_ssm_cache:
             for attr in self._PREBUILT_SSM_ATTRS:
@@ -801,12 +832,17 @@ class InputData:
         view._cpu_view = self.query_start_loc_cpu
         return view
 
-    def get_ssm_state_slot_per_seq(self):
-        """Per-seq SSM working-slot ids (int32). Use as ``cache_indices``
-        for the conv1d/GDN kernels. Raises ``AttributeError`` if the model
-        does not use the SSM cache (programmer error: a layer should not
-        call this on a non-hybrid model)."""
-        return self.ssm_state_slot_per_seq[: self.ssm_state_slot_per_seq_cpu.shape[0]]
+    def get_recurrent_state_slot_per_seq(self):
+        """Per-seq recurrent working-slot ids (int32).
+
+        The conv1d/GDN kernels take this as ``cache_indices``; DeepSeek-V4
+        gathers and stores its compressor windows with it. Raises
+        ``AttributeError`` if the model has no per-request recurrent state
+        (programmer error: a layer should not call this on such a model).
+        """
+        return self.recurrent_state_slot_per_seq[
+            : self.recurrent_state_slot_per_seq_cpu.shape[0]
+        ]
 
     def get_has_initial_state_per_seq(self):
         return self.has_initial_state_per_seq[: self.has_initial_state_per_seq_cpu.shape[0]]
@@ -1079,12 +1115,16 @@ class InputData:
             # kernels see a valid (non-zero) sequence length for every row.
             self.decode_seq_lens[len(self.seqs):len(self.seqs) + num_pad].fill_(1)
 
+        if self.use_recurrent_state:
+            # Padded rows point at the dummy slot (slot 0), which no live
+            # request owns, so whatever scratch they write is never read.
+            self.recurrent_state_slot_per_seq[
+                len(self.seqs) : len(self.seqs) + num_pad
+            ].fill_(0)
+
         if self.use_ssm_cache:
-            # Padded rows write into the SSM dummy slot (slot 0) and report
-            # ``has_initial_state=False`` so the GDN kernels treat them as a
-            # fresh prefill that quietly writes scratch into a slot nobody
-            # else reads.
-            self.ssm_state_slot_per_seq[len(self.seqs):len(self.seqs) + num_pad].fill_(0)
+            # Padded rows also report ``has_initial_state=False`` so the GDN
+            # kernels treat them as a fresh prefill.
             self.has_initial_state_per_seq[len(self.seqs):len(self.seqs) + num_pad].fill_(False)
             # Padded rows must never trigger a snapshot copy: -1 = skip.
             self.ssm_snapshot_write_slot_per_seq[

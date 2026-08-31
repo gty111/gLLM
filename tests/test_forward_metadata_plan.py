@@ -68,6 +68,9 @@ def test_uniform_gpu_snapshot_cpu_mirror_matches_device_skip_sentinel():
     ``nonzero`` path once per GDN layer.
     """
     data = InputData.__new__(InputData)
+    # A GDN model has both gates on: every hybrid seq owns a recurrent slot,
+    # and GDN additionally owns the snapshot / MTP-block-table buffers.
+    data.use_recurrent_state = True
     data.use_ssm_cache = True
     data.max_num_block = 8
     plan = ForwardMetadataPlan.uniform_gpu(

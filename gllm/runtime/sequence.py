@@ -85,15 +85,19 @@ class GenerationSequence:
         self.mm_contents = mm_contents
         # used to remove redundant token_ids
         self.to_compute_tokens = None
-        # SSM working arena slot for hybrid (Mamba/GDN) models. ``None`` means
-        # either the model has no linear-attention layers or the scheduler
-        # has not yet allocated a slot for this seq. The slot lives for the
-        # whole lifetime of the request and is reset on preempt/free.
-        self.ssm_state_slot: Optional[int] = None
+        # Arena slot holding this request's recurrent state: a hybrid
+        # (Mamba/GDN) conv+temporal state, or DeepSeek-V4's learned KV-
+        # compressor windows.  Both are mutated in place and must follow the
+        # request across continuous-batching row changes, which is what
+        # separates them from paged attention KV.  ``None`` means either the
+        # model has no such state or the scheduler has not allocated a slot
+        # yet.  The slot lives for the whole request and is reset on
+        # preempt/free.
+        self.recurrent_state_slot: Optional[int] = None
         # Spec-decode block table for hybrid MTP: a fixed ``1+k``
         # list of SSM state block ids (column 0 == rolling/committed state,
         # columns 1..k == verify-step per-token checkpoints). ``None`` for
-        # non-MTP / non-hybrid seqs (those use the scalar ``ssm_state_slot``).
+        # non-MTP / non-hybrid seqs (those use the scalar ``recurrent_state_slot``).
         # ``ssm_num_accepted`` persists the last accepted-token count so the
         # next verify's recurrent kernel resumes from column ``num_accepted-1``
         # (1 = neutral: resume from column 0). See the column protocol in
@@ -182,11 +186,11 @@ class GenerationSequence:
         # recompute catches up. ``raw_prompt_len`` stays untouched.
         self.prompt_len = len(self.token_ids)
         self.page_table = []
-        # SSM state is recurrent, so preempting (= recomputing from scratch)
-        # invalidates whatever was in the working slot. The actual slot is
-        # released by the scheduler via ``MemoryManager.free_ssm_slot`` so
+        # Recurrent state is, well, recurrent: preempting (= recomputing from
+        # scratch) invalidates whatever was in the working slot. The actual slot is
+        # released by the scheduler via ``MemoryManager.free_recurrent_slot`` so
         # that ``SSMSegment.free_block`` can also zero the tensors.
-        self.ssm_state_slot = None
+        self.recurrent_state_slot = None
         self.ssm_block_table = None
         self.ssm_num_accepted = 1
         self._mtp_async_pending = False

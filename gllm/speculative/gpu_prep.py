@@ -272,7 +272,7 @@ class MtpGpuPrep:
                     bt[i, :w] = row
                 else:
                     bt[i, :w] = 0
-                    bt[i, 0] = seq.ssm_state_slot or 0
+                    bt[i, 0] = seq.recurrent_state_slot or 0
             if bucket > nd:
                 bt[nd:bucket, :w] = 0
 
@@ -372,7 +372,7 @@ class MtpGpuPrep:
             return
         bucket = self.bucket
         bt = self._d_bt[:bucket]
-        input_data.ssm_state_slot_per_seq[:bucket].copy_(bt[:, 0])
+        input_data.recurrent_state_slot_per_seq[:bucket].copy_(bt[:, 0])
         input_data.has_initial_state_per_seq[:bucket].fill_(True)
         input_data.ssm_snapshot_write_slot_per_seq[:bucket].fill_(-1)
         if self.bt_width and hasattr(input_data, "ssm_block_table_2d"):
@@ -478,7 +478,7 @@ class MtpGpuPrep:
             tok[:, 1:].copy_(drafts_gpu[:nd, : qlen - 1])
 
         if input_data.use_ssm_cache:
-            input_data.ssm_state_slot_per_seq[:nd].copy_(self._d_bt[:nd, 0])
+            input_data.recurrent_state_slot_per_seq[:nd].copy_(self._d_bt[:nd, 0])
             input_data.has_initial_state_per_seq[:nd].fill_(True)
             input_data.ssm_snapshot_write_slot_per_seq[:nd].fill_(-1)
             if self.bt_width and hasattr(input_data, "ssm_block_table_2d"):
