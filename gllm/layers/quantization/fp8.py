@@ -72,6 +72,93 @@ def deepgemm_available() -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def deepgemm_packed_available() -> bool:
+    """Whether DeepGEMM's Blackwell packed-UE8M0 block-FP8 GEMM can be used.
+
+    On SM100/SM120 ``fp8_gemm_nt`` dispatches to the FP8/FP4 ``gemm_1d1d``
+    kernel, which wants *per-row* scales for both operands, packed four to an
+    int32 in a TMA-aligned mn-major layout. Handed the checkpoint's raw
+    ``(N/128, K/128)`` FP32 block scales it still runs, but re-lays them out on
+    every call -- measured at a flat ~15 us regardless of shape, which is most
+    of the kernel time at decode sizes. Pre-packing the weight scales once and
+    packing the activation scales with DeepGEMM's own kernel makes the same
+    GEMM 2.2-2.6x faster than the Triton fallback (measured on GB200, TP=4
+    DeepSeek-V4 shapes, M=1..32).
+
+    Packing rounds scales to UE8M0, so this path is only taken for
+    ``scale_fmt="ue8m0"`` checkpoints, whose weights are already quantized that
+    way -- there it is the model's native contract, not a precision downgrade.
+    """
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_capability() not in ((10, 0), (12, 0)):
+        return False
+    try:
+        import deep_gemm
+
+        pack = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor
+        a = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+        aq, as_ = per_token_group_quant_fp8(
+            a, 128, column_major_scales=False, round_scale=True
+        )
+        wq = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16).to(
+            torch.float8_e4m3fn
+        )
+        ws = torch.ones(2, 2, device="cuda", dtype=torch.float32)
+        c = torch.empty(4, 256, device="cuda", dtype=torch.bfloat16)
+        deep_gemm.fp8_gemm_nt(
+            (aq, pack(as_)),
+            (wq, pack(ws.repeat_interleave(128, dim=0).contiguous())),
+            c,
+        )
+        torch.cuda.synchronize()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"DeepGEMM packed-UE8M0 backend unavailable, falling back: {e}"
+        )
+        return False
+    return True
+
+
+# Cache the packed form on the scale Parameter: it is derived purely from the
+# loaded weights, so it is built once (during warmup, never under CUDA-graph
+# capture) and reused by every forward.
+_PACKED_SCALE_ATTR = "_deepgemm_packed_scale"
+
+
+def packed_weight_scale(
+    weight_scale: torch.Tensor, N: int, block_n: int
+) -> torch.Tensor:
+    """Expand ``(N/block_n, K/block_k)`` block scales to DeepGEMM's 1d1d form."""
+    cached = getattr(weight_scale, _PACKED_SCALE_ATTR, None)
+    if cached is None:
+        import deep_gemm
+
+        rows = weight_scale.repeat_interleave(block_n, dim=0)[:N].contiguous()
+        cached = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(rows)
+        setattr(weight_scale, _PACKED_SCALE_ATTR, cached)
+    return cached
+
+
+def w8a8_block_fp8_matmul_deepgemm_packed(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs_packed: torch.Tensor,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Block-FP8 ``C = A @ B^T`` via DeepGEMM's Blackwell packed-UE8M0 kernel."""
+    import deep_gemm
+
+    assert output_dtype == torch.bfloat16, "DeepGEMM only outputs bfloat16"
+    N = B.shape[0]
+    C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
+    As_packed = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(As)
+    deep_gemm.fp8_gemm_nt((A, As_packed), (B, Bs_packed), C.view(-1, N))
+    return C
+
+
 def fp8_backend_requires_bucket_warmup(quant_config) -> bool:
     """Whether an FP8 model needs eager per-bucket backend warmup.
 
@@ -82,19 +169,28 @@ def fp8_backend_requires_bucket_warmup(quant_config) -> bool:
         return False
     if quant_config.get("quant_method") != "fp8":
         return False
-    return deepgemm_available() or flashinfer_swapab_available()
+    return (
+        deepgemm_available()
+        or deepgemm_packed_available()
+        or flashinfer_swapab_available()
+    )
 
 
 _deepgemm_logged = False
 
 
-def _log_deepgemm_enabled_once() -> None:
+def _log_deepgemm_enabled_once(packed: bool = False) -> None:
     """Emit the DeepGEMM-enabled info line once, on first real FP8 GEMM use."""
     global _deepgemm_logged
     if not _deepgemm_logged:
         _deepgemm_logged = True
         logger.info(
-            "DeepGEMM FP8 GEMM backend enabled (Hopper block-scale kernels)."
+            "DeepGEMM FP8 GEMM backend enabled "
+            + (
+                "(Blackwell packed-UE8M0 1d1d kernels)."
+                if packed
+                else "(Hopper block-scale kernels)."
+            )
         )
 
 
@@ -254,9 +350,19 @@ def fp8LinearMethod(
             input_2d, block_size[1], column_major_scales=False,
             round_scale=round_scale,
         )
-        if _deepgemm_shape_supported(
-            N, K, block_n, block_k, input.dtype
-        ) and deepgemm_available():
+        shape_ok = _deepgemm_shape_supported(N, K, block_n, block_k, input.dtype)
+        # ``round_scale`` means the activation scales are already UE8M0, so the
+        # packed path costs no extra precision -- see ``deepgemm_packed_available``.
+        if shape_ok and round_scale and deepgemm_packed_available():
+            _log_deepgemm_enabled_once(packed=True)
+            output = w8a8_block_fp8_matmul_deepgemm_packed(
+                q_input,
+                weight,
+                x_scale,
+                packed_weight_scale(weight_scale, N, block_n),
+                input.dtype,
+            )
+        elif shape_ok and deepgemm_available():
             _log_deepgemm_enabled_once()
             output = w8a8_block_fp8_matmul_deepgemm(
                 q_input, weight, x_scale, weight_scale, block_size, input.dtype
@@ -625,6 +731,121 @@ def _per_token_group_quant_fp8(
 
     tl.store(y_q_ptr + cols, y_q, mask=mask)
     tl.store(y_s_ptr, y_s)
+
+
+@triton.jit
+def _per_token_group_fp8_fake_quant_inplace(
+    x_ptr,
+    group_size,
+    groups_per_row,
+    row_stride,
+    eps,
+    fp8_min,
+    fp8_max,
+    BLOCK: tl.constexpr,
+    ROUND_SCALE: tl.constexpr = False,
+):
+    """Quantize and immediately dequantize one logical group in place.
+
+    Keeping the FP8 round trip in one program avoids materializing the FP8
+    tensor and scale tensor when callers only need the QAT-rounded value.
+    ``row_stride`` deliberately supports a prefix slice of a wider tensor,
+    which is the layout used by latent KV caches.
+    """
+    group_id = tl.program_id(0)
+    row = group_id // groups_per_row
+    group_in_row = group_id % groups_per_row
+    base = (
+        row.to(tl.int64) * row_stride
+        + group_in_row.to(tl.int64) * group_size
+    )
+
+    cols = tl.arange(0, BLOCK)
+    mask = cols < group_size
+    x = tl.load(x_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+    absmax = tl.maximum(tl.max(tl.abs(x)), eps)
+    scale = absmax / fp8_max
+    if ROUND_SCALE:
+        scale = tl.exp2(tl.ceil(tl.log2(scale)))
+    quantized = tl.clamp(x / scale, fp8_min, fp8_max).to(tl.float8e4nv)
+    dequantized = quantized.to(tl.float32) * scale
+    tl.store(x_ptr + base + cols, dequantized, mask=mask)
+
+
+def block_fp8_scale_to_float32(scale: torch.Tensor) -> torch.Tensor:
+    """Normalize a checkpoint's block-FP8 scale tensor to FP32.
+
+    Checkpoints store the per-block scale in one of three ways: already FP32,
+    as ``float8_e8m0fnu``, or as raw ``uint8`` E8M0 exponent bytes.  The last
+    form is a bit pattern, not a small integer -- casting it with ``.float()``
+    would silently produce values like 127.0 instead of 1.0 -- so shift it into
+    the FP32 exponent field instead.
+    """
+    if scale.dtype == torch.float8_e8m0fnu:
+        return scale.float()
+    if scale.dtype == torch.uint8:
+        return (scale.to(torch.int32) << 23).view(torch.float32)
+    return scale.float()
+
+
+def per_token_group_fp8_fake_quant_inplace(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    *,
+    round_scale: bool = False,
+) -> torch.Tensor:
+    """Apply an E4M3 per-group fake-quantization round trip in place.
+
+    The result is numerically equivalent to
+    :func:`per_token_group_quant_fp8` followed by FP32 dequantization, but it
+    uses no temporary tensors and a single GPU launch. The last dimension is
+    grouped; compact tensors and prefix slices of compact tensors are accepted.
+    """
+    if not x.is_cuda:
+        raise ValueError("FP8 fake quantization requires a CUDA tensor")
+    if x.dtype is not torch.bfloat16:
+        raise TypeError(f"FP8 fake quantization expects bfloat16, got {x.dtype}")
+    if x.ndim < 2:
+        raise ValueError("FP8 fake quantization expects at least two dimensions")
+    width = x.shape[-1]
+    if width % group_size:
+        raise ValueError(
+            f"last dimension {width} must be divisible by group_size {group_size}"
+        )
+    if x.stride(-1) != 1:
+        raise ValueError("FP8 fake-quantization groups must be contiguous")
+
+    row_stride = x.stride(-2)
+    expected_stride = row_stride
+    for dim in range(x.ndim - 2, 0, -1):
+        expected_stride *= x.shape[dim]
+        if x.stride(dim - 1) != expected_stride:
+            raise ValueError(
+                "FP8 fake quantization requires compact logical rows or a "
+                "prefix slice of compact rows"
+            )
+
+    rows = x.numel() // width
+    groups_per_row = width // group_size
+    if rows == 0:
+        return x
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    block = triton.next_power_of_2(group_size)
+    _per_token_group_fp8_fake_quant_inplace[(rows * groups_per_row,)](
+        x,
+        group_size,
+        groups_per_row,
+        row_stride,
+        eps,
+        finfo.min,
+        finfo.max,
+        BLOCK=block,
+        ROUND_SCALE=round_scale,
+        num_warps=min(max(block // 256, 1), 8),
+        num_stages=1,
+    )
+    return x
 
 
 @triton.jit
