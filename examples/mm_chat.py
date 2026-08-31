@@ -90,7 +90,7 @@ def run_single_image(model: str, client) -> None:
             }
         ],
         model=model,
-        max_tokens=512,
+        max_completion_tokens=512,
     )
 
     result = chat_completion_from_url.choices[0].message.content
@@ -119,7 +119,7 @@ def run_multi_image(model: str, client) -> None:
             }
         ],
         model=model,
-        max_tokens=1024,
+        max_completion_tokens=1024,
     )
 
     result = chat_completion_from_url.choices[0].message.content

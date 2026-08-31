@@ -266,10 +266,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # actually takes effect — otherwise a request without
     # ``max_completion_tokens`` decodes until EOS / model_max_length,
     # which on a broken model produces thousands of garbage tokens.
+    # Pydantic intentionally warns whenever the deprecated attribute is read,
+    # even when the client did not send it.  Read the validated fallback from
+    # the model storage so modern requests do not produce a spurious warning.
     max_output_tokens = (
         request.max_completion_tokens
         if request.max_completion_tokens is not None
-        else request.max_tokens
+        else request.__dict__.get("max_tokens")
     )
     # OpenAI chat logprobs: ``logprobs`` (bool) turns them on, ``top_logprobs``
     # (0-20) is how many alternatives to report per token. Clamp to the OpenAI
@@ -647,20 +650,24 @@ def resolve_tool_parser(name=None):
     # DeepSeek-V3.2's tool-call parser uses the checkpoint's reference decoder
     # for exact-typed argument parsing. Load it in this (API server) process from
     # the model dir; None => parser falls back to a lenient regex.
-    dsv32_encoder = None
+    deepseek_encoder = None
     model_path = getattr(
         getattr(getattr(llm, "model_runner", None), "model_loader", None),
         "model_path",
         None,
     ) or getattr(getattr(llm, "model_runner", None), "model_path", None)
-    if model_path and architecture == "DeepseekV32ForCausalLM":
-        from gllm.tokenizers.deepseek_v32 import load_dsv32_encoder
+    encoder_variant = {
+        "DeepseekV32ForCausalLM": "dsv32",
+        "DeepseekV4ForCausalLM": "dsv4",
+    }.get(architecture)
+    if model_path and encoder_variant is not None:
+        from gllm.tokenizers.deepseek_official import load_deepseek_encoder
 
-        dsv32_encoder = load_dsv32_encoder(model_path)
+        deepseek_encoder = load_deepseek_encoder(model_path, encoder_variant)
     tool_parser = get_tool_parser(
         architecture=architecture,
         name=name,
-        encoder=dsv32_encoder,
+        encoder=deepseek_encoder,
     )
     if name or tool_parser is not None:
         logger.info(
@@ -673,6 +680,9 @@ def resolve_tool_parser(name=None):
 
 
 def main():
+    from gllm.runtime.model_loader import quiet_hub_logging
+
+    quiet_hub_logging()
     # ``llm`` is the module-level handle every route reads; this used to be a
     # plain module-scope assignment under ``if __name__ == "__main__"``.
     global llm

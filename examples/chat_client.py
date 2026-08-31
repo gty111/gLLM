@@ -5,7 +5,15 @@ import re
 from openai import OpenAI
 
 parser = argparse.ArgumentParser(description="Chat client")
-parser.add_argument("--num-tokens", type=int, default=8192)
+parser.add_argument(
+    "--num-tokens",
+    type=int,
+    default=None,
+    help=(
+        "Maximum completion tokens. By default the field is omitted so the "
+        "server can apply its context-aware limit."
+    ),
+)
 parser.add_argument("--port", type=int)
 parser.add_argument(
     "--thinking",
@@ -125,9 +133,10 @@ def stream_reply(msgs):
         messages=msgs,
         model=model,
         stream=True,
-        max_tokens=args.num_tokens,
         extra_body={"chat_template_kwargs": build_chat_template_kwargs(thinking)},
     )
+    if args.num_tokens is not None:
+        kwargs["max_completion_tokens"] = args.num_tokens
     if use_tools:
         kwargs["tools"] = TOOLS
     chat_completion = client.chat.completions.create(**kwargs)

@@ -137,7 +137,7 @@ def build_chat_payload(entry, mode, model, max_tokens, temperature, no_thinking)
     payload = {
         "model": model,
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_tokens,
         "stream": False,
     }
 
