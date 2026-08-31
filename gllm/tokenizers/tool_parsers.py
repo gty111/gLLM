@@ -544,10 +544,11 @@ class KimiToolParser(ToolParser):
 
 
 class DeepSeekToolParser(ToolParser):
-    """DeepSeek-V3.2 DSML tool calls.
+    """DeepSeek-V3.2/V4 DSML tool calls.
 
-    The model emits tool calls as a ``<｜DSML｜function_calls>`` block, each call
-    an ``<｜DSML｜invoke name="fn">`` with typed ``<｜DSML｜parameter>`` children::
+    V3.2 uses a ``<｜DSML｜function_calls>`` outer block while V4 uses
+    ``<｜DSML｜tool_calls>``.  Both contain ``invoke`` elements with typed
+    ``parameter`` children::
 
         <｜DSML｜function_calls>
         <｜DSML｜invoke name="get_weather">
@@ -568,8 +569,7 @@ class DeepSeekToolParser(ToolParser):
     # The model emits the block with the ``｜DSML｜`` special token, but some
     # checkpoints/decodes drop it and produce the plain ``<function_calls>`` form.
     # Detect and parse BOTH: treat the ``｜DSML｜`` prefix as optional everywhere.
-    _BLOCK_START_DSML = f"<{_DSML}function_calls"
-    _BLOCK_START_PLAIN = "<function_calls"
+    _BLOCK_TAGS = ("function_calls", "tool_calls")
     _INVOKE_RE = re.compile(
         r"<(?:｜DSML｜)?invoke\s+name=\"(?P<name>[^\"]+)\">(?P<body>.*?)"
         r"</(?:｜DSML｜)?invoke>",
@@ -586,15 +586,34 @@ class DeepSeekToolParser(ToolParser):
 
     def _block_start(self, full_text: str) -> int:
         """Index of the tool-call block (DSML or plain form), or -1."""
-        for marker in (self._BLOCK_START_DSML, self._BLOCK_START_PLAIN):
-            i = full_text.find(marker)
-            if i != -1:
-                return i
-        return -1
+        positions = [
+            i
+            for tag in self._BLOCK_TAGS
+            for marker in (f"<{self._DSML}{tag}", f"<{tag}")
+            if (i := full_text.find(marker)) != -1
+        ]
+        return min(positions, default=-1)
 
     def content_prefix(self, full_text: str) -> str:
         i = self._block_start(full_text)
-        return full_text if i == -1 else full_text[:i]
+        if i != -1:
+            return full_text[:i]
+
+        # Streaming can split a DSML marker across decoded token chunks. Keep
+        # a trailing prefix such as ``<｜DSML｜tool_c`` buffered until it either
+        # becomes a complete marker or is proven to be ordinary content.
+        markers = tuple(
+            marker
+            for tag in self._BLOCK_TAGS
+            for marker in (f"<{self._DSML}{tag}", f"<{tag}")
+        )
+        withheld = 0
+        for marker in markers:
+            for size in range(min(len(full_text), len(marker) - 1), 0, -1):
+                if full_text.endswith(marker[:size]):
+                    withheld = max(withheld, size)
+                    break
+        return full_text[:-withheld] if withheld else full_text
 
     def _parse_official(self, full_text: str):
         """Use the checkpoint's reference decoder; returns tool_calls or raises.
@@ -608,7 +627,7 @@ class DeepSeekToolParser(ToolParser):
         text = full_text
         if self._DSML not in text:
             # Restore the DSML token the strict decoder expects.
-            for tag in ("function_calls", "invoke", "parameter"):
+            for tag in (*self._BLOCK_TAGS, "invoke", "parameter"):
                 text = text.replace(f"<{tag}", f"<{self._DSML}{tag}")
                 text = text.replace(f"</{tag}", f"</{self._DSML}{tag}")
         text = text if text.endswith(eos) else text + eos
@@ -735,7 +754,10 @@ def get_tool_parser(
             return _qwen_parser_for_arch(architecture)
         if "kimi" in arch:
             return KimiToolParser()
-        if "deepseekv32" in arch or "deepseek_v32" in arch:
+        if any(
+            marker in arch
+            for marker in ("deepseekv32", "deepseek_v32", "deepseekv4", "deepseek_v4")
+        ):
             return DeepSeekToolParser(encoder=encoder)
 
     return None

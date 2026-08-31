@@ -73,7 +73,7 @@ def _all_gather_bytes(
     # freed immediately after the call returns.
     src = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(device)
     gathered = torch.empty(world_size * n, dtype=torch.uint8, device=device)
-    dist.all_gather_into_tensor(gathered, src, group=group)
+    dist.all_gather_single(gathered, src, group=group)
     raw = bytes(gathered.cpu().numpy().tobytes())
     return [raw[i * n : (i + 1) * n] for i in range(world_size)]
 

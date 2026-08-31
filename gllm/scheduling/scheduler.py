@@ -479,10 +479,11 @@ class Scheduler:
         # re-queued after this round (no slot/page allocation, no ordering loss).
         deferred_disagg_seqs: List[GenerationSequence] = []
         prefill_batched_token_nums = 0
-        # Hybrid models (Qwen3.5 GDN) claim working/checkpoint entries from the
-        # shared arena. ``ssm_segment`` is None for plain softmax-attention
-        # models, in which case the slot check below is a no-op.
-        ssm_seg = getattr(self.memory_manager, "ssm_segment", None)
+        # Models with per-request recurrent state (Qwen3.5 GDN, DeepSeek-V4)
+        # claim working/checkpoint entries from the shared arena. ``None`` for
+        # plain softmax-attention models, in which case the slot checks below
+        # are no-ops.
+        recurrent_seg = getattr(self.memory_manager, "recurrent_segment", None)
         # Cap the number of prefill seqs so the *combined* batch
         # (decode + prefill) never exceeds ``max_running_seqs`` rows, which
         # is what the device input buffers (block_table / seq_lens / ...) are
@@ -495,15 +496,15 @@ class Scheduler:
             and (max_seqs is None or len(prefill_batch) < max_seqs)
         ):
             seq = self.seqs_to_prefill.popleft()
-            # A new hybrid request atomically claims its whole per-seq state
-            # allocation (1 entry, or 1+k for MTP) from the shared arena.
-            if ssm_seg is not None and seq.ssm_state_slot is None:
-                # Claim recurrent-state extents before prefix lookup pins KV
-                # slots. Both cache types share one physical arena, so doing
-                # this in the opposite order can consume the last aligned SSM
-                # slots. The arena may reclaim evictable snapshots here; there
-                # is intentionally no fixed SSM reserve or admission watermark.
-                if not self.memory_manager.allocate_ssm_slot(seq):
+            # A new request atomically claims its whole per-seq recurrent-state
+            # allocation (1 entry, or 1+k for hybrid MTP) from the shared
+            # arena.  Claim it before prefix lookup pins KV slots: both cache
+            # types share one physical arena, so the opposite order can consume
+            # the last aligned state slots. The arena may reclaim evictable
+            # snapshots here; there is intentionally no fixed reserve or
+            # admission watermark.
+            if recurrent_seg is not None and seq.recurrent_state_slot is None:
+                if not self.memory_manager.allocate_recurrent_slot(seq):
                     self.seqs_to_prefill.appendleft(seq)
                     break
             if (
@@ -536,17 +537,17 @@ class Scheduler:
                 # Nothing prefillable this round; park and re-queue. No SSM slot
                 # / page allocation so freeing stays simple if it never runs.
                 deferred_disagg_seqs.append(seq)
-                self.memory_manager.free_ssm_slot(seq)
+                self.memory_manager.free_recurrent_slot(seq)
                 continue
             prefill_avail = len(seq) - seq.computed_token_num
             if gate_limit is not None:
                 prefill_avail = min(prefill_avail, gate_limit - seq.computed_token_num)
-            # Hybrid models: every seq needs a per-request SSM working slot
-            # for the whole duration of the request (allocated lazily on
-            # the first schedule, freed when ``model_runner.free(seq)`` is
-            # called from ``process_output`` / ``check_abort_seqs`` /
-            # ``check_preempt``). No-op for non-hybrid models.
-            if not self.memory_manager.allocate_ssm_slot(seq):
+            # Every seq needs its per-request recurrent working slot for the
+            # whole duration of the request (allocated lazily on the first
+            # schedule, freed when ``model_runner.free(seq)`` is called from
+            # ``process_output`` / ``check_abort_seqs`` / ``check_preempt``).
+            # Idempotent: the claim above already covers a fresh request.
+            if not self.memory_manager.allocate_recurrent_slot(seq):
                 self.seqs_to_prefill.appendleft(seq)
                 break
             if prefill_avail <= prefill_token_budget:

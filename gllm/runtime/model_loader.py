@@ -1,11 +1,15 @@
 import glob
 import json
+import logging
 import os
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
+from huggingface_hub.utils import disable_progress_bars
 from logger import logger
 from safetensors import safe_open
 from transformers import AutoConfig, GenerationConfig
@@ -13,6 +17,7 @@ from transformers import AutoConfig, GenerationConfig
 from gllm.models.chatglm import ChatGLMForCausalLM
 from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 from gllm.models.deepseek_v32 import DeepseekV32ForCausalLM
+from gllm.models.deepseek_v4 import DeepseekV4ForCausalLM
 from gllm.models.kimi_k25 import KimiK25ForConditionalGeneration
 from gllm.models.llama import LlamaForCausalLM
 from gllm.models.mixtral import MixtralForCausalLM
@@ -26,6 +31,59 @@ from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from gllm.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from gllm.utils import get_lock
+
+
+def quiet_hub_logging() -> None:
+    """Silence HTTP-transport/cache-discovery chatter from the hub client.
+
+    The repository's root logger is intentionally INFO, but which shard came
+    from which cache is implementation detail rather than serving telemetry.
+    Call this from a process entrypoint before the first ``AutoConfig`` /
+    ``AutoTokenizer`` call. It is deliberately a function: importing a module
+    must not reconfigure logging for whatever process happens to import it.
+    """
+    for name in ("httpx", "httpcore", "huggingface_hub"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    disable_progress_bars()
+
+
+# Weight loading reads tensors in ``named_parameters()`` order, which bears no
+# relation to how they are laid out inside the shards, so every read is a
+# seek. On a cold page cache that made the same 156 GB checkpoint take 207 s
+# where a warm cache took 32 s -- a 6.5x spread decided purely by what the OS
+# happened to still hold. Streaming the shards sequentially first turns those
+# seeks into page-cache hits. The read runs in the background so it overlaps
+# with config parsing and model construction, and each rank takes a disjoint
+# slice so a TP group reads the checkpoint once between them, not once each.
+_PREFETCH_BLOCK_BYTES = 32 << 20
+_PREFETCH_THREADS = 4
+
+
+def _prefetch_shards(paths, rank: int = 0, world_size: int = 1) -> None:
+    """Warm the page cache for this rank's slice of the checkpoint."""
+    mine = sorted(set(paths))[rank::max(1, world_size)]
+    if not mine:
+        return
+
+    def read_one(path: str) -> None:
+        try:
+            with open(path, "rb") as f:
+                while f.read(_PREFETCH_BLOCK_BYTES):
+                    pass
+        except OSError as error:  # a missing/unreadable shard fails later, loudly
+            logger.warning("Checkpoint prefetch skipped %s: %s", path, error)
+
+    def run() -> None:
+        start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=_PREFETCH_THREADS) as pool:
+            list(pool.map(read_one, mine))
+        logger.info(
+            "Prefetched %d checkpoint shards into the page cache in %.1fs",
+            len(mine),
+            time.perf_counter() - start,
+        )
+
+    threading.Thread(target=run, daemon=True, name="ckpt-prefetch").start()
 
 
 class _SafeOpenPool:
@@ -358,6 +416,16 @@ class ModelLoader:
         self.load_config()
         self.load_format = load_format
 
+    def _start_prefetch(self, shard_paths) -> None:
+        """Warm the page cache for the shards this rank will read."""
+        try:
+            from gllm.distributed.parallel_state import get_local_rank, get_tp_size
+
+            rank, world = get_local_rank(), get_tp_size()
+        except Exception:
+            rank, world = 0, 1
+        _prefetch_shards(list(shard_paths), rank=rank, world_size=world)
+
     def load_safetensors(self, path):
         index_path = os.path.join(path, "model.safetensors.index.json")
         if os.path.isfile(index_path):
@@ -381,6 +449,7 @@ class ModelLoader:
                         f"{shard_path!r}"
                     )
                 index[key] = (shard_path, key)
+            self._start_prefetch(shard for shard, _ in index.values())
             self.weights = LazySafetensors(index)
             return True
 
@@ -412,6 +481,7 @@ class ModelLoader:
                     index[k] = (weight_path, k)
         if not index:
             return False
+        self._start_prefetch(shard for shard, _ in index.values())
         self.weights = LazySafetensors(index)
         return True
 
@@ -514,6 +584,7 @@ class ModelLoader:
             "DeepseekV2ForCausalLM",
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
+            "DeepseekV4ForCausalLM",
             "KimiK25ForConditionalGeneration",
         ]
 
@@ -557,6 +628,8 @@ class ModelLoader:
             model_type = DeepseekV2ForCausalLM
         elif self.architecture == "DeepseekV32ForCausalLM":
             model_type = DeepseekV32ForCausalLM
+        elif self.architecture == "DeepseekV4ForCausalLM":
+            model_type = DeepseekV4ForCausalLM
         elif self.architecture == "Qwen2_5_VLForConditionalGeneration":
             model_type = Qwen2_5_VLForConditionalGeneration
         elif self.architecture == "Qwen3VLForConditionalGeneration":

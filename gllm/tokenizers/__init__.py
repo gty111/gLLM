@@ -8,6 +8,7 @@
 """
 
 from gllm.tokenizers.deepseek_v32 import apply_dsv32_chat_template, load_dsv32_encoder
+from gllm.tokenizers.deepseek_v4 import apply_dsv4_chat_template, load_dsv4_encoder
 from gllm.tokenizers.tool_parsers import (
     ToolParser,
     get_tool_parser,
@@ -18,6 +19,8 @@ from gllm.tokenizers.tool_parsers import (
 __all__ = [
     "apply_dsv32_chat_template",
     "load_dsv32_encoder",
+    "apply_dsv4_chat_template",
+    "load_dsv4_encoder",
     "normalize_chat_template_tool_arguments",
     "normalize_chat_template_messages",
     "ToolParser",

@@ -308,7 +308,7 @@ curl -s localhost:8200/v1/completions -H 'Content-Type: application/json' -d '{
 # Chat logprobs
 curl -s localhost:8200/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "<model>", "messages": [{"role": "user", "content": "Say hi"}],
-  "max_tokens": 5, "logprobs": true, "top_logprobs": 2
+  "max_completion_tokens": 5, "logprobs": true, "top_logprobs": 2
 }'
 ```
 

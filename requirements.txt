@@ -20,6 +20,8 @@ av # video
 # Install the +cu130 wheel from https://docs.sglang.ai/whl/cu130/.
 sglang-kernel==0.4.6.post1
 sgl-deep-gemm==0.1.5.post2 # DeepSeek V3.2 DSA FP8 index scoring
+# PyPI's source archive omits csrc; install the complete, reproducible source.
+fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@v1.1.0.post2 # DeepSeek V4 indexer Q/K rotation
 flashinfer-python[cu13]==0.6.17 # Blackwell kernels aligned with the SGLang stack
 flashinfer-cubin==0.6.17 # prebuilt cubins for flashinfer (avoids first-run JIT)
 flashinfer-jit-cache==0.6.17+cu130

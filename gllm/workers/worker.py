@@ -129,6 +129,9 @@ class Worker(TorchProfilerMixin):
         self.init_profiler_state()
 
     def init_logger(self):
+        from gllm.runtime.model_loader import quiet_hub_logging
+
+        quiet_hub_logging()
         tp_ep_log = "TP" if not self.use_ep or self.tp_size == 1 else "TP/EP"
         dp_size = getattr(self, "dp_size", 1)
         dp_rank = getattr(self, "dp_rank", 0)
@@ -497,9 +500,9 @@ class Worker(TorchProfilerMixin):
             return
         for seq in seqs:
             src = getattr(seq, "ssm_restore_src_slot", None)
-            if src is not None and seq.ssm_state_slot is not None:
+            if src is not None and seq.recurrent_state_slot is not None:
                 ssm_segment.copy_state(
-                    "snapshot", src, "working", seq.ssm_state_slot
+                    "snapshot", src, "working", seq.recurrent_state_slot
                 )
 
     def forward_pp(self):

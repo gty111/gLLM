@@ -1,6 +1,6 @@
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -24,6 +24,93 @@ _DSA_FP8_TILE = 128
 # persistent paged FP8 index-K cache in the 132-byte block-contiguous layout
 # ``get_paged_mqa_logits_metadata`` / ``fp8_paged_mqa_logits`` expect (per page:
 # [page_size*128 fp8 bytes][page_size*4 fp32-scale bytes]).
+
+
+@dataclass
+class DeepseekV4KVCacheConfig:
+    """PP-local V4 paged-cache banks sharing the ordinary request page table."""
+
+    compress_ratios: List[int]
+    head_dim: int
+    index_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    dtype: torch.dtype = torch.bfloat16
+    _c4_layers: Dict[int, int] = field(init=False, repr=False)
+    _c128_layers: Dict[int, int] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.compress_ratios = [int(ratio) for ratio in self.compress_ratios]
+        if self.head_dim <= 0 or self.index_head_dim <= 0:
+            raise ValueError((self.head_dim, self.index_head_dim))
+        invalid = [ratio for ratio in self.compress_ratios if ratio not in (0, 4, 128)]
+        if invalid:
+            raise ValueError(f"unsupported V4 compression ratios: {invalid}")
+        self._c4_layers = {
+            layer_id: index
+            for index, layer_id in enumerate(
+                i for i, ratio in enumerate(self.compress_ratios) if ratio == 4
+            )
+        }
+        self._c128_layers = {
+            layer_id: index
+            for index, layer_id in enumerate(
+                i for i, ratio in enumerate(self.compress_ratios) if ratio == 128
+            )
+        }
+
+    @classmethod
+    def from_model_config(
+        cls,
+        config,
+        *,
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
+    ) -> "DeepseekV4KVCacheConfig":
+        ratios = getattr(config, "compress_ratios", None)
+        if ratios is None:
+            rates = getattr(config, "compress_rates", {})
+            ratios = [rates.get(layer_type, 0) for layer_type in config.layer_types]
+        if end_layer is None:
+            end_layer = len(ratios)
+        return cls(
+            compress_ratios=list(ratios[start_layer:end_layer]),
+            head_dim=config.head_dim,
+            index_head_dim=config.index_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+        )
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.compress_ratios)
+
+    @property
+    def num_c4_layers(self) -> int:
+        return len(self._c4_layers)
+
+    @property
+    def num_c128_layers(self) -> int:
+        return len(self._c128_layers)
+
+    def compressed_bank(self, layer_id: int) -> tuple[str, int] | None:
+        if layer_id in self._c4_layers:
+            return "dsv4_c4", self._c4_layers[layer_id]
+        if layer_id in self._c128_layers:
+            return "dsv4_c128", self._c128_layers[layer_id]
+        return None
+
+    @staticmethod
+    def compressed_rows_per_page(page_size: int, ratio: int) -> int:
+        return max(1, (int(page_size) + int(ratio) - 1) // int(ratio))
+
+    @staticmethod
+    def compressed_page_position(
+        compressed_position: int, page_size: int, ratio: int
+    ) -> tuple[int, int]:
+        """Map compressed row ``c`` to its original-token page and bank row."""
+        end_position = (int(compressed_position) + 1) * int(ratio) - 1
+        page_index = end_position // int(page_size)
+        first_in_page = (page_index * int(page_size)) // int(ratio)
+        return page_index, int(compressed_position) - first_in_page
 
 
 @dataclass
@@ -73,7 +160,356 @@ class SSMCacheConfig:
     def temporal_state_shape_per_slot(self):
         return (self.num_v_heads, self.head_v_dim, self.head_k_dim)
 
-class SSMSegment:
+
+@dataclass
+class DeepseekV4StateCacheConfig:
+    """Packed per-request state layout for V4 learned KV compressors.
+
+    V4 has two incompatible recurrent-state shapes: C4 layers keep an
+    overlapping main-compressor window and a second indexer-compressor window,
+    while C128 layers keep one much wider main-compressor window.  Packing all
+    of them into one flat row gives every request one stable arena slot without
+    padding every layer to the largest shape.
+
+    ``compress_ratios`` is PP-local and uses 0 for ordinary sliding-window
+    layers.  The offsets below are therefore also PP-local decoder-layer ids.
+    """
+
+    compress_ratios: List[int]
+    head_dim: int
+    index_head_dim: int = 128
+    dtype: torch.dtype = torch.float32
+    # Sliding-window ring. A window row is readable for exactly ``window_size``
+    # positions, so this is one ring per request rather than one row per token:
+    # the per-token form allocated 32x what could ever be read back at 4K
+    # context and 256x at 32K, and it was 76% of every KV page.
+    window_size: int = 128
+    qk_rope_head_dim: int = 64
+    # The ring holds values the model already rounded through E4M3 (see
+    # ``deepseek_v4.kv_fp8``), so it is stored packed by default. False keeps
+    # plain BF16 rows -- same numbers, 1.75x the bytes.
+    window_fp8: bool = True
+    _main_layouts: Dict[int, Tuple[int, int, Tuple[int, int]]] = field(
+        init=False, repr=False
+    )
+    _index_layouts: Dict[int, Tuple[int, int, Tuple[int, int]]] = field(
+        init=False, repr=False
+    )
+    state_numel: int = field(init=False)
+
+    @classmethod
+    def from_model_config(
+        cls,
+        config,
+        *,
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
+    ) -> "DeepseekV4StateCacheConfig":
+        """Build a PP-local layout from raw or Transformers-normalized config."""
+        ratios = getattr(config, "compress_ratios", None)
+        if ratios is None:
+            rates = getattr(config, "compress_rates", {})
+            ratios = [rates.get(layer_type, 0) for layer_type in config.layer_types]
+        if end_layer is None:
+            end_layer = len(ratios)
+        return cls(
+            compress_ratios=list(ratios[start_layer:end_layer]),
+            head_dim=config.head_dim,
+            index_head_dim=config.index_head_dim,
+            window_size=int(
+                getattr(config, "window_size", None)
+                or getattr(config, "sliding_window", 128)
+            ),
+            qk_rope_head_dim=config.qk_rope_head_dim,
+        )
+
+    def __post_init__(self) -> None:
+        from gllm.layers.attention.deepseek_v4.kv_fp8 import supports_packed_layout
+
+        if self.dtype != torch.float32:
+            raise ValueError("DeepSeek-V4 compressor state must be float32")
+        if self.window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {self.window_size}")
+        # Packing needs whole 64-wide NoPE groups. Every real V4 checkpoint
+        # (512 latent / 64 RoPE -> 448 NoPE) qualifies; the synthetic
+        # geometries in unit tests do not, and keep BF16 rows.
+        self.window_fp8 = self.window_fp8 and supports_packed_layout(
+            self.head_dim, self.qk_rope_head_dim
+        )
+        if self.head_dim <= 0 or self.index_head_dim <= 0:
+            raise ValueError((self.head_dim, self.index_head_dim))
+
+        self.compress_ratios = [int(ratio) for ratio in self.compress_ratios]
+        self._main_layouts = {}
+        self._index_layouts = {}
+        offset = 0
+        for layer_id, ratio in enumerate(self.compress_ratios):
+            if ratio not in (0, 4, 128):
+                raise ValueError(
+                    f"unsupported V4 compression ratio {ratio} at layer {layer_id}"
+                )
+            if ratio == 0:
+                continue
+            coefficient = 2 if ratio == 4 else 1
+            shape = (coefficient * ratio, coefficient * self.head_dim)
+            end = offset + shape[0] * shape[1]
+            self._main_layouts[layer_id] = (offset, end, shape)
+            offset = end
+            if ratio == 4:
+                index_shape = (
+                    coefficient * ratio,
+                    coefficient * self.index_head_dim,
+                )
+                end = offset + index_shape[0] * index_shape[1]
+                self._index_layouts[layer_id] = (offset, end, index_shape)
+                offset = end
+        if offset == 0:
+            raise ValueError("V4 state cache needs at least one compressed layer")
+        self.state_numel = offset
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.compress_ratios)
+
+    @property
+    def window_row_width(self) -> int:
+        """Elements per ring row: packed bytes, or BF16 latent dims."""
+        if not self.window_fp8:
+            return self.head_dim
+        from gllm.layers.attention.deepseek_v4.kv_fp8 import raw_row_bytes
+
+        return raw_row_bytes(self.head_dim, self.qk_rope_head_dim)
+
+    @property
+    def window_row_dtype(self) -> torch.dtype:
+        return torch.uint8 if self.window_fp8 else torch.bfloat16
+
+    def state_layout(
+        self, layer_id: int, *, indexer: bool = False
+    ) -> Tuple[int, int, Tuple[int, int]]:
+        layouts = self._index_layouts if indexer else self._main_layouts
+        try:
+            return layouts[int(layer_id)]
+        except KeyError as exc:
+            kind = "indexer" if indexer else "main"
+            raise ValueError(
+                f"V4 layer {layer_id} has no {kind} compressor state"
+            ) from exc
+
+
+class RecurrentStateSegment:
+    """One arena-backed block of recurrent state per running request.
+
+    Two model families need this and only differ in what a block *contains*:
+    GDN/Mamba keep a conv window plus a temporal state, DeepSeek-V4 keeps the
+    learned KV-compressor windows.  Both want the same lifecycle -- borrow a
+    block on admission, reset it so the borrower starts from a defined state,
+    return it on finish/preempt/abort -- and both want slot 0 reserved as the
+    CUDA-graph padding sentinel that padded rows can point at without aliasing
+    a live request.
+
+    Subclasses own their tensor views and implement :meth:`_reset_block`.
+    """
+
+    cache_arena: "CacheArena"
+    arena_type: str
+    dummy_working_slot: int = 0
+
+    def _reset_block(self, block: int) -> None:
+        raise NotImplementedError
+
+    def _reserve_dummy_slot(self) -> None:
+        """Claim slot 0 as the padding sentinel and put it in a defined state."""
+        dummy = self.cache_arena.allocator.allocate(self.arena_type, slot=0)
+        if dummy != [0]:
+            raise RuntimeError(
+                f"cache arena did not reserve {self.arena_type} frame 0: {dummy}"
+            )
+        self._reset_block(0)
+        self.dummy_working_slot = 0
+
+    def allocate_block(self) -> Optional[int]:
+        blocks = self.cache_arena.allocator.allocate(self.arena_type, 1)
+        if blocks is None:
+            return None
+        block = blocks[0]
+        self._reset_block(block)
+        return block
+
+    def free_block(self, block: Optional[int]) -> None:
+        if block is None or block == self.dummy_working_slot:
+            return
+        # Reset before returning so the next borrower starts from a defined
+        # state without an explicit per-layer "reset" pass.
+        self._reset_block(block)
+        self.cache_arena.allocator.free(self.arena_type, [block])
+
+    def num_free_blocks(self) -> int:
+        return self.cache_arena.allocator.num_available_slots(self.arena_type)
+
+
+class DeepseekV4StateSegment(RecurrentStateSegment):
+    """Request-owned V4 compressor states backed by the shared cache arena."""
+
+    def __init__(
+        self,
+        cfg: DeepseekV4StateCacheConfig,
+        *,
+        state_cache: RegisteredCache,
+    ) -> None:
+        self.cfg = cfg
+        self.cache_arena = state_cache.arena
+        self.arena_type = state_cache.name
+        self.num_blocks = state_cache.num_slots
+        self.kv = state_cache.tensor("compressor_kv")
+        self.score = state_cache.tensor("compressor_score")
+        # [blocks, layers, window_size, row_width]: one sliding-window ring per
+        # request, addressed by ``position % window_size``.
+        self.window = state_cache.tensor("window")
+        expected = (self.num_blocks, cfg.state_numel)
+        if self.kv.shape != expected or self.score.shape != expected:
+            raise ValueError((self.kv.shape, self.score.shape, expected))
+
+        self._reserve_dummy_slot()
+
+    def _reset_block(self, block: int) -> None:
+        self.kv[block].zero_()
+        self.score[block].fill_(-torch.inf)
+        self.window[block].zero_()
+
+    def _window_rows(
+        self, blocks: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Ring row index for each position: ``position % window_size``."""
+        window = self.window
+        return positions.to(device=window.device, dtype=torch.int64).remainder(
+            window.shape[2]
+        )
+
+    def _window_offsets(
+        self, blocks: torch.Tensor, layer_id: int, positions: torch.Tensor
+    ) -> torch.Tensor:
+        """Flat element offsets of ``(block, layer, position % W)`` ring rows.
+
+        The ring shares a block with the compressor states, so it is a strided
+        view rather than a contiguous one; the offsets are built from its own
+        strides.
+        """
+        window = self.window
+        return (
+            blocks.to(device=window.device, dtype=torch.int64) * window.stride(0)
+            + int(layer_id) * window.stride(1)
+            + self._window_rows(blocks, positions) * window.stride(2)
+        )
+
+    def store_window(
+        self,
+        layer_id: int,
+        blocks: torch.Tensor,
+        positions: torch.Tensor,
+        values: torch.Tensor,
+    ) -> None:
+        """Write one KV row per (request, position) into the ring."""
+        cfg = self.cfg
+        values = values.reshape(-1, values.shape[-1])
+        if not cfg.window_fp8:
+            self.window[
+                blocks.to(self.window.device, torch.int64),
+                int(layer_id),
+                self._window_rows(blocks, positions),
+            ] = values
+            return
+        offsets = self._window_offsets(blocks, layer_id, positions)
+        from gllm.layers.attention.deepseek_v4.kv_fp8 import pack_raw_fp8
+
+        pack_raw_fp8(
+            values,
+            self.window,
+            offsets.reshape(-1),
+            rope_dim=cfg.qk_rope_head_dim,
+        )
+
+    def gather_window(
+        self,
+        layer_id: int,
+        blocks: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Read ring rows as BF16, whatever the ring's storage format.
+
+        Both sparse-attention kernels V4 dispatches to take BF16 KV, so a
+        packed ring is dequantized on the way into their workspace; the bytes
+        moved from HBM still drop by 43%.
+        """
+        cfg = self.cfg
+        if not cfg.window_fp8:
+            return self.window[
+                blocks.to(self.window.device, torch.int64),
+                int(layer_id),
+                self._window_rows(blocks, positions),
+            ]
+        offsets = self._window_offsets(blocks, layer_id, positions)
+        from gllm.layers.attention.deepseek_v4.kv_fp8 import gather_raw_fp8
+
+        return gather_raw_fp8(
+            self.window,
+            offsets,
+            head_dim=cfg.head_dim,
+            rope_dim=cfg.qk_rope_head_dim,
+        )
+
+    def state_view(
+        self, block: int, layer_id: int, *, indexer: bool = False
+    ) -> "CompressorState":
+        """Return an in-place state view for one request and one compressor."""
+        from gllm.layers.attention.deepseek_v4.compressor import CompressorState
+
+        start, end, shape = self.cfg.state_layout(layer_id, indexer=indexer)
+        return CompressorState(
+            kv=self.kv[int(block), start:end].view(1, *shape),
+            score=self.score[int(block), start:end].view(1, *shape),
+        )
+
+    def gather_states(
+        self, blocks: torch.Tensor, layer_id: int, *, indexer: bool = False
+    ) -> "CompressorState":
+        """Gather a batch for the pure-PyTorch compressor reference path.
+
+        Advanced indexing creates a batch-contiguous copy; call
+        :meth:`store_states` after decode.  Fused online kernels can instead
+        consume the stable flat arena plus slot ids directly.
+        """
+        from gllm.layers.attention.deepseek_v4.compressor import CompressorState
+
+        start, end, shape = self.cfg.state_layout(layer_id, indexer=indexer)
+        indices = blocks.to(device=self.kv.device, dtype=torch.long)
+        return CompressorState(
+            kv=self.kv[:, start:end].index_select(0, indices).view(-1, *shape),
+            score=self.score[:, start:end]
+            .index_select(0, indices)
+            .view(-1, *shape),
+        )
+
+    def store_states(
+        self,
+        blocks: torch.Tensor,
+        layer_id: int,
+        state: "CompressorState",
+        *,
+        indexer: bool = False,
+    ) -> None:
+        """Commit a gathered compressor state batch back to request slots."""
+        start, end, shape = self.cfg.state_layout(layer_id, indexer=indexer)
+        indices = blocks.to(device=self.kv.device, dtype=torch.long)
+        expected = (indices.numel(), *shape)
+        if state.kv.shape != expected or state.score.shape != expected:
+            raise ValueError((state.kv.shape, state.score.shape, expected))
+        self.kv[:, start:end].index_copy_(0, indices, state.kv.reshape(-1, end - start))
+        self.score[:, start:end].index_copy_(
+            0, indices, state.score.reshape(-1, end - start)
+        )
+
+class SSMSegment(RecurrentStateSegment):
     """GDN/Mamba tensor views and lifecycle over the shared cache arena.
 
     Working state and prefix snapshots register separate allocation types so
@@ -85,6 +521,10 @@ class SSMSegment:
     The segment never allocates storage itself. Both working state and prefix
     snapshots are registered cache layouts over the process-wide arena.
     """
+
+    # Class-level default: ``_reserve_dummy_slot`` resets slot 0 during
+    # ``__init__``, before the instance attribute below is assigned.
+    restore_stream: Optional["torch.cuda.Stream"] = None
 
     def __init__(
         self,
@@ -133,15 +573,9 @@ class SSMSegment:
         ):
             raise ValueError(self.temporal_state.shape)
 
-        dummy = self.cache_arena.allocator.allocate(self.arena_type, slot=0)
-        if dummy != [0]:
-            raise RuntimeError(f"cache arena did not reserve SSM frame 0: {dummy}")
-        self.conv_state[:, 0].zero_()
-        self.temporal_state[:, 0].zero_()
-
         # Dummy slot that padded rows / unused pointers can refer to without
         # aliasing any real state.
-        self.dummy_working_slot: int = 0
+        self._reserve_dummy_slot()
 
         # Optional CUDA stream that ``copy_state`` (the prefix-cache restore)
         # must run on. Under overlap scheduling the snapshot WRITE happens
@@ -161,15 +595,7 @@ class SSMSegment:
     # one block for their rolling state; MTP verify borrows extra transient
     # blocks for per-token checkpoints.
 
-    def allocate_block(self) -> Optional[int]:
-        blocks = self.cache_arena.allocator.allocate(self.arena_type, 1)
-        if blocks is None:
-            return None
-        block = blocks[0]
-        self._zero_block(block)
-        return block
-
-    def _zero_block(self, block: int) -> None:
+    def _reset_block(self, block: int) -> None:
         def _zero():
             self.conv_state[:, block].zero_()
             self.temporal_state[:, block].zero_()
@@ -179,18 +605,6 @@ class SSMSegment:
                 _zero()
         else:
             _zero()
-
-    def free_block(self, block: int) -> None:
-        if block is None or block == self.dummy_working_slot:
-            return
-        # Zero before returning so the next borrower starts from h_0 = 0
-        # without needing an explicit "reset state" pass through every layer.
-        # Stacked layout -> one ``zero_`` per state covers all layers.
-        self._zero_block(block)
-        self.cache_arena.allocator.free(self.arena_type, [block])
-
-    def num_free_blocks(self) -> int:
-        return self.cache_arena.allocator.num_available_slots(self.arena_type)
 
     def allocate_block_table(self, n: int) -> Optional[list]:
         """Borrow ``n`` blocks for a sequence's SSM state block table.
@@ -204,7 +618,7 @@ class SSMSegment:
         if blocks is None:
             return None
         for block in blocks:
-            self._zero_block(block)
+            self._reset_block(block)
         return blocks
 
     def free_block_table(self, blocks) -> None:
@@ -216,7 +630,7 @@ class SSMSegment:
             if blk is not None and int(blk) != self.dummy_working_slot
         ]
         for blk in real_blocks:
-            self._zero_block(blk)
+            self._reset_block(blk)
         self.cache_arena.allocator.free(self.arena_type, real_blocks)
 
     # --- prefix-cache cached-state blocks ------------------------------
@@ -229,13 +643,13 @@ class SSMSegment:
         if blocks is None:
             return None
         block = blocks[0]
-        self._zero_block(block)
+        self._reset_block(block)
         return block
 
     def free_snapshot(self, slot: int) -> None:
         if slot is None or slot == self.dummy_working_slot:
             return
-        self._zero_block(slot)
+        self._reset_block(slot)
         self.cache_arena.allocator.free(self.snapshot_arena_type, [slot])
 
     def num_free_snapshot(self) -> int:
@@ -338,6 +752,7 @@ class Segment:
         index_head_dim: int = 0,
         qk_rope_head_dim: int = 0,
         mla_cache_fp8: bool = False,
+        dsv4_kv_cache_config: Optional[DeepseekV4KVCacheConfig] = None,
     ):
         """``num_layers`` here is the number of layers that *actually consume
         KV pages*. For text-only / non-hybrid models that's the full decoder
@@ -366,7 +781,29 @@ class Segment:
         # bf16 latent cache + dense decode, which is exact for prompts <=
         # index_topk. Every non-DSA model keeps its bf16 latent cache unchanged.
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
-        if not use_mla:
+        self.dsv4_kv_cache_config = dsv4_kv_cache_config
+        if dsv4_kv_cache_config is not None:
+            self.dsv4_compressed_cache = [None] * dsv4_kv_cache_config.num_layers
+            self.dsv4_index_cache = [None] * dsv4_kv_cache_config.num_layers
+            if dsv4_kv_cache_config.num_c4_layers:
+                c4 = cache.tensor("dsv4_c4")
+                index = cache.tensor("dsv4_c4_index")
+                for layer_id, bank_id in dsv4_kv_cache_config._c4_layers.items():
+                    self.dsv4_compressed_cache[layer_id] = c4[:, bank_id]
+                    self.dsv4_index_cache[layer_id] = index[:, bank_id]
+            if dsv4_kv_cache_config.num_c128_layers:
+                c128 = cache.tensor("dsv4_c128")
+                for layer_id, bank_id in dsv4_kv_cache_config._c128_layers.items():
+                    self.dsv4_compressed_cache[layer_id] = c128[:, bank_id]
+            # Layers with no compression have no paged bank at all, so the
+            # device comes from the arena rather than from bank zero.
+            self.dsv4_device = cache.arena.backing.device
+            # Keep generic cache attributes well-defined for callers that
+            # branch on model capability rather than probing attributes.
+            self.kv_cache = self.dsv4_compressed_cache
+            self.index_k_cache = None
+            self.index_k_fp8_cache = None
+        elif not use_mla:
             keys = cache.tensor("key")
             values = cache.tensor("value")
             expected = (
@@ -388,7 +825,7 @@ class Segment:
         # DeepSeek Sparse Attention: parallel indexer key cache (bf16, one
         # single-head index_head_dim vector per token per layer). Only
         # allocated when index_head_dim > 0.
-        if index_head_dim > 0:
+        if index_head_dim > 0 and dsv4_kv_cache_config is None:
             index = cache.tensor("index_key")
             self.index_k_cache = [index[:, layer] for layer in range(num_layers)]
             # DSA FP8 indexer scoring: a parallel paged FP8 index-K cache in the
@@ -419,6 +856,76 @@ class Segment:
     def get_num_free_pages(self):
         return self.id_allocator.get_num_free_ids()
 
+    def _dsv4_flat_slots(
+        self, page_table, compressed_positions, *, ratio: int
+    ) -> torch.Tensor:
+        """Map logical compressed rows to flat ``page * rows_per_page + row``."""
+        if self.dsv4_kv_cache_config is None:
+            raise RuntimeError("DeepSeek-V4 paged cache is not configured")
+        cfg = self.dsv4_kv_cache_config
+        rows = cfg.compressed_rows_per_page(self.page_size, ratio)
+        slots = []
+        for position in compressed_positions:
+            page_index, row = cfg.compressed_page_position(
+                int(position), self.page_size, ratio
+            )
+            slots.append(int(page_table[page_index]) * rows + row)
+        return torch.as_tensor(
+            slots,
+            dtype=torch.long,
+            device=self.dsv4_device,
+        )
+
+
+    def store_dsv4_compressed(
+        self,
+        layer_id: int,
+        page_table,
+        compressed_positions,
+        values: torch.Tensor,
+        *,
+        indexer: bool = False,
+    ) -> None:
+        cfg = self.dsv4_kv_cache_config
+        ratio = cfg.compress_ratios[layer_id]
+        cache = (
+            self.dsv4_index_cache[layer_id]
+            if indexer
+            else self.dsv4_compressed_cache[layer_id]
+        )
+        if cache is None:
+            kind = "index" if indexer else "main"
+            raise ValueError(f"V4 layer {layer_id} has no {kind} compressed cache")
+        slots = self._dsv4_flat_slots(
+            page_table, compressed_positions, ratio=ratio
+        )
+        rows = cfg.compressed_rows_per_page(self.page_size, ratio)
+        cache[slots // rows, slots % rows] = values.reshape(-1, values.shape[-1])
+
+    def gather_dsv4_compressed(
+        self,
+        layer_id: int,
+        page_table,
+        compressed_positions,
+        *,
+        indexer: bool = False,
+    ) -> torch.Tensor:
+        cfg = self.dsv4_kv_cache_config
+        ratio = cfg.compress_ratios[layer_id]
+        cache = (
+            self.dsv4_index_cache[layer_id]
+            if indexer
+            else self.dsv4_compressed_cache[layer_id]
+        )
+        if cache is None:
+            kind = "index" if indexer else "main"
+            raise ValueError(f"V4 layer {layer_id} has no {kind} compressed cache")
+        slots = self._dsv4_flat_slots(
+            page_table, compressed_positions, ratio=ratio
+        )
+        rows = cfg.compressed_rows_per_page(self.page_size, ratio)
+        return cache[slots // rows, slots % rows]
+
     # return percent of used memory
     def get_memory_util(self):
         return round(
@@ -438,6 +945,8 @@ class MemoryManager:
         vocab_size: int,
         use_mla: bool = False,
         ssm_cache_config: Optional[SSMCacheConfig] = None,
+        dsv4_state_cache_config: Optional[DeepseekV4StateCacheConfig] = None,
+        dsv4_kv_cache_config: Optional[DeepseekV4KVCacheConfig] = None,
         max_running_seqs: int = 256,
         index_head_dim: int = 0,
         qk_rope_head_dim: int = 0,
@@ -455,6 +964,9 @@ class MemoryManager:
             kv_head_dim: dimension of one k/v head.
             ssm_cache_config: layout for the recurrent (Mamba/GDN) state
                 cache. ``None`` registers only the attention cache in the arena.
+            dsv4_state_cache_config: packed request-owned state layout for
+                DeepSeek-V4 learned KV compressors.
+            dsv4_kv_cache_config: V4 raw/compressed/index paged-cache banks.
             ssm_snapshot_stride_tokens: token granularity of recurrent-state
                 prefix caching, rounded down to whole KV pages (see
                 ``PrefixSegment.ssm_snapshot_stride``). Smaller = finer restore
@@ -479,6 +991,8 @@ class MemoryManager:
         # for prompts <= index_topk (the sparse top-k would select every key).
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
         self.ssm_cache_config = ssm_cache_config
+        self.dsv4_state_cache_config = dsv4_state_cache_config
+        self.dsv4_kv_cache_config = dsv4_kv_cache_config
         # Draft-chain length (mtp_k); a running seq borrows up to this many
         # transient checkpoint blocks during an MTP verify step (0 = MTP off).
         self.mtp_k = mtp_k
@@ -488,6 +1002,7 @@ class MemoryManager:
         self.ssm_snapshot_stride_tokens = ssm_snapshot_stride_tokens
         # Populated by :meth:`init`; ``None`` when the model is not hybrid.
         self.ssm_segment: Optional[SSMSegment] = None
+        self.dsv4_state_segment: Optional[DeepseekV4StateSegment] = None
         self.cache_arena: Optional[CacheArena] = None
         self.segment: Union[Segment, PrefixSegment] = None
 
@@ -508,7 +1023,27 @@ class MemoryManager:
 
     @property
     def use_ssm_cache(self) -> bool:
+        """True for GDN/Mamba models, which own snapshots and block tables."""
         return self.ssm_cache_config is not None
+
+    @property
+    def recurrent_segment(self) -> Optional[RecurrentStateSegment]:
+        """The per-request recurrent-state pool, whichever family provides it.
+
+        A model is GDN/Mamba *or* DeepSeek-V4, never both, so at most one of
+        these is ever constructed. Everything that only needs the request ->
+        slot lifecycle (the scheduler's admission gate, ``InputData``'s per-seq
+        slot buffer, ``SeqUpdate``) goes through this handle; only code that
+        touches GDN's own tensors reaches for ``ssm_segment``.
+        """
+        return self.ssm_segment or self.dsv4_state_segment
+
+    @property
+    def use_recurrent_state(self) -> bool:
+        return (
+            self.ssm_cache_config is not None
+            or self.dsv4_state_cache_config is not None
+        )
 
     def consume_pending_ssm_restores(self) -> Dict[int, int]:
         """No SSM prefix caching without prefix metadata (base manager)."""
@@ -548,6 +1083,7 @@ class MemoryManager:
             index_head_dim=self.index_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
             mla_cache_fp8=self.mla_cache_fp8,
+            dsv4_kv_cache_config=self.dsv4_kv_cache_config,
         )
 
         if self.ssm_cache_config is not None:
@@ -576,6 +1112,24 @@ class MemoryManager:
         else:
             usable_ssm_slots = None
 
+        if self.dsv4_state_cache_config is not None:
+            state_cache = arena.register_cache(self._dsv4_state_cache_layout())
+            usable_dsv4_slots = max(0, state_cache.num_slots - 1)
+            if usable_dsv4_slots < 1:
+                need = 2 * state_cache.entry_bytes
+                raise RuntimeError(
+                    f"cache arena needs >= {need / (1 << 30):.1f} GB to run "
+                    "one DeepSeek-V4 request, but its total budget is "
+                    f"{backing.numel() / (1 << 30):.1f} GB. Raise "
+                    "--gpu-memory-util or --tp."
+                )
+            self.dsv4_state_segment = DeepseekV4StateSegment(
+                self.dsv4_state_cache_config,
+                state_cache=state_cache,
+            )
+        else:
+            usable_dsv4_slots = None
+
         self.dummy_page = self.segment.allocate() if reserve_dummy_page else None
 
         cache_names = ", ".join(arena.allocator.cache_type_names)
@@ -595,6 +1149,11 @@ class MemoryManager:
                 usable_ssm_slots,
                 1 + self.mtp_k,
             )
+        if usable_dsv4_slots is not None:
+            logger.info(
+                "Shared DeepSeek-V4 compressor-state capacity: %d request slots",
+                usable_dsv4_slots,
+            )
 
         self.kv_cache_dtype = "auto"
         self.k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
@@ -603,7 +1162,42 @@ class MemoryManager:
     def _kv_cache_layout(self) -> CacheLayout:
         """Describe all tensor banks that share one attention-cache page id."""
         tensors = []
-        if not self.use_mla:
+        if self.dsv4_kv_cache_config is not None:
+            cfg = self.dsv4_kv_cache_config
+            if cfg.num_c4_layers:
+                rows = cfg.compressed_rows_per_page(self.page_size, 4)
+                tensors.extend(
+                    (
+                        CacheTensorLayout(
+                            "dsv4_c4",
+                            cfg.dtype,
+                            (cfg.num_c4_layers, rows, cfg.head_dim),
+                        ),
+                        CacheTensorLayout(
+                            "dsv4_c4_index",
+                            cfg.dtype,
+                            (cfg.num_c4_layers, rows, cfg.index_head_dim),
+                        ),
+                    )
+                )
+            if cfg.num_c128_layers:
+                rows = cfg.compressed_rows_per_page(self.page_size, 128)
+                tensors.append(
+                    CacheTensorLayout(
+                        "dsv4_c128",
+                        cfg.dtype,
+                        (cfg.num_c128_layers, rows, cfg.head_dim),
+                    )
+                )
+            if not tensors:
+                # Every layer is pure sliding-window, so nothing is paged: the
+                # window lives in the per-request ring. Pages remain the unit
+                # of admission, so register a minimal bank rather than hand the
+                # arena an empty layout. No real V4 checkpoint lands here.
+                tensors.append(
+                    CacheTensorLayout("dsv4_unused", torch.uint8, (1,))
+                )
+        elif not self.use_mla:
             shape = (
                 self.num_layers,
                 self.page_size,
@@ -646,7 +1240,7 @@ class MemoryManager:
                     )
                 )
 
-        if self.index_head_dim > 0:
+        if self.index_head_dim > 0 and self.dsv4_kv_cache_config is None:
             if self.index_head_dim % _DSA_FP8_TILE:
                 raise ValueError(
                     f"index_head_dim {self.index_head_dim} must be divisible by "
@@ -690,6 +1284,28 @@ class MemoryManager:
                     "temporal_state",
                     cfg.dtype,
                     (cfg.num_layers, *cfg.temporal_state_shape_per_slot()),
+                ),
+            ),
+            prefer_high=True,
+        )
+
+    def _dsv4_state_cache_layout(self) -> CacheLayout:
+        cfg = self.dsv4_state_cache_config
+        if cfg is None:
+            raise RuntimeError("cannot register V4 state cache without its config")
+        return CacheLayout(
+            "dsv4_state",
+            (
+                CacheTensorLayout(
+                    "compressor_kv", cfg.dtype, (cfg.state_numel,)
+                ),
+                CacheTensorLayout(
+                    "compressor_score", cfg.dtype, (cfg.state_numel,)
+                ),
+                CacheTensorLayout(
+                    "window",
+                    cfg.window_row_dtype,
+                    (cfg.num_layers, cfg.window_size, cfg.window_row_width),
                 ),
             ),
             prefer_high=True,
@@ -801,7 +1417,7 @@ class MemoryManager:
 
     def free(self, seq: GenerationSequence):
         self.segment.free_many(seq.page_table)
-        self.free_ssm_slot(seq)
+        self.free_recurrent_slot(seq)
         self.free_rep_slot(seq)
 
     # --- Repetition-penalty mask pool lifecycle ---------------------------
@@ -911,17 +1527,19 @@ class MemoryManager:
         batch_slots_t = async_tensor_h2d(batch_slots, torch.long, "cuda", True)
         return pool.index_select(0, batch_slots_t)
 
-    # --- SSM working slot lifecycle ---------------------------------------
+    # --- recurrent working-slot lifecycle ---------------------------------
     #
-    # These are no-ops for non-hybrid models (``ssm_segment is None``). For
-    # hybrid models the scheduler calls ``allocate_ssm_slot`` on the first
-    # schedule of a sequence (mirroring how KV pages are pre-allocated) and
-    # ``free_ssm_slot`` when the sequence finishes or is aborted/preempted.
+    # No-ops for models without per-request recurrent state
+    # (``recurrent_segment is None``). Otherwise the scheduler calls
+    # ``allocate_recurrent_slot`` on a sequence's first schedule (mirroring how
+    # KV pages are pre-allocated) and ``free_recurrent_slot`` when it finishes
+    # or is aborted/preempted.
 
-    def allocate_ssm_slot(self, seq: GenerationSequence) -> bool:
-        if self.ssm_segment is None:
+    def allocate_recurrent_slot(self, seq: GenerationSequence) -> bool:
+        segment = self.recurrent_segment
+        if segment is None:
             return True
-        if self.mtp_k > 0:
+        if self.ssm_segment is not None and self.mtp_k > 0:
             # MTP on: give the sequence a fixed 1+k block table (column 0 is
             # rolling state; the remaining columns are verify checkpoints).
             if seq.ssm_block_table is not None:
@@ -932,31 +1550,32 @@ class MemoryManager:
             seq.ssm_block_table = bt
             # Column 0 is also the sequence's committed-state slot, shared by
             # ordinary decode and prefix-cache snapshot restore.
-            seq.ssm_state_slot = bt[0]
+            seq.recurrent_state_slot = bt[0]
             seq.ssm_num_accepted = 1
             return True
         else:
-            if seq.ssm_state_slot is not None:
+            if seq.recurrent_state_slot is not None:
                 return True
-            slot = self.ssm_segment.allocate_block()
+            slot = segment.allocate_block()
             if slot is None:
                 return False
-            seq.ssm_state_slot = slot
+            seq.recurrent_state_slot = slot
             return True
 
-    def free_ssm_slot(self, seq: GenerationSequence) -> None:
-        if self.ssm_segment is None:
+    def free_recurrent_slot(self, seq: GenerationSequence) -> None:
+        segment = self.recurrent_segment
+        if segment is None:
             return
         if seq.ssm_block_table is not None:
             self.ssm_segment.free_block_table(seq.ssm_block_table)
             seq.ssm_block_table = None
-            seq.ssm_state_slot = None
+            seq.recurrent_state_slot = None
             seq.ssm_num_accepted = 1
             return
-        if seq.ssm_state_slot is None:
+        if seq.recurrent_state_slot is None:
             return
-        self.ssm_segment.free_block(seq.ssm_state_slot)
-        seq.ssm_state_slot = None
+        segment.free_block(seq.recurrent_state_slot)
+        seq.recurrent_state_slot = None
 
     def get_num_free_pages(self):
         return self.segment.get_num_free_pages()
@@ -1152,6 +1771,17 @@ class PrefixMemoryManager(MemoryManager):
         if seq.computed_token_num == 0:
             return
 
+        if self.dsv4_state_segment is not None:
+            # V4 compressor windows are not yet stored in prefix metadata.
+            # Reusing KV while pretending the rolling compressor state exists
+            # would corrupt every later compressed boundary, so recompute the
+            # prompt from position zero.  The already-pinned KV pages remain a
+            # valid allocation target and are overwritten idempotently.
+            hit_pages = seq.computed_token_num // self.page_size
+            seq.computed_token_num = 0
+            self.num_hit_pages = max(0, self.num_hit_pages - hit_pages)
+            return
+
         is_hybrid = self.ssm_segment is not None
         full_hit = seq.computed_token_num >= len(seq)
         # KNOWN RESIDUAL (MTP): a draft head sharing these pages stores a
@@ -1187,7 +1817,7 @@ class PrefixMemoryManager(MemoryManager):
             boundary_page = seq.page_table[seq.computed_token_num // self.page_size - 1]
             snap_slot = self._valid_snapshot_slot(boundary_page)
             if snap_slot is not None:
-                if not self.allocate_ssm_slot(seq):
+                if not self.allocate_recurrent_slot(seq):
                     # The prefix remains cached, but without a private mutable
                     # state slot this request must wait for arena capacity.
                     hit_pages = seq.computed_token_num // self.page_size
@@ -1195,7 +1825,7 @@ class PrefixMemoryManager(MemoryManager):
                     self.num_hit_pages = max(0, self.num_hit_pages - hit_pages)
                     return
                 self.ssm_segment.copy_state(
-                    "snapshot", snap_slot, "working", seq.ssm_state_slot
+                    "snapshot", snap_slot, "working", seq.recurrent_state_slot
                 )
                 # PP>1: record so the same restore is replayed on every PP
                 # stage (each owns a different GDN-layer slice). Skip entirely

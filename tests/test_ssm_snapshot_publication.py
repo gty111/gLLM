@@ -25,15 +25,19 @@ def test_overlap_snapshot_is_reserved_and_published_at_launch(monkeypatch):
     manager = SimpleNamespace(
         page_size=16,
         use_mla=False,
+        use_recurrent_state=True,
         use_ssm_cache=True,
         segment=segment,
     )
     data = InputData(False, manager, max_seq_length=512)
     seq = GenerationSequence(1, [1] * 256, [])
-    seq.ssm_state_slot = 3
+    seq.recurrent_state_slot = 3
     seq.to_compute_token_num = 256
     seq.page_table = list(range(16))
 
+    # Production order: the shared recurrent-slot array first (the snapshot
+    # source slot is read from it), then GDN's own snapshot metadata.
+    data._cal_recurrent_state_metadata([seq])
     data._cal_ssm_metadata([seq])
 
     # Merely prebuilding an overlap batch must not mutate snapshot ownership or

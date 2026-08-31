@@ -142,7 +142,7 @@ r = c.chat.completions.create(
     messages=[{"role":"user","content":[
         {"type":"text","text":"Describe this image."},
         {"type":"image_url","image_url":{"url":uri}}]}],
-    max_tokens=128, temperature=0.0, extra_body={"top_k":1})
+    max_completion_tokens=128, temperature=0.0, extra_body={"top_k":1})
 print(r.choices[0].message.content)
 EOF
 ```

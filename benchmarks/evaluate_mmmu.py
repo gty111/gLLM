@@ -173,7 +173,7 @@ async def query_one(
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_tokens,
         "temperature": 0.0,
     }
     if no_thinking:
@@ -181,7 +181,7 @@ async def query_one(
         # variable supplied through ``chat_template_kwargs``. Disabling it makes
         # the model answer
         # directly (matching a server launched with thinking off), so the
-        # ``max_tokens`` budget isn't consumed by an unfinished reasoning
+        # ``max_completion_tokens`` budget isn't consumed by unfinished reasoning
         # trace that never reaches the final "Answer: X".
         payload["chat_template_kwargs"] = {"thinking": False}
     start = time.time()

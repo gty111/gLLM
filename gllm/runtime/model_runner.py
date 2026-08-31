@@ -369,9 +369,12 @@ class ModelRunner:
         # (the loaded encoder is a module object and is NOT picklable -- the
         # runner is pickled to spawn TP workers); the encoder itself is
         # lazy-loaded per process inside ``encode`` via a module-level cache.
-        self._use_dsv32_encoder = (
-            getattr(self.model_loader, "architecture", None) == "DeepseekV32ForCausalLM"
-        )
+        architecture = getattr(self.model_loader, "architecture", None)
+        self._deepseek_encoder_variant = {
+            "DeepseekV32ForCausalLM": "dsv32",
+            "DeepseekV4ForCausalLM": "dsv4",
+        }.get(architecture)
+        self._use_dsv32_encoder = self._deepseek_encoder_variant == "dsv32"
         self.maxp = maxp
         self.maxd = maxd
         self.minp = minp
@@ -469,9 +472,20 @@ class ModelRunner:
             or getattr(_text_cfg, "mtp_num_hidden_layers", 0)
             or 0
         )
-        resolved_mtp_enabled = (
-            (_num_nextn >= 1) if mtp_enabled is None else bool(mtp_enabled)
-        )
+        if (
+            mtp_enabled is None
+            and self.model_loader.architecture == "DeepseekV4ForCausalLM"
+        ):
+            # V4's ``mtp.0/1/2`` are a joint noisy-block DSpark model with a
+            # Markov correction and confidence head. They are not compatible
+            # with gLLM's sequential one-token NextN protocol, so auto mode
+            # keeps the verified base model lean. Explicit ``--mtp-enabled on``
+            # still constructs the DSpark numerical/reference module.
+            resolved_mtp_enabled = False
+        else:
+            resolved_mtp_enabled = (
+                (_num_nextn >= 1) if mtp_enabled is None else bool(mtp_enabled)
+            )
         self._mtp_k_cfg = mtp_k
         self._mtp_max_batch_cfg = mtp_max_batch
         self.model_loader.config.mtp_enabled = resolved_mtp_enabled
@@ -560,7 +574,7 @@ class ModelRunner:
         # tighter of the two so users can keep the ``--max-cuda-graph-bs``
         # default without manually matching ``maxd`` / ``maxp``.
         cuda_graph_cap = min(maxd, self.max_num_batched_tokens)
-        if max_cuda_graph_bs > cuda_graph_cap:
+        if not self.disable_cuda_graph and max_cuda_graph_bs > cuda_graph_cap:
             logger.warning(
                 f"max_cuda_graph_bs={max_cuda_graph_bs} exceeds the runtime "
                 f"decode-batch bound min(maxd={maxd}, "
@@ -576,6 +590,16 @@ class ModelRunner:
 
         # max length
         self.model_max_length = self.resolve_model_max_length(model_max_length)
+        # Models size static tables and CUDA-graph-safe static bounds from the
+        # config (RoPE tables, worst-case candidate counts). The serving length
+        # is the *resolved* runtime limit, which is routinely orders of
+        # magnitude below the checkpoint's advertised
+        # ``max_position_embeddings`` -- DeepSeek-V4 advertises 1M. Publish it
+        # on the config so a model never has to guess.
+        self.model_loader.config.model_max_length = self.model_max_length
+        _text_config = getattr(self.model_loader.config, "text_config", None)
+        if _text_config is not None:
+            _text_config.model_max_length = self.model_max_length
 
         # ``InputData``'s per-token buffers are sized ``model_max_length`` (the
         # longest single sequence), but a prefill batch may carry
@@ -768,6 +792,22 @@ class ModelRunner:
     def init(self, mp_load_progress=None):
         self.verify_config()
         self.model = self.model_loader.load_model(mp_load_progress)
+        # Models may opt out of monolithic decode graphs while individual
+        # components are still being made graph-safe.  Keep this capability on
+        # the model rather than architecture-switching in the runner: new model
+        # adapters get the common graph path by default, and an adapter can
+        # remove the opt-out once capture *and real-data replay* are verified.
+        # ``--disable-cuda-graph`` remains the user-facing global override.
+        self._full_cuda_graph_on = bool(
+            not self.disable_cuda_graph
+            and getattr(self.model, "supports_full_cuda_graph", True)
+        )
+        if not self.disable_cuda_graph and not self._full_cuda_graph_on:
+            logger.warning(
+                "%s does not yet support decode FULL CUDA graph replay; "
+                "FULL graphs are disabled (piecewise graphs remain available).",
+                type(self.model).__name__,
+            )
         # MTP speculative decoding: number of draft tokens per step (k). Active
         # only when the model built an MTP head (mtp_enabled + nextn layers).
         self._mtp_k = (
@@ -783,6 +823,12 @@ class ModelRunner:
         # config via ``model.ssm_cache_config``. ``num_layers`` for the KV
         # path must then be the count of *full-attention* layers only.
         ssm_cache_config = getattr(self.model, "ssm_cache_config", None)
+        dsv4_state_cache_config = getattr(
+            self.model, "dsv4_state_cache_config", None
+        )
+        dsv4_kv_cache_config = getattr(
+            self.model, "dsv4_kv_cache_config", None
+        )
         memory_manager_cls = (
             PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         )
@@ -803,6 +849,8 @@ class ModelRunner:
             vocab_size=self.model_loader.vocab_size,
             use_mla=self.model_loader.use_mla,
             ssm_cache_config=ssm_cache_config,
+            dsv4_state_cache_config=dsv4_state_cache_config,
+            dsv4_kv_cache_config=dsv4_kv_cache_config,
             max_running_seqs=self.max_running_seqs,
             # DeepSeek Sparse Attention (V3.2): non-zero => allocate a parallel
             # paged indexer key cache. 0 for every other model.
@@ -943,7 +991,11 @@ class ModelRunner:
         self._piecewise_generic_on = (
             self._piecewise_cuda_graph_on and self._piecewise_cuda_graph_cfg is True
         )
-        if piecewise_requested and not piecewise_model_supported:
+        if (
+            piecewise_requested
+            and not self.disable_cuda_graph
+            and not piecewise_model_supported
+        ):
             logger.warning(
                 "Piecewise CUDA graph requested, but model %s declares no "
                 "dynamic Attention/SSM boundaries; using eager prefill/mixed "
@@ -1078,9 +1130,9 @@ class ModelRunner:
         self.profile_run()
         # Init KV cache at last; only reserve the dummy page when CUDA graphs
         # are actually enabled so we don't waste memory otherwise.
-        self.memory_manager.init(reserve_dummy_page=not self.disable_cuda_graph)
+        self.memory_manager.init(reserve_dummy_page=self._full_cuda_graph_on)
 
-        if not self.disable_cuda_graph:
+        if self._full_cuda_graph_on or self._piecewise_runner is not None:
             self.capture_graph()
 
     def encode(
@@ -1117,18 +1169,24 @@ class ModelRunner:
             for message in messages:
                 if isinstance(message, dict) and message.get("content") is None:
                     message["content"] = ""
-            dsv32_encoder = None
-            if self._use_dsv32_encoder:
-                from gllm.tokenizers.deepseek_v32 import load_dsv32_encoder
+            deepseek_encoder = None
+            if self._deepseek_encoder_variant is not None:
+                from gllm.tokenizers.deepseek_official import (
+                    load_deepseek_encoder,
+                )
 
-                dsv32_encoder = load_dsv32_encoder(self.model_path)
-            if dsv32_encoder is not None and (not self.use_mm or not has_mm):
-                # DeepSeek-V3.2: render with the model's official encoder
+                deepseek_encoder = load_deepseek_encoder(
+                    self.model_path, self._deepseek_encoder_variant
+                )
+            if deepseek_encoder is not None and (not self.use_mm or not has_mm):
+                # DeepSeek-V3.2/V4: render with the checkpoint's official encoder
                 # (reference DSML format) instead of a Jinja chat template.
-                from gllm.tokenizers.deepseek_v32 import apply_dsv32_chat_template
+                from gllm.tokenizers.deepseek_official import (
+                    apply_deepseek_chat_template,
+                )
 
-                out = apply_dsv32_chat_template(
-                    dsv32_encoder,
+                out = apply_deepseek_chat_template(
+                    deepseek_encoder,
                     messages,
                     self.tokenizer,
                     tokenize=True,
@@ -2230,8 +2288,8 @@ class ModelRunner:
                 stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 self._cuda_graph_capture_stream = stream
 
-        iterator = self.capture_sizes
-        if get_local_rank() == 0:
+        iterator = self.capture_sizes if self._full_cuda_graph_on else []
+        if get_local_rank() == 0 and self._full_cuda_graph_on:
             logger.info(
                 f"Capturing decode full CUDA graphs for bucket sizes: {list(reversed(self.capture_sizes))}"
             )
@@ -2284,7 +2342,7 @@ class ModelRunner:
                 set_dp_forward_counts([size] * dp_size)
 
         try:
-            if warmup_per_bucket:
+            if self._full_cuda_graph_on and warmup_per_bucket:
                 for size in self.capture_sizes:
                     seqs = self.create_dummy_seqs(size)
                     self.input_data.cal_and_set_input(seqs=seqs)
@@ -2298,20 +2356,21 @@ class ModelRunner:
 
             capture_ctx = car.capture() if car is not None else _nullcontext()
             with capture_ctx:
-                for size in iterator:
-                    seqs = self.create_dummy_seqs(size)
-                    self.input_data.cal_and_set_input(seqs=seqs)
-                    if self.uses_mrope:
-                        self.input_data.set_mrope_position(
-                            torch.zeros((3, size), device="cpu")
-                        )
-                    _set_dp_counts(size)
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(
-                        cuda_graph=g, pool=memory_pool, stream=stream
-                    ):
-                        self.forward()
-                    self.size_to_graph[size] = g
+                if self._full_cuda_graph_on:
+                    for size in iterator:
+                        seqs = self.create_dummy_seqs(size)
+                        self.input_data.cal_and_set_input(seqs=seqs)
+                        if self.uses_mrope:
+                            self.input_data.set_mrope_position(
+                                torch.zeros((3, size), device="cpu")
+                            )
+                        _set_dp_counts(size)
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(
+                            cuda_graph=g, pool=memory_pool, stream=stream
+                        ):
+                            self.forward()
+                        self.size_to_graph[size] = g
                 # MTP: capture the draft-step graph per bucket on the same
                 # stream/pool (inside the custom-AR capture context) so replay in
                 # ``_draft_chain_graph`` agrees on stream + IPC handles.
@@ -2370,7 +2429,7 @@ class ModelRunner:
                 seq.computed_token_num = 0
                 seq.to_compute_token_num = bucket
                 self.memory_manager.pre_allocate_page([seq], cacheable=False)
-                self.memory_manager.allocate_ssm_slot(seq)
+                self.memory_manager.allocate_recurrent_slot(seq)
                 try:
                     # Dynamic Attention/SSM boundaries are not executed while
                     # capturing, so graph-resident regions only need a correctly
@@ -2387,6 +2446,7 @@ class ModelRunner:
                     self.memory_manager.free(seq)
                     self.embedding_cache.pop(seq_id, None)
                     self.disagg_embeds.pop(seq_id, None)
+
         if stream is not None:
             stream.synchronize()
         else:
@@ -2556,7 +2616,7 @@ class ModelRunner:
         ``>= max_tokens``, or ``None`` when graphs are disabled / the batch is
         larger than any captured bucket (caller then runs eager).
         """
-        if self.disable_cuda_graph:
+        if not self._full_cuda_graph_on:
             return None
         padded_size = None
         for bucket in self.capture_sizes:
@@ -3587,8 +3647,11 @@ class ModelRunner:
             s._mtp_verify = True
             if self.memory_manager.ssm_segment is not None and self._mtp_k > 0:
                 s.ssm_block_table = [0] * k1
-                s.ssm_state_slot = 0
                 s.ssm_num_accepted = 1
+            if self.memory_manager.recurrent_segment is not None:
+                # The dummy row borrows the padding slot, which no live request
+                # owns.
+                s.recurrent_state_slot = 0
             # Seed a minimal embedding-cache stub so the VL mrope decode branch
             # (``mm_prepare_inputs``) finds a position delta for this dummy --
             # but ONLY if this id isn't already a live entry (never clobber).
@@ -4820,7 +4883,7 @@ class ModelRunner:
         # physical block holding the committed state becomes column 0, and the
         # old column-0 block moves to column ``na`` where it's overwritten as
         # scratch by the next verify. O(1) per seq, zero data movement. The next
-        # step rebuilds ``ssm_block_table_2d`` / ``ssm_state_slot`` from the
+        # step rebuilds ``ssm_block_table_2d`` / ``recurrent_state_slot`` from the
         # (now-permuted) list, so decode/snapshot read the committed state from
         # column 0 as before. na==0 -> committed state already at column 0.
         if _has_gdn:
@@ -4831,7 +4894,7 @@ class ModelRunner:
                     bt[0], bt[na] = bt[na], bt[0]
                     # Keep the scalar slot mirror consistent with column 0 (read
                     # by the plain decode path + prefix-cache snapshot capture).
-                    decode_seqs[i].ssm_state_slot = bt[0]
+                    decode_seqs[i].recurrent_state_slot = bt[0]
                 # Reset the persisted resume column: committed state is now at
                 # column 0, so next step's num_accepted is neutral (1).
                 decode_seqs[i].ssm_num_accepted = 1
@@ -4954,7 +5017,7 @@ class ModelRunner:
                     if na > 0:
                         bt = seq.ssm_block_table
                         bt[0], bt[na] = bt[na], bt[0]
-                        seq.ssm_state_slot = bt[0]
+                        seq.recurrent_state_slot = bt[0]
                     seq.ssm_num_accepted = 1
             # The GPU state used the pre-materialization block-table ordering.
             # Invalidate it so a later async run starts from the CPU column-0
@@ -5039,7 +5102,8 @@ class ModelRunner:
                 # After replay, use only the real-token slice for logits.
                 num_cal_tokens = num_real_tokens
             else:
-                self.forward()
+                if not self._run_generic_piecewise_forward(num_cal_tokens):
+                    self.forward()
         else:
             if not self._run_generic_piecewise_forward(num_cal_tokens):
                 self.forward()
@@ -5399,7 +5463,8 @@ class OverlapModelRunner(ModelRunner):
                 num_cal_tokens = self.input_data.pad_for_cuda_graph(padded_size)
                 self.size_to_graph[padded_size].replay()
             else:
-                self.forward()
+                if not self._run_generic_piecewise_forward(num_cal_tokens):
+                    self.forward()
         else:
             if not self._run_generic_piecewise_forward(num_cal_tokens):
                 self.forward()
