@@ -131,12 +131,30 @@ async def chat_completion_stream_generator(
             obfuscation=secrets.token_urlsafe(8) if include_obfuscation else None,
         )
 
-    # The first OpenAI chat stream delta establishes the assistant role.
-    role_choice = ChatCompletionResponseStreamChoice(
-        index=0, delta=DeltaMessage(role="assistant")
-    )
-    role_chunk = make_chunk([role_choice])
-    yield f"data: {role_chunk.model_dump_json(exclude_none=True)}\n\n"
+    # The first OpenAI chat stream delta establishes the assistant role. It is
+    # emitted lazily, immediately before whatever chunk actually leaves first.
+    #
+    # Sending it at admission instead -- before the engine has produced
+    # anything -- makes every standard client's TTFT measure queue-admission
+    # latency rather than time to first token. On a 1024-token prompt that read
+    # 37.7 ms against a real first token at 634.5 ms, so benchmark TTFT was
+    # understated ~17x and the prefill time it hid was amortized into TPOT.
+    role_pending = True
+
+    def role_event() -> str:
+        """The role event, once, or ``None`` if it has already been sent."""
+        nonlocal role_pending
+        if not role_pending:
+            return None
+        role_pending = False
+        chunk = make_chunk(
+            [
+                ChatCompletionResponseStreamChoice(
+                    index=0, delta=DeltaMessage(role="assistant")
+                )
+            ]
+        )
+        return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     async for item in stream:
         text = item.text
@@ -172,6 +190,9 @@ async def chat_completion_stream_generator(
             build_usage(stream.seq) if continuous_usage else None,
         )
         data = chunk.model_dump_json(exclude_none=True)
+        role = role_event()
+        if role is not None:
+            yield role
         yield f"data: {data}\n\n"
 
     # Final chunk: empty delta carrying the finish_reason, mirroring the OpenAI
@@ -186,6 +207,9 @@ async def chat_completion_stream_generator(
         finish_reason=final_reason,
     )
     final_chunk = make_chunk([final_choice])
+    role = role_event()
+    if role is not None:
+        yield role
     yield f"data: {final_chunk.model_dump_json(exclude_none=True)}\n\n"
     if include_usage:
         usage_chunk = make_chunk([], build_usage(stream.seq))
