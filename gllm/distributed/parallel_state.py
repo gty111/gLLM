@@ -14,6 +14,75 @@ def send_pp_data(output, dst):
         dist.isend(output, dst)
 
 
+def send_pp_data_async(output, dst):
+    """Enqueue PP activations and order output-buffer reuse on this stream."""
+    if type(output) == tuple:
+        assert len(output) == 2
+        works = [dist.isend(output[0], dst), dist.isend(output[1], dst)]
+    else:
+        works = [dist.isend(output, dst)]
+    # For NCCL, Work.wait() inserts a dependency on the current CUDA stream;
+    # it does not CPU-synchronize in the default non-blocking-wait mode.  This
+    # keeps the output buffer alive until the transport has consumed it.
+    for work in works:
+        work.wait()
+    return works
+
+
+def recv_pp_data_async(
+    src, num_tokens, recv_hidden_states, recv_residual, has_residual
+):
+    """Enqueue a pipeline activation receive on the current CUDA stream.
+
+    Unlike :func:`recv_pp_data`, this does not make the worker thread wait for
+    the upstream stage.  NCCL establishes the dependency on the current stream,
+    so the model forward enqueued immediately afterwards consumes the received
+    activation in-order.
+    """
+    works = [dist.irecv(recv_hidden_states[:num_tokens], src)]
+    if has_residual:
+        works.append(dist.irecv(recv_residual[:num_tokens], src))
+    for work in works:
+        work.wait()
+    return works
+
+
+def get_first_pp_rank():
+    """Global rank of this ``(dp, tp)`` column's first pipeline stage."""
+    return get_rank() - get_pp_rank() * _pp_stage_size()
+
+
+def get_last_pp_stage_rank():
+    """Global rank of this ``(dp, tp)`` column's last pipeline stage."""
+    return get_rank() + (get_pp_size() - 1 - get_pp_rank()) * _pp_stage_size()
+
+
+def send_pp_tokens_to_previous_stages(tokens):
+    """Broadcast sampled GPU tokens back along the rank's PP column."""
+    assert is_last_pp_rank()
+    work = dist.broadcast(
+        tokens,
+        src=get_last_pp_stage_rank(),
+        group=get_pp_group(),
+        async_op=True,
+    )
+    work.wait()
+    return work
+
+
+def recv_pp_tokens_from_last_stage(tokens):
+    """Join the sampled-token broadcast and receive into ``tokens``."""
+    assert not is_last_pp_rank()
+    work = dist.broadcast(
+        tokens,
+        src=get_last_pp_stage_rank(),
+        group=get_pp_group(),
+        async_op=True,
+    )
+    work.wait()
+    return work
+
+
 def recv_pp_data(src, num_tokens, recv_hidden_states, recv_residual, has_residual):
     if has_residual:
         dist.recv(recv_hidden_states[:num_tokens], src)
@@ -66,6 +135,11 @@ _DP_SIZE = 1
 _DP_FWD_COUNTS = None
 _ASSIGNED_LAYERS = None
 _TP_GROUP = None
+# One communicator per fixed ``(dp,tp)`` column across pipeline stages.  PP
+# activation traffic remains adjacent point-to-point; sampled-token feedback
+# uses this dedicated group for one broadcast instead of ``pp_size-1`` P2P
+# sends.
+_PP_GROUP = None
 # Dedicated TP communicator for the per-iter IPC broadcast (rank 0 ->
 # PP=0 TP peers). It covers the same ranks as ``_TP_GROUP`` but is a
 # *separate* NCCL communicator so its kernels don't queue behind the
@@ -189,7 +263,7 @@ def init_dp_ep(
     """
     global _DP_RANK, _DP_SIZE, _DP_GROUP, _EP_RANK, _EP_SIZE, _EP_GROUP, _USE_EP
     global _RANK, _WORLD_SIZE, _TP_SIZE, _PP_SIZE, _TP_RANK, _PP_RANK, _LOCAL_RANK
-    global _TP_GROUP, _IPC_TP_GROUP, _ASSIGNED_LAYERS
+    global _TP_GROUP, _IPC_TP_GROUP, _PP_GROUP, _ASSIGNED_LAYERS
 
     stage_size = dp_size * tp_size
     world_size = pp_size * stage_size
@@ -261,6 +335,17 @@ def init_dp_ep(
         g = dist.new_group(ranks)
         if global_rank in ranks:
             _EP_GROUP = g
+
+    # PP columns: fix (dp,tp), vary pp.
+    pp_groups = [
+        [pp * stage_size + d * tp_size + t for pp in range(pp_size)]
+        for d in range(dp_size)
+        for t in range(tp_size)
+    ]
+    for ranks in pp_groups:
+        g = dist.new_group(ranks)
+        if global_rank in ranks:
+            _PP_GROUP = g
 
 
 def set_dp_forward_counts(counts):
@@ -430,6 +515,10 @@ def get_tp_group():
     return _TP_GROUP
 
 
+def get_pp_group():
+    return _PP_GROUP
+
+
 def get_ipc_tp_group():
     """Process group used by :meth:`zmqComm.broadcast_input_to_tp`.
 
@@ -440,7 +529,7 @@ def get_ipc_tp_group():
 
 
 def init_tp_group():
-    global _TP_GROUP, _IPC_TP_GROUP
+    global _TP_GROUP, _IPC_TP_GROUP, _PP_GROUP
     tp_groups = [
         list(range(_pp_rank * get_tp_size(), (_pp_rank + 1) * get_tp_size()))
         for _pp_rank in range(get_pp_size())
@@ -456,6 +545,14 @@ def init_tp_group():
         ipc_group = dist.new_group(tp_ranks)
         if _RANK in tp_ranks:
             _IPC_TP_GROUP = ipc_group
+    pp_groups = [
+        [pp_rank * get_tp_size() + tp_rank for pp_rank in range(get_pp_size())]
+        for tp_rank in range(get_tp_size())
+    ]
+    for pp_ranks in pp_groups:
+        pp_group = dist.new_group(pp_ranks)
+        if _RANK in pp_ranks:
+            _PP_GROUP = pp_group
 
 
 def init_dist(

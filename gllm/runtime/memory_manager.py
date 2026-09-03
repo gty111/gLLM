@@ -1495,9 +1495,15 @@ class MemoryManager:
             n_total = len(seq.token_ids)
             if n_total > seq.rep_filled:
                 suffix = seq.token_ids[seq.rep_filled :]
-                new_slots.extend([seq.rep_slot] * len(suffix))
-                new_tokens.extend(suffix)
-                new_pens.extend([seq.repetition_penalty] * len(suffix))
+                # Overlap scheduling represents an in-flight sampled token as a
+                # negative FutureMap slot.  It is not a vocabulary id (negative
+                # indexing would accidentally penalize a token near the end of
+                # the vocabulary).  The overlap runner scatters the resolved GPU
+                # token through ``apply_resolved_repetition_tokens`` below.
+                resolved = [token for token in suffix if token >= 0]
+                new_slots.extend([seq.rep_slot] * len(resolved))
+                new_tokens.extend(resolved)
+                new_pens.extend([seq.repetition_penalty] * len(resolved))
                 seq.rep_filled = n_total
 
         # ``self._rep_pool`` is only stable to capture *after* the allocation
@@ -1526,6 +1532,44 @@ class MemoryManager:
         ]
         batch_slots_t = async_tensor_h2d(batch_slots, torch.long, "cuda", True)
         return pool.index_select(0, batch_slots_t)
+
+    def apply_resolved_repetition_tokens(self, input_data) -> None:
+        """Add overlap-resolved decode tokens to persistent penalty rows.
+
+        In the overlap path, CPU metadata may contain FutureMap placeholders
+        while ``input_data.tokens`` already contains their real GPU values.
+        Update both the persistent pool and this batch's gathered mask before
+        sampling so PP followers never need a CPU token round trip merely to
+        apply repetition penalty correctly.
+        """
+        mask = getattr(input_data, "repetition_penalty", None)
+        num_decodes = int(getattr(input_data, "num_decodes", 0))
+        if mask is None or num_decodes <= 0:
+            return
+
+        rows = []
+        slots = []
+        penalties = []
+        for row, seq in enumerate(input_data.seqs[:num_decodes]):
+            if (
+                getattr(seq, "repetition_penalty", 1.0) != 1.0
+                and getattr(seq, "rep_slot", None) is not None
+            ):
+                rows.append(row)
+                slots.append(seq.rep_slot)
+                penalties.append(seq.repetition_penalty)
+        if not rows:
+            return
+
+        device = input_data.tokens.device
+        row_t = torch.as_tensor(rows, dtype=torch.long, device=device)
+        slot_t = torch.as_tensor(slots, dtype=torch.long, device=device)
+        penalty_t = torch.as_tensor(penalties, dtype=self.dtype, device=device)
+        # Ordinary overlap decode has one input token per decode row and decode
+        # rows form the leading batch partition.
+        token_t = input_data.tokens[:num_decodes].index_select(0, row_t)
+        self._rep_pool[slot_t, token_t] = penalty_t
+        mask[row_t, token_t] = penalty_t
 
     # --- recurrent working-slot lifecycle ---------------------------------
     #

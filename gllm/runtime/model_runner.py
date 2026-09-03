@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import os
+import time
 from collections import OrderedDict
 from contextlib import nullcontext as _nullcontext
 from typing import Dict, List, Optional, Tuple, Union
@@ -23,8 +24,11 @@ from transformers.video_utils import load_video
 from gllm.distributed.parallel_state import (
     get_dp_size,
     get_ipc_tp_group,
+    get_last_pp_rank,
     get_local_rank,
+    get_next_pp_rank,
     get_output_rank,
+    get_pp_size,
     get_rank,
     get_tp_group,
     get_tp_rank,
@@ -33,6 +37,10 @@ from gllm.distributed.parallel_state import (
     is_first_pp_rank,
     is_last_pp_rank,
     is_output_rank,
+    recv_pp_data_async,
+    recv_pp_tokens_from_last_stage,
+    send_pp_data_async,
+    send_pp_tokens_to_previous_stages,
     set_dp_forward_counts,
 )
 from gllm.layers.attention.qkv_backends import (
@@ -42,7 +50,7 @@ from gllm.layers.attention.qkv_backends import (
 )
 from gllm.layers.rotary_embedding import MRotaryEmbedding
 from gllm.layers.sampler import Sampler
-from gllm.runtime.async_runtime import FutureMap, OverlapRuntime
+from gllm.runtime.async_runtime import FutureIndices, FutureMap, OverlapRuntime
 from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.runtime.input_data import InputData
 from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
@@ -1171,9 +1179,7 @@ class ModelRunner:
                     message["content"] = ""
             deepseek_encoder = None
             if self._deepseek_encoder_variant is not None:
-                from gllm.tokenizers.deepseek_official import (
-                    load_deepseek_encoder,
-                )
+                from gllm.tokenizers.deepseek_official import load_deepseek_encoder
 
                 deepseek_encoder = load_deepseek_encoder(
                     self.model_path, self._deepseek_encoder_variant
@@ -5287,7 +5293,7 @@ class ModelRunner:
 
 
 class OverlapModelRunner(ModelRunner):
-    """ModelRunner with FutureMap-based overlap scheduling (TP, pp_size=1 only)."""
+    """ModelRunner with FutureMap-based overlap scheduling across TP and PP."""
 
     def init(self, mp_load_progress=None):
         # Create the overlap CUDA streams BEFORE ``super().init()`` so that
@@ -5302,6 +5308,7 @@ class OverlapModelRunner(ModelRunner):
         self.overlap_runtime = OverlapRuntime(device)
         self.forward_stream = self.overlap_runtime.forward_stream
         self.copy_stream = self.overlap_runtime.copy_stream
+        self.feedback_stream = self.overlap_runtime.feedback_stream
         super().init(mp_load_progress)
         # Route hybrid (GDN/Mamba) prefix-cache snapshot restores onto
         # ``forward_stream``. The snapshot WRITE runs inside the forward on
@@ -5332,25 +5339,42 @@ class OverlapModelRunner(ModelRunner):
             chunked_prefill_size=num_prefill_chunks,
             device=device,
         )
+        # How many launched batches the overlap worker leaves un-retired.
+        #
+        # Under PP the pipeline stalls once per turn-over of the in-flight set
+        # -- measured as a bubble of ~1.7 ms recurring with a period of exactly
+        # ``depth + 1`` launches, against ~0.44 ms for every other launch --
+        # so a deeper queue amortizes that fixed stall over more batches. The
+        # cost is latency, not throughput: a batch's tokens reach the frontend
+        # ``depth`` launches after it runs, and a finished sequence keeps its
+        # row (and pages) for that long too.
+        # ``pp_size + 2`` for PP: the stall recurs once per ``depth + 1``
+        # launches, and a sweep at PP=2 measured 1983 / 2020 / 2023 / 2019
+        # tok/s at depths 2 / 4 / 6 / 8 -- flat from 4 on, because the stall
+        # itself grows as it is spread thinner. 4 and 6 tie within noise, so
+        # take the shallower one: depth also delays output publication and
+        # EOS detection by that many launches. PP=1 has no cross-stage token
+        # round-trip and keeps the historical lag of one.
+        self._overlap_depth = (
+            get_pp_size() + 2 if get_pp_size() > 1 else 1
+        )
+        # One pinned staging slot per batch that can be live at once: ``depth``
+        # un-retired, the one just launched, and the one being written.
+        self._num_output_bufs = max(2, self._overlap_depth + 2)
         self._next_tokens_bufs = [
             torch.zeros(
                 self.max_running_seqs,
                 dtype=torch.long,
                 device="cpu",
                 pin_memory=True,
-            ),
-            torch.zeros(
-                self.max_running_seqs,
-                dtype=torch.long,
-                device="cpu",
-                pin_memory=True,
-            ),
+            )
+            for _ in range(self._num_output_bufs)
         ]
         self._next_tokens_buf_idx = 0
-        # Double-buffered pinned staging for per-token logprobs, mirroring
-        # ``_next_tokens_bufs`` (keyed by the same ``buf_idx``). Only written on
-        # the output rank and only when a batch requested logprobs; sized to the
-        # OpenAI ``top_logprobs`` ceiling so the top-k columns never overflow.
+        # Pinned staging for per-token logprobs, mirroring ``_next_tokens_bufs``
+        # (keyed by the same ``buf_idx``). Only written on the output rank and
+        # only when a batch requested logprobs; sized to the OpenAI
+        # ``top_logprobs`` ceiling so the top-k columns never overflow.
         self._max_top_logprobs = 20
         self._lp_sampled_bufs = [
             torch.zeros(
@@ -5359,7 +5383,7 @@ class OverlapModelRunner(ModelRunner):
                 device="cpu",
                 pin_memory=True,
             )
-            for _ in range(2)
+            for _ in range(self._num_output_bufs)
         ]
         self._lp_topval_bufs = [
             torch.zeros(
@@ -5368,7 +5392,7 @@ class OverlapModelRunner(ModelRunner):
                 device="cpu",
                 pin_memory=True,
             )
-            for _ in range(2)
+            for _ in range(self._num_output_bufs)
         ]
         self._lp_topid_bufs = [
             torch.zeros(
@@ -5377,7 +5401,7 @@ class OverlapModelRunner(ModelRunner):
                 device="cpu",
                 pin_memory=True,
             )
-            for _ in range(2)
+            for _ in range(self._num_output_bufs)
         ]
         # Holds the context produced by ``_mm_prepare_cpu`` between the CPU
         # and GPU phases of input prep when the overlap worker drives us.
@@ -5394,8 +5418,8 @@ class OverlapModelRunner(ModelRunner):
         Safe to invoke while the previous batch's forward is still consuming
         the shared GPU input buffers — this only touches Python attributes
         and CPU tensors. The companion :meth:`prepare_input_gpu` issues the
-        actual H2D and embed work on ``prep_stream``, which itself
-        GPU-waits for the previous forward via ``input_consumed_event``.
+        actual H2D and embed work on ``forward_stream`` behind the previous
+        batch's GPU work.
         """
         self.input_data.set_input_from_prebuilt_cpu(input_data)
         if self.use_mm and is_first_pp_rank():
@@ -5410,25 +5434,13 @@ class OverlapModelRunner(ModelRunner):
     def prepare_input_gpu(self) -> None:
         """GPU/H2D portion of input prep, fully async.
 
-        All work (H2D copies into the shared input buffers, deferred
-        multimodal embed for prefill seqs, scattering decode embeddings) is
-        enqueued on ``prep_stream``. ``prep_stream`` first GPU-waits on
-        ``input_consumed_event`` so the writes can't clobber input buffers
-        that the previous batch's forward is still reading. After the work
-        is queued we record ``input_ready_event`` so that
-        :meth:`run_batch_async` can have ``forward_stream`` GPU-wait on it.
-
-        The host thread never blocks here: the ``cudaEventSynchronize`` that
-        used to serialize batches has been replaced by GPU-side
-        ``cudaStreamWaitEvent`` and stream events.
+        All work (H2D copies into the shared input buffers, deferred multimodal
+        embed for prefill seqs, and decode-embedding scatter) is enqueued on
+        ``forward_stream``. Because the buffers are shared, prep must follow
+        the previous forward anyway; stream FIFO provides that ordering without
+        consumed/ready events. Enqueueing remains host-asynchronous.
         """
-        rt = self.overlap_runtime
-        # GPU-side wait: prep_stream blocks until the previous forward has
-        # finished reading the input buffers. ``wait_event`` on an unrecorded
-        # event is a no-op (CUDA semantics), so this is safe on the very
-        # first iteration.
-        rt.prep_stream.wait_event(rt.input_consumed_event)
-        with torch.cuda.stream(rt.prep_stream):
+        with torch.cuda.stream(self.forward_stream):
             self.input_data.copy_to_input_buffer()
             if self._pending_mm_ctx is not None:
                 ctx = self._pending_mm_ctx
@@ -5439,7 +5451,6 @@ class OverlapModelRunner(ModelRunner):
                 if self.uses_mrope:
                     self.input_data.set_mrope_position(ctx["mrope_positions"])
                 self.prepare_input_embeddings(input_embeddings)
-            rt.input_ready_event.record(rt.prep_stream)
 
     def _run_forward_on_stream(
         self, num_cal_tokens: int, dp_padded_size: Optional[int] = None
@@ -5473,8 +5484,8 @@ class OverlapModelRunner(ModelRunner):
     @torch.inference_mode()
     def run_batch_async(
         self, dp_padded_size: Optional[int] = None
-    ) -> Tuple[torch.cuda.Event, int, List[int], int]:
-        """Launch forward + sample on forward_stream (pp_size=1 only).
+    ) -> Tuple[Optional[torch.cuda.Event], int, List[int], int, Optional[int]]:
+        """Launch one pipeline stage on ``forward_stream`` without host waits.
 
         ``dp_padded_size`` (DP+EP only) forces the graph bucket agreed on by the
         driver across all DP groups, keeping the captured MoE collectives'
@@ -5484,7 +5495,7 @@ class OverlapModelRunner(ModelRunner):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         batch_size = len(self.input_data.seqs)
         buf_idx = self._next_tokens_buf_idx
-        self._next_tokens_buf_idx = 1 - buf_idx
+        self._next_tokens_buf_idx = (buf_idx + 1) % self._num_output_bufs
         next_tokens_cpu = self._next_tokens_bufs[buf_idx]
 
         # ``future_slot_ids`` is purely a CPU concept (used by the scheduler
@@ -5497,34 +5508,100 @@ class OverlapModelRunner(ModelRunner):
             range(future_indices.interval.start, future_indices.interval.stop)
         )
 
-        # ``prepare_input_gpu`` enqueued all H2D + (VL) embed work on
-        # ``prep_stream`` and recorded ``input_ready_event``. ``forward_stream``
-        # GPU-waits on that event before reading the shared input buffers, so
-        # the pipeline is fully async (no host-side ``cudaEventSynchronize``).
-        # We additionally wait_stream(default_stream) defensively in case any
-        # incidental work landed on the worker thread's default stream
-        # (e.g. user-issued ops outside the overlap path); that's a no-op in
-        # the steady state.
+        # ``prepare_input_gpu`` enqueued all H2D + (VL) embed work immediately
+        # before this call on ``forward_stream``. FIFO ordering protects the
+        # shared input buffers without cross-stream events.
+        # DP+EP metadata collectives are issued on the worker's default stream
+        # before dispatch and must precede the forward.  The ordinary TP/PP
+        # path has no such producer: input H2D and recurrent-state reset/restore
+        # are already FIFO-ordered on ``forward_stream``. Recording a
+        # default-stream event on
+        # every non-DP batch was therefore pure host/API overhead.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.forward_stream):
-            self.forward_stream.wait_event(self.overlap_runtime.input_ready_event)
-            self.forward_stream.wait_stream(default_stream)
-            self.future_map.resolve_future(self.input_data.tokens[:num_cal_tokens])
+            if is_dp_attn():
+                self.forward_stream.wait_stream(default_stream)
+            if is_last_pp_rank():
+                has_futures = self.future_map.has_futures(
+                    self.input_data.tokens_cpu
+                )
+            else:
+                has_futures = self.future_map.wait_for_inputs(
+                    self.input_data.tokens_cpu,
+                    self.forward_stream,
+                )
+            if has_futures:
+                self.future_map.resolve_future(
+                    self.input_data.tokens[:num_cal_tokens]
+                )
 
-            num_decode_tokens = sum(
-                s.to_compute_token_num
-                for s in self.input_data.seqs
-                if s.computed_prompt
-            )
-            self._fixup_vl_decode_embeddings(num_decode_tokens)
+            # PP followers receive activations directly on the forward stream.
+            # ``irecv`` establishes stream ordering, so the model forward below
+            # consumes the buffer only after its upstream producer has sent it;
+            # the worker thread remains free to prepare later batches.
+            #
+            # Staging this in a two-slot ring on its own stream -- to break the
+            # write-after-read coupling that makes the pipeline critically
+            # damped -- measured 1.2% slower for the send half and 2.3% for both
+            # halves, bitwise-identical output either way: at decode microbatch
+            # widths (16 tokens, 164 KB) the cross-stream handoff costs more
+            # than the slack it buys.
+            if not is_first_pp_rank():
+                recv_pp_data_async(
+                    get_last_pp_rank(),
+                    num_cal_tokens,
+                    self.input_hidden_states,
+                    self.input_residual,
+                    self.model.ret_residual,
+                )
+
+            # This per-row Python sum only feeds the VL re-embed, which is a
+            # no-op unless ``use_mm``. It runs between the previous batch's
+            # last GPU work and this batch's forward, so on a text model it
+            # was pure bubble.
+            if self.use_mm:
+                num_decode_tokens = sum(
+                    s.to_compute_token_num
+                    for s in self.input_data.seqs
+                    if s.computed_prompt
+                )
+                self._fixup_vl_decode_embeddings(num_decode_tokens)
 
             num_cal_tokens = self._run_forward_on_stream(
                 num_cal_tokens, dp_padded_size=dp_padded_size
             )
 
+            if not is_last_pp_rank():
+                # The input metadata may be overwritten as soon as this stage's
+                # forward completes; activation/token P2P below touches only the
+                # output and FutureMap buffers.
+                output = (
+                    self.output_hidden_states[:num_cal_tokens],
+                    self.output_residual[:num_cal_tokens],
+                )
+                if not self.model.ret_residual:
+                    output = output[0]
+                send_pp_data_async(output, get_next_pp_rank())
+            if not is_last_pp_rank():
+                # Post the sampled-token receive now, outside the
+                # ``forward_stream`` context: this batch's activations are on
+                # their way, so the collective has a full stage time to drain
+                # before any collect asks for it. Deferring it to the collect
+                # step (or to whenever a successor's input happens to reference
+                # the slot) pinned the receive to two launches after dispatch,
+                # i.e. always while the last stage was still forwarding this
+                # batch -- its NCCL kernel then spun ~one forward and the
+                # driver's ``copy_done.synchronize()`` paid for it, no matter
+                # how deep the collect lag was.
+                copy_done = self.complete_pp_token_feedback(
+                    future_slot_ids, batch_size, buf_idx
+                )
+                return copy_done, batch_size, future_slot_ids, buf_idx, None
+
             hidden = self.output_hidden_states[:num_cal_tokens]
             logits = self.model.compute_logits(self.input_data, hidden)
             self.input_data.prepare_sample()
+            self.memory_manager.apply_resolved_repetition_tokens(self.input_data)
             next_tokens_gpu = None
             # ``lp_k`` doubles as the "logprobs requested this batch" flag for
             # the collect side: ``None`` => none requested (skip staging),
@@ -5610,8 +5687,8 @@ class OverlapModelRunner(ModelRunner):
             # gap the draft would later read off a recycled page.  It must run
             # AFTER the broadcast -- a rank that wrote different head KV would
             # propose different drafts and diverge -- and BEFORE
-            # ``input_consumed_event``, which releases the input buffers it
-            # reads.  ``next_tokens_gpu`` stays on the device; ``_mtp_sync_kv``
+            # the next batch's FIFO-ordered input writes. ``next_tokens_gpu``
+            # stays on the device; ``_mtp_sync_kv``
             # scatters it without a host round-trip.
             if next_tokens_gpu is not None:
                 with torch.profiler.record_function("gllm::mtp_head_kv_sync"):
@@ -5622,22 +5699,33 @@ class OverlapModelRunner(ModelRunner):
                         tail_next_tokens=next_tokens_gpu,
                     )
             self.future_map.store_to_map(future_indices, next_tokens_gpu)
-            # Every PP-0 TP rank D2H-copies the broadcast tokens into
-            # its own pinned ``_next_tokens_bufs`` slot. Pre-refactor
-            # only ``output_rank`` did this because rank-0 was the
-            # sole consumer of the integer token list; with the
-            # column-driver design every TP rank's local scheduler
-            # needs to ``process_output_finalize`` against the same
-            # tokens, so we issue ``tp_size`` independent D2H copies
-            # off the same already-broadcast GPU tensor. The copies
-            # all run on the per-rank ``copy_stream`` (one per worker
-            # process), so there's no inter-rank serialization.
-            if get_tp_size() > 1 or is_output_rank():
+            if get_pp_size() > 1:
+                # Issue the feedback broadcast on ``feedback_stream``, not on
+                # ``forward_stream``. ``Work.wait()`` blocks the issuing stream
+                # until the collective completes, and a broadcast completes
+                # only once every earlier stage has posted its matching
+                # receive -- which happens on their collect step, several
+                # launches later. Leaving it on ``forward_stream`` therefore
+                # gated this stage's *next* forward on the driver's CPU loop
+                # and serialized the whole pipeline.
+                self.feedback_stream.wait_stream(self.forward_stream)
+                next_tokens_gpu.record_stream(self.feedback_stream)
+                with torch.cuda.stream(self.feedback_stream):
+                    send_pp_tokens_to_previous_stages(next_tokens_gpu)
+            # The last stage keeps sampled tokens on GPU and broadcasts them
+            # back through the PP group. Only PP0 stages D2H-copy those tokens
+            # into their scheduler's pinned output slot; optional logprobs are
+            # staged separately on the output rank.
+            copy_on_this_rank = (
+                is_first_pp_rank() and (get_tp_size() > 1 or is_output_rank())
+            ) or lp_gpu is not None
+            if copy_on_this_rank:
                 with torch.cuda.stream(self.copy_stream):
                     self.copy_stream.wait_stream(self.forward_stream)
-                    next_tokens_cpu[:batch_size].copy_(
-                        next_tokens_gpu, non_blocking=True
-                    )
+                    if is_first_pp_rank():
+                        next_tokens_cpu[:batch_size].copy_(
+                            next_tokens_gpu, non_blocking=True
+                        )
                     # Stage this batch's logprobs into the same buf_idx slot so
                     # ``_collect_batch`` can read them once ``copy_done`` fires.
                     if lp_gpu is not None:
@@ -5653,14 +5741,49 @@ class OverlapModelRunner(ModelRunner):
                                 top_ids, non_blocking=True
                             )
 
-            self.overlap_runtime.input_consumed_event.record(self.forward_stream)
 
         copy_done = torch.cuda.Event()
-        if get_tp_size() > 1 or is_output_rank():
+        if (
+            is_first_pp_rank() and (get_tp_size() > 1 or is_output_rank())
+        ) or lp_gpu is not None:
             copy_done.record(self.copy_stream)
         else:
             copy_done.record(self.forward_stream)
         return copy_done, batch_size, future_slot_ids, buf_idx, lp_k
+
+    def complete_pp_token_feedback(
+        self, future_slot_ids: List[int], batch_size: int, buf_idx: int
+    ) -> torch.cuda.Event:
+        """Post delayed PP sampled-token feedback for one pending batch.
+
+        Delaying this receive until collect keeps the launch-current then
+        correct-previous ordering.  FutureMap still records a slot-specific
+        event, so a dependent successor can wait on the GPU without a global
+        stream synchronization.
+        """
+        if is_last_pp_rank():
+            raise RuntimeError("last PP rank produces rather than receives feedback")
+        if not future_slot_ids:
+            raise ValueError("PP feedback requires at least one future slot")
+        interval = slice(future_slot_ids[0], future_slot_ids[-1] + 1)
+        future_indices = FutureIndices(interval=interval)
+        future_tokens = self.future_map.token_ids_buf[interval]
+        with torch.cuda.stream(self.feedback_stream):
+            recv_pp_tokens_from_last_stage(future_tokens)
+            feedback_done = torch.cuda.Event()
+            feedback_done.record(self.feedback_stream)
+        self.future_map.mark_ready(future_indices, feedback_done)
+
+        if is_first_pp_rank():
+            with torch.cuda.stream(self.copy_stream):
+                self.copy_stream.wait_event(feedback_done)
+                self._next_tokens_bufs[buf_idx][:batch_size].copy_(
+                    future_tokens, non_blocking=True
+                )
+            copy_done = torch.cuda.Event()
+            copy_done.record(self.copy_stream)
+            return copy_done
+        return feedback_done
 
     @torch.inference_mode()
     def step_collect_async(

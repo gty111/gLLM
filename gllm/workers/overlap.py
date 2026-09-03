@@ -1,4 +1,4 @@
-"""Worker driver loops for overlap scheduling (TP only, pp_size must be 1).
+"""Worker driver loops for overlap scheduling across TP and PP.
 
 Distributed scheduler design (v2)
 =================================
@@ -39,13 +39,15 @@ The new design moves the scheduler onto **every PP-0 TP rank** (a
    front-end via ``comm.send_output`` -- the others compute the same
    one and discard it.
 
-Compatibility note: this module rejects ``pp_size > 1`` like before.
-The new design generalizes (each column driver would also push its
-own per-column ``SchedulePayload`` to its PP-other followers), but
-:class:`OverlapModelRunner` itself is single-stage; PP > 1 falls back
-to the (also-refactored) :class:`gllm.workers.worker.Worker` path.
+For PP > 1 each column driver additionally pushes its delta
+``SchedulePayload`` to the same-TP rank on every later stage. Activations flow
+forward and sampled token tensors flow back to every stage on CUDA streams;
+the worker thread never stages the dependency through CPU or ZMQ.
 """
 
+import os
+import queue
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -53,13 +55,19 @@ import torch
 
 from gllm.distributed.parallel_state import (
     dp_all_gather_meta,
+    get_pp_size,
     is_dp_attn,
+    is_first_pp_rank,
+    is_last_pp_rank,
+    is_output_rank,
     set_dp_forward_counts,
 )
 from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import OverlapModelRunner
 from gllm.scheduling.scheduler import OverlapScheduler
 from gllm.workers.worker import Worker
+from logger import logger
+
 
 
 @dataclass
@@ -73,6 +81,26 @@ class _PendingMtpBatch:
     # Sequences logically retired while this batch was already in flight.
     # Their pages can be released only after this completion is ready.
     release_after: list = field(default_factory=list)
+
+
+@dataclass
+class _PendingBatch:
+    """One ordinary overlap batch in flight, awaiting its sampled tokens."""
+
+    copy_done: object
+    batch_size: int
+    buf_idx: int
+    future_slot_ids: list
+    deferred: object
+    input_data: object
+    is_dummy: bool
+    lp_k: object
+    # Sequences retired while this batch was already in flight. Their pages
+    # can only be released once this batch's completion event is satisfied.
+    release_after: list = field(default_factory=list)
+    # Filled in by the retire helper: the sampled tokens, already
+    # copied out of the pinned staging slot.
+    tokens: object = None
 
 
 @dataclass(frozen=True)
@@ -103,14 +131,16 @@ class _MtpBatch:
 
 
 class OverlapWorker(Worker):
-    """Overlap-scheduling worker with FutureMap (single PP stage only)."""
+    """Overlap-scheduling worker with FutureMap-backed PP token feedback."""
+
+    # Class-level defaults so a worker built directly by a test (no ``init``)
+    # still walks the same code paths.
+    _collect_lag = 1
+    _pending_frees = ()
+    _async_retire = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if self.pp_size > 1:
-            raise ValueError(
-                "overlap_scheduling requires pp_size=1; use the default worker for PP>1"
-            )
         if not isinstance(self.model_runner, OverlapModelRunner):
             raise TypeError(
                 "OverlapWorker requires OverlapModelRunner when overlap_scheduling is enabled"
@@ -119,29 +149,51 @@ class OverlapWorker(Worker):
     def init(self):
         Worker.init(self)
         self._prefetched_input = None
+        self._prefetched_payload = None
         self._gpu_pending = deque()
         self._mtp_pending = deque()
+        self._async_retire = True
+        self._wait_q: queue.Queue = queue.Queue()
+        self._ready_q: queue.Queue = queue.Queue()
+        if self._async_retire:
+            self._retire_thread = threading.Thread(
+                target=self._retire_loop, name="OverlapRetire", daemon=True
+            )
+            self._retire_thread.start()
+        # Sequences retired logically but whose pages a batch already built or
+        # already in flight may still read. They move to the next batch's
+        # ``release_after`` when it is appended, so the release boundary is
+        # always at or after the last batch that can reference them.
+        self._pending_frees = []
+        # How many launched batches may stay un-retired. A batch's sampled
+        # tokens cannot exist until the last stage has forwarded it, i.e. one
+        # full pipeline traversal after launch, so retiring at lag 1 always
+        # lands on a batch that structurally cannot be ready yet. Deeper is
+        # only safe because ``_collect_batch`` hands the pages of a sequence
+        # retiring here to ``_pending_frees``, released at the completion
+        # boundary of the next batch launched. Measured at PP=2: 1945 / 1982 /
+        # 2014 / 2020 / 2023 tok/s at depth 1 / 2 / 3 / 4 / 6 -- flat from 4
+        # on, and depth also delays output publication and EOS detection by
+        # that many launches, so the runner settles on ``pp_size + 2``.
+        self._collect_lag = self.model_runner._overlap_depth
+        logger.info(
+            f"overlap collect lag {self._collect_lag} "
+            f"(pp {get_pp_size()}, output bufs "
+            f"{self.model_runner._num_output_bufs})"
+        )
         # Fixed after ``init``: DP-attention + EP needs the per-iter cross-DP
         # barrier + dummy-batch lockstep in ``run_pp0``; plain TP does not.
         self._dp = is_dp_attn()
 
     def _init_role_state(self):
-        """Override base setup: every PP=0 TP rank gets an OverlapScheduler.
-
-        ``pp_size == 1`` is a hard precondition (enforced in
-        ``__init__``), so every rank lands on the ``is_first_pp_rank``
-        branch -- no FollowerSeqStore / InputData queue is created.
-        We deliberately skip the :class:`DriverPayloadBuilder` setup
-        too: the per-column zmq fanout that the base path uses to ship
-        delta payloads to PP-other followers has nothing to do for
-        PP=1, and not building the payload also means we don't drain
-        ``scheduler.consume_pending_follower_frees``.
-        """
-        self.scheduler = OverlapScheduler(
-            self.pp_size,
-            self.model_runner,
-            self.schedule_method,
-        )
+        """Build an overlap scheduler on PP0 and mirrors on later stages."""
+        Worker._init_role_state(self)
+        if is_first_pp_rank():
+            self.scheduler = OverlapScheduler(
+                self.pp_size,
+                self.model_runner,
+                self.schedule_method,
+            )
 
     # ------------------------------------------------------------------
     # Forward-pipeline helpers
@@ -192,8 +244,19 @@ class OverlapWorker(Worker):
         # seqs hit max_len / EOS. Cheap (a list = []) and keeps
         # peak-memory predictable.
         with torch.profiler.record_function("gllm::schedule_and_cpu_prepare"):
-            self.scheduler.consume_pending_follower_frees()
             schedule_seqs = self.scheduler.schedule_once()
+            if get_pp_size() > 1:
+                payload = self._build_schedule_payload(schedule_seqs)
+                if not schedule_seqs:
+                    # A final free still has to reach follower stores even when
+                    # no subsequent model batch exists to carry it.
+                    if payload is not None and not payload.is_empty():
+                        self.comm.send_schedule_payload(payload)
+                    self._prefetched_payload = None
+                else:
+                    self._prefetched_payload = payload
+            else:
+                self.scheduler.consume_pending_follower_frees()
             if len(schedule_seqs) == 0:
                 self._prefetched_input = None
                 return
@@ -203,16 +266,26 @@ class OverlapWorker(Worker):
         # Pipelined input prep:
         #   * ``prepare_input_cpu`` is pure CPU work and overlaps with the
         #     previous batch's GPU forward.
-        #   * ``prepare_input_gpu`` enqueues H2D + (VL) embed work on the
-        #     overlap runtime's ``prep_stream``, which GPU-waits for the
-        #     previous batch's ``input_consumed_event``. There is no
-        #     host-side sync here -- the ordering is entirely expressed via
-        #     CUDA events, so the host thread races ahead and the GPU bubble
-        #     between back-to-back forwards collapses to the cross-stream
-        #     wait_event cost.
-        #   * ``run_batch_async`` then dispatches forward+sample on
-        #     ``forward_stream`` with a wait_event on ``input_ready_event``.
+        #   * ``prepare_input_gpu`` enqueues H2D + (VL) embed work behind the
+        #     previous batch on ``forward_stream``. Shared input buffers require
+        #     this ordering; using stream FIFO avoids redundant CUDA events.
+        #   * ``run_batch_async`` appends forward+sample to the same stream.
         self.model_runner.prepare_input_cpu(input_data)
+        if is_first_pp_rank() and get_pp_size() > 1:
+            payload = self._prefetched_payload
+            self._prefetched_payload = None
+            if payload is None:
+                raise RuntimeError("PP overlap batch is missing its schedule payload")
+            # Multimodal m-rope positions are computed in the PP0 CPU phase and
+            # piggyback on the same delta, matching the non-overlap PP path.
+            ctx = self.model_runner._pending_mm_ctx
+            if ctx is not None and self.model_runner.uses_mrope:
+                import dataclasses
+
+                payload = dataclasses.replace(
+                    payload, mrope_positions=ctx["mrope_positions"]
+                )
+            self.comm.send_schedule_payload(payload)
         self.model_runner.prepare_input_gpu()
         return self.model_runner.run_batch_async(dp_padded_size=dp_padded_size)
 
@@ -236,25 +309,71 @@ class OverlapWorker(Worker):
     def _collect_batch(self, entry) -> None:
         """Wait for a batch's D2H copy and finalize its seq state.
 
-        Every PP-0 TP rank reads its own ``_next_tokens_bufs`` slot (each rank
-        did its own D2H copy from the broadcast tokens inside
-        ``run_batch_async``) and updates its local GenerationSequence state / frees pages;
+        Every PP-0 TP rank reads its own ``_next_tokens_bufs`` slot after the
+        sampled-token PP broadcast and updates local sequence state / frees pages;
         only the frontend poller (rank 0, or each DP group's ``tp_rank == 0``)
         forwards the resulting ``IPCPackage``. ``is_dummy`` batches (idle DP
         groups) and empty ``deferred`` carry no output and are skipped.
         """
-        copy_done, batch_size, buf_idx, deferred, _input_data, is_dummy, lp_k = entry
-        copy_done.synchronize()
+        batch_size = entry.batch_size
+        buf_idx = entry.buf_idx
+        deferred = entry.deferred
+        input_data = entry.input_data
+        is_dummy = entry.is_dummy
+        lp_k = entry.lp_k
+        # Intermediate stages only need to join the collective and publish the
+        # FutureMap readiness event. There is no CPU output to wait for, and a
+        # later dependent input waits on that event itself. The last stage is
+        # the producer and keeps its old completion wait before buffer reuse.
+        if not is_first_pp_rank() and not is_last_pp_rank():
+            return
+        self._settle(entry)
+        # This batch's completion is now satisfied, so pages held back for it
+        # by an earlier retirement are safe to release before the allocator
+        # builds the next batch.
+        for seq in entry.release_after:
+            self.model_runner.free(seq)
+        entry.release_after.clear()
         if is_dummy or deferred is None:
             return
-        tokens = self.model_runner._next_tokens_bufs[buf_idx][:batch_size].tolist()
+        tokens = entry.tokens
         # Logprobs were staged only on the output rank (== the frontend poller
         # for PP=1); other columns skip the read since their IPC is discarded.
         logprobs = None
         if lp_k is not None and self._polls_frontend():
             logprobs = self._read_logprobs(buf_idx, batch_size, lp_k)
+        if get_pp_size() > 1 and self._polls_frontend():
+            needs_sidecar = any(
+                seq.logprobs_enabled or seq.prompt_logprobs_enabled
+                for seq in input_data.seqs
+            )
+            if needs_sidecar:
+                sidecar = self.comm.recv_tokens(block=True)
+                if not (
+                    isinstance(sidecar, tuple)
+                    and len(sidecar) == 3
+                    and sidecar[0] == "overlap_logprobs"
+                ):
+                    raise RuntimeError(f"invalid PP overlap logprobs sidecar: {sidecar!r}")
+                logprobs = sidecar[1]
+                prompt_logprobs = sidecar[2]
+                if prompt_logprobs:
+                    by_id = {seq.seq_id: seq for seq in input_data.seqs}
+                    for seq_id, values in prompt_logprobs.items():
+                        seq = by_id.get(seq_id)
+                        if seq is not None:
+                            seq.prompt_logprobs_data = values
+        # A sequence retiring here may still occupy rows of batches that are
+        # in flight -- or of the batch the driver has already scheduled but
+        # not yet launched. Both keep reading its pages, and the already-built
+        # batch cannot simply be compacted: its schedule payload has been
+        # derived for the follower stages, and a shorter batch than the
+        # payload describes deadlocks the PP collectives. So retire it
+        # logically now (``process_output_deferred`` skips ``_overlap_freed``
+        # rows, so no extra token is ever emitted for it) and hand the pages
+        # to ``_pending_frees``, which the next launched batch adopts.
         ipc_package = self.scheduler.process_output_finalize(
-            deferred, tokens, logprobs
+            deferred, tokens, logprobs, defer_frees=self._pending_frees
         )
         if ipc_package is not None and self._polls_frontend():
             self.comm.send_output(ipc_package)
@@ -276,9 +395,92 @@ class OverlapWorker(Worker):
             vals = [[] for _ in range(batch_size)]
         return [(sampled[i], ids[i], vals[i]) for i in range(batch_size)]
 
+    def _settle(self, entry: "_PendingBatch") -> None:
+        """Block until ``entry``'s tokens are on the CPU, then hand them over.
+
+        Ordinarily the retire helper has already done this concurrently with
+        the driver's launch work, and this is a no-op.
+        """
+        if entry.tokens is not None or entry.is_dummy:
+            return
+        entry.copy_done.synchronize()
+        if entry.deferred is not None:
+            entry.tokens = self.model_runner._next_tokens_bufs[entry.buf_idx][
+                : entry.batch_size
+            ].tolist()
+
+    def _retire_loop(self) -> None:
+        """Drain launched batches' completion events off the driver thread.
+
+        The driver used to block here itself. Averaged over a run that looks
+        harmless -- it has milliseconds of slack per iteration -- but the block
+        is not spread evenly. Only the wait and the D2H read move; the
+        scheduler finalize stays on the driver, because every column driver
+        must run it in the same order.
+        """
+        armed = False
+        while True:
+            entry = self._wait_q.get()
+            if entry is None:
+                return
+            if not armed:
+                # A new thread does not inherit the main thread's CUDA context,
+                # so it needs the device set -- but only once real work shows
+                # up. Doing it at thread start races the main thread's CUDA
+                # graph capture and fails it with ``cudaErrorIllegalState``;
+                # the first batch cannot arrive until capture is long done.
+                torch.cuda.set_device(self.model_runner.forward_stream.device)
+                armed = True
+            try:
+                self._settle(entry)
+            except Exception:  # pragma: no cover - surfaced on the driver
+                logger.exception("overlap retire helper failed")
+            self._ready_q.put(entry)
+
+    def _adopt_pending_frees(self, batch: "_PendingBatch") -> None:
+        """Make ``batch``'s completion the release boundary for pending frees."""
+        if self._pending_frees:
+            batch.release_after.extend(self._pending_frees)
+            self._pending_frees.clear()
+
+    def _take_oldest(self) -> "_PendingBatch":
+        """Pop the oldest in-flight batch, settled by the helper if enabled.
+
+        The helper is a single thread draining a FIFO, so what comes back is
+        always the head of ``_gpu_pending``.
+        """
+        if not self._async_retire:
+            return self._gpu_pending.popleft()
+        entry = self._ready_q.get()
+        if entry is not self._gpu_pending[0]:
+            raise RuntimeError("overlap retire helper returned out of order")
+        return self._gpu_pending.popleft()
+
+    def _retire_pending(self) -> None:
+        """Retire batches beyond the collect lag, oldest first.
+
+        Blocking here does gate the launch rate -- the driver waits on batch k
+        before it may issue k + depth -- and that loop is visible as a stall
+        recurring every ``depth + 1`` launches (nsys: the driver sits in
+        ``sem_wait`` for 26 ms of a long gap, against 0 in a normal one).
+        Breaking the gate does remove the stall, confirmed by nsys, and it
+        makes throughput *worse*: 2036.7 -> 2012.7 tok/s, 0/6 paired wins.
+        The GPU is not starved during those stalls -- it still has queued work
+        -- so letting the driver run further ahead only costs more in-flight
+        input staging. The gate stays.
+        """
+        while len(self._gpu_pending) > self._collect_lag:
+            self._collect_batch(self._take_oldest())
+
     def _drain_pending(self) -> None:
         while self._gpu_pending:
-            self._collect_batch(self._gpu_pending.popleft())
+            self._collect_batch(self._take_oldest())
+        # Nothing is in flight and nothing is scheduled, so no row can still
+        # be reading these pages; releasing them here keeps a drained pipeline
+        # from stranding capacity until the next launch.
+        for seq in self._pending_frees:
+            self.model_runner.free(seq)
+        self._pending_frees.clear()
 
     def _collect_mtp_batch(
         self,
@@ -367,6 +569,7 @@ class OverlapWorker(Worker):
         if (
             not self.model_runner.mtp_enabled
             or self._dp
+            or get_pp_size() > 1
             or input_data is None
             or not input_data.seqs
         ):
@@ -511,6 +714,59 @@ class OverlapWorker(Worker):
                 self.comm.send_output(ipc_package)
         # Build the next iter AFTER finalize so any max_len/eos seqs are freed.
         self._build_prefetched_input()
+
+    def run_other(self):
+        """Receive, launch and retire batches on a non-first PP stage."""
+        self.recv_schedule_payload()
+        launched = False
+        if self.schedule_queue:
+            launched = True
+            input_data = self.schedule_queue.popleft()
+            self._apply_ssm_restores(input_data.seqs)
+            copy_done, batch_size, future_slot_ids, buf_idx, lp_k = (
+                self._launch_batch(input_data)
+            )
+            if is_output_rank() and get_pp_size() > 1 and any(
+                seq.logprobs_enabled or seq.prompt_logprobs_enabled
+                for seq in input_data.seqs
+            ):
+                # Generation logprobs are copied asynchronously by the runner;
+                # prompt logprobs already materialize on CPU.  This optional
+                # sidecar preserves the OpenAI logprobs contract without putting
+                # the ordinary token dependency back on the CPU path.
+                copy_done.synchronize()
+                logprobs = (
+                    self._read_logprobs(buf_idx, batch_size, lp_k)
+                    if lp_k is not None
+                    else None
+                )
+                self.comm.send_tokens(
+                    (
+                        "overlap_logprobs",
+                        logprobs,
+                        self.model_runner._last_prompt_logprobs,
+                    )
+                )
+            batch = _PendingBatch(
+                copy_done,
+                batch_size,
+                buf_idx,
+                future_slot_ids,
+                None,
+                input_data,
+                False,
+                lp_k,
+            )
+            self._adopt_pending_frees(batch)
+            self._gpu_pending.append(batch)
+            if self._async_retire:
+                self._wait_q.put(batch)
+        if not launched:
+            # Nothing arrived to keep the pipeline moving: retire everything so
+            # the driver's feedback receives are posted and buffers recycle.
+            self._drain_pending()
+        else:
+            self._retire_pending()
 
     def _launch_mtp_async_batch(self, batch: _MtpBatch) -> None:
         """Launch one batch with gLLM's launch-current/collect-previous cadence.
@@ -674,11 +930,10 @@ class OverlapWorker(Worker):
                 else fwd_counts
             )
 
-        pending_before = len(self._gpu_pending)
-
         if input_data is not None:
             # Keep the InputData alive in ``_gpu_pending`` until the batch
-            # finishes -- ``prep_stream`` is still DMA'ing from its CPU tensors.
+            # finishes -- ``forward_stream`` may still be DMA'ing from its CPU
+            # tensors before executing the model.
             self._prefetched_input = None
             try:
                 copy_done, batch_size, future_slot_ids, buf_idx, lp_k = (
@@ -692,26 +947,44 @@ class OverlapWorker(Worker):
                 if is_dummy
                 else self.scheduler.process_output_deferred(future_slot_ids)
             )
-            self._gpu_pending.append(
-                (copy_done, batch_size, buf_idx, deferred, input_data, is_dummy, lp_k)
+            batch = _PendingBatch(
+                copy_done,
+                batch_size,
+                buf_idx,
+                future_slot_ids,
+                deferred,
+                input_data,
+                is_dummy,
+                lp_k,
             )
+            self._adopt_pending_frees(batch)
+            self._gpu_pending.append(batch)
+            if self._async_retire:
+                self._wait_q.put(batch)
 
-        if pending_before > 0:
-            self._collect_batch(self._gpu_pending.popleft())
+        if input_data is None:
+            # No new work to keep the pipeline moving: retire everything so
+            # finished rows are published and their pages released.
+            self._drain_pending()
+        else:
+            self._retire_pending()
 
         # Build the next iter AFTER finalize so any max_len/eos seqs from this
-        # iter are already freed when we reschedule.
+        # iter are already freed when we reschedule. Moving it ahead of the
+        # retire measured neutral (+0.08%) and needs the batch to survive a
+        # row being retired under it, so it is not worth the coupling.
         self._build_prefetched_input()
 
 
 def run_overlap_worker(worker: OverlapWorker):
-    """Tight per-iter loop for the overlap path (PP=1 only)."""
+    """Tight per-iter loop for the overlap path."""
     try:
         worker.init()
-        # PP=1 means every rank in the world is on PP-0; the unified
-        # ``run_pp0`` body covers driver and follower, TP and DP+EP alike.
         while True:
-            worker.run_pp0()
+            if worker.pp_rank == 0:
+                worker.run_pp0()
+            else:
+                worker.run_other()
     except KeyboardInterrupt:
         worker.handle_keyboardInterrupt()
     except Exception as e:

@@ -6,90 +6,59 @@ import triton.language as tl
 
 
 @triton.jit
-def _mtp_embed_hidden_square_kernel(
-    token_ids,
-    embed_table,
-    previous_hidden,
-    work,
-    table_stride,
-    hidden_stride,
-    num_rows,
-    hidden_size: tl.constexpr,
+def _mtp_embed_hidden_gemma_norm_kernel(
+    ids_ptr,
+    table_ptr,
+    hidden_ptr,
+    embedding_weight_ptr,
+    hidden_weight_ptr,
+    out_ptr,
+    table_row_stride,
+    hidden_row_stride,
+    out_row_stride,
+    eps,
+    mean_factor,
+    hidden_size,
     BLOCK: tl.constexpr,
 ):
+    """Gather one embedding row, norm it and the hidden row, write both.
+
+    The reduction is written exactly as in
+    ``gllm.layers.ops.gemma_rmsnorm`` -- same ``tl.sum`` over the same
+    ``next_power_of_2`` block, same ``* mean_factor + eps`` order -- so this
+    fused path stays bitwise-identical to calling that norm twice. That
+    equivalence is what ``tests/test_mtp_embed_norm.py`` asserts.
+    """
     row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = cols < hidden_size
-    token = tl.load(token_ids + row).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < hidden_size
+
+    token = tl.load(ids_ptr + row)
     embedding = tl.load(
-        embed_table + token * table_stride + cols,
-        mask=mask,
-        other=0.0,
+        table_ptr + token * table_row_stride + offs, mask=mask, other=0.0
     ).to(tl.float32)
     hidden = tl.load(
-        previous_hidden + row * hidden_stride + cols,
-        mask=mask,
-        other=0.0,
+        hidden_ptr + row * hidden_row_stride + offs, mask=mask, other=0.0
     ).to(tl.float32)
-    tl.store(
-        work + row * hidden_size + cols,
-        embedding * embedding,
-        mask=mask,
-    )
-    tl.store(
-        work + (num_rows + row) * hidden_size + cols,
-        hidden * hidden,
-        mask=mask,
-    )
 
+    inv_embedding = 1.0 / tl.sqrt(
+        tl.sum(embedding * embedding, axis=0) * mean_factor + eps
+    )
+    inv_hidden = 1.0 / tl.sqrt(
+        tl.sum(hidden * hidden, axis=0) * mean_factor + eps
+    )
+    embedding_gain = tl.load(
+        embedding_weight_ptr + offs, mask=mask, other=0.0
+    ).to(tl.float32) + 1.0
+    hidden_gain = tl.load(
+        hidden_weight_ptr + offs, mask=mask, other=0.0
+    ).to(tl.float32) + 1.0
 
-@triton.jit
-def _mtp_embed_hidden_normalize_kernel(
-    token_ids,
-    embed_table,
-    previous_hidden,
-    variance,
-    embedding_weight,
-    hidden_weight,
-    out,
-    table_stride,
-    hidden_stride,
-    out_stride,
-    num_rows,
-    eps: tl.constexpr,
-    hidden_size: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = cols < hidden_size
-    token = tl.load(token_ids + row).to(tl.int64)
-    embedding = tl.load(
-        embed_table + token * table_stride + cols,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    hidden = tl.load(
-        previous_hidden + row * hidden_stride + cols,
-        mask=mask,
-        other=0.0,
-    ).to(tl.float32)
-    embedding_var = tl.load(variance + row).to(tl.float32)
-    hidden_var = tl.load(variance + num_rows + row).to(tl.float32)
-    embedding_scale = (
-        tl.load(embedding_weight + cols, mask=mask, other=0.0).to(tl.float32)
-        + 1.0
-    )
-    hidden_scale = (
-        tl.load(hidden_weight + cols, mask=mask, other=0.0).to(tl.float32)
-        + 1.0
-    )
-    embedding = embedding * tl.rsqrt(embedding_var + eps) * embedding_scale
-    hidden = hidden * tl.rsqrt(hidden_var + eps) * hidden_scale
-    tl.store(out + row * out_stride + cols, embedding, mask=mask)
+    base = out_ptr + row * out_row_stride
+    tl.store(base + offs, embedding * inv_embedding * embedding_gain, mask=mask)
     tl.store(
-        out + row * out_stride + hidden_size + cols,
-        hidden,
+        base + hidden_size + offs,
+        hidden * inv_hidden * hidden_gain,
         mask=mask,
     )
 
@@ -102,12 +71,14 @@ def fused_mtp_embed_hidden_gemma_norm(
     hidden_weight: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Gather, exactly normalize, and concatenate MTP embedding/hidden rows.
+    """Gather, normalize and concatenate MTP embedding/hidden rows.
 
-    The FP32 squares for both inputs share one launch and one ``aten::mean``
-    reduction over ``[2N, H]``.  Keeping that reduction is what makes this
-    path bitwise-identical to the conservative Gemma RMSNorm implementation;
-    the final normalization writes directly into the ``[N, 2H]`` FC input.
+    One launch writes the ``[N, 2H]`` FC input directly. It used to take two
+    launches plus an ``aten::mean`` over a ``[2N, H]`` FP32 scratch buffer,
+    because matching that reduction tree was how the path was kept
+    bitwise-identical to the Gemma RMSNorm implementation; both now share the
+    same in-kernel ``tl.sum``, so the scratch buffer and the extra launch are
+    gone and the equivalence still holds.
     """
     ids = token_ids.reshape(-1)
     if previous_hidden.ndim != 2 or embed_table.ndim != 2:
@@ -142,39 +113,19 @@ def fused_mtp_embed_hidden_gemma_norm(
     )
     if num_rows == 0:
         return out
-    work = torch.empty(
-        (2 * num_rows, hidden_size),
-        dtype=torch.float32,
-        device=previous_hidden.device,
-    )
-    block = min(1024, triton.next_power_of_2(hidden_size))
-    grid = (num_rows, triton.cdiv(hidden_size, block))
-    _mtp_embed_hidden_square_kernel[grid](
+    _mtp_embed_hidden_gemma_norm_kernel[(num_rows,)](
         ids,
         embed_table,
         previous_hidden,
-        work,
-        embed_table.stride(0),
-        previous_hidden.stride(0),
-        num_rows,
-        hidden_size=hidden_size,
-        BLOCK=block,
-    )
-    variance = work.mean(dim=-1, keepdim=True)
-    _mtp_embed_hidden_normalize_kernel[grid](
-        ids,
-        embed_table,
-        previous_hidden,
-        variance,
         embedding_weight,
         hidden_weight,
         out,
         embed_table.stride(0),
         previous_hidden.stride(0),
         out.stride(0),
-        num_rows,
-        eps=eps,
-        hidden_size=hidden_size,
-        BLOCK=block,
+        eps,
+        1.0 / hidden_size,
+        hidden_size,
+        BLOCK=triton.next_power_of_2(hidden_size),
     )
     return out

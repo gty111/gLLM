@@ -245,7 +245,7 @@ latching `_prompt_logprobs_sent` so later decode steps don't resend it.
 | TP > 1 | ✅ | ✅ |
 | PP > 1 | ✅ | ✅ |
 | TP > 1 **and** PP > 1 | ✅ | ✅ |
-| Overlap scheduling | ✅ | ✅ (PP=1) |
+| Overlap scheduling | ✅ (PP/TP) | ✅ (PP/TP) |
 
 ---
 
@@ -280,6 +280,9 @@ Verified against a dense model (`Qwen3-0.6B`) and a multimodal model
 - Generation logprobs: PP=1 (overlap + `--no-overlap-scheduling`), PP=2, and TP=2,
   including concurrent/batched requests and long prompts. PP=1 vs PP=2 greedy
   logprobs match numerically.
+- PP=2 overlap generation + prompt logprobs were also validated through the
+  OpenAI `/v1/completions` endpoint; token logprobs and the complete prompt
+  logprob list are returned from the output stage via the optional sidecar.
 - Prompt logprobs:
   - **TP=2** output matches TP=1 within TP floating-point noise (max
     |Δlogprob| ≈ 0.07, smaller than the ≈ 0.14 seen on generation logprobs; all

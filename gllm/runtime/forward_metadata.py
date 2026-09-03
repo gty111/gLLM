@@ -209,7 +209,7 @@ class ForwardMetadataPlan:
         """Write physical buffers, then atomically install this plan.
 
         Attention preparation remains a separate phase because overlap
-        scheduling writes inputs on ``prep_stream`` and consumes them later on
+        scheduling writes inputs on ``forward_stream`` and consumes them later on
         ``forward_stream``.  The same plan spans both phases; callers invoke
         :meth:`prepare_attention` only after the stream dependency is in place.
         """

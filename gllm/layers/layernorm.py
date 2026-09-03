@@ -19,6 +19,12 @@ class GemmaRMSNorm(nn.Module):
     drops in wherever an RMSNorm is expected.
     """
 
+    # Constant added to the stored weight to form the effective gain. Read by
+    # kernels that apply the gain themselves (see
+    # ``gllm.layers.fused_allreduce_norm``) so a norm's convention travels with
+    # the class instead of being re-derived from its name.
+    weight_bias = 1.0
+
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
         self.variance_epsilon = eps
@@ -47,6 +53,9 @@ class GemmaRMSNorm(nn.Module):
 
 
 class RMSNorm(nn.Module):
+
+    # The stored weight is the gain as-is; see ``GemmaRMSNorm.weight_bias``.
+    weight_bias = 0.0
 
     def __init__(
         self,

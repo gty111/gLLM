@@ -14,6 +14,7 @@ from gllm.distributed.parallel_state import (
 
 from gllm.runtime.input_data import InputData
 from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
+from gllm.layers.fused_allreduce_norm import defer_reduce, maybe_fused_norm
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.moe import FusedMoE, SharedExpertRunner, determine_expert_map
 
@@ -77,6 +78,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.shared_expert_gate = torch.nn.Linear(
                 config.hidden_size, 1, bias=False, device="cuda"
             )
+        # Owned by this block rather than a ``RowParallelLinear``: the routed
+        # and shared branches are summed first and reduced once. ``False`` hands
+        # the caller the partial sum so a following norm can fuse the reduce.
+        self.reduce_results = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -103,7 +108,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(orig_shape)
@@ -175,6 +180,18 @@ class Qwen2MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Hand each output projection's all-reduce to the norm that consumes it
+        # so one flashinfer kernel does all-reduce + residual add + norm.
+        self._fuse_attn = defer_reduce(self.self_attn)
+        self._fuse_mlp = defer_reduce(self.mlp)
+        # ``_fuse_input`` is whether the tensor arriving at ``input_layernorm``
+        # is still a per-rank partial. That depends on the *predecessor*, not on
+        # this layer, so the model sets it after building the stack (see
+        # ``_link_fused_reduces``): layer 0 of any stage always receives a
+        # reduced tensor -- an embedding, or a value the previous PP stage
+        # reduced before sending -- and the default here keeps a standalone
+        # layer (the MTP block) safe.
+        self._fuse_input = False
 
     def forward(
         self,
@@ -186,7 +203,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = maybe_fused_norm(
+                hidden_states, residual, self.input_layernorm, self._fuse_input
+            )
         hidden_states, residual = piecewise_dynamic_tensor(
             lambda x: self.self_attn(
                 input_data=input_data,
@@ -195,7 +214,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = maybe_fused_norm(
+            hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 

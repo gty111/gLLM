@@ -1,4 +1,5 @@
 import copy
+import os
 import random
 import time
 from collections import deque
@@ -62,6 +63,12 @@ class Scheduler:
         # Hard floor so prefill never drains the free list to literally empty
         # (page allocation within a batch is slightly bursty).
         self.min_reserve_pages = max(1, self.pp_size)
+        # How many independent decode cohorts the running set is split into --
+        # i.e. how many microbatches the pipeline holds at once. More cohorts
+        # lengthen the decode dependency chain but cost a weight pass per
+        # token each: at 48 requests, two cohorts of 24 rows ran 2576 tok/s
+        # against 2088 for three of 16.
+        self.decode_cohorts = max(1, self.pp_size)
 
         # seqs to schedule
         self.seqs_to_prefill: deque[GenerationSequence] = deque()
@@ -419,19 +426,20 @@ class Scheduler:
         return []
 
     def get_balanced_decode_token_budget(self, num_total_decode_seqs):
-        if num_total_decode_seqs < self.pp_size:
+        cohorts = self.decode_cohorts
+        if num_total_decode_seqs < cohorts:
             decode_token_budget = 1
         else:
-            # Add a rotating [0, pp_size-1] jitter before the floor-divide so the
-            # split doesn't always round down (e.g. #seqs=5, pp_size=4). The
+            # Add a rotating [0, cohorts-1] jitter before the floor-divide so the
+            # split doesn't always round down (e.g. #seqs=5, cohorts=4). The
             # jitter must be *deterministic and identical across ranks* -- every
             # column-driver runs the same schedule, so a per-scheduler counter
             # advanced in lockstep keeps TP peers on the same budget (a prior
             # ``random.randint`` diverged them for pp_size>1 and deadlocked the
             # MoE/EP all-reduce; see ``__init__``).
-            jitter = self._decode_budget_jitter % self.pp_size
+            jitter = self._decode_budget_jitter % cohorts
             self._decode_budget_jitter += 1
-            decode_token_budget = (num_total_decode_seqs + jitter) // self.pp_size
+            decode_token_budget = (num_total_decode_seqs + jitter) // cohorts
 
         decode_token_budget = min(self.maxd, decode_token_budget)
         return decode_token_budget
@@ -832,6 +840,18 @@ class Scheduler:
 class OverlapScheduler(Scheduler):
     """Scheduler with deferred/finalize output processing for overlap scheduling."""
 
+    # ``decode_cohorts`` deliberately stays at ``pp_size`` even though the
+    # overlap driver keeps ``pp_size + 1`` microbatches live at the launch
+    # boundary. Adding a cohort would make every dispatched batch's inputs
+    # already resolved on the CPU, but decode cost is dominated by streaming
+    # the stage's weights, so a microbatch of N/(pp_size+1) rows costs nearly
+    # as much as one of N/pp_size: the extra cohort buys one fewer FutureMap
+    # wait at the price of another full weight pass per generated token. The
+    # in-flight token dependency is resolved on the GPU instead: the last
+    # stage broadcasts its sampled tokens on ``feedback_stream``, and
+    # ``FutureMap.wait_for_inputs`` makes the consumer's ``forward_stream``
+    # wait on that slot's readiness event rather than on the CPU.
+
     def process_output_deferred(self, future_slot_ids: list[int]):
         """Update seq state with placeholders; return metadata for later finalize."""
         if len(self.batch_running) == 0:
@@ -849,7 +869,16 @@ class OverlapScheduler(Scheduler):
                 placeholder_pos = len(seq.token_ids)
                 seq.append(placeholder)
                 deferred_seqs.append((idx, seq, placeholder_pos))
-                self.seqs_to_decode.appendleft(seq)
+                if self.pp_size > 1:
+                    # Fill the PP pipeline with independent microbatches before
+                    # revisiting this batch. Pushing an in-flight batch back to
+                    # the front makes batch N+1 immediately consume batch N's
+                    # future tokens, serializing all PP stages. Rotating to
+                    # the tail is sufficient here because decode is
+                    # already partitioned into ``pp_size`` balanced cohorts.
+                    self.seqs_to_decode.append(seq)
+                else:
+                    self.seqs_to_decode.appendleft(seq)
 
         return deferred_seqs
 
@@ -1067,13 +1096,20 @@ class OverlapScheduler(Scheduler):
             ipc_package.act_schedule_ids or ipc_package.free_ids
         ) else None
 
-    def process_output_finalize(self, deferred_seqs, next_tokens, logprobs=None):
+    def process_output_finalize(
+        self, deferred_seqs, next_tokens, logprobs=None, defer_frees=None
+    ):
         """Replace placeholders with real tokens after D2H / PP token delivery.
 
         ``logprobs`` (when provided) is a per-batch-row list of
         ``(sampled_logprob, top_ids, top_vals)`` produced by the overlap
         worker; it is keyed by the same ``batch_idx`` as ``next_tokens`` and
         sliced per-seq to that seq's ``num_top_logprobs``.
+
+        ``defer_frees``, when given, collects the sequences retired here whose
+        pages a still-in-flight successor may be reading; the caller releases
+        them at that successor's completion boundary.  Mirrors the MTP path's
+        :meth:`process_mtp_output_finalize`.
         """
         if deferred_seqs is None:
             return None
@@ -1118,7 +1154,14 @@ class OverlapScheduler(Scheduler):
                 # see ``Scheduler.consume_pending_follower_frees``.
                 self._pending_follower_frees.append(seq.seq_id)
                 seq._overlap_freed = True
-                self.model_runner.free(seq)
+                if defer_frees is None:
+                    self.model_runner.free(seq)
+                else:
+                    # A successor was launched before this output was
+                    # collected and may still be reading the sequence's pages.
+                    # Retire it logically now; the caller releases the pages at
+                    # that successor's completion boundary.
+                    defer_frees.append(seq)
                 try:
                     self.seqs_to_decode.remove(seq)
                 except ValueError:

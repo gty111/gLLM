@@ -16,6 +16,11 @@ from gllm.runtime.input_data import InputData
 from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.attention.base import AttentionLayerBase
+from gllm.layers.fused_allreduce_norm import (
+    defer_reduce,
+    link_fused_reduces,
+    maybe_fused_norm,
+)
 from gllm.layers.attention.mla import MLAAttention
 from gllm.layers.attention.qkv import QKVAttention
 from gllm.layers.layernorm import RMSNorm
@@ -124,6 +129,10 @@ class DeepseekV2MOE(nn.Module):
             # MoE must not publish its result by overwriting that tensor.
             self.experts.inplace = False
 
+        # Reduce owned by this block (routed + shared are summed first). Set to
+        # ``False`` to hand the caller the partial sum for a fused norm.
+        self.reduce_results = True
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -160,7 +169,7 @@ class DeepseekV2MOE(nn.Module):
                     1.0 / self.routed_scaling_factor
                 )
 
-        if get_tp_size() > 1:
+        if get_tp_size() > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -581,6 +590,20 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        # Hand each output projection's all-reduce to the norm that consumes it
+        # so one flashinfer kernel does all-reduce + residual add + norm. The
+        # fp16-overflow rescaling below is a constant factor and commutes with
+        # the reduce, so deferring it past those lines is safe.
+        self._fuse_attn = defer_reduce(self.self_attn)
+        self._fuse_mlp = defer_reduce(self.mlp)
+        # ``_fuse_input`` is whether the tensor arriving at ``input_layernorm``
+        # is still a per-rank partial. That depends on the *predecessor*, not on
+        # this layer, so the model sets it after building the stack (see
+        # ``_link_fused_reduces``): layer 0 of any stage always receives a
+        # reduced tensor -- an embedding, or a value the previous PP stage
+        # reduced before sending -- and the default here keeps a standalone
+        # layer (the MTP block) safe.
+        self._fuse_input = False
         self.routed_scaling_factor = config.routed_scaling_factor
 
         self.layer_id = layer_id
@@ -596,7 +619,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = maybe_fused_norm(
+                hidden_states, residual, self.input_layernorm, self._fuse_input
+            )
         hidden_states, residual = piecewise_dynamic_tensor(
             lambda x: self.self_attn(input_data, x), hidden_states, residual
         )
@@ -612,7 +637,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual *= 1.0 / self.routed_scaling_factor
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = maybe_fused_norm(
+            hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
+        )
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
@@ -641,6 +668,7 @@ class DeepseekV2Model(nn.Module):
                 for i in range(self.start_layer, self.end_layer)
             ]
         )
+        self._fuse_tail = link_fused_reduces(self.layers)
 
         if is_last_pp_rank():
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -651,10 +679,15 @@ class DeepseekV2Model(nn.Module):
         for layer in self.layers:
             hidden_states, residual = layer(input_data, hidden_states, residual)
         if is_last_pp_rank():
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states, _ = maybe_fused_norm(
+                hidden_states, residual, self.norm, self._fuse_tail
+            )
             return hidden_states
-        else:
-            return hidden_states, residual
+        # A deferred mlp reduce leaves a per-rank partial about to cross the
+        # stage boundary; the next stage's first layer would never reduce it.
+        if self._fuse_tail:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states, residual
 
 
 class DeepseekV2ForCausalLM(Qwen2MoeForCausalLM):
