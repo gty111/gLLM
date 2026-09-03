@@ -65,7 +65,10 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
         dest="overlap_scheduling",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="CPU/GPU overlap scheduling with FutureMap (default: on; requires pp=1)",
+        help=(
+            "CPU/GPU overlap scheduling with FutureMap (default: on; supports "
+            "TP and PP; combined PP+DP-attention currently falls back)"
+        ),
     )
     p.add_argument(
         "--gpu-memory-util",

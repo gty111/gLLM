@@ -47,16 +47,10 @@ import torch.distributed as dist
 from logger import logger
 
 from gllm.distributed.comm import IPCPackage, zmqComm
-from gllm.scheduling.distributed import (
-    DriverPayloadBuilder,
-    FollowerSeqStore,
-    SchedulePayload,
-)
 from gllm.distributed.parallel_state import (
     dp_all_gather_meta,
     get_last_pp_rank,
     get_next_pp_rank,
-    get_pp_rank,
     get_pp_size,
     get_rank,
     get_tp_rank,
@@ -74,6 +68,11 @@ from gllm.distributed.parallel_state import (
 from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
 from gllm.runtime.profiler import TorchProfilerMixin
+from gllm.scheduling.distributed import (
+    DriverPayloadBuilder,
+    FollowerSeqStore,
+    SchedulePayload,
+)
 from gllm.scheduling.scheduler import Scheduler
 
 
@@ -414,6 +413,7 @@ class Worker(TorchProfilerMixin):
         if payload.control_cmd != 0:
             self._apply_control_cmd(payload.control_cmd, payload.control_data)
 
+        freed_seqs = [self.follower_store.get(sid) for sid in payload.frees]
         seqs = self.follower_store.apply_payload(payload)
 
         # Hybrid/SSM (GDN) under PP>1: mirror the driver's per-page snapshot-slot
@@ -428,7 +428,9 @@ class Worker(TorchProfilerMixin):
         # used (free-after-update => mirror is in the post-batch
         # state).
         if payload.frees:
-            for sid in payload.frees:
+            for sid, freed_seq in zip(payload.frees, freed_seqs):
+                if freed_seq is not None:
+                    self.model_runner.memory_manager.free_rep_slot(freed_seq)
                 self.model_runner.free_follower_state(sid)
 
         # DP+PP: an idle DP group's filler microbatch carries no real seqs. Build

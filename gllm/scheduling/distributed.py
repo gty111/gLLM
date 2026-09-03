@@ -88,12 +88,11 @@ Design notes
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from gllm.runtime.sequence import GenerationSequence
-
 
 # ---------------------------------------------------------------------------
 # Wire-format dataclasses (pickled by zmq)
@@ -466,6 +465,8 @@ class FollowerSeq:
         "num_prompt_logprobs",
         "raw_prompt_len",
         "prompt_logprobs_data",
+        "rep_slot",
+        "rep_filled",
         "recurrent_state_slot",
         "ssm_block_table",
         "ssm_num_accepted",
@@ -539,6 +540,11 @@ class FollowerSeq:
         self.num_prompt_logprobs = reg.num_prompt_logprobs
         self.raw_prompt_len = reg.raw_prompt_len
         self.prompt_logprobs_data = None
+        # Follower-local slot in this stage's repetition-penalty pool.  The
+        # driver's slot id is intentionally not mirrored: every stage owns an
+        # independent MemoryManager and allocates/frees its own rows.
+        self.rep_slot = None
+        self.rep_filled = 0
 
     # ---- duck-typed GenerationSequence surface --------------------------------------
 
@@ -674,6 +680,10 @@ class FollowerSeqStore:
             self._table.pop(sid, None)
 
         return seqs
+
+    def get(self, seq_id: int) -> Optional[FollowerSeq]:
+        """Return a follower mirror for local resource cleanup, if present."""
+        return self._table.get(seq_id)
 
     def evict(self, seq_id: int) -> Optional[FollowerSeq]:
         """Explicit eviction hook (used by shutdown / abort paths)."""

@@ -60,6 +60,12 @@ from gllm.distributed.parallel_state import (
 )
 from gllm.runtime.input_data import InputData
 from gllm.layers.attention.qkv import QKVAttention
+from gllm.distributed.parallel_state import tensor_model_parallel_all_reduce
+from gllm.layers.fused_allreduce_norm import (
+    defer_reduce,
+    link_fused_reduces,
+    maybe_fused_norm,
+)
 from gllm.layers.layernorm import GemmaRMSNorm, RMSNorm
 from gllm.layers.linear import (
     ColumnParallelLinear,
@@ -987,6 +993,21 @@ class Qwen3_5DecoderLayer(nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
+        # Hand each output projection's all-reduce to the norm that consumes it
+        # so one flashinfer kernel does all-reduce + residual add + norm.
+        # Exactly one of ``self_attn`` / ``linear_attn`` exists per layer.
+        self._fuse_attn = defer_reduce(
+            self.self_attn if self.self_attn is not None else self.linear_attn
+        )
+        self._fuse_mlp = defer_reduce(self.mlp)
+        # ``_fuse_input`` is whether the tensor arriving at ``input_layernorm``
+        # is still a per-rank partial. That depends on the *predecessor*, not on
+        # this layer, so the model sets it after building the stack (see
+        # ``_link_fused_reduces``): layer 0 of any stage always receives a
+        # reduced tensor -- an embedding, or a value the previous PP stage
+        # reduced before sending -- and the default here keeps a standalone
+        # layer (the MTP block) safe.
+        self._fuse_input = False
 
     def forward(
         self,
@@ -998,7 +1019,9 @@ class Qwen3_5DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = maybe_fused_norm(
+                hidden_states, residual, self.input_layernorm, self._fuse_input
+            )
 
         if self.self_attn is not None:
             hidden_states, residual = piecewise_dynamic_tensor(
@@ -1008,8 +1031,8 @@ class Qwen3_5DecoderLayer(nn.Module):
             hidden_states, residual = piecewise_dynamic_tensor(
                 lambda x: self.linear_attn(input_data, x), hidden_states, residual
             )
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual
+        hidden_states, residual = maybe_fused_norm(
+            hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
         )
         # MoE routing and expert kernels are GPU-only and graph-safe for a
         # static token bucket. Its large scratch/dispatch buffers are owned by
@@ -1044,9 +1067,18 @@ class Qwen3_5Model(nn.Module):
         if decoder_layer_type is None:
             decoder_layer_type = Qwen3_5DecoderLayer
 
-        if is_first_pp_rank() or (
-            getattr(config, "tie_word_embeddings", False) and is_last_pp_rank()
-        ):
+        # The last PP rank needs the token embedding too when it carries a
+        # tied LM head, or an MTP head: the head embeds the token it drafts
+        # from (``Qwen3_5MTP._embed``), and with an untied checkpoint nothing
+        # else would put the table on that rank -- it used to fail at the
+        # first draft step with a bare ``no attribute '_embed'``. The base
+        # loader keys off ``named_parameters()``, so simply owning the module
+        # is enough for ``model.embed_tokens.weight`` to be loaded here; the
+        # cost is one extra copy of the table on that rank.
+        needs_embed_for_head = is_last_pp_rank() and (
+            getattr(config, "tie_word_embeddings", False) or _use_mtp(config)
+        )
+        if is_first_pp_rank() or needs_embed_for_head:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -1103,6 +1135,9 @@ class Qwen3_5Model(nn.Module):
                 )
                 kv_counter += 1
         self.layers = nn.ModuleList(layers)
+        # Whether the last layer handed its mlp output on un-reduced; the tail
+        # (final norm, or the PP hand-off) has to account for it.
+        self._fuse_tail = link_fused_reduces(self.layers)
         self.num_kv_layers = kv_counter
         self.num_ssm_layers = ssm_counter
         # Global linear-attn layer indices (for diagnostics / config); the
@@ -1139,11 +1174,18 @@ class Qwen3_5Model(nn.Module):
                 )
 
         if not is_last_pp_rank():
+            # A deferred mlp reduce leaves a per-rank partial about to cross the
+            # stage boundary; the next stage's first layer takes the
+            # ``residual is None`` branch and would never reduce it.
+            if self._fuse_tail:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             return hidden_states, residual
         # The MTP head consumes this POST-norm output, matching vLLM
         # (``target_hidden_states = hidden_states``) and sglang
         # (``spec_info.hidden_states``); the pre-norm residual is not it.
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states, _ = maybe_fused_norm(
+            hidden_states, residual, self.norm, self._fuse_tail
+        )
         return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1264,6 +1306,17 @@ def _load_gdn_layer_weights(layer: Qwen3_5GatedDeltaNet, prefix: str, weights):
 
 
 # ---------------------------------------------------------------------------
+def _use_mtp(config) -> bool:
+    """Whether an MTP head will be built for this config.
+
+    Needed in two places that must agree: the head itself (last PP rank) and
+    the token embedding it reads, which the base model otherwise builds only
+    on the first PP rank.
+    """
+    num_mtp = getattr(config, "mtp_num_hidden_layers", 0) or 0
+    return bool(getattr(config, "mtp_enabled", False)) and num_mtp >= 1
+
+
 # Qwen3_5MTP (Multi-Token Prediction head for speculative decoding)
 # ---------------------------------------------------------------------------
 
@@ -1367,7 +1420,9 @@ class Qwen3_5MTP(nn.Module):
         x = self.fc(eh)
         # mtp_block is a standard decoder layer: (input_data, hidden, residual).
         x, residual = self.mtp_block(input_data, x, None)
-        x, _ = self.norm(x, residual)
+        x, _ = maybe_fused_norm(
+            x, residual, self.norm, getattr(self.mtp_block, "_fuse_mlp", False)
+        )
         return x
 
     def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1460,9 +1515,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # final hidden live. The head's full-attention block uses the KV slot
         # just past the base full-attention layers (``num_kv_layers``).
         self.mtp = None
-        num_mtp = getattr(config, "mtp_num_hidden_layers", 0) or 0
-        want_mtp = getattr(config, "mtp_enabled", False) and num_mtp >= 1
-        if want_mtp and is_last_pp_rank():
+        if _use_mtp(config) and is_last_pp_rank():
             self.mtp = Qwen3_5MTP(
                 config,
                 kv_layer_id=self.model.num_kv_layers,

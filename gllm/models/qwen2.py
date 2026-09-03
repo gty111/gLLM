@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from gllm.distributed.parallel_state import (
+    tensor_model_parallel_all_reduce,
     get_pp_layers,
     is_first_pp_rank,
     is_last_pp_rank,
@@ -13,6 +14,11 @@ from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.activation import SiluAndMul
 from gllm.layers.attention.base import AttentionLayerBase
 from gllm.layers.attention.qkv import QKVAttention
+from gllm.layers.fused_allreduce_norm import (
+    defer_reduce,
+    link_fused_reduces,
+    maybe_fused_norm,
+)
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import (
     MergedColumnParallelLinear,
@@ -131,6 +137,22 @@ class Qwen2DecoderLayer(nn.Module):
         self.mlp = mlp_type(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        # Hand each output projection's all-reduce to the norm that consumes
+        # it, so one flashinfer kernel does all-reduce + residual add + norm.
+        # ``defer_reduce`` reports whether it could, and ``maybe_fused_norm``
+        # falls back to the plain norm when it could not.
+        self._fuse_attn = defer_reduce(self.self_attn)
+        self._fuse_mlp = defer_reduce(self.mlp)
+        # ``_fuse_attn``: this layer's attention left its output un-reduced, so
+        # ``post_attention_layernorm`` owns that all-reduce.
+        # ``_fuse_input``: whether the tensor arriving at ``input_layernorm`` is
+        # still a per-rank partial. That depends on the *predecessor*, not on
+        # this layer, so the model sets it after building the stack: layer 0 of
+        # any stage always receives a reduced tensor (an embedding, or a value
+        # the previous PP stage reduced before sending), and it stays False here
+        # so a layer used standalone is safe.
+        self._fuse_input = False
+
 
     def forward(
         self,
@@ -142,13 +164,17 @@ class Qwen2DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = maybe_fused_norm(
+                hidden_states, residual, self.input_layernorm, self._fuse_input
+            )
         hidden_states, residual = piecewise_dynamic_tensor(
             lambda x: self.self_attn(input_data, x), hidden_states, residual
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = maybe_fused_norm(
+            hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -169,6 +195,7 @@ class Qwen2Model(nn.Module):
                 for i in range(self.start_layer, self.end_layer)
             ]
         )
+        self._fuse_tail = link_fused_reduces(self.layers)
         if is_last_pp_rank():
             self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
@@ -179,10 +206,16 @@ class Qwen2Model(nn.Module):
             layer = self.layers[i]
             hidden_states, residual = layer(input_data, hidden_states, residual)
         if is_last_pp_rank():
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states, _ = maybe_fused_norm(
+                hidden_states, residual, self.norm, self._fuse_tail
+            )
             return hidden_states
-        else:
-            return hidden_states, residual
+        # The final layer's mlp output is a per-rank partial when its reduce was
+        # deferred, and it is about to leave this stage: reduce it here, since
+        # the next stage's first layer takes the ``residual is None`` branch.
+        if self._fuse_tail:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states, residual
         
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

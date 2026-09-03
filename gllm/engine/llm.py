@@ -11,7 +11,6 @@ from logger import logger
 from gllm.distributed.comm import IPCPackage, zmqComm
 from gllm.runtime.id_allocator import IDAllocator
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
-from gllm.workers.overlap import OverlapWorker, run_overlap_worker
 from gllm.runtime.sequence import GenerationSequence
 from gllm.utils import (
     StreamOutput,
@@ -20,6 +19,7 @@ from gllm.utils import (
     init_logger,
     random_uuid,
 )
+from gllm.workers.overlap import OverlapWorker, run_overlap_worker
 from gllm.workers.worker import Worker, run_worker
 
 
@@ -92,9 +92,10 @@ class LLM:
         skip_language = (
             disagg_config.skip_language if disagg_config is not None else False
         )
-        if overlap_scheduling and pp_size > 1:
+        if overlap_scheduling and pp_size > 1 and dp_size > 1:
             logger.warning(
-                "overlap_scheduling is not supported with pp_size>1; disabling overlap"
+                "overlap_scheduling with combined PP+DP-attention is not yet "
+                "supported; disabling overlap"
             )
             overlap_scheduling = False
         model_runner_cls = OverlapModelRunner if overlap_scheduling else ModelRunner
@@ -172,7 +173,7 @@ class LLM:
         logger.info(f"Schedule method: {schedule_method}")
         if self.overlap_scheduling:
             logger.info(
-                "Overlap scheduling enabled (FutureMap + CPU/GPU overlap, TP only)"
+                "Overlap scheduling enabled (FutureMap + CPU/GPU overlap, TP/PP)"
             )
 
         # Interact with workers

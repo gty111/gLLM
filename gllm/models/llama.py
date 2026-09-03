@@ -7,6 +7,7 @@ from gllm.runtime.input_data import InputData
 from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.attention.base import AttentionLayerBase
 from gllm.layers.attention.qkv import QKVAttention
+from gllm.layers.fused_allreduce_norm import defer_reduce, maybe_fused_norm
 from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from gllm.layers.rotary_embedding import (
@@ -110,6 +111,21 @@ class LlamaDecoderLayer(nn.Module):
         self.self_attn = LlamaAttention(layer_id, config)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = LlamaMLP(config)
+        # Hand each output projection's all-reduce to the norm that consumes
+        # it, so one flashinfer kernel does all-reduce + residual add + norm.
+        # ``defer_reduce`` reports whether it could, and ``maybe_fused_norm``
+        # falls back to the plain norm when it could not.
+        self._fuse_attn = defer_reduce(self.self_attn)
+        self._fuse_mlp = defer_reduce(self.mlp)
+        # ``_fuse_input`` is whether the tensor arriving at ``input_layernorm``
+        # is still a per-rank partial. That depends on the *predecessor*, not on
+        # this layer, so the model sets it after building the stack (see
+        # ``_link_fused_reduces``): layer 0 of any stage always receives a
+        # reduced tensor -- an embedding, or a value the previous PP stage
+        # reduced before sending -- and the default here keeps a standalone
+        # layer (the MTP block) safe.
+        self._fuse_input = False
+
 
     def forward(
         self,
@@ -122,7 +138,9 @@ class LlamaDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = maybe_fused_norm(
+                hidden_states, residual, self.input_layernorm, self._fuse_input
+            )
 
         # self attention
         hidden_states, residual = piecewise_dynamic_tensor(
@@ -130,7 +148,9 @@ class LlamaDecoderLayer(nn.Module):
         )
 
         # post attention layernorm
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, residual = maybe_fused_norm(
+            hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
+        )
 
         # mlp
         hidden_states = self.mlp(hidden_states)

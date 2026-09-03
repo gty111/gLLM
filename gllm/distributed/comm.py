@@ -1,12 +1,11 @@
 import queue
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
 import zmq
 
-from gllm.scheduling.distributed import SchedulePayload
 from gllm.distributed.parallel_state import (
     get_ipc_tp_group,
     get_output_rank,
@@ -20,8 +19,8 @@ from gllm.distributed.parallel_state import (
     send_obj_list,
 )
 from gllm.runtime.sequence import GenerationSequence
-from gllm.utils import make_socket, make_pull_random
-
+from gllm.scheduling.distributed import SchedulePayload
+from gllm.utils import make_pull_random, make_socket
 
 _SHUTDOWN = object()  # sentinel pushed onto a sender queue to drain it
 
@@ -326,8 +325,8 @@ class zmqComm:
         assert type(tokens) in (list, tuple)
         self.token_socket.send_pyobj(tokens)
 
-    def recv_tokens(self):
-        if self.token_socket.poll(timeout=0) != 0:
+    def recv_tokens(self, block: bool = False):
+        if block or self.token_socket.poll(timeout=0) != 0:
             next_tokens = self.token_socket.recv_pyobj()
             return next_tokens
         else:
@@ -537,10 +536,9 @@ class zmqComm:
         rides the existing TP NCCL communicator (no second backend, no
         gloo round trip).
 
-        For the overlap path (PP=1) this method is unnecessary: the
-        token broadcast already happens GPU-side inside
-        :meth:`OverlapModelRunner.run_batch_async` on the same TP NCCL
-        group, and every PP-0 TP rank D2H-copies it locally.
+        For the overlap path this method is unnecessary: sampled tokens
+        already travel GPU-side (within TP and, for PP>1, through the FutureMap
+        feedback path), and every PP-0 TP rank D2H-copies its result locally.
 
         Returns ``None`` (on every TP rank in lockstep) when the source
         rank had no tokens to broadcast this iter -- callers can then
