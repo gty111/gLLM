@@ -88,10 +88,10 @@ class MLAAttention:
         self.kv_cache_dtype = "auto"
 
         self.attention_backend = (attention_backend or "").lower()
-        if self.attention_backend not in ("fa4", "flashinfer"):
+        if self.attention_backend not in ("fa4", "flashinfer", "fa3"):
             raise ValueError(
                 "attention_backend must already be resolved to 'fa4' or "
-                f"'flashinfer', got {self.attention_backend!r}."
+                f"'flashinfer' or 'fa3', got {self.attention_backend!r}."
             )
 
         self.decode_backend = (decode_backend or "").lower()

@@ -89,12 +89,13 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--attention-backend",
         type=str,
-        choices=["auto", "fa4", "flashinfer"],
+        choices=["auto", "fa4", "flashinfer", "fa3"],
         default="flashinfer",
         help=(
             "Attention backend for paged-QKV attention and varlen prefill "
             "paths. FlashInfer is used by default; startup config validation "
-            "resolves the selected backend before model construction."
+            "resolves the selected backend before model construction, falling "
+            "back to SGL kernel FlashAttention-3 on SM80/SM89. Use 'fa3' to prefer it explicitly."
         ),
     )
     p.add_argument(

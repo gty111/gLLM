@@ -3,6 +3,7 @@ import inspect
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 import gllm.runtime.model_runner as model_runner_module
 from gllm.engine.llm import LLM
@@ -337,3 +338,39 @@ def test_auto_backend_keeps_fa4_without_allocating_flashinfer(monkeypatch):
     runner.verify_config()
     assert runner.attention_backend == "fa4"
     assert created == ["fa4"]
+
+
+@pytest.mark.parametrize("capability", [(8, 0), (8, 9)])
+@pytest.mark.parametrize("requested", ["auto", "fa4", "flashinfer", "fa3"])
+def test_sm8x_selects_and_probes_fa3(monkeypatch, capability, requested):
+    attempts = []
+    backend = SimpleNamespace(name="fa3", smoke_test=lambda page: attempts.append(page))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: capability)
+    monkeypatch.setattr(model_runner_module, "propagate_serving_config", lambda _: None)
+
+    def create(name, *_):
+        assert name == "fa3"
+        return backend
+
+    monkeypatch.setattr(model_runner_module, "create_qkv_attention_backend", create)
+    runner = _backend_validation_runner(requested)
+    runner.verify_config()
+    assert runner.attention_backend == runner.model_loader.config.attention_backend == "fa3"
+    assert runner._validated_qkv_attention_backend is backend
+    assert attempts == [16]
+
+
+def test_sm8x_failed_fa3_probe_reports_all_backends(monkeypatch):
+    def fail(_):
+        raise RuntimeError("wheel missing SM80 kernel")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(model_runner_module, "create_qkv_attention_backend",
+                        lambda *_: SimpleNamespace(smoke_test=fail))
+    runner = _backend_validation_runner("auto")
+    with pytest.raises(RuntimeError, match="No runnable paged-QKV") as exc:
+        runner.verify_config()
+    assert "wheel missing SM80 kernel" in str(exc.value)
+    assert "fa4:" in str(exc.value)
+    assert "flashinfer:" in str(exc.value)

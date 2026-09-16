@@ -67,6 +67,16 @@ uv pip install "git+https://github.com/gty111/gLLM.git"
 
 ## Quickstart
 
+Paged attention is validated before model construction. On A100 (SM80) and
+RTX 4090 (SM89), `auto` selects SGL kernel's FlashAttention-3 implementation;
+the default `flashinfer` preference and an explicit `fa4` preference also fall
+back to it when their paged kernels do not support the GPU. It can be selected
+directly with `--attention-backend fa3`. This uses the existing `sglang-kernel`
+dependency (its FA3 variant includes SM8x support) and supports paged prefill, decode, GQA/MQA, and CUDA Graph replay.
+Startup launches a small kernel probe and reports an error if the installed
+wheel cannot run it. This fallback covers attention; model-specific FP8/MoE
+kernels retain their own hardware requirements.
+
 
 ### Launch OpenAI-Compatible Server (Intra-node)
 
