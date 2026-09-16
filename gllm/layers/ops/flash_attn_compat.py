@@ -127,11 +127,45 @@ def flash_attn_varlen_func(
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
         raise ValueError("cu_seqlens_q and cu_seqlens_k must have equal batch size")
     backend = backend.lower()
-    if backend not in ("fa4", "flashinfer"):
+    if backend not in ("fa4", "flashinfer", "fa3"):
         raise ValueError(
-            "backend must be the resolved value 'fa4' or 'flashinfer', "
+            "backend must be the resolved value 'fa4', 'flashinfer', or 'fa3', "
             f"got {backend!r}"
         )
+
+    if backend == "fa3":
+        from sgl_kernel.flash_attn import flash_attn_varlen_func as sgl_varlen
+
+        value_dim = v.shape[-1]
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        if (
+            q.shape[-1] != value_dim
+            and torch.cuda.get_device_capability(q.device)[0] == 8
+        ):
+            # Ampere/Ada kernels require equal QK/V dimensions. Zero padding
+            # preserves attention scores, using the original softmax scale.
+            head_dim = max(q.shape[-1], value_dim)
+            q = torch.nn.functional.pad(q, (0, head_dim - q.shape[-1]))
+            k = torch.nn.functional.pad(k, (0, head_dim - k.shape[-1]))
+            v = torch.nn.functional.pad(v, (0, head_dim - value_dim))
+        result = sgl_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_softmax_lse=return_softmax_lse,
+            **kwargs,
+        )
+        if return_softmax_lse:
+            # SGL also returns auxiliary tensors; callers expect (out, lse).
+            return result[0][..., :value_dim], result[1]
+        return result[..., :value_dim]
 
     if backend == "fa4":
         if _fa4_varlen_func is None:

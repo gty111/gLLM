@@ -411,9 +411,9 @@ class ModelRunner:
         self.use_mm = self.model_loader.use_mm
         self.use_mla = self.model_loader.use_mla
         self.attention_backend = (attention_backend or "flashinfer").lower()
-        if self.attention_backend not in ("auto", "fa4", "flashinfer"):
+        if self.attention_backend not in ("auto", "fa4", "flashinfer", "fa3"):
             raise ValueError(
-                "attention_backend must be 'auto', 'fa4', or 'flashinfer', "
+                "attention_backend must be 'auto', 'fa4', 'flashinfer', or 'fa3', "
                 f"got {self.attention_backend!r}."
             )
         self.hidden_size = self.model_loader.hidden_size
@@ -652,18 +652,29 @@ class ModelRunner:
         requested = self.attention_backend
         capability = torch.cuda.get_device_capability()
 
-        # Instantiate the preferred backend and, for FlashInfer, launch both
-        # TRT-LLM Gen kernels. Some wheels import successfully but contain no
-        # cubin for the current GPU; only a real launch detects that condition.
+        # Instantiate candidates and launch the FlashInfer/FA3 kernels.
+        # Some wheels import successfully but contain no cubin for the current
+        # GPU; only a real launch detects that condition.
         preference = {
-            "auto": ("fa4", "flashinfer"),
-            "fa4": ("fa4", "flashinfer"),
-            "flashinfer": ("flashinfer", "fa4"),
+            "auto": (
+                ("fa3", "fa4", "flashinfer")
+                if capability[0] == 8
+                else ("fa4", "flashinfer", "fa3")
+            ),
+            "fa4": ("fa4", "flashinfer", "fa3"),
+            "flashinfer": ("flashinfer", "fa4", "fa3"),
+            "fa3": ("fa3", "fa4", "flashinfer"),
         }[requested]
         backend_errors = {}
         validated_backend = None
         resolved = None
         for candidate in preference:
+            if candidate == "flashinfer" and capability[0] == 8:
+                backend_errors[candidate] = "TRT-LLM/XQA paged KV is unsupported on SM8x"
+                continue
+            if candidate == "fa3" and capability[0] not in (8, 9):
+                backend_errors[candidate] = "SGL kernel FlashAttention-3 requires SM8x or SM90"
+                continue
             if candidate == "fa4" and capability[0] not in (9, 10, 11):
                 backend_errors[candidate] = (
                     f"paged KV is unsupported on SM{capability[0]}{capability[1]}"
@@ -676,7 +687,7 @@ class ModelRunner:
                     self.model_max_length,
                     self.max_running_seqs,
                 )
-                if candidate == "flashinfer":
+                if candidate in ("flashinfer", "fa3"):
                     candidate_backend.smoke_test(self.page_size)
             except Exception as exc:  # noqa: BLE001 - backend probe boundary
                 backend_errors[candidate] = str(exc)

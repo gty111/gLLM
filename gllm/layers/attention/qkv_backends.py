@@ -130,6 +130,75 @@ class FA4AttentionBackend(QKVAttentionBackend):
         return result[0] if isinstance(result, tuple) else result
 
 
+class FA3AttentionBackend(QKVAttentionBackend):
+    """SGL kernel's FlashAttention-3 implementation for SM80/SM89/SM90.
+
+    Unlike the TRT-LLM/XQA path, this supports Ampere and Ada. Metadata
+    references the runtime's static buffers directly, including during graph
+    replay; no CPU planning or sequence-length readback is needed.
+    """
+
+    name = "fa3"
+
+    def __init__(self, model_max_length: int, max_running_seqs: int):
+        super().__init__(model_max_length, max_running_seqs)
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+        self._flash_attn_with_kvcache = flash_attn_with_kvcache
+
+    def prepare_metadata(
+        self, input_data: "InputData", plan: "ForwardMetadataPlan"
+    ) -> PagedAttentionMetadata:
+        return PagedAttentionMetadata(
+            block_table=input_data.get_block_table(),
+            seq_lens=input_data.get_seq_lens(),
+            query_start_loc=input_data.get_query_start_loc(),
+            max_query_len=plan.max_query_len,
+            batch_size=plan.batch_size,
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        metadata: PagedAttentionMetadata,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        return self._flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=metadata.seq_lens,
+            page_table=metadata.block_table,
+            cu_seqlens_q=metadata.query_start_loc,
+            max_seqlen_q=metadata.max_query_len,
+            softmax_scale=softmax_scale,
+            causal=True,
+            # A fixed split count avoids host scheduling during CUDA capture.
+            num_splits=1,
+        )
+
+    def smoke_test(self, page_size: int) -> None:
+        # Exercise decode and multi-token prefill, a page boundary, and GQA.
+        # Import success alone does not guarantee that a wheel contains SM8x.
+        q = torch.zeros((3, 8, 128), dtype=torch.bfloat16, device="cuda")
+        k = torch.zeros((4, page_size, 2, 128), dtype=q.dtype, device=q.device)
+        v = torch.ones_like(k)
+        metadata = PagedAttentionMetadata(
+            block_table=torch.tensor([[2, 0], [3, 1]], dtype=torch.int32, device=q.device),
+            seq_lens=torch.tensor(
+                [page_size + 1, page_size + 1], dtype=torch.int32, device=q.device
+            ),
+            query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32, device=q.device),
+            max_query_len=2,
+            batch_size=2,
+        )
+        output = self.forward(q, k, v, metadata, 128 ** -0.5)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, torch.ones_like(q))
+
+
 class FlashInferAttentionBackend(QKVAttentionBackend):
     """FlashInfer TRT-LLM generation backend.
 
@@ -380,16 +449,18 @@ def create_qkv_attention_backend(
 ) -> QKVAttentionBackend:
     """Construct the QKV backend selected by configuration validation."""
     resolved = (resolved or "").lower()
-    if resolved not in ("fa4", "flashinfer"):
+    if resolved not in ("fa4", "flashinfer", "fa3"):
         raise ValueError(
             "attention_backend must already be resolved to 'fa4' or "
-            f"'flashinfer', got {resolved!r}."
+            f"'flashinfer' or 'fa3', got {resolved!r}."
         )
 
     capability = torch.cuda.get_device_capability()
-    backend_cls = (
-        FlashInferAttentionBackend if resolved == "flashinfer" else FA4AttentionBackend
-    )
+    backend_cls = {
+        "fa4": FA4AttentionBackend,
+        "flashinfer": FlashInferAttentionBackend,
+        "fa3": FA3AttentionBackend,
+    }[resolved]
     backend = backend_cls(model_max_length, max_running_seqs)
     # Construction is also used by startup probing and may be followed by a
     # real-kernel rejection plus fallback. Keep candidate attempts out of the

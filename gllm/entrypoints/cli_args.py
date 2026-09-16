@@ -89,7 +89,7 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--attention-backend",
         type=str,
-        choices=["auto", "fa4", "flashinfer"],
+        choices=["auto", "fa4", "flashinfer", "fa3"],
         default="flashinfer",
         help=(
             "Attention backend for paged-QKV attention and varlen prefill "
