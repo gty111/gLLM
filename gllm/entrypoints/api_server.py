@@ -10,6 +10,7 @@ import uvicorn
 from fastapi import APIRouter, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from jinja2 import TemplateError
 from logger import logger
 
 from gllm.engine.async_llm import AsyncLLM
@@ -149,7 +150,9 @@ def _validate_response_capabilities(request: ResponseRequest):
     checks = [
         (request.background is True, "background"),
         (request.conversation is not None, "conversation"),
-        (bool(request.include), "include"),
+        # This stateless backend emits no encrypted reasoning items. Asking
+        # for their optional encrypted_content therefore adds no output.
+        (bool(set(request.include or []) - {"reasoning.encrypted_content"}), "include"),
         (request.max_tool_calls is not None, "max_tool_calls"),
         (request.moderation is not None, "moderation"),
         (request.previous_response_id is not None, "previous_response_id"),
@@ -368,7 +371,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
                     else None
                 ),
             )
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, TemplateError) as exc:
         return _openai_error(str(exc), param="input", code="invalid_input")
 
     if not llm.check_seq_length(token_ids, request.max_output_tokens):
@@ -395,9 +398,12 @@ async def create_response(request: ResponseRequest, raw_request: Request):
             stream, request, chat_request, tool_parser
         )
         return StreamingResponse(content=generator, media_type="text/event-stream")
-    response = await response_completion_generator(
-        stream, request, chat_request, tool_parser
-    )
+    try:
+        response = await response_completion_generator(
+            stream, request, chat_request, tool_parser
+        )
+    except ValueError as exc:
+        return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
     return JSONResponse(content=response)
 
 

@@ -498,7 +498,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if not isinstance(data, dict):
             return data
         tool_choice = data.get("tool_choice")
-        if tool_choice not in (None, "none") and not data.get("tools"):
+        # Auto permits a text response even when no tools are available.
+        # Only choices that require a tool call need a nonempty tool list.
+        if tool_choice not in (None, "none", "auto") and not data.get("tools"):
             raise ValueError("When using `tool_choice`, `tools` must be set.")
         return data
 
@@ -838,6 +840,8 @@ class ResponseRequest(OpenAIBaseModel):
 
     model: str
     input: Union[str, List[Any]]
+    # Client routing/telemetry hints (e.g. Codex); never part of the prompt.
+    client_metadata: Optional[Dict[str, Any]] = None
     instructions: Optional[Union[str, List[Any]]] = None
     background: Optional[bool] = False
     conversation: Optional[Union[str, Dict[str, Any]]] = None

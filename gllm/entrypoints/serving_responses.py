@@ -13,6 +13,7 @@ from PIL import Image
 
 from gllm.engine.async_llm import AsyncStream
 from gllm.entrypoints.protocol import ChatCompletionRequest, ResponseRequest
+from gllm.entrypoints.response_tools import chat_tools, output_tool_call, tool_specs
 from gllm.entrypoints.serving_chat import chat_completion_generator
 from gllm.tokenizers.tool_parsers import ToolParser
 from gllm.utils import build_usage, get_finish_reason, random_uuid
@@ -222,8 +223,16 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
         if not isinstance(item, dict):
             raise ValueError(param, "Input items must be strings or objects.")
         item_type = item.get("type")
-        if item_type == "function_call":
+        if item_type in ("function_call", "custom_tool_call"):
             call_id = item.get("call_id") or item.get("id")
+            name = item.get("name")
+            if item.get("namespace"):
+                name = f"{item['namespace']}.{name}"
+            arguments = item.get("arguments", "{}")
+            if item_type == "custom_tool_call":
+                if not isinstance(item.get("input"), str):
+                    raise ValueError(param, "Custom tool input must be a string.")
+                arguments = json.dumps({"input": item["input"]}, ensure_ascii=False)
             messages.append(
                 {
                     "role": "assistant",
@@ -233,17 +242,22 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
                             "id": call_id,
                             "type": "function",
                             "function": {
-                                "name": item.get("name"),
-                                "arguments": item.get("arguments", "{}"),
+                                "name": name,
+                                "arguments": arguments,
                             },
                         }
                     ],
                 }
             )
             continue
-        if item_type == "function_call_output":
+        if item_type in ("function_call_output", "custom_tool_call_output"):
             output = item.get("output", "")
-            if not isinstance(output, str):
+            if isinstance(output, list):
+                parts, has_media = _response_content_parts(output, f"{param}.output")
+                if has_media:
+                    raise ValueError(param, "Multimodal tool outputs are not supported yet.")
+                output = "".join(part["text"] for part in parts)
+            elif not isinstance(output, str):
                 output = json.dumps(output, ensure_ascii=False)
             messages.append(
                 {
@@ -262,6 +276,24 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
         elif not isinstance(content, str):
             raise ValueError(f"{param}.content", "Message content must be text.")
         messages.append({"role": item["role"], "content": content})
+    # Codex compaction can retain a user message before its developer context.
+    # Templates such as Qwen accept instructions only at the beginning. Collect
+    # instruction messages in their original order, leaving conversation and
+    # tool-call ordering unchanged.
+    instructions = []
+    conversation = []
+    for message in messages:
+        if message["role"] in ("system", "developer"):
+            if not isinstance(message["content"], str):
+                raise ValueError("input", "Instruction messages must contain text only.")
+            instructions.append(message)
+        else:
+            conversation.append(message)
+    if instructions:
+        messages = [{
+            "role": instructions[0]["role"],
+            "content": "\n\n".join(message["content"] for message in instructions),
+        }, *conversation]
     if not any(message.get("role") == "user" for message in messages):
         raise ValueError(
             "input",
@@ -271,26 +303,7 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
 
 
 def response_tools_to_chat(tools):
-    if not tools:
-        return None
-    translated = []
-    for index, tool in enumerate(tools):
-        if tool.get("type") != "function":
-            raise ValueError(
-                f"tools.{index}", "Only function tools are supported by this runtime."
-            )
-        translated.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": tool.get("name"),
-                    "description": tool.get("description"),
-                    "parameters": tool.get("parameters"),
-                    "strict": tool.get("strict"),
-                },
-            }
-        )
-    return translated
+    return chat_tools(tools)
 
 
 def make_chat_request(request: ResponseRequest) -> ChatCompletionRequest:
@@ -368,17 +381,9 @@ async def response_completion_generator(
     choice = chat_response.choices[0]
     output = []
     if choice.message.tool_calls:
+        specs = tool_specs(request.tools)
         for tool_call in choice.message.tool_calls:
-            output.append(
-                {
-                    "id": f"fc_{random_uuid()}",
-                    "call_id": tool_call.id,
-                    "type": "function_call",
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.function.arguments,
-                    "status": "completed",
-                }
-            )
+            output.append(output_tool_call(tool_call, specs))
     else:
         output.append(
             {
@@ -451,6 +456,7 @@ async def response_stream_generator(
     message_done = False
     outputs = []
     next_output_index = 0
+    specs = tool_specs(request.tools)
 
     def start_message_events():
         nonlocal message_id, message_index, next_output_index
@@ -592,18 +598,28 @@ async def response_stream_generator(
             function = tool_call.function
             if function is None or function.name is None:
                 continue
-            arguments = function.arguments or ""
             output_index = next_output_index
             next_output_index += 1
-            item = {
-                "id": f"fc_{random_uuid()}",
-                "call_id": tool_call.id or f"call_{random_uuid()}",
-                "type": "function_call",
-                "name": function.name,
-                "arguments": arguments,
-                "status": "completed",
-            }
-            added = {**item, "status": "in_progress", "arguments": ""}
+            try:
+                item = output_tool_call(tool_call, specs)
+            except ValueError as exc:
+                # Embedded Response errors use the SDK's closed error-code
+                # enum, unlike the top-level HTTP error envelope.
+                failed = dict(
+                    initial,
+                    status="failed",
+                    output=outputs,
+                    error={"code": "server_error", "message": str(exc)},
+                )
+                yield _sse(event("response.failed", response=failed))
+                return
+            custom = item["type"] == "custom_tool_call"
+            field = "input" if custom else "arguments"
+            arguments = item[field]
+            prefix = "response.custom_tool_call_input" if custom else "response.function_call_arguments"
+            added = {**item, field: ""}
+            if not custom:
+                added["status"] = "in_progress"
             yield _sse(
                 event(
                     "response.output_item.added",
@@ -614,7 +630,7 @@ async def response_stream_generator(
             if arguments:
                 yield _sse(
                     event(
-                        "response.function_call_arguments.delta",
+                        f"{prefix}.delta",
                         output_index=output_index,
                         item_id=item["id"],
                         delta=arguments,
@@ -622,11 +638,10 @@ async def response_stream_generator(
                 )
             yield _sse(
                 event(
-                    "response.function_call_arguments.done",
+                    f"{prefix}.done",
                     output_index=output_index,
                     item_id=item["id"],
-                    name=item["name"],
-                    arguments=arguments,
+                    **{field: arguments},
                 )
             )
             yield _sse(
