@@ -29,3 +29,4 @@ flash-attn-4[cu13]==4.0.0b26
 nvidia-cutlass-dsl[cu13]==4.6.0.dev0 # exact version required by flash-attn-4
 quack-kernels==0.5.3
 torch-c-dlpack-ext==0.1.5
+lark>=1.2.2,<2 # Validate Responses custom-tool input grammars
