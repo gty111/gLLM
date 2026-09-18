@@ -215,6 +215,19 @@ async def show_available_models():
     return JSONResponse(content=models.model_dump())
 
 
+def _chat_template_kwargs(request: ChatCompletionRequest):
+    """Forward reasoning controls while preserving explicit template overrides."""
+    kwargs = dict(request.chat_template_kwargs or {})
+    if request.reasoning_effort == "none":
+        # Some templates reject "none" as an effort and use a separate switch.
+        kwargs.setdefault("enable_thinking", False)
+        kwargs.setdefault("thinking", False)
+    elif request.reasoning_effort is not None:
+        # Effort names are model-specific; leave validation to the template.
+        kwargs.setdefault("reasoning_effort", request.reasoning_effort)
+    return kwargs or None
+
+
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     capability_error = _validate_chat_capabilities(request)
@@ -222,11 +235,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         return capability_error
 
     effective_tools = request.tools if request.tool_choice != "none" else None
-    chat_template_kwargs = dict(request.chat_template_kwargs or {})
-    if request.reasoning_effort == "none":
-        # Qwen and other reasoning templates commonly expose one or both names.
-        chat_template_kwargs.setdefault("enable_thinking", False)
-        chat_template_kwargs.setdefault("thinking", False)
+    chat_template_kwargs = _chat_template_kwargs(request)
 
     mm_contents = await make_async(llm.model_runner.extract_modify_mm)(request.messages)
     # Encoder-disaggregation frontend (design §3.1 / §5.4): tokenize the *text
@@ -333,9 +342,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         return _unsupported(param, message)
 
     effective_tools = chat_request.tools if chat_request.tool_choice != "none" else None
-    chat_template_kwargs = {}
-    if chat_request.reasoning_effort == "none":
-        chat_template_kwargs.update(enable_thinking=False, thinking=False)
+    chat_template_kwargs = _chat_template_kwargs(chat_request)
     try:
         mm_contents = await make_async(llm.model_runner.extract_modify_mm)(
             chat_request.messages
