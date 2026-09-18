@@ -30,7 +30,7 @@ def test_overlap_snapshot_is_reserved_and_published_at_launch(monkeypatch):
         segment=segment,
     )
     data = InputData(False, manager, max_seq_length=512)
-    seq = GenerationSequence(1, [1] * 256, [])
+    seq = GenerationSequence(1, [1] * 256, [], output_len=8)
     seq.recurrent_state_slot = 3
     seq.to_compute_token_num = 256
     seq.page_table = list(range(16))

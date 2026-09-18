@@ -49,6 +49,7 @@ from gllm.disagg.discovery import make_discovery, make_payload, payload_nixl_met
 from gllm.disagg.protocol import EncoderJob, MmItemMeta, parse_emb_notif
 from gllm.layers.rotary_embedding import MRotaryEmbedding
 from gllm.runtime.model_runner import DisaggSeqState, ModelRunner
+from gllm.runtime.sequence import resolve_output_len
 from gllm.transfer.nixl_transfer import NixlEndpoint, RemoteRegion
 
 
@@ -881,6 +882,12 @@ class DisaggCoordinator:
                 expanded.append(tid)
         assert item_cursor == len(items), (
             f"skeleton had {item_cursor} sentinels != {len(items)} items"
+        )
+        # The frontend only knew the skeleton length. Re-resolve omitted
+        # budgets, and reject explicit budgets that no longer fit, before
+        # admitting the expanded vision prompt to the scheduler.
+        seq.output_len = resolve_output_len(
+            len(expanded), seq.requested_output_len, seq.model_max_length
         )
 
         # 2) Group items into (image-then-video) order = embed_multimodal order.

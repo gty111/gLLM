@@ -58,6 +58,15 @@ no encrypted reasoning items.
 
 ## Limits
 
+When `max_output_tokens` is omitted or null, the output budget is the configured
+context length minus the tokenized input length, including the chat template
+and image tokens. An explicit limit is preserved; requests that leave no output
+space or whose input plus output budget exceeds the context window are rejected.
+The budget includes reasoning, answer text, and tool-call tokens. EOS can end a
+response before the budget is exhausted. Limits explicitly supplied by a proxy
+still apply. Chat Completions uses the same remaining-context default; legacy
+Completions retains its default of 16 tokens when `max_tokens` is omitted.
+
 Grammar checks validate generated input **after generation**, rather than
 constraining token sampling. Lark formats use Python Lark; the empty-line regex
 forms used by Codex patches (`/(.*)/` and `/.*/`) are adapted to optional nonempty
