@@ -1412,13 +1412,38 @@ class ModelRunner:
                     batch_positions,
                 )
                 continue
+            if seq.mm_contents is None:
+                # Text has no cross-chunk visual embeddings or mrope offsets.
+                # Materialize only the scheduled span, including on prefix hits
+                # and re-prefill after preemption. A full-prompt embedding can
+                # otherwise consume gigabytes even with a small prefill budget.
+                input_ids_cpu, is_multimodal_cpu = self._mm_build_is_multimodal_cpu(
+                    seq, seq.computed_token_num, seq.seq_len
+                )
+                positions = torch.arange(
+                    seq.computed_token_num, seq.seq_len, device="cpu"
+                )
+                batch_positions.append(
+                    positions.unsqueeze(0).expand(3, -1)
+                    if self.uses_mrope
+                    else positions
+                )
+                prefill_works.append(
+                    {
+                        "kind": "text",
+                        "seq": seq,
+                        "input_ids_cpu": input_ids_cpu,
+                        "is_multimodal_cpu": is_multimodal_cpu,
+                    }
+                )
+                continue
             if seq.seq_id not in self.embedding_cache:
                 # If the scheduler already ran ``_mm_precompute_hash`` for
                 # this seq (required for multimodal prefix-cache correctness
                 # -- see that method's docstring), reuse the cached
                 # image_processor output and is_multimodal mask. Otherwise
-                # build them now (text-only seqs, non-prefix-cache configs,
-                # and the never-cached scheduler in tests all land here).
+                # build them now (non-prefix-cache configs and the
+                # never-cached scheduler in tests land here).
                 pre = getattr(seq, "_mm_precomputed", None)
                 if pre is not None:
                     mm_input = pre["mm_input"]
@@ -1685,9 +1710,9 @@ class ModelRunner:
         return mm_input, image_grid_thw, None
 
     def _mm_build_is_multimodal_cpu(
-        self, seq: GenerationSequence
+        self, seq: GenerationSequence, start: int = 0, end: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build (input_ids_cpu, is_multimodal_cpu) for ``seq``.
+        """Build CPU IDs and placeholder mask for the requested token span.
 
         Explicitly CPU-side: the repo sets the default device to CUDA
         via ``ModelLoader``, so a bare ``torch.tensor(...)`` would
@@ -1695,7 +1720,7 @@ class ModelRunner:
         launch a kernel on the default stream -- defeating overlap with
         the previous batch's forward.
         """
-        input_ids_cpu = torch.tensor(seq.token_ids, device="cpu")
+        input_ids_cpu = torch.tensor(seq.token_ids[start:end], device="cpu")
         placeholder_token_id_cpu = torch.tensor(
             self.model.get_mm_placeholder_token_ids(), device="cpu"
         )
@@ -1868,7 +1893,21 @@ class ModelRunner:
         batch_deepstack: List[Optional[torch.Tensor]] = []
         for work in ctx["prefill_works"]:
             seq = work["seq"]
-            if work["kind"] == "uncached":
+            if work["kind"] == "text":
+                embed_result = self.model.embed_input_ids(
+                    work["input_ids_cpu"].to(device, non_blocking=True),
+                    None,
+                    work["is_multimodal_cpu"].to(device, non_blocking=True),
+                )
+                embedding = (
+                    embed_result[0] if isinstance(embed_result, tuple) else embed_result
+                )
+                deepstack_chunk = None
+                # Decode needs the position delta, but no prompt-sized tensor
+                # should survive this batch for a text-only request.
+                embedding_info = EmbeddingInfo(mrope_position_delta=0)
+                self.embedding_cache[seq.seq_id] = embedding_info
+            elif work["kind"] == "uncached":
                 # Encoder-disaggregation: embeddings already arrived over NIXL
                 # and were cloned into this tuple, so skip the local ViT (the
                 # LM node has no vision tower). ``None`` -> monolith path.
