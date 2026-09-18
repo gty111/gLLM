@@ -174,8 +174,15 @@ def _merge_multimodal_embeddings(
     Note:
         This updates ``inputs_embeds`` in place.
     """
+    if is_multimodal.ndim != 1 or is_multimodal.shape[0] != inputs_embeds.shape[0]:
+        raise ValueError("Multimodal mask must contain one entry per input token")
     flattened = _flatten_embeddings(multimodal_embeddings)
-    num_expected_tokens = is_multimodal.sum().item()
+    # Select token rows, not individual hidden-state elements. CUDA
+    # masked_scatter_ broadcasts the mask across the hidden dimension and
+    # builds scan workspace for the full [tokens, hidden] tensor, which can
+    # dwarf the embeddings themselves on long prompts.
+    row_indices = is_multimodal.nonzero(as_tuple=True)[0]
+    num_expected_tokens = row_indices.numel()
 
     if flattened.shape[0] != num_expected_tokens:
         expr = _embedding_count_expression(multimodal_embeddings)
@@ -186,11 +193,10 @@ def _merge_multimodal_embeddings(
 
     try:
         # This is equivalent to: inputs_embeds[is_multimodal] = flattened.
-        inputs_embeds.masked_scatter_(
-            is_multimodal.unsqueeze(-1), flattened.to(dtype=inputs_embeds.dtype)
+        inputs_embeds.index_copy_(
+            0, row_indices, flattened.to(dtype=inputs_embeds.dtype)
         )
     except Exception as e:
-        raise ValueError("Error during masked scatter operation") from e
+        raise ValueError("Error during multimodal embedding merge") from e
 
     return inputs_embeds
-
