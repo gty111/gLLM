@@ -61,7 +61,7 @@ class LlamaAttention(AttentionLayerBase):
                 self.rotary_emb = Llama3RotaryEmbedding(
                     self.head_dim,
                     self.head_dim,
-                    original_max_position,
+                    getattr(config, "model_max_length", config.max_position_embeddings),
                     self.rope_theta,
                     True,
                     rope_scaling["factor"],
