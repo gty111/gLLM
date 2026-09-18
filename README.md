@@ -55,6 +55,8 @@ gLLM is an efficient and versatile inference engine for distributed LLM serving.
 
 ## Installation
 
+> Use a CUDA 13.0 environment; the project pins `torch-backend = "cu130"`.
+
 - For development:
 ```bash
 uv pip install -e .
