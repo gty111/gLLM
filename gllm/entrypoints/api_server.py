@@ -39,6 +39,7 @@ from gllm.entrypoints.serving_responses import (
     response_stream_generator,
 )
 from gllm.tokenizers.tool_parsers import get_tool_parser
+from gllm.tokenizers.reasoning import create_reasoning_parser
 from gllm.utils import find_free_ports, make_async
 
 router = APIRouter()
@@ -320,11 +321,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             param="messages",
             code="context_length_exceeded",
         )
+    reasoning_parser = create_reasoning_parser(
+        getattr(llm.model_runner, "tokenizer", None), token_ids
+    )
     if request.stream:
-        generator = chat_completion_stream_generator(stream, request, tool_parser)
+        generator = chat_completion_stream_generator(
+            stream, request, tool_parser, reasoning_parser
+        )
         return StreamingResponse(content=generator, media_type="text/event-stream")
     else:
-        generator = await chat_completion_generator(stream, request, tool_parser)
+        generator = await chat_completion_generator(
+            stream, request, tool_parser, reasoning_parser
+        )
         return JSONResponse(content=generator.model_dump(exclude_none=True))
 
 
@@ -400,14 +408,17 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         mm_items,
         dp_index=getattr(raw_request.app.state, "dp_index", None),
     )
+    reasoning_parser = create_reasoning_parser(
+        getattr(llm.model_runner, "tokenizer", None), token_ids
+    )
     if request.stream:
         generator = response_stream_generator(
-            stream, request, chat_request, tool_parser
+            stream, request, chat_request, tool_parser, reasoning_parser
         )
         return StreamingResponse(content=generator, media_type="text/event-stream")
     try:
         response = await response_completion_generator(
-            stream, request, chat_request, tool_parser
+            stream, request, chat_request, tool_parser, reasoning_parser
         )
     except ValueError as exc:
         return _openai_error(str(exc), status_code=500, code="invalid_tool_output")

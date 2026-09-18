@@ -747,6 +747,7 @@ class ToolCall(OpenAIBaseModel):
 class ChatMessage(OpenAIBaseModel):
     role: str
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     refusal: Optional[str] = None
     annotations: Optional[List[Dict[str, Any]]] = None
     audio: Optional[Dict[str, Any]] = None
@@ -806,6 +807,7 @@ class DeltaToolCall(OpenAIBaseModel):
 class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     refusal: Optional[str] = None
     tool_calls: Optional[List[DeltaToolCall]] = None
 

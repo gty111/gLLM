@@ -16,6 +16,7 @@ from gllm.entrypoints.protocol import ChatCompletionRequest, ResponseRequest
 from gllm.entrypoints.response_tools import chat_tools, output_tool_call, tool_specs
 from gllm.entrypoints.serving_chat import chat_completion_generator
 from gllm.tokenizers.tool_parsers import ToolParser
+from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
 from gllm.utils import build_usage, get_finish_reason, random_uuid
 
 _MAX_INLINE_FILE_BYTES = 50 * 1024 * 1024
@@ -223,6 +224,10 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
         if not isinstance(item, dict):
             raise ValueError(param, "Input items must be strings or objects.")
         item_type = item.get("type")
+        if item_type == "reasoning":
+            # Allow stateless replay of our own output. Previous-turn thoughts
+            # are not user messages and must not be folded into answer text.
+            continue
         if item_type in ("function_call", "custom_tool_call"):
             call_id = item.get("call_id") or item.get("id")
             name = item.get("name")
@@ -368,23 +373,33 @@ def _base_response(request: ResponseRequest, *, response_id: str, created_at: in
     }
 
 
+def _reasoning_item(text, item_id, status="completed"):
+    # Native model thoughts are reasoning text, not a generated summary.
+    return {"id": item_id, "type": "reasoning", "status": status,
+            "summary": [], "content": [{"type": "reasoning_text", "text": text}]}
+
+
 async def response_completion_generator(
     stream: AsyncStream,
     request: ResponseRequest,
     chat_request: ChatCompletionRequest,
     tool_parser: ToolParser = None,
+    reasoning_parser: ThinkParser = None,
 ):
-    chat_response = await chat_completion_generator(stream, chat_request, tool_parser)
+    chat_response = await chat_completion_generator(
+        stream, chat_request, tool_parser, reasoning_parser
+    )
     response_id = f"resp_{random_uuid()}"
     created_at = int(time.time())
     response = _base_response(request, response_id=response_id, created_at=created_at)
     choice = chat_response.choices[0]
     output = []
-    if choice.message.tool_calls:
-        specs = tool_specs(request.tools)
-        for tool_call in choice.message.tool_calls:
-            output.append(output_tool_call(tool_call, specs))
-    else:
+    if choice.message.reasoning_content and (request.reasoning or {}).get("summary") != "none":
+        status = "incomplete" if reasoning_parser.state != "content" else "completed"
+        output.append(_reasoning_item(
+            choice.message.reasoning_content, f"rs_{random_uuid()}", status
+        ))
+    if choice.message.content or (not choice.message.tool_calls and not output):
         output.append(
             {
                 "id": f"msg_{random_uuid()}",
@@ -401,6 +416,10 @@ async def response_completion_generator(
                 ],
             }
         )
+    if choice.message.tool_calls:
+        specs = tool_specs(request.tools)
+        for tool_call in choice.message.tool_calls:
+            output.append(output_tool_call(tool_call, specs))
     incomplete = choice.finish_reason == "length"
     response.update(
         {
@@ -425,6 +444,7 @@ async def response_stream_generator(
     request: ResponseRequest,
     chat_request: ChatCompletionRequest,
     tool_parser: ToolParser = None,
+    reasoning_parser: ThinkParser = None,
 ):
     """Translate engine deltas directly into Responses API SSE events."""
     sequence = 0
@@ -457,6 +477,46 @@ async def response_stream_generator(
     outputs = []
     next_output_index = 0
     specs = tool_specs(request.tools)
+    expose_reasoning = (request.reasoning or {}).get("summary") != "none"
+    reasoning_id = None
+    reasoning_index = None
+    reasoning_text = ""
+    reasoning_done = False
+
+    def reasoning_events(text):
+        nonlocal reasoning_id, reasoning_index, reasoning_text, next_output_index
+        if not text or not expose_reasoning:
+            return []
+        events = []
+        if reasoning_id is None:
+            reasoning_id = f"rs_{random_uuid()}"
+            reasoning_index = next_output_index
+            next_output_index += 1
+            events.append(_sse(event(
+                "response.output_item.added", output_index=reasoning_index,
+                item=_reasoning_item("", reasoning_id, "in_progress"),
+            )))
+        reasoning_text += text
+        events.append(_sse(event(
+            "response.reasoning_text.delta", output_index=reasoning_index,
+            item_id=reasoning_id, content_index=0, delta=text,
+        )))
+        return events
+
+    def finish_reasoning_events():
+        nonlocal reasoning_done
+        if reasoning_id is None or reasoning_done:
+            return []
+        reasoning_done = True
+        status = "incomplete" if reasoning_parser.state != "content" else "completed"
+        item = _reasoning_item(reasoning_text, reasoning_id, status)
+        outputs.append(item)
+        return [
+            _sse(event("response.reasoning_text.done", output_index=reasoning_index,
+                       item_id=reasoning_id, content_index=0, text=reasoning_text)),
+            _sse(event("response.output_item.done", output_index=reasoning_index,
+                       item=item)),
+        ]
 
     def start_message_events():
         nonlocal message_id, message_index, next_output_index
@@ -547,13 +607,17 @@ async def response_stream_generator(
 
     # Without model-native tool markup the output is known to be a message, so
     # announce its item/part before waiting for the first generated token.
-    if stream_parser is None:
+    if stream_parser is None and reasoning_parser is None:
         for wire_event in start_message_events():
             yield wire_event
 
-    async for stream_item in stream:
-        text = stream_item.text
-        if not text:
+    async for stream_item, reasoning, text, final in split_reasoning_stream(stream, reasoning_parser):
+        for wire_event in reasoning_events(reasoning):
+            yield wire_event
+        if reasoning_parser is not None and reasoning_parser.state == "content":
+            for wire_event in finish_reasoning_events():
+                yield wire_event
+        if not text and not (final and stream_parser is not None):
             continue
         full_text += text
         if stream_parser is None:
@@ -564,7 +628,7 @@ async def response_stream_generator(
             # One engine delta may finish both a text prefix and one or more
             # tool-call blocks. Drain every newly available parser delta.
             while True:
-                parsed = stream_parser.process(full_text)
+                parsed = stream_parser.process(full_text, final=final)
                 if parsed is None:
                     break
                 parsed_deltas.append(parsed)
@@ -653,6 +717,8 @@ async def response_stream_generator(
             )
             outputs.append(item)
 
+    for wire_event in finish_reasoning_events():
+        yield wire_event
     # Empty generations still produce a valid empty assistant message.
     if not outputs and message_id is None:
         for wire_event in start_message_events():
