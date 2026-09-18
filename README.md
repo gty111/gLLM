@@ -65,6 +65,18 @@ uv pip install -e .
 uv pip install "git+https://github.com/gty111/gLLM.git"
 ```
 
+If your Conda CUDA toolkit stores libraries under
+`$CUDA_HOME/targets/x86_64-linux/lib`, expose that directory to the compiler
+before starting gLLM:
+
+```bash
+export LIBRARY_PATH="$CUDA_HOME/targets/x86_64-linux/lib:$CUDA_HOME/targets/x86_64-linux/lib/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
+```
+
+This fixes `ld: cannot find -lcudart` when FlashInfer first compiles a kernel.
+`LD_LIBRARY_PATH` controls runtime library loading and does not replace this
+compiler search path. `CUDA_HOME` must point to the installed CUDA toolkit.
+
 ## Quickstart
 
 
