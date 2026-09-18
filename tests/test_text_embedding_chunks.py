@@ -91,15 +91,15 @@ def test_chunks_match_full_embedding_and_keep_no_prompt_tensor(uses_mrope, tuple
 @torch.inference_mode()
 def test_mixed_decode_text_and_cached_image_keep_positions_and_deepstack():
     runner, weight, calls = make_runner(True, True)
-    decode = GenerationSequence(1, [10, 11, 12], [])
+    decode = GenerationSequence(1, [10, 11, 12], [], output_len=8)
     decode.prompt_len = 2
     decode.computed_token_num = 2
     decode.to_compute_token_num = 1
     runner.embedding_cache[1] = EmbeddingInfo(mrope_position_delta=5)
-    text = GenerationSequence(2, [20, 21, 22, 23, 24], [])
+    text = GenerationSequence(2, [20, 21, 22, 23, 24], [], output_len=8)
     text.computed_token_num = 2
     text.to_compute_token_num = 2
-    media = GenerationSequence(3, [30, 31, 32, 33], [], mm_contents={'image': ['unused'], 'video': []})
+    media = GenerationSequence(3, [30, 31, 32, 33], [], output_len=8, mm_contents={'image': ['unused'], 'video': []})
     media.computed_token_num = 1
     media.to_compute_token_num = 2
     image_embeddings = weight[30:34].clone()
@@ -145,7 +145,7 @@ def test_visual_chunks_cross_images_prefix_hits_and_preemption(prefix_start):
     cleared, written = [], []
     runner.model._clear_deepstack_input_embeds = lambda n: cleared.append(n)
     runner.model._set_deepstack_input_embeds = lambda chunk, offset: written.append(chunk.clone())
-    seq = GenerationSequence(4, tokens, [], mm_contents={'image': ['first', 'second'], 'video': []})
+    seq = GenerationSequence(4, tokens, [], output_len=8, mm_contents={'image': ['first', 'second'], 'video': []})
     expected = weight[torch.tensor(tokens).masked_fill(mask, 0)].clone()
     expected[mask] = features[:, :4]
     full_deepstack = torch.zeros(1, len(tokens), 4)
@@ -184,7 +184,7 @@ def test_disaggregated_visual_features_expand_with_ready_prefix():
     tokens = [10, 11, 126, 126, 20, 21, 127, 127, 30]
     mask = torch.tensor(tokens) >= 126
     features = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4) + 1000
-    seq = GenerationSequence(5, tokens, [], mm_contents={'image': ['first', 'second'], 'video': []})
+    seq = GenerationSequence(5, tokens, [], output_len=8, mm_contents={'image': ['first', 'second'], 'video': []})
     state = DisaggSeqState(
         num_items=2, item_span=[(2, 4), (6, 8)], item_modality=['image', 'image'],
         item_ready=[True, False], item_embed=[features[:2], None],

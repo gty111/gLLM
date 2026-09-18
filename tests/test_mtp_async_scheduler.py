@@ -286,7 +286,7 @@ def test_overlap_worker_builds_one_mtp_plan_for_pure_and_mixed_batches():
     assert pure.speculate and pure.greedy and pure.use_async
     assert pure.decode_ids == (31, 32)
 
-    prefill = GenerationSequence(33, [1, 2], [], temperature=0, top_k=1)
+    prefill = GenerationSequence(33, [1, 2], [], output_len=8, temperature=0, top_k=1)
     prefill.computed_token_num = 0
     prefill.to_compute_token_num = 2
     worker._prefetched_input = SimpleNamespace(
