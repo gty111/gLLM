@@ -338,8 +338,18 @@ class StreamToolParser:
     def has_tool_calls(self) -> bool:
         return self._tool_calls_emitted > 0
 
-    def process(self, full_text: str) -> Optional[DeltaMessage]:
+    def process(self, full_text: str, *, final: bool = False) -> Optional[DeltaMessage]:
         head = self._parser.content_prefix(full_text)
+        # The Qwen opening marker can share a chunk with </think>, or arrive
+        # in pieces. Do not publish a prefix before knowing whether it is a
+        # tool call. At EOF an unfinished prefix is ordinary literal text.
+        if not final and isinstance(self._parser, (QwenToolParser, Qwen3ToolParser)):
+            marker = self._parser._START
+            if marker not in full_text:
+                for size in range(min(len(head), len(marker) - 1), 0, -1):
+                    if head.endswith(marker[:size]):
+                        head = head[:-size]
+                        break
 
         # 1) Stream the leading natural-language content (the part before the
         #    first tool-call marker) as it grows.
