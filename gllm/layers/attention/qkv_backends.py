@@ -175,8 +175,8 @@ class FA3AttentionBackend(QKVAttentionBackend):
             max_seqlen_q=metadata.max_query_len,
             softmax_scale=softmax_scale,
             causal=True,
-            # A fixed split count avoids host scheduling during CUDA capture.
-            num_splits=1,
+            # Let FlashAttention choose SplitKV parallelism for the workload.
+            num_splits=0,
         )
 
     def smoke_test(self, page_size: int) -> None:
