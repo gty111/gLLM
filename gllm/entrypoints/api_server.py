@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import traceback
 from http import HTTPStatus
 from pathlib import Path
@@ -436,29 +437,39 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         getattr(llm.model_runner, "tokenizer", None), token_ids
     )
     if request.stream:
-        inner = response_stream_generator(
+        generator = response_stream_generator(
             stream, request, chat_request, tool_parser, reasoning_parser
         )
-
-        async def storing_generator():
-            async for line in inner:
-                yield line
-                if line.startswith("data: "):
-                    try:
-                        import json
-                        event = json.loads(line[6:])
-                    except ValueError:
-                        continue
-                    if event.get("type") in (
-                        "response.completed", "response.incomplete", "response.failed",
-                    ):
-                        response = event["response"]
-                        response_store.put(response["id"], {
-                            "response": response,
-                            "input_items": request.input,
-                            "model": request.model,
-                        })
-        return StreamingResponse(content=storing_generator(), media_type="text/event-stream")
+        if request.store:
+            source_generator = generator
+            async def storing_generator():
+                async for line in source_generator:
+                    data_line = next(
+                        (part[6:] for part in line.splitlines() if part.startswith("data: ")),
+                        None,
+                    )
+                    if data_line is not None:
+                        try:
+                            event = json.loads(data_line)
+                        except ValueError:
+                            continue
+                        if event.get("type") in (
+                            "response.completed", "response.incomplete", "response.failed"
+                        ):
+                            if request.store:
+                                response = event["response"]
+                                normalized_input = (
+                                    [{"type": "message", "role": "user", "content": request.input}]
+                                    if isinstance(request.input, str) else list(request.input)
+                                )
+                                response_store.put(response["id"], {
+                                    "response": response,
+                                    "input_items": normalized_input,
+                                    "model": request.model,
+                                })
+                    yield line
+            generator = storing_generator()
+        return StreamingResponse(content=generator, media_type="text/event-stream")
     try:
         response = await response_completion_generator(
             stream, request, chat_request, tool_parser, reasoning_parser
@@ -466,9 +477,13 @@ async def create_response(request: ResponseRequest, raw_request: Request):
     except ValueError as exc:
         return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
     if request.store:
+        normalized_input = (
+            [{"type": "message", "role": "user", "content": request.input}]
+            if isinstance(request.input, str) else list(request.input)
+        )
         response_store.put(response["id"], {
             "response": response,
-            "input_items": request.input,
+            "input_items": normalized_input,
             "model": request.model,
         })
     return JSONResponse(content=response)
