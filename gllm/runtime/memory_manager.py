@@ -1682,7 +1682,13 @@ def _ensure_page_hash(seq: GenerationSequence, page_size: int, page_idx: int) ->
     """
     src = _hash_source(seq)
     _maybe_invalidate_seq_hash_cache(seq, src)
-    cache = seq._page_hashes
+    return _page_hash_from_source(src, seq._page_hashes, page_size, page_idx)
+
+
+def _page_hash_from_source(
+    src: List[int], cache: List[int], page_size: int, page_idx: int
+) -> int:
+    """Extend the hash chain after the caller has validated its source."""
     if page_idx < len(cache):
         return cache[page_idx]
     while len(cache) <= page_idx:
@@ -1779,17 +1785,10 @@ class PrefixMemoryManager(MemoryManager):
             num_page = (len(seq) + self.page_size - 1) // self.page_size
             if not seq.computed_prompt:
                 self.num_allocated_pages += num_page
-            for i in range(num_page):
-                if (i + 1) * self.page_size <= len(seq):
-                    page_num = self.segment.has_computed(seq, (i + 1) * self.page_size)
-                    if page_num is not None:
-                        seq.page_table.append(page_num)
-                        seq.computed_token_num += self.page_size
-                        self.num_hit_pages += 1
-                    else:
-                        break
-                else:
-                    break
+            pages = self.segment.retain_computed_prefix(seq)
+            seq.page_table.extend(pages)
+            seq.computed_token_num += len(pages) * self.page_size
+            self.num_hit_pages += len(pages)
         for seq in seqs:
             self._finalize_prefix_cache_hit(seq)
 
@@ -2062,6 +2061,31 @@ class PrefixSegment(Segment):
             self.hash2page[page_hash] = page_num
             self.page2canary[page_num] = _ensure_canary(seq)
 
+    def retain_computed_prefix(self, seq: GenerationSequence) -> List[int]:
+        """Find and pin the contiguous cached prefix in one arena transaction.
+
+        Hashing stays lazy: a miss stops the scan instead of hashing the rest
+        of a potentially long prompt. No allocator mutation occurs during the
+        scan; all hit pages are pinned before snapshot restoration can allocate
+        working state or reclaim any cached contents.
+        """
+        src = _hash_source(seq)
+        _maybe_invalidate_seq_hash_cache(seq, src)
+        canary = _ensure_canary(seq)
+        hashes = seq._page_hashes
+        pages = []
+        for i in range(len(seq) // self.page_size):
+            page_hash = _page_hash_from_source(src, hashes, self.page_size, i)
+            page = self.hash2page.get(page_hash)
+            if page is None or self.page2canary[page] != canary:
+                break
+            pages.append(page)
+        if pages:
+            self.id_allocator.retain_many(pages)
+            for page in pages:
+                self.page_ref_num[page] += 1
+        return pages
+
     def has_computed(self, seq: GenerationSequence, n_tokens: int) -> Optional[int]:
         """Look up a cached page. Returns the page id or ``None`` on miss.
 
@@ -2140,7 +2164,28 @@ class PrefixSegment(Segment):
             # the same lifetime — otherwise serial reuse of a cached
             # prompt would always lose the snapshot half of the hit and
             # ``_restore_ssm_working_state`` would drop the KV half too.
+            self._mark_cached_pages([page_num])
             self.id_allocator.free(page_num)
+
+    def _mark_cached_pages(self, page_nums) -> None:
+        # A released prefix is still reusable. Keep its beginning longest:
+        # losing the first page would make every subsequent page unreachable
+        # to the contiguous-prefix lookup. Partial/unregistered pages remain
+        # ordinary free space and must be consumed before valid cached pages.
+        arena = self.id_allocator.arena.allocator
+        name = self.id_allocator.cache_type
+        retained = arena.cache_type(name).retained_slots
+        cached, invalidated = [], []
+        for page in reversed(page_nums):
+            page_hash = self.page2hash[page]
+            if page_hash and self.hash2page.get(page_hash) == page:
+                cached.append(page)
+            elif page in retained:
+                invalidated.append(page)
+        if invalidated:
+            arena.discard_cached(name, invalidated)
+        if cached:
+            arena.mark_cached(name, cached)
 
     def free_many(self, page_nums) -> None:
         """Drop a request's KV references and batch-release newly unpinned pages."""
@@ -2153,6 +2198,7 @@ class PrefixSegment(Segment):
                 released.append(page_num)
         if not released:
             return
+        self._mark_cached_pages(released)
         self.id_allocator.free_many(released)
 
     def reserve_ssm_snapshot(self, page_num: int, n_tokens: int) -> Optional[int]:
