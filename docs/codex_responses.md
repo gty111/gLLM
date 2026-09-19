@@ -44,6 +44,10 @@ addresses refer to that machine. Tool execution remains the client's responsibil
 - Stateless continuation with `function_call_output` or `custom_tool_call_output`.
   Send the original user message and accumulated history on each request. Tool
   outputs may be strings or arrays of text content parts.
+  Consecutive call items attach to the preceding assistant message, preserving
+  its text and call order. This keeps a progress statement and its calls inside
+  one assistant message in the model's chat template. User/tool/instruction
+  messages break this grouping; separate text messages are not merged.
 - Streaming and non-streaming responses. Tool calls are published after their
   complete arguments have been parsed and validated.
 - `tool_choice="auto"` with an empty tool list, allowing a text-only response
@@ -67,6 +71,15 @@ response before the budget is exhausted. Limits explicitly supplied by a proxy
 still apply. Chat Completions uses the same remaining-context default; legacy
 Completions retains its default of 16 tokens when `max_tokens` is omitted.
 
+If generation ends with an unclosed model-native reasoning block, or with only
+reasoning and no non-whitespace answer or tool call, the response has status
+`failed` and an explanatory `server_error`. Streams end with `response.failed`.
+This check also applies when reasoning is hidden with `summary: "none"`.
+Reaching the output limit instead returns `incomplete` with reason
+`max_output_tokens`. A valid tool call needs no accompanying text answer.
+These checks report unsuccessful generation; they do not retry requests or
+prevent repetitive reasoning during generation.
+
 Grammar checks validate generated input **after generation**, rather than
 constraining token sampling. Lark formats use Python Lark; the empty-line regex
 forms used by Codex patches (`/(.*)/` and `/.*/`) are adapted to optional nonempty
@@ -87,12 +100,18 @@ OpenAI Responses API.
 Run in a Linux gLLM environment with its dependencies installed:
 
 ```sh
-python -m pytest -q tests/test_codex_responses.py tests/test_openai_protocol_compat.py tests/test_tool_parsers.py
+python -m pytest -q tests/test_codex_responses.py tests/test_openai_protocol_compat.py tests/test_tool_parsers.py tests/test_reasoning_output.py tests/test_responses_history.py
 ```
 
 These tests validate response objects and streaming events with the OpenAI Python
 SDK, including failed custom calls, namespace collisions, Qwen3.8 XML markup,
 text and regex tools, and Codex patch grammars.
+
+History tests also cover generated Responses items replayed as assistant/tool
+messages. To check the rendered boundaries against an actual local Qwen3.8
+checkpoint without loading model weights, set `GLLM_TEST_QWEN_TOKENIZER` to its
+path when running `tests/test_responses_history.py`. The tokenizer checks are
+skipped when this variable is unset; no checkpoint is downloaded by the tests.
 
 Protocol reference: [OpenAI Responses streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events).
 

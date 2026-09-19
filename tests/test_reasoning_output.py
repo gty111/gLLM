@@ -195,6 +195,86 @@ def test_reasoning_only_length_limit(summary):
         assert events[-1]["response"]["output"][0]["status"] == "incomplete"
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("summary", [None, "none"])
+@pytest.mark.parametrize("prefilled", [False, True])
+@pytest.mark.parametrize("tail,closed", [
+    ("", False), ("unfinished</thi", False),
+    ("</think>", True), ("thought</think> \n", True),
+])
+@pytest.mark.parametrize("truncated", [False, True])
+def test_reasoning_without_answer_never_completes(
+    streaming, summary, prefilled, tail, closed, truncated,
+):
+    req = response_request(summary, False)
+    text = ("" if prefilled else "<think>") + tail
+    stream = Stream(list(text), truncated=truncated)
+    if not truncated:
+        # Exercise an actual EOS, not the generic stop fallback.
+        stream.seq.token_ids[-1] = 99
+    parser = ThinkParser(prefilled=prefilled)
+    if streaming:
+        events = collect(response_stream_generator(
+            stream, req, make_chat_request(req), reasoning_parser=parser,
+        ))
+        for event in events:
+            TypeAdapter(ResponseStreamEvent).validate_python(event)
+        result = events[-1]["response"]
+        assert events[-1]["type"] == ("response.incomplete" if truncated else "response.failed")
+        assert [e["sequence_number"] for e in events] == list(range(len(events)))
+        assert sum(e["type"] in ("response.completed", "response.failed", "response.incomplete")
+                   for e in events) == 1
+        assert [e["item"] for e in events if e["type"] == "response.output_item.done"] == result["output"]
+    else:
+        result = asyncio.run(response_completion_generator(
+            stream, req, make_chat_request(req), reasoning_parser=parser,
+        ))
+    Response.model_validate(result)
+    assert result["status"] == ("incomplete" if truncated else "failed")
+    assert result["completed_at"] is None
+    if truncated:
+        assert result["incomplete_details"] == {"reason": "max_output_tokens"}
+        assert result["error"] is None
+    else:
+        assert result["incomplete_details"] is None
+        assert result["error"]["code"] == "server_error"
+        assert ("without an answer" if closed else "before the reasoning block") in result["error"]["message"]
+    # Whitespace emitted by the model is preserved; an empty message must not
+    # be fabricated when reasoning is hidden or its text was empty.
+    messages = [item for item in result["output"] if item["type"] == "message"]
+    assert bool(messages) == tail.endswith(" \n")
+    if summary == "none":
+        assert all(item["type"] != "reasoning" for item in result["output"])
+    assert result["usage"]["output_tokens"] == 1
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("parser", [None, False, True])
+def test_empty_nonreasoning_response_still_completes(streaming, parser):
+    req = response_request(None, False)
+    # Also preserve a literal partial opening marker that never entered thinking.
+    text = "<thi" if parser is True else ""
+    reasoning_parser = None if parser is None else ThinkParser()
+    stream = Stream(list(text))
+    generator = response_stream_generator if streaming else response_completion_generator
+    output = generator(stream, req, make_chat_request(req), reasoning_parser=reasoning_parser)
+    result = collect(output)[-1]["response"] if streaming else asyncio.run(output)
+    assert result["status"] == "completed"
+    assert result["output"][0]["content"][0]["text"] == text
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_tool_call_at_output_limit_remains_incomplete(streaming):
+    req = response_request("none", True)
+    stream = Stream(["thought</think>" + TOOL], truncated=True)
+    generator = response_stream_generator if streaming else response_completion_generator
+    output = generator(stream, req, make_chat_request(req), QwenToolParser(), ThinkParser(prefilled=True))
+    result = collect(output)[-1]["response"] if streaming else asyncio.run(output)
+    assert result["status"] == "incomplete"
+    assert result["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert result["output"][-1]["type"] == "function_call"
+
+
 @pytest.mark.parametrize("endpoint", ["chat", "responses"])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("disagg", [False, True])
@@ -243,3 +323,37 @@ def test_incomplete_tool_marker_is_flushed_as_literal_at_eof(tail):
     req = make_chat_request(response_request(None, True))
     events = collect(chat_completion_stream_generator(Stream(list("Literal " + tail)), req, QwenToolParser()))
     assert "".join(e["choices"][0]["delta"].get("content", "") for e in events) == "Literal " + tail
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("closed", [False, True])
+def test_response_route_reports_hidden_reasoning_failure(monkeypatch, streaming, closed):
+    from gllm.entrypoints import api_server
+
+    async def add_requests(*args, **kwargs):
+        stream = Stream(["thought" + ("</think>" if closed else "")])
+        stream.seq.token_ids[-1] = 99
+        return stream
+
+    runner = SimpleNamespace(
+        tokenizer=Tokenizer("assistant\n<think>\n"), use_mm=False,
+        extract_modify_mm=lambda messages: None,
+        encode=lambda *args, **kwargs: [1, 2],
+    )
+    monkeypatch.setattr(api_server, "llm", SimpleNamespace(
+        model_path="test", model_runner=runner, is_disagg_lm=False,
+        check_seq_length=lambda *args: True, add_requests_async=add_requests,
+    ))
+    raw = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    req = ResponseRequest(model="test", input="hello", stream=streaming,
+                          reasoning={"summary": "none"})
+    response = asyncio.run(api_server.create_response(req, raw))
+    if streaming:
+        events = collect(response.body_iterator)
+        assert events[-1]["type"] == "response.failed"
+        result = events[-1]["response"]
+    else:
+        result = json.loads(response.body)
+    assert result["status"] == "failed"
+    assert result["output"] == []
+    assert result["error"]["code"] == "server_error"
