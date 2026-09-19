@@ -75,6 +75,8 @@ The server implements current OpenAI-compatible `/v1/chat/completions`,
 function-tool subset of `/v1/responses`. Responses image inputs accept URLs and
 data URLs. File inputs accept URLs or Base64 data for images, text/code, and CSV
 files; PDF inputs and `file_id` references are not yet supported.
+Both APIs support [structured JSON output](docs/structured_output.md), including
+token-level JSON Schema constraints and streaming.
 Unsupported hosted features return an OpenAI-style
 `unsupported_parameter` error instead of being silently ignored.
 

@@ -387,7 +387,7 @@ class ModelRunner:
         self.init_new_token_ratio = init_new_token_ratio
         self.min_new_token_ratio = min_new_token_ratio
         self.schedule_method = schedule_method
-        self.sampler = Sampler()
+        self.sampler = Sampler(self.tokenizer)
         # Per-batch-row generation logprobs from the most recent ``step_once``
         # (non-overlap path); consumed by the worker and carried alongside the
         # sampled tokens (incl. over the token socket under PP>1). ``None`` when
@@ -2127,6 +2127,16 @@ class ModelRunner:
             raise RuntimeError(f"missing materialized MTP relay for sequence {seq_id}")
         return int(relay[0])
 
+    @staticmethod
+    def mtp_sampling_compatible(seqs) -> bool:
+        # Verify does not currently collect generation logprobs or apply
+        # repetition penalties. Preserve their plain-sampler semantics.
+        return not any(
+            getattr(s, "logprobs_enabled", False)
+            or getattr(s, "repetition_penalty", 1.0) != 1.0
+            for s in seqs
+        )
+
     def mtp_prep_eligible(self, seqs: List[GenerationSequence]) -> bool:
         """True when :meth:`step_once` owns all input prep for an MTP step.
 
@@ -2137,6 +2147,8 @@ class ModelRunner:
         can install only the batch bookkeeping via
         :meth:`prepare_input_mtp`.
         """
+        if not self.mtp_sampling_compatible(seqs):
+            return False
         if not (self.mtp_enabled and not is_dp_attn() and is_last_pp_rank()):
             return False
         if not seqs or not seqs[-1].computed_prompt:
@@ -3056,7 +3068,9 @@ class ModelRunner:
         probs = probs / probs.sum(dim=-1, keepdim=True)
         # Ties spilling past the window: ``keep`` reaching the last column means
         # more equal-valued tokens may exist beyond it.
-        self._mtp_tie_overflow += keep[:, -1].sum()
+        # Grammar masking can leave fewer than top_k finite logits. The -inf
+        # padding then ties at the cutoff but carries no probability mass.
+        self._mtp_tie_overflow += (keep[:, -1] & torch.isfinite(vals[:, -1])).sum()
         return probs, idx
 
     @staticmethod
@@ -3969,6 +3983,7 @@ class ModelRunner:
         missing_x1_gpu = self.sampler.forward_gpu(missing_logits, self.input_data)
         if get_tp_size() > 1:
             self._mtp_bcast_tp(missing_x1_gpu)
+        self.sampler.stage_structured_feedback(missing_x1_gpu, missing_seqs)
         missing_x1 = missing_x1_gpu.tolist()
         self.prepare_input_mtp(decode_seqs)
 
@@ -4313,6 +4328,10 @@ class ModelRunner:
             )
             if get_tp_size() > 1:
                 self._mtp_bcast_tp(prefill_tokens_gpu)
+            self.sampler.stage_structured_feedback(
+                prefill_tokens_gpu, extra_prefill_seqs,
+                stream=self.copy_stream if async_accept else None,
+            )
 
             if async_accept:
                 completed = [
@@ -4557,6 +4576,16 @@ class ModelRunner:
 
         # --- 2. Verify: one base forward over [x1, d1..dk] per seq. ---
         kk = (k if drafts is None else len(drafts[0])) if nd else 0
+        structured_inputs = None
+        if any(getattr(s, "structured_output", None) is not None for s in decode_seqs):
+            dg = self._drafts_gpu
+            if dg is None:
+                dg = torch.tensor(drafts, dtype=torch.int64, device=dev)
+            contexts = (self._mtp_async_state.context_lens[:nd] if x1_is_gpu else
+                        torch.tensor([len(t) for t in orig_tokens], dtype=torch.int64, device=dev))
+            structured_inputs = self.sampler._structured.stage_speculative_inputs(
+                contexts, x1_gpu, dg, stream=getattr(self, "copy_stream", None)
+            )
         verify = self._mtp_verify_target(
             decode_seqs=decode_seqs,
             orig_tokens=orig_tokens,
@@ -4577,6 +4606,20 @@ class ModelRunner:
         new_state_context_lens = verify.new_state_context_lens
         new_state_tokens = verify.new_state_tokens
         new_state_hidden = verify.new_state_hidden
+
+        structured_active = []
+        if structured_inputs is not None:
+            # Verify is already enqueued. Wait only for the earlier candidate
+            # copy and predecessor acceptance, then build masks while it runs.
+            with torch.profiler.record_function("gllm::mtp_grammar_ready"):
+                host, ready = structured_inputs
+                if ready is not None:
+                    ready.synchronize()
+                rows = host.tolist()
+                structured_active = self.sampler._structured.mask_speculative(
+                    v_logits, decode_seqs, None if x1_is_gpu else orig_tokens,
+                    [row[1:] for row in rows], positions=[row[0] for row in rows],
+                )
 
         # Target verification returns post-final-norm hidden states, matching
         # vLLM and sglang's MTP conditioning contract.
@@ -4868,6 +4911,8 @@ class ModelRunner:
                 # All speculative GenerationSequence mutations are host bookkeeping only;
                 # restore them now.  The completion event orders the later CPU
                 # finalize after verify/accept and the D2H record.
+                if structured_active:
+                    self.sampler._structured.record_speculative(structured_active, completion)
                 restore()
                 return completion
 
@@ -4895,6 +4940,11 @@ class ModelRunner:
                 new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
 
         self._record_mtp_metrics(nd, kk, n_accepted)
+        if structured_active:
+            self.sampler._structured.commit_speculative(
+                structured_active, results,
+                [new_relay[s.seq_id][0] for s in decode_seqs],
+            )
 
         # Update only rows that actually ran. A seq absent from this MTP batch
         # has not advanced, so its relay remains position-correct and must be
@@ -5020,6 +5070,8 @@ class ModelRunner:
         checkpoint.  The latest completion is materialized only when the MTP
         pipeline drains or changes cohort.
         """
+        if self.sampler._structured is not None:
+            self.sampler._structured.finish_speculative(seqs, completion)
         valid, committed = completion.collect()
         if tuple(s.seq_id for s in seqs) != completion.seq_ids:
             raise RuntimeError("MTP async completion no longer matches its cohort")
@@ -5043,6 +5095,8 @@ class ModelRunner:
                 if getattr(seq, "_overlap_freed", False):
                     continue
                 self._mtp_relay[seq.seq_id] = (int(relay_tokens[i]), relay_hidden[i])
+                if self.sampler._structured is not None:
+                    self.sampler._structured.stage_relay(seq, int(relay_tokens[i]))
                 na = int(resume[i]) - 1
                 if seq.ssm_block_table is not None:
                     if na > 0:
@@ -5082,6 +5136,7 @@ class ModelRunner:
             and self.input_data.num_decodes > 0
             and self.mtp_speculate_batch(self.input_data.num_decodes)
             and self.check_decode_batch()
+            and self.mtp_sampling_compatible(self.input_data.seqs)
         ):
             seqs = self.input_data.seqs[: self.input_data.num_decodes]
             if seqs:
@@ -5160,8 +5215,19 @@ class ModelRunner:
                 )
                 self._last_logprobs = self._build_logprob_rows(seqs, logprobs)
                 next_tokens = next_tokens_gpu.cpu().tolist()
+            elif any(getattr(s, "structured_output", None) is not None for s in seqs):
+                next_tokens_gpu = self.sampler.forward_gpu(logits, self.input_data)
+                next_tokens = None
             else:
                 next_tokens = self.sampler.forward(logits, self.input_data)
+            if any(getattr(s, "structured_output", None) is not None for s in seqs):
+                # Matchers on all sampling ranks must consume the same token.
+                # Preserve the tensor identity retained by StructuredSampler.
+                if get_tp_size() > 1:
+                    src = get_rank() - get_tp_rank() if is_dp_attn() else get_output_rank()
+                    dist.broadcast(next_tokens_gpu, src=src, group=get_tp_group())
+                self.sampler.stage_structured_feedback(next_tokens_gpu, seqs)
+                next_tokens = next_tokens_gpu.cpu().tolist()
             # Prompt logprobs re-enter the LM head (a TP all-gather), so this
             # runs on ALL last-PP TP ranks (not just the output rank) to keep
             # the collective balanced; every rank has the same real seqs, so
@@ -5184,10 +5250,11 @@ class ModelRunner:
                 self.mtp_enabled
                 and self.input_data.num_prefills == 0
                 and self.input_data.num_decodes > 0
-                and not self.mtp_speculate_batch(self.input_data.num_decodes)
+                and (not self.mtp_speculate_batch(self.input_data.num_decodes)
+                     or not self.mtp_sampling_compatible(seqs))
             ):
-                # Batch too large to profit from speculation: this step already
-                # sampled one token per seq the plain way, which is the answer.
+                # Constraints require plain sampling, or this batch is too large
+                # to profit from speculation. Its one sampled token is final.
                 # The relay it leaves behind is stale (see ``_mtp_drop_relay``).
                 self._mtp_drop_relay()
             elif (
@@ -5651,9 +5718,20 @@ class OverlapModelRunner(ModelRunner):
             # correctness -- but the timing is now symmetric, which is what makes
             # the pipeline deadlock-free by construction.
             _all_greedy = all(s.top_k == 1 for s in self.input_data.seqs)
-            _sample_here = is_output_rank() or not _all_greedy
+            # MTP verifies on every TP rank, including greedy batches. Keep
+            # grammar histories alive on all ranks already during prefill and
+            # ordinary decode, so entering MTP never starts a fresh matcher
+            # after tokens have been emitted on the output rank.
+            _sample_here = (is_output_rank() or not _all_greedy or any(
+                getattr(s, "structured_output", None) is not None
+                for s in self.input_data.seqs
+            ))
             if _sample_here:
                 seqs = self.input_data.seqs
+                # The current forward is already enqueued. Advance grammar
+                # from the previous authoritative D2H result while it runs;
+                # only mask application and sampling follow on the GPU stream.
+                structured = self.sampler.prepare_structured(logits, seqs)
                 if is_output_rank() and any(s.logprobs_enabled for s in seqs):
                     lp_k = min(
                         self._max_top_logprobs,
@@ -5663,10 +5741,10 @@ class OverlapModelRunner(ModelRunner):
                         ),
                     )
                     next_tokens_gpu, lp_gpu = self.sampler.forward_gpu(
-                        logits, self.input_data, True, lp_k
+                        logits, self.input_data, True, lp_k, structured=structured
                     )
                 else:
-                    _nt = self.sampler.forward_gpu(logits, self.input_data)
+                    _nt = self.sampler.forward_gpu(logits, self.input_data, structured=structured)
                     # Non-output ranks discard their own draw (only run it for
                     # timing symmetry); the broadcast overwrites it anyway.
                     next_tokens_gpu = _nt
@@ -5705,6 +5783,10 @@ class OverlapModelRunner(ModelRunner):
                     next_tokens_gpu,
                     src=tp_src,
                     group=get_tp_group(),
+                )
+            if next_tokens_gpu is not None:
+                self.sampler.stage_structured_feedback(
+                    next_tokens_gpu, self.input_data.seqs, stream=self.copy_stream
                 )
             # Same MTP head KV maintenance as the synchronous ``step_once``:
             # this is the non-speculative overlap step (pure prefill, an MTP

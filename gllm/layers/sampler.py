@@ -16,10 +16,23 @@ def _fused_top_k_top_p_sample(
         top_ks.to(torch.int32),
         top_ps,
         filter_apply_order="joint",
-    )
+    ).to(torch.int64)  # Same wire dtype as argmax and the PP FutureMap receiver.
 
 
 class Sampler:
+
+    def __init__(self, tokenizer=None):
+        self.tokenizer = tokenizer
+        self._structured = None
+
+    def prepare_structured(self, logits, seqs):
+        if not any(getattr(s, "structured_output", None) is not None for s in seqs):
+            return None
+        if self._structured is None:
+            from gllm.structured_output import StructuredSampler
+
+            self._structured = StructuredSampler(self.tokenizer)
+        return self._structured.prepare(seqs, logits.shape[-1], logits.device)
 
     def forward_gpu(
         self,
@@ -27,6 +40,8 @@ class Sampler:
         input_data: InputData,
         return_logprobs: bool = False,
         num_logprobs: int = 0,
+        *,
+        structured=None,
     ):
         """Sample on GPU; caller is responsible for D2H.
 
@@ -42,10 +57,18 @@ class Sampler:
         if flags["need_repetition_penalty"]:
             apply_scaling_penalties(logits, input_data.repetition_penalty)
 
+        active = None
+        if any(getattr(s, "structured_output", None) is not None for s in input_data.seqs):
+            if structured is None:
+                structured = self.prepare_structured(logits, input_data.seqs)
+            active = self._structured.apply(logits, structured)
+
         if flags["is_all_greedy"]:
             # argmax is invariant to positive temperature scaling, so the
             # full-vocab div_ would be wasted work here -- skip it.
             next_tokens = torch.argmax(logits, dim=-1)
+            if active is not None:
+                self._structured.record(active, next_tokens)
             if return_logprobs:
                 return next_tokens, self.compute_logprobs(
                     logits, next_tokens, num_logprobs
@@ -59,6 +82,8 @@ class Sampler:
         next_tokens = _fused_top_k_top_p_sample(
             probs, input_data.top_k, input_data.top_p
         )
+        if active is not None:
+            self._structured.record(active, next_tokens)
         if return_logprobs:
             return next_tokens, self.compute_logprobs(
                 logits, next_tokens, num_logprobs
@@ -67,6 +92,12 @@ class Sampler:
 
     def forward(self, logits: torch.Tensor, input_data: InputData) -> list[int]:
         return self.forward_gpu(logits, input_data).cpu().tolist()
+
+    def stage_structured_feedback(self, tokens, seqs, stream=None):
+        if self._structured is not None and any(
+            getattr(s, "structured_output", None) is not None for s in seqs
+        ):
+            self._structured.stage_feedback(tokens, stream=stream)
 
     @staticmethod
     def compute_logprobs(
@@ -85,6 +116,9 @@ class Sampler:
         k = max(0, min(num_logprobs, logprobs.shape[-1]))
         if k > 0:
             top_vals, top_ids = torch.topk(logprobs, k, dim=-1)
+            # A grammar can leave fewer than k valid tokens. JSON cannot carry
+            # -Infinity; use the API's sentinel for zero-probability alternatives.
+            top_vals = top_vals.clamp_min(-9999.0)
         else:
             top_vals = logprobs.new_zeros((logprobs.shape[0], 0))
             top_ids = next_tokens.new_zeros((logprobs.shape[0], 0))

@@ -108,6 +108,31 @@ def _unsupported(param: str, detail: Optional[str] = None):
     return _openai_error(message, param=param, code="unsupported_parameter")
 
 
+def _validate_output_format(fmt, param, tools=None, ignore_eos=False):
+    from gllm.structured_output import normalize_format
+
+    try:
+        schema = normalize_format(fmt)
+        if schema is not None and tools:
+            raise ValueError("Structured output with active tools is not supported yet.")
+        if schema is not None and ignore_eos:
+            raise ValueError("Structured output does not support ignore_eos.")
+    except (ValueError, TypeError, RecursionError) as exc:
+        return _openai_error(str(exc), param=param, code="invalid_output_format")
+    return None
+
+
+async def _prepare_output_format(fmt, token_ids):
+    from gllm.structured_output import prepare_output, normalize_format
+
+    if normalize_format(fmt) is None:
+        return None
+    return await make_async(prepare_output)(
+        fmt, llm.model_runner.tokenizer, llm.model_runner.model_loader.vocab_size,
+        llm.finish_tokens, token_ids,
+    )
+
+
 def _validate_chat_capabilities(request: ChatCompletionRequest):
     model_error = _validate_model(request.model)
     if model_error:
@@ -130,11 +155,13 @@ def _validate_chat_capabilities(request: ChatCompletionRequest):
     for condition, param in checks:
         if condition:
             return _unsupported(param)
-    if request.response_format is not None and request.response_format.type != "text":
-        return _unsupported(
-            "response_format",
-            "Structured output response formats are not wired to this runtime yet.",
-        )
+    format_error = _validate_output_format(
+        request.response_format, "response_format",
+        request.tools if request.tool_choice != "none" else None,
+        request.ignore_eos,
+    )
+    if format_error:
+        return format_error
     if request.tools:
         for tool in request.tools:
             if tool.type != "function":
@@ -168,11 +195,12 @@ def _validate_response_capabilities(request: ResponseRequest):
     for condition, param in checks:
         if condition:
             return _unsupported(param)
-    text_format = (request.text or {}).get("format") or {"type": "text"}
-    if text_format.get("type", "text") != "text":
-        return _unsupported(
-            "text.format", "Structured Responses output is not wired yet."
-        )
+    text_format = (request.text or {}).get("format")
+    format_error = _validate_output_format(
+        text_format, "text.format", request.tools if request.tool_choice != "none" else None
+    )
+    if format_error:
+        return format_error
     if request.tool_choice not in (None, "none", "auto"):
         return _unsupported(
             "tool_choice",
@@ -299,6 +327,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         min(request.prompt_logprobs, 20) if prompt_logprobs_enabled else 0
     )
     if llm.check_seq_length(token_ids, max_output_tokens):
+        try:
+            structured_output = await _prepare_output_format(request.response_format, token_ids)
+        except (ValueError, RuntimeError, ImportError) as exc:
+            return _openai_error(str(exc), param="response_format", code="invalid_output_format")
         stream = await llm.add_requests_async(
             raw_request,
             token_ids,
@@ -315,6 +347,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             num_top_logprobs=num_top_logprobs,
             prompt_logprobs_enabled=prompt_logprobs_enabled,
             num_prompt_logprobs=num_prompt_logprobs,
+            structured_output=structured_output,
         )
     else:
         return _openai_error(
@@ -420,6 +453,10 @@ async def create_response(request: ResponseRequest, raw_request: Request):
             param="input",
             code="context_length_exceeded",
         )
+    try:
+        structured_output = await _prepare_output_format((request.text or {}).get("format"), token_ids)
+    except (ValueError, RuntimeError, ImportError) as exc:
+        return _openai_error(str(exc), param="text.format", code="invalid_output_format")
     stream = await llm.add_requests_async(
         raw_request,
         token_ids,
@@ -432,6 +469,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         mm_contents,
         mm_items,
         dp_index=getattr(raw_request.app.state, "dp_index", None),
+        structured_output=structured_output,
     )
     reasoning_parser = create_reasoning_parser(
         getattr(llm.model_runner, "tokenizer", None), token_ids

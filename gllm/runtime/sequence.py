@@ -42,8 +42,10 @@ class GenerationSequence:
         num_top_logprobs=0,
         prompt_logprobs_enabled=False,
         num_prompt_logprobs=0,
+        structured_output=None,
     ):
         self.seq_id = seq_id
+        self.structured_output = structured_output
         self.token_ids: List[int] = token_ids
         # ``raw_prompt_len`` is the *original* prompt length, fixed for the
         # whole lifetime of the request. ``prompt_len`` is the dynamic prefill

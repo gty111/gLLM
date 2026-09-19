@@ -572,6 +572,7 @@ class OverlapWorker(Worker):
             or get_pp_size() > 1
             or input_data is None
             or not input_data.seqs
+            or not OverlapModelRunner.mtp_sampling_compatible(input_data.seqs)
         ):
             return []
         num_prefills = int(getattr(input_data, "num_prefills", 0))

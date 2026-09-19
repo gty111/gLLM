@@ -586,10 +586,13 @@ class LLM:
         num_top_logprobs=0,
         prompt_logprobs_enabled=False,
         num_prompt_logprobs=0,
+        structured_output=None,
     ):
         # Validate before allocating an id, including for direct engine callers
         # that bypass the HTTP length check. None means all remaining context.
         requested_output_len = output_len
+        if structured_output is not None and ignore_eos:
+            raise ValueError("Structured output does not support ignore_eos.")
         output_len = resolve_output_len(
             len(token_ids), output_len, self.model_max_length
         )
@@ -622,6 +625,7 @@ class LLM:
             num_top_logprobs,
             prompt_logprobs_enabled,
             num_prompt_logprobs,
+            structured_output=structured_output,
         )
         # Encoder-disaggregation: the ordered raw mm items the encoder will
         # process. Present only on the disaggregated LM frontend; ``None`` for

@@ -48,6 +48,11 @@ def events(req, name, args):
     adapter = TypeAdapter(ResponseStreamEvent)
     for event in result:
         adapter.validate_python(event)
+        if event["type"] == "response.function_call_arguments.done":
+            item = next(e["item"] for e in result
+                        if e["type"] == "response.output_item.done"
+                        and e["item"]["id"] == event["item_id"])
+            assert event["name"] == item["name"]
     return result
 
 

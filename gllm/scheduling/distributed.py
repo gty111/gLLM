@@ -144,6 +144,7 @@ class SeqRegister:
     # non-VL non-rep-penalty seqs we skip the accumulation (small but
     # non-trivial Python overhead per decode).
     needs_token_id_accumulation: bool = False
+    structured_output: Any = None
 
 
 @dataclass(slots=True)
@@ -195,6 +196,11 @@ class SeqUpdate:
     # replays the identical ``copy_state`` on its own GDN-layer arena view. A
     # one-shot per-iteration signal (``None`` on every other iteration).
     ssm_restore_src_slot: Optional[int] = None
+    # Preemption moves the prefill boundary past already-generated tokens.
+    prompt_len: Optional[int] = None
+    # Only the final re-prefill chunk ships committed outputs for grammar
+    # recovery. Ordinary decode needs no full token-history mirror.
+    structured_output_history: Optional[List[int]] = None
 
 
 @dataclass(slots=True)
@@ -348,6 +354,7 @@ class DriverPayloadBuilder:
                         # immutable here.
                         mm_contents=seq.mm_contents if use_mm else None,
                         needs_token_id_accumulation=needs_token_id_accumulation,
+                        structured_output=getattr(seq, "structured_output", None),
                     )
                 )
                 self._known.add(sid)
@@ -398,6 +405,14 @@ class DriverPayloadBuilder:
                     ssm_restore_src_slot=(
                         ssm_restores.get(sid) if ssm_restores else None
                     ),
+                    prompt_len=seq.prompt_len,
+                    structured_output_history=(
+                        list(seq.token_ids[seq.raw_prompt_len:seq.prompt_len])
+                        if getattr(seq, "structured_output", None) is not None
+                        and seq.raw_prompt_len < seq.prompt_len
+                        and seq.computed_token_num < seq.prompt_len <= seq.seq_len
+                        else None
+                    ),
                 )
             )
 
@@ -443,6 +458,9 @@ class FollowerSeq:
     """
 
     __slots__ = (
+        "__weakref__",
+        "structured_output",
+        "structured_output_history",
         "seq_id",
         "prompt_len",
         "token_ids",
@@ -475,6 +493,8 @@ class FollowerSeq:
 
     def __init__(self, reg: SeqRegister, mm_needs_token_ids: bool = False):
         self.seq_id = reg.seq_id
+        self.structured_output = reg.structured_output
+        self.structured_output_history = None
         self.prompt_len = reg.prompt_len
         # Keep token_ids alive throughout the seq's lifetime when:
         #   * VL: ``_mm_prepare_cpu`` walks the prompt to build the
@@ -585,6 +605,9 @@ class FollowerSeq:
         self.ssm_block_table = upd.ssm_block_table
         self.ssm_num_accepted = upd.ssm_num_accepted
         self.ssm_restore_src_slot = upd.ssm_restore_src_slot
+        if upd.prompt_len is not None:
+            self.prompt_len = upd.prompt_len
+        self.structured_output_history = upd.structured_output_history
 
         if upd.page_table_reset is not None:
             # Preemption / first scheduling.
