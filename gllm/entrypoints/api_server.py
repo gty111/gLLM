@@ -39,6 +39,7 @@ from gllm.entrypoints.serving_responses import (
     make_chat_request,
     response_completion_generator,
     response_stream_generator,
+    snapshot_response_files,
 )
 from gllm.entrypoints.response_store import ResponseStore
 from gllm.tokenizers.tool_parsers import get_tool_parser
@@ -383,7 +384,9 @@ async def create_response(request: ResponseRequest, raw_request: Request):
                 "The previous response was not found.", 404,
                 param="previous_response_id", code="response_not_found",
             )
-        if previous["model"] != request.model:
+        # Both names have to identify the checkpoint currently loaded by this
+        # server. A path, basename and HF cache alias are not different models.
+        if previous["model"] not in _served_model_ids():
             return _openai_error(
                 "The previous response uses a different model.",
                 param="previous_response_id", code="invalid_request_error",
@@ -402,6 +405,8 @@ async def create_response(request: ResponseRequest, raw_request: Request):
     try:
         # File URLs involve blocking I/O; keep them off the FastAPI event loop
         # while building the native text/image message.
+        if request.store:
+            request = await make_async(snapshot_response_files)(request)
         chat_request = await make_async(make_chat_request)(request)
     except ValueError as exc:
         param, message = exc.args if len(exc.args) == 2 else ("input", str(exc))
@@ -503,7 +508,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
                                 response_store.put(response["id"], {
                                     "response": response,
                                     "input_items": normalized_input,
-                                    "model": request.model,
+                                    "model": str(llm.model_path),
                                 })
                     yield line
             generator = storing_generator()
@@ -522,7 +527,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         response_store.put(response["id"], {
             "response": response,
             "input_items": normalized_input,
-            "model": request.model,
+            "model": str(llm.model_path),
         })
     return JSONResponse(content=response)
 
