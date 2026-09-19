@@ -52,6 +52,7 @@ def normalize_format(fmt):
         "type", "properties", "required", "additionalProperties", "items",
         "anyOf", "enum", "const", "$ref", "$defs", "definitions",
         "title", "description", "default", "$schema",
+        "minLength", "maxLength",
     }
     annotations = {"title", "description", "default", "$schema", "$defs", "definitions"}
     literal_nodes = []
@@ -78,6 +79,11 @@ def normalize_format(fmt):
             literal_nodes.append(node)
         types = node.get("type", [])
         types = [types] if isinstance(types, str) else types
+        if "minLength" in node or "maxLength" in node:
+            if "string" not in types:
+                raise ValueError("String length constraints require an explicit string type (optionally nullable).")
+            if node.get("minLength", 0) > node.get("maxLength", float("inf")):
+                raise ValueError("minLength must not exceed maxLength.")
         if strict and ("object" in types or "properties" in node):
             if node.get("additionalProperties") is not False:
                 raise ValueError("strict objects require additionalProperties=false.")
@@ -123,6 +129,39 @@ def compiler(tokenizer, vocab_size, stop_tokens):
     return xgr.GrammarCompiler(info, max_threads=2, cache_limit_bytes=64 * 1024 * 1024)
 
 
+@lru_cache(maxsize=32)
+def _string_length_grammar(schema):
+    """Repair the bounded-string character unit emitted by XGrammar 0.2.7.
+
+    Its length rule excludes escapes but permits some raw control characters.
+    Count decoded Unicode characters instead: each escape or UTF-16 surrogate
+    pair is one unit. The schema converter still owns nesting, refs and bounds.
+    This exact rewrite is tied to our pinned backend and covered by mask tests.
+    """
+    import xgrammar as xgr
+
+    grammar = str(xgr.Grammar.from_json_schema(schema, strict_mode=False))
+    old_unit = r'(([^\"\\\r\n]))'
+    char_unit = (
+        r'([^\x00-\x1f\"\\]'
+        r' | "\\" [\"\\/bfnrt]'
+        r' | "\\u" ([0-9a-cA-Ce-fE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2})'
+        r' | "\\u" [dD] [89aAbB] [0-9a-fA-F]{2} "\\u" [dD] [c-fC-F] [0-9a-fA-F]{2})'
+    )
+    # Replace whole rule bodies only, never text inside a JSON const/enum.
+    return "\n".join(
+        line.split(" ::= ", 1)[0] + " ::= " + char_unit
+        if line.endswith(" ::= " + old_unit) else line
+        for line in grammar.splitlines()
+    )
+
+
+def compile_schema(ctx, schema):
+    if '"minLength"' in schema or '"maxLength"' in schema:
+        return ctx.compile_grammar(_string_length_grammar(schema))
+    return ctx.compile_json_schema(schema, strict_mode=False)
+
+
 @dataclass(frozen=True)
 class StructuredOutput:
     schema: str
@@ -138,9 +177,7 @@ def prepare_output(fmt, tokenizer, vocab_size, stop_tokens, prompt_ids):
         return None
     # Compile before admission: bad schemas must not kill a worker. Cache hits
     # amortize compilation; the API runs this function off its event loop.
-    compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_json_schema(
-        schema, strict_mode=False
-    )
+    compile_schema(compiler(tokenizer, vocab_size, tuple(stop_tokens)), schema)
     from gllm.tokenizers.reasoning import create_reasoning_parser
 
     parser = create_reasoning_parser(tokenizer, prompt_ids)
@@ -240,7 +277,7 @@ class StructuredSampler:
         if state is None:
             spec = seq.structured_output
             ctx = compiler(self.tokenizer, vocab_size, tuple(seq.finish_tokens))
-            ctx = ctx.compile_json_schema(spec.schema, strict_mode=False)
+            ctx = compile_schema(ctx, spec.schema)
             state = self.states[seq] = _State(ctx, spec, seq.finish_tokens)
         return state
 

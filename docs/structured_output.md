@@ -57,6 +57,13 @@ Constrained syntax does not guarantee factual or semantic correctness.
 
 Types, object `properties` / `required` / `additionalProperties`, array `items`,
 `enum`, `const`, `anyOf`, local `$ref`, `$defs` and `definitions` are supported.
+String `minLength` / `maxLength` bounds are supported on explicitly typed string
+nodes (including nullable strings). Bounds must be nonnegative integers, with
+`minLength <= maxLength` when both are present. Length counts decoded Unicode
+characters, not UTF-8 bytes or JSON escape characters: `中`, `\n`, and an escaped
+UTF-16 surrogate pair each count as one character. Unpaired surrogate escapes
+are rejected in length-constrained strings. This supports schemas such as
+Codex's task title field with `minLength: 1` and `maxLength: 36`.
 `title`, `description`, `default`, and `$schema` are accepted as annotations.
 Other keywords (including numeric ranges, string patterns, and array length
 bounds) are rejected with HTTP 400 rather than silently ignored. Boolean
@@ -159,7 +166,7 @@ or copy a second speculative-execution framework.
 
 ## Tests
 
-CPU tests: `pytest -q tests/test_structured_output.py`.
+CPU tests: `pytest -q tests/test_structured_output.py tests/test_structured_string_lengths.py`.
 
 `tests/run_structured_output.py` is a Slurm-only online integration harness for
 Qwen3.8-27B: greedy and random sampling, mixed schemas and ordinary requests,
