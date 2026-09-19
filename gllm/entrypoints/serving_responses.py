@@ -297,12 +297,23 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
             "role": instructions[0]["role"],
             "content": "\n\n".join(message["content"] for message in instructions),
         }, *conversation]
-    if not any(message.get("role") == "user" for message in messages):
-        raise ValueError(
-            "input",
-            "Stateless Responses requests must include a user message; previous_response_id is not supported.",
-        )
+    if not messages:
+        raise ValueError("input", "At least one input item is required.")
     return messages
+
+
+def _previous_output_to_input_items(prev_response: dict) -> list:
+    """Convert stored output items into input items in their original order."""
+    items = []
+    for item in prev_response.get("output", []):
+        item_type = item.get("type")
+        if item_type == "message" and item.get("role") == "assistant":
+            items.append({"type": "message", "role": "assistant", "content": item["content"]})
+        elif item_type == "function_call":
+            items.append({key: item[key] for key in ("type", "call_id", "name", "arguments")})
+        elif item_type == "custom_tool_call":
+            items.append({key: item[key] for key in ("type", "call_id", "name", "input")})
+    return items
 
 
 def response_tools_to_chat(tools):
