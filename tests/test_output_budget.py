@@ -23,11 +23,48 @@ def make_engine(context=262144):
     engine.model_max_length = context
     engine.model_path = "test"
     engine.generation_config = SimpleNamespace(
-        temperature=None, top_p=None, repetition_penalty=None,
+        temperature=None, top_p=None, top_k=None, repetition_penalty=None,
     )
     engine.finish_tokens = [99]
     engine.id_allocator = IDAllocator()
     return engine
+
+
+@pytest.mark.parametrize("requested,configured,expected", [
+    (None, 20, 20),
+    (1, 20, 1),
+    (5, 20, 5),
+    (None, None, 1),
+    (None, 1, 1),
+])
+def test_engine_top_k_sampling_defaults(requested, configured, expected):
+    from gllm.layers.sampler import Sampler
+
+    engine = make_engine()
+    engine.generation_config.top_k = configured
+    seq = engine.allocate_seq([1, 2], top_k=requested)
+    assert seq.top_k == expected
+    flags = Sampler._get_sampling_flags(SimpleNamespace(seqs=[seq]))
+    assert flags["is_all_greedy"] == (expected == 1)
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({}, (1.0, 0.95)),
+    ({"temperature": 0.7, "top_p": 0.8}, (0.7, 0.8)),
+])
+def test_responses_inherits_model_sampling_defaults(overrides, expected):
+    from gllm.entrypoints.serving_responses import make_chat_request
+
+    engine = make_engine()
+    engine.generation_config.temperature = 1.0
+    engine.generation_config.top_p = 0.95
+    engine.generation_config.top_k = 20
+    chat = make_chat_request(ResponseRequest(model="test", input="Hello", **overrides))
+    seq = engine.allocate_seq(
+        [1, 2], temperature=chat.temperature, top_p=chat.top_p, top_k=chat.top_k,
+    )
+    assert (seq.temperature, seq.top_p) == expected
+    assert seq.top_k == 20
 
 
 @pytest.mark.parametrize("prompt_len,requested,expected", [

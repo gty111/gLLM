@@ -604,9 +604,9 @@ class LLM:
         gen = self.generation_config
         temperature = _resolve_sampling_param(temperature, gen.temperature, 1.0)
         top_p = _resolve_sampling_param(top_p, gen.top_p, 1.0)
-        # top_k=1 selects the greedy fast-path in ``Sampler``; do not inherit
-        # ``generation_config.top_k`` when the caller leaves it unset.
-        top_k = 1 if top_k is None else top_k
+        # Honor the model's sampling defaults; explicit top_k=1 still selects
+        # greedy decoding, as does an absent caller and model default.
+        top_k = _resolve_sampling_param(top_k, gen.top_k, 1)
         repetition_penalty = _resolve_sampling_param(
             repetition_penalty, gen.repetition_penalty, 1.0
         )
