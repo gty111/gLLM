@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import traceback
 from http import HTTPStatus
 from pathlib import Path
@@ -34,10 +35,12 @@ from gllm.entrypoints.serving_completions import (
     completion_stream_generator,
 )
 from gllm.entrypoints.serving_responses import (
+    _previous_output_to_input_items,
     make_chat_request,
     response_completion_generator,
     response_stream_generator,
 )
+from gllm.entrypoints.response_store import ResponseStore
 from gllm.tokenizers.tool_parsers import get_tool_parser
 from gllm.tokenizers.reasoning import create_reasoning_parser
 from gllm.utils import find_free_ports, make_async
@@ -49,6 +52,7 @@ llm: AsyncLLM = None
 # tool-call markup into structured ``tool_calls``. ``None`` => model has no
 # known tool-call format, raw text passes through as content.
 tool_parser = None
+response_store = ResponseStore()
 
 
 def _openai_error(
@@ -156,10 +160,8 @@ def _validate_response_capabilities(request: ResponseRequest):
         (bool(set(request.include or []) - {"reasoning.encrypted_content"}), "include"),
         (request.max_tool_calls is not None, "max_tool_calls"),
         (request.moderation is not None, "moderation"),
-        (request.previous_response_id is not None, "previous_response_id"),
         (request.prompt is not None, "prompt"),
         (request.prompt_cache_options is not None, "prompt_cache_options"),
-        (request.store is True, "store"),
         (request.top_logprobs is not None, "top_logprobs"),
         (request.truncation == "auto", "truncation"),
     ]
@@ -341,6 +343,29 @@ async def create_response(request: ResponseRequest, raw_request: Request):
     capability_error = _validate_response_capabilities(request)
     if capability_error:
         return capability_error
+    if request.previous_response_id:
+        previous = response_store.get(request.previous_response_id)
+        if previous is None:
+            return _openai_error(
+                "The previous response was not found.", 404,
+                param="previous_response_id", code="response_not_found",
+            )
+        if previous["model"] != request.model:
+            return _openai_error(
+                "The previous response uses a different model.",
+                param="previous_response_id", code="invalid_request_error",
+            )
+        current_items = (
+            [{"type": "message", "role": "user", "content": request.input}]
+            if isinstance(request.input, str) else list(request.input)
+        )
+        request = request.model_copy(update={
+            "input": (
+                list(previous["input_items"])
+                + _previous_output_to_input_items(previous["response"])
+                + current_items
+            ),
+        })
     try:
         # File URLs involve blocking I/O; keep them off the FastAPI event loop
         # while building the native text/image message.
@@ -415,6 +440,35 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         generator = response_stream_generator(
             stream, request, chat_request, tool_parser, reasoning_parser
         )
+        if request.store:
+            source_generator = generator
+            async def storing_generator():
+                async for line in source_generator:
+                    data_line = next(
+                        (part[6:] for part in line.splitlines() if part.startswith("data: ")),
+                        None,
+                    )
+                    if data_line is not None:
+                        try:
+                            event = json.loads(data_line)
+                        except ValueError:
+                            continue
+                        if event.get("type") in (
+                            "response.completed", "response.incomplete", "response.failed"
+                        ):
+                            if request.store:
+                                response = event["response"]
+                                normalized_input = (
+                                    [{"type": "message", "role": "user", "content": request.input}]
+                                    if isinstance(request.input, str) else list(request.input)
+                                )
+                                response_store.put(response["id"], {
+                                    "response": response,
+                                    "input_items": normalized_input,
+                                    "model": request.model,
+                                })
+                    yield line
+            generator = storing_generator()
         return StreamingResponse(content=generator, media_type="text/event-stream")
     try:
         response = await response_completion_generator(
@@ -422,6 +476,16 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         )
     except ValueError as exc:
         return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
+    if request.store:
+        normalized_input = (
+            [{"type": "message", "role": "user", "content": request.input}]
+            if isinstance(request.input, str) else list(request.input)
+        )
+        response_store.put(response["id"], {
+            "response": response,
+            "input_items": normalized_input,
+            "model": request.model,
+        })
     return JSONResponse(content=response)
 
 

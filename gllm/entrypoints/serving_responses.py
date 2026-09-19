@@ -300,9 +300,29 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
     if not any(message.get("role") == "user" for message in messages):
         raise ValueError(
             "input",
-            "Stateless Responses requests must include a user message; previous_response_id is not supported.",
+            "Responses requests must include a user message (either directly or via previous_response_id history).",
         )
     return messages
+
+
+def _previous_output_to_input_items(prev_response: dict) -> list:
+    """Convert stored output items into input items in their original order."""
+    items = []
+    for item in prev_response.get("output", []):
+        item_type = item.get("type")
+        if item_type == "message" and item.get("role") == "assistant":
+            items.append({"type": "message", "role": "assistant", "content": item["content"]})
+        elif item_type == "function_call":
+            entry = {key: item[key] for key in ("type", "call_id", "name", "arguments")}
+            if item.get("namespace"):
+                entry["namespace"] = item["namespace"]
+            items.append(entry)
+        elif item_type == "custom_tool_call":
+            entry = {key: item[key] for key in ("type", "call_id", "name", "input")}
+            if item.get("namespace"):
+                entry["namespace"] = item["namespace"]
+            items.append(entry)
+    return items
 
 
 def response_tools_to_chat(tools):
@@ -357,7 +377,7 @@ def _base_response(request: ResponseRequest, *, response_id: str, created_at: in
         "parallel_tool_calls": bool(request.parallel_tool_calls),
         "previous_response_id": request.previous_response_id,
         "reasoning": {"effort": effort, "summary": None},
-        "store": False,
+        "store": bool(request.store),
         "temperature": request.temperature,
         "text": request.text or {"format": {"type": "text"}},
         "tool_choice": request.tool_choice or ("auto" if request.tools else "none"),
