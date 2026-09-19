@@ -99,12 +99,18 @@ class ArenaCacheType:
     num_slots: int
     prefer_high: bool = False
     free_slots: Set[int] = field(default_factory=set)
-    free_heap: List[int] = field(default_factory=list)
+    free_heap: List[Tuple[int, int]] = field(default_factory=list)
     live_slots: Set[int] = field(default_factory=set)
     # Number of physical pages in each logical slot currently owned by any
     # cache type. Maintaining this incrementally makes the allocator's hot
     # ``is extent free?`` query O(1), independent of entry size.
     occupied_pages: List[int] = field(default_factory=list)
+    # Zero means no retained cache overlaps this extent. Otherwise use the
+    # newest overlapping cache timestamp for a free extent, protecting recent
+    # prefixes even when a different cache type borrows these bytes. Pinned
+    # extents refresh their priority when they become free.
+    cached_priority: List[int] = field(default_factory=list)
+    retained_slots: Set[int] = field(default_factory=set)
     evictor: Optional[Callable[[int], None]] = None
     reclaimer: Optional[Callable[[], bool]] = None
 
@@ -115,16 +121,30 @@ class ArenaCacheType:
         if slot in self.free_slots:
             return
         self.free_slots.add(slot)
-        heapq.heappush(self.free_heap, self.heap_key(slot))
+        self.refresh_free(slot)
+
+    def refresh_free(self, slot: int) -> None:
+        if slot not in self.free_slots:
+            return
+        heapq.heappush(
+            self.free_heap, (self.cached_priority[slot], self.heap_key(slot))
+        )
+        # Exact-slot prefix hits and priority changes leave stale heap entries.
+        # Bound their memory cost during long-lived serving.
+        if len(self.free_heap) > 4 * self.num_slots + 64:
+            self.free_heap = [
+                (self.cached_priority[s], self.heap_key(s)) for s in self.free_slots
+            ]
+            heapq.heapify(self.free_heap)
 
     def discard_free(self, slot: int) -> None:
         self.free_slots.discard(slot)
 
     def take_free(self) -> Optional[int]:
         while self.free_heap:
-            key = heapq.heappop(self.free_heap)
+            priority, key = heapq.heappop(self.free_heap)
             slot = -key if self.prefer_high else key
-            if slot in self.free_slots:
+            if slot in self.free_slots and priority == self.cached_priority[slot]:
                 self.free_slots.remove(slot)
                 return slot
         return None
@@ -146,6 +166,8 @@ class CacheArenaAllocator:
         self._owners: List[Optional[Tuple[str, int]]] = [None] * self.num_physical_pages
         self._types: Dict[str, ArenaCacheType] = {}
         self._used_physical_pages = 0
+        self._cached_pages: List[int] = [0] * self.num_physical_pages
+        self._cache_clock = 0
 
     def register_type(
         self,
@@ -167,6 +189,7 @@ class CacheArenaAllocator:
             num_slots=self.num_physical_pages // pages,
             prefer_high=prefer_high,
             occupied_pages=[0] * (self.num_physical_pages // pages),
+            cached_priority=[0] * (self.num_physical_pages // pages),
         )
         self._types[name] = cache_type
         # Types are normally registered before the first claim. Populate from
@@ -176,6 +199,7 @@ class CacheArenaAllocator:
             start, end = self._extent(cache_type, slot)
             occupied = sum(owner is not None for owner in self._owners[start:end])
             cache_type.occupied_pages[slot] = occupied
+            cache_type.cached_priority[slot] = max(self._cached_pages[start:end])
             if occupied == 0:
                 cache_type.add_free(slot)
         return cache_type
@@ -196,6 +220,63 @@ class CacheArenaAllocator:
     def set_reclaimer(self, name: str, callback: Callable[[], bool]) -> None:
         """Register pressure-driven reclamation for an evictable cache type."""
         self.cache_type(name).reclaimer = callback
+
+    def mark_cached(self, name: str, slots: Iterable[int]) -> None:
+        """Retain cache contents across an imminent release of owned slots.
+
+        The caller supplies eviction order, oldest first. Prefix caches pass
+        each completed request's pages in reverse token order so its tail is
+        reclaimed before its beginning. Uncached extents always rank first.
+        Physical ownership still controls pinning; this is soft metadata only.
+        """
+        cache_type = self.cache_type(name)
+        extents = []
+        for slot in slots:
+            slot = int(slot)
+            start, end = self._extent(cache_type, slot)
+            if slot not in cache_type.live_slots:
+                raise RuntimeError(f"cannot cache unowned {name} slot {slot}")
+            extents.append((start, end))
+        for start, end in extents:
+            self._cache_clock += 1
+            self._cached_pages[start:end] = [self._cache_clock] * (end - start)
+            cache_type.retained_slots.add(start // cache_type.pages_per_slot)
+        # All affected extents still overlap owned pages. They are not free
+        # candidates, so defer priority calculation to the ownership release.
+        # This avoids a second full pass over a long request's page table.
+
+    def _update_cached_ranges(self, extents: Iterable[Tuple[int, int]]) -> None:
+        merged = []
+        for start, end in sorted(extents):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        for start, end in merged:
+            self._update_cached_priorities(start, end)
+
+    def discard_cached(self, name: str, slots: Iterable[int]) -> None:
+        """Drop soft retention when a cache entry is no longer reachable."""
+        cache_type = self.cache_type(name)
+        extents = []
+        for slot in slots:
+            if slot in cache_type.retained_slots:
+                cache_type.retained_slots.remove(slot)
+                start, end = self._extent(cache_type, slot)
+                self._cached_pages[start:end] = [0] * (end - start)
+                extents.append((start, end))
+        self._update_cached_ranges(extents)
+
+    def _update_cached_priorities(self, start: int, end: int) -> None:
+        for cache_type in self._types.values():
+            for slot in self._overlapping_slots(cache_type, start, end):
+                if slot not in cache_type.free_slots:
+                    continue
+                slot_start, slot_end = self._extent(cache_type, slot)
+                priority = max(self._cached_pages[slot_start:slot_end])
+                if cache_type.cached_priority[slot] != priority:
+                    cache_type.cached_priority[slot] = priority
+                    cache_type.refresh_free(slot)
 
     def _reclaim_for(self, request: ArenaCacheType, count: int) -> bool:
         while len(request.free_slots) < count:
@@ -256,6 +337,11 @@ class CacheArenaAllocator:
                     )
                 cache_type.occupied_pages[slot] = occupied
                 if occupied == 0:
+                    cache_type.cached_priority[slot] = (
+                        self._cached_pages[slot_start]
+                        if cache_type.pages_per_slot == 1
+                        else max(self._cached_pages[slot_start:slot_end])
+                    )
                     cache_type.add_free(slot)
                 else:
                     cache_type.discard_free(slot)
@@ -302,18 +388,31 @@ class CacheArenaAllocator:
         # Claims are already visible, so callbacks that free some other cache
         # entry cannot accidentally reselect the just-claimed extent.
         notified: Set[Tuple[str, int]] = set()
+        invalidated = []
         for name, slot in allocations:
             source = self.cache_type(name)
             start, end = self._extent(source, slot)
             for cache_type in self._types.values():
-                if cache_type.evictor is None:
+                if cache_type.evictor is None and not cache_type.retained_slots:
                     continue
                 for stale_slot in self._overlapping_slots(cache_type, start, end):
                     key = (cache_type.name, stale_slot)
                     if key in notified or (preserved is not None and key in preserved):
                         continue
                     notified.add(key)
-                    cache_type.evictor(stale_slot)
+                    if stale_slot in cache_type.retained_slots:
+                        cache_type.retained_slots.remove(stale_slot)
+                        stale_start, stale_end = self._extent(cache_type, stale_slot)
+                        self._cached_pages[stale_start:stale_end] = [0] * (
+                            stale_end - stale_start
+                        )
+                        invalidated.append((stale_start, stale_end))
+                    if cache_type.evictor is not None:
+                        cache_type.evictor(stale_slot)
+        # A retained prefix hit changes ownership, not cached contents. Avoid
+        # recomputing overlapping SSM priorities for every hit KV page. Only
+        # actual replacement invalidates cache ages; batch those updates too.
+        self._update_cached_ranges(invalidated)
 
     def allocate(
         self,
@@ -368,6 +467,40 @@ class CacheArenaAllocator:
             preserved=preserved,
         )
         return selected
+
+    def retain_many(self, name: str, slots: Iterable[int]) -> Optional[List[int]]:
+        """Pin cached slots in one transaction, preserving their contents.
+
+        Already-live slots keep their physical ownership; logical references
+        belong to the caller. Validate the entire cohort before claiming any
+        free slots. Repeated ids need only one physical claim.
+        """
+        cache_type = self.cache_type(name)
+        slot_list = list(dict.fromkeys(int(slot) for slot in slots))
+        free_slots = []
+        for slot in slot_list:
+            self._extent(cache_type, slot)  # validate even already-live ids
+            if slot in cache_type.live_slots:
+                continue
+            if cache_type.occupied_pages[slot] != 0:
+                return None
+            free_slots.append(slot)
+        if free_slots:
+            # _claim_many merges neighboring extents before updating the KV,
+            # working-state and snapshot candidate grids.
+            self._claim_many(cache_type, free_slots)
+            # Our own views are all retained. If no other type keeps soft
+            # metadata, there is nothing to invalidate (the common KV path).
+            if any(
+                other is not cache_type
+                and (other.evictor is not None or other.retained_slots)
+                for other in self._types.values()
+            ):
+                preserved = {(name, slot) for slot in free_slots}
+                self._evict_stale_views(
+                    ((name, slot) for slot in free_slots), preserved=preserved
+                )
+        return slot_list
 
     def free(self, name: str, slots: Iterable[int]) -> None:
         cache_type = self.cache_type(name)
@@ -597,6 +730,10 @@ class ArenaSlotAllocator:
 
     def free(self, id: int):
         self.arena.allocator.free(self.cache_type, [id])
+
+    def retain_many(self, ids: Iterable[int]) -> None:
+        if self.arena.allocator.retain_many(self.cache_type, ids) is None:
+            raise RuntimeError(f"cannot retain occupied {self.cache_type} arena slots")
 
     def free_many(self, ids: Iterable[int]) -> None:
         """Return a cohort in one allocator transaction.
