@@ -7,6 +7,7 @@ class ThinkParser:
 
     def __init__(self, *, prefilled=False):
         self.prefilled = prefilled
+        self.started = prefilled
         self.state = "start"
         self.pending = ""
 
@@ -19,6 +20,7 @@ class ThinkParser:
             if not head or (len(head) < len(self.START) and self.START.startswith(head)):
                 return "", ""
             if head.startswith(self.START):
+                self.started = True
                 self.pending = head[len(self.START):]
                 self.state = "reasoning"
             elif self.prefilled:
