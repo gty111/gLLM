@@ -26,6 +26,7 @@ the server leaves the raw text in ``content`` untouched.
 import json
 import math
 import re
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
 from gllm.entrypoints.protocol import (
@@ -381,48 +382,177 @@ class StreamToolParser:
         return None
 
 
+class ToolParseError(ValueError):
+    """A model began a native tool call but did not produce a valid call."""
+
+
+class QwenStreamToolParser(StreamToolParser):
+    """Consume Qwen markup while preserving literal text and Markdown code.
+
+    Only an opening marker followed by the parser's call syntax commits to a
+    call. A marker in code, or followed by ordinary prose, remains literal.
+    Keep the cursor at ambiguous chunk boundaries so already-emitted text is
+    never retracted. Completed calls are decoded once, with stable ids.
+    """
+
+    def __init__(self, parser, tools=None):
+        super().__init__(parser, tools)
+        self._pos = 0
+        self._code = None
+        self._fenced = False
+        self._pending = deque()
+        self._error = None
+
+    def process(self, full_text: str, *, final: bool = False) -> Optional[DeltaMessage]:
+        if self._error is not None:
+            if final:
+                raise self._error
+            return None
+        if self._pending:
+            call = self._pending.popleft()
+            index = self._tool_calls_emitted
+            self._tool_calls_emitted += 1
+            return DeltaMessage(tool_calls=[DeltaToolCall(
+                index=index, id=call.id, type="function",
+                function=DeltaFunctionCall(name=call.function.name,
+                                          arguments=call.function.arguments),
+            )])
+        text = []
+        marker = self._parser._START
+        while self._pos < len(full_text):
+            pos = self._pos
+            char = full_text[pos]
+            # Escaped Markdown punctuation cannot open a code span or call.
+            if self._code is None and char == "\\":
+                if pos + 1 == len(full_text) and not final:
+                    break
+                end = min(pos + 2, len(full_text))
+                text.append(full_text[pos:end])
+                self._pos = end
+                continue
+            if char in "`~":
+                end = pos + 1
+                while end < len(full_text) and full_text[end] == char:
+                    end += 1
+                if end == len(full_text) and not final:
+                    break  # The delimiter run may continue in the next chunk.
+                size = end - pos
+                indent = full_text[full_text.rfind("\n", 0, pos) + 1:pos]
+                line_start = len(indent) <= 3 and not indent.strip()
+                if self._code is not None:
+                    code_char, code_size = self._code
+                    closes = char == code_char and (
+                        size == code_size if not self._fenced
+                        else size >= code_size and line_start
+                    )
+                    if closes and self._fenced:
+                        line_end = full_text.find("\n", end)
+                        rest = full_text[end:line_end if line_end >= 0 else None]
+                        if line_end < 0 and not final and not rest.strip():
+                            break  # A fence closer allows only trailing whitespace.
+                        closes = not rest.strip()
+                    if closes:
+                        self._code = None
+                        self._fenced = False
+                elif line_start and size >= 3:
+                    self._code = (char, size)
+                    self._fenced = True
+                elif char == "`":
+                    self._code = (char, size)
+                text.append(full_text[pos:end])
+                self._pos = end
+                continue
+            if self._code is None and char == "<":
+                tail = full_text[pos:]
+                if not final and marker.startswith(tail):
+                    break
+                if tail.startswith(marker):
+                    if text:
+                        break  # Publish preceding prose before inspecting the call.
+                    body_start = pos + len(marker)
+                    while body_start < len(full_text) and full_text[body_start].isspace():
+                        body_start += 1
+                    body = full_text[body_start:]
+                    opener = self._parser._CALL_START
+                    if not body or opener.startswith(body):
+                        if not final:
+                            break
+                        if body:
+                            raise ToolParseError("Generation ended before the tool call was closed.")
+                    if body.startswith(opener):
+                        block = self._parser.call_block(full_text, body_start)
+                        if block is None:
+                            if not final:
+                                break
+                            raise ToolParseError("Generation ended before the tool call was closed.")
+                        payload, end = block
+                        try:
+                            calls = self._parser.decode_calls(payload, self._tools)
+                        except ToolParseError as exc:
+                            # Consume the engine stream before reporting failure,
+                            # preserving usage and the actual budget finish reason.
+                            self._error = exc
+                            if final:
+                                raise
+                            return None
+                        self._pending.extend(calls)
+                        self._pos = end
+                        return self.process(full_text, final=final)
+                    # No call structure follows this marker: emit it literally.
+                    text.append(marker)
+                    self._pos = pos + len(marker)
+                    continue
+            text.append(char)
+            self._pos += 1
+        return DeltaMessage(content="".join(text)) if text else None
+
+
+def _parse_qwen_text(parser, full_text, tools):
+    stream = QwenStreamToolParser(parser, tools)
+    content, calls = [], []
+    while (delta := stream.process(full_text, final=True)) is not None:
+        if delta.content:
+            content.append(delta.content)
+        for call in delta.tool_calls or []:
+            calls.append(ToolCall(id=call.id, function=FunctionCall(
+                name=call.function.name, arguments=call.function.arguments,
+            )))
+    return "".join(content) or None, calls
+
+
 class QwenToolParser(ToolParser):
     """Qwen / Hermes style: zero or more ``<tool_call>{json}</tool_call>``
     blocks, optionally preceded by natural-language content."""
 
     name = "qwen"
     _START = "<tool_call>"
-    _BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
-
-    def content_prefix(self, full_text: str) -> str:
-        return full_text.split(self._START, 1)[0]
+    _CALL_START = "{"
 
     def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
-        if self._START not in full_text:
-            return full_text, []
+        return _parse_qwen_text(self, full_text, tools)
 
-        tool_calls: List[ToolCall] = []
-        for block in self._BLOCK_RE.findall(full_text):
-            block = block.strip()
-            if not block:
-                continue
-            try:
-                obj = json.loads(block)
-            except json.JSONDecodeError:
-                continue
-            name = obj.get("name")
-            if not name:
-                continue
-            # Hermes JSON already carries native types; no schema coercion.
-            tool_calls.append(
-                ToolCall(
-                    function=FunctionCall(
-                        name=name,
-                        arguments=_dump_arguments(obj.get("arguments", {})),
-                    )
-                )
-            )
+    def call_block(self, text, start):
+        # A closing tag inside a JSON string is part of an argument, not the
+        # boundary of the call. Decode the JSON before looking for the tag.
+        try:
+            _, size = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            return None
+        end = start + size
+        closing = re.match(r"\s*</tool_call>", text[end:])
+        return (text[start:end], end + closing.end()) if closing else None
 
-        content = self.content_prefix(full_text).strip() or None
-        return content, tool_calls
+    def decode_calls(self, block, tools):
+        obj = json.loads(block)
+        name = obj.get("name") if isinstance(obj, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            raise ToolParseError("Generated tool call has no valid function name.")
+        return [ToolCall(function=FunctionCall(
+            name=name, arguments=_dump_arguments(obj.get("arguments", {})),
+        ))]
 
     def stream_parser(self, tools=None) -> StreamToolParser:
-        return StreamToolParser(self, tools)
+        return QwenStreamToolParser(self, tools)
 
 
 class Qwen3ToolParser(ToolParser):
@@ -452,8 +582,10 @@ class Qwen3ToolParser(ToolParser):
 
     name = "qwen3"
     _START = "<tool_call>"
+    _CALL_START = "<function="
     _FUNC_RE = re.compile(
-        r"<function=(?P<name>[^>\n]+)>(?P<body>.*?)</function>", re.DOTALL
+        r"<function=(?P<name>[^>\n]+)>(?P<body>.*?)</function>"
+        r"(?=\s*(?:<function=|\Z))", re.DOTALL
     )
     # Tolerate a missing/garbled closing ``</parameter>``: a value runs until
     # its ``</parameter>``, the next ``<parameter=``, or the end of the function
@@ -461,30 +593,41 @@ class Qwen3ToolParser(ToolParser):
     _PARAM_RE = re.compile(
         r"<parameter=(?P<key>[^>\n]+)>"
         r"(?P<val>.*?)"
-        r"(?:</parameter>|(?=<parameter=)|\Z)",
+        r"(?:</parameter>(?=\s*(?:<parameter=|\Z))|(?=<parameter=)|\Z)",
         re.DOTALL,
     )
 
-    def content_prefix(self, full_text: str) -> str:
-        return full_text.split(self._START, 1)[0]
-
     def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
-        if self._START not in full_text:
-            return full_text, []
+        return _parse_qwen_text(self, full_text, tools)
 
+    def call_block(self, text, start):
+        closing = re.search(r"</function>\s*</tool_call>", text[start:])
+        if closing is None:
+            return None
+        end = start + closing.start() + len("</function>")
+        return text[start:end], start + closing.end()
+
+    def decode_calls(self, block, tools):
         tool_calls: List[ToolCall] = []
-        # ``<function=..>`` blocks only ever appear inside ``<tool_call>``, so
-        # scanning the whole text is safe and also tolerates a missing/garbled
-        # closing ``</tool_call>`` tag.
-        for fm in self._FUNC_RE.finditer(full_text):
+        consumed = 0
+        for fm in self._FUNC_RE.finditer(block):
+            if block[consumed:fm.start()].strip():
+                raise ToolParseError("Generated tool call contains malformed function markup.")
             name = fm.group("name").strip()
             if not name:
-                continue
+                raise ToolParseError("Generated tool call has no valid function name.")
             args = {}
-            for pm in self._PARAM_RE.finditer(fm.group("body")):
+            body = fm.group("body")
+            parameter_end = 0
+            for pm in self._PARAM_RE.finditer(body):
+                if body[parameter_end:pm.start()].strip():
+                    raise ToolParseError("Generated tool call contains malformed parameter markup.")
                 key = pm.group("key").strip()
                 if key:
                     args[key] = pm.group("val").strip()
+                parameter_end = pm.end()
+            if body[parameter_end:].strip():
+                raise ToolParseError("Generated tool call contains malformed parameter markup.")
             # Values come out of the XML as raw strings; type-correct them
             # against the tool schema (string params stay strings).
             args = _coerce_args(args, tools, name)
@@ -493,12 +636,13 @@ class Qwen3ToolParser(ToolParser):
                     function=FunctionCall(name=name, arguments=_dump_arguments(args))
                 )
             )
-
-        content = self.content_prefix(full_text).strip() or None
-        return content, tool_calls
+            consumed = fm.end()
+        if not tool_calls or block[consumed:].strip():
+            raise ToolParseError("Generated tool call contains malformed function markup.")
+        return tool_calls
 
     def stream_parser(self, tools=None) -> StreamToolParser:
-        return StreamToolParser(self, tools)
+        return QwenStreamToolParser(self, tools)
 
 
 class KimiToolParser(ToolParser):

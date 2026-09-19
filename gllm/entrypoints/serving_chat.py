@@ -1,3 +1,4 @@
+import json
 import secrets
 import time
 
@@ -14,7 +15,7 @@ from gllm.entrypoints.protocol import (
     ChatMessage,
     DeltaMessage,
 )
-from gllm.tokenizers.tool_parsers import ToolParser
+from gllm.tokenizers.tool_parsers import ToolParser, ToolParseError
 from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
 from gllm.utils import build_usage, get_finish_reason
 
@@ -75,7 +76,13 @@ async def chat_completion_generator(
     content = full_text
     tool_calls = []
     if tool_parser is not None and request.tools and request.tool_choice != "none":
-        parsed_content, tool_calls = tool_parser.parse(full_text, request.tools)
+        try:
+            parsed_content, tool_calls = tool_parser.parse(full_text, request.tools)
+        except ToolParseError:
+            if get_finish_reason(stream.seq) != "length":
+                raise
+            # Report the actual budget exhaustion; never publish a partial call.
+            parsed_content, tool_calls = "", []
         content = parsed_content if parsed_content is not None else ""
 
     logprobs = None
@@ -178,7 +185,16 @@ async def chat_completion_stream_generator(
             # One delta may contain both a thought terminator and complete
             # tool calls. Drain all tool deltas even if this is the last chunk.
             while True:
-                delta = sp.process(full_text, final=final)
+                try:
+                    delta = sp.process(full_text, final=final)
+                except ToolParseError as exc:
+                    if get_finish_reason(stream.seq) == "length":
+                        break
+                    error = {"message": str(exc), "type": "server_error",
+                             "code": "invalid_tool_output"}
+                    yield f"data: {json.dumps({'error': error})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 if delta is None:
                     break
                 deltas.append(delta)
@@ -207,7 +223,7 @@ async def chat_completion_stream_generator(
     # streaming protocol. OpenAI sends opted-in usage in a separate final
     # chunk with an empty choices array.
     final_reason = get_finish_reason(stream.seq)
-    if streaming and sp.has_tool_calls():
+    if streaming and sp.has_tool_calls() and final_reason != "length":
         final_reason = "tool_calls"
     final_choice = ChatCompletionResponseStreamChoice(
         index=0,

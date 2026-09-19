@@ -42,7 +42,7 @@ from gllm.entrypoints.serving_responses import (
     snapshot_response_files,
 )
 from gllm.entrypoints.response_store import ResponseStore
-from gllm.tokenizers.tool_parsers import get_tool_parser
+from gllm.tokenizers.tool_parsers import ToolParseError, get_tool_parser
 from gllm.tokenizers.reasoning import create_reasoning_parser
 from gllm.utils import find_free_ports, make_async
 
@@ -366,9 +366,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
         return StreamingResponse(content=generator, media_type="text/event-stream")
     else:
-        generator = await chat_completion_generator(
-            stream, request, tool_parser, reasoning_parser
-        )
+        try:
+            generator = await chat_completion_generator(
+                stream, request, tool_parser, reasoning_parser
+            )
+        except ToolParseError as exc:
+            return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
         return JSONResponse(content=generator.model_dump(exclude_none=True))
 
 

@@ -13,10 +13,10 @@ from urllib.request import Request, urlopen
 from PIL import Image
 
 from gllm.engine.async_llm import AsyncStream
-from gllm.entrypoints.protocol import ChatCompletionRequest, ResponseRequest
+from gllm.entrypoints.protocol import ChatCompletionRequest, DeltaMessage, ResponseRequest
 from gllm.entrypoints.response_tools import chat_tools, output_tool_call, tool_specs
 from gllm.entrypoints.serving_chat import chat_completion_generator
-from gllm.tokenizers.tool_parsers import ToolParser
+from gllm.tokenizers.tool_parsers import ToolParser, ToolParseError
 from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
 from gllm.utils import build_usage, get_finish_reason, random_uuid
 
@@ -385,8 +385,7 @@ def make_chat_request(request: ResponseRequest) -> ChatCompletionRequest:
     )
 
 
-def _usage(chat_response):
-    usage = chat_response.usage
+def _usage(usage):
     return {
         "input_tokens": usage.prompt_tokens,
         "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
@@ -435,7 +434,7 @@ def _reasoning_item(text, item_id, status="completed"):
             "summary": [], "content": [{"type": "reasoning_text", "text": text}]}
 
 
-def _response_completion_fields(finish_reason, reasoning_parser, has_output):
+def _response_completion_fields(finish_reason, reasoning_parser, has_output, tool_error=None):
     """Resolve terminal status independently of whether reasoning is exposed."""
     status = "completed"
     error = None
@@ -443,6 +442,9 @@ def _response_completion_fields(finish_reason, reasoning_parser, has_output):
     if finish_reason == "length":
         status = "incomplete"
         incomplete_details = {"reason": "max_output_tokens"}
+    elif tool_error:
+        status = "failed"
+        error = {"code": "server_error", "message": tool_error}
     elif reasoning_parser is not None and reasoning_parser.started:
         if reasoning_parser.state != "content":
             error = {
@@ -471,12 +473,20 @@ async def response_completion_generator(
     tool_parser: ToolParser = None,
     reasoning_parser: ThinkParser = None,
 ):
-    chat_response = await chat_completion_generator(
-        stream, chat_request, tool_parser, reasoning_parser
-    )
     response_id = f"resp_{random_uuid()}"
     created_at = int(time.time())
     response = _base_response(request, response_id=response_id, created_at=created_at)
+    try:
+        chat_response = await chat_completion_generator(
+            stream, chat_request, tool_parser, reasoning_parser
+        )
+    except ToolParseError as exc:
+        response.update(
+            _response_completion_fields(get_finish_reason(stream.seq), reasoning_parser,
+                                        False, tool_error=str(exc)),
+            output=[], usage=_usage(build_usage(stream.seq)),
+        )
+        return response
     choice = chat_response.choices[0]
     output = []
     if choice.message.reasoning_content and (request.reasoning or {}).get("summary") != "none":
@@ -515,7 +525,7 @@ async def response_completion_generator(
                 bool((choice.message.content or "").strip() or choice.message.tool_calls),
             ),
             "output": output,
-            "usage": _usage(chat_response),
+            "usage": _usage(chat_response.usage),
         }
     )
     return response
@@ -556,6 +566,7 @@ async def response_stream_generator(
         tool_parser.stream_parser(chat_request.tools) if parse_tools else None
     )
     full_text = ""
+    tool_error = None
     message_text = ""
     message_id = None
     message_index = None
@@ -707,102 +718,104 @@ async def response_stream_generator(
             continue
         full_text += text
         if stream_parser is None:
-            deltas = [text]
-            tool_deltas = []
+            parsed_deltas = [DeltaMessage(content=text)]
         else:
             parsed_deltas = []
             # One engine delta may finish both a text prefix and one or more
             # tool-call blocks. Drain every newly available parser delta.
             while True:
-                parsed = stream_parser.process(full_text, final=final)
+                try:
+                    parsed = stream_parser.process(full_text, final=final)
+                except ToolParseError as exc:
+                    tool_error = str(exc)
+                    break
                 if parsed is None:
                     break
                 parsed_deltas.append(parsed)
-            deltas = [delta.content for delta in parsed_deltas if delta.content]
-            tool_deltas = [
-                tool_call
-                for delta in parsed_deltas
-                for tool_call in (delta.tool_calls or [])
-            ]
 
-        for text_delta in deltas:
-            for wire_event in start_message_events():
-                yield wire_event
-            message_text += text_delta
-            yield _sse(
-                event(
-                    "response.output_text.delta",
-                    output_index=message_index,
-                    item_id=message_id,
-                    content_index=0,
-                    delta=text_delta,
-                    logprobs=[],
-                )
-            )
-
-        for tool_call in tool_deltas:
-            # Natural-language content, when present, precedes tool-call output
-            # items and must be finalized before the next item is announced.
-            for wire_event in finish_message_events():
-                yield wire_event
-            function = tool_call.function
-            if function is None or function.name is None:
-                continue
-            output_index = next_output_index
-            next_output_index += 1
-            try:
-                item = output_tool_call(tool_call, specs)
-            except ValueError as exc:
-                # Embedded Response errors use the SDK's closed error-code
-                # enum, unlike the top-level HTTP error envelope.
-                failed = dict(
-                    initial,
-                    status="failed",
-                    output=outputs,
-                    error={"code": "server_error", "message": str(exc)},
-                )
-                yield _sse(event("response.failed", response=failed))
-                return
-            custom = item["type"] == "custom_tool_call"
-            field = "input" if custom else "arguments"
-            arguments = item[field]
-            prefix = "response.custom_tool_call_input" if custom else "response.function_call_arguments"
-            added = {**item, field: ""}
-            if not custom:
-                added["status"] = "in_progress"
-            yield _sse(
-                event(
-                    "response.output_item.added",
-                    output_index=output_index,
-                    item=added,
-                )
-            )
-            if arguments:
+        for delta in parsed_deltas:
+            if delta.content:
+                text_delta = delta.content
+                for wire_event in start_message_events():
+                    yield wire_event
+                message_text += text_delta
                 yield _sse(
                     event(
-                        f"{prefix}.delta",
+                        "response.output_text.delta",
+                        output_index=message_index,
+                        item_id=message_id,
+                        content_index=0,
+                        delta=text_delta,
+                        logprobs=[],
+                    )
+            )
+
+            for tool_call in delta.tool_calls or []:
+                # Natural-language content, when present, precedes tool-call output
+                # items and must be finalized before the next item is announced.
+                for wire_event in finish_message_events():
+                    yield wire_event
+                message_id = message_index = None
+                message_text = ""
+                message_done = False
+                function = tool_call.function
+                if function is None or function.name is None:
+                    continue
+                output_index = next_output_index
+                next_output_index += 1
+                try:
+                    item = output_tool_call(tool_call, specs)
+                except ValueError as exc:
+                    # Embedded Response errors use the SDK's closed error-code
+                    # enum, unlike the top-level HTTP error envelope.
+                    failed = dict(
+                        initial,
+                        status="failed",
+                        output=outputs,
+                        error={"code": "server_error", "message": str(exc)},
+                    )
+                    yield _sse(event("response.failed", response=failed))
+                    return
+                custom = item["type"] == "custom_tool_call"
+                field = "input" if custom else "arguments"
+                arguments = item[field]
+                prefix = "response.custom_tool_call_input" if custom else "response.function_call_arguments"
+                added = {**item, field: ""}
+                if not custom:
+                    added["status"] = "in_progress"
+                yield _sse(
+                    event(
+                        "response.output_item.added",
                         output_index=output_index,
-                        item_id=item["id"],
-                        delta=arguments,
+                        item=added,
                     )
                 )
-            yield _sse(
-                event(
-                    f"{prefix}.done",
-                    output_index=output_index,
-                    item_id=item["id"],
-                    **{field: arguments},
-                    **({"name": item["name"]} if not custom else {}),
+                if arguments:
+                    yield _sse(
+                        event(
+                            f"{prefix}.delta",
+                            output_index=output_index,
+                            item_id=item["id"],
+                            delta=arguments,
+                        )
+                    )
+                yield _sse(
+                    event(
+                        f"{prefix}.done",
+                        output_index=output_index,
+                        item_id=item["id"],
+                        **{field: arguments},
+                        **({"name": item["name"]} if not custom else {}),
+                    )
                 )
-            )
-            yield _sse(
-                event(
-                    "response.output_item.done",
-                    output_index=output_index,
-                    item=item,
+                yield _sse(
+                    event(
+                        "response.output_item.done",
+                        output_index=output_index,
+                        item=item,
+                    )
                 )
-            )
-            outputs.append(item)
+                outputs.append(item)
 
     for wire_event in finish_reasoning_events():
         yield wire_event
@@ -826,18 +839,10 @@ async def response_stream_generator(
                     item["type"] in ("function_call", "custom_tool_call")
                     for item in outputs
                 ),
+                tool_error=tool_error,
             ),
             "output": outputs,
-            "usage": {
-                "input_tokens": usage.prompt_tokens,
-                "input_tokens_details": {
-                    "cached_tokens": 0,
-                    "cache_write_tokens": 0,
-                },
-                "output_tokens": usage.completion_tokens or 0,
-                "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": usage.total_tokens,
-            },
+            "usage": _usage(usage),
         }
     )
     terminal_event = f"response.{final['status']}"
