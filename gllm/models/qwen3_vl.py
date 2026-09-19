@@ -858,24 +858,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return ``(inputs_embeds, deepstack_input_embeds_or_None)``.
 
-        ``deepstack_input_embeds`` is the full-prompt per-token deepstack
-        residual ``[deepstack_num_level, N, hidden]`` produced from the
-        ViT's multiscale features. Previously this was eagerly copied into
-        a shared model buffer here, but with prefix caching the caller
-        only feeds the *un-cached* tail (``prompt_embeddings[computed:seq_len]``)
-        to the model -- the eagerly-written buffer (sized to the full prompt
-        and starting at row 0) then mis-aligns with hidden_states by exactly
-        the prefix-hit length, and ``Qwen3LLMModel.forward`` adds the wrong
-        deepstack delta to every multimodal layer until the issue manifests
-        as garbage output (this was the root cause of the multimodal
-        prefix-cache regression that previously forced
-        ``--no-enable-prefix-caching``).
+        ``deepstack_input_embeds`` is the per-token residual for the supplied
+        chunk, with shape ``[deepstack_num_level, N, hidden]``. The caller
+        supplies only this chunk's token IDs, mask and visual feature rows,
+        including when a prefix-cache hit starts partway through an image.
 
-        We now return the tensor to the caller, which slices it the same
-        way it slices ``inputs_embeds``, concatenates across the batch's
-        decode + per-seq prefill chunks, and writes the final layout into
-        the buffer via :meth:`_set_deepstack_input_embeds`. Text-only
-        prompts and non-deepstack models return ``None`` here.
+        Return the residual instead of eagerly writing the shared model
+        buffer: the caller places it at the offset matching this sequence's
+        rows in the combined decode + prefill batch via
+        :meth:`_set_deepstack_input_embeds`. Chunks without visual rows and
+        non-deepstack models return ``None`` here.
         """
         inputs_embeds = self._embed_text_input_ids(
             input_ids,

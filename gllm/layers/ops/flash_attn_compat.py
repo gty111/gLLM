@@ -5,9 +5,8 @@ module only dispatches to the final backend and never changes that decision at
 kernel-call time. It never loops over individual sequences.
 """
 
-from collections import OrderedDict
+import math
 import os
-import weakref
 from typing import Optional
 
 import torch
@@ -29,9 +28,7 @@ except Exception:
 _WORKSPACE_BYTES = int(
     os.environ.get("GLLM_FLASHINFER_WORKSPACE_SIZE", str(512 * 1024 * 1024))
 )
-_MAX_PLAN_CACHE = 32
 _workspaces: dict[int, torch.Tensor] = {}
-_plan_cache: OrderedDict[tuple, tuple] = OrderedDict()
 
 
 def _workspace(device: torch.device) -> torch.Tensor:
@@ -59,32 +56,8 @@ def _planned_wrapper(
     causal: bool,
     softmax_scale: Optional[float],
 ) -> BatchPrefillWithRaggedKVCacheWrapper:
-    # Tensor version + identity lets every vision/MLA layer reuse one plan,
-    # while an in-place metadata update or a new request gets a fresh plan.
-    key = (
-        q.device.index,
-        cu_seqlens_q.data_ptr(),
-        cu_seqlens_q._version,
-        cu_seqlens_k.data_ptr(),
-        cu_seqlens_k._version,
-        q.shape[1],
-        k.shape[1],
-        q.shape[-1],
-        v.shape[-1],
-        q.dtype,
-        k.dtype,
-        v.dtype,
-        causal,
-        softmax_scale,
-    )
-    cached = _plan_cache.get(key)
-    if cached is not None:
-        q_ref, k_ref, wrapper = cached
-        if q_ref() is cu_seqlens_q and k_ref() is cu_seqlens_k:
-            _plan_cache.move_to_end(key)
-            return wrapper
-        del _plan_cache[key]
-
+    # Inference-mode metadata has no version counter and may be updated in
+    # place. Always plan against the current lengths; only workspace is reused.
     wrapper = BatchPrefillWithRaggedKVCacheWrapper(
         _workspace(q.device), "NHD", backend="auto"
     )
@@ -102,9 +75,6 @@ def _planned_wrapper(
         o_data_type=q.dtype,
         non_blocking=True,
     )
-    _plan_cache[key] = (weakref.ref(cu_seqlens_q), weakref.ref(cu_seqlens_k), wrapper)
-    while len(_plan_cache) > _MAX_PLAN_CACHE:
-        _plan_cache.popitem(last=False)
     return wrapper
 
 
@@ -219,10 +189,29 @@ def flash_attn_varlen_func(
             return_lse=return_softmax_lse,
         )
     else:
+        # FlashInfer FA2 uses tiled head dimensions. An irregular vision width
+        # such as Qwen3-VL's 72 compiles but produces incorrect results on SM80.
+        # Pad to a supported multiple of 64, preserving the original QK scale.
+        value_dim = v.shape[-1]
+        qk_dim = ((q.shape[-1] + 63) // 64) * 64
+        vo_dim = ((value_dim + 63) // 64) * 64
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** -0.5
+        if q.shape[-1] != qk_dim:
+            q = torch.nn.functional.pad(q, (0, qk_dim - q.shape[-1]))
+            k = torch.nn.functional.pad(k, (0, qk_dim - k.shape[-1]))
+        if value_dim != vo_dim:
+            v = torch.nn.functional.pad(v, (0, vo_dim - value_dim))
         wrapper = _planned_wrapper(
             q, k, v, cu_seqlens_q, cu_seqlens_k, causal, softmax_scale
         )
         result = wrapper.run(q, k, v, return_lse=return_softmax_lse)
+        if return_softmax_lse:
+            # FlashInfer FA2 reports base-2 LSE; the FA-compatible interface
+            # returns natural-log LSE, including when padded dimensions are used.
+            result = (result[0][..., :value_dim], result[1] * math.log(2.0))
+        else:
+            result = result[..., :value_dim]
 
     if not return_softmax_lse:
         return result

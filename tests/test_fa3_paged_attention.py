@@ -80,6 +80,48 @@ def test_fa3_graph_replay_refreshes_lengths_pages_and_query_boundaries():
         torch.testing.assert_close(out, _reference(q, k, v, metadata), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("query_len", [1, 4])
+def test_fa3_graph_replay_grows_from_short_to_144k_context(query_len):
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(456)
+    capacity, page_size = 144256, 16
+    q = torch.randn(query_len, 24, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(capacity // page_size, page_size, 4, 256,
+                    device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    table = torch.randperm(capacity // page_size, device=q.device,
+                           dtype=torch.int32).unsqueeze(0)
+    lengths = torch.tensor([16], device=q.device, dtype=torch.int32)
+    starts = torch.tensor([0, query_len], device=q.device, dtype=torch.int32)
+    data = SimpleNamespace(get_block_table=lambda: table, get_seq_lens=lambda: lengths,
+                           get_query_start_loc=lambda: starts)
+    backend = FA3AttentionBackend(capacity, 1)
+    metadata = backend.prepare_metadata(
+        data, SimpleNamespace(max_query_len=query_len, batch_size=1)
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        backend.forward(q, k, v, metadata, 256 ** -0.5)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out = backend.forward(q, k, v, metadata, 256 ** -0.5)
+    # The split policy must remain correct as live lengths outgrow the length
+    # used during graph capture, for both draft decode and target verification.
+    for length in (4096, 144000, 144128):
+        lengths.fill_(length)
+        q.normal_()
+        graph.replay()
+        reference = flash_attn_with_kvcache(
+            q, k, v, cache_seqlens=lengths, page_table=table,
+            cu_seqlens_q=starts, max_seqlen_q=query_len,
+            softmax_scale=256 ** -0.5, causal=True, num_splits=1,
+        )
+        torch.testing.assert_close(out, reference, atol=1e-3, rtol=1e-2)
+
+
 @pytest.mark.parametrize("qk_dim,v_dim,causal", [(128, 128, False), (192, 128, True)])
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_fa3_varlen_adapter_and_lse(qk_dim, v_dim, causal, return_lse):

@@ -15,6 +15,7 @@ from gllm.entrypoints.protocol import (
     DeltaMessage,
 )
 from gllm.tokenizers.tool_parsers import ToolParser
+from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
 from gllm.utils import build_usage, get_finish_reason
 
 
@@ -54,12 +55,15 @@ async def chat_completion_generator(
     stream: AsyncStream,
     request: ChatCompletionRequest,
     tool_parser: ToolParser = None,
+    reasoning_parser: ThinkParser = None,
 ):
     full_text = ""
+    reasoning_text = ""
     entries = []
     prompt_logprobs = None
-    async for item in stream:
-        full_text += item.text
+    async for item, reasoning, content, _ in split_reasoning_stream(stream, reasoning_parser):
+        full_text += content
+        reasoning_text += reasoning
         if item.logprob is not None:
             entries.append(item.logprob)
         if item.prompt_logprobs is not None:
@@ -83,7 +87,8 @@ async def chat_completion_generator(
     choice_data = ChatCompletionResponseChoice(
         index=0,
         message=ChatMessage(
-            role="assistant", content=content, tool_calls=tool_calls or None
+            role="assistant", content=content, tool_calls=tool_calls or None,
+            reasoning_content=reasoning_text or None,
         ),
         logprobs=logprobs,
         prompt_logprobs=prompt_logprobs,
@@ -103,6 +108,7 @@ async def chat_completion_stream_generator(
     stream: AsyncStream,
     request: ChatCompletionRequest,
     tool_parser: ToolParser = None,
+    reasoning_parser: ThinkParser = None,
 ):
     # When a parser is available and the request offered tools, run the
     # incremental streaming tool-call parser: it accumulates the full text and
@@ -156,44 +162,46 @@ async def chat_completion_stream_generator(
         )
         return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
-    async for item in stream:
-        text = item.text
+    async for item, reasoning, text, final in split_reasoning_stream(stream, reasoning_parser):
         # Keep chunks that carry text OR a logprob (a multi-byte token can
         # produce an empty text delta whose logprob must still be reported) OR
         # the one-shot prompt_logprobs payload.
-        if not text and item.logprob is None and item.prompt_logprobs is None:
+        if not text and not reasoning and item.logprob is None and item.prompt_logprobs is None and not (final and streaming):
             continue
         logprobs = None
         if item.logprob is not None:
             logprobs = _build_chat_logprobs([item.logprob], as_token_ids)
         prompt_logprobs = item.prompt_logprobs
+        deltas = [DeltaMessage(reasoning_content=reasoning)] if reasoning else []
         if streaming:
             full_text += text
-            delta = sp.process(full_text)
-            if delta is None and logprobs is None and prompt_logprobs is None:
-                continue
+            # One delta may contain both a thought terminator and complete
+            # tool calls. Drain all tool deltas even if this is the last chunk.
+            while True:
+                delta = sp.process(full_text, final=final)
+                if delta is None:
+                    break
+                deltas.append(delta)
+        elif text:
+            deltas.append(DeltaMessage(content=text))
+        if not deltas and (logprobs is not None or prompt_logprobs is not None):
+            deltas.append(DeltaMessage())
+        for index, delta in enumerate(deltas):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=0,
-                delta=delta or DeltaMessage(),
-                logprobs=logprobs,
-                prompt_logprobs=prompt_logprobs,
+                delta=delta,
+                logprobs=logprobs if index == 0 else None,
+                prompt_logprobs=prompt_logprobs if index == 0 else None,
             )
-        else:
-            choice_data = ChatCompletionResponseStreamChoice(
-                index=0,
-                delta=DeltaMessage(content=text),
-                logprobs=logprobs,
-                prompt_logprobs=prompt_logprobs,
+            chunk = make_chunk(
+                [choice_data],
+                build_usage(stream.seq) if continuous_usage else None,
             )
-        chunk = make_chunk(
-            [choice_data],
-            build_usage(stream.seq) if continuous_usage else None,
-        )
-        data = chunk.model_dump_json(exclude_none=True)
-        role = role_event()
-        if role is not None:
-            yield role
-        yield f"data: {data}\n\n"
+            data = chunk.model_dump_json(exclude_none=True)
+            role = role_event()
+            if role is not None:
+                yield role
+            yield f"data: {data}\n\n"
 
     # Final chunk: empty delta carrying the finish_reason, mirroring the OpenAI
     # streaming protocol. OpenAI sends opted-in usage in a separate final

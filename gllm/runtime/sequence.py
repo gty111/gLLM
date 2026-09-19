@@ -5,13 +5,33 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from gllm.utils import unify_decode
 
 
+def resolve_output_len(prompt_len: int, output_len: Optional[int], model_max_length: int) -> int:
+    """Resolve an omitted generation budget without exceeding the context window."""
+    remaining = model_max_length - prompt_len
+    if remaining <= 0:
+        raise ValueError(
+            f"Input length ({prompt_len}) leaves no output space in the "
+            f"model's context window ({model_max_length})."
+        )
+    if output_len is None:
+        return remaining
+    if output_len <= 0:
+        raise ValueError("Output length must be positive.")
+    if output_len > remaining:
+        raise ValueError(
+            f"Requested {prompt_len} input + {output_len} output tokens exceeds "
+            f"the model's context window ({model_max_length})."
+        )
+    return output_len
+
+
 class GenerationSequence:
     def __init__(
         self,
         seq_id,
         token_ids,
         finish_tokens,
-        output_len=None,
+        output_len: int,
         ignore_eos=False,
         temperature=0.6,
         top_p=0.9,
@@ -39,11 +59,10 @@ class GenerationSequence:
         self.output = ""
         self.ignore_eos = ignore_eos
         self.finish_tokens: List[int] = finish_tokens
-        # maximum output length
-        if output_len is None:
-            self.output_len = 4096
-        else:
-            self.output_len = output_len
+        # The engine resolves the budget using the actual prompt and context
+        # lengths before constructing a sequence. Profiling callers pass an
+        # explicit budget as well; there is no context-independent fallback.
+        self.output_len = output_len
         # used for detokenize
         self.cur_length = self.prompt_len
         # used for sample

@@ -2,7 +2,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch.multiprocessing as mp
 import tqdm
@@ -11,7 +11,7 @@ from logger import logger
 from gllm.distributed.comm import IPCPackage, zmqComm
 from gllm.runtime.id_allocator import IDAllocator
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
-from gllm.runtime.sequence import GenerationSequence
+from gllm.runtime.sequence import GenerationSequence, resolve_output_len
 from gllm.utils import (
     StreamOutput,
     find_free_port,
@@ -563,17 +563,13 @@ class LLM:
         self.send_ipc_package(log)
         return num_finish_seqs
 
-    def check_seq_length(self, token_ids: List[int], output_len: int):
-        max_seq_length = (
-            len(token_ids) + output_len if output_len is not None else len(token_ids)
-        )
-        if max_seq_length > self.model_max_length:
-            logger.warning(
-                f"Ignore seq due to the length ({max_seq_length}) exceeds max model len({self.model_max_length})"
-            )
+    def check_seq_length(self, token_ids: List[int], output_len: Optional[int]):
+        try:
+            resolve_output_len(len(token_ids), output_len, self.model_max_length)
+        except ValueError as exc:
+            logger.warning(f"Ignore seq: {exc}")
             return False
-        else:
-            return True
+        return True
 
     def allocate_seq(
         self,
@@ -591,6 +587,12 @@ class LLM:
         prompt_logprobs_enabled=False,
         num_prompt_logprobs=0,
     ):
+        # Validate before allocating an id, including for direct engine callers
+        # that bypass the HTTP length check. None means all remaining context.
+        requested_output_len = output_len
+        output_len = resolve_output_len(
+            len(token_ids), output_len, self.model_max_length
+        )
         # Models without a ``generation_config.json`` (e.g. Qwen3.5-0.8B)
         # leave the HF ``GenerationConfig`` defaults as ``None``, which then
         # crashes ``InputData.prepare_sample``'s ``async_tensor_h2d`` H2D
@@ -625,6 +627,10 @@ class LLM:
         # process. Present only on the disaggregated LM frontend; ``None`` for
         # text and for the monolith path.
         seq.mm_items = mm_items
+        # Disaggregated vision expands its skeleton after encoder metadata
+        # arrives. Retain the original request to resolve against that length.
+        seq.requested_output_len = requested_output_len
+        seq.model_max_length = self.model_max_length
         return seq
 
     def free_finish_ids(self, finish_ids: List[int]):

@@ -214,9 +214,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_logprobs: Optional[int] = 0
     max_tokens: Optional[int] = Field(
         default=None,
+        gt=0,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
     )
-    max_completion_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = Field(default=None, gt=0)
     n: Optional[int] = 1
     modalities: Optional[List[Literal["text", "audio"]]] = None
     metadata: Optional[Dict[str, str]] = None
@@ -528,7 +529,7 @@ class CompletionRequest(OpenAIBaseModel):
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
     prompt_logprobs: Optional[int] = None
-    max_tokens: Optional[int] = 16
+    max_tokens: Optional[int] = Field(default=16, gt=0)
     n: int = 1
     presence_penalty: Optional[float] = 0.0
     seed: Optional[int] = Field(
@@ -747,6 +748,7 @@ class ToolCall(OpenAIBaseModel):
 class ChatMessage(OpenAIBaseModel):
     role: str
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     refusal: Optional[str] = None
     annotations: Optional[List[Dict[str, Any]]] = None
     audio: Optional[Dict[str, Any]] = None
@@ -806,6 +808,7 @@ class DeltaToolCall(OpenAIBaseModel):
 class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    reasoning_content: Optional[str] = None
     refusal: Optional[str] = None
     tool_calls: Optional[List[DeltaToolCall]] = None
 
@@ -846,7 +849,7 @@ class ResponseRequest(OpenAIBaseModel):
     background: Optional[bool] = False
     conversation: Optional[Union[str, Dict[str, Any]]] = None
     include: Optional[List[str]] = None
-    max_output_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = Field(default=None, gt=0)
     max_tool_calls: Optional[int] = None
     metadata: Optional[Dict[str, str]] = None
     moderation: Optional[Dict[str, Any]] = None

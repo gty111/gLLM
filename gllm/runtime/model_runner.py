@@ -103,21 +103,14 @@ class MtpVerifyResult:
 
 @dataclass
 class EmbeddingInfo:
-    embedding: torch.Tensor = None
     prompt_positions: torch.Tensor = None
     mrope_position_delta: torch.Tensor = None
-    # Per-prompt deepstack residual (shape ``[L, N, hidden]``). Cached
-    # alongside ``embedding`` so chunked prefill / prefix-cache re-runs can
-    # re-slice it the same way ``embedding`` is sliced and feed the model
-    # buffer the chunk that matches ``hidden_states``. ``None`` for
-    # text-only prompts and for non-deepstack VL models.
-    deepstack_embedding: torch.Tensor = None
-    # Encoder-disaggregation overlap (design §6.2): for a seq whose visual
-    # embeddings are still arriving, ``embedding`` only covers the span-aligned
-    # *ready prefix* ``[0, coverage_len)``. When the scheduler later advances
-    # past ``coverage_len`` (more items became ready), the embed is rebuilt
-    # over the larger prefix. ``None`` => full-prompt embedding (monolith and
-    # fully-ready disagg seqs), i.e. no coverage limit.
+    # Only encoded visual rows are retained between prefill chunks. Text and
+    # deepstack embeddings are materialized for the scheduled span each time.
+    multimodal_embeddings: Optional[torch.Tensor] = None
+    is_multimodal_cpu: Optional[torch.Tensor] = None
+    # Disaggregated encoders may have delivered only a ready prefix. Refresh
+    # the visual rows when the scheduler advances beyond this coverage.
     coverage_len: Optional[int] = None
 
 
@@ -1412,13 +1405,39 @@ class ModelRunner:
                     batch_positions,
                 )
                 continue
-            if seq.seq_id not in self.embedding_cache:
+            if seq.mm_contents is None:
+                # Text has no cross-chunk visual embeddings or mrope offsets.
+                # Materialize only the scheduled span, including on prefix hits
+                # and re-prefill after preemption. A full-prompt embedding can
+                # otherwise consume gigabytes even with a small prefill budget.
+                input_ids_cpu, is_multimodal_cpu = self._mm_build_is_multimodal_cpu(
+                    seq, seq.computed_token_num, seq.seq_len
+                )
+                positions = torch.arange(
+                    seq.computed_token_num, seq.seq_len, device="cpu"
+                )
+                batch_positions.append(
+                    positions.unsqueeze(0).expand(3, -1)
+                    if self.uses_mrope
+                    else positions
+                )
+                prefill_works.append(
+                    {
+                        "kind": "text",
+                        "seq": seq,
+                        "input_ids_cpu": input_ids_cpu,
+                        "is_multimodal_cpu": is_multimodal_cpu,
+                    }
+                )
+                continue
+            cached_info = self.embedding_cache.get(seq.seq_id)
+            if cached_info is None or cached_info.is_multimodal_cpu is None:
                 # If the scheduler already ran ``_mm_precompute_hash`` for
                 # this seq (required for multimodal prefix-cache correctness
                 # -- see that method's docstring), reuse the cached
                 # image_processor output and is_multimodal mask. Otherwise
-                # build them now (text-only seqs, non-prefix-cache configs,
-                # and the never-cached scheduler in tests all land here).
+                # build them now (non-prefix-cache configs and the
+                # never-cached scheduler in tests land here).
                 pre = getattr(seq, "_mm_precomputed", None)
                 if pre is not None:
                     mm_input = pre["mm_input"]
@@ -1557,16 +1576,16 @@ class ModelRunner:
         """Build the prefill work for an overlap disagg seq (design §6.2).
 
         Positions come from the full-prompt mrope grid (all grids known once
-        meta arrived). The embedding covers the ready prefix; it is rebuilt
+        meta arrived). Encoded visual rows cover the ready prefix; refresh them
         (kind ``uncached``) whenever the scheduler advances past the cached
         ``coverage_len`` because more items became ready, otherwise the cached
-        prefix is re-sliced (kind ``cached``).
+        rows are re-sliced for the current chunk (kind ``cached``).
         """
         batch_positions.append(
             st.prompt_positions[:, seq.computed_token_num : seq.seq_len]
         )
         info = self.embedding_cache.get(seq.seq_id)
-        need_build = info is None or (
+        need_build = info is None or info.is_multimodal_cpu is None or (
             info.coverage_len is not None and seq.seq_len > info.coverage_len
         )
         if not need_build:
@@ -1685,9 +1704,9 @@ class ModelRunner:
         return mm_input, image_grid_thw, None
 
     def _mm_build_is_multimodal_cpu(
-        self, seq: GenerationSequence
+        self, seq: GenerationSequence, start: int = 0, end: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build (input_ids_cpu, is_multimodal_cpu) for ``seq``.
+        """Build CPU IDs and placeholder mask for the requested token span.
 
         Explicitly CPU-side: the repo sets the default device to CUDA
         via ``ModelLoader``, so a bare ``torch.tensor(...)`` would
@@ -1695,7 +1714,7 @@ class ModelRunner:
         launch a kernel on the default stream -- defeating overlap with
         the previous batch's forward.
         """
-        input_ids_cpu = torch.tensor(seq.token_ids, device="cpu")
+        input_ids_cpu = torch.tensor(seq.token_ids[start:end], device="cpu")
         placeholder_token_id_cpu = torch.tensor(
             self.model.get_mm_placeholder_token_ids(), device="cpu"
         )
@@ -1868,90 +1887,87 @@ class ModelRunner:
         batch_deepstack: List[Optional[torch.Tensor]] = []
         for work in ctx["prefill_works"]:
             seq = work["seq"]
-            if work["kind"] == "uncached":
-                # Encoder-disaggregation: embeddings already arrived over NIXL
-                # and were cloned into this tuple, so skip the local ViT (the
-                # LM node has no vision tower). ``None`` -> monolith path.
-                mm_embeddings = work.get("mm_embeddings")
-                mm_input = work["mm_input"]
-                if mm_embeddings is None and mm_input:
-                    # Skip the ViT encoder when this prompt's MM bundle is
-                    # already in the cache (e.g. identical-image rerun).
-                    # Cache stores the per-item embedding tuple verbatim;
-                    # downstream ``embed_input_ids`` is happy with cached
-                    # tensors since they live on the same device as the
-                    # encoder output.
-                    bundle_key = work.get("mm_bundle_key")
-                    mm_embeddings = self.mm_embed_cache.get(bundle_key)
-                    if mm_embeddings is None:
-                        mm_embeddings = self.model.embed_multimodal(**mm_input)
-                        if bundle_key is not None:
-                            self.mm_embed_cache.put(bundle_key, mm_embeddings)
-
-                # Materialize CPU tensors built in ``_mm_prepare_cpu`` onto
-                # the model device for the embed kernels. Sources are small
-                # (one prompt's worth of ids) so a synchronous H2D is cheap
-                # and avoids the pageable-memory caveats of non_blocking.
-                input_ids = work["input_ids_cpu"].to(device, non_blocking=True)
-                is_multimodal = work["is_multimodal_cpu"].to(device, non_blocking=True)
-                embed_result = self.model.embed_input_ids(
-                    input_ids,
-                    mm_embeddings,
-                    is_multimodal,
-                )
-                # ``embed_input_ids`` returns either a plain embedding
-                # tensor (non-deepstack models / text-only prompts that
-                # don't bother building the tuple) or
-                # ``(embedding, deepstack)``. Unify to a 2-tuple for the
-                # downstream layout code.
-                if isinstance(embed_result, tuple):
-                    prompt_embeddings, prompt_deepstack = embed_result
-                else:
-                    prompt_embeddings, prompt_deepstack = embed_result, None
-
-                embedding_info = EmbeddingInfo(
-                    prompt_embeddings,
-                    work["prompt_positions"],
-                    work["mrope_position_delta"],
-                    deepstack_embedding=prompt_deepstack,
-                    coverage_len=work.get("coverage_len"),
-                )
+            visual_chunk = None
+            if work["kind"] == "text":
+                # Text takes the same embedding path, without encoded media.
+                input_ids_cpu = work["input_ids_cpu"]
+                mask_cpu = work["is_multimodal_cpu"]
+                embedding_info = EmbeddingInfo(mrope_position_delta=0)
                 self.embedding_cache[seq.seq_id] = embedding_info
-                embedding = prompt_embeddings[seq.computed_token_num : seq.seq_len, :]
-                deepstack_chunk = (
-                    prompt_deepstack[:, seq.computed_token_num : seq.seq_len, :]
-                    if prompt_deepstack is not None
-                    else None
-                )
             else:
-                embedding_info = work["embedding_info"]
-                if embedding_info.embedding is None:
-                    raise RuntimeError(
-                        "cached multimodal embedding was released before row "
-                        f"preparation: seq={seq.seq_id} computed="
-                        f"{seq.computed_token_num} prompt={seq.prompt_len} "
-                        f"len={seq.seq_len} to_compute={seq.to_compute_token_num} "
-                        f"mtp_verify={getattr(seq, '_mtp_verify', False)}"
+                if work["kind"] == "uncached":
+                    from gllm.models.utils import _flatten_embeddings
+
+                    # These may come from a local encoder, the visual feature
+                    # cache, or the ready prefix of a disaggregated encoder.
+                    mm_embeddings = work.get("mm_embeddings")
+                    mm_input = work["mm_input"]
+                    if mm_embeddings is None and mm_input:
+                        bundle_key = work.get("mm_bundle_key")
+                        mm_embeddings = self.mm_embed_cache.get(bundle_key)
+                        if mm_embeddings is None:
+                            mm_embeddings = self.model.embed_multimodal(**mm_input)
+                            if bundle_key is not None:
+                                self.mm_embed_cache.put(bundle_key, mm_embeddings)
+                    visual_rows = (
+                        _flatten_embeddings(mm_embeddings)
+                        if mm_embeddings is not None and len(mm_embeddings) > 0
+                        else None
                     )
-                embedding = embedding_info.embedding[
-                    seq.computed_token_num : seq.seq_len, :
-                ]
-                deepstack_chunk = (
-                    embedding_info.deepstack_embedding[
-                        :, seq.computed_token_num : seq.seq_len, :
-                    ]
-                    if embedding_info.deepstack_embedding is not None
-                    else None
-                )
+                    mask = work["is_multimodal_cpu"]
+                    expected = int(mask.sum())
+                    actual = visual_rows.shape[0] if visual_rows is not None else 0
+                    if actual != expected:
+                        raise ValueError(
+                            f"Expected {expected} visual embedding rows, got {actual}"
+                        )
+                    embedding_info = EmbeddingInfo(
+                        prompt_positions=work["prompt_positions"],
+                        mrope_position_delta=work["mrope_position_delta"],
+                        multimodal_embeddings=visual_rows,
+                        is_multimodal_cpu=mask,
+                        coverage_len=work.get("coverage_len"),
+                    )
+                    self.embedding_cache[seq.seq_id] = embedding_info
+                else:
+                    embedding_info = work["embedding_info"]
+
+                start, end = seq.computed_token_num, seq.seq_len
+                mask = embedding_info.is_multimodal_cpu
+                if mask is None or end > mask.numel():
+                    raise RuntimeError(
+                        f"Visual metadata does not cover prefill span [{start}, {end})"
+                    )
+                input_ids_cpu = torch.tensor(seq.token_ids[start:end], device="cpu")
+                mask_cpu = mask[start:end]
+                visual_start = int(mask[:start].sum())
+                visual_count = int(mask_cpu.sum())
+                if visual_count:
+                    # Slice by placeholder ordinal, not by image boundaries:
+                    # chunks and prefix hits may start in the middle of an image.
+                    visual_chunk = (
+                        embedding_info.multimodal_embeddings[
+                            visual_start : visual_start + visual_count
+                        ],
+                    )
+
+            # One path for text, images and video: embed only this chunk, then
+            # merge its visual rows (and produce only this chunk's deepstack).
+            embed_result = self.model.embed_input_ids(
+                input_ids_cpu.to(device, non_blocking=True),
+                visual_chunk,
+                mask_cpu.to(device, non_blocking=True),
+            )
+            if isinstance(embed_result, tuple):
+                embedding, deepstack_chunk = embed_result
+            else:
+                embedding, deepstack_chunk = embed_result, None
 
             if seq.seq_len == seq.prompt_len:
-                # Prefill just finished; drop the cached embedding tensors
-                # to free memory. We still keep mrope_position_delta around
-                # for future decode-position calculations.
-                embedding_info.embedding = None
-                embedding_info.deepstack_embedding = None
-                # Encoder-disaggregation: the per-item visual embeddings are now
-                # baked into the KV cache, so the (cloned) gate-B copies can go.
+                # Retain position metadata for decode, but no request-owned
+                # visual tensors after prefill has completed.
+                embedding_info.multimodal_embeddings = None
+                embedding_info.is_multimodal_cpu = None
                 self.disagg_embeds.pop(seq.seq_id, None)
 
             batch_embeddings.append(embedding)
@@ -3674,9 +3690,7 @@ class ModelRunner:
             # but ONLY if this id isn't already a live entry (never clobber).
             if self.use_mm and self.uses_mrope and sid not in self.embedding_cache:
                 self.embedding_cache[sid] = EmbeddingInfo(
-                    None,
-                    None,
-                    torch.zeros(1, dtype=torch.long, device="cuda"),
+                    mrope_position_delta=torch.zeros(1, dtype=torch.long, device="cuda"),
                 )
                 seeded_ids.append(sid)
             seqs.append(s)

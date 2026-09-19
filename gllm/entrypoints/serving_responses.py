@@ -16,6 +16,7 @@ from gllm.entrypoints.protocol import ChatCompletionRequest, ResponseRequest
 from gllm.entrypoints.response_tools import chat_tools, output_tool_call, tool_specs
 from gllm.entrypoints.serving_chat import chat_completion_generator
 from gllm.tokenizers.tool_parsers import ToolParser
+from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
 from gllm.utils import build_usage, get_finish_reason, random_uuid
 
 _MAX_INLINE_FILE_BYTES = 50 * 1024 * 1024
@@ -223,6 +224,10 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
         if not isinstance(item, dict):
             raise ValueError(param, "Input items must be strings or objects.")
         item_type = item.get("type")
+        if item_type == "reasoning":
+            # Allow stateless replay of our own output. Previous-turn thoughts
+            # are not user messages and must not be folded into answer text.
+            continue
         if item_type in ("function_call", "custom_tool_call"):
             call_id = item.get("call_id") or item.get("id")
             name = item.get("name")
@@ -233,22 +238,20 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
                 if not isinstance(item.get("input"), str):
                     raise ValueError(param, "Custom tool input must be a string.")
                 arguments = json.dumps({"input": item["input"]}, ensure_ascii=False)
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": arguments,
-                            },
-                        }
-                    ],
-                }
-            )
+            call = {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+            # Responses represents assistant text and calls as separate items.
+            # Reassemble the assistant message before applying a chat template;
+            # a separate message per call inserts spurious turn-end tokens.
+            if messages and messages[-1]["role"] == "assistant":
+                messages[-1].setdefault("tool_calls", []).append(call)
+            else:
+                messages.append({
+                    "role": "assistant", "content": None, "tool_calls": [call],
+                })
             continue
         if item_type in ("function_call_output", "custom_tool_call_output"):
             output = item.get("output", "")
@@ -368,23 +371,65 @@ def _base_response(request: ResponseRequest, *, response_id: str, created_at: in
     }
 
 
+def _reasoning_item(text, item_id, status="completed"):
+    # Native model thoughts are reasoning text, not a generated summary.
+    return {"id": item_id, "type": "reasoning", "status": status,
+            "summary": [], "content": [{"type": "reasoning_text", "text": text}]}
+
+
+def _response_completion_fields(finish_reason, reasoning_parser, has_output):
+    """Resolve terminal status independently of whether reasoning is exposed."""
+    status = "completed"
+    error = None
+    incomplete_details = None
+    if finish_reason == "length":
+        status = "incomplete"
+        incomplete_details = {"reason": "max_output_tokens"}
+    elif reasoning_parser is not None and reasoning_parser.started:
+        if reasoning_parser.state != "content":
+            error = {
+                "code": "server_error",
+                "message": "Generation ended before the reasoning block was closed.",
+            }
+        elif not has_output:
+            error = {
+                "code": "server_error",
+                "message": "Generation ended after reasoning without an answer or tool call.",
+            }
+        if error is not None:
+            status = "failed"
+    return {
+        "status": status,
+        "completed_at": int(time.time()) if status == "completed" else None,
+        "error": error,
+        "incomplete_details": incomplete_details,
+    }
+
+
 async def response_completion_generator(
     stream: AsyncStream,
     request: ResponseRequest,
     chat_request: ChatCompletionRequest,
     tool_parser: ToolParser = None,
+    reasoning_parser: ThinkParser = None,
 ):
-    chat_response = await chat_completion_generator(stream, chat_request, tool_parser)
+    chat_response = await chat_completion_generator(
+        stream, chat_request, tool_parser, reasoning_parser
+    )
     response_id = f"resp_{random_uuid()}"
     created_at = int(time.time())
     response = _base_response(request, response_id=response_id, created_at=created_at)
     choice = chat_response.choices[0]
     output = []
-    if choice.message.tool_calls:
-        specs = tool_specs(request.tools)
-        for tool_call in choice.message.tool_calls:
-            output.append(output_tool_call(tool_call, specs))
-    else:
+    if choice.message.reasoning_content and (request.reasoning or {}).get("summary") != "none":
+        status = "incomplete" if reasoning_parser.state != "content" else "completed"
+        output.append(_reasoning_item(
+            choice.message.reasoning_content, f"rs_{random_uuid()}", status
+        ))
+    started_reasoning = reasoning_parser is not None and reasoning_parser.started
+    if choice.message.content or (
+        not choice.message.tool_calls and not output and not started_reasoning
+    ):
         output.append(
             {
                 "id": f"msg_{random_uuid()}",
@@ -401,13 +446,15 @@ async def response_completion_generator(
                 ],
             }
         )
-    incomplete = choice.finish_reason == "length"
+    if choice.message.tool_calls:
+        specs = tool_specs(request.tools)
+        for tool_call in choice.message.tool_calls:
+            output.append(output_tool_call(tool_call, specs))
     response.update(
         {
-            "status": "incomplete" if incomplete else "completed",
-            "completed_at": int(time.time()),
-            "incomplete_details": (
-                {"reason": "max_output_tokens"} if incomplete else None
+            **_response_completion_fields(
+                get_finish_reason(stream.seq), reasoning_parser,
+                bool((choice.message.content or "").strip() or choice.message.tool_calls),
             ),
             "output": output,
             "usage": _usage(chat_response),
@@ -425,6 +472,7 @@ async def response_stream_generator(
     request: ResponseRequest,
     chat_request: ChatCompletionRequest,
     tool_parser: ToolParser = None,
+    reasoning_parser: ThinkParser = None,
 ):
     """Translate engine deltas directly into Responses API SSE events."""
     sequence = 0
@@ -457,6 +505,46 @@ async def response_stream_generator(
     outputs = []
     next_output_index = 0
     specs = tool_specs(request.tools)
+    expose_reasoning = (request.reasoning or {}).get("summary") != "none"
+    reasoning_id = None
+    reasoning_index = None
+    reasoning_text = ""
+    reasoning_done = False
+
+    def reasoning_events(text):
+        nonlocal reasoning_id, reasoning_index, reasoning_text, next_output_index
+        if not text or not expose_reasoning:
+            return []
+        events = []
+        if reasoning_id is None:
+            reasoning_id = f"rs_{random_uuid()}"
+            reasoning_index = next_output_index
+            next_output_index += 1
+            events.append(_sse(event(
+                "response.output_item.added", output_index=reasoning_index,
+                item=_reasoning_item("", reasoning_id, "in_progress"),
+            )))
+        reasoning_text += text
+        events.append(_sse(event(
+            "response.reasoning_text.delta", output_index=reasoning_index,
+            item_id=reasoning_id, content_index=0, delta=text,
+        )))
+        return events
+
+    def finish_reasoning_events():
+        nonlocal reasoning_done
+        if reasoning_id is None or reasoning_done:
+            return []
+        reasoning_done = True
+        status = "incomplete" if reasoning_parser.state != "content" else "completed"
+        item = _reasoning_item(reasoning_text, reasoning_id, status)
+        outputs.append(item)
+        return [
+            _sse(event("response.reasoning_text.done", output_index=reasoning_index,
+                       item_id=reasoning_id, content_index=0, text=reasoning_text)),
+            _sse(event("response.output_item.done", output_index=reasoning_index,
+                       item=item)),
+        ]
 
     def start_message_events():
         nonlocal message_id, message_index, next_output_index
@@ -547,13 +635,17 @@ async def response_stream_generator(
 
     # Without model-native tool markup the output is known to be a message, so
     # announce its item/part before waiting for the first generated token.
-    if stream_parser is None:
+    if stream_parser is None and reasoning_parser is None:
         for wire_event in start_message_events():
             yield wire_event
 
-    async for stream_item in stream:
-        text = stream_item.text
-        if not text:
+    async for stream_item, reasoning, text, final in split_reasoning_stream(stream, reasoning_parser):
+        for wire_event in reasoning_events(reasoning):
+            yield wire_event
+        if reasoning_parser is not None and reasoning_parser.state == "content":
+            for wire_event in finish_reasoning_events():
+                yield wire_event
+        if not text and not (final and stream_parser is not None):
             continue
         full_text += text
         if stream_parser is None:
@@ -564,7 +656,7 @@ async def response_stream_generator(
             # One engine delta may finish both a text prefix and one or more
             # tool-call blocks. Drain every newly available parser delta.
             while True:
-                parsed = stream_parser.process(full_text)
+                parsed = stream_parser.process(full_text, final=final)
                 if parsed is None:
                     break
                 parsed_deltas.append(parsed)
@@ -653,23 +745,28 @@ async def response_stream_generator(
             )
             outputs.append(item)
 
-    # Empty generations still produce a valid empty assistant message.
-    if not outputs and message_id is None:
+    for wire_event in finish_reasoning_events():
+        yield wire_event
+    # Preserve ordinary empty generations, but never fabricate an answer for
+    # reasoning-only output (including when the client hides reasoning).
+    started_reasoning = reasoning_parser is not None and reasoning_parser.started
+    if not outputs and message_id is None and not started_reasoning:
         for wire_event in start_message_events():
             yield wire_event
     for wire_event in finish_message_events():
         yield wire_event
 
     finish_reason = get_finish_reason(stream.seq)
-    incomplete = finish_reason == "length"
     usage = build_usage(stream.seq)
     final = dict(initial)
     final.update(
         {
-            "status": "incomplete" if incomplete else "completed",
-            "completed_at": int(time.time()),
-            "incomplete_details": (
-                {"reason": "max_output_tokens"} if incomplete else None
+            **_response_completion_fields(
+                finish_reason, reasoning_parser,
+                bool(message_text.strip()) or any(
+                    item["type"] in ("function_call", "custom_tool_call")
+                    for item in outputs
+                ),
             ),
             "output": outputs,
             "usage": {
@@ -684,5 +781,5 @@ async def response_stream_generator(
             },
         }
     )
-    terminal_event = "response.incomplete" if incomplete else "response.completed"
+    terminal_event = f"response.{final['status']}"
     yield _sse(event(terminal_event, response=final))

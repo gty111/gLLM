@@ -39,6 +39,7 @@ from gllm.entrypoints.serving_responses import (
     response_stream_generator,
 )
 from gllm.tokenizers.tool_parsers import get_tool_parser
+from gllm.tokenizers.reasoning import create_reasoning_parser
 from gllm.utils import find_free_ports, make_async
 
 router = APIRouter()
@@ -215,6 +216,19 @@ async def show_available_models():
     return JSONResponse(content=models.model_dump())
 
 
+def _chat_template_kwargs(request: ChatCompletionRequest):
+    """Forward reasoning controls while preserving explicit template overrides."""
+    kwargs = dict(request.chat_template_kwargs or {})
+    if request.reasoning_effort == "none":
+        # Some templates reject "none" as an effort and use a separate switch.
+        kwargs.setdefault("enable_thinking", False)
+        kwargs.setdefault("thinking", False)
+    elif request.reasoning_effort is not None:
+        # Effort names are model-specific; leave validation to the template.
+        kwargs.setdefault("reasoning_effort", request.reasoning_effort)
+    return kwargs or None
+
+
 @router.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     capability_error = _validate_chat_capabilities(request)
@@ -222,11 +236,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         return capability_error
 
     effective_tools = request.tools if request.tool_choice != "none" else None
-    chat_template_kwargs = dict(request.chat_template_kwargs or {})
-    if request.reasoning_effort == "none":
-        # Qwen and other reasoning templates commonly expose one or both names.
-        chat_template_kwargs.setdefault("enable_thinking", False)
-        chat_template_kwargs.setdefault("thinking", False)
+    chat_template_kwargs = _chat_template_kwargs(request)
 
     mm_contents = await make_async(llm.model_runner.extract_modify_mm)(request.messages)
     # Encoder-disaggregation frontend (design §3.1 / §5.4): tokenize the *text
@@ -311,11 +321,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             param="messages",
             code="context_length_exceeded",
         )
+    reasoning_parser = create_reasoning_parser(
+        getattr(llm.model_runner, "tokenizer", None), token_ids
+    )
     if request.stream:
-        generator = chat_completion_stream_generator(stream, request, tool_parser)
+        generator = chat_completion_stream_generator(
+            stream, request, tool_parser, reasoning_parser
+        )
         return StreamingResponse(content=generator, media_type="text/event-stream")
     else:
-        generator = await chat_completion_generator(stream, request, tool_parser)
+        generator = await chat_completion_generator(
+            stream, request, tool_parser, reasoning_parser
+        )
         return JSONResponse(content=generator.model_dump(exclude_none=True))
 
 
@@ -333,9 +350,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         return _unsupported(param, message)
 
     effective_tools = chat_request.tools if chat_request.tool_choice != "none" else None
-    chat_template_kwargs = {}
-    if chat_request.reasoning_effort == "none":
-        chat_template_kwargs.update(enable_thinking=False, thinking=False)
+    chat_template_kwargs = _chat_template_kwargs(chat_request)
     try:
         mm_contents = await make_async(llm.model_runner.extract_modify_mm)(
             chat_request.messages
@@ -393,14 +408,17 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         mm_items,
         dp_index=getattr(raw_request.app.state, "dp_index", None),
     )
+    reasoning_parser = create_reasoning_parser(
+        getattr(llm.model_runner, "tokenizer", None), token_ids
+    )
     if request.stream:
         generator = response_stream_generator(
-            stream, request, chat_request, tool_parser
+            stream, request, chat_request, tool_parser, reasoning_parser
         )
         return StreamingResponse(content=generator, media_type="text/event-stream")
     try:
         response = await response_completion_generator(
-            stream, request, chat_request, tool_parser
+            stream, request, chat_request, tool_parser, reasoning_parser
         )
     except ValueError as exc:
         return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
