@@ -1,5 +1,6 @@
 import base64
 import binascii
+import copy
 import io
 import json
 import mimetypes
@@ -108,6 +109,43 @@ def _decode_text_file(data: bytes, param: str) -> str:
     if b"\x00" in data[:4096]:
         raise ValueError(param, "This binary document type is not supported yet.")
     return data.decode("latin-1")
+
+
+def snapshot_response_files(request: ResponseRequest) -> ResponseRequest:
+    """Freeze remote file inputs before encoding and storing a response.
+
+    Keep Responses item identities/order, but replace file URLs with the exact
+    downloaded bytes. Work on a private copy so a continuation never mutates
+    an earlier stored record or the caller's request. Run off the event loop.
+    """
+    if isinstance(request.input, str):
+        return request
+    items = copy.deepcopy(request.input)
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind in (None, "message") and "role" in item:
+            field = "content"
+        elif kind in ("function_call_output", "custom_tool_call_output"):
+            field = "output"
+        else:
+            continue
+        parts = item.get(field)
+        if not isinstance(parts, list):
+            continue
+        for part_index, part in enumerate(parts):
+            if (not isinstance(part, dict) or part.get("type") != "input_file"
+                    or not part.get("file_url") or part.get("file_data") or part.get("file_id")):
+                continue  # The normal input parser reports invalid source combinations.
+            param = f"input.{index}.{field}.{part_index}"
+            data, mime_type, downloaded_name = _download_file(part["file_url"], f"{param}.file_url")
+            filename = part.get("filename") or downloaded_name or "input_file"
+            mime_type = mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            part.pop("file_url")
+            part["filename"] = filename
+            part["file_data"] = f"data:{mime_type};base64," + base64.b64encode(data).decode("ascii")
+    return request.model_copy(update={"input": items})
 
 
 def _input_file_parts(part: Dict[str, Any], param: str) -> List[Dict[str, Any]]:
