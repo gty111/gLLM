@@ -63,6 +63,13 @@ bounds) are rejected with HTTP 400 rather than silently ignored. Boolean
 subschemas are not supported (boolean `additionalProperties` is supported).
 Schemas are limited to 64 KiB and 32 nested schema levels.
 
+`$ref` and `anyOf` may have annotation siblings, but sibling constraints are
+rejected because the backend does not enforce their intersection. Every
+`required` name must appear in `properties`. `enum` / `const` values must satisfy
+all other constraints on their node; for example, `type: string` with
+`enum: [1, "x"]` is rejected. Ordinary `type: string` with `enum: ["x", "y"]`
+remains supported. These checks apply even when `strict` is false.
+
 `strict: true` requires an object root, all properties listed in `required`, and
 `additionalProperties: false` on every object. Nullable fields can use a union
 with `null`. When strict is omitted or false, the declared schema is still
@@ -73,6 +80,9 @@ constrained, but these additional strict-shape requirements are not imposed.
 - Ordinary requests do not allocate masks or perform grammar GPU operations.
 - Compilers are cached per tokenizer/vocabulary/stop-token set; mutable matchers
   are request-local and never serialized over IPC.
+- After preemption, intermediate re-prefill samples are discarded. The final
+  chunk restores grammar from committed output tokens, including on TP/PP
+  followers, so scheduler copies cannot lose the request's grammar history.
 - Native single-token `<think>` / `</think>` boundaries are recognized from the
   actual generation prefix. Reasoning is unconstrained until its closing marker;
   EOS is masked during reasoning. Models with other reasoning conventions need

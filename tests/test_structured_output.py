@@ -1,3 +1,4 @@
+import copy
 import gc
 import json
 import pickle
@@ -504,3 +505,125 @@ def test_async_completion_remap_keeps_per_request_row_identity(backend):
     assert backend.states[b].history == [ord('3')]
     assert calls == ["wait"]
     assert (logits[:, 128] == 0).all()
+
+
+@pytest.mark.parametrize("follower", [False, True])
+@pytest.mark.parametrize("chunk_end", [1, 4])
+@pytest.mark.parametrize("thinking", [False, True])
+def test_reprefill_recovers_committed_history_after_chunk_copy(backend, follower, chunk_end, thinking):
+    from gllm.scheduling.distributed import DriverPayloadBuilder, FollowerSeqStore
+
+    spec = so.StructuredOutput(so.normalize_format(fmt()), 129, 130, thinking)
+    s = seq(spec)
+    builder, store = DriverPayloadBuilder(), FollowerSeqStore()
+    mirror = store.apply_payload(builder.build([s], []))[0]
+    prefix = ([ord('x'), 130] if thinking else []) + list(map(ord, '{"answer":'))
+    for token in prefix:
+        emit(backend, [s], [token])
+        s.token_ids.append(token)
+    s.preempt()
+    s.to_compute_token_num = chunk_end
+    if follower:
+        payload = pickle.loads(pickle.dumps(builder.build([s], [])))
+        assert payload.updates[0].structured_output_history is None
+        current = store.apply_payload(payload)[0]
+        assert current is mirror and current.token_ids is None
+        assert current.prompt_len == s.prompt_len
+    else:
+        current = s
+    assert backend.mask(torch.zeros(1, 131), [current]) == []
+
+    # schedule_prefill_batch deep-copies each unfinished chunk. The resumed
+    # driver object has no WeakKeyDictionary entry; the follower keeps its
+    # object identity but receives a changed prefill boundary and history.
+    resumed = copy.deepcopy(s)
+    resumed.computed_token_num = chunk_end
+    resumed.to_compute_token_num = resumed.prompt_len - chunk_end
+    if follower:
+        payload = builder.build([resumed], [])
+        snapshot = payload.updates[0].structured_output_history
+        assert snapshot == prefix
+        assert snapshot is not resumed.token_ids
+        current = store.apply_payload(pickle.loads(pickle.dumps(payload)))[0]
+    else:
+        current = resumed
+    logits = torch.zeros(1, 131)
+    active = backend.mask(logits, [current])
+    assert backend.states[current].history == prefix
+    assert not backend.states[current].thinking
+    assert logits[0, ord('4')] == 0
+    assert torch.isneginf(logits[0, ord('{')])
+    backend.record(active, torch.tensor([ord('4')]))
+    backend.stage_feedback(torch.tensor([ord('4')]))
+
+    # The first ordinary decode must consume the new sample exactly once.
+    resumed.computed_token_num = resumed.prompt_len
+    resumed.to_compute_token_num = 1
+    resumed.token_ids.append(ord('4'))
+    if follower:
+        payload = builder.build([resumed], [])
+        assert payload.updates[0].structured_output_history is None
+        current = store.apply_payload(payload)[0]
+    else:
+        current = resumed
+    emit(backend, [current], [ord('2')])
+    emit(backend, [current], [ord('}')])
+    emit(backend, [current], [128])
+
+
+@pytest.mark.parametrize("schema", [
+    {"type": "object", "properties": {"x": {"$ref": "#/$defs/X", "enum": [1]}},
+     "required": ["x"], "additionalProperties": False, "$defs": {"X": {"type": "integer"}}},
+    {"type": "object", "properties": {"x": {"type": "string", "enum": [1, "x"]}},
+     "required": ["x"], "additionalProperties": False},
+    {"type": "object", "properties": {"x": {"type": "integer", "const": "x"}},
+     "required": ["x"], "additionalProperties": False},
+    {"type": "object", "properties": {"x": {"type": "integer", "anyOf": [{"const": 1}] }},
+     "required": ["x"], "additionalProperties": False},
+    {"type": "object", "properties": {"x": {"type": "integer"}},
+     "required": ["x"], "additionalProperties": False, "enum": [{}, {"x": 1}]},
+])
+@pytest.mark.parametrize("strict", [False, True])
+def test_unenforced_schema_intersections_return_400(schema, strict):
+    from gllm.entrypoints.api_server import _validate_output_format
+
+    chat = fmt(schema, strict=strict)
+    response = {"type": "json_schema", **chat["json_schema"]}
+    for value, param in ((chat, "response_format"), (response, "text.format")):
+        error = _validate_output_format(value, param)
+        assert error.status_code == 400
+        assert json.loads(error.body)["error"]["code"] == "invalid_output_format"
+
+
+def test_required_properties_without_schema_are_rejected():
+    with pytest.raises(ValueError, match="Required properties"):
+        so.normalize_format(fmt({"type": "object", "required": ["x"]}, strict=False))
+
+
+def test_reprefill_same_object_discards_uncommitted_feedback(backend):
+    s = seq()
+    prefix = list(map(ord, '{"answer":1'))
+    for token in prefix:
+        emit(backend, [s], [token])
+        s.token_ids.append(token)
+    emit(backend, [s], [ord('2')])  # overlap sample not committed by scheduler
+    previous_state = backend.states[s]
+    s.preempt()
+    s.to_compute_token_num = s.prompt_len
+    emit(backend, [s], [ord('}')])
+    assert backend.states[s] is previous_state
+    assert previous_state.history == prefix
+
+
+@pytest.mark.parametrize("value", [
+    {"type": "integer", "enum": [1, 2]},
+    {"type": "integer", "const": 1, "enum": [1, 2]},
+    {"$ref": "#/$defs/X", "description": "An integer"},
+    {"anyOf": [{"const": 1}, {"const": 2}], "title": "Choice"},
+])
+def test_supported_schema_combinations_still_enforced(backend, value):
+    schema = {"type": "object", "properties": {"x": value}, "required": ["x"],
+              "additionalProperties": False, "$defs": {"X": {"type": "integer", "enum": [1, 2]}}}
+    s = seq(so.StructuredOutput(so.normalize_format(fmt(schema))))
+    for token in [*map(ord, '{"x":1}'), 128]:
+        emit(backend, [s], [token])

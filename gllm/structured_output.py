@@ -53,6 +53,8 @@ def normalize_format(fmt):
         "anyOf", "enum", "const", "$ref", "$defs", "definitions",
         "title", "description", "default", "$schema",
     }
+    annotations = {"title", "description", "default", "$schema", "$defs", "definitions"}
+    literal_nodes = []
 
     def visit(node, depth=0):
         if depth > 32:
@@ -64,6 +66,16 @@ def normalize_format(fmt):
             raise ValueError(f"Unsupported JSON schema keywords: {sorted(unknown)}")
         if "$ref" in node and not node["$ref"].startswith("#"):
             raise ValueError("Only local JSON schema references are supported.")
+        # XGrammar gives these keywords precedence over sibling assertions;
+        # JSON Schema instead requires their intersection. Do not silently
+        # compile a weaker grammar, even when strict=false.
+        for keyword in ("$ref", "anyOf"):
+            if keyword in node and set(node) - annotations - {keyword}:
+                raise ValueError(f"{keyword} with sibling constraints is not supported.")
+        if set(node.get("required", [])) - set(node.get("properties", {})):
+            raise ValueError("Required properties must have an explicit properties schema.")
+        if "const" in node or "enum" in node:
+            literal_nodes.append(node)
         types = node.get("type", [])
         types = [types] if isinstance(types, str) else types
         if strict and ("object" in types or "properties" in node):
@@ -84,6 +96,18 @@ def normalize_format(fmt):
             visit(child, depth + 1)
 
     visit(schema)
+    # enum/const also take precedence in the backend. Keep common type+enum
+    # schemas, but reject literals that would bypass another assertion. Do
+    # this after visiting every node so references are known to be local.
+    validator = Draft202012Validator(schema)
+    for node in literal_nodes:
+        values = [node["const"]] if "const" in node else node["enum"]
+        try:
+            valid = all(validator.evolve(schema=node).is_valid(value) for value in values)
+        except Exception as exc:
+            raise ValueError("Cannot validate enum/const constraints.") from exc
+        if not valid:
+            raise ValueError("enum/const values must satisfy all sibling constraints.")
     if strict and (schema.get("type") != "object" or "anyOf" in schema):
         raise ValueError("strict output requires an object root without anyOf.")
     return encoded
@@ -336,10 +360,20 @@ class StructuredSampler:
         active = []
         for row, seq in enumerate(seqs):
             spec = getattr(seq, "structured_output", None)
-            position = seq.computed_token_num + seq.to_compute_token_num - seq.raw_prompt_len
-            if spec is None or position < 0:
+            end = seq.computed_token_num + seq.to_compute_token_num
+            position = end - seq.raw_prompt_len
+            if spec is None or end < seq.prompt_len:
                 continue  # intermediate prefill samples are discarded
             state = self._state(seq, vocab_size)
+            if seq.computed_token_num < seq.prompt_len and seq.prompt_len > seq.raw_prompt_len:
+                # Preemption retains committed outputs, but the scheduler
+                # deep-copies unfinished chunks. Rebuild from authoritative
+                # tokens at the final chunk, not from a discarded chunk sample
+                # or a matcher belonging to an earlier sequence object.
+                history = getattr(seq, "structured_output_history", None)
+                if history is None:
+                    history = seq.token_ids[seq.raw_prompt_len:end]
+                state.synchronize(history)
             active.append((row, position, state))
         if not active:
             return None
