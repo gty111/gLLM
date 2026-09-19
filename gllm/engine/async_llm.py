@@ -112,6 +112,7 @@ class AsyncLLM(LLM):
         num_top_logprobs=0,
         prompt_logprobs_enabled=False,
         num_prompt_logprobs=0,
+        structured_output=None,
     ):
         seq = self.allocate_seq(
             token_ids,
@@ -127,6 +128,7 @@ class AsyncLLM(LLM):
             num_top_logprobs=num_top_logprobs,
             prompt_logprobs_enabled=prompt_logprobs_enabled,
             num_prompt_logprobs=num_prompt_logprobs,
+            structured_output=structured_output,
         )
         # Pin to a specific DP replica when the request came in on a per-replica
         # endpoint (``--endpoint-per-dp``); ``None`` keeps the round-robin default.

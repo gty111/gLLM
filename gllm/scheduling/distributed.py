@@ -144,6 +144,7 @@ class SeqRegister:
     # non-VL non-rep-penalty seqs we skip the accumulation (small but
     # non-trivial Python overhead per decode).
     needs_token_id_accumulation: bool = False
+    structured_output: Any = None
 
 
 @dataclass(slots=True)
@@ -348,6 +349,7 @@ class DriverPayloadBuilder:
                         # immutable here.
                         mm_contents=seq.mm_contents if use_mm else None,
                         needs_token_id_accumulation=needs_token_id_accumulation,
+                        structured_output=getattr(seq, "structured_output", None),
                     )
                 )
                 self._known.add(sid)
@@ -443,6 +445,8 @@ class FollowerSeq:
     """
 
     __slots__ = (
+        "__weakref__",
+        "structured_output",
         "seq_id",
         "prompt_len",
         "token_ids",
@@ -475,6 +479,7 @@ class FollowerSeq:
 
     def __init__(self, reg: SeqRegister, mm_needs_token_ids: bool = False):
         self.seq_id = reg.seq_id
+        self.structured_output = reg.structured_output
         self.prompt_len = reg.prompt_len
         # Keep token_ids alive throughout the seq's lifetime when:
         #   * VL: ``_mm_prepare_cpu`` walks the prompt to build the

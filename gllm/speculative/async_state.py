@@ -15,7 +15,7 @@ successor runs. Optimistic placeholders and GDN state-column selection remain
 explicit in the worker so the synchronization boundary is easy to audit.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Sequence as SequenceType, Tuple
 
 import torch
@@ -32,14 +32,16 @@ class MtpAsyncCompletion:
     event: torch.cuda.Event
     output_seq_ids: Tuple[int, ...] = ()
     extra_batch_size: int = 0
+    _result: object = field(default=None, init=False, repr=False)
 
-    def collect(self) -> Tuple[List[int], List[List[int]]]:
-        """Wait for D2H and return ``(valid_counts, committed)``.
+    def read(self) -> Tuple[List[int], List[List[int]]]:
+        """Read acceptance without retiring the scheduler's completion slot.
 
-        ``valid_counts`` includes the always-committed x1. ``committed`` has
-        already had its ``-1`` padding removed and is therefore ready for the
-        scheduler's variable-length commit path.
+        Grammar can consume this at the successor's mask boundary while that
+        successor's forward runs. CPU scheduling/slot retirement happens later.
         """
+        if self._result is not None:
+            return self._result
         self.event.synchronize()
         host = self.owner._host[self.slot][: self.batch_size]
         valid = host[:, 0].tolist()
@@ -48,8 +50,14 @@ class MtpAsyncCompletion:
         if self.extra_batch_size:
             extra = self.owner._extra_host[self.slot][: self.extra_batch_size]
             committed.extend([[int(token)] for token in extra.tolist()])
+        self._result = valid, committed
+        return self._result
+
+    def collect(self) -> Tuple[List[int], List[List[int]]]:
+        """Return the accepted prefix (including x1), then release the slot."""
+        result = self.read()
         self.owner._release(self.slot)
-        return valid, committed
+        return result
 
 
 class MtpAsyncBatchState:

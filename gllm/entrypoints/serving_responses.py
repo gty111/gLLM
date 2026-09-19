@@ -734,6 +734,7 @@ async def response_stream_generator(
                     output_index=output_index,
                     item_id=item["id"],
                     **{field: arguments},
+                    **({"name": item["name"]} if not custom else {}),
                 )
             )
             yield _sse(

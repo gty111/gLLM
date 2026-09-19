@@ -60,6 +60,8 @@ def get_last_pp_stage_rank():
 def send_pp_tokens_to_previous_stages(tokens):
     """Broadcast sampled GPU tokens back along the rank's PP column."""
     assert is_last_pp_rank()
+    if tokens.dtype != torch.int64:
+        raise TypeError("PP sampled-token feedback requires int64 tokens")
     work = dist.broadcast(
         tokens,
         src=get_last_pp_stage_rank(),
@@ -73,6 +75,8 @@ def send_pp_tokens_to_previous_stages(tokens):
 def recv_pp_tokens_from_last_stage(tokens):
     """Join the sampled-token broadcast and receive into ``tokens``."""
     assert not is_last_pp_rank()
+    if tokens.dtype != torch.int64:
+        raise TypeError("PP sampled-token feedback requires an int64 receive buffer")
     work = dist.broadcast(
         tokens,
         src=get_last_pp_stage_rank(),

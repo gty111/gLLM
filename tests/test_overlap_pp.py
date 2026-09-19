@@ -1,12 +1,33 @@
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 import gllm.distributed.parallel_state as parallel_state
 import gllm.workers.overlap as overlap_worker
 from gllm.scheduling.distributed import FollowerSeq, SeqRegister
 from gllm.scheduling.scheduler import OverlapScheduler
 from gllm.runtime.async_runtime import FutureMap
+
+
+@pytest.mark.parametrize("sending", [False, True])
+def test_pp_feedback_rejects_mismatched_wire_dtype(monkeypatch, sending):
+    _set_pp_rank(monkeypatch, rank=5 if sending else 3, pp_rank=2 if sending else 1)
+    monkeypatch.setattr(parallel_state.dist, "broadcast", lambda *a, **k: pytest.fail("invalid collective launched"))
+    fn = (parallel_state.send_pp_tokens_to_previous_stages if sending
+          else parallel_state.recv_pp_tokens_from_last_stage)
+    with pytest.raises(TypeError, match="int64"):
+        fn(torch.tensor([3, 7], dtype=torch.int32))
+
+
+def test_random_sampler_matches_greedy_and_future_map_wire_dtype(monkeypatch):
+    import gllm.layers.sampler as sampling
+
+    monkeypatch.setattr(sampling, "top_k_top_p_sampling_from_probs",
+                        lambda *a, **k: torch.tensor([3, 7], dtype=torch.int32))
+    tokens = sampling._fused_top_k_top_p_sample(torch.ones(2, 8), torch.ones(2), torch.ones(2))
+    assert tokens.dtype == torch.int64
+    assert tokens.tolist() == [3, 7]
 
 
 class _Work:
