@@ -9,6 +9,7 @@ import tqdm
 from logger import logger
 
 from gllm.distributed.comm import IPCPackage, zmqComm
+from gllm.tokenizers.reasoning import decode_stream_delta, reasoning_control_tokens
 from gllm.runtime.id_allocator import IDAllocator
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
 from gllm.runtime.sequence import GenerationSequence, resolve_output_len
@@ -130,6 +131,7 @@ class LLM:
             mtp_max_batch=mtp_max_batch,
             ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
         )
+        self._reasoning_controls = reasoning_control_tokens(self.model_runner.tokenizer)
         self.pp_size = pp_size
         self.tp_size = tp_size
         # Data-parallel (DP) attention + Expert-Parallel MoE. Run ``dp_size``
@@ -459,10 +461,10 @@ class LLM:
                     token_id = ipc_package.next_tokens[idx]
                     # MTP: a per-seq entry may be a LIST of committed tokens.
                     tokens = token_id if isinstance(token_id, list) else [token_id]
-                    for t in tokens:
-                        seq.append(t)
                     if self.async_streams:
-                        text = seq.detokenize_inc(self.model_runner.tokenizer)
+                        text, controls = decode_stream_delta(
+                            seq, self.model_runner.tokenizer, tokens, self._reasoning_controls
+                        )
                         logprob = None
                         if idx < len(ipc_package.logprobs):
                             logprob = self._make_logprob_entry(
@@ -473,8 +475,11 @@ class LLM:
                         if raw_prompt_lp is not None:
                             prompt_lp = self._make_prompt_logprobs(raw_prompt_lp)
                         self.async_streams[id].put(
-                            StreamOutput(text, logprob, prompt_lp)
+                            StreamOutput(text, logprob, prompt_lp, control_tokens=controls)
                         )
+                    else:
+                        for t in tokens:
+                            seq.append(t)
                 if id in ipc_package.free_ids:
                     self.running_maps.pop(id)
                     if self.async_streams:

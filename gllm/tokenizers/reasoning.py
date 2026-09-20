@@ -1,4 +1,5 @@
-"""Incrementally separate a leading model-native thinking block from its answer."""
+"""Incrementally separate native thinking from answers without parsing examples."""
+from gllm.tokenizers.literals import LiteralScanner
 
 
 class ThinkParser:
@@ -10,48 +11,106 @@ class ThinkParser:
         self.started = prefilled
         self.state = "start"
         self.pending = ""
+        self._pos = 0
+        self._literals = LiteralScanner()
+        self._native = set()
+        self._token_aware = False
 
-    def feed(self, text):
+    def feed(self, text, *, control_tokens=None):
         if self.state == "content":
             return "", text
+        if control_tokens is not None:
+            self._token_aware = True
+            self._native.update(len(self.pending) + offset for offset, _ in control_tokens)
         self.pending += text
+        return self._consume(final=False)
+
+    def _consume(self, *, final):
+        text = self.pending
         if self.state == "start":
-            head = self.pending.lstrip()
-            if not head or (len(head) < len(self.START) and self.START.startswith(head)):
+            head = text.lstrip()
+            if not final and (not head or (len(head) < len(self.START) and self.START.startswith(head))):
                 return "", ""
-            if head.startswith(self.START):
+            start = len(text) - len(head)
+            if head.startswith(self.START) and (not self._token_aware or start in self._native):
                 self.started = True
-                self.pending = head[len(self.START):]
+                self._pos = start + len(self.START)
+                self._literals = LiteralScanner(start=self._pos)
                 self.state = "reasoning"
             elif self.prefilled:
                 self.state = "reasoning"
             else:
                 self.state = "content"
-                content, self.pending = self.pending, ""
-                return "", content
-        end = self.pending.find(self.END)
-        if end >= 0:
-            reasoning = self.pending[:end]
-            content = self.pending[end + len(self.END):]
-            self.pending = ""
-            self.state = "content"
-            return reasoning, content
-        # Hold only a possible split closing delimiter, never the whole thought.
-        keep = 0
-        for size in range(1, min(len(self.pending), len(self.END) - 1) + 1):
-            if self.END.startswith(self.pending[-size:]):
-                keep = size
-        cut = len(self.pending) - keep
-        reasoning, self.pending = self.pending[:cut], self.pending[cut:]
-        return reasoning, ""
+                self.pending = ""
+                return "", text
+        begin = self._pos
+        while self._pos < len(text):
+            pos = self._pos
+            literal_end = self._literals.end(text, pos, final=final)
+            if literal_end is None:
+                break
+            if literal_end > pos:
+                self._pos = literal_end
+                continue
+            if text[pos] == "<":
+                tail = text[pos:pos + len(self.END)]
+                if not final and self.END.startswith(tail) and len(tail) < len(self.END):
+                    break
+                if tail == self.END and (not self._token_aware or pos in self._native):
+                    self.state = "content"
+                    reasoning, content = text[begin:pos], text[pos + len(self.END):]
+                    self.pending = ""
+                    self._native.clear()
+                    return reasoning, content
+            self._pos += 1
+        return text[begin:self._pos], ""
 
     def finish(self):
-        pending, self.pending = self.pending, ""
-        if self.state == "reasoning" or (self.state == "start" and self.prefilled):
-            # A length-limited thought (including a partial end tag) is never
-            # reclassified as an answer just because generation ended.
-            return pending, ""
-        return "", pending
+        if self.state == "content":
+            return "", ""
+        return self._consume(final=True)
+
+
+def reasoning_control_tokens(tokenizer):
+    """Discover native token IDs once, not in the per-delta hot path."""
+    result = {}
+    for marker in (ThinkParser.START, ThinkParser.END):
+        token_id = tokenizer.convert_tokens_to_ids(marker)
+        if token_id is not None and tokenizer.decode([token_id], skip_special_tokens=False) == marker:
+            result[token_id] = marker
+    return result if len(result) == 2 else {}
+
+
+def decode_stream_delta(seq, tokenizer, tokens, controls):
+    """Append committed tokens and preserve native delimiter character offsets.
+
+    Ordinary deltas use the existing batched detokenizer. Only a batch containing
+    a control token is split, including MTP batches containing both boundaries.
+    Detokenize before/through each boundary to retain pending UTF-8 bytes. Keep
+    native markers even on tokenizers that hide them with skip_special_tokens.
+    """
+    if not any(t in controls for t in tokens):
+        for token in tokens:
+            seq.append(token)
+        return seq.detokenize_inc(tokenizer), ()
+    pieces, positions = [], []
+    size = 0
+    for token in tokens:
+        marker = controls.get(token)
+        if marker is not None:
+            prefix = seq.detokenize_inc(tokenizer)
+            pieces.append(prefix)
+            size += len(prefix)
+        seq.append(token)
+        if marker is not None:
+            piece = seq.detokenize_inc(tokenizer)
+            if not piece.endswith(marker):
+                piece += marker
+            positions.append((size + len(piece) - len(marker), marker))
+            pieces.append(piece)
+            size += len(piece)
+    pieces.append(seq.detokenize_inc(tokenizer))
+    return "".join(pieces), tuple(positions)
 
 
 def create_reasoning_parser(tokenizer, token_ids):
@@ -75,7 +134,7 @@ async def split_reasoning_stream(stream, parser):
     from gllm.utils import StreamOutput
 
     async for item in stream:
-        reasoning, content = parser.feed(item.text) if parser else ("", item.text)
+        reasoning, content = parser.feed(item.text, control_tokens=item.control_tokens) if parser else ("", item.text)
         yield item, reasoning, content, False
     reasoning, content = parser.finish() if parser else ("", "")
     yield StreamOutput(""), reasoning, content, True

@@ -29,6 +29,7 @@ import re
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
+from gllm.tokenizers.literals import LiteralScanner
 from gllm.entrypoints.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -398,8 +399,7 @@ class QwenStreamToolParser(StreamToolParser):
     def __init__(self, parser, tools=None):
         super().__init__(parser, tools)
         self._pos = 0
-        self._code = None
-        self._fenced = False
+        self._literals = LiteralScanner()
         self._pending = deque()
         self._error = None
 
@@ -422,47 +422,14 @@ class QwenStreamToolParser(StreamToolParser):
         while self._pos < len(full_text):
             pos = self._pos
             char = full_text[pos]
-            # Escaped Markdown punctuation cannot open a code span or call.
-            if self._code is None and char == "\\":
-                if pos + 1 == len(full_text) and not final:
-                    break
-                end = min(pos + 2, len(full_text))
-                text.append(full_text[pos:end])
-                self._pos = end
+            literal_end = self._literals.end(full_text, pos, final=final)
+            if literal_end is None:
+                break
+            if literal_end > pos:
+                text.append(full_text[pos:literal_end])
+                self._pos = literal_end
                 continue
-            if char in "`~":
-                end = pos + 1
-                while end < len(full_text) and full_text[end] == char:
-                    end += 1
-                if end == len(full_text) and not final:
-                    break  # The delimiter run may continue in the next chunk.
-                size = end - pos
-                indent = full_text[full_text.rfind("\n", 0, pos) + 1:pos]
-                line_start = len(indent) <= 3 and not indent.strip()
-                if self._code is not None:
-                    code_char, code_size = self._code
-                    closes = char == code_char and (
-                        size == code_size if not self._fenced
-                        else size >= code_size and line_start
-                    )
-                    if closes and self._fenced:
-                        line_end = full_text.find("\n", end)
-                        rest = full_text[end:line_end if line_end >= 0 else None]
-                        if line_end < 0 and not final and not rest.strip():
-                            break  # A fence closer allows only trailing whitespace.
-                        closes = not rest.strip()
-                    if closes:
-                        self._code = None
-                        self._fenced = False
-                elif line_start and size >= 3:
-                    self._code = (char, size)
-                    self._fenced = True
-                elif char == "`":
-                    self._code = (char, size)
-                text.append(full_text[pos:end])
-                self._pos = end
-                continue
-            if self._code is None and char == "<":
+            if char == "<":
                 tail = full_text[pos:]
                 if not final and marker.startswith(tail):
                     break
