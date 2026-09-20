@@ -21,6 +21,7 @@ def scheduler(manager, method='chunked_prefill'):
         minp=1, iterp=1, page_size=16, init_new_token_ratio=0.1,
         min_new_token_ratio=0.1, mtp_enabled=False, free=free,
         _mm_precompute_hash=lambda seq: None, disagg_prefill_limit=lambda seq: None,
+        register_decode_page_hash=manager.register_decode_boundary,
     )
     result = Scheduler(1, runner, method)
     result.log = False
@@ -136,7 +137,7 @@ def test_impossible_waiter_gets_terminal_error_instead_of_idle_loop():
     assert s.check_abort_seqs() is None
 
 
-def test_no_progress_releases_partial_owner_and_wakes_next_waiter():
+def test_request_that_cannot_fit_alone_releases_capacity_for_smaller_waiter():
     mm, _, _ = prefix_manager(pages=1)
     big, small = seq(1, 32), GenerationSequence(2, [777], [], output_len=1)
     big.page_table = [mm.segment.allocate()]

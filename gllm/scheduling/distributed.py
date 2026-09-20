@@ -260,9 +260,8 @@ class DriverPayloadBuilder:
       on subsequent iterations.
     * ``_last_pages_len``: ``len(seq.page_table)`` as of the last
       payload we built for this seq. Lets us slice off only the newly
-      appended page ids. Preemption (``len < _last_pages_len``)
-      triggers a ``page_table_reset`` so the follower drops stale page
-      ids.
+      appended page ids. A changed cache epoch after preemption triggers a
+      ``page_table_reset``, even when the replacement table is equally long.
 
     Lifetime: one instance per worker (rank-0). The same instance is
     used for both follower groups (``schedule_first_pp_sockets`` and
@@ -273,6 +272,7 @@ class DriverPayloadBuilder:
     def __init__(self):
         self._known: set[int] = set()
         self._last_pages_len: Dict[int, int] = {}
+        self._last_cache_epoch: Dict[int, int] = {}
 
     # ------------------------------------------------------------------ free
 
@@ -280,6 +280,7 @@ class DriverPayloadBuilder:
         """Drop driver-side tracking for a seq the followers will free."""
         self._known.discard(seq_id)
         self._last_pages_len.pop(seq_id, None)
+        self._last_cache_epoch.pop(seq_id, None)
 
     # ------------------------------------------------------------------ build
 
@@ -363,8 +364,10 @@ class DriverPayloadBuilder:
 
             last_n = self._last_pages_len.get(sid, 0)
             cur_n = len(seq.page_table)
+            cache_epoch = getattr(seq, "_cache_epoch", 0)
             page_table_reset: Optional[List[int]] = None
-            if cur_n < last_n:
+            if (cur_n < last_n
+                    or self._last_cache_epoch.get(sid, cache_epoch) != cache_epoch):
                 # Preemption: ``GenerationSequence.preempt`` cleared page_table.
                 # Re-baseline the follower's mirror from scratch.
                 page_table_reset = []
@@ -373,6 +376,7 @@ class DriverPayloadBuilder:
                 # Steady state: ship only the appended tail.
                 new_page_ids = list(seq.page_table[last_n:cur_n])
             self._last_pages_len[sid] = cur_n
+            self._last_cache_epoch[sid] = cache_epoch
 
             # Mirror the snapshot-slot assignment for each newly shipped page so
             # the follower's ``_cal_ssm_metadata`` picks the same SSM snapshot

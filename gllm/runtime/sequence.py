@@ -61,6 +61,7 @@ class GenerationSequence:
         self.raw_prompt_len = len(token_ids)
         self.prompt_len = len(token_ids)
         self.page_table = []
+        self._cache_epoch = 0
         self.prompt = ""
         self.output = ""
         self.ignore_eos = ignore_eos
@@ -203,7 +204,12 @@ class GenerationSequence:
         )
 
     def preempt(self):
+        # Followers must replace their page table even if recomputation grows
+        # it back to the old length before the next scheduling payload.
+        self._cache_epoch += 1
         self.computed_token_num = 0
+        self.to_compute_token_num = 0
+        self.to_compute_tokens = None
         # Preemption recomputes the seq from scratch, so every token currently
         # in ``token_ids`` (original prompt + already-generated tokens) must be
         # re-prefilled. Bump the prefill boundary accordingly so
