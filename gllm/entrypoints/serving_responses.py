@@ -11,10 +11,11 @@ from urllib.parse import unquote, unquote_to_bytes, urlparse
 from urllib.request import Request, urlopen
 
 from PIL import Image
+from logger import logger
 
 from gllm.engine.async_llm import AsyncStream
 from gllm.entrypoints.protocol import ChatCompletionRequest, DeltaMessage, ResponseRequest
-from gllm.entrypoints.response_tools import chat_tools, output_tool_call, tool_specs
+from gllm.entrypoints.response_tools import bind_custom_parser, chat_tools, output_tool_call, tool_specs
 from gllm.entrypoints.serving_chat import chat_completion_generator
 from gllm.tokenizers.tool_parsers import ToolParser, ToolParseError
 from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
@@ -473,6 +474,7 @@ async def response_completion_generator(
     tool_parser: ToolParser = None,
     reasoning_parser: ThinkParser = None,
 ):
+    tool_parser = bind_custom_parser(tool_parser, request.tools)
     response_id = f"resp_{random_uuid()}"
     created_at = int(time.time())
     response = _base_response(request, response_id=response_id, created_at=created_at)
@@ -543,6 +545,7 @@ async def response_stream_generator(
     reasoning_parser: ThinkParser = None,
 ):
     """Translate engine deltas directly into Responses API SSE events."""
+    tool_parser = bind_custom_parser(tool_parser, request.tools)
     sequence = 0
 
     def event(event_type, **payload):
@@ -766,6 +769,7 @@ async def response_stream_generator(
                 try:
                     item = output_tool_call(tool_call, specs)
                 except ValueError as exc:
+                    logger.warning("Response %s rejected tool %s: %s", response_id, function.name, exc)
                     # Embedded Response errors use the SDK's closed error-code
                     # enum, unlike the top-level HTTP error envelope.
                     failed = dict(

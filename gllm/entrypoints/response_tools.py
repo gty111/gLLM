@@ -2,7 +2,8 @@
 
 Namespaces remain distinct on the wire. Custom tools use a single string
 argument internally; callers still receive custom_tool_call items and events.
-Grammar formats are validated before publishing a call, not during decoding.
+Grammar formats also constrain decoding for supported model envelopes; the
+final check remains a defense against parser and backend mismatches.
 """
 
 import json
@@ -38,6 +39,19 @@ def _grammar(syntax, definition):
                 return True
             except UnexpectedInput:
                 return False
+
+        def explain(value):
+            from lark import UnexpectedInput
+
+            try:
+                parser.parse(value)
+            except UnexpectedInput as exc:
+                if getattr(exc, "line", -1) > 0:
+                    return f"line {exc.line}, column {exc.column}"
+                return "end of input"
+            return "unknown position"
+
+        matches.explain = explain
 
         return matches
     raise ValueError("Unsupported custom tool grammar syntax.")
@@ -113,6 +127,20 @@ def chat_tools(tools):
     return translated or None
 
 
+def custom_tool_formats(tools):
+    return {name: tool.get("format") or {"type": "text"}
+            for name, (tool, _) in tool_specs(tools).items() if tool["type"] == "custom"}
+
+
+def bind_custom_parser(parser, tools):
+    from gllm.tokenizers.tool_parsers import Qwen3ToolParser
+
+    formats = custom_tool_formats(tools)
+    if isinstance(parser, Qwen3ToolParser) and formats:
+        return Qwen3ToolParser(custom_formats=formats)
+    return parser
+
+
 def output_tool_call(tool_call, specs):
     function = tool_call.function
     name = function.name
@@ -134,7 +162,12 @@ def output_tool_call(tool_call, specs):
         value = parsed["input"]
         fmt = tool.get("format") or {}
         if fmt.get("type") == "grammar" and not _grammar(fmt["syntax"], fmt["definition"])(value):
-            raise ValueError(f"Generated input does not match the grammar for {name}.")
+            validator = _grammar(fmt["syntax"], fmt["definition"])
+            detail = validator.explain(value) if hasattr(validator, "explain") else "regex mismatch"
+            raise ValueError(
+                f"Generated input does not match the grammar for {name}: {detail} "
+                f"(input length {len(value)} characters)."
+            )
         item.update(type="custom_tool_call", input=value)
     else:
         item.update(type="function_call", arguments=arguments, status="completed")

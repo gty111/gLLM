@@ -147,16 +147,15 @@ def _validate_output_format(fmt, param, tools=None, ignore_eos=False):
 
     try:
         schema = normalize_format(fmt)
-        if schema is not None and tools:
-            raise ValueError("Structured output with active tools is not supported yet.")
-        if schema is not None and ignore_eos:
+        if (schema is not None or tools) and ignore_eos:
             raise ValueError("Structured output does not support ignore_eos.")
     except (ValueError, TypeError, RecursionError) as exc:
         return _openai_error(str(exc), param=param, code="invalid_output_format")
     return None
 
 
-async def _prepare_output_format(fmt, token_ids):
+async def _prepare_output_format(fmt, token_ids, *, tools=None, custom_formats=None,
+                                 parallel_tool_calls=True):
     from gllm.structured_output import prepare_output
 
     runner = getattr(llm, "model_runner", None)
@@ -164,6 +163,8 @@ async def _prepare_output_format(fmt, token_ids):
         fmt, getattr(runner, "tokenizer", None),
         getattr(getattr(runner, "model_loader", None), "vocab_size", 0),
         getattr(llm, "finish_tokens", ()), token_ids,
+        tools=tools, parser_name=getattr(tool_parser, "name", None),
+        custom_formats=custom_formats, parallel_tool_calls=parallel_tool_calls,
     )
 
 
@@ -362,7 +363,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
     if llm.check_seq_length(token_ids, max_output_tokens):
         try:
-            structured_output = await _prepare_output_format(request.response_format, token_ids)
+            structured_output = await _prepare_output_format(
+                request.response_format, token_ids, tools=effective_tools,
+                parallel_tool_calls=request.parallel_tool_calls is not False,
+            )
             if request.ignore_eos and structured_output is not None and structured_output.schema is None:
                 structured_output = None
         except (ValueError, RuntimeError, ImportError) as exc:
@@ -499,7 +503,13 @@ async def create_response(request: ResponseRequest, raw_request: Request):
             code="context_length_exceeded",
         )
     try:
-        structured_output = await _prepare_output_format((request.text or {}).get("format"), token_ids)
+        from gllm.entrypoints.response_tools import custom_tool_formats
+
+        structured_output = await _prepare_output_format(
+            (request.text or {}).get("format"), token_ids, tools=effective_tools,
+            custom_formats=custom_tool_formats(request.tools) if effective_tools else None,
+            parallel_tool_calls=request.parallel_tool_calls is not False,
+        )
     except (ValueError, RuntimeError, ImportError) as exc:
         return _openai_error(str(exc), param="text.format", code="invalid_output_format")
     stream = await llm.add_requests_async(

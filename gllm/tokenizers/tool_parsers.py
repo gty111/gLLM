@@ -447,7 +447,7 @@ class QwenStreamToolParser(StreamToolParser):
                         if body:
                             raise ToolParseError("Generation ended before the tool call was closed.")
                     if body.startswith(opener):
-                        block = self._parser.call_block(full_text, body_start)
+                        block = self._parser.call_block(full_text, body_start, final=final)
                         if block is None:
                             if not final:
                                 break
@@ -498,7 +498,7 @@ class QwenToolParser(ToolParser):
     def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
         return _parse_qwen_text(self, full_text, tools)
 
-    def call_block(self, text, start):
+    def call_block(self, text, start, *, final=False):
         # A closing tag inside a JSON string is part of an argument, not the
         # boundary of the call. Decode the JSON before looking for the tag.
         try:
@@ -563,18 +563,63 @@ class Qwen3ToolParser(ToolParser):
         r"(?:</parameter>(?=\s*(?:<parameter=|\Z))|(?=<parameter=)|\Z)",
         re.DOTALL,
     )
+    _CLOSED_PARAM_RE = re.compile(
+        r"<parameter=(?P<key>[^>\n]+)>(?P<val>.*?)"
+        r"</parameter>(?=\s*(?:<parameter=|\Z))", re.DOTALL,
+    )
+
+    def __init__(self, *, custom_formats=None):
+        self.custom_formats = custom_formats or {}
+
+    def _custom_header(self, text):
+        match = re.match(r"<function=([^>\n]+)>\n<parameter=input>\n", text)
+        if match and match[1] in self.custom_formats:
+            return match[1], match.end()
+        return None
 
     def parse(self, full_text: str, tools=None) -> Tuple[Optional[str], List[ToolCall]]:
         return _parse_qwen_text(self, full_text, tools)
 
-    def call_block(self, text, start):
-        closing = re.search(r"</function>\s*</tool_call>", text[start:])
-        if closing is None:
-            return None
-        end = start + closing.start() + len("</function>")
-        return text[start:end], start + closing.end()
+    def call_block(self, text, start, *, final=False):
+        header = self._custom_header(text[start:])
+        if header is not None:
+            from gllm.entrypoints.response_tools import _grammar
 
-    def decode_calls(self, block, tools):
+            name, offset = header
+            fmt = self.custom_formats[name]
+            closing = "\n</parameter>\n</function>\n</tool_call>"
+            cursor = start + offset
+            last = None
+            while (end := text.find(closing, cursor)) >= 0:
+                value = text[start + offset:end]
+                last = (text[start:end + len("\n</parameter>\n</function>")], end + len(closing))
+                if fmt.get("type") != "grammar" or _grammar(fmt["syntax"], fmt["definition"])(value):
+                    return last
+                cursor = end + 1
+            # Keep malformed candidates buffered while generation continues;
+            # a delimiter in the input must not publish a truncated patch.
+            return last if final else None
+        last = None
+        for closing in re.finditer(r"</function>\s*</tool_call>", text[start:]):
+            end = start + closing.start() + len("</function>")
+            last = (text[start:end], start + closing.end())
+            try:
+                # A closing function marker inside a still-open parameter is
+                # data, not a call boundary. Prefer complete parameter frames.
+                self.decode_calls(last[0], None, require_closed=True)
+            except ToolParseError:
+                continue
+            return last
+        return last if final else None
+
+    def decode_calls(self, block, tools, *, require_closed=False):
+        header = self._custom_header(block)
+        ending = "\n</parameter>\n</function>"
+        if header is not None and block.endswith(ending):
+            name, offset = header
+            return [ToolCall(function=FunctionCall(
+                name=name, arguments=_dump_arguments({"input": block[offset:-len(ending)]}),
+            ))]
         tool_calls: List[ToolCall] = []
         consumed = 0
         for fm in self._FUNC_RE.finditer(block):
@@ -586,8 +631,14 @@ class Qwen3ToolParser(ToolParser):
             args = {}
             body = fm.group("body")
             parameter_end = 0
-            for pm in self._PARAM_RE.finditer(body):
-                if body[parameter_end:pm.start()].strip():
+            while parameter_end < len(body):
+                if body[parameter_end].isspace():
+                    parameter_end += 1
+                    continue
+                pm = self._CLOSED_PARAM_RE.match(body, parameter_end)
+                if pm is None and not require_closed:
+                    pm = self._PARAM_RE.match(body, parameter_end)
+                if pm is None:
                     raise ToolParseError("Generated tool call contains malformed parameter markup.")
                 key = pm.group("key").strip()
                 if key:
