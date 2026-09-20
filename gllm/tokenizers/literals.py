@@ -2,7 +2,7 @@
 
 Closed inline code/quoted examples are literal; unmatched inline delimiters
 are ordinary text. Fenced code remains literal even if generation truncates.
-Lookahead stops at paragraph boundaries and resumes at the last scanned byte,
+Lookahead resolves paragraph boundaries and resumes at the last scanned character,
 so an unfinished example cannot cause quadratic rescanning on every delta.
 """
 
@@ -11,6 +11,7 @@ class LiteralScanner:
     def __init__(self, start=0):
         self._start = start
         self._waiting = None
+        self._paragraph_close = None
         self._fence = None
         self._comment = False
         self._line_wait = None
@@ -110,6 +111,24 @@ class LiteralScanner:
                     self._waiting = (key, scan)
                     return None
                 if next_pos < len(text) and text[next_pos] == "\n":
+                    if char in "\"'":
+                        # A quote directly after blank lines still closes the
+                        # current example. Do not publish its contents while
+                        # that closing quote may be in the next delta. Other
+                        # paragraph content ends recovery, preventing a stray
+                        # quote from stealing a closer from a later tool call.
+                        cached = self._paragraph_close
+                        close = cached[1] if cached and cached[0] == key else next_pos + 1
+                        while close < len(text) and text[close].isspace():
+                            close += 1
+                        if close == len(text) and not final:
+                            self._paragraph_close = (key, close)
+                            self._waiting = (key, scan)
+                            return None
+                        self._paragraph_close = None
+                        if close < len(text) and text[close] == char:
+                            self._waiting = None
+                            return close + 1
                     self._waiting = None
                     return end
             if char in "\"'" and text[scan] == "\\":

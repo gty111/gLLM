@@ -12,8 +12,13 @@ Both reasoning and Qwen tool parsing use the same literal scanner:
   fenced/indented code, explicit block-quote lines, and HTML comments protect
   markers from interpretation. Unclosed comments remain literal through EOF.
 - Inline code requires an exact matching backtick run. It can span lines but
-  not paragraphs. Unmatched inline delimiters are ordinary text, so a stray
-  backtick cannot suppress a later complete tool call indefinitely.
+  not paragraphs. Quoted examples also recover at paragraph boundaries, but
+  a matching closing quote directly after blank lines/whitespace still closes
+  the current example. Wait for that decision across deltas before publishing
+  text. New non-quote paragraph content releases an unmatched quote; a later
+  quote inside tool arguments cannot retroactively close it. Unmatched inline
+  delimiters are ordinary text, so a stray delimiter cannot suppress a later
+  complete tool call indefinitely.
 - Fences start at the beginning of a line with up to three spaces. Matching
   fences must be at least as long, use the same character, and have only
   whitespace after them. An unclosed fence remains literal through EOF.
