@@ -43,13 +43,15 @@ class StreamOutput:
     bare str) so the async stream can carry both without a second channel.
     """
 
-    __slots__ = ("text", "logprob", "prompt_logprobs")
+    __slots__ = ("text", "logprob", "prompt_logprobs", "control_tokens")
 
     def __init__(
         self,
         text: str,
         logprob: Optional[dict] = None,
         prompt_logprobs: Optional[list] = None,
+        *,
+        control_tokens=None,
     ):
         self.text = text
         self.logprob = logprob
@@ -57,6 +59,9 @@ class StreamOutput:
         # ``prompt_logprobs``: the full per-prompt-token list (index 0 is
         # ``None``). ``None`` on every other delta.
         self.prompt_logprobs = prompt_logprobs
+        # None: legacy text-only source; (): known to contain no native controls.
+        # Otherwise (character offset, marker) pairs in this delta.
+        self.control_tokens = control_tokens
 
 
 def init_logger():
