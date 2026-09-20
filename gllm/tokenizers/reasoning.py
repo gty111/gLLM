@@ -1,4 +1,6 @@
 """Incrementally separate native thinking from answers without parsing examples."""
+import copy
+
 from gllm.tokenizers.literals import LiteralScanner
 
 
@@ -69,6 +71,58 @@ class ThinkParser:
         if self.state == "content":
             return "", ""
         return self._consume(final=True)
+
+    def fork(self):
+        """Copy mutable cursors; immutable buffered text can be shared."""
+        result = copy.copy(self)
+        result._literals = copy.copy(self._literals)
+        result._native = self._native.copy()
+        return result
+
+
+class ReasoningGuard:
+    """Block premature EOS using the same boundary rules as API parsing.
+
+    Speculative sampling forks this state and commits only accepted tokens.
+    Detokenization retains only the previous token and incomplete UTF-8 bytes,
+    never the request's long prompt or its full generated-token history.
+    """
+
+    def __init__(self, tokenizer, *, prefilled, prefix=()):
+        from gllm.runtime.sequence import GenerationSequence
+
+        self.tokenizer = tokenizer
+        self.controls = reasoning_control_tokens(tokenizer)
+        self.parser = ThinkParser(prefilled=prefilled)
+        self.decoder = GenerationSequence("reasoning_guard", list(prefix), [], 0)
+        self.allows_eos = not prefilled
+
+    def accept(self, token):
+        if self.parser.state == "content":
+            return
+        text, controls = decode_stream_delta(self.decoder, self.tokenizer, [token], self.controls)
+        self.parser.feed(text, control_tokens=controls)
+        drop = max(0, self.decoder.cur_length - 1)
+        if drop:
+            del self.decoder.token_ids[:drop]
+            self.decoder.cur_length -= drop
+        self.allows_eos = not self.parser.started or self.parser.state == "content"
+        if not self.allows_eos and any(
+            pos >= self.parser._pos and self.parser.pending.startswith(ThinkParser.END, pos)
+            for pos in self.parser._native
+        ):
+            # An unmatched inline delimiter may defer the end marker until
+            # EOF. Probe EOF without committing that speculative recovery.
+            probe = self.parser.fork()
+            probe.finish()
+            self.allows_eos = probe.state == "content"
+
+    def fork(self):
+        result = copy.copy(self)
+        result.parser = self.parser.fork()
+        result.decoder = copy.copy(self.decoder)
+        result.decoder.token_ids = self.decoder.token_ids.copy()
+        return result
 
 
 def reasoning_control_tokens(tokenizer):

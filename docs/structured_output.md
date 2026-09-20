@@ -64,6 +64,13 @@ characters, not UTF-8 bytes or JSON escape characters: `中`, `\n`, and an escap
 UTF-16 surrogate pair each count as one character. Unpaired surrogate escapes
 are rejected in length-constrained strings. This supports schemas such as
 Codex's task title field with `minLength: 1` and `maxLength: 36`.
+For common length bounds, the grammar expands to counter states with the normal
+character branch inlined. This lets XGrammar precompute masks for ordinary
+text instead of repeatedly interpreting a union of character/escape rules.
+The first compilation can cost more and uses the existing compiler cache.
+Expansion is capped at 1,025 states per string and 2,048 per schema; larger
+bounds retain the compact, correct grammar and can still be slower. Escaped
+Unicode pairs still count as one character in either representation.
 `title`, `description`, `default`, and `$schema` are accepted as annotations.
 Other keywords (including numeric ranges, string patterns, and array length
 bounds) are rejected with HTTP 400 rather than silently ignored. Boolean
@@ -84,7 +91,14 @@ constrained, but these additional strict-shape requirements are not imposed.
 
 ## Runtime behavior and limits
 
-- Ordinary requests do not allocate masks or perform grammar GPU operations.
+- Ordinary requests without native reasoning do not allocate masks or perform
+  grammar GPU operations. Native reasoning requests use an EOS-only guard even
+  without a JSON schema, including requests with tools. This guard does not
+  compile a grammar or constrain tool arguments. It shares literal-boundary
+  rules with the API parser and permits EOS only when the reasoning block can
+  close at EOF. The output-token budget still applies; this does not guarantee
+  that a model will eventually produce an answer. Explicit `ignore_eos` retains
+  its existing behavior.
 - Compilers are cached per tokenizer/vocabulary/stop-token set; mutable matchers
   are request-local and never serialized over IPC.
 - After preemption, intermediate re-prefill samples are discarded. The final
@@ -94,6 +108,9 @@ constrained, but these additional strict-shape requirements are not imposed.
   actual generation prefix. Reasoning is unconstrained until its closing marker;
   EOS is masked during reasoning. Models with other reasoning conventions need
   an adapter or thinking disabled before using this feature.
+- The EOS-only guard uses the API's literal-aware boundary rules. The JSON
+  grammar's existing native-token reasoning transition is unchanged; this
+  change does not add full reasoning/tool structural constraints or retries.
 - The ordinary forward CUDA Graph remains enabled. CPU matching and GPU mask
   application take place outside the model graph.
 - Overlap retains GPU model execution but grammar preparation waits for the

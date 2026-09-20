@@ -124,13 +124,13 @@ def _validate_output_format(fmt, param, tools=None, ignore_eos=False):
 
 
 async def _prepare_output_format(fmt, token_ids):
-    from gllm.structured_output import prepare_output, normalize_format
+    from gllm.structured_output import prepare_output
 
-    if normalize_format(fmt) is None:
-        return None
+    runner = getattr(llm, "model_runner", None)
     return await make_async(prepare_output)(
-        fmt, llm.model_runner.tokenizer, llm.model_runner.model_loader.vocab_size,
-        llm.finish_tokens, token_ids,
+        fmt, getattr(runner, "tokenizer", None),
+        getattr(getattr(runner, "model_loader", None), "vocab_size", 0),
+        getattr(llm, "finish_tokens", ()), token_ids,
     )
 
 
@@ -330,6 +330,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if llm.check_seq_length(token_ids, max_output_tokens):
         try:
             structured_output = await _prepare_output_format(request.response_format, token_ids)
+            if request.ignore_eos and structured_output is not None and structured_output.schema is None:
+                structured_output = None
         except (ValueError, RuntimeError, ImportError) as exc:
             return _openai_error(str(exc), param="response_format", code="invalid_output_format")
         stream = await llm.add_requests_async(
