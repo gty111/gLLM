@@ -129,72 +129,43 @@ def compiler(tokenizer, vocab_size, stop_tokens):
     return xgr.GrammarCompiler(info, max_threads=2, cache_limit_bytes=64 * 1024 * 1024)
 
 
-@lru_cache(maxsize=32)
-def _string_length_grammar(schema):
-    """Repair the bounded-string character unit emitted by XGrammar 0.2.7.
-
-    Its length rule excludes escapes but permits some raw control characters.
-    Count decoded Unicode characters instead: each escape or UTF-16 surrogate
-    pair is one unit. The schema converter still owns nesting, refs and bounds.
-    This exact rewrite is tied to our pinned backend and covered by mask tests.
-    """
-    import xgrammar as xgr
-
-    grammar = str(xgr.Grammar.from_json_schema(schema, strict_mode=False))
-    old_unit = r'(([^\"\\\r\n]))'
-    char_unit = (
-        r'([^\x00-\x1f\"\\]'
-        r' | "\\" [\"\\/bfnrt]'
-        r' | "\\u" ([0-9a-cA-Ce-fE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2})'
-        r' | "\\u" [dD] [89aAbB] [0-9a-fA-F]{2} "\\u" [dD] [c-fC-F] [0-9a-fA-F]{2})'
-    )
-    # Replace whole rule bodies only, never text inside a JSON const/enum.
-    return "\n".join(
-        line.split(" ::= ", 1)[0] + " ::= " + char_unit
-        if line.endswith(" ::= " + old_unit) else line
-        for line in grammar.splitlines()
-    )
-
-
-def compile_schema(ctx, schema):
-    if '"minLength"' in schema or '"maxLength"' in schema:
-        return ctx.compile_grammar(_string_length_grammar(schema))
-    return ctx.compile_json_schema(schema, strict_mode=False)
-
-
 @dataclass(frozen=True)
 class StructuredOutput:
-    schema: str
+    schema: str | None
     think_start: int | None = None
     think_end: int | None = None
     thinking: bool = False
     allow_think_start: bool = False
+    prefix_tail: tuple[int, ...] = ()
 
 
 def prepare_output(fmt, tokenizer, vocab_size, stop_tokens, prompt_ids):
     schema = normalize_format(fmt)
-    if schema is None:
-        return None
     # Compile before admission: bad schemas must not kill a worker. Cache hits
     # amortize compilation; the API runs this function off its event loop.
-    compile_schema(compiler(tokenizer, vocab_size, tuple(stop_tokens)), schema)
+    if schema is not None:
+        compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_json_schema(schema, strict_mode=False)
     from gllm.tokenizers.reasoning import create_reasoning_parser
 
     parser = create_reasoning_parser(tokenizer, prompt_ids)
     if parser is None:
-        return StructuredOutput(schema)
+        return StructuredOutput(schema) if schema is not None else None
     start = tokenizer.convert_tokens_to_ids(parser.START)
     end = tokenizer.convert_tokens_to_ids(parser.END)
     suffix = tokenizer.decode(prompt_ids[-16:], skip_special_tokens=False).rstrip()
+    if schema is None and suffix.endswith(parser.END):
+        return None  # template explicitly disabled thinking
     return StructuredOutput(
         schema, start, end, parser.prefilled,
         not parser.prefilled and not suffix.endswith(parser.END),
+        tuple(prompt_ids[-1:]),
     )
 
 
 class _State:
-    def __init__(self, ctx, spec, stops):
+    def __init__(self, ctx, spec, stops, tokenizer=None):
         self.ctx, self.spec, self.stops = ctx, spec, stops
+        self.tokenizer = tokenizer
         self.history = []
         self.pending = None
         self.spec_pending = None
@@ -203,12 +174,22 @@ class _State:
     def reset(self):
         import xgrammar as xgr
 
-        self.matcher = xgr.GrammarMatcher(self.ctx, override_stop_tokens=self.stops)
+        self.matcher = xgr.GrammarMatcher(self.ctx, override_stop_tokens=self.stops) if self.ctx is not None else None
+        self.guard = None
+        if self.ctx is None and self.tokenizer is not None:
+            from gllm.tokenizers.reasoning import ReasoningGuard
+
+            self.guard = ReasoningGuard(
+                self.tokenizer, prefilled=self.spec.thinking, prefix=self.spec.prefix_tail,
+            )
         self.thinking = self.spec.thinking
         self.allow_start = self.spec.allow_think_start
 
     def accept(self, token):
-        if self.matcher.is_terminated():
+        if self.guard is not None:
+            self.guard.accept(token)
+            return
+        if self.matcher is not None and self.matcher.is_terminated():
             return  # overlap can run past EOS before retirement
         if self.thinking:
             if token == self.spec.think_end:
@@ -219,7 +200,7 @@ class _State:
             self.thinking = True
             return
         self.allow_start = False
-        if not self.matcher.accept_token(token):
+        if self.matcher is not None and not self.matcher.accept_token(token):
             raise RuntimeError(f"Structured output sampled an invalid token: {token}")
 
     def advance(self, position, previous=None):
@@ -250,11 +231,19 @@ class _State:
         self.pending = None
 
     def fill_mask(self, mask, row):
+        if self.guard is not None:
+            if not self.guard.allows_eos:
+                for token in self.stops:
+                    bit = (1 << (token % 32)) if token % 32 != 31 else -(1 << 31)
+                    mask[row, token // 32] &= ~bit
+            return
         if self.thinking:
             allowed = []
             for token in self.stops:
                 bit = (1 << (token % 32)) if token % 32 != 31 else -(1 << 31)
                 mask[row, token // 32] &= ~bit
+        elif self.matcher is None:
+            return
         elif self.matcher.is_terminated():
             mask[row].zero_()
             allowed = self.stops
@@ -276,9 +265,10 @@ class StructuredSampler:
         state = self.states.get(seq)
         if state is None:
             spec = seq.structured_output
-            ctx = compiler(self.tokenizer, vocab_size, tuple(seq.finish_tokens))
-            ctx = compile_schema(ctx, spec.schema)
-            state = self.states[seq] = _State(ctx, spec, seq.finish_tokens)
+            ctx = None
+            if spec.schema is not None:
+                ctx = compiler(self.tokenizer, vocab_size, tuple(seq.finish_tokens)).compile_json_schema(spec.schema, strict_mode=False)
+            state = self.states[seq] = _State(ctx, spec, seq.finish_tokens, self.tokenizer)
         return state
 
     @staticmethod
@@ -364,7 +354,8 @@ class StructuredSampler:
                 state.advance(position, previous)
                 state.pending = None
             trial = copy.copy(state)
-            trial.matcher = state.matcher.fork()
+            trial.matcher = state.matcher.fork() if state.matcher is not None else None
+            trial.guard = state.guard.fork() if state.guard is not None else None
             for j, token in enumerate(tokens):
                 row = i * len(tokens) + j
                 if j and not (int(mask[row - 1, token // 32]) & (1 << (token % 32))):
