@@ -59,18 +59,17 @@ Types, object `properties` / `required` / `additionalProperties`, array `items`,
 `enum`, `const`, `anyOf`, local `$ref`, `$defs` and `definitions` are supported.
 String `minLength` / `maxLength` bounds are supported on explicitly typed string
 nodes (including nullable strings). Bounds must be nonnegative integers, with
-`minLength <= maxLength` when both are present. Length counts decoded Unicode
-characters, not UTF-8 bytes or JSON escape characters: `中`, `\n`, and an escaped
-UTF-16 surrogate pair each count as one character. Unpaired surrogate escapes
-are rejected in length-constrained strings. This supports schemas such as
-Codex's task title field with `minLength: 1` and `maxLength: 36`.
-For common length bounds, the grammar expands to counter states with the normal
-character branch inlined. This lets XGrammar precompute masks for ordinary
-text instead of repeatedly interpreting a union of character/escape rules.
-The first compilation can cost more and uses the existing compiler cache.
-Expansion is capped at 1,025 states per string and 2,048 per schema; larger
-bounds retain the compact, correct grammar and can still be slower. Escaped
-Unicode pairs still count as one character in either representation.
+`minLength <= maxLength` when both are present. Schemas are passed directly to
+XGrammar's `compile_json_schema`, including string length constraints; gLLM
+does not rewrite its grammar. This supports ordinary title schemas such as
+`minLength: 1` and `maxLength: 36`.
+
+String escaping and length enforcement follow the pinned XGrammar version.
+In XGrammar 0.2.7, the bounded-string rule excludes JSON escape sequences and
+can accept some unescaped control characters. Consequently, length-constrained
+strings do not support the full range of valid JSON string representations.
+Compilation uses the existing per-process compiler cache.
+
 `title`, `description`, `default`, and `$schema` are accepted as annotations.
 Other keywords (including numeric ranges, string patterns, and array length
 bounds) are rejected with HTTP 400 rather than silently ignored. Boolean

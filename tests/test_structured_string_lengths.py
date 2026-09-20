@@ -27,7 +27,7 @@ def fmt(schema):
 def byte_compiler():
     import xgrammar as xgr
 
-    vocab = [bytes([i]) for i in range(256)] + [b"<eos>", b"abc", "中文".encode(), b"\\n"]
+    vocab = [bytes([i]) for i in range(256)] + [b"<eos>", b"abc", "\u4e2d\u6587".encode(), b"\\n"]
     info = xgr.TokenizerInfo(vocab, vocab_type=xgr.VocabType.RAW, stop_token_ids=[256])
     return xgr.GrammarCompiler(info, max_threads=1)
 
@@ -62,18 +62,24 @@ def accepts(backend, schema, raw):
     {"minLength": 1, "maxLength": 36}, {"minLength": 2, "maxLength": 2},
     {"maxLength": 0}, {"minLength": 2}, {"maxLength": 2},
 ])
-@pytest.mark.parametrize("value", ["", "a", "ab", "abc", "中", "中文", "😀", "a\n", 'a"', "\\", "a" * 36, "a" * 37])
+@pytest.mark.parametrize("value", ["", "a", "ab", "abc", "\u4e2d", "\u4e2d\u6587", "\U0001f600", "a" * 36, "a" * 37])
 def test_decoded_length_matches_jsonschema(backend, bounds, value):
     schema = title_schema(bounds)
     payload = {"title": value}
     expected = jsonschema.Draft202012Validator(schema).is_valid(payload)
-    for ascii_only in (False, True):
-        assert accepts(backend, schema, json.dumps(payload, ensure_ascii=ascii_only)) == expected
+    assert accepts(backend, schema, json.dumps(payload, ensure_ascii=False)) == expected
 
 
-@pytest.mark.parametrize("value", ["\x00", "\t", "\x1f", r"\x41", r"\uD83D", r"\uDE00"])
-def test_invalid_json_and_unpaired_surrogates_are_masked(backend, value):
-    assert not accepts(backend, title_schema({"minLength": 1, "maxLength": 2}), '{"title":"' + value + '"}')
+@pytest.mark.parametrize("value", ["\x00", "\t", "\x1f", r"\n", r"\\", r'\"', r"\u0041", r"\uD83D\uDE00"])
+def test_string_edge_cases_follow_native_xgrammar(backend, byte_compiler, value):
+    import xgrammar as xgr
+
+    schema = title_schema({"minLength": 1, "maxLength": 2})
+    encoded = so.normalize_format(fmt(schema))
+    matcher = xgr.GrammarMatcher(byte_compiler.compile_json_schema(encoded, strict_mode=False))
+    raw = '{"title":"' + value + '"}'
+    expected = all(matcher.accept_token(token) for token in [*raw.encode(), 256])
+    assert accepts(backend, schema, raw) == expected
 
 
 def test_multi_character_token_boundary(backend):
@@ -87,8 +93,8 @@ def test_multi_character_token_boundary(backend):
     logits = torch.zeros(1, 260)
     backend.mask(logits, [seq])
     assert torch.isneginf(logits[0, 257])  # abc exceeds the bound in one token
-    assert not torch.isneginf(logits[0, 258])  # 中文 is two Unicode characters
-    assert not torch.isneginf(logits[0, 259])  # escaped newline is one character
+    assert not torch.isneginf(logits[0, 258])  # Two Unicode characters fit the bound
+    assert torch.isneginf(logits[0, 259])  # XGrammar 0.2.7 excludes bounded-string escapes
 
 
 @pytest.mark.parametrize("bounds", [
@@ -113,8 +119,8 @@ def test_untyped_length_rejected():
 
 
 def test_enum_cannot_bypass_length(backend):
-    schema = title_schema({"minLength": 1, "maxLength": 2}, enum=["a", "中文"])
-    assert accepts(backend, schema, '{"title":"中文"}')
+    schema = title_schema({"minLength": 1, "maxLength": 2}, enum=["a", "\u4e2d\u6587"])
+    assert accepts(backend, schema, '{"title":"\u4e2d\u6587"}')
     with pytest.raises(ValueError, match="enum/const"):
         so.normalize_format(fmt(title_schema({"maxLength": 1}, enum=["too long"])))
 
@@ -125,7 +131,7 @@ def test_nested_nullable_reference(backend):
         "required": ["titles"], "additionalProperties": False,
         "$defs": {"title": {"type": ["string", "null"], "minLength": 1, "maxLength": 2}},
     }
-    assert accepts(backend, schema, '{"titles":[null,"中","ab"]}')
+    assert accepts(backend, schema, '{"titles":[null,"\u4e2d","ab"]}')
     assert not accepts(backend, schema, '{"titles":[""]}')
     assert not accepts(backend, schema, '{"titles":["abc"]}')
 

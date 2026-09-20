@@ -129,88 +129,6 @@ def compiler(tokenizer, vocab_size, stop_tokens):
     return xgr.GrammarCompiler(info, max_threads=2, cache_limit_bytes=64 * 1024 * 1024)
 
 
-@lru_cache(maxsize=32)
-def _string_length_grammar(schema):
-    """Repair the bounded-string character unit emitted by XGrammar 0.2.7.
-
-    Its length rule excludes escapes but permits some raw control characters.
-    Count decoded Unicode characters instead: each escape or UTF-16 surrogate
-    pair is one unit. The schema converter still owns nesting, refs and bounds.
-    This exact rewrite is tied to our pinned backend and covered by mask tests.
-    """
-    import xgrammar as xgr
-
-    grammar = str(xgr.Grammar.from_json_schema(schema, strict_mode=False))
-    old_unit = r'(([^\"\\\r\n]))'
-    char_unit = (
-        r'([^\x00-\x1f\"\\]'
-        r' | "\\" [\"\\/bfnrt]'
-        r' | "\\u" ([0-9a-cA-Ce-fE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2})'
-        r' | "\\u" [dD] [89aAbB] [0-9a-fA-F]{2} "\\u" [dD] [c-fC-F] [0-9a-fA-F]{2})'
-    )
-    # The generic repeated union is correct but makes ordinary multi-character
-    # tokens context-dependent in XGrammar 0.2.7. Inline the common character
-    # path into bounded counter states so its token masks can be precomputed.
-    # Each state includes the closing quote, avoiding ambiguous empty exits.
-    # Cap expansion across the entire schema; unusually large bounds retain
-    # the original, correct compact representation instead of allocating an
-    # arbitrarily large grammar from a user-supplied integer.
-    rules = [line.split(" ::= ", 1) for line in grammar.splitlines()]
-    character_rules = {name for name, body in rules if body == old_unit}
-    names = {name for name, _ in rules}
-    extra = []
-    state_budget = 2048
-
-    def fresh(stem):
-        name = stem
-        while name in names:
-            name += "_"
-        names.add(name)
-        return name
-
-    normal = r'[^\x00-\x1f\"\\]'
-    short_escape = r'"\\" [\"\\/bfnrt]'
-    unicode_escape = (
-        r'"\\u" ([0-9a-cA-Ce-fE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2})'
-        r' | "\\u" [dD] [89aAbB] [0-9a-fA-F]{2} "\\u" [dD] [c-fC-F] [0-9a-fA-F]{2}'
-    )
-    unicode_rule = None
-    opening, closing = r'(("\"" ', r' "\""))'
-    result = []
-    for name, body in rules:
-        if name in character_rules:
-            body = char_unit
-        elif body.startswith(opening) and body.endswith(closing):
-            repeat = re.fullmatch(r'(\w+)\{(\d+), (-?\d+)\}', body[len(opening):-len(closing)])
-            if repeat and repeat[1] in character_rules:
-                lower, upper = int(repeat[2]), int(repeat[3])
-                states = (upper if upper >= 0 else lower) + 1
-                if states <= state_budget and states <= 1025:
-                    state_budget -= states
-                    if unicode_rule is None:
-                        unicode_rule = fresh('gllm_json_unicode_escape')
-                        extra.append(f'{unicode_rule} ::= ({unicode_escape})')
-                    counters = [fresh(f'{name}_length_{i}') for i in range(states)]
-                    for remaining, counter in enumerate(counters):
-                        choices = []
-                        if (upper >= 0 and remaining <= upper - lower) or (upper < 0 and remaining == 0):
-                            choices.append(r'"\""')
-                        if remaining or upper < 0:
-                            following = counters[max(0, remaining - 1)]
-                            choices.extend((f'{normal} {following}', f'{short_escape} {following}',
-                                            f'{unicode_rule} {following}'))
-                        extra.append(f'{counter} ::= (' + ' | '.join(choices) + ')')
-                    body = r'("\"" ' + counters[-1] + ')'
-        result.append(f'{name} ::= {body}')
-    return "\n".join(result + extra)
-
-
-def compile_schema(ctx, schema):
-    if '"minLength"' in schema or '"maxLength"' in schema:
-        return ctx.compile_grammar(_string_length_grammar(schema))
-    return ctx.compile_json_schema(schema, strict_mode=False)
-
-
 @dataclass(frozen=True)
 class StructuredOutput:
     schema: str | None
@@ -226,7 +144,7 @@ def prepare_output(fmt, tokenizer, vocab_size, stop_tokens, prompt_ids):
     # Compile before admission: bad schemas must not kill a worker. Cache hits
     # amortize compilation; the API runs this function off its event loop.
     if schema is not None:
-        compile_schema(compiler(tokenizer, vocab_size, tuple(stop_tokens)), schema)
+        compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_json_schema(schema, strict_mode=False)
     from gllm.tokenizers.reasoning import create_reasoning_parser
 
     parser = create_reasoning_parser(tokenizer, prompt_ids)
@@ -349,7 +267,7 @@ class StructuredSampler:
             spec = seq.structured_output
             ctx = None
             if spec.schema is not None:
-                ctx = compile_schema(compiler(self.tokenizer, vocab_size, tuple(seq.finish_tokens)), spec.schema)
+                ctx = compiler(self.tokenizer, vocab_size, tuple(seq.finish_tokens)).compile_json_schema(spec.schema, strict_mode=False)
             state = self.states[seq] = _State(ctx, spec, seq.finish_tokens, self.tokenizer)
         return state
 
