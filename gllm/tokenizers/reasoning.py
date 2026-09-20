@@ -99,9 +99,9 @@ class ReasoningGuard:
 
     def accept(self, token):
         if self.parser.state == "content":
-            return
+            return ""
         text, controls = decode_stream_delta(self.decoder, self.tokenizer, [token], self.controls)
-        self.parser.feed(text, control_tokens=controls)
+        _, content = self.parser.feed(text, control_tokens=controls)
         drop = max(0, self.decoder.cur_length - 1)
         if drop:
             del self.decoder.token_ids[:drop]
@@ -116,6 +116,7 @@ class ReasoningGuard:
             probe = self.parser.fork()
             probe.finish()
             self.allows_eos = probe.state == "content"
+        return content
 
     def fork(self):
         result = copy.copy(self)

@@ -282,7 +282,8 @@ def test_api_rejects_incompatible_options():
     from gllm.entrypoints.api_server import _validate_output_format
 
     assert _validate_output_format(fmt(), "response_format") is None
-    for kwargs in ({"tools": [{"type": "function"}]}, {"ignore_eos": True}):
+    assert _validate_output_format(fmt(), "response_format", tools=[{"type": "function"}]) is None
+    for kwargs in ({"ignore_eos": True}, {"tools": [{"type": "function"}], "ignore_eos": True}):
         assert _validate_output_format(fmt(), "response_format", **kwargs).status_code == 400
 
 

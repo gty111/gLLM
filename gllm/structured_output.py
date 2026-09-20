@@ -137,28 +137,38 @@ class StructuredOutput:
     thinking: bool = False
     allow_think_start: bool = False
     prefix_tail: tuple[int, ...] = ()
+    tag: str | None = None
 
 
-def prepare_output(fmt, tokenizer, vocab_size, stop_tokens, prompt_ids):
+def prepare_output(fmt, tokenizer, vocab_size, stop_tokens, prompt_ids, *,
+                   tools=None, parser_name=None, custom_formats=None,
+                   parallel_tool_calls=True):
     schema = normalize_format(fmt)
+    from gllm.tool_constraints import build_tool_tag
+
+    tag = build_tool_tag(tools, parser_name, custom_formats=custom_formats,
+                         schema=schema, parallel_tool_calls=parallel_tool_calls)
     # Compile before admission: bad schemas must not kill a worker. Cache hits
     # amortize compilation; the API runs this function off its event loop.
-    if schema is not None:
+    if tag is not None:
+        compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_structural_tag(tag)
+    elif schema is not None:
         compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_json_schema(schema, strict_mode=False)
     from gllm.tokenizers.reasoning import create_reasoning_parser
 
     parser = create_reasoning_parser(tokenizer, prompt_ids)
     if parser is None:
-        return StructuredOutput(schema) if schema is not None else None
+        return StructuredOutput(schema, tag=tag) if schema is not None or tag is not None else None
     start = tokenizer.convert_tokens_to_ids(parser.START)
     end = tokenizer.convert_tokens_to_ids(parser.END)
     suffix = tokenizer.decode(prompt_ids[-16:], skip_special_tokens=False).rstrip()
-    if schema is None and suffix.endswith(parser.END):
+    if schema is None and tag is None and suffix.endswith(parser.END):
         return None  # template explicitly disabled thinking
     return StructuredOutput(
         schema, start, end, parser.prefilled,
         not parser.prefilled and not suffix.endswith(parser.END),
         tuple(prompt_ids[-1:]),
+        tag,
     )
 
 
@@ -176,7 +186,8 @@ class _State:
 
         self.matcher = xgr.GrammarMatcher(self.ctx, override_stop_tokens=self.stops) if self.ctx is not None else None
         self.guard = None
-        if self.ctx is None and self.tokenizer is not None:
+        if self.tokenizer is not None and (self.ctx is None or (
+                self.spec.tag is not None and (self.spec.thinking or self.spec.allow_think_start))):
             from gllm.tokenizers.reasoning import ReasoningGuard
 
             self.guard = ReasoningGuard(
@@ -187,7 +198,13 @@ class _State:
 
     def accept(self, token):
         if self.guard is not None:
-            self.guard.accept(token)
+            if self.matcher is not None and self.guard.parser.state == "content":
+                if not self.matcher.is_terminated() and not self.matcher.accept_token(token):
+                    raise RuntimeError(f"Structured output sampled an invalid token: {token}")
+            else:
+                content = self.guard.accept(token)
+                if self.matcher is not None and content and not self.matcher.accept_string(content):
+                    raise RuntimeError("Invalid structured content after reasoning boundary")
             return
         if self.matcher is not None and self.matcher.is_terminated():
             return  # overlap can run past EOS before retirement
@@ -232,10 +249,26 @@ class _State:
 
     def fill_mask(self, mask, row):
         if self.guard is not None:
-            if not self.guard.allows_eos:
+            if self.matcher is None or self.guard.parser.state != "content":
+                if self.matcher is not None and not self.guard.parser.started:
+                    self.matcher.fill_next_token_bitmask(mask, row)
+                    token = self.spec.think_start
+                    if token is not None:
+                        mask[row, token // 32] |= (1 << (token % 32)) if token % 32 != 31 else -(1 << 31)
+                    return
+                if not self.guard.allows_eos or self.matcher is not None:
+                    for token in self.stops:
+                        bit = (1 << (token % 32)) if token % 32 != 31 else -(1 << 31)
+                        mask[row, token // 32] &= ~bit
+                return
+            # Reasoning is closed; the tool grammar owns every subsequent token.
+            if self.matcher.is_terminated():
+                mask[row].zero_()
                 for token in self.stops:
                     bit = (1 << (token % 32)) if token % 32 != 31 else -(1 << 31)
-                    mask[row, token // 32] &= ~bit
+                    mask[row, token // 32] |= bit
+            else:
+                self.matcher.fill_next_token_bitmask(mask, row)
             return
         if self.thinking:
             allowed = []
@@ -266,7 +299,9 @@ class StructuredSampler:
         if state is None:
             spec = seq.structured_output
             ctx = None
-            if spec.schema is not None:
+            if spec.tag is not None:
+                ctx = compiler(self.tokenizer, vocab_size, tuple(seq.finish_tokens)).compile_structural_tag(spec.tag)
+            elif spec.schema is not None:
                 ctx = compiler(self.tokenizer, vocab_size, tuple(seq.finish_tokens)).compile_json_schema(spec.schema, strict_mode=False)
             state = self.states[seq] = _State(ctx, spec, seq.finish_tokens, self.tokenizer)
         return state
