@@ -97,6 +97,10 @@ class Scheduler:
         self.abort_ids = set()
         self._pending_request_errors = {}
         self._blocked_prefills = []
+        # After a cache stall, drain resident work before admitting another
+        # request. Keep this mode until the retracted requests finish/abort so
+        # their cached prefixes cannot immediately recreate the same deadlock.
+        self._prefill_recovery_ids = set()
         # log
         self.log = True
         # Seq-ids that finished / aborted since the last time we built a
@@ -402,6 +406,52 @@ class Scheduler:
         else:
             return None
 
+    @staticmethod
+    def _owns_cache(seq):
+        return bool(seq.page_table) or seq.recurrent_state_slot is not None
+
+    def _recover_stalled_prefills(self):
+        owners = [seq for seq in self.seqs_to_prefill if self._owns_cache(seq)]
+        blocked_owners = [seq for seq in self._blocked_prefills if self._owns_cache(seq)]
+        if blocked_owners:
+            victim = max(blocked_owners, key=lambda seq: len(seq.page_table))
+            capacity = (len(victim.page_table) + self.get_num_free_pages()) * self.page_size
+            # Only reject a resident request when even exclusive ownership
+            # cannot cover its current context. Concurrent pressure is solved
+            # by full retraction, preserving the frontend request and stream.
+            impossible_alone = len(owners) == 1 and len(victim) > capacity
+            if not impossible_alone:
+                self.model_runner.free(victim)
+                victim.preempt()
+                getattr(self.memory_manager, "_pending_ssm_restores", {}).pop(victim.seq_id, None)
+                self.seqs_to_prefill.remove(victim)
+                self.seqs_to_prefill.append(victim)
+                self._prefill_recovery_ids.add(victim.seq_id)
+                self.num_preempt_seqs += 1
+                logger.warning(
+                    "Preempting request %s to recover stalled prefill; queued for recompute",
+                    victim.seq_id,
+                )
+                return
+        elif owners:
+            # A resident request may be waiting for external image embeddings.
+            # Its next chunk can release pressure once those arrive.
+            return
+        else:
+            # All admissions rolled back and there is no cache owner left to
+            # preempt. Allocating even one request failed in an otherwise idle
+            # scheduler, so requeuing alone cannot restore progress.
+            victim = self._blocked_prefills[0]
+
+        self.seqs_to_prefill.remove(victim)
+        self.model_runner.free(victim)
+        self._pending_follower_frees.append(victim.seq_id)
+        self._pending_request_errors[victim.seq_id] = (
+            "Insufficient cache capacity for a single request even without "
+            "concurrent cache owners; reduce input/output length or increase cache capacity."
+        )
+        logger.warning("Rejecting request %s: cannot fit alone in the cache", victim.seq_id)
+
     def schedule_once(self):
         """Pick a batch from the queues; followers no longer get a GenerationSequence list.
 
@@ -420,6 +470,11 @@ class Scheduler:
         deferred-output processing in :class:`OverlapScheduler`) want
         the live ``GenerationSequence`` anyway.
         """
+        if self._prefill_recovery_ids:
+            live_ids = {seq.seq_id for seq in self.seqs_to_prefill}
+            live_ids.update(seq.seq_id for seq in self.seqs_to_decode)
+            live_ids.update(seq.seq_id for batch in self.batch_running for seq in batch)
+            self._prefill_recovery_ids.intersection_update(live_ids)
         if (
             len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0
             and len(self.batch_running) < self.pp_size
@@ -430,19 +485,7 @@ class Scheduler:
             if (not schedule_seqs and not self.batch_running
                     and not self.seqs_to_decode and self._blocked_prefills
                     and self.num_preempt_seqs == preemptions_before):
-                # Nothing is in flight that could release capacity. Reject one
-                # stalled owner rather than keeping every client waiting for
-                # an SSE timeout. Prefer the largest owner so smaller waiters
-                # can make progress on the next tick.
-                victim = max(self._blocked_prefills, key=lambda seq: len(seq.page_table))
-                self.seqs_to_prefill.remove(victim)
-                self.model_runner.free(victim)
-                self._pending_follower_frees.append(victim.seq_id)
-                self._pending_request_errors[victim.seq_id] = (
-                    "Insufficient cache capacity to make progress on this request; "
-                    "reduce input/output length or concurrent requests."
-                )
-                logger.warning("Rejecting request %s: cache admission cannot make progress", victim.seq_id)
+                self._recover_stalled_prefills()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
                 return schedule_seqs
@@ -502,7 +545,8 @@ class Scheduler:
         return qlen
 
     def schedule_prefill_batch(
-        self, prefill_token_budget, max_seqs=None, reserve_pages=0
+        self, prefill_token_budget, max_seqs=None, reserve_pages=0,
+        has_scheduled_decode=False,
     ):
         prefill_batch: List[GenerationSequence] = []
         unfinish_prefill_seqs = deque()
@@ -510,6 +554,11 @@ class Scheduler:
         # smaller request from using the remaining capacity.
         deferred_seqs = []
         attempts = len(self.seqs_to_prefill)
+        recovering = bool(self._prefill_recovery_ids)
+        resident_work = recovering and (
+            has_scheduled_decode or bool(self.seqs_to_decode or self.batch_running)
+            or any(self._owns_cache(seq) for seq in self.seqs_to_prefill)
+        )
         # Encoder-disaggregation overlap (design §6.2): seqs whose next chunk is
         # entirely blocked behind a not-yet-ready image span are parked here and
         # re-queued after this round (no slot/page allocation, no ordering loss).
@@ -534,6 +583,11 @@ class Scheduler:
         ):
             attempts -= 1
             seq = self.seqs_to_prefill.popleft()
+            if recovering and resident_work and not self._owns_cache(seq):
+                # Do not repin a retracted prefix (or admit new work) while
+                # resident requests still need the pages released for them.
+                deferred_seqs.append(seq)
+                continue
             fresh = seq.computed_token_num == 0 and not seq.page_table
             cache_counts = None
             if fresh and isinstance(self.memory_manager, PrefixMemoryManager):
@@ -642,6 +696,7 @@ class Scheduler:
             prefill_batched_token_nums += seq.to_compute_token_num
             prefill_token_budget -= seq.to_compute_token_num
             self.memory_manager.pre_allocate_page([seq])
+            resident_work = True
             prefill_batch.append(seq)
             if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
                 seq_new = copy.deepcopy(seq)
@@ -727,6 +782,7 @@ class Scheduler:
             num_tokens_budget,
             max_seqs=prefill_row_budget,
             reserve_pages=reserve_pages,
+            has_scheduled_decode=bool(decode_batch),
         )
 
         # Deadlock guard: in split_pd we zeroed the decode budget to favor
