@@ -1143,6 +1143,10 @@ class ModelRunner:
         # Init KV cache at last; only reserve the dummy page when CUDA graphs
         # are actually enabled so we don't waste memory otherwise.
         self.memory_manager.init(reserve_dummy_page=self._full_cuda_graph_on)
+        self.memory_manager.validate_model_max_length(
+            self.model_max_length,
+            mtp_lookahead=self._mtp_k if self.mtp_enabled else 0,
+        )
 
         if self._full_cuda_graph_on or self._piecewise_runner is not None:
             self.capture_graph()

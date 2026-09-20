@@ -448,6 +448,7 @@ class LLM:
 
     def _apply_ipc_package(self, ipc_package):
         if ipc_package is not None:
+            had_async_streams = bool(self.async_streams)
             for idx, id in enumerate(ipc_package.act_schedule_ids):
                 # Under overlap scheduling a worker can emit a trailing token
                 # for a sequence it freed one step earlier (EOS detected after
@@ -480,13 +481,25 @@ class LLM:
                     else:
                         for t in tokens:
                             seq.append(t)
-                if id in ipc_package.free_ids:
-                    self.running_maps.pop(id)
-                    if self.async_streams:
-                        self.async_streams[id].finish()
-                        del self.async_streams[id]
-            self.free_finish_ids(ipc_package.free_ids)
-            return len(ipc_package.free_ids)
+            # Aborts (including queued requests) carry free_ids without any
+            # acted token rows. Retire them independently, exactly once.
+            retired = []
+            for id in ipc_package.free_ids:
+                if self.running_maps.pop(id, None) is None:
+                    continue
+                retired.append(id)
+                stream = self.async_streams.pop(id, None)
+                if stream is not None:
+                    error = getattr(ipc_package, "request_errors", {}).get(id)
+                    if error:
+                        from gllm.runtime.sequence import RequestCapacityError
+                        stream.put(RequestCapacityError(error))
+                    stream.finish()
+            self.free_finish_ids(retired)
+            if not had_async_streams and getattr(ipc_package, "request_errors", {}):
+                from gllm.runtime.sequence import RequestCapacityError
+                raise RequestCapacityError(next(iter(ipc_package.request_errors.values())))
+            return len(retired)
         return 0
 
     def send_ipc_package(self, log=True):

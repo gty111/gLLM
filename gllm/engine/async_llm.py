@@ -7,15 +7,15 @@ from fastapi import Request
 from logger import logger
 
 from gllm.engine.llm import LLM
-from gllm.utils import make_async
 
 
 class AsyncStream:
 
-    def __init__(self, raw_request: Request, seq=None):
+    def __init__(self, raw_request: Request, seq=None, on_abort=None):
         self._queue: asyncio.Queue = asyncio.Queue()
         self._finished = False
         self._raw_request = raw_request
+        self._on_abort = on_abort
         # The owning GenerationSequence, kept so response builders can report accurate
         # token usage (prompt_len / generated count) and finish_reason once the
         # stream drains. The engine appends generated ids to this same object,
@@ -28,8 +28,20 @@ class AsyncStream:
         self._queue.put_nowait(item)
 
     def finish(self):
+        if self._finished:
+            return
         self._queue.put_nowait(StopAsyncIteration())
         self._finished = True
+
+    def abort(self):
+        if self._finished:
+            return
+        if self._on_abort is not None:
+            self._on_abort()
+        # The consumer has gone away. Do not accumulate its remaining tokens.
+        while not self._queue.empty():
+            self._queue.get_nowait()
+        self.finish()
 
     @property
     def finished(self) -> bool:
@@ -39,7 +51,13 @@ class AsyncStream:
         return self
 
     async def __anext__(self):
-        result = await self._queue.get()
+        if self._finished and self._queue.empty():
+            raise StopAsyncIteration
+        try:
+            result = await self._queue.get()
+        except asyncio.CancelledError:
+            self.abort()
+            raise
         if isinstance(result, Exception):
             raise result
         return result
@@ -134,10 +152,18 @@ class AsyncLLM(LLM):
         # endpoint (``--endpoint-per-dp``); ``None`` keeps the round-robin default.
         if dp_index is not None and self.dp_size > 1:
             seq.target_dp = dp_index % self.dp_size
-        stream = AsyncStream(raw_request, seq=seq)
+        def abort():
+            with self._pending_lock:
+                if not seq.is_abort:
+                    seq.is_abort = True
+                    self.abort_ids.append(seq.seq_id)
+
+        stream = AsyncStream(raw_request, seq=seq, on_abort=abort)
         assert seq.seq_id not in self.async_streams
         self.async_streams[seq.seq_id] = stream
-        await make_async(self.add_requests)(requests=[seq])
+        # Enqueue before exposing a cancellable await. This is just a locked
+        # list append; executor submission could race cancellation and intake.
+        self.add_requests(requests=[seq])
         if self.schedule_engine is None:
             self.start_schedule_engine()
         return stream
@@ -153,9 +179,7 @@ class AsyncLLM(LLM):
             if stream is None:
                 continue
             if await stream.is_disconnected() and not seq.is_abort:
-                with self._pending_lock:
-                    self.abort_ids.append(id)
-                seq.is_abort = True
+                stream.abort()
 
     async def schedule(self):
         while True:
