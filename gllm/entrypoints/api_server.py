@@ -15,6 +15,7 @@ from jinja2 import TemplateError
 from logger import logger
 
 from gllm.engine.async_llm import AsyncLLM
+from gllm.runtime.sequence import RequestCapacityError
 from gllm.entrypoints import cli_args
 from gllm.entrypoints.protocol import (
     ChatCompletionRequest,
@@ -54,6 +55,38 @@ llm: AsyncLLM = None
 # known tool-call format, raw text passes through as content.
 tool_parser = None
 response_store = ResponseStore()
+
+
+def _abort_stream(stream):
+    abort = getattr(stream, "abort", None)
+    if abort is not None:
+        abort()
+
+
+class RequestStreamingResponse(StreamingResponse):
+    """Own engine cancellation even while the consumer is blocked in send()."""
+
+    def __init__(self, content, stream):
+        async def with_errors():
+            try:
+                async for chunk in content:
+                    yield chunk
+            except RequestCapacityError as exc:
+                error = {"type": "error", "error": {
+                    "type": "server_error", "code": "cache_capacity_exceeded",
+                    "message": str(exc),
+                }}
+                yield "event: error\ndata: " + json.dumps(error) + "\n\n"
+        super().__init__(content=with_errors(), media_type="text/event-stream")
+        self.engine_stream = stream
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Covers disconnect, send failure, cancellation, and early parser
+            # termination. A normally finished stream makes this a no-op.
+            _abort_stream(self.engine_stream)
 
 
 def _openai_error(
@@ -366,7 +399,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         generator = chat_completion_stream_generator(
             stream, request, tool_parser, reasoning_parser
         )
-        return StreamingResponse(content=generator, media_type="text/event-stream")
+        return RequestStreamingResponse(generator, stream)
     else:
         try:
             generator = await chat_completion_generator(
@@ -374,6 +407,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             )
         except ToolParseError as exc:
             return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
+        finally:
+            _abort_stream(stream)
         return JSONResponse(content=generator.model_dump(exclude_none=True))
 
 
@@ -517,13 +552,15 @@ async def create_response(request: ResponseRequest, raw_request: Request):
                                 })
                     yield line
             generator = storing_generator()
-        return StreamingResponse(content=generator, media_type="text/event-stream")
+        return RequestStreamingResponse(generator, stream)
     try:
         response = await response_completion_generator(
             stream, request, chat_request, tool_parser, reasoning_parser
         )
     except ValueError as exc:
         return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
+    finally:
+        _abort_stream(stream)
     if request.store:
         normalized_input = (
             [{"type": "message", "role": "user", "content": request.input}]
@@ -577,9 +614,12 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         )
     if request.stream:
         generator = completion_stream_generator(stream, request)
-        return StreamingResponse(content=generator, media_type="text/event-stream")
+        return RequestStreamingResponse(generator, stream)
     else:
-        generator = await completion_generator(stream, request)
+        try:
+            generator = await completion_generator(stream, request)
+        finally:
+            _abort_stream(stream)
         return JSONResponse(content=generator.model_dump())
 
 
@@ -599,6 +639,10 @@ def _build_app(dp_index=None):
     """One FastAPI app. ``dp_index`` (via ``app.state``) pins every request that
     arrives on this app to a specific DP replica; ``None`` = round-robin."""
     app = fastapi.FastAPI()
+
+    @app.exception_handler(RequestCapacityError)
+    async def cache_capacity_error_handler(_, exc):
+        return _openai_error(str(exc), status_code=503, code="cache_capacity_exceeded")
 
     @app.exception_handler(RequestValidationError)
     async def openai_validation_error_handler(_, exc: RequestValidationError):

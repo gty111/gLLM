@@ -95,6 +95,8 @@ class Scheduler:
         self._decode_budget_jitter = 0
         # abort ids
         self.abort_ids = set()
+        self._pending_request_errors = {}
+        self._blocked_prefills = []
         # log
         self.log = True
         # Seq-ids that finished / aborted since the last time we built a
@@ -198,7 +200,7 @@ class Scheduler:
                     continue
                 seen.add(seq.seq_id)
                 reserve += self._seq_reserve_pages(seq, ratio)
-        return max(self.min_reserve_pages, reserve)
+        return max(self.min_reserve_pages, reserve) if seen else 0
 
     def update_num_wait_tokens(self):
         self.num_wait_tokens = sum(
@@ -389,6 +391,10 @@ class Scheduler:
 
     def check_abort_seqs(self):
         ipc_package = IPCPackage([])
+        ipc_package.request_errors = self._pending_request_errors
+        self._pending_request_errors = {}
+        ipc_package.free_ids.extend(ipc_package.request_errors)
+        self.abort_ids.difference_update(ipc_package.request_errors)
         self.check_abort_seqs_list(self.seqs_to_prefill, ipc_package)
         self.check_abort_seqs_list(self.seqs_to_decode, ipc_package)
         if len(ipc_package.free_ids) != 0:
@@ -418,7 +424,25 @@ class Scheduler:
             len(self.seqs_to_decode) + len(self.seqs_to_prefill) != 0
             and len(self.batch_running) < self.pp_size
         ):
+            self._blocked_prefills = []
+            preemptions_before = self.num_preempt_seqs
             schedule_seqs = self.schedule()
+            if (not schedule_seqs and not self.batch_running
+                    and not self.seqs_to_decode and self._blocked_prefills
+                    and self.num_preempt_seqs == preemptions_before):
+                # Nothing is in flight that could release capacity. Reject one
+                # stalled owner rather than keeping every client waiting for
+                # an SSE timeout. Prefer the largest owner so smaller waiters
+                # can make progress on the next tick.
+                victim = max(self._blocked_prefills, key=lambda seq: len(seq.page_table))
+                self.seqs_to_prefill.remove(victim)
+                self.model_runner.free(victim)
+                self._pending_follower_frees.append(victim.seq_id)
+                self._pending_request_errors[victim.seq_id] = (
+                    "Insufficient cache capacity to make progress on this request; "
+                    "reduce input/output length or concurrent requests."
+                )
+                logger.warning("Rejecting request %s: cache admission cannot make progress", victim.seq_id)
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
                 return schedule_seqs
@@ -482,6 +506,10 @@ class Scheduler:
     ):
         prefill_batch: List[GenerationSequence] = []
         unfinish_prefill_seqs = deque()
+        # Inspect each waiter at most once. A blocked head must not keep a
+        # smaller request from using the remaining capacity.
+        deferred_seqs = []
+        attempts = len(self.seqs_to_prefill)
         # Encoder-disaggregation overlap (design §6.2): seqs whose next chunk is
         # entirely blocked behind a not-yet-ready image span are parked here and
         # re-queued after this round (no slot/page allocation, no ordering loss).
@@ -499,11 +527,34 @@ class Scheduler:
         # enough short prompts that ``decode + prefill`` overflows the buffer
         # and ``copy_to_input_buffer`` crashes on a row-count mismatch.
         while (
-            len(self.seqs_to_prefill) != 0
-            and prefill_token_budget != 0
+            attempts > 0
+            and len(self.seqs_to_prefill) != 0
+            and prefill_token_budget > 0
             and (max_seqs is None or len(prefill_batch) < max_seqs)
         ):
+            attempts -= 1
             seq = self.seqs_to_prefill.popleft()
+            fresh = seq.computed_token_num == 0 and not seq.page_table
+            cache_counts = None
+            if fresh and isinstance(self.memory_manager, PrefixMemoryManager):
+                cache_counts = (self.memory_manager.num_allocated_pages,
+                                self.memory_manager.num_hit_pages)
+
+            def defer(resource_blocked=True):
+                seq.to_compute_token_num = 0
+                if fresh:
+                    # Admission is transactional: an unscheduled prefix must
+                    # remain evictable, including its private recurrent state.
+                    self.memory_manager.free(seq)
+                    seq.preempt()
+                    if cache_counts is not None:
+                        (self.memory_manager.num_allocated_pages,
+                         self.memory_manager.num_hit_pages) = cache_counts
+                    getattr(self.memory_manager, "_pending_ssm_restores", {}).pop(seq.seq_id, None)
+                deferred_seqs.append(seq)
+                if resource_blocked:
+                    self._blocked_prefills.append(seq)
+
             # A new request atomically claims its whole per-seq recurrent-state
             # allocation (1 entry, or 1+k for hybrid MTP) from the shared
             # arena.  Claim it before prefix lookup pins KV slots: both cache
@@ -513,8 +564,8 @@ class Scheduler:
             # admission watermark.
             if recurrent_seg is not None and seq.recurrent_state_slot is None:
                 if not self.memory_manager.allocate_recurrent_slot(seq):
-                    self.seqs_to_prefill.appendleft(seq)
-                    break
+                    defer()
+                    continue
             if (
                 isinstance(self.memory_manager, PrefixMemoryManager)
                 and seq.computed_token_num == 0
@@ -544,8 +595,10 @@ class Scheduler:
             if gate_limit is not None and gate_limit <= seq.computed_token_num:
                 # Nothing prefillable this round; park and re-queue. No SSM slot
                 # / page allocation so freeing stays simple if it never runs.
-                deferred_disagg_seqs.append(seq)
-                self.memory_manager.free_recurrent_slot(seq)
+                if fresh:
+                    defer(resource_blocked=False)
+                else:
+                    deferred_disagg_seqs.append(seq)
                 continue
             prefill_avail = len(seq) - seq.computed_token_num
             if gate_limit is not None:
@@ -556,8 +609,17 @@ class Scheduler:
             # ``process_output`` / ``check_abort_seqs`` / ``check_preempt``).
             # Idempotent: the claim above already covers a fresh request.
             if not self.memory_manager.allocate_recurrent_slot(seq):
-                self.seqs_to_prefill.appendleft(seq)
-                break
+                defer()
+                continue
+            # Compute may reuse already-owned pages even when no new page is
+            # available. Bound only growth by the free capacity after reserve;
+            # prefix pinning and recurrent allocation above can change it.
+            new_pages = max(0, self.get_num_free_pages() - reserve_pages)
+            capacity = (len(seq.page_table) + new_pages) * self.page_size
+            prefill_avail = min(prefill_avail, max(0, capacity - seq.computed_token_num))
+            if prefill_avail <= 0:
+                defer()
+                continue
             if prefill_avail <= prefill_token_budget:
                 seq.to_compute_token_num = prefill_avail
             else:
@@ -577,30 +639,6 @@ class Scheduler:
                     aligned = (end // stride) * stride
                     if aligned > seq.computed_token_num:
                         seq.to_compute_token_num = aligned - seq.computed_token_num
-            # Page guard: the prefill ``token`` budget only accounts for the
-            # *uncached tail* a seq computes this step, but ``pre_allocate_page``
-            # below grabs a KV page for every NEW page boundary the seq crosses
-            # -- and with prefix caching the seq already grabbed its whole cached
-            # prefix in ``pre_allocate_computed_page`` above (pages that cost
-            # zero compute tokens). So a high cache-hit-rate workload can pass
-            # the token-budget check while collectively demanding far more pages
-            # than exist, and ``IDAllocator.allocate`` then asserts on an empty
-            # free list mid-batch. Stop admitting before that happens: compute
-            # the pages this seq still needs and re-queue it (unmodified) when
-            # the free pool -- minus the decode reserve -- can't cover them.
-            pages_have = len(seq.page_table)
-            pages_needed_total = (
-                seq.computed_token_num + seq.to_compute_token_num + self.page_size - 1
-            ) // self.page_size
-            pages_to_alloc = max(0, pages_needed_total - pages_have)
-            if pages_to_alloc > self.get_num_free_pages() - reserve_pages:
-                # Undo the per-step bookkeeping and park this seq for a later
-                # round. Its cached-prefix pages stay in ``page_table`` (a
-                # sibling in this batch may share them); they are reclaimed
-                # normally when the seq eventually runs or is freed.
-                seq.to_compute_token_num = 0
-                self.seqs_to_prefill.appendleft(seq)
-                break
             prefill_batched_token_nums += seq.to_compute_token_num
             prefill_token_budget -= seq.to_compute_token_num
             self.memory_manager.pre_allocate_page([seq])
@@ -610,6 +648,7 @@ class Scheduler:
                 seq_new.computed_token_num += seq_new.to_compute_token_num
                 unfinish_prefill_seqs.appendleft(seq_new)
 
+        self.seqs_to_prefill.extendleft(reversed(deferred_seqs))
         self.seqs_to_prefill.extendleft(unfinish_prefill_seqs)
         # Re-queue gate-B-blocked disagg seqs (preserving their relative order)
         # for a future round once their embeddings land.
@@ -621,7 +660,14 @@ class Scheduler:
         self, decode_token_budget, token_budget=None, mtp_eligible=True
     ):
         decode_batch: List[GenerationSequence] = []
-        self.check_preempt(min(decode_token_budget, len(self.seqs_to_decode)))
+        candidates = list(self.seqs_to_decode)[:decode_token_budget]
+        width = self._decode_tokens_per_seq(len(candidates), mtp_eligible=mtp_eligible)
+        # Ordinary decode computes the final token already in token_ids.
+        # MTP additionally preallocates len(seq) + 1 + k in the runner.
+        lookahead = width if width > 1 else 0
+        pages_needed = sum(max(0, (len(seq) + lookahead + self.page_size - 1) // self.page_size
+                               - len(seq.page_table)) for seq in candidates)
+        self.check_preempt(pages_needed)
         num_to_schedule = min(decode_token_budget, len(self.seqs_to_decode))
         if token_budget is not None and num_to_schedule > 0:
             tokens_per_seq = self._decode_tokens_per_seq(
@@ -673,13 +719,9 @@ class Scheduler:
         )
         num_tokens_budget -= self._decode_batch_token_cost(decode_batch)
 
-        # prefill: only admit into the page headroom left *after* reserving for
-        # the in-flight decode batch's projected growth (anti-preemption).
-        num_tokens_budget = min(
-            num_tokens_budget,
-            self.page_size * max(self.get_num_free_pages() - reserve_pages, 0),
-        )
-
+        # Per-request admission accounts for pinned prefix pages as well as
+        # new allocations. A global free-page cap can prevent even a full hit
+        # from recomputing its tail, leaving every request waiting forever.
         prefill_row_budget = self.maxd - len(decode_batch)
         prefill_batch, prefill_batched_token_nums = self.schedule_prefill_batch(
             num_tokens_budget,
@@ -744,10 +786,8 @@ class Scheduler:
         # Pages to keep free for the in-flight decode batch (anti-preemption).
         reserve_pages = self._decode_reserve_pages()
         # prefill
-        prefill_token_budget = self.page_size * max(
-            self.get_num_free_pages() - reserve_pages, 0
-        )
-        if get_world_size() > 1 and prefill_token_budget != 0:
+        prefill_token_budget = self.maxp
+        if get_world_size() > 1:
             self.update_num_wait_tokens()
             free_ratio = self.memory_manager.get_memory_free()
             # Fraction of the cache held back for in-flight decode growth
@@ -759,7 +799,7 @@ class Scheduler:
             prefill_ratio = (free_ratio - reserve_ratio) / (1 - reserve_ratio)
             prefill_ratio = max(prefill_ratio, 0)
             prefill_token_budget = min(
-                round(prefill_ratio * self.maxp), prefill_token_budget
+                max(self.minp, round(prefill_ratio * self.maxp)), prefill_token_budget
             )
             # Use WT only when the number of waiting seqs is greater than 1
             if len(self.seqs_to_prefill) > 1:

@@ -51,6 +51,7 @@ class IPCPackage:
         self.disagg_events = None
         # worker => front-end
         self.free_ids = []  # seq_ids to free
+        self.request_errors = {}  # terminal per-request capacity errors
         self.act_schedule_ids = []
         self.next_tokens = []
         # Per-token logprobs aligned with ``next_tokens`` (one entry per acted

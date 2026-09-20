@@ -25,6 +25,10 @@ def resolve_output_len(prompt_len: int, output_len: Optional[int], model_max_len
     return output_len
 
 
+class RequestCapacityError(RuntimeError):
+    """A request cannot make progress with the available cache capacity."""
+
+
 class GenerationSequence:
     def __init__(
         self,

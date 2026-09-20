@@ -1159,6 +1159,52 @@ class MemoryManager:
         self.k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
         self.v_scale = self.k_scale
 
+    def validate_model_max_length(
+        self, model_max_length: int, *, mtp_lookahead: int = 0
+    ) -> int:
+        """Check single-request capacity at startup, before graph capture.
+
+        The shared arena's advertised KV and recurrent capacities overlap.
+        Claim one request's working states in the allocator to account for
+        their actual aligned extents and the already-reserved dummy slots.
+        This touches CPU ownership metadata only, not the cache tensors.
+        Prefix snapshots are evictable and need no permanent reservation.
+        """
+        segment = self.recurrent_segment
+        allocator = self.cache_arena.allocator
+        blocks = []
+        state_count = 0
+        if segment is not None:
+            state_count = 1 + self.mtp_k if self.ssm_segment is not None else 1
+            blocks = allocator.allocate(segment.arena_type, state_count)
+            if blocks is None:
+                raise RuntimeError(
+                    "Cache arena cannot hold the recurrent working states "
+                    "for one request. Raise --gpu-memory-util or --tp."
+                )
+        try:
+            kv_pages = self.get_num_free_pages()
+            # MTP preallocates len(seq) + 1 + k positions before verification.
+            # The final step can start at model_max_length - 1 tokens.
+            max_length = max(0, kv_pages * self.page_size - mtp_lookahead)
+        finally:
+            if blocks:
+                allocator.free(segment.arena_type, blocks)
+
+        logger.info(
+            "Single-request cache capacity: %d tokens (%d KV pages after "
+            "%d working states and dummy reservations, MTP lookahead=%d)",
+            max_length, kv_pages, state_count, mtp_lookahead,
+        )
+        if model_max_length > max_length:
+            raise RuntimeError(
+                f"--model-max-length={model_max_length} exceeds single-request "
+                f"cache capacity ({max_length} tokens, including recurrent "
+                "working states and MTP lookahead). Reduce --model-max-length "
+                f"to <= {max_length}, or raise --gpu-memory-util or --tp."
+            )
+        return max_length
+
     def _kv_cache_layout(self) -> CacheLayout:
         """Describe all tensor banks that share one attention-cache page id."""
         tensors = []
