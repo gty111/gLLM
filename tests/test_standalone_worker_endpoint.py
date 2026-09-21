@@ -937,3 +937,110 @@ def test_pre_first_output_abort_identity_from_admission():
     assert n == 1
     assert 0 not in eng.running_maps
     assert freed == [0]
+
+
+def test_multi_step_generation_identity_survives_intermediate_rows():
+    """P1 (round 5): a max_tokens=N>1 request emits one NON-TERMINAL act
+    row per decode step. Translating an intermediate step must NOT reclaim
+    the admission identity: the scheduler drops the seq from every live
+    queue at its final step, so the terminal (token + free) rows can only
+    be translated from the admission registry. Previously every translated
+    id was marked reclaimable, so step 2's translation deleted the
+    mapping and step 3's rows shipped as internal id + None stamp -- the
+    frontend dropped them and the client hung."""
+    from gllm.distributed.comm import IPCPackage
+
+    req = _seq(0, "epoch-A")
+    w = _remap_worker_factory(None)
+    w._remap_client_ids([req])
+    internal = req.seq_id
+    # Simulate step 1: seq still in the live decode queue.
+    w.scheduler.seqs_to_decode.append(req)
+
+    def _emit(step, final):
+        pkg = IPCPackage([])
+        pkg.act_schedule_ids = [internal]
+        pkg.next_tokens = [[10 + step]]
+        if final:
+            # Final step: the scheduler pops the batch and frees the seq
+            # BEFORE the package is translated -- it is in no queue.
+            w.scheduler.seqs_to_decode.clear()
+            w.scheduler.seqs_to_prefill.clear()
+            w.scheduler.batch_running.clear()
+            pkg.free_ids = [internal]
+        w.translate_output_for_frontend(pkg)
+        return pkg
+
+    # Step 1 (non-terminal): translated from the live queue; the mapping
+    # must SURVIVE for the next steps.
+    p1 = _emit(1, final=False)
+    assert p1.act_schedule_ids == [0] and p1.sessions == ["epoch-A"]
+    assert internal in w.comm._session_identity, (
+        "non-terminal row must not mark the identity reclaimable")
+
+    # Step 2 (non-terminal): same requirement, and the pending reclaim
+    # drain must not have erased it either.
+    p2 = _emit(2, final=False)
+    assert p2.act_schedule_ids == [0] and p2.sessions == ["epoch-A"]
+    assert internal in w.comm._session_identity, (
+        "second non-terminal row still must not reclaim the identity")
+
+    # Step 3 (terminal token + free): the seq is already gone from every
+    # queue -- only the admission registry can answer.
+    p3 = _emit(3, final=True)
+    assert p3.act_schedule_ids == [0], (
+        "terminal token row must be translated, not leak the internal id")
+    assert p3.sessions == ["epoch-A"]
+    assert p3.free_ids == [0]
+    assert p3.free_sessions == ["epoch-A"]
+    # The terminal rows mark the identity reclaimable; the next drain
+    # reclaims it (bounded retention).
+    assert internal in w.comm._identity_reclaim
+    w.translate_output_for_frontend(IPCPackage([]))
+    assert internal not in w.comm._session_identity, (
+        "identity must be reclaimed after the terminal rows go out")
+
+
+def test_cancel_after_first_output_translates_terminal_free():
+    """P1 (round 5, cancel path): the client cancels AFTER the first token.
+    The seq already produced a non-terminal act row (so the identity
+    survived that translation); the abort frees it from the decode queue,
+    and its free-only reply row must still translate to (client id,
+    session) so the frontend can retire the stream -- not leave it hung
+    on an untranslated internal id."""
+    from gllm.distributed.comm import IPCPackage
+
+    req = _seq(0, "epoch-A")
+    w = _remap_worker_factory(None)
+    w._remap_client_ids([req])
+    internal = req.seq_id
+
+    # First token: non-terminal act row, seq back in the decode queue.
+    w.scheduler.seqs_to_decode.append(req)
+    pkg1 = IPCPackage([])
+    pkg1.act_schedule_ids = [internal]
+    pkg1.next_tokens = [[11]]
+    w.translate_output_for_frontend(pkg1)
+    assert pkg1.act_schedule_ids == [0] and pkg1.sessions == ["epoch-A"]
+
+    # Client cancels: the abort drain removes the seq from the queue and
+    # replies free-only (no act rows, check_abort_seqs shape).
+    w.scheduler.seqs_to_decode.clear()
+    pkg2 = IPCPackage([])
+    pkg2.free_ids = [internal]
+    w.translate_output_for_frontend(pkg2)
+    assert pkg2.free_ids == [0], (
+        "cancel free row must be translated from the admission registry")
+    assert pkg2.free_sessions == ["epoch-A"]
+
+    # Frontend retires exactly its own request.
+    eng = _bare_llm()
+    freed = []
+    eng.id_allocator = _FreeTracker(freed)
+    eng.free_finish_ids = lambda ids: freed.extend(ids)
+    new0 = _seq(0, "epoch-A")
+    eng.running_maps[0] = new0
+    n = eng._apply_ipc_package(pkg2)
+    assert n == 1
+    assert 0 not in eng.running_maps
+    assert freed == [0]

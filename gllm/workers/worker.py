@@ -460,34 +460,46 @@ class Worker(TorchProfilerMixin):
         """
         if not self._standalone_remap_enabled():
             return
-        # Identity retention: a row is translated AT MOST ONCE (act rows
-        # only ever appear in act, free rows only in free), so the
-        # admission-time registry entry of every translated internal id
-        # becomes reclaimable the NEXT drain -- bounding the table's
-        # growth to (one drain of terminal rows), not the fleet lifetime.
+        # Identity retention: an admission-time mapping is reclaimable only
+        # AFTER the request's TERMINAL rows have been translated -- free
+        # rows (abort / capacity-error replies) and the final act row of a
+        # finishing seq (which the scheduler ships together with its free
+        # row in the same package). Ordinary non-terminal act rows -- one
+        # PER DECODE STEP for a max_tokens=N request -- must NOT trigger
+        # reclamation: the request keeps producing rows (and the scheduler
+        # drops it from every live queue at its final step), so its
+        # mapping must survive until the terminal rows go out. Deferral
+        # bounds retention: reclaimed on the NEXT drain after the terminal
+        # rows, i.e. at most one drain's worth of finished requests.
         reg = self.comm._session_identity
         pending = self.comm._identity_reclaim
         for stale in pending:
             reg.pop(stale, None)
         pending.clear()
 
-        def _row(internal_id):
+        # Act rows of ids freed in THIS package are the finishing step
+        # (token + free ship together); they join the free rows as
+        # reclaimable.
+        terminal = set(ipc_package.free_ids)
+
+        def _row(internal_id, reclaim):
             ident = self._output_row_identity(internal_id)
             if ident is not None:
-                self.comm._identity_reclaim.add(internal_id)
+                if reclaim:
+                    self.comm._identity_reclaim.add(internal_id)
                 return ident
             return None
 
         act = list(ipc_package.act_schedule_ids)
         free = list(ipc_package.free_ids)
         if act:
-            rows = [_row(i) for i in act]
+            rows = [_row(i, i in terminal) for i in act]
             ipc_package.act_schedule_ids = [
                 r[0] if r is not None else i for r, i in zip(rows, act)]
             ipc_package.sessions = [r[1] if r is not None else None
                                     for r in rows]
         if free:
-            rows = [_row(i) for i in free]
+            rows = [_row(i, True) for i in free]
             ipc_package.free_ids = [
                 r[0] if r is not None else i for r, i in zip(rows, free)]
             ipc_package.free_sessions = [r[1] if r is not None else None
@@ -496,14 +508,17 @@ class Worker(TorchProfilerMixin):
         if errors:
             new_errors = {}
             for internal_id, err in errors.items():
-                r = _row(internal_id)
+                # Terminal capacity errors free the request this tick.
+                r = _row(internal_id, True)
                 new_errors[r[0] if r is not None else internal_id] = err
             ipc_package.request_errors = new_errors
         plc = getattr(ipc_package, "prompt_logprobs", None)
         if plc:
             new_plc = {}
             for internal_id, val in plc.items():
-                r = _row(internal_id)
+                # Prefill-side sidecar (seq still running unless freed in
+                # this same package): reclaim only for terminal ids.
+                r = _row(internal_id, internal_id in terminal)
                 new_plc[r[0] if r is not None else internal_id] = val
             ipc_package.prompt_logprobs = new_plc
     def _admit_requests(self, seqs):
