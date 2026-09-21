@@ -59,6 +59,9 @@ from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.async_state import MtpAsyncBatchState, MtpAsyncCompletion
 from gllm.speculative.gpu_prep import MTP_DRAFT_POS_OFFSET, MtpGpuPrep
+from gllm.speculative.repetition_penalty import (
+    SpeculativeRepetitionPenalty, apply_speculative_penalties,
+)
 from gllm.speculative.staging import MtpStagingBuffers
 from gllm.tokenizers.tool_parsers import normalize_chat_template_messages
 from gllm.utils import unify_decode
@@ -953,6 +956,9 @@ class ModelRunner:
         # Sparse (top-k) sampled-draft graphs; see
         # ``_draft_step_forward_sampled_sparse``.
         self._draft_size_to_graph_sampled_sparse: Dict[int, torch.cuda.CUDAGraph] = {}
+        self._draft_penalty_graphs = {mode: {} for mode in ("greedy", "dense", "sparse")}
+        self._capture_draft_penalty = False
+        self._mtp_penalties = None
         self._draft_input = None
         # MTP verify CUDA graph: capture the full target verify forward (over the
         # uniform 1+k query per decode seq) per bucket at init and replay it. The
@@ -2133,11 +2139,10 @@ class ModelRunner:
 
     @staticmethod
     def mtp_sampling_compatible(seqs) -> bool:
-        # Verify does not currently collect generation logprobs or apply
-        # repetition penalties. Preserve their plain-sampler semantics.
+        # Verify still does not collect generation logprobs. Repetition
+        # penalties are applied causally in both draft and target sampling.
         return not any(
             getattr(s, "logprobs_enabled", False)
-            or getattr(s, "repetition_penalty", 1.0) != 1.0
             for s in seqs
         )
 
@@ -3123,6 +3128,8 @@ class ModelRunner:
         tok = torch.tensor(x1, device=dev, dtype=torch.int64)
         cur_hidden = hidden
         q_steps, qv_steps, qi_steps, qd_steps = [], [], [], []
+        penalties = getattr(self, "_mtp_penalties", None)
+        penalty_history = penalties.history.clone() if penalties is not None else None
         if sparse:
             temps, top_ks, top_ps = self._mtp_sample_params(decode_seqs, dev)
             k_pad = self._mtp_kpad(decode_seqs)
@@ -3141,6 +3148,10 @@ class ModelRunner:
             self._prepare_attention_metadata(self.input_data)
             out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
             logits = mtp.logits_from_hidden(out_hidden)
+            if penalties is not None:
+                apply_speculative_penalties(
+                    logits, penalty_history, penalties.values, tok[:, None], update_history=True,
+                )
             # Sample one draft token per seq from q (TP-synced generator), then
             # broadcast TP-rank-0's picks so every rank feeds the SAME token into
             # the next draft forward (multinomial isn't TP-deterministic).
@@ -3188,6 +3199,8 @@ class ModelRunner:
         drafts_cols = [[] for _ in range(nd)]
         tok = torch.tensor(x1, device=dev, dtype=torch.int64)
         cur_hidden = hidden
+        penalties = getattr(self, "_mtp_penalties", None)
+        penalty_history = penalties.history.clone() if penalties is not None else None
         for j in range(k):
             for i, s in enumerate(decode_seqs):
                 s.computed_token_num = (
@@ -3198,7 +3211,12 @@ class ModelRunner:
             self.prepare_input(decode_seqs)
             self._prepare_attention_metadata(self.input_data)
             out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
-            tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
+            logits = mtp.logits_from_hidden(out_hidden)
+            if penalties is not None:
+                apply_speculative_penalties(
+                    logits, penalty_history, penalties.values, tok[:, None], update_history=True,
+                )
+            tok = logits.argmax(dim=-1).to(torch.int64)
             # Need python token_ids for the next step's slot bookkeeping, so this
             # step's tokens must be materialized before building step j+1. Keep a
             # single per-step D2H (unavoidable in the eager path since positions/
@@ -3231,8 +3249,12 @@ class ModelRunner:
 
         # Smallest captured bucket >= nd (sorted() ascending, take the first
         # match). Fall back to eager if this batch size wasn't captured at init.
+        graphs = self._draft_size_to_graph
+        penalties = getattr(self, "_mtp_penalties", None)
+        if penalties is not None:
+            graphs = self._draft_penalty_graphs["greedy"]
         bucket = None
-        for b in sorted(self._draft_size_to_graph.keys()):
+        for b in sorted(graphs):
             if b >= nd:
                 bucket = b
                 break
@@ -3240,7 +3262,9 @@ class ModelRunner:
             return self._draft_chain_eager(
                 decode_seqs, orig_tokens, x1, hidden, k, nd
             )
-        g = self._draft_size_to_graph[bucket]
+        g = graphs[bucket]
+        if penalties is not None:
+            self._stage_draft_penalties(penalties, nd, bucket)
 
         # KV pages for the whole speculative window were pre-allocated once by
         # ``_mtp_decode`` (draft writes ctx..ctx+k-1, verify ctx..ctx+k), so the
@@ -3346,6 +3370,9 @@ class ModelRunner:
             if sparse
             else self._draft_size_to_graph_sampled
         )
+        penalties = getattr(self, "_mtp_penalties", None)
+        if penalties is not None:
+            graphs = self._draft_penalty_graphs["sparse" if sparse else "dense"]
         bucket = None
         for b in sorted(graphs.keys()):
             if b >= nd:
@@ -3357,6 +3384,8 @@ class ModelRunner:
                 decode_seqs, orig_tokens, x1, hidden, k, nd, gen, sparse=sparse
             )
         g = graphs[bucket]
+        if penalties is not None:
+            self._stage_draft_penalties(penalties, nd, bucket)
 
         # KV pages for the whole speculative window were pre-allocated once by
         # ``_mtp_decode``; fill the static draft buffers the same way the greedy
@@ -3489,6 +3518,10 @@ class ModelRunner:
         self._d_drafts = torch.empty((B, self._mtp_k), dtype=torch.int64, device=dev)
         self._d_base_pos = torch.empty(B, dtype=torch.long, device=dev)
         self._d_row_idx = torch.arange(B, dtype=torch.int64, device=dev)
+        self._d_penalty_history = torch.ones(
+            (B, self.memory_manager.vocab_size), dtype=self.memory_manager.dtype, device=dev,
+        )
+        self._d_penalty_values = torch.ones(B, dtype=self.memory_manager.dtype, device=dev)
         # Sampled-draft (rejection sampling) static buffers: per-seq sampling
         # params + the drawn q distribution the accept step reads. Vocab-wide q
         # is the only large one (B*vocab); allocated once, reused across replays.
@@ -3575,6 +3608,43 @@ class ModelRunner:
                 self._draft_size_to_graph_sampled_sparse[bucket] = gsp
                 self._d_topk[:bucket].fill_(self.memory_manager.vocab_size)
 
+            # Separate graphs leave neutral requests on the original fast path.
+            # The penalized variants read fixed-address scratch masks, updated
+            # entirely on-device between draft steps and reset per chain.
+            variants = [("greedy", self._draft_step_forward)]
+            if self._mtp_can_sample:
+                variants += [("dense", self._draft_step_forward_sampled),
+                             ("sparse", self._draft_step_forward_sampled_sparse)]
+            self._capture_draft_penalty = True
+            try:
+                for mode, forward in variants:
+                    self._d_penalty_history[:bucket].fill_(1.0)
+                    if mode == "sparse":
+                        self._d_topk[:bucket].fill_(self._sparse_kpad_capture - self._SPARSE_TIE_MARGIN)
+                    forward()
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(cuda_graph=graph, pool=memory_pool, stream=stream):
+                        forward()
+                    self._draft_penalty_graphs[mode][bucket] = graph
+            finally:
+                self._capture_draft_penalty = False
+
+    def _stage_draft_penalties(self, penalties, nd, bucket):
+        self._d_penalty_history[:nd].copy_(penalties.history)
+        self._d_penalty_values[:nd].copy_(penalties.values)
+        if bucket > nd:
+            self._d_penalty_history[nd:bucket].fill_(1.0)
+            self._d_penalty_values[nd:bucket].fill_(1.0)
+
+    def _apply_draft_penalties(self, logits):
+        if self._capture_draft_penalty:
+            nd = self._d_nd
+            apply_speculative_penalties(
+                logits, self._d_penalty_history[:nd], self._d_penalty_values[:nd],
+                self._d_tok[:nd, None], update_history=True,
+            )
+
     @torch.inference_mode()
     def _draft_step_forward(self):
         """One MTP draft step over the static draft buffers (captured/replayed).
@@ -3590,7 +3660,9 @@ class ModelRunner:
             self._draft_input, self._d_hidden[:nd], self._d_tok[:nd]
         )
         self._d_out_hidden[:nd].copy_(out_hidden)
-        tok = mtp.logits_from_hidden(out_hidden).argmax(dim=-1).to(torch.int64)
+        logits = mtp.logits_from_hidden(out_hidden)
+        self._apply_draft_penalties(logits)
+        tok = logits.argmax(dim=-1).to(torch.int64)
         self._d_next_tok[:nd].copy_(tok)
 
     @torch.inference_mode()
@@ -3615,6 +3687,7 @@ class ModelRunner:
         )
         self._d_out_hidden[:nd].copy_(out_hidden)
         logits = mtp.logits_from_hidden(out_hidden)
+        self._apply_draft_penalties(logits)
         q = self._mtp_probs_static(
             logits, self._d_temp[:nd], self._d_topk[:nd], self._d_topp[:nd]
         )
@@ -3643,6 +3716,7 @@ class ModelRunner:
         )
         self._d_out_hidden[:nd].copy_(out_hidden)
         logits = mtp.logits_from_hidden(out_hidden)
+        self._apply_draft_penalties(logits)
         qv, qi = self._mtp_sparse_probs(
             logits,
             self._d_temp[:nd],
@@ -4462,6 +4536,7 @@ class ModelRunner:
         orig_ctn = [s.computed_token_num for s in decode_seqs]
         orig_tctn = [s.to_compute_token_num for s in decode_seqs]
         orig_compute_tokens = [s.to_compute_tokens for s in decode_seqs]
+        self._mtp_penalties = SpeculativeRepetitionPenalty.prepare(self.memory_manager, decode_seqs)
         self._mtp_prep_epoch += 1
         # Pre-allocate the KV pages for the WHOLE speculative window once: the
         # draft chain writes tokens at ctx .. ctx+k-1 and the verify forward at
@@ -4610,6 +4685,14 @@ class ModelRunner:
         new_state_context_lens = verify.new_state_context_lens
         new_state_tokens = verify.new_state_tokens
         new_state_hidden = verify.new_state_hidden
+
+        penalty_candidates = None
+        if self._mtp_penalties is not None:
+            dg = self._drafts_gpu
+            if dg is None:
+                dg = torch.tensor(drafts, dtype=torch.int64, device=dev)
+            penalty_candidates = torch.cat((x1_gpu[:, None], dg), dim=1)
+            self._mtp_penalties.verify(v_logits, penalty_candidates)
 
         structured_active = []
         if structured_inputs is not None:
@@ -4830,6 +4913,9 @@ class ModelRunner:
                     # (only seeds the next draft, whose token is broadcast).
                     _, h = new_relay[decode_seqs[i].seq_id]
                     new_relay[decode_seqs[i].seq_id] = (bonus_cpu[i], h)
+                # The persistent penalty history must adopt rank 0's accepted
+                # prefix, just like the CPU sequence/relay state above.
+                na_gpu = lens - 1
         else:
             # --- 3. Greedy accept per seq (vectorized on GPU). ---
             # Verify inputs per seq are [x1, d1..dk] at positions start..start+k.
@@ -4868,6 +4954,8 @@ class ModelRunner:
             bonus_rows = seq_ar * qlen + na_l
             bonus_hidden_all = v_hidden.index_select(0, bonus_rows)  # [nd, H]
             if _async_accept:
+                if self._mtp_penalties is not None:
+                    self._mtp_penalties.commit(penalty_candidates, na_gpu)
                 state = self._mtp_async_state
                 seq_ids = tuple(s.seq_id for s in decode_seqs)
                 if state is None:
@@ -4943,6 +5031,8 @@ class ModelRunner:
                 # the batched gather and only seeds the next draft.
                 new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
 
+        if self._mtp_penalties is not None:
+            self._mtp_penalties.commit(penalty_candidates, na_gpu)
         self._record_mtp_metrics(nd, kk, n_accepted)
         if structured_active:
             self.sampler._structured.commit_speculative(

@@ -325,7 +325,7 @@ def test_mtp_sampling_supports_constraints_but_preserves_optional_features():
     assert not ModelRunner.mtp_sampling_compatible([a])
     a.logprobs_enabled = False
     a.repetition_penalty = 1.1
-    assert not ModelRunner.mtp_sampling_compatible([a])
+    assert ModelRunner.mtp_sampling_compatible([a])
 
 
 def test_speculative_rejected_suffix_does_not_advance_grammar(backend):
