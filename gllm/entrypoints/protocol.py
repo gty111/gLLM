@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import openai.types.chat
 import torch
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 # pydantic needs the TypedDict from typing_extensions
 from typing_extensions import Annotated, Required, TypedDict
@@ -522,7 +522,7 @@ class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
     model: str
-    prompt: Union[List[int], List[List[int]], str, List[str]]
+    prompt: Union[List[StrictInt], List[List[StrictInt]], str, List[str]]
     best_of: Optional[int] = None
     echo: Optional[bool] = False
     frequency_penalty: Optional[float] = 0.0
@@ -547,7 +547,7 @@ class CompletionRequest(OpenAIBaseModel):
     use_beam_search: Optional[bool] = False
     top_k: Optional[int] = None
     min_p: Optional[float] = 0.0
-    repetition_penalty: Optional[float] = 1.0
+    repetition_penalty: Optional[float] = None
     length_penalty: Optional[float] = 1.0
     early_stopping: Optional[bool] = False
     stop_token_ids: Optional[List[int]] = Field(default_factory=list)

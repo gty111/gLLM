@@ -589,7 +589,25 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     model_error = _validate_model(request.model)
     if model_error:
         return model_error
-    token_ids = await make_async(llm.model_runner.encode)(request.prompt)
+    if isinstance(request.prompt, str):
+        token_ids = await make_async(llm.model_runner.encode)(request.prompt)
+    else:
+        # Tokenized prompts must reach the engine unchanged: decoding and
+        # re-encoding can merge token boundaries or alter special tokens.
+        if not request.prompt:
+            return _openai_error("Token prompt must not be empty.", 400, param="prompt")
+        # Pydantic has already enforced homogeneous lists and strict integers.
+        if not isinstance(request.prompt[0], int):
+            return _openai_error(
+                "Batched prompts are not supported; provide one string or one token ID array.",
+                400, param="prompt",
+            )
+        token_ids = request.prompt
+        vocab_size = llm.model_runner.model_loader.vocab_size
+        if min(token_ids) < 0 or max(token_ids) >= vocab_size:
+            return _openai_error(
+                f"Prompt token IDs must be in [0, {vocab_size}).", 400, param="prompt",
+            )
     # OpenAI completions ``logprobs`` is an int: the number of top alternatives
     # to report (the sampled token's logprob is always included). ``None`` /
     # unset disables it. Clamp to the OpenAI ceiling.
