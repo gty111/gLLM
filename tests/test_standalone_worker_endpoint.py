@@ -182,9 +182,10 @@ def _bare_llm():
 
 
 def test_foreign_session_outputs_are_dropped():
-    """P1-1: outputs stamped with a DEAD frontend's epoch must not be applied
-    to this frontend's identically-numbered request ids (id pools both start
-    at 0)."""
+    """P1-B2: outputs whose PER-REQUEST session stamp is NOT this
+    frontend's epoch must not be applied to its identically-numbered
+    request ids (id pools both start at 0). Stamps now travel with the
+    request (aligned with act_schedule_ids), never as a package scalar."""
     from gllm.distributed.comm import IPCPackage
     from gllm.runtime.sequence import GenerationSequence
 
@@ -195,38 +196,43 @@ def test_foreign_session_outputs_are_dropped():
     pkg = IPCPackage([])
     pkg.act_schedule_ids = [0]
     pkg.next_tokens = [[42]]
-    pkg.session_epoch = "epoch-OLD-dead-frontend"
+    pkg.sessions = ["epoch-OLD-dead-frontend"]
     n = eng._apply_ipc_package(pkg)
     assert n == 0, "foreign-session package must be dropped entirely"
     assert seq.token_ids == [1], "no token may land on the new session seq"
     assert 0 in eng.running_maps, "seq must not be retired by foreign output"
 
     # Same package stamped with OUR epoch applies normally.
-    pkg.session_epoch = "epoch-A"
+    pkg.sessions = ["epoch-A"]
     n = eng._apply_ipc_package(pkg)
     assert n == 0  # 42 is not EOS; no retire, but the token WAS applied
     # token 42 appended after the prompt token 1.
     assert seq.token_ids == [1, 42]
 
-    # Unstamped (legacy) packages are accepted for backward compatibility.
+    # Unstamped rows are DROPPED on the standalone transport (fail-closed):
+    # a dead session's trailing output must not ride into the new session
+    # under a numerically identical id.
     seq2 = GenerationSequence(seq_id=1, token_ids=[1], finish_tokens=None, output_len=8)
     eng.running_maps[1] = seq2
     pkg2 = IPCPackage([])
     pkg2.act_schedule_ids = [1]
     pkg2.next_tokens = [[7]]
-    pkg2.session_epoch = None
+    pkg2.sessions = [None]
     eng._apply_ipc_package(pkg2)
-    assert seq2.token_ids == [1, 7]
+    assert seq2.token_ids == [1], "unstamped row must be dropped, not applied"
 
 
-def test_send_is_bounded_when_peer_is_down():
-    """P1-2: a non-blocking dispatch to a transport with no receiver must
-    return False within the bound instead of parking the engine-IO thread,
-    and the pending requests must be requeued for retry."""
+def test_dispatch_requeues_when_fleet_is_dead(tmp_path):
+    """P1-B1: a DEAD fleet (endpoint file gone) must NOT have its requests
+    absorbed into the send buffer -- _dispatch_pending refuses within the
+    bound and requeues for the next tick (the liveness watcher then drives
+    the reconnect). Note: zmq itself cannot refuse here -- with SNDBUF=512MB
+    a send to a dead peer still ACKs into the buffer, which is exactly why
+    the endpoint-file probe gates the dispatch."""
     import time as _time
-    import zmq as _zmq
 
-    from gllm.distributed.comm import zmqComm
+    from gllm.distributed.comm import IPCPackage, zmqComm
+    from gllm.runtime.sequence import GenerationSequence
 
     sched_path = "ipc:///tmp/_gllm_nopeer_sched_%d" % os.getpid()
     comm = zmqComm(
@@ -237,25 +243,61 @@ def test_send_is_bounded_when_peer_is_down():
         frontend=True, dp_size=1, standalone_remote=True,
     )
     comm.init()
+    try:
+        eng = _bare_llm()
+        eng.comm = comm
+        # Endpoint file missing -> fleet dead -> dispatch must refuse.
+        eng.worker_endpoint_file = str(tmp_path / "nope.json")
 
-    from gllm.distributed.comm import IPCPackage
+        seq = GenerationSequence(
+            seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
+        eng.wait_lists = [seq]
+        t0 = _time.monotonic()
+        ok = eng._dispatch_pending()
+        dt = _time.monotonic() - t0
+        assert ok is False, "dead fleet must refuse dispatch"
+        assert dt < 1.0, f"refusal took {dt:.1f}s; must be immediate"
+        # Requeued, still runnable on the next tick; bookkeeping undone.
+        assert eng.wait_lists == [seq], "pending request must be requeued"
+        assert 0 not in eng.running_maps, "bookkeeping must be undone on refusal"
+    finally:
+        comm.close()
+
+
+def test_dispatch_sends_when_fleet_lively(tmp_path):
+    """P1-B1 companion: with a LIVE fleet (fresh endpoint file) and a
+    healthy PULL peer, dispatch succeeds and the request is delivered."""
+    from gllm.distributed.comm import IPCPackage, zmqComm
     from gllm.runtime.sequence import GenerationSequence
 
-    eng = _bare_llm()
-    eng.comm = comm
-    seq = GenerationSequence(seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
-    eng.wait_lists = [seq]
-    eng.frontend_epoch = "epoch-A"
+    w = we.WorkerEndpointWriter(str(tmp_path / "ep.json"))
+    w.set_endpoints({0: {"schedule": "s", "output": "o", "token": "t"}})
+    w.heartbeat()
+    try:
+        eng = _bare_llm()
+        eng.worker_endpoint_file = str(tmp_path / "ep.json")
+        seq = GenerationSequence(
+            seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
+        eng.wait_lists = [seq]
 
-    t0 = _time.monotonic()
-    ok = eng._dispatch_pending()
-    dt = _time.monotonic() - t0
-    assert ok is False, "send must refuse when no peer is connected"
-    assert dt < 3.0, f"dispatch took {dt:.1f}s; must be bounded by ~1s"
-    # Requeued, still runnable on the next tick.
-    assert eng.wait_lists == [seq], "pending request must be requeued"
-    assert 0 not in eng.running_maps, "bookkeeping must be undone on refusal"
-    comm.close()
+        class _FakeComm:
+            def __init__(self):
+                self.sent = []
+
+            def send_ipc_package_nonblocking(self, pkg):
+                self.sent.append(pkg)
+                return True
+
+        fake = _FakeComm()
+        eng.comm = fake
+        ok = eng._dispatch_pending()
+        assert ok is True
+        assert len(fake.sent) == 1
+        assert fake.sent[0].schedule_lists[0].seq_id == 0
+        # The stamp rode along with the request.
+        assert fake.sent[0].schedule_lists[0].frontend_session == "epoch-A"
+    finally:
+        w.cleanup()
 
 
 def _make_stream():
@@ -367,3 +409,232 @@ def test_metadata_only_preserves_mm_flag(tmp_path):
     assert runner.use_mm is True
     assert runner.processor is not None
     assert runner.is_kimi_mm is False
+
+
+# ---------------------------------------------------------------------------
+# Second-round review regressions: P1-B1 (bounded dispatch to a HEALTHY
+# peer), P1-B2 (per-request session stamps on worker output incl. the
+# overlap path), P2-B3 (real TCP standalone frontend init + roundtrip).
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_succeeds_with_healthy_peer():
+    """P1-B1: send_ipc_package_nonblocking must SUCCEED (not time out) when
+    a healthy PULL peer is bound, and the peer must actually receive the
+    dispatched package. The prior default poll mask (POLLIN) never fired on
+    a PUSH socket, so even a healthy fleet looked dead."""
+    import zmq as _zmq
+
+    from gllm.distributed.comm import IPCPackage, zmqComm
+    from gllm.runtime.sequence import GenerationSequence
+
+    sched_path = "ipc:///tmp/_gllm_b1_sched_%d" % os.getpid()
+    out_path = "ipc:///tmp/_gllm_b1_out_%d" % os.getpid()
+
+    peer_ctx = _zmq.Context()
+    peer_pull = peer_ctx.socket(_zmq.PULL)
+    peer_pull.setsockopt(_zmq.LINGER, 0)
+    peer_pull.bind(sched_path)
+    # Frontend-side comm: the standalone_remote topology (PUSH connect to the
+    # worker's request PULL; PULL output).
+    fe = zmqComm(
+        "127.0.0.1", "normal", "127.0.0.1",
+        sched_path, out_path, out_path,
+        frontend=True, standalone_remote=True,
+    )
+    fe.init()
+    try:
+        seq = GenerationSequence(seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
+        seq.frontend_session = "epoch-A"
+        pkg = IPCPackage([seq])
+        ok = fe.send_ipc_package_nonblocking(pkg)
+        assert ok is True, "nonblocking send to a healthy peer must succeed"
+        deadline = time.monotonic() + 5.0
+        got = None
+        while time.monotonic() < deadline:
+            if peer_pull.poll(timeout=200):
+                got = peer_pull.recv_pyobj()
+                break
+        assert got is not None, "worker peer must receive the dispatched package"
+        assert got.schedule_lists[0].seq_id == 0
+        assert got.schedule_lists[0].frontend_session == "epoch-A"
+    finally:
+        fe.close()
+        peer_pull.close(linger=0)
+        peer_ctx.term()
+
+
+def test_output_sessions_echo_per_seq_stamp():
+    """P1-B2: the worker's OUTPUT packages echo each seq's frontend_session,
+    aligned with act_schedule_ids AND free_ids -- including free-only rows
+    (aborts/capacity errors with no live seq) via the admission registry,
+    and rows from a DIFFERENT session keep their own (foreign) stamp."""
+    from types import SimpleNamespace
+
+    import collections
+
+    from gllm.distributed.comm import IPCPackage, zmqComm
+    from gllm.runtime.sequence import GenerationSequence
+
+    def _seq(sid, epoch):
+        s = GenerationSequence(seq_id=sid, token_ids=[1], finish_tokens=None, output_len=8)
+        s.frontend_session = epoch
+        return s
+
+    live = {5: _seq(5, "epoch-A"), 6: _seq(6, "epoch-B")}
+    comm = zmqComm.__new__(zmqComm)
+    comm.output_socket = None
+    comm._lookup_seq = (lambda sid: live.get(sid))
+
+    # process_output shape: act rows (+ the finishing seq freed the same tick).
+    pkg = IPCPackage([])
+    pkg.act_schedule_ids = [5, 6]
+    pkg.next_tokens = [[42], [43]]
+    pkg.free_ids = [6]
+    comm.stamp_output_sessions(pkg)
+    assert pkg.sessions == ["epoch-A", "epoch-B"]
+    assert pkg.free_sessions == ["epoch-B"]
+    # A dead session's late output keeps ITS stamp -- the frontend drops it.
+    assert pkg.sessions[1] != "epoch-A"
+
+    # check_abort_seqs shape: free-only rows, incl. ids whose live seq is
+    # already gone (capacity error / aborted before admit completion).
+    abort_pkg = IPCPackage([])
+    abort_pkg.act_schedule_ids = []
+    abort_pkg.free_ids = [7, 5]
+    comm.stamp_output_sessions(abort_pkg)
+    assert abort_pkg.sessions == []
+    # 7: never seen -> None (frontend fails closed). 5: admitted earlier,
+    # still in the (lagged) registry -> original stamp survives.
+    assert abort_pkg.free_sessions == [None, "epoch-A"]
+
+    # Frontend-side comm has no lookup: stamping is a no-op.
+    fe_comm = zmqComm.__new__(zmqComm)
+    fe_comm.output_socket = None
+    fe_comm._lookup_seq = None
+    noop = IPCPackage([])
+    noop.act_schedule_ids = [5]
+    noop.free_ids = [5]
+    fe_comm.stamp_output_sessions(noop)
+    assert noop.sessions is None and noop.free_sessions is None
+
+
+def test_worker_registry_lookup_and_eviction():
+    """P1-B2: the worker's per-id session registry records the stamp at
+    admission, serves it after the live seq is freed (free-only rows), and
+    forgets it one tick later (no unbounded growth)."""
+    from types import SimpleNamespace
+
+    import collections
+
+    from gllm.workers.worker import Worker
+    from gllm.runtime.sequence import GenerationSequence
+
+    w = Worker.__new__(Worker)
+    w._session_by_seq = {}
+
+    seq = GenerationSequence(seq_id=9, token_ids=[1], finish_tokens=None, output_len=8)
+    seq.frontend_session = "epoch-A"
+    w._register_session_seqs([seq])
+
+    # Live lookup hits the scheduler deques first.
+    w.scheduler = SimpleNamespace(
+        seqs_to_prefill=collections.deque([seq]), seqs_to_decode=collections.deque()
+    )
+    assert w._lookup_seq_for_stamp(9) is seq
+
+    # Freed from the live deques -> the registry (not yet evicted) still
+    # answers for the free's own output tick.
+    w.scheduler.seqs_to_prefill.clear()
+    standin = w._lookup_seq_for_stamp(9)
+    assert standin is not None and standin.frontend_session == "epoch-A"
+
+    # Next tick's eviction removes it; unknown ids give None.
+    w._evict_finished_sessions([9])
+    assert w._lookup_seq_for_stamp(9) is None
+    assert w._lookup_seq_for_stamp(1234) is None
+    assert w._session_by_seq == {}
+
+
+def test_overlap_output_path_stamps_sessions():
+    """P1-B2: the overlap/MTP paths emit through the SAME
+    comm.send_output, so their packages get the per-seq stamp too."""
+    from gllm.distributed.comm import IPCPackage, zmqComm
+    from gllm.runtime.sequence import GenerationSequence
+
+    seq = GenerationSequence(seq_id=3, token_ids=[1], finish_tokens=None, output_len=8)
+    seq.frontend_session = "epoch-OVERLAP"
+
+    class _Out:
+        def __init__(self):
+            self.sent = []
+
+        def send_pyobj(self, obj):
+            self.sent.append(obj)
+
+    out = _Out()
+    comm = zmqComm.__new__(zmqComm)
+    comm.output_socket = out
+    comm._lookup_seq = lambda sid: seq if sid == 3 else None
+
+    pkg = IPCPackage([])
+    pkg.act_schedule_ids = [3]
+    pkg.next_tokens = [[7]]
+    comm.send_output(pkg)
+    assert out.sent[0].sessions == ["epoch-OVERLAP"]
+    assert out.sent[0].free_sessions == []
+
+
+def test_standalone_frontend_tcp_init_roundtrip():
+    """P2-B3: a standalone_remote frontend must initialize cleanly on tcp://
+    endpoints (the PULL output used to hit make_socket's tcp assertion) and
+    exchange frames BOTH ways over real TCP -- with the worker-side output
+    PUSH binding the advertised address (the old make_socket PUSH connected,
+    which is backwards for a remote frontend)."""
+    import zmq as _zmq
+
+    from gllm.distributed.comm import IPCPackage, zmqComm
+
+    port = 59970
+    sched = "tcp://127.0.0.1:%d" % port
+    out = "tcp://127.0.0.1:%d" % (port + 1)
+
+    # Worker-side sockets: request PULL binds, output PUSH binds (TCP).
+    wctx = _zmq.Context()
+    w_req = wctx.socket(_zmq.PULL)
+    w_req.setsockopt(_zmq.LINGER, 0)
+    w_req.bind(sched)
+    w_out = wctx.socket(_zmq.PUSH)
+    w_out.setsockopt(_zmq.LINGER, 0)
+    w_out.bind(out)
+
+    fe = zmqComm(
+        "127.0.0.1", "normal", "127.0.0.1",
+        sched, out, out,
+        frontend=True, standalone_remote=True,
+    )
+    # Must not raise (tcp:// PULL through make_socket asserted before).
+    fe.init()
+    try:
+        # frontend -> worker (schedule PUSH over tcp)
+        fe.request_socket.send_pyobj({"req": 1})
+        assert w_req.poll(5000) and w_req.recv_pyobj() == {"req": 1}
+
+        # worker -> frontend (output, both directions of the tcp channel)
+        w_out.send_pyobj({"resp": 2})
+        got = None
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if fe.output_socket.poll(timeout=200):
+                got = fe.output_socket.recv_pyobj()
+                break
+        assert got == {"resp": 2}
+
+        # The production nonblocking dispatch path also works over tcp.
+        ok = fe.send_ipc_package_nonblocking(IPCPackage([]))
+        assert ok is True
+    finally:
+        fe.close()
+        w_req.close(linger=0)
+        w_out.close(linger=0)
+        wctx.term()

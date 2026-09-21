@@ -21,6 +21,9 @@ def frontend():
     llm.abort_ids = []
     llm._pending_lock = threading.Lock()
     llm.dp_size = 1
+    # Monolith fixture: no standalone session filtering on the output path.
+    llm.standalone_frontend = False
+    llm.frontend_epoch = "test-epoch"
     llm.schedule_engine = object()
     llm.allocate_seq = lambda *args, **kwargs: GenerationSequence(7, [1], [], 8)
     return llm

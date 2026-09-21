@@ -197,6 +197,12 @@ class Worker(TorchProfilerMixin):
         self.rank = get_rank()
         torch.cuda.set_device(f"cuda:{self.local_rank}")
 
+        # Per-seq stamp source for the per-REQUEST session echo on OUTPUT
+        # packages (zmqComm.stamp_output_sessions, invoked from send_output):
+        # the frontend stamped ``frontend_session`` onto each seq at
+        # dispatch, the worker echoes it back so a restarted frontend can
+        # separate this session's outputs from a dead session's.
+        self.comm._lookup_seq = self._lookup_seq_for_stamp
         self.comm.init()
 
         # Bring up the custom NVLink-P2P all-reduce path before the model
@@ -302,6 +308,50 @@ class Worker(TorchProfilerMixin):
             )
             self._disagg_coord.setup()
 
+    # --- per-request session registry (decoupled deployment) -------------
+    #
+    # The frontend stamps ``seq.frontend_session`` at dispatch; the worker
+    # echoes it on OUTPUT packages (via comm.stamp_output_sessions) so a
+    # restarted frontend can separate live outputs from a dead session's.
+    # Free-only rows (aborted/errored ids) often no longer have a live seq,
+    # so admission snapshots the stamp per id and eviction lags by one
+    # output tick (the same tick that FREES the id is also the one that
+    # needs the stamp -- the NEXT tick's evictions are harmless residue).
+
+    def _register_session_seqs(self, seqs):
+        stamp_map = getattr(self, "_session_by_seq", None)
+        if stamp_map is None:
+            stamp_map = self._session_by_seq = {}
+        for seq in seqs or ():
+            stamp_map[seq.seq_id] = getattr(seq, "frontend_session", None)
+
+    def _evict_finished_sessions(self, free_ids):
+        stamp_map = getattr(self, "_session_by_seq", None)
+        if stamp_map is not None:
+            for seq_id in free_ids or ():
+                stamp_map.pop(seq_id, None)
+
+    def _lookup_seq_for_stamp(self, seq_id):
+        """Session-stamp source for comm.send_output: the stamped seq object
+        if still live, else a tiny stand-in carrying the recorded stamp,
+        else ``None`` (unknown -> frontend drops the row, fail-closed)."""
+        stamp_map = getattr(self, "_session_by_seq", None)
+        try:
+            for deq in (
+                self.scheduler.seqs_to_prefill,
+                self.scheduler.seqs_to_decode,
+            ):
+                for seq in deq:
+                    if seq.seq_id == seq_id:
+                        return seq
+        except Exception:
+            pass
+        if stamp_map is not None and seq_id in stamp_map:
+            from types import SimpleNamespace
+
+            return SimpleNamespace(frontend_session=stamp_map[seq_id])
+        return None
+
     def _admit_requests(self, seqs):
         """Route new front-end seqs: disagg mm seqs -> coordinator, else scheduler.
 
@@ -314,6 +364,7 @@ class Worker(TorchProfilerMixin):
         and the monolith path) goes straight to the scheduler on every column.
         """
         if not self._is_disagg_lm:
+            self._register_session_seqs(seqs)
             self.scheduler.add_new_requests(seqs)
             return
         direct = []
@@ -325,6 +376,7 @@ class Worker(TorchProfilerMixin):
             else:
                 direct.append(seq)
         if direct:
+            self._register_session_seqs(direct)
             self.scheduler.add_new_requests(direct)
 
     def _apply_disagg_events(self, events) -> None:
@@ -341,6 +393,7 @@ class Worker(TorchProfilerMixin):
             return
         for seq, state in events.admits:
             self.model_runner.disagg_register(seq.seq_id, state)
+            self._register_session_seqs([seq])
             self.scheduler.add_new_requests([seq])
         if events.emb_ready:
             self._disagg_recv.sync()
@@ -582,11 +635,6 @@ class Worker(TorchProfilerMixin):
         if self._polls_frontend():
             cum = IPCPackage([])
             saw_log_override = False
-            # Last non-None frontend session epoch observed in this drain.
-            # Carried onto the OUTPUT package so a restarted frontend (fresh
-            # id pool starting at 0) can drop outputs still in flight for the
-            # DEAD session's ids, which collide numerically with its own.
-            session_epoch = None
             while True:
                 ipc_package = self.comm.recv_ipc_package()
                 if ipc_package is None:
@@ -596,8 +644,6 @@ class Worker(TorchProfilerMixin):
                 if ipc_package.log is not None:
                     cum.log = ipc_package.log
                     saw_log_override = True
-                if getattr(ipc_package, "session_epoch", None) is not None:
-                    session_epoch = ipc_package.session_epoch
                 if ipc_package.control_cmd is not None:
                     code, data = self._translate_control_cmd(
                         ipc_package.control_cmd
@@ -607,11 +653,9 @@ class Worker(TorchProfilerMixin):
                         cum.control_data = data
             if not saw_log_override:
                 cum.log = None
-            cum.session_epoch = session_epoch
-            # Remember it for output packages built outside the drain path
-            # (abort / process_output replies), which otherwise have no
-            # inbound package to read the stamp from.
-            self.current_session_epoch = session_epoch
+            # (Session stamping happens on the OUTPUT side -- see
+            # zmqComm.stamp_output_sessions; the inbound aggregate needs
+            # none, since each admitted seq already carries its own.)
 
         # TP0 control plane: drive the disagg coordinator (discovery / meta /
         # notif / dispatch / watchdog) once per iter and attach the resulting
@@ -721,17 +765,19 @@ class Worker(TorchProfilerMixin):
         """Process aborts on every column driver; only the driver replies."""
         ipc_package = self.scheduler.check_abort_seqs()
         if ipc_package is not None and self._polls_frontend():
-            # Stamp with the current frontend session so a restarted frontend
-            # can tell these (old-session) frees from its own request ids.
-            ipc_package.session_epoch = getattr(self, "current_session_epoch", None)
             self.comm.send_output(ipc_package)
+        if ipc_package is not None:
+            # Every PP-0 driver aborts the identical ids (the scheduler is
+            # deterministic across columns), so evict here on ALL ranks --
+            # process_output is rank-conditional and would leak entries on
+            # non-replying ranks. Lags the free's own output by one tick,
+            # which is fine: the free package already built its stamps.
+            self._evict_finished_sessions(ipc_package.free_ids)
 
     def process_output(self):
         """Finalize this column's batch; only the driver replies to frontend."""
         ipc_package = self.scheduler.process_output()
         if ipc_package is not None and self._polls_frontend():
-            # Stamp with the current frontend session (see check_abort_seqs).
-            ipc_package.session_epoch = getattr(self, "current_session_epoch", None)
             self.comm.send_output(ipc_package)
 
     def _build_schedule_payload(

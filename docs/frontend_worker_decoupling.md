@@ -62,17 +62,25 @@ Transport: `ipc://` on a single machine, or fixed `tcp://` ports
 
 ### Frontend session epoch
 
-Every frontend process mints a random **session epoch** and stamps it onto
-each outgoing schedule package (`IPCPackage.session_epoch`). The worker
-carries the stamp through to the output packages it sends back, and the
-frontend applies only outputs stamped with its own epoch. This is required
-because the frontend's request-id pool (and therefore the seq ids inside
-outputs) restarts at 0 on every frontend (re)start, while a *surviving*
-worker fleet may still be emitting trailing tokens / free_ids for the dead
-frontend's requests -- numerically identical ids that would otherwise be
-applied to the new frontend's request 0 (cross-session corruption, spurious
-early EOS). Unstamped packages (pre-epoch workers) are accepted for
-backward compatibility.
+Every frontend process mints a random **session epoch**, and the epoch is
+bound to the *request*: the frontend stamps `seq.frontend_session` on every
+sequence before dispatching it. The worker echoes each seq's stamp back on
+the output packages (`IPCPackage.sessions`, aligned with
+`act_schedule_ids`; `free_sessions` aligned with `free_ids`), and the
+standalone frontend applies only rows stamped with its own epoch. Binding
+identity to the request -- never to "the last package seen" -- is what
+makes this correct: a tick with no new input must not reset the stamp, and
+a late output of a dead session's request keeps that session's stamp. This
+is required because the frontend's request-id pool (and therefore the seq
+ids inside outputs) restarts at 0 on every frontend (re)start, while a
+*surviving* worker fleet may still be emitting trailing tokens / free_ids
+for the dead frontend's requests -- numerically identical ids that would
+otherwise be applied to the new frontend's request 0 (cross-session
+corruption, spurious early EOS). On the standalone transport, unstamped
+rows are dropped (fail-closed): a dead session's trailing output must not
+ride into the new session under an identical id. Dispatch is gated by a
+cheap endpoint-file liveness probe so a dead fleet cannot silently absorb
+requests into its 512MB send buffer.
 
 ## Crash semantics (verified end-to-end)
 
@@ -135,7 +143,11 @@ worker_unavailable` when it is down.
   (tokenizer + config + `model_max_length`) used by the standalone frontend so
   it never touches CUDA.
 * `zmqComm(..., standalone_remote=True)` is the frontend's connect-only socket
-  layout (PUSH schedule / PULL output) pointing at the worker's bound endpoints.
+  layout (PUSH schedule / PULL output) pointing at the worker's bound
+  endpoints. Both legs CONNECT from the frontend: the worker Binds its request
+  PULL and, over `tcp://`, also Binds its output PUSH (`make_socket`'s PUSH
+  connects, which is backwards for a remote frontend); over `ipc://` the
+  classic PULL-bind/PUSH-connect roles are kept.
 * The standalone worker **parent** must not create a second frontend-role ZMQ
   comm on the same endpoints: a `PUSH→PULL` leg load-balances across all PULLs,
   so a stray parent PULL on the output leg would silently swallow half the
