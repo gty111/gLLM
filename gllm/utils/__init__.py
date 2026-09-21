@@ -93,6 +93,18 @@ def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
+def env_flag(name: str, default: bool) -> bool:
+    """Read a boolean environment variable.
+
+    Unset variables fall back to *default*; set ones accept any of
+    ``0/false/no/off`` (case-insensitive) as False, anything else True.
+    """
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def async_tensor_h2d(
     data: list,
     dtype: torch.dtype,
