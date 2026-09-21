@@ -49,6 +49,13 @@ class GenerationSequence:
         structured_output=None,
     ):
         self.seq_id = seq_id
+        # The id the dispatching frontend used for this request. The
+        # standalone worker remaps ``seq_id`` to a fleet-unique internal id
+        # at admission (two surviving frontends both mint ids from 0; a bare
+        # id would let scheduling / aborts / output stamping cross sessions),
+        # so the original is kept here to translate output rows back.
+        # Monolith seqs are never remapped and carry their own ``seq_id``.
+        self.client_seq_id = seq_id
         self.structured_output = structured_output
         # Frontend session epoch that minted this sequence (LLM.frontend_epoch,
         # stamped by the frontend before dispatch). The worker echoes it back

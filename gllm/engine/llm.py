@@ -96,10 +96,10 @@ class LLM:
         self.worker_endpoint_file = worker_endpoint_file
         self._worker_writer = None  # WorkerEndpointWriter (standalone worker)
         self.worker_transport_base_port = worker_transport_base_port
-        # Frontend session epoch (echoed per-request via
-        # IPCPackage.sessions / free_sessions, see Worker
-        # _lookup_seq_for_stamp). Every (re)started frontend mints a NEW
-        # epoch and stamps it on each dispatched seq
+        # Frontend session epoch (echoed per output row via
+        # IPCPackage.sessions / free_sessions, see
+        # Worker.translate_output_for_frontend). Every (re)started frontend
+        # mints a NEW epoch and stamps it on each dispatched seq
         # (``seq.frontend_session``) so a surviving worker fleet can tell
         # our request ids apart from the ids a dead frontend's in-flight
         # requests were still producing -- both id pools restart at 0, so
@@ -769,17 +769,6 @@ class LLM:
         with self._pending_lock:
             self.wait_lists.extend(requests)
 
-    def _standalone_input_ok(self, ipc_package) -> bool:
-        """A standalone frontend only trusts input-side work for ITS OWN
-        session. Every seq it dispatched carries ``frontend_session``; a
-        stale package from a dead frontend's session must not schedule.
-        (Outputs are filtered symmetrically in :meth:`_apply_ipc_package`.)
-        """
-        for seq in ipc_package.schedule_lists:
-            if getattr(seq, "frontend_session", None) != self.frontend_epoch:
-                return False
-        return True
-
     def recv_ipc_package(self):
         """
         return: number of finished requests in each schedule
@@ -797,14 +786,6 @@ class LLM:
             ipc_package: IPCPackage = self.comm.recv_output()
             if ipc_package is None:
                 break
-            if (
-                self.standalone_frontend
-                and ipc_package.schedule_lists
-                and not self._standalone_input_ok(ipc_package)
-            ):
-                # Foreign session's dispatch (dead frontend's leftover).
-                # Drop; its own frontend is gone and will reap its ids.
-                continue
             num_finish += self._apply_ipc_package(ipc_package)
         return num_finish
 
@@ -863,34 +844,42 @@ class LLM:
             # standalone frontend) and ``None`` on a bare engine such as the
             # standalone *worker* (which has no HTTP streams to feed).
             has_async = isinstance(self.async_streams, dict)
-            # Session isolation is per-REQUEST: the worker echoes each seq's
-            # ``frontend_session`` on the output rows carrying it (see
-            # gllm.workers.worker). A restarted frontend's id pool restarts
-            # at 0 while a surviving fleet still emits the dead session's
-            # trailing tokens/frees for numerically-identical ids; apply
-            # only rows stamped with OUR epoch.
-            session_by_id = None
-            if self.standalone_frontend:
-                # Per-request stamps, act rows first; ``free_sessions``
-                # overrides only when it disagrees, covering free-only rows
-                # (abort / capacity-error ids absent from this tick's act).
-                stamped = getattr(ipc_package, "sessions", None)
-                if stamped is not None:
-                    session_by_id = dict(zip(
-                        ipc_package.act_schedule_ids, stamped))
-                    free_stamped = getattr(
-                        ipc_package, "free_sessions", None)
-                    if free_stamped is not None:
-                        session_by_id.update(zip(
-                            ipc_package.free_ids, free_stamped))
-                else:
-                    session_by_id = {}
+            # Session isolation: the worker fleet remaps client ids to
+            # internal ids per session (Worker._remap_client_ids) and
+            # translates OUTPUT rows back to client ids with each row's
+            # session stamp (Worker.translate_output_for_frontend). A
+            # restarted frontend's id pool restarts at 0 while a surviving
+            # fleet still emits the dead session's trailing tokens/frees for
+            # numerically-identical ids; apply only rows stamped with OUR
+            # epoch (unstamped rows are dropped, fail-closed).
+            def _own_session(stamp_by_row, row_id):
+                return (
+                    stamp_by_row is not None
+                    and stamp_by_row.get(row_id) == self.frontend_epoch
+                )
+
+            act_stamps = (
+                dict(zip(
+                    ipc_package.act_schedule_ids,
+                    getattr(ipc_package, "sessions", None),
+                ))
+                if getattr(ipc_package, "sessions", None) is not None
+                else None
+            )
+            free_stamps = (
+                dict(zip(
+                    ipc_package.free_ids,
+                    getattr(ipc_package, "free_sessions", None),
+                ))
+                if getattr(ipc_package, "free_sessions", None) is not None
+                else None
+            )
             for idx, id in enumerate(ipc_package.act_schedule_ids):
-                if session_by_id is not None:
-                    # Stamped path: foreign (or legacy-unstamped on a
-                    # standalone transport) row belongs to a dead session.
-                    if session_by_id.get(id) != self.frontend_epoch:
-                        continue
+                if (
+                    self.standalone_frontend
+                    and not _own_session(act_stamps, id)
+                ):
+                    continue  # dead session's trailing token
                 # Under overlap scheduling a worker can emit a trailing token
                 # for a sequence it freed one step earlier (EOS detected after
                 # the next step was already launched), so the driver may have
@@ -933,8 +922,8 @@ class LLM:
             retired = []
             for id in ipc_package.free_ids:
                 if (
-                    session_by_id is not None
-                    and session_by_id.get(id) != self.frontend_epoch
+                    self.standalone_frontend
+                    and not _own_session(free_stamps, id)
                 ):
                     continue  # dead session's free; our running_maps has no key
                 if self.running_maps.pop(id, None) is None:
@@ -1070,6 +1059,17 @@ class LLM:
             )
         ipc_package.abort_ids = abort_ids
         ipc_package.log = True
+        if self.standalone_frontend and abort_ids:
+            # Aborts are CLIENT ids; name their session so a surviving
+            # fleet resolves them to the right (possibly other-session)
+            # request instead of whatever shares the bare id.
+            ipc_package.abort_sessions = [
+                getattr(
+                    self.running_maps.get(a)
+                    or next(
+                        (s for s in wait_lists if s.seq_id == a), None),
+                    "frontend_session", self.frontend_epoch)
+                for a in abort_ids]
         if self.standalone_frontend:
             # A DEAD fleet (endpoint file gone/stale) would absorb every
             # dispatch into the 512MB send buffer and ACK it, so requeue the

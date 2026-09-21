@@ -197,12 +197,11 @@ class Worker(TorchProfilerMixin):
         self.rank = get_rank()
         torch.cuda.set_device(f"cuda:{self.local_rank}")
 
-        # Per-seq stamp source for the per-REQUEST session echo on OUTPUT
-        # packages (zmqComm.stamp_output_sessions, invoked from send_output):
-        # the frontend stamped ``frontend_session`` onto each seq at
-        # dispatch, the worker echoes it back so a restarted frontend can
-        # separate this session's outputs from a dead session's.
-        self.comm._lookup_seq = self._lookup_seq_for_stamp
+        # OUTPUT translation hook (see translate_output_for_frontend): every
+        # frontend-facing package gets its internal ids rewritten to the
+        # dispatching frontend's client ids plus per-row session stamps
+        # before it hits the wire. Covers plain / overlap / MTP paths alike.
+        self.comm._output_committer = self.translate_output_for_frontend
         self.comm.init()
 
         # Bring up the custom NVLink-P2P all-reduce path before the model
@@ -308,50 +307,172 @@ class Worker(TorchProfilerMixin):
             )
             self._disagg_coord.setup()
 
-    # --- per-request session registry (decoupled deployment) -------------
+    # --- per-session id remapping (decoupled deployment) -----------------
     #
-    # The frontend stamps ``seq.frontend_session`` at dispatch; the worker
-    # echoes it on OUTPUT packages (via comm.stamp_output_sessions) so a
-    # restarted frontend can separate live outputs from a dead session's.
-    # Free-only rows (aborted/errored ids) often no longer have a live seq,
-    # so admission snapshots the stamp per id and eviction lags by one
-    # output tick (the same tick that FREES the id is also the one that
-    # needs the stamp -- the NEXT tick's evictions are harmless residue).
+    # A standalone frontend is stateless and restarts freely; its id pool
+    # re-issues 0, 1, 2, ... on every incarnation, while a SURVIVING fleet
+    # may still be running the dead frontend's request 0. Two live
+    # (session, id) pairs can therefore carry the SAME client seq_id, and a
+    # bare id cannot name a unique request anywhere inside the worker
+    # (scheduling, aborts, FollowerSeq mirrors, KV, output stamping).
+    #
+    # Remapping at admission fixes this structurally: each admitted seq gets
+    # a FLEET-UNIQUE monotonic internal id (``seq_id``); the dispatching
+    # frontend's original id is preserved as ``client_seq_id`` next to the
+    # session stamp, and OUTPUT packages translate internal ids back to
+    # client ids with per-row session stamps before hitting the wire. The
+    # frontend (running_maps / async_streams) keeps seeing only client ids.
 
-    def _register_session_seqs(self, seqs):
-        stamp_map = getattr(self, "_session_by_seq", None)
-        if stamp_map is None:
-            stamp_map = self._session_by_seq = {}
+    def _standalone_remap_enabled(self) -> bool:
+        return bool(getattr(self, "comm", None)) and not self.comm.frontend
+
+    def _remap_client_ids(self, seqs):
+        """Assign fleet-unique internal ids to freshly admitted seqs.
+
+        Ids start past the allocator's client range (0..99999) so an
+        internal id can never collide with a bare client id on the wire.
+        Every PP-0 TP rank runs this with the IDENTICAL input order (the
+        aggregated package is broadcast pre-admission), so all columns mint
+        the same internal ids in lockstep; monolith workers skip it.
+        """
+        if not self._standalone_remap_enabled():
+            return
+        counter = getattr(self, "_next_internal_seq", None)
+        if counter is None:
+            counter = self._next_internal_seq = 100000
         for seq in seqs or ():
-            stamp_map[seq.seq_id] = getattr(seq, "frontend_session", None)
+            seq.client_seq_id = seq.seq_id
+            seq.seq_id = counter
+            counter += 1
+        self._next_internal_seq = counter
 
-    def _evict_finished_sessions(self, free_ids):
-        stamp_map = getattr(self, "_session_by_seq", None)
-        if stamp_map is not None:
-            for seq_id in free_ids or ():
-                stamp_map.pop(seq_id, None)
+    def _route_frontend_aborts(self, abort_ids, abort_sessions):
+        """Translate frontend aborts (CLIENT ids + session stamps) to the
+        INTERNAL ids of the requests those stamps actually own.
 
-    def _lookup_seq_for_stamp(self, seq_id):
-        """Session-stamp source for comm.send_output: the stamped seq object
-        if still live, else a tiny stand-in carrying the recorded stamp,
-        else ``None`` (unknown -> frontend drops the row, fail-closed)."""
-        stamp_map = getattr(self, "_session_by_seq", None)
+        A stamped abort (standalone frontend) resolves only to live seqs
+        whose (client id, session) pair matches exactly -- a bare id
+        naming a request of ANOTHER session is ignored. An unstamped
+        abort (monolith; the standalone frontend always stamps) resolves
+        to every live holder of that id, preserving monolith semantics.
+        Aborts that match no live seq are dropped: the request already
+        finished (or the stamp is unknown) and nothing is left to free.
+        """
+        ids = list(abort_ids or ())
+        if not ids or not self._standalone_remap_enabled():
+            return ids
+        stamps = list(abort_sessions) if abort_sessions is not None \
+            else [None] * len(ids)
         try:
-            for deq in (
-                self.scheduler.seqs_to_prefill,
-                self.scheduler.seqs_to_decode,
-            ):
-                for seq in deq:
+            batches = [
+                list(self.scheduler.seqs_to_prefill),
+                list(self.scheduler.seqs_to_decode),
+            ]
+            batches.extend(self.scheduler.batch_running)
+        except Exception:
+            return ids
+        # Live (client_id, session) holders of any requested client id.
+        live = {}
+        for batch in batches:
+            for seq in batch:
+                cid = getattr(seq, "client_seq_id", None)
+                if cid is not None and cid in ids:
+                    live.setdefault(cid, []).append(
+                        (getattr(seq, "frontend_session", None),
+                         seq.seq_id))
+        routed = []
+        for cid, st in zip(ids, stamps):
+            holders = live.get(cid) or []
+            if st is None:
+                # Unstamped (monolith): every holder of that id.
+                routed.extend(internal for _, internal in holders)
+            else:
+                # Stamped: only the request of THIS session.
+                routed.extend(internal for held, internal in holders
+                              if held == st)
+        return routed
+
+    def _output_row_identity(self, seq_id):
+        """(client_id, session) for one OUTPUT row's internal id, or None.
+
+        Resolves live seqs first (covers every row produced this tick,
+        including free rows: the scheduler frees the seq only AFTER the
+        output package is built); the finished-seq registry then covers
+        free rows of requests that ended one tick earlier (overlap/MTP
+        defer). Unknown ids degrade to None and are dropped by the
+        frontend (fail-closed).
+        """
+        try:
+            batches = [
+                list(self.scheduler.seqs_to_prefill),
+                list(self.scheduler.seqs_to_decode),
+            ]
+            batches.extend(self.scheduler.batch_running)
+            for batch in batches:
+                for seq in batch:
                     if seq.seq_id == seq_id:
-                        return seq
+                        return getattr(seq, "client_seq_id", seq_id), \
+                            getattr(seq, "frontend_session", None)
         except Exception:
             pass
-        if stamp_map is not None and seq_id in stamp_map:
-            from types import SimpleNamespace
-
-            return SimpleNamespace(frontend_session=stamp_map[seq_id])
+        reg = getattr(self, "_finished_sessions", None)
+        if reg is not None and seq_id in reg:
+            client_id, session = reg[seq_id]
+            return client_id, session
         return None
 
+    def translate_output_for_frontend(self, ipc_package) -> None:
+        """In-place: internal ids -> client ids, with per-row session stamps.
+
+        Invoked from zmqComm.send_output (installed via
+        ``comm._output_committer``) so EVERY frontend-facing emission --
+        plain process_output, check_abort_seqs replies, overlap finalize,
+        MTP paths -- is translated. Monolith packages (no stamps minted)
+        pass through byte-identical: internal id equals client id and the
+        stamp lists come back all-None, which the monolith frontend never
+        consults.
+        """
+        if not self._standalone_remap_enabled():
+            return
+        reg = getattr(self, "_finished_sessions", None)
+        if reg is None:
+            reg = self._finished_sessions = {}
+
+        def _row(internal_id):
+            ident = self._output_row_identity(internal_id)
+            if ident is not None:
+                reg[internal_id] = ident  # keep the free row's identity
+                return ident
+            return None
+
+        act = list(ipc_package.act_schedule_ids)
+        free = list(ipc_package.free_ids)
+        if act:
+            rows = [_row(i) for i in act]
+            ipc_package.act_schedule_ids = [
+                r[0] if r is not None else i for r, i in zip(rows, act)]
+            ipc_package.sessions = [r[1] if r is not None else None
+                                    for r in rows]
+        if free:
+            rows = [_row(i) for i in free]
+            ipc_package.free_ids = [
+                r[0] if r is not None else i for r, i in zip(rows, free)]
+            ipc_package.free_sessions = [r[1] if r is not None else None
+                                         for r in rows]
+        errors = getattr(ipc_package, "request_errors", None)
+        if errors:
+            new_errors = {}
+            for internal_id, err in errors.items():
+                r = _row(internal_id)
+                new_errors[r[0] if r is not None else internal_id] = err
+            ipc_package.request_errors = new_errors
+        plc = getattr(ipc_package, "prompt_logprobs", None)
+        if plc:
+            new_plc = {}
+            for internal_id, val in plc.items():
+                r = _row(internal_id)
+                new_plc[r[0] if r is not None else internal_id] = val
+            ipc_package.prompt_logprobs = new_plc
     def _admit_requests(self, seqs):
         """Route new front-end seqs: disagg mm seqs -> coordinator, else scheduler.
 
@@ -364,7 +485,7 @@ class Worker(TorchProfilerMixin):
         and the monolith path) goes straight to the scheduler on every column.
         """
         if not self._is_disagg_lm:
-            self._register_session_seqs(seqs)
+            self._remap_client_ids(seqs)
             self.scheduler.add_new_requests(seqs)
             return
         direct = []
@@ -376,7 +497,7 @@ class Worker(TorchProfilerMixin):
             else:
                 direct.append(seq)
         if direct:
-            self._register_session_seqs(direct)
+            self._remap_client_ids(direct)
             self.scheduler.add_new_requests(direct)
 
     def _apply_disagg_events(self, events) -> None:
@@ -392,8 +513,10 @@ class Worker(TorchProfilerMixin):
         if not events:
             return
         for seq, state in events.admits:
+            # Remap BEFORE registering the gate state so coordinator-held
+            # state keys off the fleet-unique internal id.
+            self._remap_client_ids([seq])
             self.model_runner.disagg_register(seq.seq_id, state)
-            self._register_session_seqs([seq])
             self.scheduler.add_new_requests([seq])
         if events.emb_ready:
             self._disagg_recv.sync()
@@ -691,7 +814,13 @@ class Worker(TorchProfilerMixin):
         if cum.disagg_events is not None:
             self._apply_disagg_events(cum.disagg_events)
         if cum.abort_ids:
-            self.scheduler.add_abort_ids(cum.abort_ids)
+            # Aborts carry CLIENT ids (+ session stamps); resolve them to
+            # the internal ids of the requests those stamps own before
+            # touching the scheduler.
+            self.scheduler.add_abort_ids(
+                self._route_frontend_aborts(
+                    cum.abort_ids, getattr(cum, "abort_sessions", None))
+            )
             # TP0 also reclaims any coordinator-held NIXL receive slots for
             # aborted seqs still pending pre-admission (the scheduler-side
             # teardown above already covers admitted seqs on every column).
@@ -766,13 +895,6 @@ class Worker(TorchProfilerMixin):
         ipc_package = self.scheduler.check_abort_seqs()
         if ipc_package is not None and self._polls_frontend():
             self.comm.send_output(ipc_package)
-        if ipc_package is not None:
-            # Every PP-0 driver aborts the identical ids (the scheduler is
-            # deterministic across columns), so evict here on ALL ranks --
-            # process_output is rank-conditional and would leak entries on
-            # non-replying ranks. Lags the free's own output by one tick,
-            # which is fine: the free package already built its stamps.
-            self._evict_finished_sessions(ipc_package.free_ids)
 
     def process_output(self):
         """Finalize this column's batch; only the driver replies to frontend."""

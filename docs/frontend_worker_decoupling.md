@@ -62,25 +62,22 @@ Transport: `ipc://` on a single machine, or fixed `tcp://` ports
 
 ### Frontend session epoch
 
-Every frontend process mints a random **session epoch**, and the epoch is
-bound to the *request*: the frontend stamps `seq.frontend_session` on every
-sequence before dispatching it. The worker echoes each seq's stamp back on
-the output packages (`IPCPackage.sessions`, aligned with
-`act_schedule_ids`; `free_sessions` aligned with `free_ids`), and the
-standalone frontend applies only rows stamped with its own epoch. Binding
-identity to the request -- never to "the last package seen" -- is what
-makes this correct: a tick with no new input must not reset the stamp, and
-a late output of a dead session's request keeps that session's stamp. This
-is required because the frontend's request-id pool (and therefore the seq
-ids inside outputs) restarts at 0 on every frontend (re)start, while a
-*surviving* worker fleet may still be emitting trailing tokens / free_ids
-for the dead frontend's requests -- numerically identical ids that would
-otherwise be applied to the new frontend's request 0 (cross-session
-corruption, spurious early EOS). On the standalone transport, unstamped
-rows are dropped (fail-closed): a dead session's trailing output must not
-ride into the new session under an identical id. Dispatch is gated by a
-cheap endpoint-file liveness probe so a dead fleet cannot silently absorb
-requests into its 512MB send buffer.
+Every frontend process mints a random **session epoch**, bound to the
+*request*: the frontend stamps `seq.frontend_session` on every sequence
+before dispatching it. The worker then makes the identity UNAMBIGUOUS
+internally: at admission each seq's client id is remapped to a
+fleet-unique monotonic **internal id** (client id + stamp preserved as
+`seq.client_seq_id` / `seq.frontend_session`), so two surviving sessions'
+request 0s can coexist in the same scheduler, abort set, KV tables and
+output pipelines without cross-talk. OUTPUT packages are translated back
+in flight (`Worker.translate_output_for_frontend`, hooked into
+`comm.send_output`): internal ids -> client ids, with per-row session
+stamps (`IPCPackage.sessions` / `free_sessions`), so the standalone
+frontend applies only rows stamped with its own epoch -- a late completion
+of the dead session's request 0 can never terminate the new session's
+request 0, and `abort(0)` from the new session frees only its own
+request. Dispatch is gated by a cheap endpoint-file liveness probe so a
+dead fleet cannot silently absorb requests into its 512MB send buffer.
 
 ## Crash semantics (verified end-to-end)
 

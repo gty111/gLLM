@@ -32,7 +32,15 @@ class IPCPackage:
         # front-end => worker
         self.log = True
         self.schedule_lists = schedule_lists
-        self.abort_ids = []  # seq_ids to abort
+        self.abort_ids = []  # seq_ids (CLIENT ids) to abort
+        # Frontend session stamps aligned with ``abort_ids``: which session's
+        # request an abort targets. The standalone worker remaps client ids
+        # to internal ids per session, so a bare id names TWO live requests
+        # once a frontend restarts (both pools start at 0); the worker
+        # resolves each abort through (stamp, id) and ignores stamps it does
+        # not know. Monolith seqs are unstamped (None entries) and resolve
+        # unconditionally -- see Worker._route_frontend_aborts.
+        self.abort_sessions = None
         self.control_cmd = None  # optional control command (e.g., start/stop profile)
         # ``control_cmd_code`` and ``control_data`` are populated by the
         # rank-0 worker before it broadcasts an :class:`IPCPackage` to its
@@ -107,7 +115,6 @@ class zmqComm:
         dp_rank=0,
         dp_size=1,
         standalone_remote=False,
-        lookup_seq=None,
     ):
         self.host_addr = host_addr
         self.master_addr = master_addr
@@ -132,11 +139,11 @@ class zmqComm:
         # set by the frontend so it knows the schedule path is remote and
         # must not be treated as a local ipc path it binds.
         self.standalone_remote = standalone_remote
-        # Worker-side per-seq lookup used by :meth:`send_output` to echo each
-        # acted/free seq's ``frontend_session`` onto outgoing packages (see
-        # IPCPackage.sessions). Injected by the Worker; None on frontends, so
-        # the stamp pass is a no-op there.
-        self._lookup_seq = lookup_seq
+        # Worker-side output hook installed by the Worker (None on
+        # frontends): translates internal seq ids back to the dispatching
+        # frontend's client ids and attaches the per-row session stamps
+        # before the package hits the wire (see send_output).
+        self._output_committer = None
 
     def init(self):
         self.ctx = zmq.Context()
@@ -406,47 +413,15 @@ class zmqComm:
         else:
             return None
 
-    def stamp_output_sessions(self, ipc_package) -> None:
-        """Echo the per-seq frontend session stamp onto an OUTPUT package.
-
-        ``sessions`` aligns with ``act_schedule_ids`` (the worker looks each
-        acted id up in its live seqs); ``free_sessions`` aligns with
-        ``free_ids``. Session identity travels with the REQUEST (the
-        dispatching frontend stamped ``seq.frontend_session`` before pickling
-        it to the worker): a tick with no new input must not reset identity,
-        and a late output of a dead session's request keeps THAT session's
-        stamp. Free-only rows (aborts, finished-before-acted, capacity-error
-        ids) often no longer have a live seq -- a missing stamp degrades to
-        ``None``, which the standalone frontend drops (fail-closed).
-
-        Shared by the plain worker and the overlap/MTP paths: they all emit
-        through :meth:`send_output`, which invokes this hook. No-op on
-        frontends (``_lookup_seq`` unset) and on packages with no ids.
-        """
-        lookup = self._lookup_seq
-        if lookup is None:
-            return
-        act = list(getattr(ipc_package, "act_schedule_ids", None) or ())
-        free = list(getattr(ipc_package, "free_ids", None) or ())
-        if not act and not free:
-            return
-
-        def _stamp(seq_id):
-            seq = None
-            try:
-                seq = lookup(seq_id)
-            except Exception:
-                seq = None
-            return getattr(seq, "frontend_session", None) if seq is not None else None
-
-        ipc_package.sessions = [_stamp(i) for i in act]
-        ipc_package.free_sessions = [_stamp(i) for i in free]
-
     def send_output(self, output):
-        # Output packages carry no ids on the monolith (worker replies via
-        # the in-process path) but always do in the decoupled layout, where
-        # the frontend filters by these stamps. Cheap no-op elsewhere.
-        self.stamp_output_sessions(output)
+        # Session stamps ride the OUTPUT package (see Worker
+        # translate_output_for_frontend / stamp_output_sessions): the worker
+        # translates its internal ids back to client ids and attaches each
+        # row's frontend session, so the frontend filters by stamp. No-op
+        # on the monolith (no ``_output_committer`` installed).
+        commit = getattr(self, "_output_committer", None)
+        if commit is not None:
+            commit(output)
         self.output_socket.send_pyobj(output)
 
     def recv_output(self):
