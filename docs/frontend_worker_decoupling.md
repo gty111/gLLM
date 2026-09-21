@@ -1,0 +1,129 @@
+# Frontend/Worker Decoupling (Standalone Deployment)
+
+gLLM traditionally runs the OpenAI **frontend** (HTTP API) and the GPU
+**worker** fleet as tightly coupled processes: the frontend *spawns* the
+workers, and a crash of either half tears the whole system down
+(`check_worker_alive` does `sys.exit()` when a worker dies; killing the
+frontend orphan-then-loses the GPU fleet). This document describes the
+**decoupled deployment** where the two halves are independent processes that
+can be restarted (or crash) without dragging the other down.
+
+## Why
+
+* A frontend crash (bad request handler bug, OOM in the Python HTTP layer, a
+  restart for a config change) should **not** reload the model weights /
+  re-capture CUDA graphs on the GPU.
+* A worker crash (CUDA error, OOM, a kernel panic) should **not** kill the
+  HTTP listeners that clients are attached to. In-flight requests fail fast
+  and new ones resume as soon as a worker is back.
+* Independent scaling / patching of the API layer and the inference layer.
+
+## Architecture
+
+```
+   ┌────────────────────────┐         ┌──────────────────────────────┐
+   │  frontend (api_server) │  zmq    │  worker fleet (worker_server)│
+   │  --standalone-frontend │◄───────►│  (GPU child process)         │
+   │  no GPU, no spawn      │  ipc/tcp│  binds schedule PULL,        │
+   │  loads tokenizer+cfg   │         │  output PUSH, runs the model │
+   └────────────────────────┘         └──────────────────────────────┘
+                │                                   │
+                └────── rendezvous: worker endpoint file ──────┘
+                     (<endpoint-file>.json)
+```
+
+The two sides rendezvous through a small JSON **worker endpoint file**
+(`gllm.entrypoints.worker_endpoint.py`):
+
+```json
+{
+  "version": 1,
+  "uuid": "<transport id, random per worker launch>",
+  "updated_at": 1789974106.123,
+  "endpoints": {
+    "0": {
+      "schedule": "ipc:///tmp/<uuid>_gllm_schedule",
+      "output":   "ipc:///tmp/<uuid>_gllm_output",
+      "token":    "ipc:///tmp/<uuid>_gllm_token"
+    }
+  }
+}
+```
+
+* The **worker parent** writes it (only *after* the GPU child has bound its
+  sockets and finished init) and removes it via `atexit` + a child-supervision
+  loop when the fleet goes away.
+* The **frontend** polls it. A change in `uuid` means the worker fleet
+  restarted; the frontend tears down and re-connects its ZMQ sockets
+  **in-process** (`LLM.reconnect_comm`) — no frontend process restart.
+
+Transport: `ipc://` on a single machine, or fixed `tcp://` ports
+(`--worker-transport-base-port`) so a frontend on another host can connect.
+
+## Crash semantics (verified end-to-end)
+
+| Event                              | Frontend                              | Worker fleet                     |
+|------------------------------------|---------------------------------------|----------------------------------|
+| **Worker GPU child dies**          | stays up; in-flight requests fail fast; auto-reconnects when a new worker publishes | parent watchdog removes the endpoint file and exits |
+| **New worker launched**            | detects the new `uuid`, re-connects in-process, serves immediately | fresh fleet, weights re-loaded |
+| **Frontend dies**                  | (gone) — new frontend re-reads the endpoint file and reconnects | **survives**; weights stay loaded, keeps serving |
+| **New frontend launched**          | connects to the still-running worker (same `uuid`) | unchanged |
+
+## Usage
+
+### 1) Launch the GPU worker fleet (no HTTP)
+
+```bash
+python -m gllm.entrypoints.worker_server \
+    --model-path /path/to/model \
+    --worker-gpu 1 \                    # physical GPU(s); length must equal --tp
+    --worker-endpoint-file /tmp/gllm_worker_endpoint.json \
+    --master-addr 127.0.0.1 --master-port 29611 \
+    --tp 1 --gpu-memory-util 0.9 \
+    [--worker-transport-base-port 50001]   # cross-machine frontends
+```
+
+### 2) Launch the stateless frontend (no GPU)
+
+```bash
+python -m gllm.entrypoints.api_server \
+    --model-path /path/to/model \
+    --host 0.0.0.0 --port 8000 \
+    --standalone-frontend \
+    --worker-endpoint-file /tmp/gllm_worker_endpoint.json
+```
+
+The frontend blocks (up to 5 min) until the worker endpoint file appears, then
+serves. `GET /health` probes the worker fleet and returns `503
+worker_unavailable` when it is down.
+
+> `--model-path` is required on **both** sides: the frontend loads the
+> tokenizer + HF config (CPU only, no weights / no CUDA) to tokenize requests
+> and resolve the tool-call parser; the worker loads the actual model.
+
+## Scope & limitations (current)
+
+* Single-rank worker fleets are fully supported (`--tp 1`). Multi-rank fleets
+  (TP>1 / PP>1) publish one transport row per rank but the standalone frontend
+  currently connects rank 0's transport; wire the extra ranks up as needed.
+* Encoder-disaggregation (`lm_server`) and DP-attention per-replica endpoints
+  are orthogonal and not combined with standalone mode yet.
+* On a worker *restart* the KV cache is lost (expected — it lived in the dead
+  process); in-flight requests are terminated and must be retried by the client.
+
+## Implementation notes
+
+* `ModelRunner.load_metadata(...)` builds the CPU-only subset of the runner
+  (tokenizer + config + `model_max_length`) used by the standalone frontend so
+  it never touches CUDA.
+* `zmqComm(..., standalone_remote=True)` is the frontend's connect-only socket
+  layout (PUSH schedule / PULL output) pointing at the worker's bound endpoints.
+* The standalone worker **parent** must not create a second frontend-role ZMQ
+  comm on the same endpoints: a `PUSH→PULL` leg load-balances across all PULLs,
+  so a stray parent PULL on the output leg would silently swallow half the
+  worker's output frames.
+* `mp.set_warmup_delay(...)` is set on the spawn context so each GPU child
+  re-reads its own `CUDA_VISIBLE_DEVICES` before any CUDA call — otherwise a
+  parent that probed `torch.cuda` (seeing all GPUs) initialises the primary
+  context on GPU 0 and the child inherits it, allocating on the wrong (often
+  busy) GPU.

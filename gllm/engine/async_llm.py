@@ -168,6 +168,18 @@ class AsyncLLM(LLM):
             self.start_schedule_engine()
         return stream
 
+    async def health_async(self):
+        # Liveness probe for the (possibly separately deployed) worker fleet.
+        # Raises when the fleet is down; the API layer maps that to /health.
+        return await self._run_engine_io(self._probe_worker_fleet)
+
+    def _probe_worker_fleet(self):
+        if self.standalone_frontend:
+            self.check_standalone_worker()
+        else:
+            self.check_worker_alive()
+        return True
+
     async def check_abort_seqs(self):
         # Snapshot: the engine step (``send_ipc_package`` / ``_apply_ipc_package``
         # on an executor thread) mutates ``running_maps`` concurrently, so
@@ -184,8 +196,58 @@ class AsyncLLM(LLM):
     async def schedule(self):
         while True:
             await self.check_abort_seqs()
-            await self._run_engine_io(super().schedule)
+            try:
+                await self._run_engine_io(super().schedule)
+            except Exception as e:
+                # Decoupled deployment: the worker fleet died (endpoint file
+                # vanished / unreadable). Fail every in-flight stream fast
+                # instead of hanging them; keep the event loop alive so a
+                # frontend *process* restart is NOT required -- once the
+                # worker fleet is back (or this frontend is re-launched),
+                # service resumes. A monolith engine never raises here in
+                # practice (check_worker_alive does sys.exit), so this is a
+                # no-op on the legacy path.
+                self._fail_open_streams(e)
+                await asyncio.sleep(1.0)
             await asyncio.sleep(0)
+
+    def _fail_open_streams(self, exc: Exception):
+        """Terminate every outstanding async stream with ``exc`` and drop the
+        frontend-side bookkeeping so the frontend can keep serving new
+        requests once the worker fleet comes back.
+
+        Mirrors the normal-completion path (``_apply_ipc_package``) for the
+        resources it must release: per-stream bookkeeping (``running_maps`` +
+        ``async_streams``), the allocator ids (``free_finish_ids``), and the
+        pending intake queues (``wait_lists`` / ``abort_ids``). Skipping any
+        of these leaks ids or leaves dangling sequences for the next tick.
+        """
+        if not self.async_streams and not self.wait_lists:
+            return
+        retired = []
+        logger.error(
+            "Worker fleet unavailable; failing %d in-flight request(s): %s",
+            len(self.async_streams),
+            exc,
+        )
+        for sid, stream in list(self.async_streams.items()):
+            self.running_maps.pop(sid, None)
+            self.async_streams.pop(sid, None)
+            retired.append(sid)
+            try:
+                if not stream.finished:
+                    stream.put(exc)
+                    stream.finish()
+            except Exception:
+                pass
+        self.free_finish_ids(retired)
+        # Drop any not-yet-dispatched requests too: the dead fleet never saw
+        # them, and their streams are in ``async_streams`` (already failed
+        # above) while their seq objects would otherwise sit in wait_lists
+        # for the next dispatch to a fleet that has no state for them.
+        with self._pending_lock:
+            self.wait_lists = []
+            self.abort_ids = []
 
     def start_schedule_engine(self):
         # launch schedule engine

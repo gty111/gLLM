@@ -113,12 +113,31 @@ def make_socket(ctx, path: str, type):
         return socket
     elif type == zmq.PULL:
         socket = ctx.socket(type)
-        socket.bind(path)
+        if path.startswith("tcp://"):
+            # TCP bind variant (standalone workers advertising remote
+            # endpoints). The PULL socket is created by ``make_pull_bind``;
+            # ``bind()`` is only reached here for ipc:// paths.
+            raise AssertionError("TCP PULL sockets must be created via make_pull_bind")
+        else:
+            socket.bind(path)
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, int(0.5 * 1024**3))
         return socket
     else:
         assert 0
+
+
+def make_pull_bind(ctx, path: str):
+    """Bind a PULL socket with the same buffer tuning as :func:`make_socket`.
+
+    Used by standalone workers that bind their request/token PULL sockets on
+    TCP endpoints reachable from a separate frontend process.
+    """
+    socket = ctx.socket(zmq.PULL)
+    socket.bind(path)
+    socket.setsockopt(zmq.RCVHWM, 0)
+    socket.setsockopt(zmq.RCVBUF, int(0.5 * 1024**3))
+    return socket
 
 
 def find_free_port(host="0.0.0.0"):

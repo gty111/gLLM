@@ -246,6 +246,20 @@ def _validate_response_capabilities(request: ResponseRequest):
 
 @router.get("/health")
 async def health():
+    # Probe the (possibly separately deployed) worker fleet. In monolith mode
+    # this is the worker-alive check; in standalone mode it verifies the
+    # endpoint file is present/fresh.
+    try:
+        if llm is not None and hasattr(llm, "health_async"):
+            await llm.health_async()
+    except Exception as e:
+        logger.warning("health probe failed: %s", e)
+        return _openai_error(
+            f"worker fleet unavailable: {e}",
+            status_code=503,
+            error_type="server_error",
+            code="worker_unavailable",
+        )
     return JSONResponse(content={"status": "ok"})
 
 
@@ -828,6 +842,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Token Throttling
     # Multi-Node deployment
     parser.add_argument(
+        "--standalone-frontend",
+        dest="standalone_frontend",
+        action="store_true",
+        default=False,
+        help=(
+            "Run this process as a pure frontend: no GPU, no worker spawn. "
+            "The engine connects to a separately deployed worker fleet "
+            "discovered via --worker-endpoint-file (see "
+            "docs/frontend_worker_decoupling.md)."
+        ),
+    )
+    parser.add_argument(
         "--launch-mode",
         type=str,
         choices=["normal", "master", "slave"],
@@ -850,11 +876,15 @@ def resolve_tool_parser(name=None):
     """
     global tool_parser
 
+    # Standalone frontends carry a metadata-only runner (tokenizer + config,
+    # no weights); the architecture still resolves from its model_loader.
     architecture = getattr(
         getattr(getattr(llm, "model_runner", None), "model_loader", None),
         "architecture",
         None,
     )
+    if llm is None or getattr(llm, "model_runner", None) is None:
+        logger.warning("tool parser resolved before engine construction")
     # DeepSeek-V3.2's tool-call parser uses the checkpoint's reference decoder
     # for exact-typed argument parsing. Load it in this (API server) process from
     # the model dir; None => parser falls back to a lenient regex.
@@ -897,6 +927,14 @@ def main():
 
     args = build_arg_parser().parse_args()
 
+    if args.standalone_frontend and not args.worker_endpoint_file:
+        raise SystemExit("--standalone-frontend requires --worker-endpoint-file")
+    if args.standalone_frontend and (args.pp != 1 or args.dp != 1 or args.tp != 1):
+        raise SystemExit(
+            "standalone frontend currently supports single-rank worker fleets "
+            "(--pp 1 --dp 1 --tp 1); it must mirror the fleet it connects to."
+        )
+
     llm = AsyncLLM(
         host=args.host,
         launch_mode=args.launch_mode,
@@ -905,6 +943,7 @@ def main():
         dp_size=args.dp,
         use_ep=args.enable_ep,
         assigned_layers=args.assigned_layers,
+        standalone_frontend=args.standalone_frontend,
         **cli_args.engine_kwargs(args),
     )
 

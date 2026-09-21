@@ -20,7 +20,7 @@ from gllm.distributed.parallel_state import (
 )
 from gllm.runtime.sequence import GenerationSequence
 from gllm.scheduling.distributed import SchedulePayload
-from gllm.utils import make_pull_random, make_socket
+from gllm.utils import make_pull_bind, make_pull_random, make_socket
 
 _SHUTDOWN = object()  # sentinel pushed onto a sender queue to drain it
 
@@ -91,6 +91,7 @@ class zmqComm:
         frontend=False,
         dp_rank=0,
         dp_size=1,
+        standalone_remote=False,
     ):
         self.host_addr = host_addr
         self.master_addr = master_addr
@@ -107,12 +108,32 @@ class zmqComm:
         # frontend output PULL. ``dp_rank`` selects this replica's request path.
         self.dp_rank = dp_rank
         self.dp_size = dp_size
+        # Decoupled deployment: a standalone worker fleet binds its
+        # frontend-facing PULL sockets on remote-reachable paths (tcp:// when
+        # --worker-transport-base-port is set, ipc:// otherwise). The ipc
+        # binder is the worker itself (launch_mode 'normal' worker branch
+        # below); the frontend only ever *connects*. ``standalone_remote`` is
+        # set by the frontend so it knows the schedule path is remote and
+        # must not be treated as a local ipc path it binds.
+        self.standalone_remote = standalone_remote
 
     def init(self):
         self.ctx = zmq.Context()
         # Persistent zmq-sender threads keyed by socket. See ``_get_sender``
         # for why we avoid the prior fresh-thread-per-send pattern.
         self._senders: Dict["zmq.Socket", "queue.SimpleQueue"] = {}
+
+        if self.frontend and self.standalone_remote:
+            # Decoupled deployment: the standalone worker fleet already bound
+            # these PULL endpoints (see gllm.engine.llm.LLM._publish_worker_endpoint);
+            # the frontend only connects. Same socket roles as the monolith
+            # frontend (PUSH schedule, PULL output); the token path is unused
+            # by the frontend (worker-internal) but is created for symmetry
+            # and future control channels.
+            self.request_socket = make_socket(self.ctx, self.schedule_path, zmq.PUSH)
+            self.output_socket = make_socket(self.ctx, self.output_path, zmq.PULL)
+            self.token_socket = None
+            return
 
         if self.frontend:  # front-end process
             if self.dp_size > 1:
@@ -342,6 +363,45 @@ class zmqComm:
             return output
         else:
             return None
+
+    def close(self):
+        """Tear down every sender thread and socket, then terminate the ctx.
+
+        Idempotent; intended for the decoupled-deployment paths where a
+        frontend may reconnect in-process (or a test process must exit
+        cleanly) and a lingering zmq I/O thread holding open ipc://
+        connections would otherwise block subsequent CUDA init or process
+        shutdown.
+        """
+        for sock, q in list(getattr(self, "_senders", {}).items()):
+            try:
+                q.put(_SHUTDOWN)
+            except Exception:
+                pass
+        self._senders.clear()
+        for attr in ("request_socket", "output_socket", "token_socket"):
+            sock = getattr(self, attr, None)
+            if sock is not None:
+                try:
+                    sock.setsockopt(zmq.LINGER, 0)
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        for sock in list(getattr(self, "request_sockets", []) or []):
+            try:
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.close(linger=0)
+            except Exception:
+                pass
+        self.request_sockets = []
+        ctx = getattr(self, "ctx", None)
+        if ctx is not None:
+            try:
+                ctx.term()
+            except Exception:
+                pass
+            self.ctx = None
 
     def _get_sender(self, socket: "zmq.Socket") -> "queue.SimpleQueue":
         """Return a persistent FIFO that ships pyobjs to ``socket``.

@@ -78,8 +78,24 @@ class LLM:
         mtp_k=3,
         mtp_max_batch=0,
         ssm_snapshot_stride_tokens=256,
+        worker_transport_base_port=None,
+        # --- Frontend/worker decoupling (see docs/frontend_worker_decoupling.md) ---
+        # ``standalone_frontend=True``: this process is a pure frontend -- it
+        # does NOT spawn worker processes and does NOT initialize a GPU. It
+        # discovers a separately deployed worker fleet through
+        # ``worker_endpoint_file`` (written by ``worker_server``). ``standalone_worker``:
+        # this process hosts a worker fleet whose frontend-facing sockets are
+        # advertised in ``worker_endpoint_file`` instead of spawning.
+        standalone_frontend=False,
+        standalone_worker=False,
+        worker_endpoint_file=None,
     ):
         init_logger()
+        self.standalone_frontend = bool(standalone_frontend)
+        self.standalone_worker = bool(standalone_worker)
+        self.worker_endpoint_file = worker_endpoint_file
+        self._worker_writer = None  # WorkerEndpointWriter (standalone worker)
+        self.worker_transport_base_port = worker_transport_base_port
         self.model_path = model_path
         self.load_format = load_format
         # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig) or
@@ -100,37 +116,49 @@ class LLM:
             )
             overlap_scheduling = False
         model_runner_cls = OverlapModelRunner if overlap_scheduling else ModelRunner
-        self.model_runner = model_runner_cls(
-            load_format=load_format,
-            model_path=model_path,
-            gpu_memory_util=gpu_memory_util,
-            page_size=page_size,
-            enable_prefix_caching=enable_prefix_caching,
-            maxp=maxp,
-            maxd=maxd,
-            minp=minp,
-            iterp=iterp,
-            init_new_token_ratio=init_new_token_ratio,
-            min_new_token_ratio=min_new_token_ratio,
-            schedule_method=schedule_method,
-            disable_cuda_graph=disable_cuda_graph,
-            piecewise_cuda_graph=piecewise_cuda_graph,
-            max_piecewise_cuda_graph_tokens=max_piecewise_cuda_graph_tokens,
-            max_cuda_graph_bs=max_cuda_graph_bs,
-            model_max_length=model_max_length,
-            mm_processor_min_pixels=mm_processor_min_pixels,
-            mm_processor_max_pixels=mm_processor_max_pixels,
-            skip_visual=skip_visual,
-            skip_language=skip_language,
-            attention_backend=attention_backend,
-            mla_decode_backend=mla_decode_backend,
-            mla_cache_dtype=mla_cache_dtype,
-            mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
-            mtp_enabled=mtp_enabled,
-            mtp_k=mtp_k,
-            mtp_max_batch=mtp_max_batch,
-            ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
-        )
+        if self.standalone_frontend:
+            # Pure frontend: no GPU, no worker spawn. Build a lightweight
+            # metadata-only runner (tokenizer + config) instead of the full
+            # GPU runner; every attribute this class reads off it is provided
+            # by ModelRunner.load_metadata.
+            self.model_runner = model_runner_cls.load_metadata(
+                load_format=load_format,
+                model_path=model_path,
+                schedule_method=schedule_method,
+                model_max_length=model_max_length,
+            )
+        else:
+            self.model_runner = model_runner_cls(
+                load_format=load_format,
+                model_path=model_path,
+                gpu_memory_util=gpu_memory_util,
+                page_size=page_size,
+                enable_prefix_caching=enable_prefix_caching,
+                maxp=maxp,
+                maxd=maxd,
+                minp=minp,
+                iterp=iterp,
+                init_new_token_ratio=init_new_token_ratio,
+                min_new_token_ratio=min_new_token_ratio,
+                schedule_method=schedule_method,
+                disable_cuda_graph=disable_cuda_graph,
+                piecewise_cuda_graph=piecewise_cuda_graph,
+                max_piecewise_cuda_graph_tokens=max_piecewise_cuda_graph_tokens,
+                max_cuda_graph_bs=max_cuda_graph_bs,
+                model_max_length=model_max_length,
+                mm_processor_min_pixels=mm_processor_min_pixels,
+                mm_processor_max_pixels=mm_processor_max_pixels,
+                skip_visual=skip_visual,
+                skip_language=skip_language,
+                attention_backend=attention_backend,
+                mla_decode_backend=mla_decode_backend,
+                mla_cache_dtype=mla_cache_dtype,
+                mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+                mtp_enabled=mtp_enabled,
+                mtp_k=mtp_k,
+                mtp_max_batch=mtp_max_batch,
+                ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
+            )
         self._reasoning_controls = reasoning_control_tokens(self.model_runner.tokenizer)
         self.pp_size = pp_size
         self.tp_size = tp_size
@@ -195,10 +223,17 @@ class LLM:
         self._pending_lock = threading.Lock()
 
         # Init workers
-        self.init_workers()
+        if self.standalone_frontend:
+            self.num_workers = 0
+            self.process_list = []
+            self.act_worker_ranks = []
+            self._init_standalone_frontend()
+        else:
+            self.init_workers()
 
         # wait worker start
-        self.wait_workers()
+        if not self.standalone_frontend:
+            self.wait_workers()
 
     def wait_workers(self):
         while True:
@@ -210,6 +245,12 @@ class LLM:
             if num_worker_start == self.num_workers:
                 break
             time.sleep(1)
+        # The worker child has bound its frontend-facing sockets and finished
+        # initialization (mp_alive is set at the end of Worker.init). Publish
+        # the endpoint file *now* so a connecting frontend can never buffer
+        # work into a socket nobody is reading yet.
+        if self.standalone_worker:
+            self._publish_worker_endpoint()
 
     def init_workers(self):
         if self.launch_mode != "normal":
@@ -227,6 +268,18 @@ class LLM:
         self.num_workers = len(self.act_worker_ranks)
 
         self.ctx = mp.get_context("spawn")
+        # Delay CUDA init in spawned children until the pickled target runs.
+        # Without this, a parent that touched ``torch.cuda`` (e.g. device-count
+        # probes at import) initialises the CUDA primary context on the *first
+        # visible* device, and the child inherits that context even when it
+        # sets its own ``CUDA_VISIBLE_DEVICES`` -- so a GPU-pinned worker would
+        # actually allocate on the wrong (often busy) GPU. The warmup delay
+        # makes each child re-read its own ``CUDA_VISIBLE_DEVICES`` before any
+        # CUDA call, which is exactly what standalone GPU pinning relies on.
+        try:
+            self.ctx.set_warmup_delay(1.0)
+        except Exception:
+            pass
         self.mp_alive = self.ctx.Array("i", [0 for i in range(self.num_workers)])
         self.mp_load_progress = self.ctx.Array(
             "i", [0 for _ in range(self.num_workers * 2)]
@@ -244,8 +297,47 @@ class LLM:
         )
         self._launch_workers()
 
+    def _publish_worker_endpoint(self):
+        """Standby worker fleet: advertise the frontend-facing socket paths.
+
+        The frontend binds nothing; it *connects* to what we publish here
+        (ipc:// on the same machine, tcp:// when the fleet is reachable over
+        the network via ``--worker-transport-base-port``).
+        """
+        from gllm.entrypoints.worker_endpoint import WorkerEndpointWriter
+
+        if not self.worker_endpoint_file:
+            raise ValueError(
+                "standalone_worker=True requires worker_endpoint_file"
+            )
+        base_port = getattr(self, "worker_transport_base_port", None)
+        host = self.host or "0.0.0.0"
+        self._worker_writer = WorkerEndpointWriter(self.worker_endpoint_file)
+        if base_port:
+            # tcp:// transports at fixed offsets: schedule=output base,
+            # output=+1, token=+2 (per rank 0; other ranks' paths are
+            # informational for now).
+            p = int(base_port)
+            schedule = f"tcp://{host}:{p}"
+            output = f"tcp://{host}:{p + 1}"
+            token = f"tcp://{host}:{p + 2}"
+        else:
+            schedule, output, token = self.schedule_path, self.output_path, self.token_path
+        self._worker_writer.set_endpoints({0: {"schedule": schedule, "output": output, "token": token}})
+
     def _init_frontend_comm(self):
         """Create the frontend ZeroMQ sockets on their owning thread."""
+        if self.standalone_worker:
+            # The worker *child* process owns the frontend-facing transport
+            # (it BINDs the schedule PULL / output PUSH sockets). The parent
+            # must NOT create a second frontend-role comm on the same endpoints:
+            # a zmq PUSH->PULL leg load-balances across all PULLs, so a stray
+            # parent PULL on the output leg would swallow ~half the worker's
+            # output frames and the real frontend would only ever see the
+            # other half. The parent's only role is fleet lifecycle (endpoint
+            # file + child supervision), which needs no sockets.
+            self.comm = None
+            return
         self.comm = zmqComm(
             self.host,
             self.launch_mode,
@@ -257,6 +349,236 @@ class LLM:
             dp_size=self.dp_size,
         )
         self.comm.init()
+
+    # ------------------------------------------------------------------
+    # Standalone frontend (decoupled from the worker fleet)
+    # ------------------------------------------------------------------
+
+    def _init_standalone_frontend(self):
+        """Wire this process to a separately deployed worker fleet.
+
+        The endpoint file is written by the worker processes
+        (``gllm.entrypoints.worker_server``). We poll it until it appears,
+        then (re)build the frontend ZMQ sockets from the published paths. A
+        later worker restart publishes a new transport uuid; the watcher
+        task started by :meth:`start_schedule_engine` (AsyncLLM) detects it
+        and calls :meth:`reconnect_comm`, so the frontend recovers without a
+        process restart.
+        """
+        from gllm.entrypoints.worker_endpoint import (
+            DEFAULT_POLL_INTERVAL,
+            read_worker_endpoint_file,
+        )
+
+        path = self.worker_endpoint_file
+        deadline = time.time() + 300
+        while True:
+            transport_uuid, endpoints = read_worker_endpoint_file(path)
+            if transport_uuid is not None and endpoints:
+                break
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f"No worker endpoint file appeared at {path} within "
+                    f"{deadline - time.time() + 300:.0f}s"
+                )
+            logger.info(
+                "Waiting for worker endpoint file %s (standalone frontend)...", path
+            )
+            time.sleep(DEFAULT_POLL_INTERVAL)
+        logger.info(
+            "Connected to standalone worker fleet (transport uuid %s, ranks %s) via %s",
+            transport_uuid,
+            sorted(endpoints),
+            path,
+        )
+        self._worker_transport_uuid = transport_uuid
+        self._worker_endpoints = endpoints
+        self._build_standalone_frontend_comm(endpoints)
+
+    def _build_standalone_frontend_comm(self, endpoints: dict):
+        """Create/replace the frontend ZMQ sockets for one transport incarnation."""
+        prev = getattr(self, "comm", None)
+        if prev is not None:
+            try:
+                prev.close()
+            except Exception:
+                pass
+            self.comm = None
+        # One transport path per rank; rank 0 carries schedule/output/token.
+        ep = endpoints[0]
+        self.comm = zmqComm(
+            self.host,
+            self.launch_mode,
+            self.master_addr,
+            ep["schedule"],
+            ep["output"],
+            ep["token"],
+            frontend=True,
+            dp_size=self.dp_size,
+            standalone_remote=True,
+        )
+        self.comm.init()
+        # Keep the (stale) self.* paths updated for logging/debugging.
+        self.schedule_path = ep["schedule"]
+        self.output_path = ep["output"]
+        self.token_path = ep["token"]
+
+    def reconnect_comm(self):
+        """Re-resolve the worker fleet after it restarted (new uuid).
+
+        Called by the standalone watcher from the engine IO executor thread.
+        In-flight zmq messages are lost with the old transport; that is the
+        intended blast radius (a restarted worker loses its KV cache anyway).
+        """
+        from gllm.entrypoints.worker_endpoint import read_worker_endpoint_file
+
+        path = self.worker_endpoint_file
+        deadline = time.time() + 600
+        last_err = None
+        while True:
+            transport_uuid, endpoints = read_worker_endpoint_file(path)
+            if transport_uuid is not None and endpoints:
+                if transport_uuid == getattr(self, "_worker_transport_uuid", None):
+                    # Same incarnation; transient read glitch.
+                    return
+                logger.warning(
+                    "Worker fleet restarted: transport uuid %s -> %s; reconnecting "
+                    "frontend ZMQ transport.",
+                    getattr(self, "_worker_transport_uuid", None),
+                    transport_uuid,
+                )
+                self._worker_transport_uuid = transport_uuid
+                self._worker_endpoints = endpoints
+                self._build_standalone_frontend_comm(endpoints)
+                # The restarted fleet has no memory of these sequences: drop
+                # the frontend-side bookkeeping. The async layer (AsyncLLM)
+                # terminates the client streams from the exception path the
+                # next schedule tick takes; monolith callers have no streams.
+                with self._pending_lock:
+                    self.wait_lists = []
+                    self.abort_ids = []
+                self.running_maps.clear()
+                return
+            last_err = "endpoint file absent (worker down?)"
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f"Standby timeout: worker endpoint file {path} not republished "
+                    f"within 600s ({last_err}); restarting the worker fleet will "
+                    f"recover the frontend without a frontend restart."
+                )
+            logger.warning("Worker down; polling %s for republish (%s)", path, last_err)
+            time.sleep(1.0)
+
+    def check_standalone_worker(self):
+        """Heartbeat/liveness check for the standalone worker fleet.
+
+        Cheap: one file stat + a JSON read when the mtime changed enough.
+        Raises RuntimeError when the endpoint file has vanished (worker
+        fleet gone) -- the schedule loop converts that into a terminal
+        error for every in-flight async stream instead of hanging them.
+        """
+        from gllm.entrypoints.worker_endpoint import (
+            endpoint_file_age_seconds,
+            read_worker_endpoint_file,
+            STALE_AFTER_SECONDS,
+        )
+
+        path = self.worker_endpoint_file
+        age = endpoint_file_age_seconds(path)
+        # The fleet is "gone" when the endpoint file is absent *or* stale
+        # (mtime older than STALE_AFTER_SECONDS, i.e. the heartbeat thread is
+        # no longer refreshing it -- the SIGKILL / power-loss backstop).
+        gone = age is None or age > STALE_AFTER_SECONDS
+        if gone:
+            # Only declare the fleet dead after a grace period so a brief
+            # atomic-rewrite window (rename) or a one-off slow heartbeat
+            # cannot false-trip. The grace is much shorter than the old 30s
+            # so a crashed worker is recovered quickly.
+            self._gone_since = getattr(self, "_gone_since", None) or time.monotonic()
+            if time.monotonic() - self._gone_since > 3:
+                raise RuntimeError(
+                    f"Worker endpoint file {path} is "
+                    f"{'missing' if age is None else f'stale (age {age:.1f}s)'}; "
+                    f"the worker fleet appears to be down."
+                )
+            return
+        self._gone_since = None
+        transport_uuid, endpoints = read_worker_endpoint_file(path)
+        if transport_uuid is None or not endpoints:
+            # File present but unparseable / empty: treat as gone, with the
+            # same short grace as above.
+            if self._gone_since is None:
+                self._gone_since = time.monotonic()
+            if time.monotonic() - self._gone_since > 3:
+                raise RuntimeError(
+                    f"Worker endpoint file {path} is unreadable; the worker fleet "
+                    f"appears to be down."
+                )
+            return
+        if transport_uuid != getattr(self, "_worker_transport_uuid", None):
+            # The worker fleet restarted in the background; reconnect our
+            # sockets. This runs on the engine IO executor thread, the same
+            # thread that owns the sockets, so the swap is race-free with
+            # send/recv.
+            self.reconnect_comm()
+
+    def mainloop(self):
+        """Blocking engine loop for a standalone (frontend-less) worker.
+
+        Same schedule cadence as :meth:`schedule` (recv outputs, then push
+        pending new work); the worker has no async streams, so finished
+        sequences are simply retired. The standalone transport is driven by
+        the *external* frontend, so we block on the output socket (no busy
+        spin): a wakeup happens on every worker->frontend output frame, after
+        which we push any pending new work and block again. The spawned GPU
+        child process is the fleet: if it dies, this parent removes the
+        endpoint file (via :meth:`_watch_worker_process`) so a connected
+        frontend detects the crash. Ctrl-C exits the process; the endpoint
+        file is removed via atexit too.
+        """
+        # The request data path is handled entirely by the *worker child*
+        # process (frontend PUSH -> child PULL schedule -> GPU -> child PUSH
+        # output -> frontend PULL). This parent's only job is the fleet's
+        # lifecycle: keep running while the child is alive, and remove the
+        # endpoint file the moment the child dies so a connected frontend
+        # detects the outage. The parent's own ``self.comm`` is a frontend-role
+        # socket that no one feeds, so we must NOT run the engine schedule
+        # loop here (doing so double-drains / starves the real transport).
+        _ml_t0 = time.monotonic()
+        while True:
+            time.sleep(0.5)
+            if not self._watch_worker_process():
+                raise RuntimeError(
+                    "Standalone worker child process died; tearing down."
+                )
+            if time.monotonic() - _ml_t0 >= 10.0:
+                logger.info("STANDALONE worker fleet healthy (child alive)")
+                _ml_t0 = time.monotonic()
+
+    def _watch_worker_process(self):
+        """Poll the spawned worker child; on death, remove the endpoint file.
+
+        Returns True while the fleet is healthy. When the child is gone the
+        endpoint file is unlinked so a frontend's liveness probe (endpoint
+        file present + output socket responsive) flips to down immediately.
+        """
+        dead = None
+        for proc in getattr(self, "process_list", []):
+            if not proc.is_alive():
+                dead = proc
+                break
+        if dead is None:
+            return True
+        code = getattr(dead, "exitcode", None)
+        logger.error(
+            "Standalone worker child process died (exit code %s); removing "
+            "endpoint file so frontends detect the outage.",
+            code,
+        )
+        writer = getattr(self, "_worker_writer", None)
+        if writer is not None:
+            writer.cleanup()
+        return False
 
     def _launch_workers(self):
         # Build every worker process object first (cheap), then fire all the
@@ -449,6 +771,10 @@ class LLM:
     def _apply_ipc_package(self, ipc_package):
         if ipc_package is not None:
             had_async_streams = bool(self.async_streams)
+            # ``async_streams`` is a dict on the async server (monolith /
+            # standalone frontend) and ``None`` on a bare engine such as the
+            # standalone *worker* (which has no HTTP streams to feed).
+            has_async = isinstance(self.async_streams, dict)
             for idx, id in enumerate(ipc_package.act_schedule_ids):
                 # Under overlap scheduling a worker can emit a trailing token
                 # for a sequence it freed one step earlier (EOS detected after
@@ -462,7 +788,7 @@ class LLM:
                     token_id = ipc_package.next_tokens[idx]
                     # MTP: a per-seq entry may be a LIST of committed tokens.
                     tokens = token_id if isinstance(token_id, list) else [token_id]
-                    if self.async_streams:
+                    if has_async:
                         text, controls = decode_stream_delta(
                             seq, self.model_runner.tokenizer, tokens, self._reasoning_controls
                         )
@@ -488,7 +814,7 @@ class LLM:
                 if self.running_maps.pop(id, None) is None:
                     continue
                 retired.append(id)
-                stream = self.async_streams.pop(id, None)
+                stream = self.async_streams.pop(id, None) if has_async else None
                 if stream is not None:
                     error = getattr(ipc_package, "request_errors", {}).get(id)
                     if error:
@@ -496,7 +822,7 @@ class LLM:
                         stream.put(RequestCapacityError(error))
                     stream.finish()
             self.free_finish_ids(retired)
-            if not had_async_streams and getattr(ipc_package, "request_errors", {}):
+            if not has_async and getattr(ipc_package, "request_errors", {}):
                 from gllm.runtime.sequence import RequestCapacityError
                 raise RequestCapacityError(next(iter(ipc_package.request_errors.values())))
             return len(retired)
@@ -576,7 +902,10 @@ class LLM:
         self.send_control_command("stop_profile")
 
     def schedule(self, log=True):
-        self.check_worker_alive()
+        if self.standalone_frontend:
+            self.check_standalone_worker()
+        else:
+            self.check_worker_alive()
         num_finish_seqs = self.recv_ipc_package()
         self.send_ipc_package(log)
         return num_finish_seqs

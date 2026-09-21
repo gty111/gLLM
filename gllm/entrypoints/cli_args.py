@@ -304,6 +304,40 @@ def add_frontend_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def add_decoupled_args(p: argparse.ArgumentParser) -> None:
+    """Frontend/worker decoupling (standalone deployment).
+
+    When set, the process no longer owns the *other* half of the system: a
+    standalone frontend never spawns workers or touches a GPU, and a
+    standalone worker never runs the HTTP app. They rendezvous through
+    ``--worker-endpoint-file`` (see docs/frontend_worker_decoupling.md).
+    """
+    p.add_argument(
+        "--worker-endpoint-file",
+        dest="worker_endpoint_file",
+        type=str,
+        default=None,
+        help=(
+            "Path to the worker endpoint rendezvous file. For a standalone "
+            "frontend: read (polled) to discover the separately deployed "
+            "worker fleet. For a standalone worker: written by the worker "
+            "process to publish its frontend-facing sockets."
+        ),
+    )
+    p.add_argument(
+        "--worker-transport-base-port",
+        dest="worker_transport_base_port",
+        type=int,
+        default=None,
+        help=(
+            "Standalone worker only: expose the frontend-facing transport on "
+            "fixed TCP ports (schedule=base, output=base+1, token=base+2) "
+            "instead of ephemeral ipc:// paths, so a frontend on another "
+            "machine can connect."
+        ),
+    )
+
+
 def add_engine_args(p: argparse.ArgumentParser, *, tp_help: str = None) -> None:
     """Every engine-facing argument both entrypoints share."""
     add_model_args(p)
@@ -312,6 +346,7 @@ def add_engine_args(p: argparse.ArgumentParser, *, tp_help: str = None) -> None:
     add_scheduler_args(p)
     add_mtp_args(p)
     add_mm_processor_args(p)
+    add_decoupled_args(p)
 
 
 def engine_kwargs(args: argparse.Namespace) -> dict:
@@ -358,4 +393,8 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
         "mtp_max_batch": args.mtp_max_batch,
         "mm_processor_min_pixels": args.mm_processor_min_pixels,
         "mm_processor_max_pixels": args.mm_processor_max_pixels,
+        "worker_endpoint_file": getattr(args, "worker_endpoint_file", None),
+        "worker_transport_base_port": getattr(
+            args, "worker_transport_base_port", None
+        ),
     }
