@@ -636,9 +636,8 @@ class SSMSegment(RecurrentStateSegment):
     # --- prefix-cache cached-state blocks ------------------------------
 
     def allocate_snapshot(self) -> Optional[int]:
-        # Snapshot allocations are best effort. The allocator may use any free
-        # aligned extent, but does not evict one snapshot merely to create a
-        # different snapshot of the same type.
+        # PrefixSegment owns same-type replacement and protects live readers
+        # and pending writes. This low-level allocation only uses free extents.
         blocks = self.cache_arena.allocator.allocate(self.snapshot_arena_type, 1)
         if blocks is None:
             return None
@@ -926,10 +925,12 @@ class Segment:
         rows = cfg.compressed_rows_per_page(self.page_size, ratio)
         return cache[slots // rows, slots % rows]
 
-    # return percent of used memory
     def get_memory_util(self):
+        """Percent of the shared arena unavailable for pressure reclamation."""
+        allocator = self.id_allocator.arena.allocator
         return round(
-            100 * self.id_allocator.get_num_used_ids() / self.id_allocator.size, 2
+            100 * allocator.num_non_reclaimable_physical_pages
+            / allocator.num_physical_pages, 2
         )
 
 
@@ -1788,7 +1789,8 @@ class PrefixMemoryManager(MemoryManager):
         )
         if self.ssm_segment is not None:
             self.cache_arena.allocator.set_reclaimer(
-                "ssm_snapshot", self.segment.reclaim_one_ssm_snapshot
+                "ssm_snapshot", self.segment.reclaim_one_ssm_snapshot,
+                self.segment.num_reclaimable_ssm_snapshots,
             )
         # Recurrent-state caching granularity for this run. Rounded DOWN to
         # whole pages (only page boundaries can carry a snapshot) with a floor
@@ -1824,6 +1826,17 @@ class PrefixMemoryManager(MemoryManager):
         # and the payload builder ships them; ``consume`` clears the buffer so
         # each is shipped exactly once.
         self._pending_ssm_restores: Dict[int, int] = {}
+        # PP followers may restore after the driver prepares another batch.
+        # Keep their source protected until request teardown (PP has no local
+        # completion event covering every stage's copy).
+        self._ssm_restore_pins: Dict[int, int] = {}
+
+    def free(self, seq: GenerationSequence):
+        page = getattr(self, "_ssm_restore_pins", {}).pop(seq.seq_id, None)
+        if page is not None:
+            self.segment.unpin_ssm_snapshot(page)
+        getattr(self, "_pending_ssm_restores", {}).pop(seq.seq_id, None)
+        super().free(seq)
 
     def pre_allocate_computed_page(self, seqs: List[GenerationSequence]):
         for seq in seqs:
@@ -1906,22 +1919,27 @@ class PrefixMemoryManager(MemoryManager):
             boundary_page = seq.page_table[seq.computed_token_num // self.page_size - 1]
             snap_slot = self._valid_snapshot_slot(boundary_page)
             if snap_slot is not None:
-                if not self.allocate_recurrent_slot(seq):
-                    # The prefix remains cached, but without a private mutable
-                    # state slot this request must wait for arena capacity.
-                    hit_pages = seq.computed_token_num // self.page_size
-                    seq.computed_token_num = 0
-                    self.num_hit_pages = max(0, self.num_hit_pages - hit_pages)
-                    return
-                self.ssm_segment.copy_state(
-                    "snapshot", snap_slot, "working", seq.recurrent_state_slot
-                )
-                # PP>1: record so the same restore is replayed on every PP
-                # stage (each owns a different GDN-layer slice). Skip entirely
-                # on PP=1 where rank-0's copy above is the whole story (and
-                # nothing would ever drain the buffer).
-                if get_pp_size() > 1:
-                    self._pending_ssm_restores[seq.seq_id] = snap_slot
+                self.segment.pin_ssm_snapshot(boundary_page)
+                keep_pinned = False
+                try:
+                    if not self.allocate_recurrent_slot(seq):
+                        # The source must survive allocation's pressure reclaim.
+                        hit_pages = seq.computed_token_num // self.page_size
+                        seq.computed_token_num = 0
+                        self.num_hit_pages = max(0, self.num_hit_pages - hit_pages)
+                        return
+                    self.ssm_segment.copy_state(
+                        "snapshot", snap_slot, "working", seq.recurrent_state_slot
+                    )
+                    if get_pp_size() > 1:
+                        self._pending_ssm_restores[seq.seq_id] = snap_slot
+                        self._ssm_restore_pins[seq.seq_id] = boundary_page
+                        keep_pinned = True
+                finally:
+                    if not keep_pinned:
+                        # Copy/reset/write operations share the forward stream;
+                        # enqueue ordering protects the bytes without a sync.
+                        self.segment.unpin_ssm_snapshot(boundary_page)
                 return
             seq.computed_token_num -= self.page_size
             self.num_hit_pages -= 1
@@ -2069,6 +2087,7 @@ class PrefixSegment(Segment):
             False for _ in range(self.num_pages)
         ]
         self._ssm_snapshot_lru: "OrderedDict[int, None]" = OrderedDict()
+        self._ssm_snapshot_pins: Dict[int, int] = {}
 
     # --- public API ---------------------------------------------------------
 
@@ -2089,7 +2108,7 @@ class PrefixSegment(Segment):
         self.page2ssm_snapshot_valid[page_num] = False
 
     def reclaim_one_ssm_snapshot(self) -> bool:
-        """Release the least-recently-used snapshot under arena pressure."""
+        """Release the oldest published, unpinned snapshot under pressure."""
         while self._ssm_snapshot_lru:
             page_num, _ = self._ssm_snapshot_lru.popitem(last=False)
             if self.page2ssm_snapshot[page_num] is None:
@@ -2097,6 +2116,31 @@ class PrefixSegment(Segment):
             self._release_snapshot_for(page_num)
             return True
         return False
+
+    def num_reclaimable_ssm_snapshots(self) -> int:
+        return len(self._ssm_snapshot_lru)
+
+    def pin_ssm_snapshot(self, page_num: int) -> None:
+        self._ssm_snapshot_lru.pop(page_num, None)
+        self._ssm_snapshot_pins[page_num] = self._ssm_snapshot_pins.get(page_num, 0) + 1
+
+    def unpin_ssm_snapshot(self, page_num: int) -> None:
+        count = self._ssm_snapshot_pins[page_num] - 1
+        if count:
+            self._ssm_snapshot_pins[page_num] = count
+        else:
+            del self._ssm_snapshot_pins[page_num]
+            if self.page2ssm_snapshot_valid[page_num]:
+                self._ssm_snapshot_lru[page_num] = None
+
+    def publish_ssm_snapshot(self, page_num: int, slot: int) -> None:
+        """Make a written snapshot reusable after its copies are enqueued."""
+        if self.page2ssm_snapshot[page_num] != slot:
+            return
+        self.page2ssm_snapshot_valid[page_num] = True
+        if page_num not in self._ssm_snapshot_pins:
+            self._ssm_snapshot_lru[page_num] = None
+            self._ssm_snapshot_lru.move_to_end(page_num)
 
     def update(self, seq: GenerationSequence, n_tokens: int, page_num: int) -> None:
         """Register a hash for ``page_num`` after its KV was filled in decode."""
@@ -2256,9 +2300,10 @@ class PrefixSegment(Segment):
 
         * the boundary is not on the coarse ``ssm_snapshot_stride`` grid,
         * the page is not cacheable (nothing could ever hit it), or
-        * no arena extent is currently available. Snapshots are reclaimable;
-          live KV/working-state pressure can evict them later without a fixed
-          watermark or reserved sub-pool.
+        * no arena extent is available even after evicting older, unpinned
+          snapshots. Pending writes and restore sources are protected; all
+          other snapshots can serve newer boundaries or KV/working-state
+          pressure without a fixed watermark or reserved sub-pool.
         """
         if self.ssm_segment is None:
             return None
@@ -2268,13 +2313,20 @@ class PrefixSegment(Segment):
             return None
         slot = self.page2ssm_snapshot[page_num]
         if slot is not None:
+            # The batch will write this entry again. Protect it from another
+            # row's reservation until all copy targets have been enqueued.
+            self._ssm_snapshot_lru.pop(page_num, None)
+            self.page2ssm_snapshot_valid[page_num] = False
             return slot
         slot = self.ssm_segment.allocate_snapshot()
+        while slot is None and self.reclaim_one_ssm_snapshot():
+            slot = self.ssm_segment.allocate_snapshot()
         if slot is None:
             return None
         self.page2ssm_snapshot[page_num] = slot
         self.page2ssm_snapshot_valid[page_num] = False
-        self._ssm_snapshot_lru[page_num] = None
+        # Pending writes are owned but not reclaimable. Publication adds the
+        # entry to the LRU; a later row cannot steal this batch's write target.
         return slot
 
     def _release_snapshot_for(self, page_num: int) -> None:
@@ -2282,6 +2334,8 @@ class PrefixSegment(Segment):
             return
         snap_slot = self.page2ssm_snapshot[page_num]
         if snap_slot is not None:
+            if page_num in self._ssm_snapshot_pins:
+                raise RuntimeError(f"cannot release pinned SSM snapshot for page {page_num}")
             self.ssm_segment.free_snapshot(snap_slot)
             self.page2ssm_snapshot[page_num] = None
             self._ssm_snapshot_lru.pop(page_num, None)

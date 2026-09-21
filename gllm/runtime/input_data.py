@@ -291,6 +291,7 @@ class InputData:
         has_init = np.empty(bs, dtype=np.bool_)
         snap_targets = np.full(bs, -1, dtype=np.int32)
         snapshot_candidates = []
+        snapshot_pending = []
 
         # Pull the snapshot pointer table once; ``PrefixSegment`` is the
         # only Segment subclass that owns ``page2ssm_snapshot``. The
@@ -336,7 +337,7 @@ class InputData:
                 snap_slot = reserve(page_num, end_tokens)
                 if snap_slot is not None:
                     snap_targets[i] = snap_slot
-                    segment.page2ssm_snapshot_valid[page_num] = True
+                    snapshot_pending.append((page_num, snap_slot))
 
         self.has_initial_state_per_seq_cpu = torch.as_tensor(
             has_init, device="cpu"
@@ -352,7 +353,7 @@ class InputData:
         )
         self._ssm_snapshot_valid_rows = ()
         self._ssm_snapshot_candidates = tuple(snapshot_candidates)
-        self._ssm_snapshot_writes_pending = ()
+        self._ssm_snapshot_writes_pending = tuple(snapshot_pending)
 
         # Spec-decode 2D block table plus accepted count for hybrid MTP.
         # Built only when at least one seq carries a ``ssm_block_table`` (MTP on).
@@ -520,8 +521,7 @@ class InputData:
             # A mapping mismatch means arena pressure reclaimed the intent
             # before launch. Never publish a different tenant as this page's
             # recurrent state.
-            if segment.page2ssm_snapshot[page_num] == slot:
-                segment.page2ssm_snapshot_valid[page_num] = True
+            segment.publish_ssm_snapshot(page_num, slot)
         self._ssm_snapshot_writes_pending = ()
 
     def mark_gpu_buffer_shapes(
