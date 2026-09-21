@@ -625,10 +625,11 @@ def _remap_worker_factory(client0_holder):
     )
     comm._output_committer = None  # installed in the test below
     # zmqComm.__init__ sets this; construct the real object without init
-    # (no sockets) so the remap guard (comm.frontend) behaves as in prod.
-    comm.frontend = False
+    # (no sockets) so the comm-based guards behave as in prod.
     w = Worker.__new__(Worker)
     w.comm = comm
+    # Deployment mode drives the remap guard (explicit, not socket role).
+    w.standalone_worker = True
     w.scheduler = SimpleNamespace(
         seqs_to_prefill=collections.deque(
             [client0_holder] if client0_holder is not None else []),
@@ -638,7 +639,14 @@ def _remap_worker_factory(client0_holder):
         add_abort_ids=lambda ids: w.scheduler.abort_ids.update(ids),
     )
     # Holders are already-admitted seqs: queue them (without re-remapping).
-    # Callers append FRESHLY REMAPPED seqs as well.
+    # Register their identity as admission would (the registry now seeds at
+    # admission time, before the scheduler can free the seq).
+    if client0_holder is not None:
+        comm._session_identity[client0_holder.seq_id] = (
+            getattr(client0_holder, "client_seq_id",
+                    client0_holder.seq_id),
+            client0_holder.frontend_session,
+        )
     return w
 
 
@@ -648,6 +656,20 @@ def _seq(sid, epoch):
     s = GenerationSequence(seq_id=sid, token_ids=[1], finish_tokens=None, output_len=8)
     s.frontend_session = epoch
     return s
+
+
+class _FreeTracker:
+    """Tiny stand-in for IDAllocator: records freed ids, is_free always
+    True (tests only check what was released)."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def free(self, id):
+        self.sink.append(id)
+
+    def is_free(self, id):
+        return True
 
 
 def test_completion_remaps_same_client_id_across_sessions():
@@ -746,3 +768,172 @@ def test_abort_targets_the_right_session_request():
     w.scheduler.add_abort_ids(routed)
     survivors = [s for s in w.scheduler.seqs_to_prefill if s.seq_id not in w.scheduler.abort_ids]
     assert survivors == [old0]
+
+
+# ---------------------------------------------------------------------------
+# Fourth-round review regressions (P1 x3): positional stamp check (same
+# client id twice in one batch), drain merge preserves abort_sessions,
+# and identity registered at admission (first-token-EOS / pre-first-output
+# abort).
+# ---------------------------------------------------------------------------
+
+
+def test_same_client_id_twice_in_one_output_batch():
+    """P1-1: one output batch may legally carry the SAME client id twice
+    (old session's request 0 AND new session's request 0 both emit). The
+    frontend must check stamps POSITIONALLY per row, never collapse them
+    into a dict keyed by client id (which would keep only one stamp and
+    mis-apply / mis-drop the other row)."""
+    from gllm.distributed.comm import IPCPackage
+
+    eng = _bare_llm()  # epoch-A
+    new0 = _seq(0, "epoch-A")
+    eng.running_maps[0] = new0
+
+    # Worker translates both rows to client id 0 with their own stamps.
+    pkg = IPCPackage([])
+    pkg.act_schedule_ids = [0, 0]
+    pkg.sessions = ["epoch-OLD", "epoch-A"]
+    pkg.next_tokens = [[42], [7]]
+    eng._apply_ipc_package(pkg)
+    # Exactly ONE token (the new session's 7) may land on the new request.
+    assert new0.token_ids == [1, 7], (
+        "old session's token must not bleed into the new request")
+    assert 0 in eng.running_maps, "new request must still be running"
+
+    # Reverse order: the new session's row FIRST must not be dropped by a
+    # dict collapse keeping only the LAST (OLD) stamp.
+    new0b = _seq(1, "epoch-A")
+    eng.running_maps[1] = new0b
+    pkg2 = IPCPackage([])
+    pkg2.act_schedule_ids = [1, 1]
+    pkg2.sessions = ["epoch-A", "epoch-OLD"]
+    pkg2.next_tokens = [[9], [42]]
+    eng._apply_ipc_package(pkg2)
+    assert new0b.token_ids == [1, 9], (
+        "new session's own row must apply regardless of position")
+    assert 1 in eng.running_maps
+
+
+def test_drain_merge_preserves_abort_sessions():
+    """P1-2: the worker's recv_ipc_package drain must merge abort_sessions
+    ALIGNED with abort_ids. Previously only abort_ids was extended, so the
+    aggregate stayed unstamped (None) and _route_frontend_aborts fell back
+    to legacy 'abort every holder' -- freeing BOTH sessions' request 0."""
+    import collections
+    from types import SimpleNamespace
+
+    from gllm.distributed.comm import IPCPackage
+
+    old0 = _seq(0, "epoch-OLD")
+    new0 = _seq(0, "epoch-A")
+    w = _remap_worker_factory(None)
+    w._remap_client_ids([old0, new0])
+    w.scheduler.seqs_to_prefill.extend([old0, new0])
+
+    # Simulate the drain merge of ONE frontend package (the production
+    # path inside recv_ipc_package).
+    cum = IPCPackage([])
+    fe_pkg = IPCPackage([])
+    fe_pkg.abort_ids = [0]
+    fe_pkg.abort_sessions = ["epoch-A"]
+    cum.schedule_lists.extend(fe_pkg.schedule_lists)
+    cum.abort_ids.extend(fe_pkg.abort_ids)
+    in_stamps = getattr(fe_pkg, "abort_sessions", None)
+    if in_stamps is None:
+        in_stamps = [None] * len(fe_pkg.abort_ids)
+    if cum.abort_sessions is None:
+        cum.abort_sessions = [None] * (len(cum.abort_ids) - len(in_stamps))
+    cum.abort_sessions.extend(in_stamps)
+
+    assert cum.abort_sessions == ["epoch-A"], (
+        "merge must preserve the stamped session")
+
+    # Routing the MERGED package frees only the new session's request.
+    routed = w._route_frontend_aborts(
+        cum.abort_ids, getattr(cum, "abort_sessions", None))
+    assert routed == [new0.seq_id], (
+        f"merged aborts must target only the new session's seq, got {routed}")
+    w.scheduler.add_abort_ids(routed)
+    survivors = [s for s in w.scheduler.seqs_to_prefill
+                 if s.seq_id not in w.scheduler.abort_ids]
+    assert survivors == [old0], "old session's request must survive"
+
+
+def test_first_token_eos_identity_from_admission():
+    """P1-3: a request whose FIRST output token is terminal (max_tokens=1
+    or first-token EOS) is freed by the scheduler BEFORE its row reaches
+    translate -- no live queue holds it, so identity must come from the
+    ADMISSION-time registry, not from live-seq lookup. Without that the
+    terminal row ships with an untranslated internal id + None stamp and
+    the frontend never sees the completion."""
+    from gllm.distributed.comm import IPCPackage
+
+    req = _seq(0, "epoch-A")
+    w = _remap_worker_factory(None)
+    w._remap_client_ids([req])
+    internal = req.seq_id
+    assert internal >= 100000
+
+    # The scheduler popped the batch and freed the seq: it is in NO queue.
+    w.scheduler.seqs_to_prefill.clear()
+    w.scheduler.seqs_to_decode.clear()
+    w.scheduler.batch_running.clear()
+
+    # Terminal output row (token + free in the same package).
+    pkg = IPCPackage([])
+    pkg.act_schedule_ids = [internal]
+    pkg.next_tokens = [[13]]
+    pkg.free_ids = [internal]
+    w.translate_output_for_frontend(pkg)
+    assert pkg.act_schedule_ids == [0], "internal id must be translated"
+    assert pkg.sessions == ["epoch-A"]
+    assert pkg.free_ids == [0]
+    assert pkg.free_sessions == ["epoch-A"]
+
+    # And the frontend actually applies both rows (completion delivered).
+    eng = _bare_llm()
+    freed = []
+    eng.id_allocator = _FreeTracker(freed)
+    eng.free_finish_ids = lambda ids: freed.extend(ids)
+    new0 = _seq(0, "epoch-A")
+    new0.output_len = 1  # first token finishes it
+    eng.running_maps[0] = new0
+    n = eng._apply_ipc_package(pkg)
+    assert new0.token_ids == [1, 13], "terminal token must land"
+    assert n == 1, "request must be retired by its own completion"
+    assert 0 not in eng.running_maps
+    assert freed == [0], "retired id must be released to the allocator"
+
+
+def test_pre_first_output_abort_identity_from_admission():
+    """P1-3 (cancel path): a request aborted BEFORE its first output token
+    never enters batch_running; its free row (check_abort_seqs reply) is
+    translated from the admission-time registry. The frontend retires its
+    stream with the cancel, never the other session's same-id request."""
+    from gllm.distributed.comm import IPCPackage
+
+    req = _seq(0, "epoch-A")
+    w = _remap_worker_factory(None)
+    w._remap_client_ids([req])
+    internal = req.seq_id
+
+    # Still queued, then aborted: removed from the queue, never run.
+    w.scheduler.seqs_to_prefill.clear()
+    pkg = IPCPackage([])
+    pkg.free_ids = [internal]
+    w.translate_output_for_frontend(pkg)
+    assert pkg.free_ids == [0]
+    assert pkg.free_sessions == ["epoch-A"]
+
+    # Frontend retires exactly its own request 0.
+    eng = _bare_llm()
+    freed = []
+    eng.id_allocator = _FreeTracker(freed)
+    eng.free_finish_ids = lambda ids: freed.extend(ids)
+    new0 = _seq(0, "epoch-A")
+    eng.running_maps[0] = new0
+    n = eng._apply_ipc_package(pkg)
+    assert n == 1
+    assert 0 not in eng.running_maps
+    assert freed == [0]

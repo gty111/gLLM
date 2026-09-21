@@ -723,6 +723,7 @@ class LLM:
             self.assigned_layers,
             self.schedule_method,
             self.disagg_config,
+            self.standalone_worker,
         )
         # DP bookkeeping (logging + is_dp_attn); no signature change to Worker.
         worker.dp_rank = dp_rank
@@ -852,33 +853,31 @@ class LLM:
             # fleet still emits the dead session's trailing tokens/frees for
             # numerically-identical ids; apply only rows stamped with OUR
             # epoch (unstamped rows are dropped, fail-closed).
-            def _own_session(stamp_by_row, row_id):
+            # Stamps are POSITIONAL (aligned with the id lists): a batch
+            # may legally carry the SAME client id twice, once per session
+            # (act_schedule_ids == [0, 0]), so they must never be collapsed
+            # into a dict keyed by client id.
+            act_stamps = getattr(ipc_package, "sessions", None)
+            free_stamps = getattr(ipc_package, "free_sessions", None)
+
+            def _foreign(idx, stamps):
+                """True iff this row belongs to a DIFFERENT (dead) session.
+
+                Monolith: never foreign (no session filtering). Standalone:
+                the worker always ships stamp lists aligned with the id
+                lists; a missing/short list or a non-matching stamp means
+                the row is not ours (fail-closed).
+                """
+                if not self.standalone_frontend:
+                    return False
                 return (
-                    stamp_by_row is not None
-                    and stamp_by_row.get(row_id) == self.frontend_epoch
+                    stamps is None
+                    or idx >= len(stamps)
+                    or stamps[idx] != self.frontend_epoch
                 )
 
-            act_stamps = (
-                dict(zip(
-                    ipc_package.act_schedule_ids,
-                    getattr(ipc_package, "sessions", None),
-                ))
-                if getattr(ipc_package, "sessions", None) is not None
-                else None
-            )
-            free_stamps = (
-                dict(zip(
-                    ipc_package.free_ids,
-                    getattr(ipc_package, "free_sessions", None),
-                ))
-                if getattr(ipc_package, "free_sessions", None) is not None
-                else None
-            )
             for idx, id in enumerate(ipc_package.act_schedule_ids):
-                if (
-                    self.standalone_frontend
-                    and not _own_session(act_stamps, id)
-                ):
+                if _foreign(idx, act_stamps):
                     continue  # dead session's trailing token
                 # Under overlap scheduling a worker can emit a trailing token
                 # for a sequence it freed one step earlier (EOS detected after
@@ -920,11 +919,8 @@ class LLM:
             # Aborts (including queued requests) carry free_ids without any
             # acted token rows. Retire them independently, exactly once.
             retired = []
-            for id in ipc_package.free_ids:
-                if (
-                    self.standalone_frontend
-                    and not _own_session(free_stamps, id)
-                ):
+            for fidx, id in enumerate(ipc_package.free_ids):
+                if _foreign(fidx, free_stamps):
                     continue  # dead session's free; our running_maps has no key
                 if self.running_maps.pop(id, None) is None:
                     continue

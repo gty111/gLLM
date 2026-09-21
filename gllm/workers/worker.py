@@ -96,6 +96,7 @@ class Worker(TorchProfilerMixin):
         assigned_layers,
         schedule_method,
         disagg_config=None,
+        standalone_worker=False,
     ):
         self.model_runner = model_runner
         self.local_rank = local_rank
@@ -111,6 +112,12 @@ class Worker(TorchProfilerMixin):
         self.mp_load_progress = mp_load_progress
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
+        # Deployment mode: True when this fleet serves a separately
+        # deployed (stateless, restartable) frontend -- the per-session
+        # client-id remap applies only there (see
+        # _standalone_remap_enabled). Pickled from the parent across
+        # the spawn boundary.
+        self.standalone_worker = bool(standalone_worker)
         self.use_mla = model_runner.model_loader.use_mla
         # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig),
         # pickled here from the parent across the spawn boundary; ``None`` on the
@@ -324,7 +331,17 @@ class Worker(TorchProfilerMixin):
     # frontend (running_maps / async_streams) keeps seeing only client ids.
 
     def _standalone_remap_enabled(self) -> bool:
-        return bool(getattr(self, "comm", None)) and not self.comm.frontend
+        """True iff this worker sits behind a STANDALONE frontend.
+
+        A monolith worker also has ``comm.frontend == False`` (it talks
+        to its in-process frontend), so the remap must key off the
+        deployment mode, not the socket role: monolith client ids are
+        already unique per fleet (one frontend), remapping there is
+        pointless churn. ``standalone_worker`` is set on the worker
+        parent and inherited by its spawned child.
+        """
+        return bool(getattr(self, "comm", None)) \
+            and bool(getattr(self, "standalone_worker", False))
 
     def _remap_client_ids(self, seqs):
         """Assign fleet-unique internal ids to freshly admitted seqs.
@@ -340,9 +357,17 @@ class Worker(TorchProfilerMixin):
         counter = getattr(self, "_next_internal_seq", None)
         if counter is None:
             counter = self._next_internal_seq = 100000
+        # Register the identity AT ADMISSION: the scheduler may free a seq
+        # (first token == EOS / max_tokens=1) before it ever produces a
+        # non-terminal output row, so identity recorded only at translate
+        # time would be lost for exactly those requests. Retention is
+        # bounded by the output drain below.
+        reg = self.comm._session_identity
         for seq in seqs or ():
             seq.client_seq_id = seq.seq_id
             seq.seq_id = counter
+            reg[seq.seq_id] = (seq.client_seq_id,
+                               getattr(seq, "frontend_session", None))
             counter += 1
         self._next_internal_seq = counter
 
@@ -395,13 +420,18 @@ class Worker(TorchProfilerMixin):
     def _output_row_identity(self, seq_id):
         """(client_id, session) for one OUTPUT row's internal id, or None.
 
-        Resolves live seqs first (covers every row produced this tick,
-        including free rows: the scheduler frees the seq only AFTER the
-        output package is built); the finished-seq registry then covers
-        free rows of requests that ended one tick earlier (overlap/MTP
-        defer). Unknown ids degrade to None and are dropped by the
-        frontend (fail-closed).
+        The admission-time registry answers first: it covers rows of
+        requests the scheduler already freed (first token == EOS /
+        max_tokens=1, aborted pre-first-output -- the seq is gone from
+        every queue by the time its terminal row is translated) and rows
+        of overlap/MTP requests deferred across ticks. A live seq is
+        consulted when the registry missed (defensive; admission
+        registers every remapped seq). Unknown ids degrade to None and
+        are dropped by the frontend (fail-closed).
         """
+        reg = getattr(self.comm, "_session_identity", None)
+        if reg is not None and seq_id in reg:
+            return reg[seq_id]
         try:
             batches = [
                 list(self.scheduler.seqs_to_prefill),
@@ -415,10 +445,6 @@ class Worker(TorchProfilerMixin):
                             getattr(seq, "frontend_session", None)
         except Exception:
             pass
-        reg = getattr(self, "_finished_sessions", None)
-        if reg is not None and seq_id in reg:
-            client_id, session = reg[seq_id]
-            return client_id, session
         return None
 
     def translate_output_for_frontend(self, ipc_package) -> None:
@@ -434,14 +460,21 @@ class Worker(TorchProfilerMixin):
         """
         if not self._standalone_remap_enabled():
             return
-        reg = getattr(self, "_finished_sessions", None)
-        if reg is None:
-            reg = self._finished_sessions = {}
+        # Identity retention: a row is translated AT MOST ONCE (act rows
+        # only ever appear in act, free rows only in free), so the
+        # admission-time registry entry of every translated internal id
+        # becomes reclaimable the NEXT drain -- bounding the table's
+        # growth to (one drain of terminal rows), not the fleet lifetime.
+        reg = self.comm._session_identity
+        pending = self.comm._identity_reclaim
+        for stale in pending:
+            reg.pop(stale, None)
+        pending.clear()
 
         def _row(internal_id):
             ident = self._output_row_identity(internal_id)
             if ident is not None:
-                reg[internal_id] = ident  # keep the free row's identity
+                self.comm._identity_reclaim.add(internal_id)
                 return ident
             return None
 
@@ -764,6 +797,19 @@ class Worker(TorchProfilerMixin):
                     break
                 cum.schedule_lists.extend(ipc_package.schedule_lists)
                 cum.abort_ids.extend(ipc_package.abort_ids)
+                # Session stamps ride ALIGNED with abort_ids (see
+                # IPCPackage.abort_sessions). Merging the ids without
+                # their stamps would downgrade the aggregate to legacy
+                # routing and abort EVERY same-id request across
+                # sessions. Backfill so the list stays aligned even when
+                # some packages in the drain are unstamped.
+                in_stamps = getattr(ipc_package, "abort_sessions", None)
+                if in_stamps is None:
+                    in_stamps = [None] * len(ipc_package.abort_ids)
+                if cum.abort_sessions is None:
+                    cum.abort_sessions = [
+                        None] * (len(cum.abort_ids) - len(in_stamps))
+                cum.abort_sessions.extend(in_stamps)
                 if ipc_package.log is not None:
                     cum.log = ipc_package.log
                     saw_log_override = True

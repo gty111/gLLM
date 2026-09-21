@@ -144,6 +144,15 @@ class zmqComm:
         # frontend's client ids and attaches the per-row session stamps
         # before the package hits the wire (see send_output).
         self._output_committer = None
+        # Worker-side (standalone) per-seq identity bookkeeping, owned by
+        # the WORKER's comm (never the frontend's): registered at
+        # ADMISSION (Worker._remap_client_ids), before the scheduler can
+        # free the seq (first token == EOS / max_tokens=1 requests never
+        # reach a live-queue lookup); reclaimed one output tick after
+        # their terminal row is translated (see
+        # Worker.translate_output_for_frontend). Keyed by INTERNAL id.
+        self._session_identity = {}
+        self._identity_reclaim = set()
 
     def init(self):
         self.ctx = zmq.Context()
