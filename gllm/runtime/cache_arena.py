@@ -113,6 +113,7 @@ class ArenaCacheType:
     retained_slots: Set[int] = field(default_factory=set)
     evictor: Optional[Callable[[int], None]] = None
     reclaimer: Optional[Callable[[], bool]] = None
+    reclaimable_count: Optional[Callable[[], int]] = None
 
     def heap_key(self, slot: int) -> int:
         return -slot if self.prefer_high else slot
@@ -217,9 +218,13 @@ class CacheArenaAllocator:
     def set_evictor(self, name: str, callback: Callable[[int], None]) -> None:
         self.cache_type(name).evictor = callback
 
-    def set_reclaimer(self, name: str, callback: Callable[[], bool]) -> None:
+    def set_reclaimer(
+        self, name: str, callback: Callable[[], bool],
+        reclaimable_count: Optional[Callable[[], int]] = None,
+    ) -> None:
         """Register pressure-driven reclamation for an evictable cache type."""
         self.cache_type(name).reclaimer = callback
+        self.cache_type(name).reclaimable_count = reclaimable_count
 
     def mark_cached(self, name: str, slots: Iterable[int]) -> None:
         """Retain cache contents across an imminent release of owned slots.
@@ -282,8 +287,8 @@ class CacheArenaAllocator:
         while len(request.free_slots) < count:
             progressed = False
             for donor in self._types.values():
-                # Replacing one entry with another entry of the same cache type
-                # only churns metadata and cannot increase its free capacity.
+                # Same-type replacement belongs to the cache policy: it must
+                # protect pending writes and any state currently being read.
                 if donor.name == request.name or donor.reclaimer is None:
                     continue
                 before = self._used_physical_pages
@@ -543,7 +548,7 @@ class CacheArenaAllocator:
         """Free slots plus pressure-reclaimable capacity (admission estimate)."""
         request = self.cache_type(name)
         reclaimable_pages = sum(
-            len(cache_type.live_slots) * cache_type.pages_per_slot
+            self._reclaimable_pages(cache_type)
             for cache_type in self._types.values()
             if cache_type.name != name and cache_type.reclaimer is not None
         )
@@ -555,6 +560,23 @@ class CacheArenaAllocator:
     @property
     def num_used_physical_pages(self) -> int:
         return self._used_physical_pages
+
+    @staticmethod
+    def _reclaimable_pages(cache_type: ArenaCacheType) -> int:
+        if cache_type.reclaimer is None:
+            return 0
+        count = (cache_type.reclaimable_count()
+                 if cache_type.reclaimable_count is not None
+                 else len(cache_type.live_slots))
+        return count * cache_type.pages_per_slot
+
+    @property
+    def num_non_reclaimable_physical_pages(self) -> int:
+        """Owned pages excluding idle cache entries eligible for eviction."""
+        return self._used_physical_pages - sum(
+            self._reclaimable_pages(cache_type)
+            for cache_type in self._types.values()
+        )
 
 
 class RegisteredCache:

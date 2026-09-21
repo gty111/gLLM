@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 import gllm.runtime.input_data as input_data_module
 from gllm.runtime.input_data import InputData
@@ -18,9 +19,14 @@ class _SnapshotSegment:
         self.page2ssm_snapshot[page_num] = 7
         return 7
 
+    def publish_ssm_snapshot(self, page_num, slot):
+        if self.page2ssm_snapshot[page_num] == slot:
+            self.page2ssm_snapshot_valid[page_num] = True
 
-def test_overlap_snapshot_is_reserved_and_published_at_launch(monkeypatch):
-    monkeypatch.setattr(input_data_module, "get_pp_size", lambda: 1)
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_overlap_snapshot_is_reserved_and_published_at_launch(monkeypatch, pp_size):
+    monkeypatch.setattr(input_data_module, "get_pp_size", lambda: pp_size)
     segment = _SnapshotSegment()
     manager = SimpleNamespace(
         page_size=16,
@@ -42,8 +48,8 @@ def test_overlap_snapshot_is_reserved_and_published_at_launch(monkeypatch):
 
     # Merely prebuilding an overlap batch must not mutate snapshot ownership or
     # make zero-initialized storage visible to a later prefix-cache lookup.
-    assert segment.calls == []
-    assert data.ssm_snapshot_write_slot_per_seq_cpu.tolist() == [-1]
+    assert segment.calls == ([] if pp_size == 1 else [(15, 256)])
+    assert data.ssm_snapshot_write_slot_per_seq_cpu.tolist() == ([-1] if pp_size == 1 else [7])
     assert not any(segment.page2ssm_snapshot_valid)
 
     data._materialize_ssm_snapshot_targets()
