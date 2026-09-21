@@ -194,6 +194,25 @@ class OverlapWorker(Worker):
                 self.model_runner,
                 self.schedule_method,
             )
+            self.scheduler.preemption_barrier = self._preemption_barrier
+
+    def _preemption_barrier(self) -> bool:
+        """Retire in-flight owners before cache-pressure retraction.
+
+        Scheduling normally overlaps pending output. Resetting a victim in
+        that window would turn FutureMap placeholders into prefill input or
+        let MTP finalize subtract its reservation from already-reset progress.
+        This boundary is used only on allocation pressure, never per batch.
+        All launched readers must finish before physical cache release, even
+        if the victim's own output has already been collected.
+        """
+        changed = bool(self._gpu_pending or self._mtp_pending or self._pending_frees)
+        self._drain_pending()
+        self._drain_mtp_pending()
+        # A completed mixed prefill may own x1 only in the GPU relay. Commit
+        # it before preemption clears that state, preserving output exactly
+        # once and the correct re-prefill boundary.
+        return self._publish_mtp_relay_only() or changed
 
     # ------------------------------------------------------------------
     # Forward-pipeline helpers

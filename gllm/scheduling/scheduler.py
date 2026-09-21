@@ -101,6 +101,11 @@ class Scheduler:
         # request. Keep this mode until the retracted requests finish/abort so
         # their cached prefixes cannot immediately recreate the same deadlock.
         self._prefill_recovery_ids = set()
+        # Overlap workers must retire GPU readers and authoritative output
+        # before a request's cache/progress can be reset. Called only under
+        # cache pressure; synchronous workers have nothing to retire.
+        self.preemption_barrier = None
+        self._preemption_barrier_epoch = 0
         # log
         self.log = True
         # Seq-ids that finished / aborted since the last time we built a
@@ -318,11 +323,20 @@ class Scheduler:
         return ipc_package
 
     def check_preempt(self, num_tokens_to_allocate):
+        """Reclaim decode owners; return True if admission must be recalculated."""
         if (
             self.get_num_free_pages() >= num_tokens_to_allocate
             or len(self.seqs_to_decode) == 0
         ):
             return
+
+        barrier = getattr(self, "preemption_barrier", None)
+        if barrier is not None and barrier():
+            # EOS can remove a candidate and MTP can compact its optimistic
+            # history. The caller must recompute page demand before choosing
+            # victims; the old demand may no longer require any preemption.
+            self._preemption_barrier_epoch += 1
+            return True
 
         # Victim selection (SGLang-style retract): evict the largest-footprint
         # decode seqs first so each preemption reclaims the most pages -> fewer
@@ -336,6 +350,10 @@ class Scheduler:
             if self.get_num_free_pages() >= num_tokens_to_allocate:
                 break
             self.seqs_to_decode.remove(seq_to_preempt)
+            logger.info(
+                "Preempting decode request %s (%s tokens, %s cache pages); queued for recompute",
+                seq_to_preempt.seq_id, len(seq_to_preempt), len(seq_to_preempt.page_table),
+            )
             self.model_runner.free(seq_to_preempt)
             seq_to_preempt.preempt()
             # Don't notify followers here: the seq is being re-queued as a
@@ -411,6 +429,12 @@ class Scheduler:
         return bool(seq.page_table) or seq.recurrent_state_slot is not None
 
     def _recover_stalled_prefills(self):
+        barrier = getattr(self, "preemption_barrier", None)
+        if barrier is not None and barrier():
+            # A partial prefill can still be executing even when no decode
+            # owner is queued. Retire it before freeing its shared KV/SSM
+            # pages, then retry admission on the next tick with fresh state.
+            return
         owners = [seq for seq in self.seqs_to_prefill if self._owns_cache(seq)]
         blocked_owners = [seq for seq in self._blocked_prefills if self._owns_cache(seq)]
         if blocked_owners:
@@ -481,10 +505,15 @@ class Scheduler:
         ):
             self._blocked_prefills = []
             preemptions_before = self.num_preempt_seqs
+            barrier_epoch = self._preemption_barrier_epoch
             schedule_seqs = self.schedule()
             if (not schedule_seqs and not self.batch_running
                     and not self.seqs_to_decode and self._blocked_prefills
-                    and self.num_preempt_seqs == preemptions_before):
+                    and self.num_preempt_seqs == preemptions_before
+                    and self._preemption_barrier_epoch == barrier_epoch):
+                # A barrier may have completed the decode owners after this
+                # tick calculated its prefill reserve. Retry with a fresh
+                # reserve before diagnosing a capacity deadlock.
                 self._recover_stalled_prefills()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
@@ -715,14 +744,16 @@ class Scheduler:
         self, decode_token_budget, token_budget=None, mtp_eligible=True
     ):
         decode_batch: List[GenerationSequence] = []
-        candidates = list(self.seqs_to_decode)[:decode_token_budget]
-        width = self._decode_tokens_per_seq(len(candidates), mtp_eligible=mtp_eligible)
-        # Ordinary decode computes the final token already in token_ids.
-        # MTP additionally preallocates len(seq) + 1 + k in the runner.
-        lookahead = width if width > 1 else 0
-        pages_needed = sum(max(0, (len(seq) + lookahead + self.page_size - 1) // self.page_size
-                               - len(seq.page_table)) for seq in candidates)
-        self.check_preempt(pages_needed)
+        while True:
+            candidates = list(self.seqs_to_decode)[:decode_token_budget]
+            width = self._decode_tokens_per_seq(len(candidates), mtp_eligible=mtp_eligible)
+            # Ordinary decode computes the final token already in token_ids.
+            # MTP additionally preallocates len(seq) + 1 + k in the runner.
+            lookahead = width if width > 1 else 0
+            pages_needed = sum(max(0, (len(seq) + lookahead + self.page_size - 1) // self.page_size
+                                   - len(seq.page_table)) for seq in candidates)
+            if not self.check_preempt(pages_needed):
+                break
         num_to_schedule = min(decode_token_budget, len(self.seqs_to_decode))
         if token_budget is not None and num_to_schedule > 0:
             tokens_per_seq = self._decode_tokens_per_seq(
