@@ -12,6 +12,7 @@ from test_output_budget import FakeStream, make_engine
 @pytest.fixture
 def completion_client(monkeypatch):
     engine = make_engine(context=16)
+    engine.generation_config.repetition_penalty = 1.05
     encoded, admitted = [], []
     def encode(text):
         assert isinstance(text, str)
@@ -25,7 +26,10 @@ def completion_client(monkeypatch):
         kwargs.pop('dp_index', None)
         seq = engine.allocate_seq(*args, **kwargs)
         admitted.append(list(seq.token_ids))
+        admitted_penalties.append(seq.repetition_penalty)
         return FakeStream(seq)
+    admitted_penalties = []
+    engine.admitted_penalties = admitted_penalties
     engine.add_requests_async = add_requests
     monkeypatch.setattr(api_server, 'llm', engine)
     with TestClient(api_server._build_app()) as client:
@@ -79,3 +83,17 @@ def test_text_prompt_keeps_existing_encoding(completion_client):
     response = client.post('/v1/completions', json=dict(model='test', prompt='Hello', max_tokens=1))
     assert response.status_code == 200
     assert encoded == ['Hello'] and admitted == [[1, 2]]
+
+
+@pytest.mark.parametrize('prompt', ['Hello', [1, 2]])
+@pytest.mark.parametrize('overrides,expected', [
+    ({}, 1.05), ({'repetition_penalty': None}, 1.05),
+    ({'repetition_penalty': 1.0}, 1.0), ({'repetition_penalty': 1.1}, 1.1),
+])
+def test_completion_inherits_or_overrides_repetition_penalty(completion_client, prompt, overrides, expected):
+    client, _, _ = completion_client
+    response = client.post('/v1/completions', json=dict(
+        model='test', prompt=prompt, max_tokens=1, **overrides,
+    ))
+    assert response.status_code == 200, response.text
+    assert api_server.llm.admitted_penalties == [expected]
