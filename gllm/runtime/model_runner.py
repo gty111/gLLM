@@ -838,11 +838,30 @@ class ModelRunner:
         )
         self._deepseek_encoder_variant = None
         self._use_dsv32_encoder = False
-        # Multimodal bookkeeping (text-only for the frontend: the worker fleet
-        # owns any vision tower; the frontend only tokenizes + routes).
-        self.use_mm = False
-        self.is_kimi_mm = False
-        self.processor = None
+        # Multimodal metadata MUST mirror the real runner: capability checks
+        # (e.g. the /v1/responses image-capability gate) and chat-template
+        # preprocessing read these off the frontend's model_runner. The
+        # processor is CPU-only here -- it only does tokenization/image-grid
+        # preprocessing, never touches the (skipped) vision tower weights.
+        self.use_mm = self.model_loader.use_mm
+        self.is_kimi_mm = (
+            self.model_loader.architecture == "KimiK25ForConditionalGeneration"
+        )
+        self.uses_mrope = self.use_mm and not self.is_kimi_mm
+        if self.use_mm and self.is_kimi_mm:
+            self.processor = AutoProcessor.from_pretrained(
+                model_path, trust_remote_code=True, use_fast=True
+            )
+            self.image_processor = None
+            self.video_processor = None
+        elif self.use_mm:
+            self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+            self.image_processor = self.processor.image_processor
+            self.video_processor = self.processor.video_processor
+        else:
+            self.processor = None
+            self.image_processor = None
+            self.video_processor = None
         self.maxp = 0
         self.maxd = 0
         self.minp = 0

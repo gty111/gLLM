@@ -200,16 +200,31 @@ class AsyncLLM(LLM):
                 await self._run_engine_io(super().schedule)
             except Exception as e:
                 # Decoupled deployment: the worker fleet died (endpoint file
-                # vanished / unreadable). Fail every in-flight stream fast
-                # instead of hanging them; keep the event loop alive so a
-                # frontend *process* restart is NOT required -- once the
-                # worker fleet is back (or this frontend is re-launched),
-                # service resumes. A monolith engine never raises here in
-                # practice (check_worker_alive does sys.exit), so this is a
-                # no-op on the legacy path.
+                # vanished / unreadable, raised by check_standalone_worker
+                # *before* any transport use). Fail every in-flight stream
+                # fast instead of hanging them; keep the event loop alive so
+                # a frontend *process* restart is NOT required -- once the
+                # worker fleet republishes its endpoint file, the watcher
+                # reconnects in-process and service resumes. Note the uuid
+                # change does NOT raise out of the engine IO (the watcher
+                # reconnects inside it); that path terminates streams via
+                # :meth:`on_standalone_reconnect` instead. A monolith engine
+                # never raises here in practice (check_worker_alive does
+                # sys.exit), so this is a no-op on the legacy path.
                 self._fail_open_streams(e)
                 await asyncio.sleep(1.0)
             await asyncio.sleep(0)
+
+    def on_standalone_reconnect(self, reason: Exception):
+        """Explicit cleanup at a transport transition (worker fleet restart).
+
+        The restarted fleet has no memory of the sequences this frontend is
+        tracking, and the transition does NOT surface as an exception to
+        :meth:`schedule` (the watcher reconnects inside the engine IO call
+        and returns normally) -- so without this hook the client streams
+        would wait forever and their ids would leak.
+        """
+        self._fail_open_streams(reason)
 
     def _fail_open_streams(self, exc: Exception):
         """Terminate every outstanding async stream with ``exc`` and drop the

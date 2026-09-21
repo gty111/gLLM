@@ -582,6 +582,11 @@ class Worker(TorchProfilerMixin):
         if self._polls_frontend():
             cum = IPCPackage([])
             saw_log_override = False
+            # Last non-None frontend session epoch observed in this drain.
+            # Carried onto the OUTPUT package so a restarted frontend (fresh
+            # id pool starting at 0) can drop outputs still in flight for the
+            # DEAD session's ids, which collide numerically with its own.
+            session_epoch = None
             while True:
                 ipc_package = self.comm.recv_ipc_package()
                 if ipc_package is None:
@@ -591,6 +596,8 @@ class Worker(TorchProfilerMixin):
                 if ipc_package.log is not None:
                     cum.log = ipc_package.log
                     saw_log_override = True
+                if getattr(ipc_package, "session_epoch", None) is not None:
+                    session_epoch = ipc_package.session_epoch
                 if ipc_package.control_cmd is not None:
                     code, data = self._translate_control_cmd(
                         ipc_package.control_cmd
@@ -600,6 +607,11 @@ class Worker(TorchProfilerMixin):
                         cum.control_data = data
             if not saw_log_override:
                 cum.log = None
+            cum.session_epoch = session_epoch
+            # Remember it for output packages built outside the drain path
+            # (abort / process_output replies), which otherwise have no
+            # inbound package to read the stamp from.
+            self.current_session_epoch = session_epoch
 
         # TP0 control plane: drive the disagg coordinator (discovery / meta /
         # notif / dispatch / watchdog) once per iter and attach the resulting
@@ -709,12 +721,17 @@ class Worker(TorchProfilerMixin):
         """Process aborts on every column driver; only the driver replies."""
         ipc_package = self.scheduler.check_abort_seqs()
         if ipc_package is not None and self._polls_frontend():
+            # Stamp with the current frontend session so a restarted frontend
+            # can tell these (old-session) frees from its own request ids.
+            ipc_package.session_epoch = getattr(self, "current_session_epoch", None)
             self.comm.send_output(ipc_package)
 
     def process_output(self):
         """Finalize this column's batch; only the driver replies to frontend."""
         ipc_package = self.scheduler.process_output()
         if ipc_package is not None and self._polls_frontend():
+            # Stamp with the current frontend session (see check_abort_seqs).
+            ipc_package.session_epoch = getattr(self, "current_session_epoch", None)
             self.comm.send_output(ipc_package)
 
     def _build_schedule_payload(

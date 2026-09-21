@@ -96,6 +96,12 @@ class LLM:
         self.worker_endpoint_file = worker_endpoint_file
         self._worker_writer = None  # WorkerEndpointWriter (standalone worker)
         self.worker_transport_base_port = worker_transport_base_port
+        # Frontend session epoch (see IPCPackage.session_epoch). Every
+        # (re)started frontend mints a NEW epoch so a surviving worker fleet
+        # can tell our request ids apart from the ids a dead frontend's
+        # in-flight requests were still producing -- both id pools restart
+        # at 0, so matching by seq_id alone cross-links the two sessions.
+        self.frontend_epoch = random_uuid()
         self.model_path = model_path
         self.load_format = load_format
         # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig) or
@@ -286,9 +292,21 @@ class LLM:
         )
 
         ipc_path_prefix = random_uuid()
-        self.schedule_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_schedule"
-        self.output_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_output"
-        self.token_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_token"
+        base_port = getattr(self, "worker_transport_base_port", None)
+        if self.standalone_worker and base_port:
+            # TCP mode: the published endpoint file and the sockets the
+            # spawned worker actually binds MUST be the same fixed addresses
+            # (schedule=base, output=base+1, token=base+2 on the bind host),
+            # otherwise a remote frontend connects to one address while the
+            # worker listens on a random local ipc path.
+            p = int(base_port)
+            self.schedule_path = f"tcp://{self.host or '0.0.0.0'}:{p}"
+            self.output_path = f"tcp://{self.host or '0.0.0.0'}:{p + 1}"
+            self.token_path = f"tcp://{self.host or '0.0.0.0'}:{p + 2}"
+        else:
+            self.schedule_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_schedule"
+            self.output_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_output"
+            self.token_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_token"
 
         self._init_frontend_comm()
 
@@ -400,6 +418,10 @@ class LLM:
         prev = getattr(self, "comm", None)
         if prev is not None:
             try:
+                prev.drain_request_buffer()
+            except Exception:
+                pass
+            try:
                 prev.close()
             except Exception:
                 pass
@@ -423,12 +445,17 @@ class LLM:
         self.output_path = ep["output"]
         self.token_path = ep["token"]
 
-    def reconnect_comm(self):
+    def reconnect_comm(self, terminate_reason: Exception = None):
         """Re-resolve the worker fleet after it restarted (new uuid).
 
         Called by the standalone watcher from the engine IO executor thread.
         In-flight zmq messages are lost with the old transport; that is the
         intended blast radius (a restarted worker loses its KV cache anyway).
+
+        ``terminate_reason``: when given (the watcher caught a worker-down
+        error), it is handed to :meth:`on_standalone_reconnect` AFTER the new
+        transport is up, so the async layer terminates every in-flight client
+        stream and releases its ids as an explicit step of the transition.
         """
         from gllm.entrypoints.worker_endpoint import read_worker_endpoint_file
 
@@ -451,13 +478,17 @@ class LLM:
                 self._worker_endpoints = endpoints
                 self._build_standalone_frontend_comm(endpoints)
                 # The restarted fleet has no memory of these sequences: drop
-                # the frontend-side bookkeeping. The async layer (AsyncLLM)
-                # terminates the client streams from the exception path the
-                # next schedule tick takes; monolith callers have no streams.
+                # the frontend-side bookkeeping.
                 with self._pending_lock:
                     self.wait_lists = []
                     self.abort_ids = []
                 self.running_maps.clear()
+                # Explicit stream termination + id release for this
+                # transition (overridden by AsyncLLM).
+                self.on_standalone_reconnect(
+                    terminate_reason
+                    or RuntimeError("worker fleet restarted; stale request")
+                )
                 return
             last_err = "endpoint file absent (worker down?)"
             if time.time() > deadline:
@@ -468,6 +499,14 @@ class LLM:
                 )
             logger.warning("Worker down; polling %s for republish (%s)", path, last_err)
             time.sleep(1.0)
+
+    def on_standalone_reconnect(self, reason: Exception):
+        """Hook for the transport-transition cleanup.
+
+        ``LLM`` holds no client streams (``async_streams`` is None), so the
+        base implementation is a no-op; :class:`AsyncLLM` overrides it to
+        fail every in-flight stream and release the ids.
+        """
 
     def check_standalone_worker(self):
         """Heartbeat/liveness check for the standalone worker fleet.
@@ -770,6 +809,15 @@ class LLM:
 
     def _apply_ipc_package(self, ipc_package):
         if ipc_package is not None:
+            # Session isolation: a worker fleet that outlives a frontend keeps
+            # producing outputs for the DEAD session's request ids, which are
+            # numerically identical to ids this (new) frontend already
+            # allocated (both pools start at 0). Apply only outputs stamped
+            # with OUR epoch; drop foreign ones. Packages without a stamp are
+            # accepted (legacy workers predate the field).
+            stamp = getattr(ipc_package, "session_epoch", None)
+            if stamp is not None and stamp != getattr(self, "frontend_epoch", None):
+                return 0
             had_async_streams = bool(self.async_streams)
             # ``async_streams`` is a dict on the async server (monolith /
             # standalone frontend) and ``None`` on a bare engine such as the
@@ -801,7 +849,13 @@ class LLM:
                         raw_prompt_lp = ipc_package.prompt_logprobs.get(id)
                         if raw_prompt_lp is not None:
                             prompt_lp = self._make_prompt_logprobs(raw_prompt_lp)
-                        self.async_streams[id].put(
+                        stream = self.async_streams.get(id)
+                        if stream is None:
+                            # Terminal token for a sequence already retired
+                            # through free_ids (see the pop guard below);
+                            # nothing left to feed.
+                            continue
+                        stream.put(
                             StreamOutput(text, logprob, prompt_lp, control_tokens=controls)
                         )
                     else:
@@ -853,6 +907,7 @@ class LLM:
             )
         ipc_package.abort_ids = abort_ids
         ipc_package.log = log
+        ipc_package.session_epoch = self.frontend_epoch
         self.comm.send_ipc_package(ipc_package)
 
     def _send_ipc_package_dp(self, wait_lists, abort_ids, log=True):
@@ -907,8 +962,62 @@ class LLM:
         else:
             self.check_worker_alive()
         num_finish_seqs = self.recv_ipc_package()
-        self.send_ipc_package(log)
+        if self.standalone_frontend:
+            self._dispatch_pending()
+        else:
+            self.send_ipc_package(log)
         return num_finish_seqs
+
+    def _dispatch_pending(self):
+        """Drain ``wait_lists``/``abort_ids`` and ship them to the worker.
+
+        Returns True when the fleet received the payload, False when there
+        is nothing to send or the transport refused it (non-blocking send
+        timeout) -- on refusal the pending state is REQUEUED so the next
+        tick retries instead of dropping requests.
+        """
+        with self._pending_lock:
+            if len(self.wait_lists) == 0 and len(self.abort_ids) == 0:
+                return True
+            wait_lists = self.wait_lists
+            abort_ids = self.abort_ids
+            self.wait_lists = []
+            self.abort_ids = []
+
+        for seq in wait_lists:
+            self.running_maps[seq.seq_id] = seq
+        if self.dp_size > 1:
+            # Non-standalone path: keep the historical blocking send.
+            self._send_ipc_package_dp(wait_lists, abort_ids, True)
+            return True
+        ipc_package = IPCPackage(wait_lists)
+        if len(abort_ids) != 0:
+            logger.warning(
+                f"Abort {len(abort_ids)} request(s) due to loss of network connection"
+            )
+        ipc_package.abort_ids = abort_ids
+        ipc_package.log = True
+        ipc_package.session_epoch = self.frontend_epoch
+        if self.standalone_frontend:
+            # The standalone transport has a peer that can legitimately be
+            # gone; a blocking send would then park the single engine-IO
+            # thread (taking the liveness check and /health down with it).
+            if self.comm.send_ipc_package_nonblocking(ipc_package):
+                return True
+            with self._pending_lock:
+                # Undo the bookkeeping and let the next tick retry.
+                for seq in wait_lists:
+                    self.running_maps.pop(seq.seq_id, None)
+                self.wait_lists = wait_lists + self.wait_lists
+                self.abort_ids = abort_ids + self.abort_ids
+            logger.warning(
+                "Worker transport not ready; requeued %d pending request(s) "
+                "for the next tick.",
+                len(wait_lists),
+            )
+            return False
+        self.comm.send_ipc_package(ipc_package)
+        return True
 
     def check_seq_length(self, token_ids: List[int], output_len: Optional[int]):
         try:

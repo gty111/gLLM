@@ -1,5 +1,7 @@
+import pickle
 import queue
 import threading
+import time
 from typing import Dict, List, Optional
 
 import torch
@@ -59,6 +61,15 @@ class IPCPackage:
         # ``None`` when the seq did not request logprobs. Empty on the common
         # (no-logprobs) path so it adds nothing to the pickled payload.
         self.logprobs = []
+        # Frontend session epoch: the id of the frontend PROCESS that minted
+        # this package's schedule_lists (LLM.frontend_epoch, random per
+        # process). A worker fleet that outlives a frontend must know which
+        # session a seq_id belongs to before applying its outputs: both the
+        # old and the new frontend's id pools start at 0, so a bare seq_id
+        # match would let the dead session's trailing tokens / free_ids land
+        # on the new session's request 0 (cross-session corruption + early
+        # EOS). Absent on payloads pickled by a pre-epoch frontend.
+        self.session_epoch = None
         # Prompt-token logprobs, keyed by seq_id, sent once when a seq finishes
         # prefill. Each value is the seq's ``prompt_logprobs_data`` list
         # (per prompt position: ``None`` or ``(token_id, logprob, ids, vals)``).
@@ -198,7 +209,13 @@ class zmqComm:
             req_path = self.schedule_path
             if self.dp_size > 1:
                 req_path = f"{self.schedule_path}_dp{self.dp_rank}"
-            self.request_socket = make_socket(self.ctx, req_path, zmq.PULL)
+            # tcp:// request endpoints are bound (standalone worker exposing a
+            # fixed, remotely reachable port); ipc:// goes through make_socket
+            # (bind + buffer tuning).
+            if req_path.startswith("tcp://"):
+                self.request_socket = make_pull_bind(self.ctx, req_path)
+            else:
+                self.request_socket = make_socket(self.ctx, req_path, zmq.PULL)
             self.output_socket = make_socket(self.ctx, self.output_path, zmq.PUSH)
             if pp_size > 1:
                 # last-stage output_rank => this column's PP=0 driver : next
@@ -651,6 +668,48 @@ class zmqComm:
     def send_ipc_package(self, ipc_package):
         self.request_socket.send_pyobj(ipc_package)
 
+    def send_ipc_package_nonblocking(self, ipc_package, timeout=1.0) -> bool:
+        """Send without the ability to wedge the caller's thread.
+
+        A blocking ``send_pyobj`` on a PUSH socket with a large SNDBUF parks
+        the whole payload in a zero-copy buffer and only returns once it is
+        fully staged -- with no connected receiver (worker fleet down) that
+        is effectively forever. The standalone-frontend schedule loop runs on
+        the *single* engine-IO thread, so a parked send also blocks the
+        liveness check, reconnect and /health probe behind it.
+
+        Sends with a wall-clock bound instead: True when the payload was
+        accepted, False on timeout (caller decides whether to retry/queue).
+        """
+        data = pickle.dumps(ipc_package)
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.request_socket.poll(timeout=1000) != 0:
+                try:
+                    self.request_socket.send(data, zmq.NOBLOCK)
+                    return True
+                except zmq.ZMQError:
+                    pass  # buffer filled mid-flush; re-poll
+            if time.monotonic() >= deadline:
+                return False
+
+    def drain_request_buffer(self):
+        """Best-effort drop of anything left staged on the request PUSH.
+
+        Called after the worker transport is torn down (fleet restart): the
+        old socket's buffers may hold payloads addressed to a fleet that is
+        gone, and a brand-new socket on the same endpoint must start clean.
+        ZeroMQ buffers are per-socket, so this is belt-and-braces for the
+        local case where an OS-level endpoint could replay them.
+        """
+        sock = getattr(self, "request_socket", None)
+        if sock is None:
+            return
+        while True:
+            try:
+                sock.recv(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
     def send_ipc_package_to_dp(self, ipc_package, dp_index):
         """Send a package to one DP replica (frontend, dp_size > 1 only)."""
         self.request_sockets[dp_index].send_pyobj(ipc_package)

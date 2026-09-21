@@ -146,3 +146,224 @@ def test_standalone_worker_skips_frontend_comm():
     eng.dp_size = 1
     eng._init_frontend_comm()
     assert eng.comm is None
+
+
+# ---------------------------------------------------------------------------
+# Review regression tests: session isolation, bounded send, reconnect cleanup,
+# TCP rendezvous, metadata-only multimodal flags.
+# ---------------------------------------------------------------------------
+
+
+def _bare_llm():
+    """A standalone-frontend LLM shell without constructing the real engine
+    (which would wait on the endpoint file / build runners)."""
+    from gllm.engine.llm import LLM
+
+    eng = LLM.__new__(LLM)
+    import threading as _threading
+    eng.standalone_frontend = True
+    eng.standalone_worker = False
+    eng.async_streams = {}
+    eng._pending_lock = _threading.Lock()
+    eng.wait_lists = []
+    eng.abort_ids = []
+    eng.running_maps = {}
+    eng.frontend_epoch = "epoch-A"
+    eng.dp_size = 1
+    # Bare-engine stand-in: _apply_ipc_package's async path derefs these.
+    # Fake tokenizer: decode([t]) -> chr(A+t); no special tokens, no spacing.
+    from types import SimpleNamespace
+    eng.model_runner = SimpleNamespace(tokenizer=SimpleNamespace(
+        decode=lambda toks, **kw: "".join(chr(65 + t) for t in toks),
+        all_special_ids=[],
+    ))
+    eng._reasoning_controls = ()
+    return eng
+
+
+def test_foreign_session_outputs_are_dropped():
+    """P1-1: outputs stamped with a DEAD frontend's epoch must not be applied
+    to this frontend's identically-numbered request ids (id pools both start
+    at 0)."""
+    from gllm.distributed.comm import IPCPackage
+    from gllm.runtime.sequence import GenerationSequence
+
+    eng = _bare_llm()
+    seq = GenerationSequence(seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
+    eng.running_maps[0] = seq
+
+    pkg = IPCPackage([])
+    pkg.act_schedule_ids = [0]
+    pkg.next_tokens = [[42]]
+    pkg.session_epoch = "epoch-OLD-dead-frontend"
+    n = eng._apply_ipc_package(pkg)
+    assert n == 0, "foreign-session package must be dropped entirely"
+    assert seq.token_ids == [1], "no token may land on the new session seq"
+    assert 0 in eng.running_maps, "seq must not be retired by foreign output"
+
+    # Same package stamped with OUR epoch applies normally.
+    pkg.session_epoch = "epoch-A"
+    n = eng._apply_ipc_package(pkg)
+    assert n == 0  # 42 is not EOS; no retire, but the token WAS applied
+    # token 42 appended after the prompt token 1.
+    assert seq.token_ids == [1, 42]
+
+    # Unstamped (legacy) packages are accepted for backward compatibility.
+    seq2 = GenerationSequence(seq_id=1, token_ids=[1], finish_tokens=None, output_len=8)
+    eng.running_maps[1] = seq2
+    pkg2 = IPCPackage([])
+    pkg2.act_schedule_ids = [1]
+    pkg2.next_tokens = [[7]]
+    pkg2.session_epoch = None
+    eng._apply_ipc_package(pkg2)
+    assert seq2.token_ids == [1, 7]
+
+
+def test_send_is_bounded_when_peer_is_down():
+    """P1-2: a non-blocking dispatch to a transport with no receiver must
+    return False within the bound instead of parking the engine-IO thread,
+    and the pending requests must be requeued for retry."""
+    import time as _time
+    import zmq as _zmq
+
+    from gllm.distributed.comm import zmqComm
+
+    sched_path = "ipc:///tmp/_gllm_nopeer_sched_%d" % os.getpid()
+    comm = zmqComm(
+        "127.0.0.1", "normal", "127.0.0.1",
+        sched_path,
+        "ipc:///tmp/_gllm_nopeer_out_%d" % os.getpid(),
+        "ipc:///tmp/_gllm_nopeer_tok_%d" % os.getpid(),
+        frontend=True, dp_size=1, standalone_remote=True,
+    )
+    comm.init()
+
+    from gllm.distributed.comm import IPCPackage
+    from gllm.runtime.sequence import GenerationSequence
+
+    eng = _bare_llm()
+    eng.comm = comm
+    seq = GenerationSequence(seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
+    eng.wait_lists = [seq]
+    eng.frontend_epoch = "epoch-A"
+
+    t0 = _time.monotonic()
+    ok = eng._dispatch_pending()
+    dt = _time.monotonic() - t0
+    assert ok is False, "send must refuse when no peer is connected"
+    assert dt < 3.0, f"dispatch took {dt:.1f}s; must be bounded by ~1s"
+    # Requeued, still runnable on the next tick.
+    assert eng.wait_lists == [seq], "pending request must be requeued"
+    assert 0 not in eng.running_maps, "bookkeeping must be undone on refusal"
+    comm.close()
+
+
+def _make_stream():
+    """Minimal stand-in for AsyncStream: put()/finish(), tracks finished."""
+    import collections
+
+    class _S:
+        def __init__(self):
+            self.q = collections.deque()
+            self.finished = False
+
+        def put(self, x):
+            self.q.append(x)
+
+        def finish(self):
+            if not self.finished:
+                self.finished = True
+
+    return _S()
+
+
+def test_reconnect_terminates_streams_and_frees_ids():
+    """P1-3: a worker restart (new transport uuid) must terminate every
+    in-flight client stream and release its ids as an explicit transition
+    step -- the exception does NOT propagate on this path."""
+    eng2 = _bare_llm()
+    eng2.running_maps = {0: object()}
+    eng2.async_streams = {0: _make_stream()}
+    from gllm.engine.async_llm import AsyncLLM as _AsyncLLM
+    from gllm.runtime.id_allocator import IDAllocator
+    eng2.id_allocator = IDAllocator(0, 99999)
+    eng2.id_allocator.allocate(0)  # mark 0 in use
+    # Expose the AsyncLLM helpers on the bare engine (same semantics; the
+    # real object gets them through inheritance).
+    eng2._fail_open_streams = _AsyncLLM._fail_open_streams.__get__(eng2)
+    _AsyncLLM.on_standalone_reconnect(eng2, RuntimeError("worker restarted"))
+    assert eng2.async_streams == {}, "streams must be terminated"
+    assert eng2.running_maps == {}, "bookkeeping must be cleared"
+    assert eng2.id_allocator.is_free(0), "ids must be released"
+    assert eng2.wait_lists == [] and eng2.abort_ids == []
+
+
+def test_endpoint_file_publishes_matching_tcp_addresses():
+    """P2-1: in TCP mode the endpoint file must advertise exactly the fixed
+    addresses the worker child will bind (schedule=base, output=base+1,
+    token=base+2 on the host)."""
+    from gllm.engine.llm import LLM
+
+    eng = LLM.__new__(LLM)
+    eng.standalone_worker = True
+    eng.host = "127.0.0.1"
+    eng.worker_transport_base_port = 59990
+    eng.worker_endpoint_file = "/tmp/_gllm_tcp_ep_test_%d.json" % os.getpid()
+    eng._publish_worker_endpoint()
+    from gllm.entrypoints import worker_endpoint as we
+    uuid_, eps = we.read_worker_endpoint_file(eng.worker_endpoint_file)
+    ep = eps[0]
+    assert ep["schedule"] == "tcp://127.0.0.1:59990"
+    assert ep["output"] == "tcp://127.0.0.1:59991"
+    assert ep["token"] == "tcp://127.0.0.1:59992"
+    eng._worker_writer.cleanup()
+
+
+def test_tcp_pull_bind_roundtrip():
+    """P2-1: a make_pull_bind PULL on tcp:// must exchange frames with the
+    frontend-style PUSH (the roles the standalone worker/frontend use)."""
+    import zmq as _zmq
+
+    from gllm.utils import make_pull_bind, make_socket
+
+    path = "tcp://127.0.0.1:0"  # can't use :0 for a fixed bind; use real port
+    port = 59991
+    path = "tcp://127.0.0.1:%d" % port
+    ctx = _zmq.Context()
+    pull = make_pull_bind(ctx, path)
+    push = make_socket(ctx, path, _zmq.PUSH)
+    push.send_pyobj({"r": 1})
+    got = None
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if pull.poll(timeout=200):
+            got = pull.recv_pyobj()
+            break
+    assert got == {"r": 1}
+    pull.close(linger=0)
+    push.close(linger=0)
+    ctx.term()
+
+
+def test_metadata_only_preserves_mm_flag(tmp_path):
+    """P2-2: load_metadata must mirror the loader's multimodal flag instead
+    of forcing text-only (capability gates read use_mm off the frontend)."""
+    from unittest import mock
+    import gllm.runtime.model_runner as mr
+
+    fake_loader = mock.Mock()
+    fake_loader.use_mm = True
+    fake_loader.architecture = "Qwen3VLForConditionalGeneration"
+    with mock.patch.object(mr, "ModelLoader", return_value=fake_loader), \
+         mock.patch.object(mr.ModelRunner, "resolve_model_max_length",
+                           staticmethod(lambda mml: 4096)), \
+         mock.patch.object(mr, "AutoTokenizer", create=True), \
+         mock.patch.object(mr, "AutoProcessor") as ap:
+        ap.return_value.image_processor = mock.Mock()
+        ap.return_value.video_processor = mock.Mock()
+        runner = mr.ModelRunner.load_metadata(
+            load_format="dummy", model_path="/fake", schedule_method="fcfs"
+        )
+    assert runner.use_mm is True
+    assert runner.processor is not None
+    assert runner.is_kimi_mm is False

@@ -60,6 +60,20 @@ The two sides rendezvous through a small JSON **worker endpoint file**
 Transport: `ipc://` on a single machine, or fixed `tcp://` ports
 (`--worker-transport-base-port`) so a frontend on another host can connect.
 
+### Frontend session epoch
+
+Every frontend process mints a random **session epoch** and stamps it onto
+each outgoing schedule package (`IPCPackage.session_epoch`). The worker
+carries the stamp through to the output packages it sends back, and the
+frontend applies only outputs stamped with its own epoch. This is required
+because the frontend's request-id pool (and therefore the seq ids inside
+outputs) restarts at 0 on every frontend (re)start, while a *surviving*
+worker fleet may still be emitting trailing tokens / free_ids for the dead
+frontend's requests -- numerically identical ids that would otherwise be
+applied to the new frontend's request 0 (cross-session corruption, spurious
+early EOS). Unstamped packages (pre-epoch workers) are accepted for
+backward compatibility.
+
 ## Crash semantics (verified end-to-end)
 
 | Event                              | Frontend                              | Worker fleet                     |
@@ -67,7 +81,7 @@ Transport: `ipc://` on a single machine, or fixed `tcp://` ports
 | **Worker GPU child dies**          | stays up; in-flight requests fail fast; auto-reconnects when a new worker publishes | parent watchdog removes the endpoint file and exits |
 | **New worker launched**            | detects the new `uuid`, re-connects in-process, serves immediately | fresh fleet, weights re-loaded |
 | **Frontend dies**                  | (gone) — new frontend re-reads the endpoint file and reconnects | **survives**; weights stay loaded, keeps serving |
-| **New frontend launched**          | connects to the still-running worker (same `uuid`) | unchanged |
+| **New frontend launched**          | connects to the still-running worker (same `uuid`); mints a fresh session epoch, so late outputs for the dead frontend's ids are dropped by the worker's stamp | unchanged |
 
 ## Usage
 
@@ -103,9 +117,13 @@ worker_unavailable` when it is down.
 
 ## Scope & limitations (current)
 
-* Single-rank worker fleets are fully supported (`--tp 1`). Multi-rank fleets
-  (TP>1 / PP>1) publish one transport row per rank but the standalone frontend
-  currently connects rank 0's transport; wire the extra ranks up as needed.
+* Single-rank worker fleets are fully supported (`--tp 1`), including the
+  cross-machine `tcp://` transport (`--worker-transport-base-port`): the
+  worker child binds the exact fixed addresses published in the endpoint
+  file (schedule=base, output=base+1, token=base+2). Multi-rank fleets
+  (TP>1 / PP>1) publish one transport row per rank but the standalone
+  frontend currently connects rank 0's transport; wire the extra ranks up
+  as needed.
 * Encoder-disaggregation (`lm_server`) and DP-attention per-replica endpoints
   are orthogonal and not combined with standalone mode yet.
 * On a worker *restart* the KV cache is lost (expected — it lived in the dead
