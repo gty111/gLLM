@@ -284,7 +284,6 @@ class zmqComm:
         dp_rank=0,
         dp_size=1,
         standalone_remote=False,
-        standalone_worker=False,
     ):
         self.host_addr = host_addr
         self.master_addr = master_addr
@@ -309,7 +308,6 @@ class zmqComm:
         # set by the frontend so it knows the schedule path is remote and
         # must not be treated as a local ipc path it binds.
         self.standalone_remote = standalone_remote
-        self.standalone_worker = standalone_worker
         # Worker-side output hook installed by the Worker (None on
         # frontends): translates internal seq ids back to the dispatching
         # frontend's client ids and attaches the per-row session stamps
@@ -613,28 +611,6 @@ class zmqComm:
             return output
         else:
             return None
-
-    def frontend_gone(self) -> bool:
-        """True iff the FRONTEND side of this transport has gone away.
-
-        The worker's output leg is a PUSH into the frontend's PULL. A
-        CRASHED frontend destroys its PULL, so the kernel tears the PUSH
-        leg down and the socket starts failing immediately; a CLEAN
-        frontend death (SIGKILL) leaves the leg half-open until keepalive
-        (see :func:`_apply_tcp_keepalive`) tears it down in ~90s. Either
-        way the leg's send fileno eventually drops below 0, which this
-        detects. Only meaningful for a standalone *worker* comm (its output
-        socket is the frontend-facing PUSH); False everywhere else.
-        """
-        if not getattr(self, "standalone_worker", False):
-            return False  # frontends / monolith: no frontend-facing PUSH leg
-        sock = getattr(self, "output_socket", None)
-        if sock is None:
-            return True  # torn down entirely
-        try:
-            return sock.getsockopt(zmq.SNDFILENO) < 0
-        except Exception:
-            return False
 
     def close(self):
         """Tear down every sender thread and socket, then terminate the ctx.

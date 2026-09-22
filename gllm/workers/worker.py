@@ -210,9 +210,6 @@ class Worker(FrontendMixin, TorchProfilerMixin):
         # dispatching frontend's client ids plus per-row session stamps
         # before it hits the wire. Covers plain / overlap / MTP paths alike.
         self.comm._output_committer = self.translate_output_for_frontend
-        # Tag the frontend-facing role BEFORE init: the PUSH output leg's
-        # frontend-death detection (zmqComm.frontend_gone) keys off this.
-        self.comm.standalone_worker = self.standalone_worker
         self.comm.init()
 
         # Bring up the custom NVLink-P2P all-reduce path before the model

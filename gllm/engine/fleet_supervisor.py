@@ -41,6 +41,20 @@ _CONNECT_TIMEOUT = 300  # initial wait for the endpoint file to appear
 _RECONNECT_TIMEOUT = 600  # standby wait after a fleet restart
 
 
+class FleetDownError(RuntimeError):
+    """Raised when the worker fleet is GONE (endpoint file vanished or went
+    stale) -- as opposed to a uuid-CHANGE transition (handled in-process by
+    :meth:`FleetSupervisor.heartbeat` -> :meth:`_rebuild`, no raise) or an
+    unrelated engine-IO bug.
+
+    A dedicated type (rather than a string-matched RuntimeError) so the
+    schedule loop can route fleet-down to the time-sliced standby
+    (:meth:`FleetSupervisor.wait_ready`) via ``isinstance`` without coupling
+    to the exact message text -- changing a log line can no longer silently
+    demote fleet-down to a plain 1 Hz retry.
+    """
+
+
 class FleetSupervisor:
     def __init__(self, llm, dp_size: int):
         # The host LLM: the supervisor reads its comm / paths /
@@ -205,7 +219,7 @@ class FleetSupervisor:
             # so a crashed worker is recovered quickly.
             self._gone_since = self._gone_since or time.monotonic()
             if time.monotonic() - self._gone_since > _GRACE_SECONDS:
-                raise RuntimeError(
+                raise FleetDownError(
                     f"Worker endpoint file {path} is "
                     f"{'missing' if age is None else f'stale (age {age:.1f}s)'}; "
                     f"the worker fleet appears to be down."
@@ -219,7 +233,7 @@ class FleetSupervisor:
             if self._gone_since is None:
                 self._gone_since = time.monotonic()
             if time.monotonic() - self._gone_since > _GRACE_SECONDS:
-                raise RuntimeError(
+                raise FleetDownError(
                     f"Worker endpoint file {path} is unreadable; the worker fleet "
                     f"appears to be down."
                 )
@@ -231,8 +245,67 @@ class FleetSupervisor:
     # RECONNECT (standby: fleet down, waiting for a new incarnation)
     # ------------------------------------------------------------------
 
+    def wait_ready(self, max_wait: float) -> bool:
+        """Time-sliced fleet liveness probe (the standby primitive).
+
+        Polls the endpoint file for up to ``max_wait`` seconds:
+
+        * returns True as soon as the fleet is READY (endpoint file present
+          + parseable). The caller's NEXT heartbeat tick commits the
+          :meth:`_rebuild` via the normal uuid-change path (or no-ops when
+          the uuid is unchanged); ``wait_ready`` deliberately does NOT
+          rebuild, keeping the heavier rebuild in one place.
+        * returns False after ``max_wait`` without readiness (fleet still
+          down). No exception: the caller just retries on its next tick.
+
+        Bounding the wait is the whole point: ``schedule()`` runs on the
+        SINGLE engine-IO thread (max_workers=1), so an unbounded standby
+        (the old blocking :meth:`reconnect`, up to ``_RECONNECT_TIMEOUT``)
+        would freeze /health (queued behind the standby) and stall process
+        shutdown (executor.shutdown(wait=True)). Sliced polls leave the
+        thread free between ticks.
+        """
+        from gllm.entrypoints.worker_endpoint import (
+            endpoint_file_age_seconds,
+            read_worker_endpoint_file,
+            STALE_AFTER_SECONDS,
+        )
+
+        path = self.endpoint_file
+        deadline = time.time() + max_wait
+        while True:
+            age = endpoint_file_age_seconds(path)
+            present = age is not None and age <= STALE_AFTER_SECONDS
+            if present:
+                transport_uuid, endpoints = read_worker_endpoint_file(path)
+                if (
+                    transport_uuid is not None
+                    and endpoints
+                    and transport_uuid != self._worker_transport_uuid
+                ):
+                    # A FRESH incarnation: the next heartbeat will commit the
+                    # _rebuild. (Same-uuid means a transient glitch or the
+                    # recorded uuid was never set -- keep polling so the loop
+                    # does not spin on a stale-but-present file.)
+                    return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
+
     def reconnect(self, terminate_reason: Exception = None) -> None:
-        """Re-resolve the worker fleet after it restarted (new uuid).
+        """DEPRECATED -- superseded by :meth:`wait_ready` + heartbeat.
+
+        Kept for API compatibility; the standalone frontend no longer
+        calls it. The old fully-down path blocked this method for up to
+        ``_RECONNECT_TIMEOUT`` (600s) on the SINGLE engine-IO thread, which
+        froze /health (queued behind the standby) and stalled process
+        shutdown. Recovery is now time-sliced: ``schedule()`` polls
+        :meth:`wait_ready` for a bounded ``_STANDBY_SLICE`` each tick, and
+        the NEXT heartbeat commits the ``_rebuild`` once the fleet
+        republishes. This blocking variant is only safe off the engine-IO
+        thread.
+
+        Re-resolves the worker fleet after it restarted (new uuid).
 
         In-flight zmq messages are lost with the old transport; that is
         the intended blast radius (a restarted worker loses its KV cache

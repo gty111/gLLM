@@ -1277,33 +1277,6 @@ def test_heartbeat_driven_rebuild_on_uuid_change(tmp_path):
 # Round 8 residual-fix regressions
 # ---------------------------------------------------------------------------
 
-def test_frontend_gone_detects_dead_output_leg(tmp_path):
-    """A standalone worker's frontend-facing PUSH leg must report the
-    frontend as gone once the leg is torn down; frontends/monolith comms
-    must always report False (the check only guards the worker's leg)."""
-    import zmq as _zmq
-
-    from gllm.distributed.comm import zmqComm
-
-    path = "ipc:///tmp/_gllm_fg_%d" % os.getpid()
-    w = zmqComm("127.0.0.1", "normal", "127.0.0.1", path, path, path,
-                frontend=False, standalone_worker=True)
-    w.init()
-    # Leg bound but no PULL connected yet: zmq reports no broken pipe --
-    # "gone" must be False (a bound-but-idle leg is healthy).
-    assert w.frontend_gone() is False
-    w.close()
-    # Fully torn down: the leg is gone.
-    assert w.frontend_gone() is True
-
-    # A frontend-role comm never reports "gone" regardless of state.
-    f = zmqComm("127.0.0.1", "normal", "127.0.0.1", path, path, path,
-                frontend=True, standalone_remote=True)
-    f.init()
-    assert f.frontend_gone() is False
-    f.close()
-
-
 def test_get_sender_tracks_thread_and_close_clears(tmp_path):
     """Deterministic (no peer, no exit-timing): _get_sender records the
     spawned thread in _sender_threads, and close() signals _SHUTDOWN,
@@ -1346,28 +1319,86 @@ def test_get_sender_tracks_thread_and_close_clears(tmp_path):
         probe_ctx.term()
 
 
-def test_schedule_enters_standby_when_fleet_down(tmp_path):
+def test_schedule_enters_standby_when_fleet_down(monkeypatch):
     """The worker-DOWN branch of schedule() must drive
-    FleetSupervisor.reconnect (standby) -- it is a live path, not dead
-    code: a fleet-dead RuntimeError is classified as a fleet-down error
-    and the reconnect is invoked on the engine IO executor."""
-    from gllm.engine.async_llm import AsyncLLM
+    ``FleetSupervisor.wait_ready`` (the time-sliced standby) -- a LIVE path,
+    not dead code. A ``FleetDownError`` (raised by the supervisor heartbeat
+    when the endpoint file vanishes/goes stale) routes to ``wait_ready`` on
+    the engine-IO executor; any OTHER engine-IO error fails open and retries
+    at 1 Hz WITHOUT holding the thread.
 
-    class _FakeFleet:
-        def __init__(self):
-            self.calls = []
-        def reconnect(self, reason=None):
-            self.calls.append(reason)
-            return None
+    Drives the REAL ``AsyncLLM.schedule()`` exception handler for one tick
+    (the base ``LLM.schedule`` is stubbed so its liveness check raises the
+    configured error). Asserts ``wait_ready`` is called with the
+    ``_STANDBY_SLICE`` bound for a fleet-down error and NOT for a plain
+    error, and that ``_fail_open_streams`` runs on both branches."""
+    import asyncio
+    import gllm.engine.async_llm as alm
+    from gllm.engine.fleet_supervisor import FleetDownError
 
-    fake = _FakeFleet()
-    # _is_fleet_down_error is a pure string check: exercise it directly.
-    assert AsyncLLM._is_fleet_down_error(None, RuntimeError(
-        "Worker endpoint file /tmp/x.json is missing; the worker fleet "
-        "appears to be down.")) is True
-    assert AsyncLLM._is_fleet_down_error(None, RuntimeError(
-        "Worker endpoint file /tmp/x.json is stale (age 9.0s); the worker "
-        "fleet appears to be down.")) is True
-    assert AsyncLLM._is_fleet_down_error(None, KeyError("bogus")) is False
-    assert AsyncLLM._is_fleet_down_error(None, RuntimeError(
-        "transport uuid changed")) is False
+    class _EndTicks(Exception):
+        """Sentinel raised by the patched asyncio.sleep to stop the loop."""
+
+    def _make_llm(exc):
+        rec = {"wait_ready": [], "failed": 0}
+        class _Sub(alm.AsyncLLM):
+            standalone_frontend = True
+            async_streams = {}
+            wait_lists = {}
+            def __init__(self):
+                from concurrent.futures import ThreadPoolExecutor
+                self._engine_io_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="gllm-test-io")
+                self._rec = rec
+                # The base LLM.schedule runs check_standalone_worker() FIRST;
+                # instance-stub it to raise our error in place of the real
+                # heartbeat (no endpoint file / supervisor in this unit test).
+                self._boom = exc
+            def check_standalone_worker(self):
+                raise self._boom
+            async def check_abort_seqs(self):
+                return None
+            def _fail_open_streams(self, e):
+                self._rec["failed"] += 1
+            def wait_ready(self, max_wait):
+                self._rec["wait_ready"].append(max_wait)
+                return True
+        llm = _Sub()
+        # stand-in for self.fleet (only wait_ready is reached by the handler)
+        import types
+        llm.fleet = types.SimpleNamespace(wait_ready=llm.wait_ready)
+        return llm, rec
+
+    def _drive_one_tick(llm):
+        orig_sleep = asyncio.sleep
+        state = {"hit": 0}
+        async def _sentinel_sleep(sec):
+            if abs(sec - 1.0) < 1e-9:
+                state["hit"] += 1
+                if state["hit"] >= 1:
+                    raise _EndTicks
+            await orig_sleep(0)
+        loop = asyncio.new_event_loop()
+        try:
+            monkeypatch.setattr(asyncio, "sleep", _sentinel_sleep)
+            try:
+                loop.run_until_complete(alm.AsyncLLM.schedule(llm))
+            except _EndTicks:
+                pass
+        finally:
+            monkeypatch.setattr(asyncio, "sleep", orig_sleep)
+            loop.close()
+            llm._engine_io_executor.shutdown(wait=False)
+        return llm._rec
+
+    # Fleet DOWN -> wait_ready called with the slice; streams fail open.
+    llm, rec = _make_llm(FleetDownError("worker endpoint file gone"))
+    _drive_one_tick(llm)
+    assert rec["wait_ready"] == [alm._STANDBY_SLICE], rec["wait_ready"]
+    assert rec["failed"] >= 1, "fail-open must run on fleet-down"
+
+    # Unrelated engine-IO error -> NO standby; streams still fail open.
+    llm2, rec2 = _make_llm(KeyError("pickle"))
+    _drive_one_tick(llm2)
+    assert rec2["wait_ready"] == [], "non-fleet errors must not enter standby"
+    assert rec2["failed"] >= 1, "fail-open must run on non-fleet errors"

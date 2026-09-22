@@ -6,6 +6,7 @@ from typing import Dict, List
 from fastapi import Request
 from logger import logger
 
+from gllm.engine.fleet_supervisor import FleetDownError
 from gllm.engine.llm import LLM
 from gllm.utils import random_uuid
 
@@ -78,6 +79,8 @@ def _log_task_completion(task: asyncio.Task) -> None:
         logger.error("Engine background task failed", exc_info=e)
 
 
+_STANDBY_SLICE = 5.0  # max seconds schedule() holds the engine-IO thread per fleet-down poll
+
 class AsyncLLM(LLM):
     """Asynchronous request and stream facade over :class:`LLM`."""
 
@@ -102,9 +105,16 @@ class AsyncLLM(LLM):
         # sockets must be created and used by the same owner thread, so run
         # the connect on that same persistent executor (the ctor blocks until
         # it is done; a standalone frontend always blocks on the endpoint
-        # file here, so this costs no extra wall time).
+        # file here, so this costs no extra wall time). Guarded by the SAME
+        # try/except as super().__init__: a connect failure (or the 300s
+        # endpoint wait) must tear the executor down too, else the non-daemon
+        # IO thread outlives the failed ctor and strands process exit.
         if self.standalone_frontend:
-            self._engine_io_executor.submit(self._fleet_connect_sync).result()
+            try:
+                self._engine_io_executor.submit(self._fleet_connect_sync).result()
+            except BaseException:
+                self._engine_io_executor.shutdown(wait=True)
+                raise
 
     def _init_frontend_comm(self):
         # LLM's synchronous constructor waits for this short task. The same
@@ -235,28 +245,30 @@ class AsyncLLM(LLM):
                 logger.error(
                     "Engine IO tick failed; failing open in-flight streams "
                     "and retrying: %s", e, exc_info=True)
-                self._fail_open_streams(e)
                 # Classification drives WHICH recovery to run: a fleet-GONE
-                # error enters the in-process standby (reconnect), anything
-                # else just retries at 1 Hz. See _is_fleet_down_error.
-                if self.standalone_frontend and self._is_fleet_down_error(e):
-                    # Fleet fully DOWN (endpoint file gone/stale): enter
-                    # standby -- block on the engine IO thread until the
-                    # fleet republishes (or 600s), then rebuild the
-                    # transport IN-PROCESS. This is the path the uuid-
-                    # CHANGE case cannot take (heartbeat rebuilds inside
-                    # the same tick and never raises), so reconnect()'s
-                    # standby loop is a live branch, not dead code.
-                    # on_standalone_reconnect re-fails the (already
-                    # cleared) streams -- a cheap no-op. If the standby
-                    # times out, the re-raise lands back in this handler
-                    # on the next tick and the loop retries.
+                # error (FleetDownError, raised by the supervisor heartbeat)
+                # enters the bounded time-sliced standby; any OTHER engine-IO
+                # bug just fails open and retries at 1 Hz (thread not held).
+                if isinstance(e, FleetDownError):
+                    self._fail_open_streams(e)
+                    # Time-sliced standby instead of the old 600s-blocking
+                    # fleet.reconnect(): both run on the SINGLE engine-IO
+                    # thread (max_workers=1), so an unbounded standby there
+                    # would freeze /health (queued behind standby) and stall
+                    # shutdown. wait_ready() returns after _STANDBY_SLICE or
+                    # as soon as the fleet republishes; the next tick's
+                    # heartbeat then commits the _rebuild via the normal
+                    # uuid-change path and retries the schedule.
                     try:
                         await self._run_engine_io(
-                            self.fleet.reconnect, e)
+                            self.fleet.wait_ready, _STANDBY_SLICE)
                     except Exception as re:
+                        # wait_ready never raises in practice; log and fall
+                        # through to the 1 Hz retry.
                         logger.error(
-                            "Fleet standby timed out; retrying: %s", re)
+                            "Fleet standby poll failed; retrying: %s", re)
+                else:
+                    self._fail_open_streams(e)
                 await asyncio.sleep(1.0)
             await asyncio.sleep(0)
 
@@ -316,21 +328,6 @@ class AsyncLLM(LLM):
         # _rebuild re-mints too; the two are complementary (uuid change
         # vs fail-open-without-uuid-change).
         self.frontend_epoch = random_uuid()
-
-    def _is_fleet_down_error(self, e: Exception) -> bool:
-        """True iff *e* says the worker fleet is GONE (endpoint file
-        missing/stale) -- as opposed to a uuid-change transition (rebuilt
-        inside the tick, never raises here) or an unrelated engine-IO bug
-        (which must keep the 1 Hz retry WITHOUT entering standby).
-
-        String-based on purpose: both fleet-down messages come from
-        ``FleetSupervisor.heartbeat`` and are the ONLY place that emits
-        "Worker endpoint file ... appears to be down"; uuid-change
-        transitions return cleanly (no raise) and genuine IO bugs carry no
-        such phrase, so the match cannot mis-route. See the ``schedule()``
-        handler for the standby vs retry decision this feeds.
-        """
-        return "worker endpoint file" in str(e).lower()
 
     def start_schedule_engine(self):
         # launch schedule engine
