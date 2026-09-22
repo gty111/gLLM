@@ -1175,7 +1175,14 @@ def test_connect_builds_comm_without_prior_comm_attribute(tmp_path):
     ``llm.comm`` attribute (the ctor skips _init_frontend_comm);
     _build_comm must tolerate that (getattr defense) and end with a
     working comm. A second build through the same supervisor must take
-    the close-and-replace branch cleanly."""
+    the close-and-replace branch cleanly.
+
+    NOTE: the second incarnation is exercised via
+    ``FleetSupervisor.reconnect()`` (the blocking rebuild). That method is
+    DEPRECATED for the production standby path (now
+    ``wait_ready`` + heartbeat), but is kept for API compatibility -- this
+    test still covers the close-and-replace branch it exercises. It is a
+    unit test (no engine-IO thread), so the blocking form is safe here."""
     import json as _json
 
     from gllm.engine.fleet_supervisor import FleetSupervisor
@@ -1350,6 +1357,9 @@ def test_schedule_enters_standby_when_fleet_down(monkeypatch):
                 self._engine_io_executor = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="gllm-test-io")
                 self._rec = rec
+                # Attrs the real __init__ would set (the handler reads the
+                # once-per-outage log sentinel).
+                self._last_engine_io_error = None
                 # The base LLM.schedule runs check_standalone_worker() FIRST;
                 # instance-stub it to raise our error in place of the real
                 # heartbeat (no endpoint file / supervisor in this unit test).
@@ -1402,3 +1412,24 @@ def test_schedule_enters_standby_when_fleet_down(monkeypatch):
     _drive_one_tick(llm2)
     assert rec2["wait_ready"] == [], "non-fleet errors must not enter standby"
     assert rec2["failed"] >= 1, "fail-open must run on non-fleet errors"
+def test_sync_standalone_frontend_raises_clear_error():
+    """A plain LLM (not AsyncLLM) with standalone_frontend=True must fail
+    FAST with a clear TypeError -- the frontend transport must be built on
+    the engine-IO thread that only AsyncLLM provides, so a synchronous
+    standalone frontend is unsupported (previously it would silently skip
+    connect and die with a confusing AttributeError on first use).
+
+    Calls LLM.__init__ directly (type(self) is LLM) so the guard fires
+    before any worker/fault work; the endpoint_file arg satisfies the
+    pre-existing standalone_worker precondition path is not taken because
+    standalone_WORKER is False here (this is the FRONTEND role)."""
+    import gllm.engine.llm as llm_mod
+
+    with pytest.raises(TypeError, match="requires AsyncLLM"):
+        llm_mod.LLM(
+            model_path="/tmp/does-not-matter",
+            host="127.0.0.1",
+            master_addr="127.0.0.1",
+            launch_mode="normal",
+            standalone_frontend=True,
+        )

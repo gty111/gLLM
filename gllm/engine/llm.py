@@ -100,6 +100,22 @@ class LLM:
         self.standalone_frontend = bool(standalone_frontend)
         self.standalone_worker = bool(standalone_worker)
         self.worker_endpoint_file = worker_endpoint_file
+        if self.standalone_frontend:
+            # A standalone FRONTEND must be an AsyncLLM: the frontend ZMQ
+            # transport is created on the engine-IO executor thread (zmq
+            # requires sockets to be created on the same thread that owns
+            # them), which only AsyncLLM provides. A plain synchronous LLM
+            # would skip connect and die with a confusing AttributeError on
+            # first use, so fail fast (production always builds AsyncLLM).
+            if "AsyncLLM" not in type(self).__name__:
+                raise TypeError(
+                    "standalone_frontend=True requires AsyncLLM: the "
+                    "frontend ZMQ transport must be created on the "
+                    "engine-IO thread (AsyncLLM performs the connect on "
+                    "its executor). A synchronous standalone frontend is "
+                    "not supported; wrap the engine in AsyncLLM (as "
+                    "api_server does)."
+                )
         if standalone_frontend and dp_size > 1:
             # The standalone transport is a SINGLE frontend<->rank-0
             # leg (FleetSupervisor builds one comm from endpoints[0]);
@@ -259,14 +275,12 @@ class LLM:
             self.num_workers = 0
             self.process_list = []
             self.act_worker_ranks = []
-            # NOTE: no fleet.connect() here. connect() builds the frontend
-            # ZMQ sockets, which zmq requires to be created on the SAME
-            # thread that later owns them. AsyncLLM (the only standalone
-            # frontend runtime) performs the connect on its engine-IO
-            # executor (see AsyncLLM.__init__); a synchronous standalone
-            # frontend does not exist, so there is no synchronous path to
-            # serve. Connecting here too would double-connect (two
-            # "Connected" logs) and close the first sockets cross-thread.
+            # NOTE: no fleet.connect() here -- it is performed EXACTLY ONCE
+            # by AsyncLLM on its engine-IO executor (AsyncLLM.__init__),
+            # because zmq requires the frontend sockets to be created on the
+            # same thread that later owns them. (A synchronous standalone
+            # frontend is rejected up-front in __init__ with a clear
+            # TypeError, so this branch is always an AsyncLLM.)
         else:
             self.init_workers()
 
@@ -456,8 +470,9 @@ class LLM:
         in-flight async stream instead of hanging them); a uuid change
         (fleet restarted in the background) is handled IN-PROCESS by the
         supervisor's heartbeat-driven :meth:`FleetSupervisor._rebuild`
-        (standby :meth:`FleetSupervisor.reconnect` covers the fully-down
-        case), no raise on that path.
+        (fully-down standby: the schedule loop polls
+        :meth:`FleetSupervisor.wait_ready` and the next heartbeat commits
+        the rebuild), no raise on that path.
         """
         self.fleet.heartbeat()
 
@@ -473,8 +488,9 @@ class LLM:
         child process is the fleet: if it dies, this parent removes the
         endpoint file (via :meth:`_watch_worker_process`) so a connected
         frontend detects the crash; the frontend's heartbeat then rebuilds
-        the transport in-process (or enters standby via
-        :meth:`FleetSupervisor.reconnect`) once a new fleet republishes.
+        the transport in-process (fully-down standby: it polls
+        :meth:`FleetSupervisor.wait_ready` and the next heartbeat commits
+        the rebuild) once a new fleet republishes.
         Ctrl-C exits the process; the endpoint file is removed via atexit
         too.
         """

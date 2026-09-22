@@ -55,7 +55,8 @@ The two sides rendezvous through a small JSON **worker endpoint file**
   loop when the fleet goes away.
 * The **frontend** polls it. A change in `uuid` means the worker fleet
   restarted; the frontend tears down and re-connects its ZMQ sockets
-  **in-process** (`FleetSupervisor.reconnect`) — no frontend process restart.
+  **in-process** (`FleetSupervisor._rebuild`, polled via `wait_ready`) —
+  no frontend process restart.
 
 Transport: `ipc://` on a single machine, or fixed `tcp://` ports
 (`--worker-transport-base-port`) so a frontend on another host can connect.

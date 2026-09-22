@@ -100,6 +100,8 @@ class AsyncLLM(LLM):
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
+        # Last engine-IO exception (for once-per-outage error logging).
+        self._last_engine_io_error = None
         # Thread-ownership: the standalone frontend's ZMQ sockets are CREATED
         # by fleet.connect() and then used by the engine IO executor. zmq
         # sockets must be created and used by the same owner thread, so run
@@ -242,9 +244,18 @@ class AsyncLLM(LLM):
                 # (pickle failure, KeyError in _apply_ipc_package, ...)
                 # would otherwise retry silently at 1 Hz forever -- the
                 # service looks alive but never processes another token.
-                logger.error(
-                    "Engine IO tick failed; failing open in-flight streams "
-                    "and retrying: %s", e, exc_info=True)
+                # Log once per OUTAGE: a fleet-down raises every tick (~6s)
+                # during the outage, so a full traceback each time would be
+                # bounded-but-noisy; keep the first (with traceback) and
+                # rate-limit the repeats to an info line.
+                if self._last_engine_io_error is None:
+                    logger.error(
+                        "Engine IO tick failed; failing open in-flight "
+                        "streams and retrying: %s", e, exc_info=True)
+                else:
+                    logger.info(
+                        "Engine IO tick still failing (retrying): %s", e)
+                self._last_engine_io_error = e
                 # Classification drives WHICH recovery to run: a fleet-GONE
                 # error (FleetDownError, raised by the supervisor heartbeat)
                 # enters the bounded time-sliced standby; any OTHER engine-IO
@@ -270,6 +281,8 @@ class AsyncLLM(LLM):
                 else:
                     self._fail_open_streams(e)
                 await asyncio.sleep(1.0)
+            self._last_engine_io_error = None
+            await asyncio.sleep(0)
             await asyncio.sleep(0)
 
     def on_standalone_reconnect(self, reason: Exception):

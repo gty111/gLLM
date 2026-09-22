@@ -13,16 +13,17 @@ the thin one-liner touchpoints:
 * RECONNECT -- detect a worker-fleet restart (new transport uuid) and
   re-build the transport IN-PROCESS, no frontend process restart. The
   heartbeat path does this via :meth:`_rebuild` (reactive, fleet already
-  republished); :meth:`reconnect` is the standby variant that blocks
-  waiting for the new incarnation (fleet fully down, e.g. after a
-  worker-down error surfaced to the schedule loop).
+  republished); when the fleet is fully down the schedule loop polls
+  :meth:`wait_ready` on a bounded time slice and the NEXT heartbeat
+  commits the rebuild once the fleet republishes. (The blocking
+  :meth:`reconnect` is deprecated and no longer on this path.)
 * DISPATCH GATE -- refuse to ship work into a dead fleet's 512MB send
   buffer, requeueing it for the next tick
   (:meth:`ship`, :meth:`stamp_abort_sessions`).
 
 Threading: every entry point runs on the engine IO executor thread
 (the same thread that owns the sockets), so the transport swap inside
-:meth:`reconnect` is race-free with send/recv. The supervisor holds a
+:meth:`_rebuild` is race-free with send/recv. The supervisor holds a
 reference to its host :class:`~gllm.engine.llm.LLM` and calls back
 into ``host.on_standalone_reconnect`` after every successful
 transport transition so the host (AsyncLLM) can fail in-flight
