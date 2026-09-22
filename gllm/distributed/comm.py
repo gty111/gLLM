@@ -200,25 +200,26 @@ class IPCPackage:
                 return False
         return True
 
-    def act_session_at(self, idx: int, our_epoch, valid: bool = True) -> bool:
+    def act_session_at(
+        self, idx: int, our_epoch, valid: bool = True, legacy_ok: bool = True
+    ) -> bool:
         """Whether row ``idx`` of ``act_schedule_ids`` belongs to THIS
         frontend incarnation.
 
         This is the single sanctioned frontend-side row gate (used by
         :meth:`LLM._apply_ipc_package`). Semantics:
 
-        * no ``sessions`` list at all -> LEGACY/monolith worker: every
-          row is ours (ids were never remapped, nothing to filter);
-        * malformed list (wrong length) -> every row is foreign
-          (fail closed -- a misaligned stamp cannot be trusted to name
-          a session);
-        * otherwise the row is ours iff ``sessions[idx] == our_epoch``.
-
-        ``valid`` lets the caller short-circuit the WHOLE packet: the
-        frontend checks :meth:`output_stamps_valid` once per package
-        (O(1), no per-row cost) and threads the answer in, so a
-        malformed packet fails closed in one shot instead of row by
-        row. Default ``True`` keeps per-row callers safe.
+        * ``valid`` False -> every row is foreign (the caller checked
+          :meth:`output_stamps_valid` once per package, O(1), and a
+          malformed packet fails closed in one shot);
+        * no ``sessions`` list at all -> LEGACY packet: ours only when
+          ``legacy_ok``. The MONOLITH frontend passes ``legacy_ok=True``
+          (its worker never remaps ids -- nothing to filter); the
+          STANDALONE frontend passes ``legacy_ok=False`` because a
+          stamp-less row from its fleet names no session and MUST NOT
+          touch a request of the same bare id (fail closed);
+        * otherwise the row is ours iff ``sessions[idx] == our_epoch``;
+          an index past the end of the list is unconditionally foreign.
 
         A batch may carry the same client id twice (once per session),
         so the check is strictly positional -- never dict-by-id.
@@ -227,20 +228,23 @@ class IPCPackage:
             return False
         stamps = self.sessions
         if stamps is None:
-            return True
+            return legacy_ok
         if idx >= len(stamps):
             return False
         return stamps[idx] == our_epoch
 
-    def free_session_at(self, idx: int, our_epoch, valid: bool = True) -> bool:
+    def free_session_at(
+        self, idx: int, our_epoch, valid: bool = True, legacy_ok: bool = True
+    ) -> bool:
         """Same as :meth:`act_session_at` for ``free_ids`` rows
         (``free_sessions``). Fail-closed on a malformed list (either
-        via ``valid`` or a per-row length miss)."""
+        via ``valid`` or a per-row length miss); a stamp-less list is
+        legacy -- honored only when ``legacy_ok`` (monolith)."""
         if not valid:
             return False
         stamps = self.free_sessions
         if stamps is None:
-            return True
+            return legacy_ok
         if idx >= len(stamps):
             return False
         return stamps[idx] == our_epoch

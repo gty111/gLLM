@@ -670,9 +670,15 @@ class LLM:
                 stamps_ok = ipc_package.output_stamps_valid()
 
             def _ours(row_fn, idx):
-                if self.standalone_frontend:
-                    return row_fn(idx, self.frontend_epoch, stamps_ok)
-                return True
+                if not self.standalone_frontend:
+                    # Monolith: its worker never remaps ids; every row
+                    # is ours by construction (no filtering at all).
+                    return True
+                # Standalone: fail closed on a malformed packet, and a
+                # STAMP-LESS row (legacy_ok=False) must never touch a
+                # request of the same bare id.
+                return row_fn(idx, self.frontend_epoch, stamps_ok,
+                              legacy_ok=False)
 
             for idx, id in enumerate(ipc_package.act_schedule_ids):
                 if not _ours(ipc_package.act_session_at, idx):

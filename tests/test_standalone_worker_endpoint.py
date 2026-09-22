@@ -1050,3 +1050,88 @@ def test_cancel_after_first_output_translates_terminal_free():
     assert n == 1
     assert 0 not in eng.running_maps
     assert freed == [0]
+
+
+# ---------------------------------------------------------------------------
+# Review round 6: supervisor init/first-heartbeat + first-connect safety
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_before_connect_survives_missing_endpoint(tmp_path):
+    """P2: the three supervisor state fields must exist BEFORE connect()
+    succeeds -- a missing endpoint file on the FIRST heartbeat must hit
+    the 3s grace window (and not AttributeError)."""
+    import time as _time
+
+    from gllm.engine.fleet_supervisor import FleetSupervisor
+
+    eng = _bare_llm()
+    eng.worker_endpoint_file = str(tmp_path / "nope.json")
+    sup = FleetSupervisor(eng, eng.dp_size)
+    # State initialized in __init__ (unreachable-code regression guard).
+    assert sup._worker_transport_uuid is None
+    assert sup._worker_endpoints is None
+    assert sup._gone_since is None
+
+    t0 = _time.monotonic()
+    try:
+        sup.heartbeat()
+    except RuntimeError:
+        raise AssertionError("first heartbeat inside the 3s grace must NOT raise")
+    dt = _time.monotonic() - t0
+    assert dt < 1.0, "grace-window path must be cheap"
+    assert sup._gone_since is not None, "grace timer must be armed on first miss"
+
+    # Fast-forward past the grace window: now the fleet-dead error fires.
+    sup._gone_since = _time.monotonic() - 4
+    try:
+        sup.heartbeat()
+        raise AssertionError("stale endpoint past the grace window must raise")
+    except RuntimeError as e:
+        assert "down" in str(e)
+
+
+def test_connect_builds_comm_without_prior_comm_attribute(tmp_path):
+    """P1: the FIRST standalone connect runs with no pre-existing
+    ``llm.comm`` attribute (the ctor skips _init_frontend_comm);
+    _build_comm must tolerate that (getattr defense) and end with a
+    working comm. A second build through the same supervisor must take
+    the close-and-replace branch cleanly."""
+    import json as _json
+
+    from gllm.engine.fleet_supervisor import FleetSupervisor
+
+    sched = "ipc:///tmp/_gllm_p1_sched_%d" % os.getpid()
+    out = "ipc:///tmp/_gllm_p1_out_%d" % os.getpid()
+    tok = "ipc:///tmp/_gllm_p1_tok_%d" % os.getpid()
+    ep = str(tmp_path / "ep.json")
+    # Schema as read by read_worker_endpoint_file: {"uuid", "endpoints"}.
+    with open(ep, "w") as f:
+        _json.dump({"uuid": "uuid-one",
+                    "endpoints": {"0": {"schedule": sched, "output": out, "token": tok}}}, f)
+
+    eng = _bare_llm()
+    # Transport parameters _build_comm reads from the host.
+    eng.host = "127.0.0.1"
+    eng.master_addr = "127.0.0.1"
+    eng.launch_mode = "normal"
+    eng.worker_endpoint_file = ep
+    # The reported failure shape: no comm attribute at all.
+    if hasattr(eng, "comm"):
+        del eng.comm
+    eng.fleet = FleetSupervisor(eng, eng.dp_size)
+
+    eng.fleet.connect()
+    assert eng.comm is not None, "connect must install the frontend comm"
+    assert eng.fleet._worker_transport_uuid == "uuid-one"
+    first_comm = eng.comm
+
+    # Second incarnation: same supervisor, close-and-replace branch.
+    with open(ep, "w") as f:
+        _json.dump({"uuid": "uuid-two",
+                    "endpoints": {"0": {"schedule": sched, "output": out, "token": tok}}}, f)
+    eng.fleet.reconnect()
+    assert eng.comm is not None and eng.comm is not first_comm, \
+        "reconnect must swap the transport"
+    assert eng.fleet._worker_transport_uuid == "uuid-two"
+    eng.comm.close()

@@ -174,3 +174,61 @@ def test_free_gate_packet_invalid_fails_wholesale():
     p = _out_pkg(free=[0], free_sessions=["e2", "extra"])
     assert not p.output_stamps_valid()
     assert not p.free_session_at(0, "e2", p.output_stamps_valid())
+
+
+# ---------------------------------------------------------------------------
+# Review round 6: stamp-LESS output in standalone mode must fail closed
+# ---------------------------------------------------------------------------
+
+
+def test_stampless_rows_legacy_ok_for_monolith():
+    # Monolith semantics (legacy_ok=True, the default): a worker that
+    # never stamps sends no stamp lists at all, and every row is ours.
+    p = _out_pkg(act=[0, 1], act_sessions=None, free=[2], free_sessions=None)
+    assert p.act_session_at(0, "any-epoch")
+    assert p.act_session_at(1, "any-epoch")
+    assert p.free_session_at(0, "any-epoch")
+
+
+def test_stampless_rows_rejected_when_legacy_not_ok():
+    # STANDALONE semantics (legacy_ok=False): a stamp-less act/free row
+    # names no session and must be foreign -- otherwise a legacy packet
+    # could terminate the restarted frontend's identically-numbered
+    # request (the session-isolation bypass the protocol exists to
+    # prevent).
+    p = _out_pkg(act=[0, 1], act_sessions=None, free=[2], free_sessions=None)
+    assert not p.act_session_at(0, "e2", legacy_ok=False)
+    assert not p.act_session_at(1, "e2", legacy_ok=False)
+    assert not p.free_session_at(0, "e2", legacy_ok=False)
+
+
+def test_standalone_apply_drops_stampless_package_whole():
+    # End-to-end through the real LLM._apply_ipc_package row gates: a
+    # standalone frontend applying a completely unstamped package must
+    # drop EVERY row (token AND free) instead of finishing request 0.
+    from tests.test_standalone_worker_endpoint import _bare_llm
+    from gllm.runtime.sequence import GenerationSequence
+
+    eng = _bare_llm()
+    seq = GenerationSequence(seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
+    eng.running_maps[0] = seq
+    eng.async_streams = {}  # bare engine: no streams
+
+    pkg = IPCPackage([])
+    pkg.act_schedule_ids = [0]
+    pkg.next_tokens = [7]
+    pkg.free_ids = [0]
+    pkg.sessions = None      # stamp-less (the reported exploit shape)
+    pkg.free_sessions = None
+
+    # The exact gating expression LLM._apply_ipc_package uses.
+    stamps_ok = pkg.output_stamps_valid()
+    applied = [i for i in range(len(pkg.act_schedule_ids))
+               if pkg.act_session_at(i, eng.frontend_epoch, stamps_ok,
+                                     legacy_ok=False)]
+    freed = [i for i in range(len(pkg.free_ids))
+             if pkg.free_session_at(i, eng.frontend_epoch, stamps_ok,
+                                    legacy_ok=False)]
+    assert applied == [], "stamp-less act row must not be applied"
+    assert freed == [], "stamp-less free row must not retire the request"
+    assert 0 in eng.running_maps, "request 0 must survive a stamp-less packet"

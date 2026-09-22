@@ -46,14 +46,18 @@ class FleetSupervisor:
         # host at call time, so tests/harnesses may re-point it freely.
         self.llm = llm
         self.dp_size = dp_size
+        # Transport-incarnation + liveness state. NOTE: these must be
+        # initialized here (NOT after the property below -- that is
+        # unreachable code): heartbeat() may run its first check before
+        # connect() ever succeeds, and a missing _gone_since would raise
+        # AttributeError and bypass the grace window.
+        self._worker_transport_uuid = None
+        self._worker_endpoints = None
+        self._gone_since = None
 
     @property
     def endpoint_file(self) -> str:
         return self.llm.worker_endpoint_file
-
-        self._worker_transport_uuid = None
-        self._worker_endpoints = None
-        self._gone_since = None
 
     # ------------------------------------------------------------------
     # CONNECT
@@ -99,7 +103,10 @@ class FleetSupervisor:
         """Create/replace the frontend ZMQ sockets for one transport
         incarnation (called on the engine IO thread)."""
         llm = self.llm
-        prev = llm.comm
+        # Defensive read: on the FIRST standalone connect the host has
+        # not run _init_frontend_comm (the ctor skips it), so the attr
+        # may not exist yet -- getattr mirrors the original behavior.
+        prev = getattr(llm, "comm", None)
         if prev is not None:
             try:
                 prev.drain_request_buffer()
