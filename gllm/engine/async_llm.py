@@ -283,7 +283,6 @@ class AsyncLLM(LLM):
                 await asyncio.sleep(1.0)
             self._last_engine_io_error = None
             await asyncio.sleep(0)
-            await asyncio.sleep(0)
 
     def on_standalone_reconnect(self, reason: Exception):
         """Explicit cleanup at a transport transition (worker fleet restart).

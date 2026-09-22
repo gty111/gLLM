@@ -107,7 +107,11 @@ class LLM:
             # them), which only AsyncLLM provides. A plain synchronous LLM
             # would skip connect and die with a confusing AttributeError on
             # first use, so fail fast (production always builds AsyncLLM).
-            if "AsyncLLM" not in type(self).__name__:
+            # Lazy import: async_llm imports LLM from here, so a module-level
+            # reference would be circular. isinstance (not a name match) so a
+            # future AsyncLLM SUBCLASS is also accepted.
+            from gllm.engine.async_llm import AsyncLLM
+            if not isinstance(self, AsyncLLM):
                 raise TypeError(
                     "standalone_frontend=True requires AsyncLLM: the "
                     "frontend ZMQ transport must be created on the "

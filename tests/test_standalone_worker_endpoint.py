@@ -1412,6 +1412,8 @@ def test_schedule_enters_standby_when_fleet_down(monkeypatch):
     _drive_one_tick(llm2)
     assert rec2["wait_ready"] == [], "non-fleet errors must not enter standby"
     assert rec2["failed"] >= 1, "fail-open must run on non-fleet errors"
+
+
 def test_sync_standalone_frontend_raises_clear_error():
     """A plain LLM (not AsyncLLM) with standalone_frontend=True must fail
     FAST with a clear TypeError -- the frontend transport must be built on
@@ -1419,10 +1421,9 @@ def test_sync_standalone_frontend_raises_clear_error():
     standalone frontend is unsupported (previously it would silently skip
     connect and die with a confusing AttributeError on first use).
 
-    Calls LLM.__init__ directly (type(self) is LLM) so the guard fires
-    before any worker/fault work; the endpoint_file arg satisfies the
-    pre-existing standalone_worker precondition path is not taken because
-    standalone_WORKER is False here (this is the FRONTEND role)."""
+    Calls LLM.__init__ directly, so the guard fires before any model load or
+    worker work (this is the FRONTEND role; standalone_WORKER is False, so
+    no endpoint-file precondition applies)."""
     import gllm.engine.llm as llm_mod
 
     with pytest.raises(TypeError, match="requires AsyncLLM"):
