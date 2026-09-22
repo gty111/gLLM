@@ -98,6 +98,54 @@ def _wait_for(pred, timeout, interval=1.0):
     return False
 
 
+def _start_registry():
+    """An in-process endpoint-registry middleware on a free loopback port;
+    returns (server, "HOST:PORT")."""
+    import socket
+    import threading
+
+    from gllm.disagg.discovery import DiscoveryServer
+
+    sock = socket.socket(); sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]; sock.close()
+    addr = f"127.0.0.1:{port}"
+    server = DiscoveryServer(addr)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, addr
+
+
+def _stop_registry(server):
+    try:
+        server.stop()
+    except Exception:
+        pass
+
+
+def _registry_has_member(addr):
+    """True once the worker fleet has registered in the registry."""
+    try:
+        from gllm.disagg.discovery import make_discovery
+        d = make_discovery(addr)
+        try:
+            return len(d.list("gllm-worker")) > 0
+        finally:
+            d.close()
+    except Exception:
+        return False
+
+
+def _registry_first_row(addr):
+    """The rank-0 transport row the worker published (for assertions)."""
+    from gllm.disagg.discovery import make_discovery
+    d = make_discovery(addr)
+    try:
+        members = d.list("gllm-worker")
+        assert members, "no gllm-worker member in registry"
+        return members[0]["payload"]["endpoints"]["0"]
+    finally:
+        d.close()
+
+
 def _kill(p):
     if p.poll() is None:
         p.terminate()
@@ -109,19 +157,19 @@ def _kill(p):
 
 
 @requires_model
-def test_monolith_worker_launches_and_serves(tmp_path):
+def test_monolith_worker_launches_and_serves():
     """BLOCKER regression: run_worker's parent watchdog must not block
     worker.init() (a synchronous infinite loop parked every non-overlap
     child before its first CUDA call; wait_workers deadlocked and NO
     deployment -- monolith included -- could start).
 
     Launch the real worker_server entrypoint (which spawns a real GPU
-    child through run_worker) and require the endpoint file to be
-    published -- publish happens AFTER child init + bind, so a hung
-    child means no publish within the timeout.
+    child through run_worker) and require the fleet to REGISTER with the
+    endpoint registry -- registration happens AFTER child init + bind, so
+    a hung child means no registration within the timeout.
     """
+    server, addr = _start_registry()
     model = _model_path()
-    ep = str(tmp_path / "ep.json")
     env = _compat_env()
     # worker_server pins CVV from --worker-gpu (physical); do not preset.
     env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -129,7 +177,7 @@ def test_monolith_worker_launches_and_serves(tmp_path):
         PY, "-m", "gllm.entrypoints.worker_server",
         "--model-path", model,
         "--worker-gpu", GPU,  # PHYSICAL ordinal; worker_server pins CVV to it
-        "--worker-endpoint-file", ep,
+        "--endpoint-registry-addr", addr,
         "--tp", "1",
         "--gpu-memory-util", GPU_MEMORY_UTIL,
         "--master-addr", "127.0.0.1",
@@ -137,30 +185,27 @@ def test_monolith_worker_launches_and_serves(tmp_path):
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     try:
-        ok = _wait_for(lambda: os.path.exists(ep), STARTUP_TIMEOUT)
+        ok = _wait_for(lambda: _registry_has_member(addr), STARTUP_TIMEOUT)
         assert ok, (
-            "worker endpoint file never published -- the spawned child "
-            "never finished init (watchdog/launch regression)\n"
+            "worker fleet never registered with the endpoint registry -- "
+            "the spawned child never finished init (watchdog/launch regression)\n"
             + (proc.stdout.read().decode(errors="replace")[-4000:] if proc.poll() is not None else "")
         )
-        with open(ep) as f:
-            obj = json.load(f)
-        assert obj.get("uuid")
-        assert "0" in obj["endpoints"]
-        row = obj["endpoints"]["0"]
-        assert all(k in row for k in ("schedule", "output", "token"))
         # Local ipc:// transport (no base port): rows must be ipc:// paths.
+        row = _registry_first_row(addr)
+        assert all(k in row for k in ("schedule", "output", "token"))
         assert all(v.startswith("ipc://") for v in row.values())
     finally:
         _kill(proc)
+        _stop_registry(server)
 
 
 @requires_model
-def test_standalone_frontend_connects_and_generates(tmp_path):
+def test_standalone_frontend_connects_and_generates():
     """End-to-end: real worker fleet + real standalone frontend + real
     completion through the decoupled transport."""
+    server, addr = _start_registry()
     model = _model_path()
-    ep = str(tmp_path / "ep_ep.json")
     env = _compat_env()
     # worker_server pins CVV from --worker-gpu (physical); do not preset.
     env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -168,7 +213,7 @@ def test_standalone_frontend_connects_and_generates(tmp_path):
         PY, "-m", "gllm.entrypoints.worker_server",
         "--model-path", model,
         "--worker-gpu", GPU,
-        "--worker-endpoint-file", ep,
+        "--endpoint-registry-addr", addr,
         "--tp", "1",
         "--gpu-memory-util", GPU_MEMORY_UTIL,
         "--master-addr", "127.0.0.1",
@@ -180,16 +225,16 @@ def test_standalone_frontend_connects_and_generates(tmp_path):
         "--host", "127.0.0.1",
         "--port", "18123",
         "--standalone-frontend",
-        "--worker-endpoint-file", ep,
+        "--endpoint-registry-addr", addr,
     ]
     worker = subprocess.Popen(wcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     frontend = None
     try:
-        ok = _wait_for(lambda: os.path.exists(ep), STARTUP_TIMEOUT)
+        ok = _wait_for(lambda: _registry_has_member(addr), STARTUP_TIMEOUT)
         if not ok:
             out = _drain_pipe(worker.stdout)
             raise AssertionError(
-                "worker endpoint file never published\n" + out[-6000:]
+                "worker fleet never registered with the endpoint registry\n" + out[-6000:]
             )
         frontend = subprocess.Popen(
             fcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env
@@ -231,25 +276,15 @@ def test_standalone_frontend_connects_and_generates(tmp_path):
 
 
 @requires_model
-def test_standalone_via_in_memory_registry_proxy(tmp_path):
+def test_standalone_via_in_memory_registry_proxy():
     """End-to-end THROUGH the in-memory registry proxy middleware: the
     control plane (worker register / frontend discover) is served by a real
     DiscoveryServer, and the data plane stays frontend<->worker point-to-point
-    zmq (the proxy never forwards tokens). Verifies --endpoint-registry proxy
-    actually launches + generates, distinct from the file-based smoke above."""
-    import socket
-    import threading
+    zmq (the proxy never forwards tokens). Verifies the registry-backed
+    standalone pair actually launches + generates."""
     import urllib.request
 
-    from gllm.disagg.discovery import DiscoveryServer
-
-    # In-process middleware on a free loopback port.
-    sock = socket.socket(); sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]; sock.close()
-    server = DiscoveryServer(f"127.0.0.1:{port}")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    addr = f"127.0.0.1:{port}"
-
+    server, addr = _start_registry()
     model = _model_path()
     env = _compat_env()
     env.pop("CUDA_VISIBLE_DEVICES", None)
@@ -257,7 +292,6 @@ def test_standalone_via_in_memory_registry_proxy(tmp_path):
         PY, "-m", "gllm.entrypoints.worker_server",
         "--model-path", model,
         "--worker-gpu", GPU,
-        "--endpoint-registry", "proxy",
         "--endpoint-registry-addr", addr,
         "--tp", "1",
         "--gpu-memory-util", GPU_MEMORY_UTIL,
@@ -270,24 +304,12 @@ def test_standalone_via_in_memory_registry_proxy(tmp_path):
         "--host", "127.0.0.1",
         "--port", "18133",
         "--standalone-frontend",
-        "--endpoint-registry", "proxy",
         "--endpoint-registry-addr", addr,
     ]
     worker = subprocess.Popen(wcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     frontend = None
     try:
-        def ready():
-            try:
-                from gllm.disagg.discovery import make_discovery
-                d = make_discovery(addr)
-                try:
-                    return len(d.list("gllm-worker")) > 0
-                finally:
-                    d.close()
-            except Exception:
-                return False
-
-        ok = _wait_for(ready, STARTUP_TIMEOUT)
+        ok = _wait_for(lambda: _registry_has_member(addr), STARTUP_TIMEOUT)
         if not ok:
             out = _drain_pipe(worker.stdout)
             raise AssertionError(

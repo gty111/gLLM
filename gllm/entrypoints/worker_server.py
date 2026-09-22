@@ -3,24 +3,28 @@
 Runs the GPU worker fleet *without* the OpenAI HTTP frontend, so the two
 halves of a gLLM deployment can be managed (and restarted) independently:
 
-    # 1) GPU worker fleet (e.g. GPU 1) -- binds ipc/tcp transport, publishes
-    #    its endpoints to the rendezvous file, serves inference forever.
+    # 0) Endpoint registry middleware (in-memory proxy; one per deployment).
+    python -m gllm.entrypoints.discovery_server --listen 0.0.0.0:9500
+
+    # 1) GPU worker fleet (e.g. GPU 1) -- binds ipc/tcp transport, registers
+    #    its endpoints with the registry, serves inference forever.
     python -m gllm.entrypoints.worker_server \
         --model-path /path/to/model --worker-gpu 1 \
-        --worker-endpoint-file /tmp/gllm_worker_endpoint.json \
+        --endpoint-registry-addr 127.0.0.1:9500 \
         [--worker-transport-base-port 50001]   # for cross-machine frontends
 
-    # 2) Stateless frontend (any process, no GPU) -- connects to the fleet.
+    # 2) Stateless frontend (any process, no GPU) -- discovers the fleet via
+    #    the registry and connects.
     python -m gllm.entrypoints.api_server \
         --model-path /path/to/model --port 8000 \
         --standalone-frontend \
-        --worker-endpoint-file /tmp/gllm_worker_endpoint.json
+        --endpoint-registry-addr 127.0.0.1:9500
 
 Crash semantics:
 
 * kill the worker -> in-flight requests fail fast on the (still alive)
-  frontend; when a new worker publishes the endpoint file again, the
-  frontend reconnects in-process. No frontend restart.
+  frontend; when a new worker re-registers with the registry, the frontend
+  reconnects in-process. No frontend restart.
 * kill the frontend -> the worker keeps running; a new frontend simply
   reconnects. No worker restart (weights stay loaded).
 
@@ -60,15 +64,12 @@ def main():
 
     args = build_arg_parser().parse_args()
 
-    _reg = getattr(args, "endpoint_registry", "file") or "file"
-    if _reg == "proxy":
-        if not getattr(args, "endpoint_registry_addr", None):
-            raise SystemExit(
-                "worker_server with --endpoint-registry proxy requires "
-                "--endpoint-registry-addr (HOST:PORT)"
-            )
-    elif not args.worker_endpoint_file:
-        raise SystemExit("worker_server requires --worker-endpoint-file")
+    if not getattr(args, "endpoint_registry_addr", None):
+        raise SystemExit(
+            "worker_server requires --endpoint-registry-addr (HOST:PORT of the "
+            "discovery registry middleware; start one with "
+            "python -m gllm.entrypoints.discovery_server --listen HOST:PORT)"
+        )
 
     # Pin to the requested physical GPU(s) before any CUDA init, mirroring
     # lm_server (--lm-gpu): spawned children then use local ranks 0..tp-1.
@@ -116,9 +117,9 @@ def main():
     engine = LLM(**kwargs)
 
     logger.info(
-        "Standalone worker fleet ready (endpoint file: %s). Waiting for "
-        "frontend connections; requests arrive via the rendezvous transport.",
-        args.worker_endpoint_file,
+        "Standalone worker fleet ready (registry: %s). Waiting for frontend "
+        "connections; requests arrive via the rendezvous transport.",
+        args.endpoint_registry_addr,
     )
 
     # Drive the engine loop directly: recv outputs -> send new work. This is

@@ -309,21 +309,12 @@ def add_decoupled_args(p: argparse.ArgumentParser) -> None:
 
     When set, the process no longer owns the *other* half of the system: a
     standalone frontend never spawns workers or touches a GPU, and a
-    standalone worker never runs the HTTP app. They rendezvous through
-    ``--worker-endpoint-file`` (see docs/frontend_worker_decoupling.md).
+    standalone worker never runs the HTTP app. They rendezvous through a
+    standalone in-memory registry middleware
+    (``--endpoint-registry-addr``; see docs/frontend_worker_decoupling.md).
+    The middleware is control-plane only: the data plane stays
+    frontend<->worker point-to-point zmq.
     """
-    p.add_argument(
-        "--worker-endpoint-file",
-        dest="worker_endpoint_file",
-        type=str,
-        default=None,
-        help=(
-            "Path to the worker endpoint rendezvous file. For a standalone "
-            "frontend: read (polled) to discover the separately deployed "
-            "worker fleet. For a standalone worker: written by the worker "
-            "process to publish its frontend-facing sockets."
-        ),
-    )
     p.add_argument(
         "--worker-transport-base-port",
         dest="worker_transport_base_port",
@@ -336,7 +327,6 @@ def add_decoupled_args(p: argparse.ArgumentParser) -> None:
             "machine can connect."
         ),
     )
-
     p.add_argument(
         "--worker-transport-advertise-host",
         dest="worker_transport_advertise_host",
@@ -344,28 +334,11 @@ def add_decoupled_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Standalone worker only: hostname/IP to put in the tcp:// "
-            "endpoints PUBLISHED to the rendezvous file. Defaults to the "
-            "bind host (--master-addr; 0.0.0.0 means the wildcard, which "
-            "the worker uses to listen on all interfaces). Remote "
-            "frontends need a routable address, so pass e.g. the fleet "
-            "IP here (or point --master-addr at it)."
-        ),
-    )
-    p.add_argument(
-        "--endpoint-registry",
-        dest="endpoint_registry",
-        type=str,
-        default="file",
-        choices=["file", "proxy"],
-        help=(
-            "Standalone deployment: how the worker and frontend discover "
-            "each other's transport. 'file' (default) uses the on-disk "
-            "rendezvous file (--worker-endpoint-file), zero-dependency. "
-            "'proxy' routes through a standalone in-memory registry "
-            "middleware (start: python -m gllm.entrypoints.discovery_server "
-            "--listen HOST:PORT; set --endpoint-registry-addr to it). The "
-            "middleware is control-plane only: the data plane stays "
-            "frontend<->worker point-to-point zmq."
+            "endpoints registered in the registry. Defaults to the bind host "
+            "(--master-addr; 0.0.0.0 means the wildcard, which the worker "
+            "uses to listen on all interfaces). Remote frontends need a "
+            "routable address, so pass e.g. the fleet IP here (or point "
+            "--master-addr at it)."
         ),
     )
     p.add_argument(
@@ -374,12 +347,14 @@ def add_decoupled_args(p: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help=(
-            "Standalone deployment, --endpoint-registry proxy only: "
-            "HOST:PORT of the discovery proxy middleware (same service as "
-            "--discovery-endpoint for encoder disaggregation)."
+            "Standalone deployment (REQUIRED): HOST:PORT of the discovery "
+            "registry middleware both sides rendezvous on (start it: "
+            "python -m gllm.entrypoints.discovery_server --listen "
+            "HOST:PORT; same service as --discovery-endpoint for encoder "
+            "disaggregation). Control plane only -- the data plane stays "
+            "frontend<->worker point-to-point zmq."
         ),
     )
-
 
 def add_engine_args(p: argparse.ArgumentParser, *, tp_help: str = None) -> None:
     """Every engine-facing argument both entrypoints share."""
@@ -436,13 +411,11 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
         "mtp_max_batch": args.mtp_max_batch,
         "mm_processor_min_pixels": args.mm_processor_min_pixels,
         "mm_processor_max_pixels": args.mm_processor_max_pixels,
-        "worker_endpoint_file": getattr(args, "worker_endpoint_file", None),
         "worker_transport_base_port": getattr(
             args, "worker_transport_base_port", None
         ),
         "worker_transport_advertise_host": getattr(
             args, "worker_transport_advertise_host", None
         ),
-        "endpoint_registry": getattr(args, "endpoint_registry", "file"),
         "endpoint_registry_addr": getattr(args, "endpoint_registry_addr", None),
     }

@@ -228,12 +228,12 @@ class AsyncLLM(LLM):
             try:
                 await self._run_engine_io(super().schedule)
             except Exception as e:
-                # Decoupled deployment: the worker fleet died (endpoint file
+                # Decoupled deployment: the worker fleet died (registry entry
                 # vanished / unreadable, raised by check_standalone_worker
                 # *before* any transport use). Fail every in-flight stream
                 # fast instead of hanging them; keep the event loop alive so
                 # a frontend *process* restart is NOT required -- once the
-                # worker fleet republishes its endpoint file, the watcher
+                # worker fleet re-registers, the watcher
                 # reconnects in-process and service resumes. Note the uuid
                 # change does NOT raise out of the engine IO (the watcher
                 # reconnects inside it); that path terminates streams via

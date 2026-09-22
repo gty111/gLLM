@@ -85,23 +85,20 @@ class LLM:
         ssm_snapshot_stride_tokens=256,
         worker_transport_base_port=None,
         worker_transport_advertise_host=None,
-        endpoint_registry=None,
         endpoint_registry_addr=None,
         # --- Frontend/worker decoupling (see docs/frontend_worker_decoupling.md) ---
         # ``standalone_frontend=True``: this process is a pure frontend -- it
         # does NOT spawn worker processes and does NOT initialize a GPU. It
-        # discovers a separately deployed worker fleet through
-        # ``worker_endpoint_file`` (written by ``worker_server``). ``standalone_worker``:
-        # this process hosts a worker fleet whose frontend-facing sockets are
-        # advertised in ``worker_endpoint_file`` instead of spawning.
+        # discovers a separately deployed worker fleet through the endpoint
+        # registry (``endpoint_registry_addr``). ``standalone_worker``: this
+        # process hosts a worker fleet whose frontend-facing sockets it
+        # registers in the registry instead of spawning.
         standalone_frontend=False,
         standalone_worker=False,
-        worker_endpoint_file=None,
     ):
         init_logger()
         self.standalone_frontend = bool(standalone_frontend)
         self.standalone_worker = bool(standalone_worker)
-        self.worker_endpoint_file = worker_endpoint_file
         if self.standalone_frontend:
             # A standalone FRONTEND must be an AsyncLLM: the frontend ZMQ
             # transport is created on the engine-IO executor thread (zmq
@@ -136,15 +133,11 @@ class LLM:
             )
         self.worker_transport_base_port = worker_transport_base_port
         self.worker_transport_advertise_host = worker_transport_advertise_host
-        # Endpoint registry: how this process discovers / advertises the
-        # standalone transport. "file" (default) is the on-disk rendezvous
-        # file (zero-dep, backward compatible); "proxy" routes to a standalone
-        # in-memory registry process (see docs/frontend_worker_decoupling.md).
-        # Built here so BOTH roles (standalone worker publishes, standalone
-        # frontend discovers) share the same backend selection.
-        self.endpoint_registry_kind = endpoint_registry
+        # Endpoint registry: the standalone discovery backend -- a standalone
+        # in-memory proxy middleware (endpoint_registry_addr). Both roles use
+        # it: a standalone worker REGISTERS its transport, a standalone
+        # frontend DISCOVERS it. (see docs/frontend_worker_decoupling.md)
         self.endpoint_registry_addr = endpoint_registry_addr
-        self._worker_writer = None  # WorkerEndpointWriter (file-mode worker)
         self.endpoint_registry = self._build_endpoint_registry()
         # Frontend session epoch (echoed per output row via
         # IPCPackage.sessions / free_sessions, see
@@ -315,7 +308,7 @@ class LLM:
             time.sleep(1)
         # The worker child has bound its frontend-facing sockets and finished
         # initialization (mp_alive is set at the end of Worker.init). Publish
-        # the endpoint file *now* so a connecting frontend can never buffer
+        # the registry entry *now* so a connecting frontend can never buffer
         # work into a socket nobody is reading yet.
         if self.standalone_worker:
             self._publish_worker_endpoint()
@@ -348,7 +341,7 @@ class LLM:
         ipc_path_prefix = random_uuid()
         base_port = getattr(self, "worker_transport_base_port", None)
         if self.standalone_worker and base_port:
-            # TCP mode: the published endpoint file and the sockets the
+            # TCP mode: the registered endpoints and the sockets the
             # spawned worker actually binds MUST be the same fixed addresses
             # (schedule=base, output=base+1, token=base+2 on the bind host),
             # otherwise a remote frontend connects to one address while the
@@ -370,19 +363,16 @@ class LLM:
         self._launch_workers()
 
     def _build_endpoint_registry(self):
-        """Instantiate the endpoint registry for this process.
+        """Instantiate the endpoint registry (a network proxy client).
 
-        Selection (CLI): ``--endpoint-registry {file,proxy}`` +
-        ``--endpoint-registry-addr`` (proxy only). Default is ``file``,
-        which reuses ``worker_endpoint_file`` and is byte-for-byte the
-        previous behavior.
+        Requires ``endpoint_registry_addr`` (HOST:PORT of the discovery
+        proxy). A standalone worker registers into it, a standalone
+        frontend discovers from it.
         """
         from gllm.entrypoints.worker_endpoint import build_endpoint_registry
 
         cfg = {
-            "endpoint_registry": self.endpoint_registry_kind,
             "endpoint_registry_addr": self.endpoint_registry_addr,
-            "worker_endpoint_file": self.worker_endpoint_file,
             "standalone_worker": self.standalone_worker,
         }
         return build_endpoint_registry(cfg)
@@ -394,10 +384,6 @@ class LLM:
         (ipc:// on the same machine, tcp:// when the fleet is reachable over
         the network via ``--worker-transport-base-port``).
         """
-        # A worker MUST advertise: file mode needs the path, proxy mode needs
-        # the registry built with the proxy addr. (File mode: the path doubles
-        # as the default rendezvous; proxy mode: worker_endpoint_file may be
-        # unset.)
         base_port = getattr(self, "worker_transport_base_port", None)
         if base_port:
             # tcp:// transports at fixed offsets: schedule=output base,
@@ -428,26 +414,15 @@ class LLM:
             token = f"tcp://{advertise_host}:{p + 2}"
         else:
             schedule, output, token = self.schedule_path, self.output_path, self.token_path
-        # Publish through the registry (file writer OR network proxy). For the
-        # file backend this is exactly the previous WorkerEndpointWriter path
-        # (set_endpoints mints the uuid, starts the heartbeat, ABA-safe
-        # cleanup); for proxy it registers + leases on the middleware. A raw
-        # LLM.__new__ shell (tests) has no registry attr -> synthesize the
-        # file writer so the historical path is preserved. (Imported at the
-        # TOP of this block -- not inside the `if` -- because a later line
-        # references FileEndpointRegistry, which would make the name local to
-        # the whole function and unbound on the non-shell path.)
-        from gllm.entrypoints.worker_endpoint import FileEndpointRegistry
-
+        # Register through the registry (network proxy). A raw LLM.__new__
+        # shell (tests) has no registry -> synthesize one pointed at the
+        # configured addr so the historical call shape is preserved.
         reg = getattr(self, "endpoint_registry", None)
         if reg is None:
-            reg = FileEndpointRegistry(self.worker_endpoint_file, side="worker")
+            from gllm.entrypoints.worker_endpoint import NetworkEndpointRegistry
+            reg = NetworkEndpointRegistry(
+                self.endpoint_registry_addr or "127.0.0.1:0", side="worker")
         reg.register({0: {"schedule": schedule, "output": output, "token": token}})
-        # Keep the legacy _worker_writer handle (some code paths/tests reference
-        # it for cleanup). In file mode that IS the writer; in proxy mode it
-        # stays None and the watchdog revokes via the registry instead.
-        if isinstance(reg, FileEndpointRegistry):
-            self._worker_writer = reg._writer
         logger.info(
             "Published standalone worker endpoint (registry=%s, transport uuid %s)",
             getattr(reg, "side", "?"),
@@ -519,7 +494,7 @@ class LLM:
         """Heartbeat/liveness check for the standalone worker fleet.
 
         Delegates to :meth:`FleetSupervisor.heartbeat`: raises
-        RuntimeError when the endpoint file has vanished / gone stale
+        RuntimeError when the registry entry has vanished / gone stale
         (the schedule loop converts that into a terminal error for every
         in-flight async stream instead of hanging them); a uuid change
         (fleet restarted in the background) is handled IN-PROCESS by the
@@ -540,19 +515,19 @@ class LLM:
         spin): a wakeup happens on every worker->frontend output frame, after
         which we push any pending new work and block again. The spawned GPU
         child process is the fleet: if it dies, this parent removes the
-        endpoint file (via :meth:`_watch_worker_process`) so a connected
+        registry entry (via :meth:`_watch_worker_process`) so a connected
         frontend detects the crash; the frontend's heartbeat then rebuilds
         the transport in-process (fully-down standby: it polls
         :meth:`FleetSupervisor.wait_ready` and the next heartbeat commits
         the rebuild) once a new fleet republishes.
-        Ctrl-C exits the process; the endpoint file is removed via atexit
+        Ctrl-C exits the process; the registry entry is revoked via atexit
         too.
         """
         # The request data path is handled entirely by the *worker child*
         # process (frontend PUSH -> child PULL schedule -> GPU -> child PUSH
         # output -> frontend PULL). This parent's only job is the fleet's
         # lifecycle: keep running while the child is alive, and remove the
-        # endpoint file the moment the child dies so a connected frontend
+        # registry entry the moment the child dies so a connected frontend
         # detects the outage. The parent's own ``self.comm`` is a frontend-role
         # socket that no one feeds, so we must NOT run the engine schedule
         # loop here (doing so double-drains / starves the real transport).
@@ -568,10 +543,10 @@ class LLM:
                 _ml_t0 = time.monotonic()
 
     def _watch_worker_process(self):
-        """Poll the spawned worker child; on death, remove the endpoint file.
+        """Poll the spawned worker child; on death, revoke the registry entry.
 
         Returns True while the fleet is healthy. When the child is gone the
-        endpoint file is unlinked so a frontend's liveness probe (endpoint
+        registry entry is revoked so a frontend's liveness probe (registry
         file present + output socket responsive) flips to down immediately.
         """
         dead = None
@@ -584,7 +559,7 @@ class LLM:
         code = getattr(dead, "exitcode", None)
         logger.error(
             "Standalone worker child process died (exit code %s); removing "
-            "endpoint file so frontends detect the outage.",
+            "registry entry so frontends detect the outage.",
             code,
         )
         reg = getattr(self, "endpoint_registry", None)

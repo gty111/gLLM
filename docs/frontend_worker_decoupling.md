@@ -28,16 +28,17 @@ can be restarted (or crash) without dragging the other down.
    │  loads tokenizer+cfg   │         │  output PUSH, runs the model │
    └────────────────────────┘         └──────────────────────────────┘
                 │                                   │
-                └────── rendezvous: worker endpoint file ──────┘
-                     (<endpoint-file>.json)
+                └───────────────────── rendezvous: endpoint registry (in-memory proxy) ────────────┘
+                     (discovery_server; control plane only)
 ```
 
-The two sides rendezvous through a small JSON **worker endpoint file**
-(`gllm.entrypoints.worker_endpoint.py`):
+The two sides rendezvous through a small **endpoint registry** — a
+standalone, in-memory proxy middleware (control plane only; details in
+the section below). The worker registers one entry per launch
+(`gllm.entrypoints.worker_endpoint.py`), shaped like:
 
 ```json
 {
-  "version": 1,
   "uuid": "<transport id, random per worker launch>",
   "updated_at": 1789974106.123,
   "endpoints": {
@@ -50,55 +51,54 @@ The two sides rendezvous through a small JSON **worker endpoint file**
 }
 ```
 
-* The **worker parent** writes it (only *after* the GPU child has bound its
-  sockets and finished init) and removes it via `atexit` + a child-supervision
-  loop when the fleet goes away.
-* The **frontend** polls it. A change in `uuid` means the worker fleet
-  restarted; the frontend tears down and re-connects its ZMQ sockets
-  **in-process** (`FleetSupervisor._rebuild`, polled via `wait_ready`) —
-  no frontend process restart.
+* The **worker** registers it (only *after* the GPU child has bound its
+  sockets and finished init) and leases it; the parent revokes it via
+  `atexit` + a child-supervision loop when the fleet goes away, and lease
+  expiry itself is the SIGKILL / power-loss backstop.
+* The **frontend** discovers it on every liveness tick. A change in `uuid`
+  means the worker fleet restarted; the frontend tears down and
+  re-connects its ZMQ sockets **in-process**
+  (`FleetSupervisor._rebuild`, polled via `wait_ready`) — no frontend
+  process restart.
 
 Transport: `ipc://` on a single machine, or fixed `tcp://` ports
 (`--worker-transport-base-port`) so a frontend on another host can connect.
 
-### Endpoint registry: file (default) or proxy middleware
+### Endpoint registry (in-memory proxy middleware)
 
 The rendezvous is behind a small `EndpointRegistry` interface
-(`gllm/entrypoints/worker_endpoint.py`). Two backends ship:
-
-* **file** (default): the on-disk `--worker-endpoint-file` above. Zero
-  dependency, backward compatible.
-* **proxy**: a standalone, in-memory registry middleware process (control
-  plane only). The worker *registers* its transport rows and leases them; the
-  frontend *discovers* them. The middleware is `gllm.entrypoints.discovery_server`
-  (the same dependency-free ZMQ `DiscoveryServer` used for encoder
-  disaggregation) — reuse it directly:
+(`gllm/entrypoints/worker_endpoint.py`) with a single backend: a
+standalone, in-memory registry middleware process (control plane only).
+The worker *registers* its transport rows and leases them; the frontend
+*discovers* them. The middleware is `gllm.entrypoints.discovery_server`
+(the same dependency-free ZMQ `DiscoveryServer` used for encoder
+disaggregation) — start one per deployment:
 
   ```bash
   # 0) middleware (independent process; control plane only)
   python -m gllm.entrypoints.discovery_server --listen 0.0.0.0:9500
 
-  # 1) worker registers with it (no --worker-endpoint-file needed)
+  # 1) worker registers with it
   python -m gllm.entrypoints.worker_server \
       --model-path /path/to/model --worker-gpu 1 \
-      --endpoint-registry proxy --endpoint-registry-addr 127.0.0.1:9500 \
+      --endpoint-registry-addr 127.0.0.1:9500 \
       --tp 1 --gpu-memory-util 0.9
 
   # 2) frontend discovers from it
   python -m gllm.entrypoints.api_server \
       --model-path /path/to/model --host 0.0.0.0 --port 8000 \
       --standalone-frontend \
-      --endpoint-registry proxy --endpoint-registry-addr 127.0.0.1:9500
+      --endpoint-registry-addr 127.0.0.1:9500
   ```
 
   The middleware is **control-plane only**: it stores `(uuid -> transport
   rows + lease)`. The data plane stays **frontend <-> worker point-to-point
   zmq** using the addresses it hands out — the proxy is never in the request
-  path, so it is not a forwarding single point. Lease expiry (3x the file
+  path, so it is not a forwarding single point. Lease expiry (3x the
   staleness window) is the SIGKILL / power-loss backstop; a proxy restart
-  does not lose a live worker (the worker's lease heartbeat re-registers it).
-  Cross-machine, this removes the shared-filesystem requirement of file mode
-  (both sides only need to reach the proxy).
+  does not lose a live worker (the worker's lease heartbeat re-registers
+  it). Cross-machine, both sides only need network reachability to the
+  proxy and to the worker's advertised transport host.
 
 ### Frontend session epoch
 
@@ -116,7 +116,7 @@ stamps (`IPCPackage.sessions` / `free_sessions`), so the standalone
 frontend applies only rows stamped with its own epoch -- a late completion
 of the dead session's request 0 can never terminate the new session's
 request 0, and `abort(0)` from the new session frees only its own
-request. Dispatch is gated by a cheap endpoint-file liveness probe so a
+request. Dispatch is gated by a cheap registry liveness probe so a
 dead fleet cannot silently absorb requests into its 512MB send buffer.
 
 ### Wire protocol (single definition)
@@ -144,9 +144,9 @@ wholesale rather than guessed, and a missing stamp list is legacy
 
 | Event                              | Frontend                              | Worker fleet                     |
 |------------------------------------|---------------------------------------|----------------------------------|
-| **Worker GPU child dies**          | stays up; in-flight requests fail fast; auto-reconnects when a new worker publishes | parent watchdog removes the endpoint file and exits |
+| **Worker GPU child dies**          | stays up; in-flight requests fail fast; auto-reconnects when a new worker re-registers | parent watchdog revokes the registry entry and exits |
 | **New worker launched**            | detects the new `uuid`, re-connects in-process, serves immediately | fresh fleet, weights re-loaded |
-| **Frontend dies**                  | (gone) — new frontend re-reads the endpoint file and reconnects | **survives**; weights stay loaded, keeps serving |
+| **Frontend dies**                  | (gone) — new frontend re-discovers the fleet from the registry and reconnects | **survives**; weights stay loaded, keeps serving |
 | **New frontend launched**          | connects to the still-running worker (same `uuid`); mints a fresh session epoch, so late outputs for the dead frontend's ids are dropped by the worker's stamp | unchanged |
 
 ## Usage
@@ -157,7 +157,7 @@ wholesale rather than guessed, and a missing stamp list is legacy
 python -m gllm.entrypoints.worker_server \
     --model-path /path/to/model \
     --worker-gpu 1 \                    # physical GPU(s); length must equal --tp
-    --worker-endpoint-file /tmp/gllm_worker_endpoint.json \
+    --endpoint-registry-addr 127.0.0.1:9500 \
     --master-addr 127.0.0.1 --master-port 29611 \
     --tp 1 --gpu-memory-util 0.9 \
     [--worker-transport-base-port 50001]   # cross-machine frontends
@@ -166,10 +166,10 @@ python -m gllm.entrypoints.worker_server \
 
 > **Cross-machine tip:** with `--worker-transport-base-port`, the worker
 > *listens* on the bind host (`--master-addr`, `0.0.0.0` = all
-> interfaces) but the endpoint file must carry a *routable* address —
-> frontends on other hosts cannot dial `0.0.0.0`. If
+> interfaces) but the registered endpoints must carry a *routable*
+> address — frontends on other hosts cannot dial `0.0.0.0`. If
 > `--master-addr` is already a real IP it is reused; otherwise pass
-> `--worker-transport-advertise-host FLEET_IP`. Publishing a wildcard
+> `--worker-transport-advertise-host FLEET_IP`. Registering a wildcard
 > is refused at startup.
 
 ### 2) Launch the stateless frontend (no GPU)
@@ -179,11 +179,11 @@ python -m gllm.entrypoints.api_server \
     --model-path /path/to/model \
     --host 0.0.0.0 --port 8000 \
     --standalone-frontend \
-    --worker-endpoint-file /tmp/gllm_worker_endpoint.json
+    --endpoint-registry-addr 127.0.0.1:9500
 ```
 
-The frontend blocks (up to 5 min) until the worker endpoint file appears, then
-serves. `GET /health` probes the worker fleet and returns `503
+The frontend blocks (up to 5 min) until the worker fleet appears in the
+registry, then serves. `GET /health` probes the worker fleet and returns `503
 worker_unavailable` when it is down.
 
 > `--model-path` is required on **both** sides: the frontend loads the
@@ -194,11 +194,11 @@ worker_unavailable` when it is down.
 
 * Single-rank worker fleets are fully supported (`--tp 1`), including the
   cross-machine `tcp://` transport (`--worker-transport-base-port`): the
-  worker child binds the exact fixed addresses published in the endpoint
-  file (schedule=base, output=base+1, token=base+2), and the published
-  rows use `--worker-transport-advertise-host` (falling back to
-  `--master-addr`) so remote frontends get a dialable address. The
-  published file carries a single rank-0 transport row; multi-rank
+  worker child binds the exact fixed addresses it registers (schedule=base,
+  output=base+1, token=base+2), and the published rows use
+  `--worker-transport-advertise-host` (falling back to `--master-addr`)
+  so remote frontends get a dialable address. The registry entry carries
+  a single rank-0 transport row; multi-rank
   fleets (TP>1 / PP>1) coordinate internally behind that one leg and
   are not independently addressable by the frontend yet.
 * Encoder-disaggregation (`lm_server`) and DP-attention per-replica endpoints
@@ -227,13 +227,12 @@ worker_unavailable` when it is down.
   `mp.set_warmup_delay` on the context to defer CUDA init in children;
   that knob is gone — spawn already gives the fresh-interpreter
   guarantee, and a silent `set_warmup_delay` no-op would have masked it.)
-* Cross-machine (`tcp://`) deployment requirements: the endpoint file
-  must be readable/writable by BOTH processes (shared filesystem: NFS /
-  a local mount the frontend can reach), since it is the rendezvous;
-  clocks on the two hosts must be roughly synchronized (NTP), because
-  liveness uses the file's `updated_at` staleness window as a
-  SIGKILL/power-loss backstop (the primary restart signal is the
-  transport uuid change, which is clock-independent); and the fixed
-  transport ports (base, base+1, base+2) must be reachable through any
-  intervening firewall from the frontend host to the worker's
-  advertise host.
+* Cross-machine (`tcp://`) deployment requirements: BOTH sides must
+  reach the registry middleware over the network (any host/port pair),
+  and clocks on the involved hosts must be roughly synchronized (NTP),
+  because liveness uses the registered entry's `updated_at` staleness
+  window as a SIGKILL/power-loss backstop (the primary restart signal
+  is the transport uuid change, which is clock-independent); and the
+  fixed transport ports (base, base+1, base+2) must be reachable
+  through any intervening firewall from the frontend host to the
+  worker's advertise host.

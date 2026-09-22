@@ -1,13 +1,16 @@
 """Unit tests for the frontend/worker decoupling rendezvous
 (``gllm.entrypoints.worker_endpoint``) and the standalone engine plumbing.
 
-These run without a GPU: they exercise the endpoint-file writer/reader
-lifecycle and the standalone frontend's comm construction + reconnect
-logic, which is the load-bearing part of the crash-isolation contract.
+These run without a GPU: they exercise the endpoint REGISTRY (a standalone
+in-memory proxy, started in-process via DiscoveryServer) plus the standalone
+frontend's comm construction + reconnect logic, which is the load-bearing
+part of the crash-isolation contract.
 """
 
 import json
 import os
+import socket
+import threading
 import time
 
 import pytest
@@ -16,41 +19,67 @@ import zmq
 from gllm.entrypoints import worker_endpoint as we
 
 
-def test_writer_publish_read_roundtrip(tmp_path):
-    path = str(tmp_path / "ep.json")
-    w = we.WorkerEndpointWriter(path)
-    uuid1 = w.set_endpoints(
-        {0: {"schedule": "ipc:///tmp/a", "output": "ipc:///tmp/b", "token": "ipc:///tmp/c"}}
-    )
-    # Reader must see the published endpoints with INTEGER rank keys.
-    got_uuid, endpoints = we.read_worker_endpoint_file(path)
-    assert got_uuid == uuid1
-    assert 0 in endpoints  # JSON string key normalised to int
-    assert endpoints[0]["output"] == "ipc:///tmp/b"
-    w.cleanup()
-    # Cleanup removes the file so no frontend can dial a dead worker.
-    assert we.read_worker_endpoint_file(path) == (None, None)
+class _RegistryCtx:
+    """A standalone in-memory registry proxy, started in-process, for tests.
 
+    Replaces the old endpoint-file fixture: the worker side registers into a
+    real DiscoveryServer and the frontend side discovers from it, so the
+    liveness / uuid-change / standby / dispatch-gating paths are exercised
+    exactly as in production (network registry), with no GPU and no files.
+    """
 
-def test_missing_file_reads_none(tmp_path):
-    path = str(tmp_path / "nope.json")
-    assert we.read_worker_endpoint_file(path) == (None, None)
-    assert we.endpoint_file_age_seconds(path) is None
+    def __init__(self):
+        from gllm.disagg.discovery import DiscoveryServer
 
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        self.addr = "127.0.0.1:%d" % sock.getsockname()[1]
+        sock.close()
+        self.server = DiscoveryServer(self.addr)
+        self._thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self._thread.start()
 
-def test_heartbeat_refreshes_mtime(tmp_path):
-    path = str(tmp_path / "ep.json")
-    w = we.WorkerEndpointWriter(path, heartbeat_interval=0.01)
-    w.set_endpoints({0: {"schedule": "s", "output": "o", "token": "t"}})
-    before = we.endpoint_file_age_seconds(path)
-    time.sleep(0.05)
-    after = we.endpoint_file_age_seconds(path)
-    # 0.5s after publish the age would be ~0.5s; staying near-zero proves
-    # the heartbeat kept rewriting the file.
-    assert after < 0.3, f"mtime not refreshed: before={before:.3f} after={after:.3f}"
-    assert after >= 0
-    w.heartbeat()
-    w.cleanup()
+    def worker_side(self, ttl_ms=30000):
+        from gllm.entrypoints.worker_endpoint import NetworkEndpointRegistry
+        return NetworkEndpointRegistry(
+            self.addr, side="worker", ttl_ms=ttl_ms)
+
+    def frontend_side(self):
+        from gllm.entrypoints.worker_endpoint import NetworkEndpointRegistry
+        return NetworkEndpointRegistry(self.addr, side="frontend")
+
+    def wait_visible(self, side_client, uuid, timeout=5.0):
+        """Poll until the registry serves `uuid` (the register RPC's
+        effect is visible to a separate client). Returns True on success."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            if side_client.latest()[0] == uuid:
+                return True
+            _time.sleep(0.02)
+        return False
+
+    def wait_gone(self, side_client, timeout=5.0):
+        """Poll until the registry has no fleet entry (revoke applied)."""
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            if side_client.latest()[0] is None:
+                return True
+            _time.sleep(0.02)
+        return False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.server.stop()
+        except Exception:
+            pass
 
 
 def test_standalone_frontend_comm_connects(monkeypatch):
@@ -156,7 +185,7 @@ def test_standalone_worker_skips_frontend_comm():
 
 def _bare_llm():
     """A standalone-frontend LLM shell without constructing the real engine
-    (which would wait on the endpoint file / build runners)."""
+    (which would wait on the registry / build runners)."""
     from gllm.engine.llm import LLM
 
     eng = LLM.__new__(LLM)
@@ -170,8 +199,11 @@ def _bare_llm():
     eng.running_maps = {}
     eng.frontend_epoch = "epoch-A"
     eng.dp_size = 1
-    # Supervisor target (tests may override after the fact).
-    eng.worker_endpoint_file = None
+    # Endpoint registry: tests override with a _RegistryCtx().frontend_side();
+    # None means "no fleet" (the liveness gate treats it as dead, exactly as a
+    # the fleet is not registered did).
+    eng.endpoint_registry = None
+    eng.endpoint_registry_addr = None
     # Bare-engine stand-in: _apply_ipc_package's async path derefs these.
     # Fake tokenizer: decode([t]) -> chr(A+t); no special tokens, no spacing.
     from types import SimpleNamespace
@@ -228,13 +260,14 @@ def test_foreign_session_outputs_are_dropped():
     assert seq2.token_ids == [1], "unstamped row must be dropped, not applied"
 
 
-def test_dispatch_requeues_when_fleet_is_dead(tmp_path):
-    """P1-B1: a DEAD fleet (endpoint file gone) must NOT have its requests
-    absorbed into the send buffer -- _dispatch_pending refuses within the
-    bound and requeues for the next tick (the liveness watcher then drives
-    the reconnect). Note: zmq itself cannot refuse here -- with SNDBUF=512MB
-    a send to a dead peer still ACKs into the buffer, which is exactly why
-    the endpoint-file probe gates the dispatch."""
+def test_dispatch_requeues_when_fleet_is_dead():
+    """P1-B1: a DEAD fleet (nothing registered in the endpoint registry)
+    must NOT have its requests absorbed into the send buffer --
+    _dispatch_pending refuses within the bound and requeues for the next
+    tick (the liveness watcher then drives the reconnect). Note: zmq itself
+    cannot refuse here -- with SNDBUF=512MB a send to a dead peer still
+    ACKs into the buffer, which is exactly why the registry probe gates the
+    dispatch."""
     import time as _time
 
     from gllm.distributed.comm import IPCPackage, zmqComm
@@ -250,10 +283,12 @@ def test_dispatch_requeues_when_fleet_is_dead(tmp_path):
     )
     comm.init()
     try:
+        ctx = _RegistryCtx()
         eng = _bare_llm()
         eng.comm = comm
-        # Endpoint file missing -> fleet dead -> dispatch must refuse.
-        eng.worker_endpoint_file = str(tmp_path / "nope.json")
+        # Empty registry (no worker registered) -> fleet dead -> dispatch
+        # must refuse. (The registry server stays up for the whole dispatch.)
+        eng.endpoint_registry = ctx.frontend_side()
 
         seq = GenerationSequence(
             seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
@@ -267,21 +302,22 @@ def test_dispatch_requeues_when_fleet_is_dead(tmp_path):
         assert eng.wait_lists == [seq], "pending request must be requeued"
         assert 0 not in eng.running_maps, "bookkeeping must be undone on refusal"
     finally:
+        ctx.server.stop()
         comm.close()
 
 
-def test_dispatch_sends_when_fleet_lively(tmp_path):
-    """P1-B1 companion: with a LIVE fleet (fresh endpoint file) and a
+def test_dispatch_sends_when_fleet_lively():
+    """P1-B1 companion: with a LIVE fleet (a fresh registry entry) and a
     healthy PULL peer, dispatch succeeds and the request is delivered."""
     from gllm.distributed.comm import IPCPackage, zmqComm
     from gllm.runtime.sequence import GenerationSequence
 
-    w = we.WorkerEndpointWriter(str(tmp_path / "ep.json"))
-    w.set_endpoints({0: {"schedule": "s", "output": "o", "token": "t"}})
-    w.heartbeat()
+    ctx = _RegistryCtx()
+    wreg = ctx.worker_side()
+    wreg.register({0: {"schedule": "s", "output": "o", "token": "t"}})
     try:
         eng = _bare_llm()
-        eng.worker_endpoint_file = str(tmp_path / "ep.json")
+        eng.endpoint_registry = ctx.frontend_side()
         seq = GenerationSequence(
             seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
         eng.wait_lists = [seq]
@@ -303,7 +339,7 @@ def test_dispatch_sends_when_fleet_lively(tmp_path):
         # The stamp rode along with the request.
         assert fake.sent[0].schedule_lists[0].frontend_session == "epoch-A"
     finally:
-        w.cleanup()
+        wreg.revoke()
 
 
 def _make_stream():
@@ -346,25 +382,28 @@ def test_reconnect_terminates_streams_and_frees_ids():
     assert eng2.wait_lists == [] and eng2.abort_ids == []
 
 
-def test_endpoint_file_publishes_matching_tcp_addresses():
-    """P2-1: in TCP mode the endpoint file must advertise exactly the fixed
-    addresses the worker child will bind (schedule=base, output=base+1,
-    token=base+2 on the host)."""
+def test_registry_publishes_matching_tcp_addresses():
+    """P2-1: in TCP mode the registry entry must advertise exactly the
+    fixed addresses the worker child will bind (schedule=base,
+    output=base+1, token=base+2 on the host)."""
     from gllm.engine.llm import LLM
 
-    eng = LLM.__new__(LLM)
-    eng.standalone_worker = True
-    eng.host = "127.0.0.1"
-    eng.worker_transport_base_port = 59990
-    eng.worker_endpoint_file = "/tmp/_gllm_tcp_ep_test_%d.json" % os.getpid()
-    eng._publish_worker_endpoint()
-    from gllm.entrypoints import worker_endpoint as we
-    uuid_, eps = we.read_worker_endpoint_file(eng.worker_endpoint_file)
-    ep = eps[0]
-    assert ep["schedule"] == "tcp://127.0.0.1:59990"
-    assert ep["output"] == "tcp://127.0.0.1:59991"
-    assert ep["token"] == "tcp://127.0.0.1:59992"
-    eng._worker_writer.cleanup()
+    with _RegistryCtx() as ctx:
+        wreg = ctx.worker_side()
+        eng = LLM.__new__(LLM)
+        eng.standalone_worker = True
+        eng.host = "127.0.0.1"
+        eng.worker_transport_base_port = 59990
+        eng.endpoint_registry_addr = ctx.addr
+        eng.endpoint_registry = wreg
+        eng._publish_worker_endpoint()
+        uuid_, eps = ctx.frontend_side().latest()
+        assert uuid_ == wreg.uuid
+        ep = eps[0]
+        assert ep["schedule"] == "tcp://127.0.0.1:59990"
+        assert ep["output"] == "tcp://127.0.0.1:59991"
+        assert ep["token"] == "tcp://127.0.0.1:59992"
+        wreg.revoke()
 
 
 def test_tcp_pull_bind_roundtrip():
@@ -1136,41 +1175,45 @@ def test_cancel_after_first_output_translates_terminal_free():
 # ---------------------------------------------------------------------------
 
 
-def test_heartbeat_before_connect_survives_missing_endpoint(tmp_path):
+def test_heartbeat_before_connect_survives_missing_endpoint():
     """P2: the three supervisor state fields must exist BEFORE connect()
-    succeeds -- a missing endpoint file on the FIRST heartbeat must hit
-    the 3s grace window (and not AttributeError)."""
+    succeeds -- an EMPTY registry (no fleet registered) on the FIRST
+    heartbeat must hit the 3s grace window (and not AttributeError)."""
     import time as _time
 
     from gllm.engine.fleet_supervisor import FleetSupervisor
 
     eng = _bare_llm()
-    eng.worker_endpoint_file = str(tmp_path / "nope.json")
     sup = FleetSupervisor(eng, eng.dp_size)
     # State initialized in __init__ (unreachable-code regression guard).
     assert sup._worker_transport_uuid is None
     assert sup._worker_endpoints is None
     assert sup._gone_since is None
 
-    t0 = _time.monotonic()
-    try:
-        sup.heartbeat()
-    except RuntimeError:
-        raise AssertionError("first heartbeat inside the 3s grace must NOT raise")
-    dt = _time.monotonic() - t0
-    assert dt < 1.0, "grace-window path must be cheap"
-    assert sup._gone_since is not None, "grace timer must be armed on first miss"
+    with _RegistryCtx() as ctx:
+        eng.endpoint_registry = ctx.frontend_side()
+        t0 = _time.monotonic()
+        try:
+            sup.heartbeat()
+        except RuntimeError:
+            raise AssertionError(
+                "first heartbeat inside the 3s grace must NOT raise")
+        dt = _time.monotonic() - t0
+        assert dt < 1.0, "grace-window path must be cheap"
+        assert sup._gone_since is not None, \
+            "grace timer must be armed on first miss"
 
-    # Fast-forward past the grace window: now the fleet-dead error fires.
-    sup._gone_since = _time.monotonic() - 4
-    try:
-        sup.heartbeat()
-        raise AssertionError("stale endpoint past the grace window must raise")
-    except RuntimeError as e:
-        assert "down" in str(e)
+        # Fast-forward past the grace window: now the fleet-dead error fires.
+        sup._gone_since = _time.monotonic() - 4
+        try:
+            sup.heartbeat()
+            raise AssertionError(
+                "stale endpoint past the grace window must raise")
+        except RuntimeError as e:
+            assert "down" in str(e)
 
 
-def test_connect_builds_comm_without_prior_comm_attribute(tmp_path):
+def test_connect_builds_comm_without_prior_comm_attribute():
     """P1: the FIRST standalone connect runs with no pre-existing
     ``llm.comm`` attribute (the ctor skips _init_frontend_comm);
     _build_comm must tolerate that (getattr defense) and end with a
@@ -1183,101 +1226,107 @@ def test_connect_builds_comm_without_prior_comm_attribute(tmp_path):
     ``wait_ready`` + heartbeat), but is kept for API compatibility -- this
     test still covers the close-and-replace branch it exercises. It is a
     unit test (no engine-IO thread), so the blocking form is safe here."""
-    import json as _json
-
     from gllm.engine.fleet_supervisor import FleetSupervisor
 
     sched = "ipc:///tmp/_gllm_p1_sched_%d" % os.getpid()
     out = "ipc:///tmp/_gllm_p1_out_%d" % os.getpid()
     tok = "ipc:///tmp/_gllm_p1_tok_%d" % os.getpid()
-    ep = str(tmp_path / "ep.json")
-    # Schema as read by read_worker_endpoint_file: {"uuid", "endpoints"}.
-    with open(ep, "w") as f:
-        _json.dump({"uuid": "uuid-one",
-                    "endpoints": {"0": {"schedule": sched, "output": out, "token": tok}}}, f)
+    rows = {"schedule": sched, "output": out, "token": tok}
 
-    eng = _bare_llm()
-    # Transport parameters _build_comm reads from the host.
-    eng.host = "127.0.0.1"
-    eng.master_addr = "127.0.0.1"
-    eng.launch_mode = "normal"
-    eng.worker_endpoint_file = ep
-    # The reported failure shape: no comm attribute at all.
-    if hasattr(eng, "comm"):
-        del eng.comm
-    eng.fleet = FleetSupervisor(eng, eng.dp_size)
+    with _RegistryCtx() as ctx:
+        wreg = ctx.worker_side()
+        wreg.register({0: rows})
+        eng = _bare_llm()
+        # Transport parameters _build_comm reads from the host.
+        eng.host = "127.0.0.1"
+        eng.master_addr = "127.0.0.1"
+        eng.launch_mode = "normal"
+        eng.endpoint_registry = ctx.frontend_side()
+        # The reported failure shape: no comm attribute at all.
+        if hasattr(eng, "comm"):
+            del eng.comm
+        eng.fleet = FleetSupervisor(eng, eng.dp_size)
 
-    eng.fleet.connect()
-    assert eng.comm is not None, "connect must install the frontend comm"
-    assert eng.fleet._worker_transport_uuid == "uuid-one"
-    first_comm = eng.comm
+        eng.fleet.connect()
+        assert eng.comm is not None, "connect must install the frontend comm"
+        assert eng.fleet._worker_transport_uuid == wreg.uuid
+        first_comm = eng.comm
 
-    # Second incarnation: same supervisor, close-and-replace branch.
-    with open(ep, "w") as f:
-        _json.dump({"uuid": "uuid-two",
-                    "endpoints": {"0": {"schedule": sched, "output": out, "token": tok}}}, f)
-    eng.fleet.reconnect()
-    assert eng.comm is not None and eng.comm is not first_comm, \
-        "reconnect must swap the transport"
-    assert eng.fleet._worker_transport_uuid == "uuid-two"
-    eng.comm.close()
+        # Second incarnation: simulate a clean worker restart -- the old
+        # registration disappears (revoke), then a fresh one appears with a
+        # new transport uuid. This exercises the supervisor's
+        # close-and-replace branch.
+        wreg.revoke()
+        assert ctx.wait_gone(eng.endpoint_registry)
+        wreg2 = ctx.worker_side()
+        wreg2.register({0: rows})
+        assert ctx.wait_visible(eng.endpoint_registry, wreg2.uuid)
+        eng.fleet.reconnect()
+        assert eng.comm is not None and eng.comm is not first_comm, \
+            "reconnect must swap the transport"
+        assert eng.fleet._worker_transport_uuid == wreg2.uuid
+        eng.comm.close()
+        wreg2.revoke()
 
 
-def test_heartbeat_driven_rebuild_on_uuid_change(tmp_path):
+def test_heartbeat_driven_rebuild_on_uuid_change():
     """Round 7: in production the fleet-restart transition runs from the
-    HEARTBEAT (a new uuid on the existing endpoint file triggers the
-    supervisor's reactive _rebuild), not from reconnect()'s standby loop.
-    Cover that path: file present, uuid rotated -> heartbeat swaps the
-    comm, clears bookkeeping, re-mints the frontend epoch and runs the
+    HEARTBEAT (a new uuid in the registry triggers the supervisor's
+    reactive _rebuild), not from reconnect()'s standby loop. Cover that
+    path: entry present, uuid rotated -> heartbeat swaps the comm,
+    clears bookkeeping, re-mints the frontend epoch and runs the
     on_standalone_reconnect hook."""
-    import json as _json
-
     from gllm.engine.fleet_supervisor import FleetSupervisor
 
     sched = "ipc:///tmp/_gllm_hb_sched_%d" % os.getpid()
     out = "ipc:///tmp/_gllm_hb_out_%d" % os.getpid()
     tok = "ipc:///tmp/_gllm_hb_tok_%d" % os.getpid()
-    ep = str(tmp_path / "ep.json")
-    with open(ep, "w") as f:
-        _json.dump({"uuid": "uuid-a",
-                    "endpoints": {"0": {"schedule": sched, "output": out, "token": tok}}}, f)
+    rows = {"schedule": sched, "output": out, "token": tok}
 
-    eng = _bare_llm()
-    eng.host = "127.0.0.1"
-    eng.master_addr = "127.0.0.1"
-    eng.launch_mode = "normal"
-    eng.worker_endpoint_file = ep
-    if hasattr(eng, "comm"):
-        del eng.comm
-    eng.fleet = FleetSupervisor(eng, eng.dp_size)
-    eng.fleet.connect()
-    first_comm = eng.comm
-    epoch_before = eng.frontend_epoch
-    # Simulate in-flight state the rebuild must discard.
-    from gllm.runtime.sequence import GenerationSequence
-    dummy = GenerationSequence(seq_id=1, token_ids=[1], finish_tokens=None, output_len=8)
-    eng.running_maps[1] = dummy
-    eng.wait_lists = [dummy]
-    eng.abort_ids = [1]
-    transitions = []
-    eng.on_standalone_reconnect = lambda reason: transitions.append(reason)
+    with _RegistryCtx() as ctx:
+        wreg_a = ctx.worker_side()
+        wreg_a.register({0: rows})
+        eng = _bare_llm()
+        eng.host = "127.0.0.1"
+        eng.master_addr = "127.0.0.1"
+        eng.launch_mode = "normal"
+        eng.endpoint_registry = ctx.frontend_side()
+        if hasattr(eng, "comm"):
+            del eng.comm
+        eng.fleet = FleetSupervisor(eng, eng.dp_size)
+        eng.fleet.connect()
+        first_comm = eng.comm
+        epoch_before = eng.frontend_epoch
+        # Simulate in-flight state the rebuild must discard.
+        from gllm.runtime.sequence import GenerationSequence
+        dummy = GenerationSequence(seq_id=1, token_ids=[1],
+                                   finish_tokens=None, output_len=8)
+        eng.running_maps[1] = dummy
+        eng.wait_lists = [dummy]
+        eng.abort_ids = [1]
+        transitions = []
+        eng.on_standalone_reconnect = lambda reason: transitions.append(reason)
 
-    # Rotate the fleet: same file, new uuid (the worker's heartbeat
-    # thread refreshed it with a fresh transport identity).
-    with open(ep, "w") as f:
-        _json.dump({"uuid": "uuid-b",
-                    "endpoints": {"0": {"schedule": sched, "output": out, "token": tok}}}, f)
+        # Rotate the fleet: a clean restart -- the old entry is revoked,
+        # then a fresh registration carries a new uuid (what a restarted
+        # worker does).
+        wreg_a.revoke()
+        assert ctx.wait_gone(eng.endpoint_registry)
+        wreg_b = ctx.worker_side()
+        wreg_b.register({0: rows})
+        assert ctx.wait_visible(eng.endpoint_registry, wreg_b.uuid)
 
-    eng.fleet.heartbeat()
+        eng.fleet.heartbeat()
 
-    assert eng.comm is not None and eng.comm is not first_comm, \
-        "heartbeat must swap the transport on a uuid change"
-    assert eng.fleet._worker_transport_uuid == "uuid-b"
-    assert eng.running_maps == {} and eng.wait_lists == [] and eng.abort_ids == []
-    assert eng.frontend_epoch != epoch_before, \
-        "each transition must re-mint the frontend epoch"
-    assert len(transitions) == 1, "transition hook must fire exactly once"
-    eng.comm.close()
+        assert eng.comm is not None and eng.comm is not first_comm, \
+            "heartbeat must swap the transport on a uuid change"
+        assert eng.fleet._worker_transport_uuid == wreg_b.uuid
+        assert eng.running_maps == {} and eng.wait_lists == [] and eng.abort_ids == []
+        assert eng.frontend_epoch != epoch_before, \
+            "each transition must re-mint the frontend epoch"
+        assert len(transitions) == 1, "transition hook must fire exactly once"
+        eng.comm.close()
+        wreg_b.revoke()
 
 
 # ---------------------------------------------------------------------------
@@ -1330,7 +1379,7 @@ def test_schedule_enters_standby_when_fleet_down(monkeypatch):
     """The worker-DOWN branch of schedule() must drive
     ``FleetSupervisor.wait_ready`` (the time-sliced standby) -- a LIVE path,
     not dead code. A ``FleetDownError`` (raised by the supervisor heartbeat
-    when the endpoint file vanishes/goes stale) routes to ``wait_ready`` on
+    when the registry entry vanishes/goes stale) routes to ``wait_ready`` on
     the engine-IO executor; any OTHER engine-IO error fails open and retries
     at 1 Hz WITHOUT holding the thread.
 
@@ -1362,7 +1411,7 @@ def test_schedule_enters_standby_when_fleet_down(monkeypatch):
                 self._last_engine_io_error = None
                 # The base LLM.schedule runs check_standalone_worker() FIRST;
                 # instance-stub it to raise our error in place of the real
-                # heartbeat (no endpoint file / supervisor in this unit test).
+                # heartbeat (no registry entry / supervisor in this unit test).
                 self._boom = exc
             def check_standalone_worker(self):
                 raise self._boom
@@ -1402,7 +1451,7 @@ def test_schedule_enters_standby_when_fleet_down(monkeypatch):
         return llm._rec
 
     # Fleet DOWN -> wait_ready called with the slice; streams fail open.
-    llm, rec = _make_llm(FleetDownError("worker endpoint file gone"))
+    llm, rec = _make_llm(FleetDownError("worker fleet entry gone"))
     _drive_one_tick(llm)
     assert rec["wait_ready"] == [alm._STANDBY_SLICE], rec["wait_ready"]
     assert rec["failed"] >= 1, "fail-open must run on fleet-down"
@@ -1437,81 +1486,46 @@ def test_sync_standalone_frontend_raises_clear_error():
 
 
 # ============================================================================
-# Endpoint registry abstraction: file (default) + in-memory proxy
+# Endpoint registry: the network (in-memory proxy) backend
 # ============================================================================
 
-def test_build_endpoint_registry_defaults_to_file():
+def test_build_endpoint_registry_returns_network_backend():
     from gllm.entrypoints.worker_endpoint import (
-        FileEndpointRegistry, ProxyEndpointRegistry, build_endpoint_registry,
+        NetworkEndpointRegistry, build_endpoint_registry,
     )
-    # No registry hint -> file, frontend side (reads).
-    r = build_endpoint_registry({"worker_endpoint_file": "/tmp/x.json"})
-    assert isinstance(r, FileEndpointRegistry) and r.side == "frontend"
-    # Worker hint -> file, worker side (writes).
+    # Network registry, frontend side (reads) when standalone_worker is unset.
     r = build_endpoint_registry(
-        {"worker_endpoint_file": "/tmp/x.json", "standalone_worker": True})
-    assert isinstance(r, FileEndpointRegistry) and r.side == "worker"
-    # proxy without addr -> clear error.
+        {"endpoint_registry_addr": "127.0.0.1:9500"})
+    assert isinstance(r, NetworkEndpointRegistry) and r.side == "frontend"
+    # Worker hint -> worker side (registers).
+    r = build_endpoint_registry(
+        {"endpoint_registry_addr": "127.0.0.1:9500", "standalone_worker": True})
+    assert isinstance(r, NetworkEndpointRegistry) and r.side == "worker"
+    # No registry addr -> clear error (the proxy addr is mandatory).
     try:
-        build_endpoint_registry({"endpoint_registry": "proxy"})
-        raise AssertionError("expected ValueError for proxy without addr")
+        build_endpoint_registry({"standalone_worker": True})
+        raise AssertionError("expected ValueError for missing registry addr")
     except ValueError:
         pass
-    # Unknown kind -> error.
-    try:
-        build_endpoint_registry({"endpoint_registry": "bogus"})
-        raise AssertionError("expected ValueError for unknown kind")
-    except ValueError:
-        pass
 
 
-def test_file_registry_file_roundtrip(tmp_path):
-    """The file registry is byte-compatible with the legacy writer/reader."""
-    import gllm.entrypoints.worker_endpoint as we
-    from gllm.entrypoints.worker_endpoint import FileEndpointRegistry
-    path = str(tmp_path / "ep.json")
-    w = FileEndpointRegistry(path, side="worker")
-    u = w.register({0: {"schedule": "ipc:///tmp/s", "output": "ipc:///tmp/o",
-                        "token": "ipc:///tmp/t"}})
-    assert u == w.uuid
-    # Legacy reader sees exactly what the worker wrote.
-    gu, ge = we.read_worker_endpoint_file(path)
-    assert gu == u and ge[0]["schedule"] == "ipc:///tmp/s"
-    # Frontend-side registry reads the same file.
-    f = FileEndpointRegistry(path, side="frontend")
-    assert f.latest() == (u, ge)
-    assert f.age() is not None
-    w.revoke()
-    assert we.read_worker_endpoint_file(path) == (None, None)
-
-
-def test_proxy_registry_over_in_memory_discovery_server():
+def test_network_registry_over_in_memory_discovery_server():
     """End-to-end registry semantics over the REAL in-memory proxy middleware:
     a worker registers + leases; a frontend (a second client) discovers the
     same (uuid, endpoints); the uuid is stable; lease expiry (tiny ttl) reaps
     the entry so the frontend sees it gone. Data plane is untouched (we only
     exchange the published zmq address strings)."""
-    import socket
     import time as _time
-    from gllm.disagg.discovery import DiscoveryServer
-    from gllm.entrypoints.worker_endpoint import ProxyEndpointRegistry
 
-    # Pick a free loopback port for the proxy.
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    server = DiscoveryServer(f"127.0.0.1:{port}")
-    import threading
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
+    from gllm.entrypoints.worker_endpoint import NetworkEndpointRegistry
+
+    ctx = _RegistryCtx()
     try:
-        addr = f"127.0.0.1:{port}"
         # Frontend client: nothing published yet.
-        fe = ProxyEndpointRegistry(addr, side="frontend")
+        fe = ctx.frontend_side()
         assert fe.latest() == (None, None)
         # Worker client: register its transport rows.
-        wk = ProxyEndpointRegistry(addr, side="worker")
+        wk = ctx.worker_side()
         eps = {"schedule": "tcp://10.0.0.5:50001",
                "output": "tcp://10.0.0.5:50002",
                "token": "tcp://10.0.0.5:50003"}
@@ -1538,4 +1552,4 @@ def test_proxy_registry_over_in_memory_discovery_server():
             _time.sleep(0.05)
         assert fe.latest()[0] is None
     finally:
-        server.stop()
+        ctx.__exit__(None, None, None)

@@ -248,7 +248,7 @@ def _validate_response_capabilities(request: ResponseRequest):
 async def health():
     # Probe the (possibly separately deployed) worker fleet. In monolith mode
     # this is the worker-alive check; in standalone mode it verifies the
-    # endpoint file is present/fresh.
+    # registry entry is present/fresh.
     try:
         if llm is not None and hasattr(llm, "health_async"):
             await llm.health_async()
@@ -849,7 +849,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Run this process as a pure frontend: no GPU, no worker spawn. "
             "The engine connects to a separately deployed worker fleet "
-            "discovered via --worker-endpoint-file (see "
+            "discovered via the endpoint registry "
+            "(--endpoint-registry-addr; see "
             "docs/frontend_worker_decoupling.md)."
         ),
     )
@@ -927,16 +928,14 @@ def main():
 
     args = build_arg_parser().parse_args()
 
-    if args.standalone_frontend:
-        reg = getattr(args, "endpoint_registry", "file") or "file"
-        if reg == "proxy":
-            if not getattr(args, "endpoint_registry_addr", None):
-                raise SystemExit(
-                    "--standalone-frontend with --endpoint-registry proxy "
-                    "requires --endpoint-registry-addr (HOST:PORT)"
-                )
-        elif not args.worker_endpoint_file:
-            raise SystemExit("--standalone-frontend requires --worker-endpoint-file")
+    if args.standalone_frontend and not getattr(
+        args, "endpoint_registry_addr", None
+    ):
+        raise SystemExit(
+            "--standalone-frontend requires --endpoint-registry-addr "
+            "(HOST:PORT of the discovery registry middleware; start one with "
+            "python -m gllm.entrypoints.discovery_server --listen HOST:PORT)"
+        )
     if args.standalone_frontend and (args.pp != 1 or args.dp != 1 or args.tp != 1):
         raise SystemExit(
             "standalone frontend currently supports single-rank worker fleets "

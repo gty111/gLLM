@@ -6,10 +6,11 @@ docs/frontend_worker_decoupling.md). Its whole relationship to that
 fleet is the concern this component owns, so that ``LLM`` keeps only
 the thin one-liner touchpoints:
 
-* CONNECT -- wait for the worker endpoint file and build the frontend
-  ZMQ sockets for the published transport (:meth:`FleetSupervisor.connect`);
-* LIVENESS -- endpoint-file probes for the dispatch path and the
-  heartbeat check (:meth:`lively`, :meth:`heartbeat`);
+* CONNECT -- wait for the worker fleet to appear in the endpoint registry
+  and build the frontend ZMQ sockets for its published transport
+  (:meth:`FleetSupervisor.connect`);
+* LIVENESS -- registry probes for the dispatch path and the heartbeat
+  check (:meth:`lively`, :meth:`heartbeat`);
 * RECONNECT -- detect a worker-fleet restart (new transport uuid) and
   re-build the transport IN-PROCESS, no frontend process restart. The
   heartbeat path does this via :meth:`_rebuild` (reactive, fleet already
@@ -35,22 +36,19 @@ import time
 from logger import logger
 
 from gllm.distributed.comm import zmqComm
-from gllm.entrypoints.worker_endpoint import (
-    endpoint_file_age_seconds,
-    read_worker_endpoint_file,
-)
 from gllm.utils import random_uuid
 
-_GRACE_SECONDS = 3  # tolerate atomic rename / one slow heartbeat
-_CONNECT_TIMEOUT = 300  # initial wait for the endpoint file to appear
+_GRACE_SECONDS = 3  # tolerate proxy flakiness / one slow lease renewal
+_CONNECT_TIMEOUT = 300  # initial wait for the fleet entry to appear
+_CONNECT_POLL_INTERVAL = 1  # registry poll cadence while waiting for the fleet
 _RECONNECT_TIMEOUT = 600  # standby wait after a fleet restart
 
 
 class FleetDownError(RuntimeError):
-    """Raised when the worker fleet is GONE (endpoint file vanished or went
-    stale) -- as opposed to a uuid-CHANGE transition (handled in-process by
-    :meth:`FleetSupervisor.heartbeat` -> :meth:`_rebuild`, no raise) or an
-    unrelated engine-IO bug.
+    """Raised when the worker fleet is GONE (absent from / stale in the
+    endpoint registry) -- as opposed to a uuid-CHANGE transition
+    (handled in-process by :meth:`FleetSupervisor.heartbeat` ->
+    :meth:`_rebuild`, no raise) or an unrelated engine-IO bug.
 
     A dedicated type (rather than a string-matched RuntimeError) so the
     schedule loop can route fleet-down to the time-sliced standby
@@ -65,8 +63,9 @@ class FleetSupervisor:
         # The host LLM: the supervisor reads its comm / paths /
         # bookkeeping and calls back into its on_standalone_reconnect.
         # (The llm.fleet back-pointer is never used here, so there is no
-        # recursive access hazard.) The endpoint file is read FROM the
-        # host at call time, so tests/harnesses may re-point it freely.
+        # recursive access hazard.) The endpoint registry client is read
+        # FROM the host at call time, so tests/harnesses may re-point it
+        # freely.
         self.llm = llm
         self.dp_size = dp_size
         # Transport-incarnation + liveness state. NOTE: these must be
@@ -78,49 +77,35 @@ class FleetSupervisor:
         self._worker_endpoints = None
         self._gone_since = None
 
-    @property
-    def endpoint_file(self) -> str:
-        return self.llm.worker_endpoint_file
-
     def _reg(self):
-        """The host's endpoint registry, or None for the default file mode.
+        """The host's endpoint registry (a network proxy client)."""
+        return self.llm.endpoint_registry
 
-        A plain ``LLM`` (or a test's ``_bare_llm`` shell) has no
-        ``endpoint_registry`` attribute, so this returns None and the
-        read helpers below fall back to the file -- preserving the
-        historical zero-dependency default and all file-based tests.
-        """
-        return getattr(self.llm, "endpoint_registry", None)
+    @property
+    def registry_addr(self) -> str:
+        """Human-readable registry location (for logs / error messages)."""
+        return getattr(self.llm, "endpoint_registry_addr", None) or "?"
 
     def _reg_latest(self):
-        """Current ``(uuid, endpoints)`` from the registry, falling back to
-        the endpoint file when no registry is configured."""
-        reg = self._reg()
-        if reg is not None:
-            return reg.latest()
-        return read_worker_endpoint_file(self.endpoint_file)
+        """Current ``(uuid, endpoints)`` from the registry, or ``(None, None)``."""
+        return self._reg().latest()
 
     def _reg_age(self) -> float:
-        """Seconds since the last registry update, falling back to the file
-        mtime. ``None`` means "no endpoint visible"."""
-        reg = self._reg()
-        if reg is not None:
-            return reg.age()
-        return endpoint_file_age_seconds(self.endpoint_file)
+        """Seconds since the last registry update, or ``None`` (no fleet)."""
+        return self._reg().age()
 
     # ------------------------------------------------------------------
     # CONNECT
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Wait for the worker endpoint file, then build the transport.
+        """Wait for the worker fleet to appear in the registry, then build the
+        transport.
 
         Called from the host constructor while the fleet is coming up
-        (polls until the file appears or ``_CONNECT_TIMEOUT`` elapses).
+        (polls until the entry appears or ``_CONNECT_TIMEOUT`` elapses).
         """
-        from gllm.entrypoints.worker_endpoint import DEFAULT_POLL_INTERVAL
-
-        path = self.endpoint_file
+        path = self.registry_addr
         deadline = time.time() + _CONNECT_TIMEOUT
         while True:
             transport_uuid, endpoints = self._reg_latest()
@@ -128,13 +113,13 @@ class FleetSupervisor:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
-                    f"No worker endpoint file appeared at {path} within "
+                    f"No worker fleet entry appeared in registry {path} within "
                     f"{deadline - time.time() + _CONNECT_TIMEOUT:.0f}s"
                 )
             logger.info(
-                "Waiting for worker endpoint file %s (standalone frontend)...", path
+                "Waiting for worker fleet in registry %s (standalone frontend)...", path
             )
-            time.sleep(DEFAULT_POLL_INTERVAL)
+            time.sleep(_CONNECT_POLL_INTERVAL)
         logger.info(
             "Connected to standalone worker fleet (transport uuid %s, ranks %s) via %s",
             transport_uuid,
@@ -169,7 +154,7 @@ class FleetSupervisor:
         # callers.)
         if 0 not in endpoints:
             raise ValueError(
-                f"Malformed endpoint file: no rank-0 row in {sorted(endpoints)!r}; "
+                f"Malformed registry entry: no rank-0 row in {sorted(endpoints)!r}; "
                 "the standalone transport connects rank 0 only."
             )
         ep = endpoints[0]
@@ -198,8 +183,8 @@ class FleetSupervisor:
         """Cheap fleet liveness probe for the DISPATCH path.
 
         zmq cannot tell "sent to a dead peer's buffer" from "sent to a
-        live one" (SNDBUF=512MB absorbs either), so the endpoint file is
-        the source of truth: present and freshly heartbeat-ed. Unlike
+        live one" (SNDBUF=512MB absorbs either), so the endpoint registry
+        is the source of truth: an entry present and freshly leased. Unlike
         :meth:`heartbeat` this NEVER raises -- a probe error means
         "unknown", and unknown is treated as live so dispatch falls
         through to the bounded non-blocking send.
@@ -215,33 +200,34 @@ class FleetSupervisor:
     def heartbeat(self) -> None:
         """Heartbeat/liveness check; raises when the fleet is down.
 
-        Cheap: one file stat + a JSON read when the mtime changed enough.
-        Raises RuntimeError when the endpoint file has vanished (worker
+        Cheap: one registry lookup (a ZMQ RPC to the in-memory proxy).
+        Raises RuntimeError when no fleet entry exists / is stale (worker
         fleet gone) -- the schedule loop converts that into a terminal
         error for every in-flight async stream instead of hanging them.
 
-        Also detects a BACKGROUND fleet restart (same file, new uuid) and
+        Also detects a BACKGROUND fleet restart (new uuid, same role) and
         reconnects in-process. This runs on the engine IO executor
         thread -- the same thread that owns the sockets -- so the swap
         is race-free with send/recv.
         """
         from gllm.entrypoints.worker_endpoint import STALE_AFTER_SECONDS
 
-        path = self.endpoint_file
+        path = self.registry_addr
         age = self._reg_age()
-        # The fleet is "gone" when the endpoint file is absent *or* stale
-        # (mtime older than STALE_AFTER_SECONDS, i.e. the heartbeat thread
-        # is no longer refreshing it -- the SIGKILL / power-loss backstop).
+        # The fleet is "gone" when the registry entry is absent *or* stale
+        # (last update older than STALE_AFTER_SECONDS, i.e. the worker's
+        # lease renewal is no longer running -- the SIGKILL / power-loss
+        # backstop).
         gone = age is None or age > STALE_AFTER_SECONDS
         if gone:
             # Only declare the fleet dead after a grace period so a brief
-            # atomic-rewrite window (rename) or a one-off slow heartbeat
-            # cannot false-trip. The grace is much shorter than the old 30s
-            # so a crashed worker is recovered quickly.
+            # proxy blip or a one-off slow lease renewal cannot false-trip.
+            # The grace is much shorter than the old 30s so a crashed
+            # worker is recovered quickly.
             self._gone_since = self._gone_since or time.monotonic()
             if time.monotonic() - self._gone_since > _GRACE_SECONDS:
                 raise FleetDownError(
-                    f"Worker endpoint file {path} is "
+                    f"Worker fleet entry in registry {path} is "
                     f"{'missing' if age is None else f'stale (age {age:.1f}s)'}; "
                     f"the worker fleet appears to be down."
                 )
@@ -249,14 +235,14 @@ class FleetSupervisor:
         self._gone_since = None
         transport_uuid, endpoints = self._reg_latest()
         if transport_uuid is None or not endpoints:
-            # File present but unparseable / empty: treat as gone, with the
-            # same short grace as above.
+            # Entry present but empty: treat as gone, with the same short
+            # grace as above.
             if self._gone_since is None:
                 self._gone_since = time.monotonic()
             if time.monotonic() - self._gone_since > _GRACE_SECONDS:
                 raise FleetDownError(
-                    f"Worker endpoint file {path} is unreadable; the worker fleet "
-                    f"appears to be down."
+                    f"Worker fleet entry in registry {path} is unusable; the "
+                    f"worker fleet appears to be down."
                 )
             return
         if transport_uuid != self._worker_transport_uuid:
@@ -269,10 +255,10 @@ class FleetSupervisor:
     def wait_ready(self, max_wait: float) -> bool:
         """Time-sliced fleet liveness probe (the standby primitive).
 
-        Polls the endpoint file for up to ``max_wait`` seconds:
+        Polls the endpoint registry for up to ``max_wait`` seconds:
 
-        * returns True as soon as the fleet is READY (endpoint file present
-          + parseable). The caller's NEXT heartbeat tick commits the
+        * returns True as soon as the fleet is READY (registry entry
+          present + parseable). The caller's NEXT heartbeat tick commits the
           :meth:`_rebuild` via the normal uuid-change path (or no-ops when
           the uuid is unchanged); ``wait_ready`` deliberately does NOT
           rebuild, keeping the heavier rebuild in one place.
@@ -288,7 +274,7 @@ class FleetSupervisor:
         """
         from gllm.entrypoints.worker_endpoint import STALE_AFTER_SECONDS
 
-        path = self.endpoint_file
+        path = self.registry_addr
         deadline = time.time() + max_wait
         while True:
             age = self._reg_age()
@@ -334,7 +320,7 @@ class FleetSupervisor:
         client stream and releases its ids as an explicit step of the
         transition.
         """
-        path = self.endpoint_file
+        path = self.registry_addr
         deadline = time.time() + _RECONNECT_TIMEOUT
         last_err = None
         while True:
@@ -353,10 +339,10 @@ class FleetSupervisor:
                     transport_uuid, endpoints, terminate_reason=terminate_reason
                 )
                 return
-            last_err = "endpoint file absent (worker down?)"
+            last_err = "no fleet entry in registry (worker down?)"
             if time.time() > deadline:
                 raise RuntimeError(
-                    f"Standby timeout: worker endpoint file {path} not republished "
+                    f"Standby timeout: worker fleet entry not republished in registry {path} "
                     f"within {_RECONNECT_TIMEOUT}s ({last_err}); restarting the worker "
                     f"fleet will recover the frontend without a frontend restart."
                 )
@@ -376,24 +362,25 @@ class FleetSupervisor:
         ORDER MATTERS (atomicity): the NEW comm is built and fully
         initialised BEFORE the uuid is committed. If zmqComm.init()
         fails, the old transport is still in place AND the recorded
-        uuid still differs from the file, so heartbeat() retries the
-        rebuild on the next tick -- a build failure must never wedge
-        the frontend (that would defeat the in-process recovery this
-        component exists for). Endpoint rows are validated up front:
-        a partial/corrupt file is rejected without touching state.
+        uuid still differs from the registry, so heartbeat() retries
+        the rebuild on the next tick -- a build failure must never
+        wedge the frontend (that would defeat the in-process recovery
+        this component exists for). Endpoint rows are validated up
+        front: a partial/corrupt entry is rejected without touching
+        state.
         """
         # All validation BEFORE the old comm is torn down (inside
-        # _build_comm): a malformed file must not destroy a working
+        # _build_comm): a malformed entry must not destroy a working
         # transport, even temporarily.
         for rank, ep in (endpoints or {}).items():
             if not all(k in ep for k in ('schedule', 'output', 'token')):
                 raise ValueError(
-                    f"Malformed endpoint file: rank {rank} row lacks "
+                    f"Malformed registry entry: rank {rank} row lacks "
                     f"schedule/output/token keys: {ep!r}"
                 )
         if 0 not in (endpoints or {}):
             raise ValueError(
-                f"Malformed endpoint file: no rank-0 row in {sorted(endpoints or {})!r}; "
+                f"Malformed registry entry: no rank-0 row in {sorted(endpoints or {})!r}; "
                 "the standalone transport connects rank 0 only."
             )
         # Build FIRST, commit AFTER: the host keeps its old comm until
@@ -454,7 +441,7 @@ class FleetSupervisor:
     def ship(self, ipc_package, wait_lists) -> bool:
         """Send *ipc_package* to the fleet with dead-fleet protection.
 
-        A DEAD fleet (endpoint file gone/stale) would absorb every
+        A DEAD fleet (absent from / stale in the registry) would absorb every
         dispatch into the 512MB send buffer and ACK it, so requeue the
         pending work instead of shipping it into the void: the liveness
         check surfaces the outage and the transition hook cleans up.
