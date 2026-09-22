@@ -1,5 +1,7 @@
+import pickle
 import queue
 import threading
+import time
 from typing import Dict, List, Optional
 
 import torch
@@ -20,17 +22,85 @@ from gllm.distributed.parallel_state import (
 )
 from gllm.runtime.sequence import GenerationSequence
 from gllm.scheduling.distributed import SchedulePayload
-from gllm.utils import make_pull_random, make_socket
+from gllm.utils import make_pull_bind, make_pull_random, make_socket
 
 _SHUTDOWN = object()  # sentinel pushed onto a sender queue to drain it
 
+# TCP keepalive for decoupled (tcp://) transports: a half-open connection
+# (machine/network partition -- no FIN, hours-long default TCP timeout)
+# otherwise keeps stealing a share of the worker's load-balanced output
+# PUSH into dead kernel buffers, and the replacement frontend's requests
+# hang with no error. With keepalive the kernel tears the leg down
+# (~idle + retries) so the partition is detected in minutes, not hours.
+_TCP_KEEPALIVE_IDLE = 60   # seconds of idle before probing
+_TCP_KEEPALIVE_INTERVAL = 10
+_TCP_KEEPALIVE_COUNT = 3
+
+
+def _apply_tcp_keepalive(socket) -> None:
+    """Enable kernel TCP keepalive on a tcp:// socket (no-op for ipc://)."""
+    try:
+        socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+        socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _TCP_KEEPALIVE_IDLE)
+        socket.setsockopt(zmq.TCP_KEEPALIVE_INTERVAL, _TCP_KEEPALIVE_INTERVAL)
+        socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, _TCP_KEEPALIVE_COUNT)
+    except (zmq.ZMQError, AttributeError):
+        pass  # non-tcp transport or libzmq without the options
+
 
 class IPCPackage:
+    """One tick of frontend<->worker traffic, in a single pickle.
+
+    FRONTEND SESSION PROTOCOL (decoupled deployment)
+    ================================================
+
+    Four fields carry session identity across the wire. THREE of them
+    are STAMP LISTS that must stay POSITIONALLY aligned with their id
+    list for the entire lifetime of the package (construction, drain
+    merges, pickling, translation):
+
+    ============================  ========  =====================  ======
+    field                         direction aligns with            set by
+    ============================  ========  =====================  ======
+    ``seq.frontend_session``      req       (per seq object)       frontend
+    ``abort_sessions``            req       ``abort_ids``          frontend
+    ``sessions``                  output    ``act_schedule_ids``   worker
+    ``free_sessions``             output    ``free_ids``           worker
+    ============================  ========  =====================  ======
+
+    * ``None`` on a stamp field means LEGACY/unstamped (monolith path);
+      an empty list is only legal alongside an empty id list.
+    * A batch may legally carry the SAME client id more than once
+      (once per session), so stamps must never be collapsed into a
+      dict keyed by id -- positional order is the contract.
+    * Helpers below (:meth:`merge_aligned`, :meth:`abort_stamps_valid`,
+      :meth:`output_stamps_valid`) are the only sanctioned places to
+      read or extend these pairs; both sides of the wire route through
+      them so the alignment invariant has one definition.
+    * ``seq.frontend_session`` rides inside each pickled
+      :class:`~gllm.runtime.sequence.GenerationSequence` and is
+      echoed back by the worker (``client_seq_id`` / translate) -- it
+      is not a package field, which is why it gets no package-level
+      helper here.
+
+    On the monolith path every stamp field stays ``None`` and the
+    helpers below reduce to no-ops / legacy answers, so the protocol
+    costs nothing when unused.
+    """
+
     def __init__(self, schedule_lists: List[GenerationSequence]):
         # front-end => worker
         self.log = True
         self.schedule_lists = schedule_lists
-        self.abort_ids = []  # seq_ids to abort
+        self.abort_ids = []  # seq_ids (CLIENT ids) to abort
+        # Frontend session stamps aligned with ``abort_ids``: which session's
+        # request an abort targets. The standalone worker remaps client ids
+        # to internal ids per session, so a bare id names TWO live requests
+        # once a frontend restarts (both pools start at 0); the worker
+        # resolves each abort through (stamp, id) and ignores stamps it does
+        # not know. Monolith seqs are unstamped (None entries) and resolve
+        # unconditionally -- see Worker._route_frontend_aborts.
+        self.abort_sessions = None
         self.control_cmd = None  # optional control command (e.g., start/stop profile)
         # ``control_cmd_code`` and ``control_data`` are populated by the
         # rank-0 worker before it broadcasts an :class:`IPCPackage` to its
@@ -59,6 +129,19 @@ class IPCPackage:
         # ``None`` when the seq did not request logprobs. Empty on the common
         # (no-logprobs) path so it adds nothing to the pickled payload.
         self.logprobs = []
+        # Per-REQUEST frontend session epochs, aligned with
+        # ``act_schedule_ids`` (LLM.frontend_epoch echoed back by the worker
+        # from each seq's ``frontend_session``). Session identity must travel
+        # with the REQUEST, not with "last package seen": a tick with no new
+        # input must not reset it, and a late output of a dead session's
+        # request must not inherit the new session's stamp. ``None``/empty
+        # means legacy (unstamped) workers.
+        self.sessions = None
+        # Same idea for ``free_ids`` (aligned with it): the ids being freed
+        # this tick. Free-only rows -- aborts, finished-before-acted, capacity
+        # errors -- frequently lack a live seq at stamp time, so their entry
+        # can be ``None``; the standalone frontend fails closed on those.
+        self.free_sessions = None
         # Prompt-token logprobs, keyed by seq_id, sent once when a seq finishes
         # prefill. Each value is the seq's ``prompt_logprobs_data`` list
         # (per prompt position: ``None`` or ``(token_id, logprob, ids, vals)``).
@@ -78,6 +161,115 @@ class IPCPackage:
             and self.control_cmd_code == 0
         )
 
+    # ------------------------------------------------------------------
+    # Frontend session protocol: alignment helpers (see class docstring)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _backfilled(stamps, n_ids):
+        """Stamp list of exactly ``n_ids`` entries, legacy None-filled.
+
+        ``None`` input becomes an all-None list (legacy); a list is
+        trusted to be well-formed (the sender's own helper built it).
+        """
+        if stamps is None:
+            return [None] * n_ids
+        return list(stamps)
+
+    def merge_aligned(self, other: "IPCPackage") -> None:
+        """Fold *other*'s request-dir content into self, PRESERVING the
+        ``abort_ids`` / ``abort_sessions`` positional alignment.
+
+        This is the ONLY sanctioned way to merge drained request
+        packages: merging the bare id lists would silently drop the
+        session stamps and downgrade the aggregate to legacy routing
+        (aborting EVERY same-id request across sessions). Stamps from
+        unstamped packages are backfilled with None so the merged list
+        is always exactly as long as the merged id list.
+        """
+        self.schedule_lists.extend(other.schedule_lists)
+        n_in = len(other.abort_ids)
+        in_stamps = self._backfilled(other.abort_sessions, n_in)
+        if self.abort_sessions is None:
+            base = [None] * len(self.abort_ids)
+        else:
+            base = list(self.abort_sessions)
+        self.abort_ids = self.abort_ids + other.abort_ids
+        self.abort_sessions = base + in_stamps
+
+    def abort_stamps_valid(self) -> bool:
+        """True iff ``abort_sessions`` is absent (legacy/monolith) or
+        exactly as long as ``abort_ids``. Callers (frontend drain) use
+        this to fail closed on malformed packets instead of guessing
+        which session an abort belongs to."""
+        if self.abort_sessions is None:
+            return True
+        return len(self.abort_sessions) == len(self.abort_ids)
+
+    def output_stamps_valid(self) -> bool:
+        """True iff the output stamp lists are absent (legacy/monolith)
+        or exactly as long as their id lists (``sessions`` vs
+        ``act_schedule_ids``, ``free_sessions`` vs ``free_ids``). The
+        standalone frontend applies this before trusting any row."""
+        for stamps, ids in (
+            (self.sessions, self.act_schedule_ids),
+            (self.free_sessions, self.free_ids),
+        ):
+            if stamps is None:
+                continue
+            if len(stamps) != len(ids):
+                return False
+        return True
+
+    def act_session_at(
+        self, idx: int, our_epoch, valid: bool = True, legacy_ok: bool = True
+    ) -> bool:
+        """Whether row ``idx`` of ``act_schedule_ids`` belongs to THIS
+        frontend incarnation.
+
+        This is the single sanctioned frontend-side row gate (used by
+        :meth:`LLM._apply_ipc_package`). Semantics:
+
+        * ``valid`` False -> every row is foreign (the caller checked
+          :meth:`output_stamps_valid` once per package, O(1), and a
+          malformed packet fails closed in one shot);
+        * no ``sessions`` list at all -> LEGACY packet: ours only when
+          ``legacy_ok``. The MONOLITH frontend passes ``legacy_ok=True``
+          (its worker never remaps ids -- nothing to filter); the
+          STANDALONE frontend passes ``legacy_ok=False`` because a
+          stamp-less row from its fleet names no session and MUST NOT
+          touch a request of the same bare id (fail closed);
+        * otherwise the row is ours iff ``sessions[idx] == our_epoch``;
+          an index past the end of the list is unconditionally foreign.
+
+        A batch may carry the same client id twice (once per session),
+        so the check is strictly positional -- never dict-by-id.
+        """
+        if not valid:
+            return False
+        stamps = self.sessions
+        if stamps is None:
+            return legacy_ok
+        if idx >= len(stamps):
+            return False
+        return stamps[idx] == our_epoch
+
+    def free_session_at(
+        self, idx: int, our_epoch, valid: bool = True, legacy_ok: bool = True
+    ) -> bool:
+        """Same as :meth:`act_session_at` for ``free_ids`` rows
+        (``free_sessions``). Fail-closed on a malformed list (either
+        via ``valid`` or a per-row length miss); a stamp-less list is
+        legacy -- honored only when ``legacy_ok`` (monolith)."""
+        if not valid:
+            return False
+        stamps = self.free_sessions
+        if stamps is None:
+            return legacy_ok
+        if idx >= len(stamps):
+            return False
+        return stamps[idx] == our_epoch
+
 
 class zmqComm:
     def __init__(
@@ -91,6 +283,7 @@ class zmqComm:
         frontend=False,
         dp_rank=0,
         dp_size=1,
+        standalone_remote=False,
     ):
         self.host_addr = host_addr
         self.master_addr = master_addr
@@ -107,12 +300,63 @@ class zmqComm:
         # frontend output PULL. ``dp_rank`` selects this replica's request path.
         self.dp_rank = dp_rank
         self.dp_size = dp_size
+        # Decoupled deployment: a standalone worker fleet binds its
+        # frontend-facing PULL sockets on remote-reachable paths (tcp:// when
+        # --worker-transport-base-port is set, ipc:// otherwise). The ipc
+        # binder is the worker itself (launch_mode 'normal' worker branch
+        # below); the frontend only ever *connects*. ``standalone_remote`` is
+        # set by the frontend so it knows the schedule path is remote and
+        # must not be treated as a local ipc path it binds.
+        self.standalone_remote = standalone_remote
+        # Worker-side output hook installed by the Worker (None on
+        # frontends): translates internal seq ids back to the dispatching
+        # frontend's client ids and attaches the per-row session stamps
+        # before the package hits the wire (see send_output).
+        self._output_committer = None
+        # Worker-side (standalone) per-seq identity bookkeeping, owned by
+        # the WORKER's comm (never the frontend's): registered at
+        # ADMISSION (Worker._remap_client_ids), before the scheduler can
+        # free the seq (first token == EOS / max_tokens=1 requests never
+        # reach a live-queue lookup); reclaimed one output tick after
+        # their terminal row is translated (see
+        # Worker.translate_output_for_frontend). Keyed by INTERNAL id.
+        self._session_identity = {}
+        self._identity_reclaim = set()
 
     def init(self):
         self.ctx = zmq.Context()
         # Persistent zmq-sender threads keyed by socket. See ``_get_sender``
         # for why we avoid the prior fresh-thread-per-send pattern.
         self._senders: Dict["zmq.Socket", "queue.SimpleQueue"] = {}
+        self._sender_threads: Dict["zmq.Socket", "threading.Thread"] = {}
+
+        if self.frontend and self.standalone_remote:
+            # Decoupled deployment: the standalone worker fleet already bound
+            # these PULL endpoints (see gllm.engine.llm.LLM._publish_worker_endpoint);
+            # the frontend only connects. Same socket roles as the monolith
+            # frontend (PUSH schedule, PULL output); the token path is unused
+            # by the frontend (worker-internal) but is created for symmetry
+            # and future control channels.
+            # schedule: the worker BINDs its request PULL on this
+            # (remote-reachable) path; the frontend PUSH connects to it.
+            self.request_socket = make_socket(self.ctx, self.schedule_path, zmq.PUSH)
+            # output: the worker BINDs its output PUSH on the advertised path
+            # (PUSH connects by default -- wrong direction for a remote
+            # frontend), so THIS side must PULL-connect. A tcp:// PULL cannot
+            # go through make_socket (asserts by design, routing binders to
+            # make_pull_bind); ipc:// binds locally as before.
+            if self.output_path.startswith("tcp://"):
+                self.output_socket = self.ctx.socket(zmq.PULL)
+                self.output_socket.connect(self.output_path)
+                self.output_socket.setsockopt(zmq.RCVHWM, 0)
+                self.output_socket.setsockopt(
+                    zmq.RCVBUF, int(0.5 * 1024**3)
+                )
+                _apply_tcp_keepalive(self.output_socket)
+            else:
+                self.output_socket = make_socket(self.ctx, self.output_path, zmq.PULL)
+            self.token_socket = None
+            return
 
         if self.frontend:  # front-end process
             if self.dp_size > 1:
@@ -177,8 +421,25 @@ class zmqComm:
             req_path = self.schedule_path
             if self.dp_size > 1:
                 req_path = f"{self.schedule_path}_dp{self.dp_rank}"
-            self.request_socket = make_socket(self.ctx, req_path, zmq.PULL)
-            self.output_socket = make_socket(self.ctx, self.output_path, zmq.PUSH)
+            # tcp:// request endpoints are bound (standalone worker exposing a
+            # fixed, remotely reachable port); ipc:// goes through make_socket
+            # (bind + buffer tuning).
+            if req_path.startswith("tcp://"):
+                self.request_socket = make_pull_bind(self.ctx, req_path)
+            else:
+                self.request_socket = make_socket(self.ctx, req_path, zmq.PULL)
+            # output: this side must BIND (the remote frontend PULL-connects
+            # to the advertised address); make_socket's PUSH CONNECTS, which
+            # is only correct for ipc:// where the local frontend binds.
+            if self.output_path.startswith("tcp://"):
+                push = self.ctx.socket(zmq.PUSH)
+                push.bind(self.output_path)
+                push.setsockopt(zmq.SNDHWM, 0)
+                push.setsockopt(zmq.SNDBUF, int(0.5 * 1024**3))
+                _apply_tcp_keepalive(push)
+                self.output_socket = push
+            else:
+                self.output_socket = make_socket(self.ctx, self.output_path, zmq.PUSH)
             if pp_size > 1:
                 # last-stage output_rank => this column's PP=0 driver : next
                 # tokens (single PULL, broadcast inside the stage-0 TP group
@@ -334,6 +595,14 @@ class zmqComm:
             return None
 
     def send_output(self, output):
+        # Session stamps ride the OUTPUT package (see Worker
+        # translate_output_for_frontend / stamp_output_sessions): the worker
+        # translates its internal ids back to client ids and attaches each
+        # row's frontend session, so the frontend filters by stamp. No-op
+        # on the monolith (no ``_output_committer`` installed).
+        commit = getattr(self, "_output_committer", None)
+        if commit is not None:
+            commit(output)
         self.output_socket.send_pyobj(output)
 
     def recv_output(self):
@@ -342,6 +611,74 @@ class zmqComm:
             return output
         else:
             return None
+
+    def close(self):
+        """Tear down every sender thread and socket, then terminate the ctx.
+
+        Idempotent; intended for the decoupled-deployment paths where a
+        frontend may reconnect in-process (or a test process must exit
+        cleanly) and a lingering zmq I/O thread holding open ipc://
+        connections would otherwise block subsequent CUDA init or process
+        shutdown.
+        """
+        for sock, q in list(getattr(self, "_senders", {}).items()):
+            try:
+                q.put(_SHUTDOWN)
+            except Exception:
+                pass
+        # Join the sender threads before the primary sockets close. A
+        # sender parked on a LIVE peer drains on _SHUTDOWN and exits
+        # quickly (bounded join); a sender parked in send_pyobj on a DEAD
+        # peer is unstuck only by the socket close below, so this first
+        # pass yields fast (<=~1.0s) and a second short pass reaps it
+        # after the sockets go. Bounding the first join avoids paying
+        # 2x the full timeout for a single dead-peer sender. Sender
+        # threads are daemon, so none can strand the process; this just
+        # ensures a live sender never outlives the ctx.term() it would
+        # block on.
+        sender_threads = getattr(self, "_sender_threads", {})
+        for sock, t in list(sender_threads.items()):
+            try:
+                t.join(timeout=0.5)
+            except Exception:
+                pass
+        self._senders.clear()
+        self._sender_threads.clear()
+        for attr in ("request_socket", "output_socket", "token_socket"):
+            sock = getattr(self, attr, None)
+            if sock is not None:
+                try:
+                    sock.setsockopt(zmq.LINGER, 0)
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        # ``request_sockets`` is only present on multi-DP frontends; the
+        # attribute may never have been created.
+        for sock in list(getattr(self, "request_sockets", None) or []):
+            try:
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.close(linger=0)
+            except Exception:
+                pass
+        if hasattr(self, "request_sockets"):
+            self.request_sockets = []
+        # Second (short) rejoin: the socket closes above unstick any sender
+        # still parked in send_pyobj; reap it before ctx.term() so it cannot
+        # hold a socket the term would block on.
+        for sock, t in list(sender_threads.items()):
+            if t.is_alive():
+                try:
+                    t.join(timeout=1.0)
+                except Exception:
+                    pass
+        ctx = getattr(self, "ctx", None)
+        if ctx is not None:
+            try:
+                ctx.term()
+            except Exception:
+                pass
+            self.ctx = None
 
     def _get_sender(self, socket: "zmq.Socket") -> "queue.SimpleQueue":
         """Return a persistent FIFO that ships pyobjs to ``socket``.
@@ -382,6 +719,7 @@ class zmqComm:
         t = threading.Thread(target=_run, daemon=True, name="zmq-sender")
         t.start()
         self._senders[socket] = q
+        self._sender_threads[socket] = t
         return q
 
     def send_schedule_payload(
@@ -591,6 +929,59 @@ class zmqComm:
     def send_ipc_package(self, ipc_package):
         self.request_socket.send_pyobj(ipc_package)
 
+    def send_ipc_package_nonblocking(self, ipc_package, timeout=1.0) -> bool:
+        """Send without the ability to wedge the caller's thread.
+
+        A blocking ``send_pyobj`` on a PUSH socket with a large SNDBUF parks
+        the whole payload in a zero-copy buffer and only returns once it is
+        fully staged -- with no connected receiver (worker fleet down) that
+        is effectively forever. The standalone-frontend schedule loop runs on
+        the *single* engine-IO thread, so a parked send also blocks the
+        liveness check, reconnect and /health probe behind it.
+
+        Sends with a wall-clock bound instead: True when the payload was
+        accepted, False on timeout (caller decides whether to retry/queue).
+        """
+        data = pickle.dumps(ipc_package)
+        deadline = time.monotonic() + timeout
+        while True:
+            # PUSH readiness is about the SEND buffer: poll POLLOUT explicitly
+            # (the default poll mask is POLLIN, which a PUSH socket never
+            # raises -- even a healthy, writable connection would time out).
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                return False
+            if self.request_socket.poll(timeout=remaining_ms, flags=zmq.POLLOUT):
+                try:
+                    self.request_socket.send(data, zmq.NOBLOCK)
+                    return True
+                except zmq.ZMQError:
+                    pass  # buffer filled mid-flush; re-poll
+            else:
+                if time.monotonic() >= deadline:
+                    return False
+
+    def drain_request_buffer(self):
+        """Best-effort drop of anything left staged on the request PUSH.
+
+        Called after the worker transport is torn down (fleet restart): the
+        old socket's buffers may hold payloads addressed to a fleet that is
+        gone, and a brand-new socket on the same endpoint must start clean.
+        ZeroMQ buffers are per-socket, so this is belt-and-braces for the
+        local case where an OS-level endpoint could replay them. Note the
+        request leg is a PUSH: PUSH sockets cannot recv (it would raise
+        EFSM / ZMQERRNO), so in practice the loop exits on the first
+        iteration and this is a defensive no-op kept for future socket-type
+        changes.
+        """
+        sock = getattr(self, "request_socket", None)
+        if sock is None:
+            return
+        while True:
+            try:
+                sock.recv(zmq.NOBLOCK)
+            except zmq.ZMQError:
+                break
     def send_ipc_package_to_dp(self, ipc_package, dp_index):
         """Send a package to one DP replica (frontend, dp_size > 1 only)."""
         self.request_sockets[dp_index].send_pyobj(ipc_package)

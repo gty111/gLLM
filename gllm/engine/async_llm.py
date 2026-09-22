@@ -6,7 +6,9 @@ from typing import Dict, List
 from fastapi import Request
 from logger import logger
 
+from gllm.engine.fleet_supervisor import FleetDownError
 from gllm.engine.llm import LLM
+from gllm.utils import random_uuid
 
 
 class AsyncStream:
@@ -77,6 +79,8 @@ def _log_task_completion(task: asyncio.Task) -> None:
         logger.error("Engine background task failed", exc_info=e)
 
 
+_STANDBY_SLICE = 5.0  # max seconds schedule() holds the engine-IO thread per fleet-down poll
+
 class AsyncLLM(LLM):
     """Asynchronous request and stream facade over :class:`LLM`."""
 
@@ -96,11 +100,31 @@ class AsyncLLM(LLM):
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
+        # Last engine-IO exception (for once-per-outage error logging).
+        self._last_engine_io_error = None
+        # Thread-ownership: the standalone frontend's ZMQ sockets are CREATED
+        # by fleet.connect() and then used by the engine IO executor. zmq
+        # sockets must be created and used by the same owner thread, so run
+        # the connect on that same persistent executor (the ctor blocks until
+        # it is done; a standalone frontend always blocks on the endpoint
+        # file here, so this costs no extra wall time). Guarded by the SAME
+        # try/except as super().__init__: a connect failure (or the 300s
+        # endpoint wait) must tear the executor down too, else the non-daemon
+        # IO thread outlives the failed ctor and strands process exit.
+        if self.standalone_frontend:
+            try:
+                self._engine_io_executor.submit(self._fleet_connect_sync).result()
+            except BaseException:
+                self._engine_io_executor.shutdown(wait=True)
+                raise
 
     def _init_frontend_comm(self):
         # LLM's synchronous constructor waits for this short task. The same
         # persistent executor later owns every frontend-side send and receive.
         self._engine_io_executor.submit(super()._init_frontend_comm).result()
+
+    def _fleet_connect_sync(self):
+        self.fleet.connect()
 
     async def _run_engine_io(self, func, *args, **kwargs):
         loop = asyncio.get_running_loop()
@@ -168,6 +192,23 @@ class AsyncLLM(LLM):
             self.start_schedule_engine()
         return stream
 
+    async def health_async(self):
+        # Liveness probe for the (possibly separately deployed) worker fleet.
+        # Raises when the fleet is down; the API layer maps that to /health.
+        return await self._run_engine_io(self._probe_worker_fleet)
+
+    def _probe_worker_fleet(self):
+        if self.standalone_frontend:
+            self.check_standalone_worker()
+        else:
+            # check_worker_alive() does sys.exit() on a dead worker; the
+            # probe path must RAISE (the /health handler maps exceptions to
+            # 503) instead of silently killing the frontend process.
+            for i in self.mp_alive:
+                if i == -1:
+                    raise RuntimeError("worker process died")
+        return True
+
     async def check_abort_seqs(self):
         # Snapshot: the engine step (``send_ipc_package`` / ``_apply_ipc_package``
         # on an executor thread) mutates ``running_maps`` concurrently, so
@@ -184,8 +225,121 @@ class AsyncLLM(LLM):
     async def schedule(self):
         while True:
             await self.check_abort_seqs()
-            await self._run_engine_io(super().schedule)
+            try:
+                await self._run_engine_io(super().schedule)
+            except Exception as e:
+                # Decoupled deployment: the worker fleet died (endpoint file
+                # vanished / unreadable, raised by check_standalone_worker
+                # *before* any transport use). Fail every in-flight stream
+                # fast instead of hanging them; keep the event loop alive so
+                # a frontend *process* restart is NOT required -- once the
+                # worker fleet republishes its endpoint file, the watcher
+                # reconnects in-process and service resumes. Note the uuid
+                # change does NOT raise out of the engine IO (the watcher
+                # reconnects inside it); that path terminates streams via
+                # :meth:`on_standalone_reconnect` instead. A monolith engine
+                # never raises here in practice (check_worker_alive does
+                # sys.exit), so this is a no-op on the legacy path.
+                # Log UNCONDITIONALLY: a persistent non-fleet exception
+                # (pickle failure, KeyError in _apply_ipc_package, ...)
+                # would otherwise retry silently at 1 Hz forever -- the
+                # service looks alive but never processes another token.
+                # Log once per OUTAGE: a fleet-down raises every tick (~6s)
+                # during the outage, so a full traceback each time would be
+                # bounded-but-noisy; keep the first (with traceback) and
+                # rate-limit the repeats to an info line.
+                if self._last_engine_io_error is None:
+                    logger.error(
+                        "Engine IO tick failed; failing open in-flight "
+                        "streams and retrying: %s", e, exc_info=True)
+                else:
+                    logger.info(
+                        "Engine IO tick still failing (retrying): %s", e)
+                self._last_engine_io_error = e
+                # Classification drives WHICH recovery to run: a fleet-GONE
+                # error (FleetDownError, raised by the supervisor heartbeat)
+                # enters the bounded time-sliced standby; any OTHER engine-IO
+                # bug just fails open and retries at 1 Hz (thread not held).
+                if isinstance(e, FleetDownError):
+                    self._fail_open_streams(e)
+                    # Time-sliced standby instead of the old 600s-blocking
+                    # fleet.reconnect(): both run on the SINGLE engine-IO
+                    # thread (max_workers=1), so an unbounded standby there
+                    # would freeze /health (queued behind standby) and stall
+                    # shutdown. wait_ready() returns after _STANDBY_SLICE or
+                    # as soon as the fleet republishes; the next tick's
+                    # heartbeat then commits the _rebuild via the normal
+                    # uuid-change path and retries the schedule.
+                    try:
+                        await self._run_engine_io(
+                            self.fleet.wait_ready, _STANDBY_SLICE)
+                    except Exception as re:
+                        # wait_ready never raises in practice; log and fall
+                        # through to the 1 Hz retry.
+                        logger.error(
+                            "Fleet standby poll failed; retrying: %s", re)
+                else:
+                    self._fail_open_streams(e)
+                await asyncio.sleep(1.0)
+            self._last_engine_io_error = None
             await asyncio.sleep(0)
+
+    def on_standalone_reconnect(self, reason: Exception):
+        """Explicit cleanup at a transport transition (worker fleet restart).
+
+        The restarted fleet has no memory of the sequences this frontend is
+        tracking, and the transition does NOT surface as an exception to
+        :meth:`schedule` (the watcher reconnects inside the engine IO call
+        and returns normally) -- so without this hook the client streams
+        would wait forever and their ids would leak.
+        """
+        self._fail_open_streams(reason)
+
+    def _fail_open_streams(self, exc: Exception):
+        """Terminate every outstanding async stream with ``exc`` and drop the
+        frontend-side bookkeeping so the frontend can keep serving new
+        requests once the worker fleet comes back.
+
+        Mirrors the normal-completion path (``_apply_ipc_package``) for the
+        resources it must release: per-stream bookkeeping (``running_maps`` +
+        ``async_streams``), the allocator ids (``free_finish_ids``), and the
+        pending intake queues (``wait_lists`` / ``abort_ids``). Skipping any
+        of these leaks ids or leaves dangling sequences for the next tick.
+        """
+        if not self.async_streams and not self.wait_lists:
+            return
+        retired = []
+        logger.error(
+            "Worker fleet unavailable; failing %d in-flight request(s): %s",
+            len(self.async_streams),
+            exc,
+        )
+        for sid, stream in list(self.async_streams.items()):
+            self.running_maps.pop(sid, None)
+            self.async_streams.pop(sid, None)
+            retired.append(sid)
+            try:
+                if not stream.finished:
+                    stream.put(exc)
+                    stream.finish()
+            except Exception:
+                pass
+        self.free_finish_ids(retired)
+        # Drop any not-yet-dispatched requests too: the dead fleet never saw
+        # them, and their streams are in ``async_streams`` (already failed
+        # above) while their seq objects would otherwise sit in wait_lists
+        # for the next dispatch to a fleet that has no state for them.
+        with self._pending_lock:
+            self.wait_lists = []
+            self.abort_ids = []
+        # Re-mint the session epoch: ids recycled after a false trip
+        # (same uuid -- e.g. a SIGSTOP'd fleet whose heartbeat stalled,
+        # or a non-uuid rebuild path) must not let the old fleet's LATE
+        # rows (still carrying the previous epoch's stamps) pass the
+        # stamp gate of the successor requests that reuse those ids.
+        # _rebuild re-mints too; the two are complementary (uuid change
+        # vs fail-open-without-uuid-change).
+        self.frontend_epoch = random_uuid()
 
     def start_schedule_engine(self):
         # launch schedule engine

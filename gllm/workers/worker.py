@@ -67,7 +67,8 @@ from gllm.distributed.parallel_state import (
 )
 from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
-from gllm.runtime.profiler import TorchProfilerMixin
+from gllm.workers.profiler_mixin import TorchProfilerMixin
+from gllm.workers.frontend_identity_mixin import FrontendMixin
 from gllm.scheduling.distributed import (
     DriverPayloadBuilder,
     FollowerSeqStore,
@@ -77,7 +78,7 @@ from gllm.scheduling.scheduler import Scheduler
 
 
 # Used with AsyncLLM
-class Worker(TorchProfilerMixin):
+class Worker(FrontendMixin, TorchProfilerMixin):
 
     def __init__(
         self,
@@ -96,6 +97,7 @@ class Worker(TorchProfilerMixin):
         assigned_layers,
         schedule_method,
         disagg_config=None,
+        standalone_worker=False,
     ):
         self.model_runner = model_runner
         self.local_rank = local_rank
@@ -111,6 +113,12 @@ class Worker(TorchProfilerMixin):
         self.mp_load_progress = mp_load_progress
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
+        # Deployment mode: True when this fleet serves a separately
+        # deployed (stateless, restartable) frontend -- the per-session
+        # client-id remap applies only there (see
+        # _standalone_remap_enabled). Pickled from the parent across
+        # the spawn boundary.
+        self.standalone_worker = bool(standalone_worker)
         self.use_mla = model_runner.model_loader.use_mla
         # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig),
         # pickled here from the parent across the spawn boundary; ``None`` on the
@@ -197,6 +205,11 @@ class Worker(TorchProfilerMixin):
         self.rank = get_rank()
         torch.cuda.set_device(f"cuda:{self.local_rank}")
 
+        # OUTPUT translation hook (see translate_output_for_frontend): every
+        # frontend-facing package gets its internal ids rewritten to the
+        # dispatching frontend's client ids plus per-row session stamps
+        # before it hits the wire. Covers plain / overlap / MTP paths alike.
+        self.comm._output_committer = self.translate_output_for_frontend
         self.comm.init()
 
         # Bring up the custom NVLink-P2P all-reduce path before the model
@@ -314,6 +327,7 @@ class Worker(TorchProfilerMixin):
         and the monolith path) goes straight to the scheduler on every column.
         """
         if not self._is_disagg_lm:
+            self._remap_client_ids(seqs)
             self.scheduler.add_new_requests(seqs)
             return
         direct = []
@@ -325,6 +339,7 @@ class Worker(TorchProfilerMixin):
             else:
                 direct.append(seq)
         if direct:
+            self._remap_client_ids(direct)
             self.scheduler.add_new_requests(direct)
 
     def _apply_disagg_events(self, events) -> None:
@@ -340,6 +355,9 @@ class Worker(TorchProfilerMixin):
         if not events:
             return
         for seq, state in events.admits:
+            # Remap BEFORE registering the gate state so coordinator-held
+            # state keys off the fleet-unique internal id.
+            self._remap_client_ids([seq])
             self.model_runner.disagg_register(seq.seq_id, state)
             self.scheduler.add_new_requests([seq])
         if events.emb_ready:
@@ -586,8 +604,10 @@ class Worker(TorchProfilerMixin):
                 ipc_package = self.comm.recv_ipc_package()
                 if ipc_package is None:
                     break
-                cum.schedule_lists.extend(ipc_package.schedule_lists)
-                cum.abort_ids.extend(ipc_package.abort_ids)
+                # merge_aligned folds schedule_lists AND keeps
+                # abort_sessions positionally aligned with abort_ids
+                # (IPCPackage protocol; never merge the bare id lists).
+                cum.merge_aligned(ipc_package)
                 if ipc_package.log is not None:
                     cum.log = ipc_package.log
                     saw_log_override = True
@@ -600,6 +620,9 @@ class Worker(TorchProfilerMixin):
                         cum.control_data = data
             if not saw_log_override:
                 cum.log = None
+            # (Session stamping happens on the OUTPUT side -- see
+            # zmqComm.stamp_output_sessions; the inbound aggregate needs
+            # none, since each admitted seq already carries its own.)
 
         # TP0 control plane: drive the disagg coordinator (discovery / meta /
         # notif / dispatch / watchdog) once per iter and attach the resulting
@@ -635,7 +658,13 @@ class Worker(TorchProfilerMixin):
         if cum.disagg_events is not None:
             self._apply_disagg_events(cum.disagg_events)
         if cum.abort_ids:
-            self.scheduler.add_abort_ids(cum.abort_ids)
+            # Aborts carry CLIENT ids (+ session stamps); resolve them to
+            # the internal ids of the requests those stamps own before
+            # touching the scheduler.
+            self.scheduler.add_abort_ids(
+                self._route_frontend_aborts(
+                    cum.abort_ids, getattr(cum, "abort_sessions", None))
+            )
             # TP0 also reclaims any coordinator-held NIXL receive slots for
             # aborted seqs still pending pre-admission (the scheduler-side
             # teardown above already covers admitted seqs on every column).
@@ -1041,7 +1070,56 @@ class Worker(TorchProfilerMixin):
         os._exit(1)
 
 
+def _parent_watchdog_loop() -> None:
+    """Exit this worker child if the fleet parent dies (SIGKILL backstop).
+
+    Runs on its OWN daemon thread (see :func:`start_parent_watchdog`):
+    a synchronous infinite loop would block ``worker.init()`` forever
+    (the child parks before the first CUDA call and the parent's
+    ``wait_workers`` never returns -- this broke every launch, monolith
+    included).
+
+    ``daemon=True`` only reaps children on a CLEAN parent exit. If the
+    parent is SIGKILLed, the child is orphaned yet keeps holding GPU
+    memory and -- in TCP mode -- the fixed transport base ports, so a
+    replacement fleet can neither bind nor allocate. A ppid poll (safe
+    across spawn; PDEATHSIG is fork-only) catches the orphan within one
+    interval and lets the restart recover the fleet.
+    """
+    import time
+
+    pid = os.getpid()
+    parent = os.getppid()
+    while True:
+        time.sleep(2.0)
+        if os.getppid() != parent:
+            logger.error(
+                "Worker child %d: parent %d is gone; exiting to release "
+                "GPU/ports for the replacement fleet.",
+                pid, parent,
+            )
+            os._exit(1)
+
+
+def start_parent_watchdog() -> None:
+    """Arm the parent-death watchdog (idempotent per process).
+
+    Call at the TOP of the spawned-child entry point (``run_worker`` /
+    ``run_overlap_worker``), before ``worker.init()``: the thread starts
+    polling immediately and never blocks the child's main work.
+    """
+    import threading
+
+    t = threading.Thread(
+        target=_parent_watchdog_loop,
+        name="gllm-parent-watchdog",
+        daemon=True,
+    )
+    t.start()
+
+
 def run_worker(worker: Worker):
+    start_parent_watchdog()
     try:
         worker.init()
         while True:

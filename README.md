@@ -120,6 +120,27 @@ python -m gllm.entrypoints.api_server --host $HOST \
 > - Ensure `$PP` matches `$RANKS` across instances (e.g., if `$PP=4` and master has `$RANKS=0,1`, then slave must have `$RANKS=2,3`)
 > - Set environment variables `NCCL_SOCKET_IFNAME` and `NCCL_IB_DISABLE` properly
 
+### Decoupled Frontend/Worker Deployment (Standalone)
+
+By default the OpenAI frontend and the GPU workers are one coupled deployment
+(a frontend crash or a worker crash takes both down). gLLM also supports
+**decoupling** them into independent processes that rendezvous over a worker
+endpoint file, so a crashed frontend can be restarted without reloading the
+model, and a crashed worker can be replaced without restarting the HTTP layer:
+
+```bash
+# 1) GPU worker fleet (no HTTP)
+python -m gllm.entrypoints.worker_server --model-path $MODEL_PATH \
+    --worker-gpu 1 --worker-endpoint-file /tmp/gllm_worker_endpoint.json
+
+# 2) Stateless frontend (no GPU)
+python -m gllm.entrypoints.api_server --model-path $MODEL_PATH --port 8000 \
+    --standalone-frontend --worker-endpoint-file /tmp/gllm_worker_endpoint.json
+```
+
+See [docs/frontend_worker_decoupling.md](docs/frontend_worker_decoupling.md)
+for crash semantics, cross-machine transports, and limitations.
+
 ### Client Completions
 ```bash
 # Launch server first

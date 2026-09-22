@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from gllm.runtime.profiler import TorchProfilerMixin, _env_flag
+from gllm.utils import env_flag
+from gllm.workers.profiler_mixin import TorchProfilerMixin
 
 
 class _FakeProfiler:
@@ -39,12 +40,12 @@ def test_large_profiler_trace_skips_key_averages(tmp_path):
 
 def test_profiler_boolean_environment_flag(monkeypatch):
     monkeypatch.delenv("TEST_PROFILER_FLAG", raising=False)
-    assert _env_flag("TEST_PROFILER_FLAG", True)
-    assert not _env_flag("TEST_PROFILER_FLAG", False)
+    assert env_flag("TEST_PROFILER_FLAG", True)
+    assert not env_flag("TEST_PROFILER_FLAG", False)
 
     for value in ("0", "false", "NO", "off"):
         monkeypatch.setenv("TEST_PROFILER_FLAG", value)
-        assert not _env_flag("TEST_PROFILER_FLAG", True)
+        assert not env_flag("TEST_PROFILER_FLAG", True)
 
     monkeypatch.setenv("TEST_PROFILER_FLAG", "1")
-    assert _env_flag("TEST_PROFILER_FLAG", False)
+    assert env_flag("TEST_PROFILER_FLAG", False)

@@ -93,6 +93,18 @@ def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
+def env_flag(name: str, default: bool) -> bool:
+    """Read a boolean environment variable.
+
+    Unset variables fall back to *default*; set ones accept any of
+    ``0/false/no/off`` (case-insensitive) as False, anything else True.
+    """
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def async_tensor_h2d(
     data: list,
     dtype: torch.dtype,
@@ -113,12 +125,31 @@ def make_socket(ctx, path: str, type):
         return socket
     elif type == zmq.PULL:
         socket = ctx.socket(type)
-        socket.bind(path)
+        if path.startswith("tcp://"):
+            # TCP bind variant (standalone workers advertising remote
+            # endpoints). The PULL socket is created by ``make_pull_bind``;
+            # ``bind()`` is only reached here for ipc:// paths.
+            raise AssertionError("TCP PULL sockets must be created via make_pull_bind")
+        else:
+            socket.bind(path)
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, int(0.5 * 1024**3))
         return socket
     else:
         assert 0
+
+
+def make_pull_bind(ctx, path: str):
+    """Bind a PULL socket with the same buffer tuning as :func:`make_socket`.
+
+    Used by standalone workers that bind their request/token PULL sockets on
+    TCP endpoints reachable from a separate frontend process.
+    """
+    socket = ctx.socket(zmq.PULL)
+    socket.bind(path)
+    socket.setsockopt(zmq.RCVHWM, 0)
+    socket.setsockopt(zmq.RCVBUF, int(0.5 * 1024**3))
+    return socket
 
 
 def find_free_port(host="0.0.0.0"):

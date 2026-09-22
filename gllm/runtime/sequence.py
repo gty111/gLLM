@@ -49,7 +49,24 @@ class GenerationSequence:
         structured_output=None,
     ):
         self.seq_id = seq_id
+        # The id the dispatching frontend used for this request. The
+        # standalone worker remaps ``seq_id`` to a fleet-unique internal id
+        # at admission (two surviving frontends both mint ids from 0; a bare
+        # id would let scheduling / aborts / output stamping cross sessions),
+        # so the original is kept here to translate output rows back.
+        # Monolith seqs are never remapped and carry their own ``seq_id``.
+        self.client_seq_id = seq_id
         self.structured_output = structured_output
+        # Frontend session epoch that minted this sequence (LLM.frontend_epoch,
+        # stamped by the frontend before dispatch). The worker echoes it back
+        # on the OUTPUT packages that carry this sequence's tokens/frees, so
+        # a restarted frontend can tell outputs of the dead session's
+        # in-flight requests apart from its own (both id pools start at 0).
+        # Bound to the *sequence*, never to "last package seen": a request
+        # keeps its stamp until it finishes, regardless of what other
+        # sessions dispatch while it is running. Legacy monolith seqs carry
+        # None.
+        self.frontend_session = None
         self.token_ids: List[int] = token_ids
         # ``raw_prompt_len`` is the *original* prompt length, fixed for the
         # whole lifetime of the request. ``prompt_len`` is the dynamic prefill

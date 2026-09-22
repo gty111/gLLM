@@ -998,6 +998,11 @@ class OverlapWorker(Worker):
 
 def run_overlap_worker(worker: OverlapWorker):
     """Tight per-iter loop for the overlap path."""
+    # Same SIGKILL-orphan backstop as the non-overlap path (BLOCKER:
+    # the watchdog must cover BOTH spawned-child entry points).
+    from gllm.workers.worker import start_parent_watchdog
+
+    start_parent_watchdog()
     try:
         worker.init()
         while True:

@@ -804,7 +804,98 @@ class ModelRunner:
             sizes.append(max_bs)
         return list(reversed(sizes))
 
+    @classmethod
+    def load_metadata(cls, load_format: str, model_path: str, schedule_method: str,
+                      model_max_length: int = None,
+                      mm_processor_min_pixels: int = None,
+                      mm_processor_max_pixels: int = None):
+        """Build the CPU-only subset of a :class:`ModelRunner`.
+
+        Used by the *standalone frontend* process (decoupled deployment):
+        it needs the tokenizer, generation config, architecture and
+        ``model_max_length`` to validate and tokenize requests, but must not
+        initialize CUDA, load weights, or allocate KV memory.
+
+        Mirrors the ``ModelRunner.__init__`` fields that ``LLM`` reads off
+        ``self.model_runner`` (``tokenizer``, ``model_loader``,
+        ``model_max_length``, ``maxd``/``maxp``/``minp``/``iterp``) and
+        marks itself non-initializable via :meth:`init`.
+        """
+        self = cls.__new__(cls)
+        self._metadata_only = True
+        self.max_num_batched_tokens = 0
+        self.max_running_seqs = 0
+        self.model_path = model_path
+        self.model_loader = ModelLoader(
+            load_format,
+            model_path,
+            self.max_num_batched_tokens,
+        )
+        self.gpu_memory_util = 0.0
+        self.page_size = 16
+        self.enable_prefix_caching = True
+        self.schedule_method = schedule_method
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+        # Mirror __init__: the frontend decides tool-call/thinking render
+        # mode from this, so a DSv3.2/DSv4 model must NOT fall back to the
+        # generic path only because the fleet is decoupled.
+        architecture = getattr(self.model_loader, "architecture", None)
+        self._deepseek_encoder_variant = {
+            "DeepseekV32ForCausalLM": "dsv32",
+            "DeepseekV4ForCausalLM": "dsv4",
+        }.get(architecture)
+        self._use_dsv32_encoder = self._deepseek_encoder_variant == "dsv32"
+        # Multimodal metadata MUST mirror the real runner: capability checks
+        # (e.g. the /v1/responses image-capability gate) and chat-template
+        # preprocessing read these off the frontend's model_runner. The
+        # processor is CPU-only here -- it only does tokenization/image-grid
+        # preprocessing, never touches the (skipped) vision tower weights.
+        self.use_mm = self.model_loader.use_mm
+        self.is_kimi_mm = (
+            self.model_loader.architecture == "KimiK25ForConditionalGeneration"
+        )
+        self.uses_mrope = self.use_mm and not self.is_kimi_mm
+        if self.use_mm and self.is_kimi_mm:
+            self.processor = AutoProcessor.from_pretrained(
+                model_path, trust_remote_code=True, use_fast=True
+            )
+            self.image_processor = None
+            self.video_processor = None
+        elif self.use_mm:
+            self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+            self.image_processor = self.processor.image_processor
+            self.video_processor = self.processor.video_processor
+            # Mirror __init__ EXACTLY: the frontend expands image/video
+            # placeholders against THIS grid config, so worker and
+            # frontend must agree on min/max pixels (the worker's runner applies
+            # the same flags in its __init__).
+            if mm_processor_min_pixels is not None:
+                self.image_processor.min_pixels = mm_processor_min_pixels
+                self.video_processor.min_pixels = mm_processor_min_pixels
+                self.image_processor.size["shortest_edge"] = mm_processor_min_pixels
+                self.video_processor.size["shortest_edge"] = mm_processor_min_pixels
+            if mm_processor_max_pixels is not None:
+                self.image_processor.max_pixels = mm_processor_max_pixels
+                self.video_processor.max_pixels = mm_processor_max_pixels
+                self.image_processor.size["longest_edge"] = mm_processor_max_pixels
+                self.video_processor.size["longest_edge"] = mm_processor_max_pixels
+        else:
+            self.processor = None
+            self.image_processor = None
+            self.video_processor = None
+        self.maxp = 0
+        self.maxd = 0
+        self.minp = 0
+        self.iterp = 0
+        self.model_max_length = self.resolve_model_max_length(model_max_length)
+        return self
+
+
     def init(self, mp_load_progress=None):
+        if getattr(self, '_metadata_only', False):
+            raise RuntimeError('metadata-only ModelRunner cannot be initialized')
         self.verify_config()
         self.model = self.model_loader.load_model(mp_load_progress)
         # Models may opt out of monolithic decode graphs while individual

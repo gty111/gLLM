@@ -7,13 +7,7 @@ import torch
 from logger import logger
 
 from gllm.distributed.parallel_state import get_world_size
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off"}
+from gllm.utils import env_flag as _env_flag
 
 
 class TorchProfilerMixin:
