@@ -228,3 +228,99 @@ def test_standalone_frontend_connects_and_generates(tmp_path):
         if frontend is not None:
             _kill(frontend)
         _kill(worker)
+
+
+@requires_model
+def test_standalone_via_in_memory_registry_proxy(tmp_path):
+    """End-to-end THROUGH the in-memory registry proxy middleware: the
+    control plane (worker register / frontend discover) is served by a real
+    DiscoveryServer, and the data plane stays frontend<->worker point-to-point
+    zmq (the proxy never forwards tokens). Verifies --endpoint-registry proxy
+    actually launches + generates, distinct from the file-based smoke above."""
+    import socket
+    import threading
+    import urllib.request
+
+    from gllm.disagg.discovery import DiscoveryServer
+
+    # In-process middleware on a free loopback port.
+    sock = socket.socket(); sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]; sock.close()
+    server = DiscoveryServer(f"127.0.0.1:{port}")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    addr = f"127.0.0.1:{port}"
+
+    model = _model_path()
+    env = _compat_env()
+    env.pop("CUDA_VISIBLE_DEVICES", None)
+    wcmd = [
+        PY, "-m", "gllm.entrypoints.worker_server",
+        "--model-path", model,
+        "--worker-gpu", GPU,
+        "--endpoint-registry", "proxy",
+        "--endpoint-registry-addr", addr,
+        "--tp", "1",
+        "--gpu-memory-util", GPU_MEMORY_UTIL,
+        "--master-addr", "127.0.0.1",
+        "--master-port", "29641",
+    ]
+    fcmd = [
+        PY, "-m", "gllm.entrypoints.api_server",
+        "--model-path", model,
+        "--host", "127.0.0.1",
+        "--port", "18133",
+        "--standalone-frontend",
+        "--endpoint-registry", "proxy",
+        "--endpoint-registry-addr", addr,
+    ]
+    worker = subprocess.Popen(wcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    frontend = None
+    try:
+        def ready():
+            try:
+                from gllm.disagg.discovery import make_discovery
+                d = make_discovery(addr)
+                try:
+                    return len(d.list("gllm-worker")) > 0
+                finally:
+                    d.close()
+            except Exception:
+                return False
+
+        ok = _wait_for(ready, STARTUP_TIMEOUT)
+        if not ok:
+            out = _drain_pipe(worker.stdout)
+            raise AssertionError(
+                "worker never registered with the proxy registry\n" + out[-6000:]
+            )
+        frontend = subprocess.Popen(
+            fcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env
+        )
+
+        def health_ok():
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:18133/health", timeout=2) as r:
+                    return r.status == 200
+            except Exception:
+                return False
+
+        assert _wait_for(health_ok, 120), "frontend /health never came up via proxy"
+        req = urllib.request.Request(
+            "http://127.0.0.1:18133/v1/completions",
+            data=json.dumps({
+                "model": os.path.basename(model.rstrip("/")),
+                "prompt": "Hello, world!",
+                "max_tokens": 8,
+                "temperature": 0,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            body = json.load(r)
+        assert body.get("choices"), body
+        assert isinstance(body["choices"][0].get("text", ""), str)
+    finally:
+        if frontend is not None:
+            _kill(frontend)
+        _kill(worker)
+        server.stop()

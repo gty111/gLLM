@@ -61,6 +61,45 @@ The two sides rendezvous through a small JSON **worker endpoint file**
 Transport: `ipc://` on a single machine, or fixed `tcp://` ports
 (`--worker-transport-base-port`) so a frontend on another host can connect.
 
+### Endpoint registry: file (default) or proxy middleware
+
+The rendezvous is behind a small `EndpointRegistry` interface
+(`gllm/entrypoints/worker_endpoint.py`). Two backends ship:
+
+* **file** (default): the on-disk `--worker-endpoint-file` above. Zero
+  dependency, backward compatible.
+* **proxy**: a standalone, in-memory registry middleware process (control
+  plane only). The worker *registers* its transport rows and leases them; the
+  frontend *discovers* them. The middleware is `gllm.entrypoints.discovery_server`
+  (the same dependency-free ZMQ `DiscoveryServer` used for encoder
+  disaggregation) — reuse it directly:
+
+  ```bash
+  # 0) middleware (independent process; control plane only)
+  python -m gllm.entrypoints.discovery_server --listen 0.0.0.0:9500
+
+  # 1) worker registers with it (no --worker-endpoint-file needed)
+  python -m gllm.entrypoints.worker_server \
+      --model-path /path/to/model --worker-gpu 1 \
+      --endpoint-registry proxy --endpoint-registry-addr 127.0.0.1:9500 \
+      --tp 1 --gpu-memory-util 0.9
+
+  # 2) frontend discovers from it
+  python -m gllm.entrypoints.api_server \
+      --model-path /path/to/model --host 0.0.0.0 --port 8000 \
+      --standalone-frontend \
+      --endpoint-registry proxy --endpoint-registry-addr 127.0.0.1:9500
+  ```
+
+  The middleware is **control-plane only**: it stores `(uuid -> transport
+  rows + lease)`. The data plane stays **frontend <-> worker point-to-point
+  zmq** using the addresses it hands out — the proxy is never in the request
+  path, so it is not a forwarding single point. Lease expiry (3x the file
+  staleness window) is the SIGKILL / power-loss backstop; a proxy restart
+  does not lose a live worker (the worker's lease heartbeat re-registers it).
+  Cross-machine, this removes the shared-filesystem requirement of file mode
+  (both sides only need to reach the proxy).
+
 ### Frontend session epoch
 
 Every frontend process mints a random **session epoch**, bound to the

@@ -60,7 +60,14 @@ def main():
 
     args = build_arg_parser().parse_args()
 
-    if not args.worker_endpoint_file:
+    _reg = getattr(args, "endpoint_registry", "file") or "file"
+    if _reg == "proxy":
+        if not getattr(args, "endpoint_registry_addr", None):
+            raise SystemExit(
+                "worker_server with --endpoint-registry proxy requires "
+                "--endpoint-registry-addr (HOST:PORT)"
+            )
+    elif not args.worker_endpoint_file:
         raise SystemExit("worker_server requires --worker-endpoint-file")
 
     # Pin to the requested physical GPU(s) before any CUDA init, mirroring

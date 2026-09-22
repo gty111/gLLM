@@ -351,6 +351,34 @@ def add_decoupled_args(p: argparse.ArgumentParser) -> None:
             "IP here (or point --master-addr at it)."
         ),
     )
+    p.add_argument(
+        "--endpoint-registry",
+        dest="endpoint_registry",
+        type=str,
+        default="file",
+        choices=["file", "proxy"],
+        help=(
+            "Standalone deployment: how the worker and frontend discover "
+            "each other's transport. 'file' (default) uses the on-disk "
+            "rendezvous file (--worker-endpoint-file), zero-dependency. "
+            "'proxy' routes through a standalone in-memory registry "
+            "middleware (start: python -m gllm.entrypoints.discovery_server "
+            "--listen HOST:PORT; set --endpoint-registry-addr to it). The "
+            "middleware is control-plane only: the data plane stays "
+            "frontend<->worker point-to-point zmq."
+        ),
+    )
+    p.add_argument(
+        "--endpoint-registry-addr",
+        dest="endpoint_registry_addr",
+        type=str,
+        default=None,
+        help=(
+            "Standalone deployment, --endpoint-registry proxy only: "
+            "HOST:PORT of the discovery proxy middleware (same service as "
+            "--discovery-endpoint for encoder disaggregation)."
+        ),
+    )
 
 
 def add_engine_args(p: argparse.ArgumentParser, *, tp_help: str = None) -> None:
@@ -415,4 +443,6 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
         "worker_transport_advertise_host": getattr(
             args, "worker_transport_advertise_host", None
         ),
+        "endpoint_registry": getattr(args, "endpoint_registry", "file"),
+        "endpoint_registry_addr": getattr(args, "endpoint_registry_addr", None),
     }

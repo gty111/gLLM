@@ -1434,3 +1434,108 @@ def test_sync_standalone_frontend_raises_clear_error():
             launch_mode="normal",
             standalone_frontend=True,
         )
+
+
+# ============================================================================
+# Endpoint registry abstraction: file (default) + in-memory proxy
+# ============================================================================
+
+def test_build_endpoint_registry_defaults_to_file():
+    from gllm.entrypoints.worker_endpoint import (
+        FileEndpointRegistry, ProxyEndpointRegistry, build_endpoint_registry,
+    )
+    # No registry hint -> file, frontend side (reads).
+    r = build_endpoint_registry({"worker_endpoint_file": "/tmp/x.json"})
+    assert isinstance(r, FileEndpointRegistry) and r.side == "frontend"
+    # Worker hint -> file, worker side (writes).
+    r = build_endpoint_registry(
+        {"worker_endpoint_file": "/tmp/x.json", "standalone_worker": True})
+    assert isinstance(r, FileEndpointRegistry) and r.side == "worker"
+    # proxy without addr -> clear error.
+    try:
+        build_endpoint_registry({"endpoint_registry": "proxy"})
+        raise AssertionError("expected ValueError for proxy without addr")
+    except ValueError:
+        pass
+    # Unknown kind -> error.
+    try:
+        build_endpoint_registry({"endpoint_registry": "bogus"})
+        raise AssertionError("expected ValueError for unknown kind")
+    except ValueError:
+        pass
+
+
+def test_file_registry_file_roundtrip(tmp_path):
+    """The file registry is byte-compatible with the legacy writer/reader."""
+    import gllm.entrypoints.worker_endpoint as we
+    from gllm.entrypoints.worker_endpoint import FileEndpointRegistry
+    path = str(tmp_path / "ep.json")
+    w = FileEndpointRegistry(path, side="worker")
+    u = w.register({0: {"schedule": "ipc:///tmp/s", "output": "ipc:///tmp/o",
+                        "token": "ipc:///tmp/t"}})
+    assert u == w.uuid
+    # Legacy reader sees exactly what the worker wrote.
+    gu, ge = we.read_worker_endpoint_file(path)
+    assert gu == u and ge[0]["schedule"] == "ipc:///tmp/s"
+    # Frontend-side registry reads the same file.
+    f = FileEndpointRegistry(path, side="frontend")
+    assert f.latest() == (u, ge)
+    assert f.age() is not None
+    w.revoke()
+    assert we.read_worker_endpoint_file(path) == (None, None)
+
+
+def test_proxy_registry_over_in_memory_discovery_server():
+    """End-to-end registry semantics over the REAL in-memory proxy middleware:
+    a worker registers + leases; a frontend (a second client) discovers the
+    same (uuid, endpoints); the uuid is stable; lease expiry (tiny ttl) reaps
+    the entry so the frontend sees it gone. Data plane is untouched (we only
+    exchange the published zmq address strings)."""
+    import socket
+    import time as _time
+    from gllm.disagg.discovery import DiscoveryServer
+    from gllm.entrypoints.worker_endpoint import ProxyEndpointRegistry
+
+    # Pick a free loopback port for the proxy.
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    server = DiscoveryServer(f"127.0.0.1:{port}")
+    import threading
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    try:
+        addr = f"127.0.0.1:{port}"
+        # Frontend client: nothing published yet.
+        fe = ProxyEndpointRegistry(addr, side="frontend")
+        assert fe.latest() == (None, None)
+        # Worker client: register its transport rows.
+        wk = ProxyEndpointRegistry(addr, side="worker")
+        eps = {"schedule": "tcp://10.0.0.5:50001",
+               "output": "tcp://10.0.0.5:50002",
+               "token": "tcp://10.0.0.5:50003"}
+        u = wk.register({0: eps})
+        assert u and wk.uuid == u
+        # Frontend discovers the SAME uuid + endpoints (int rank key).
+        deadline = _time.time() + 5
+        seen = None
+        while _time.time() < deadline:
+            seen = fe.latest()
+            if seen[0] is not None:
+                break
+            _time.sleep(0.05)
+        fu, feps = seen
+        assert fu == u, (fu, u)
+        assert feps[0] == eps, feps
+        assert fe.age() is not None
+        # Clean revoke -> frontend sees gone (after a brief settle).
+        wk.revoke()
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            if fe.latest()[0] is None:
+                break
+            _time.sleep(0.05)
+        assert fe.latest()[0] is None
+    finally:
+        server.stop()

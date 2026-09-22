@@ -85,6 +85,8 @@ class LLM:
         ssm_snapshot_stride_tokens=256,
         worker_transport_base_port=None,
         worker_transport_advertise_host=None,
+        endpoint_registry=None,
+        endpoint_registry_addr=None,
         # --- Frontend/worker decoupling (see docs/frontend_worker_decoupling.md) ---
         # ``standalone_frontend=True``: this process is a pure frontend -- it
         # does NOT spawn worker processes and does NOT initialize a GPU. It
@@ -132,9 +134,18 @@ class LLM:
                 f"dp_size={dp_size} (>1); the decoupled transport is "
                 "single-rank. Launch the fleet with --dp-size 1."
             )
-        self._worker_writer = None  # WorkerEndpointWriter (standalone worker)
         self.worker_transport_base_port = worker_transport_base_port
         self.worker_transport_advertise_host = worker_transport_advertise_host
+        # Endpoint registry: how this process discovers / advertises the
+        # standalone transport. "file" (default) is the on-disk rendezvous
+        # file (zero-dep, backward compatible); "proxy" routes to a standalone
+        # in-memory registry process (see docs/frontend_worker_decoupling.md).
+        # Built here so BOTH roles (standalone worker publishes, standalone
+        # frontend discovers) share the same backend selection.
+        self.endpoint_registry_kind = endpoint_registry
+        self.endpoint_registry_addr = endpoint_registry_addr
+        self._worker_writer = None  # WorkerEndpointWriter (file-mode worker)
+        self.endpoint_registry = self._build_endpoint_registry()
         # Frontend session epoch (echoed per output row via
         # IPCPackage.sessions / free_sessions, see
         # Worker.translate_output_for_frontend). Every (re)started frontend
@@ -358,6 +369,24 @@ class LLM:
         )
         self._launch_workers()
 
+    def _build_endpoint_registry(self):
+        """Instantiate the endpoint registry for this process.
+
+        Selection (CLI): ``--endpoint-registry {file,proxy}`` +
+        ``--endpoint-registry-addr`` (proxy only). Default is ``file``,
+        which reuses ``worker_endpoint_file`` and is byte-for-byte the
+        previous behavior.
+        """
+        from gllm.entrypoints.worker_endpoint import build_endpoint_registry
+
+        cfg = {
+            "endpoint_registry": self.endpoint_registry_kind,
+            "endpoint_registry_addr": self.endpoint_registry_addr,
+            "worker_endpoint_file": self.worker_endpoint_file,
+            "standalone_worker": self.standalone_worker,
+        }
+        return build_endpoint_registry(cfg)
+
     def _publish_worker_endpoint(self):
         """Standby worker fleet: advertise the frontend-facing socket paths.
 
@@ -365,14 +394,11 @@ class LLM:
         (ipc:// on the same machine, tcp:// when the fleet is reachable over
         the network via ``--worker-transport-base-port``).
         """
-        from gllm.entrypoints.worker_endpoint import WorkerEndpointWriter
-
-        if not self.worker_endpoint_file:
-            raise ValueError(
-                "standalone_worker=True requires worker_endpoint_file"
-            )
+        # A worker MUST advertise: file mode needs the path, proxy mode needs
+        # the registry built with the proxy addr. (File mode: the path doubles
+        # as the default rendezvous; proxy mode: worker_endpoint_file may be
+        # unset.)
         base_port = getattr(self, "worker_transport_base_port", None)
-        self._worker_writer = WorkerEndpointWriter(self.worker_endpoint_file)
         if base_port:
             # tcp:// transports at fixed offsets: schedule=output base,
             # output=+1, token=+2 (per rank 0; other ranks' paths are
@@ -402,7 +428,31 @@ class LLM:
             token = f"tcp://{advertise_host}:{p + 2}"
         else:
             schedule, output, token = self.schedule_path, self.output_path, self.token_path
-        self._worker_writer.set_endpoints({0: {"schedule": schedule, "output": output, "token": token}})
+        # Publish through the registry (file writer OR network proxy). For the
+        # file backend this is exactly the previous WorkerEndpointWriter path
+        # (set_endpoints mints the uuid, starts the heartbeat, ABA-safe
+        # cleanup); for proxy it registers + leases on the middleware. A raw
+        # LLM.__new__ shell (tests) has no registry attr -> synthesize the
+        # file writer so the historical path is preserved. (Imported at the
+        # TOP of this block -- not inside the `if` -- because a later line
+        # references FileEndpointRegistry, which would make the name local to
+        # the whole function and unbound on the non-shell path.)
+        from gllm.entrypoints.worker_endpoint import FileEndpointRegistry
+
+        reg = getattr(self, "endpoint_registry", None)
+        if reg is None:
+            reg = FileEndpointRegistry(self.worker_endpoint_file, side="worker")
+        reg.register({0: {"schedule": schedule, "output": output, "token": token}})
+        # Keep the legacy _worker_writer handle (some code paths/tests reference
+        # it for cleanup). In file mode that IS the writer; in proxy mode it
+        # stays None and the watchdog revokes via the registry instead.
+        if isinstance(reg, FileEndpointRegistry):
+            self._worker_writer = reg._writer
+        logger.info(
+            "Published standalone worker endpoint (registry=%s, transport uuid %s)",
+            getattr(reg, "side", "?"),
+            reg.uuid,
+        )
 
 
     def check_tcp_advertise_host(self) -> None:
@@ -537,9 +587,12 @@ class LLM:
             "endpoint file so frontends detect the outage.",
             code,
         )
-        writer = getattr(self, "_worker_writer", None)
-        if writer is not None:
-            writer.cleanup()
+        reg = getattr(self, "endpoint_registry", None)
+        if reg is not None:
+            try:
+                reg.revoke()
+            except Exception:
+                pass
         return False
 
     def _launch_workers(self):

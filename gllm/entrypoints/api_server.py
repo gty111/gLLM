@@ -927,8 +927,16 @@ def main():
 
     args = build_arg_parser().parse_args()
 
-    if args.standalone_frontend and not args.worker_endpoint_file:
-        raise SystemExit("--standalone-frontend requires --worker-endpoint-file")
+    if args.standalone_frontend:
+        reg = getattr(args, "endpoint_registry", "file") or "file"
+        if reg == "proxy":
+            if not getattr(args, "endpoint_registry_addr", None):
+                raise SystemExit(
+                    "--standalone-frontend with --endpoint-registry proxy "
+                    "requires --endpoint-registry-addr (HOST:PORT)"
+                )
+        elif not args.worker_endpoint_file:
+            raise SystemExit("--standalone-frontend requires --worker-endpoint-file")
     if args.standalone_frontend and (args.pp != 1 or args.dp != 1 or args.tp != 1):
         raise SystemExit(
             "standalone frontend currently supports single-rank worker fleets "

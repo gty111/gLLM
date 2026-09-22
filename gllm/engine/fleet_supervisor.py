@@ -35,6 +35,10 @@ import time
 from logger import logger
 
 from gllm.distributed.comm import zmqComm
+from gllm.entrypoints.worker_endpoint import (
+    endpoint_file_age_seconds,
+    read_worker_endpoint_file,
+)
 from gllm.utils import random_uuid
 
 _GRACE_SECONDS = 3  # tolerate atomic rename / one slow heartbeat
@@ -78,6 +82,32 @@ class FleetSupervisor:
     def endpoint_file(self) -> str:
         return self.llm.worker_endpoint_file
 
+    def _reg(self):
+        """The host's endpoint registry, or None for the default file mode.
+
+        A plain ``LLM`` (or a test's ``_bare_llm`` shell) has no
+        ``endpoint_registry`` attribute, so this returns None and the
+        read helpers below fall back to the file -- preserving the
+        historical zero-dependency default and all file-based tests.
+        """
+        return getattr(self.llm, "endpoint_registry", None)
+
+    def _reg_latest(self):
+        """Current ``(uuid, endpoints)`` from the registry, falling back to
+        the endpoint file when no registry is configured."""
+        reg = self._reg()
+        if reg is not None:
+            return reg.latest()
+        return read_worker_endpoint_file(self.endpoint_file)
+
+    def _reg_age(self) -> float:
+        """Seconds since the last registry update, falling back to the file
+        mtime. ``None`` means "no endpoint visible"."""
+        reg = self._reg()
+        if reg is not None:
+            return reg.age()
+        return endpoint_file_age_seconds(self.endpoint_file)
+
     # ------------------------------------------------------------------
     # CONNECT
     # ------------------------------------------------------------------
@@ -88,15 +118,12 @@ class FleetSupervisor:
         Called from the host constructor while the fleet is coming up
         (polls until the file appears or ``_CONNECT_TIMEOUT`` elapses).
         """
-        from gllm.entrypoints.worker_endpoint import (
-            DEFAULT_POLL_INTERVAL,
-            read_worker_endpoint_file,
-        )
+        from gllm.entrypoints.worker_endpoint import DEFAULT_POLL_INTERVAL
 
         path = self.endpoint_file
         deadline = time.time() + _CONNECT_TIMEOUT
         while True:
-            transport_uuid, endpoints = read_worker_endpoint_file(path)
+            transport_uuid, endpoints = self._reg_latest()
             if transport_uuid is not None and endpoints:
                 break
             if time.time() > deadline:
@@ -178,12 +205,9 @@ class FleetSupervisor:
         through to the bounded non-blocking send.
         """
         try:
-            from gllm.entrypoints.worker_endpoint import (
-                STALE_AFTER_SECONDS,
-                endpoint_file_age_seconds,
-            )
+            from gllm.entrypoints.worker_endpoint import STALE_AFTER_SECONDS
 
-            age = endpoint_file_age_seconds(self.endpoint_file)
+            age = self._reg_age()
             return age is not None and age <= STALE_AFTER_SECONDS
         except Exception:
             return True
@@ -201,14 +225,10 @@ class FleetSupervisor:
         thread -- the same thread that owns the sockets -- so the swap
         is race-free with send/recv.
         """
-        from gllm.entrypoints.worker_endpoint import (
-            endpoint_file_age_seconds,
-            read_worker_endpoint_file,
-            STALE_AFTER_SECONDS,
-        )
+        from gllm.entrypoints.worker_endpoint import STALE_AFTER_SECONDS
 
         path = self.endpoint_file
-        age = endpoint_file_age_seconds(path)
+        age = self._reg_age()
         # The fleet is "gone" when the endpoint file is absent *or* stale
         # (mtime older than STALE_AFTER_SECONDS, i.e. the heartbeat thread
         # is no longer refreshing it -- the SIGKILL / power-loss backstop).
@@ -227,7 +247,7 @@ class FleetSupervisor:
                 )
             return
         self._gone_since = None
-        transport_uuid, endpoints = read_worker_endpoint_file(path)
+        transport_uuid, endpoints = self._reg_latest()
         if transport_uuid is None or not endpoints:
             # File present but unparseable / empty: treat as gone, with the
             # same short grace as above.
@@ -266,19 +286,15 @@ class FleetSupervisor:
         shutdown (executor.shutdown(wait=True)). Sliced polls leave the
         thread free between ticks.
         """
-        from gllm.entrypoints.worker_endpoint import (
-            endpoint_file_age_seconds,
-            read_worker_endpoint_file,
-            STALE_AFTER_SECONDS,
-        )
+        from gllm.entrypoints.worker_endpoint import STALE_AFTER_SECONDS
 
         path = self.endpoint_file
         deadline = time.time() + max_wait
         while True:
-            age = endpoint_file_age_seconds(path)
+            age = self._reg_age()
             present = age is not None and age <= STALE_AFTER_SECONDS
             if present:
-                transport_uuid, endpoints = read_worker_endpoint_file(path)
+                transport_uuid, endpoints = self._reg_latest()
                 if (
                     transport_uuid is not None
                     and endpoints
@@ -318,13 +334,11 @@ class FleetSupervisor:
         client stream and releases its ids as an explicit step of the
         transition.
         """
-        from gllm.entrypoints.worker_endpoint import read_worker_endpoint_file
-
         path = self.endpoint_file
         deadline = time.time() + _RECONNECT_TIMEOUT
         last_err = None
         while True:
-            transport_uuid, endpoints = read_worker_endpoint_file(path)
+            transport_uuid, endpoints = self._reg_latest()
             if transport_uuid is not None and endpoints:
                 if transport_uuid == self._worker_transport_uuid:
                     # Same incarnation; transient read glitch.
