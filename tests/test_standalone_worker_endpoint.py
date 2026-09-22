@@ -170,6 +170,8 @@ def _bare_llm():
     eng.running_maps = {}
     eng.frontend_epoch = "epoch-A"
     eng.dp_size = 1
+    # Supervisor target (tests may override after the fact).
+    eng.worker_endpoint_file = None
     # Bare-engine stand-in: _apply_ipc_package's async path derefs these.
     # Fake tokenizer: decode([t]) -> chr(A+t); no special tokens, no spacing.
     from types import SimpleNamespace
@@ -178,6 +180,10 @@ def _bare_llm():
         all_special_ids=[],
     ))
     eng._reasoning_controls = ()
+    # Fleet supervisor (standalone frontend): mirrors the production
+    # constructor wiring (LLM.__init__) without the heavy setup.
+    from gllm.engine.fleet_supervisor import FleetSupervisor
+    eng.fleet = FleetSupervisor(eng, eng.dp_size)
     return eng
 
 

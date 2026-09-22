@@ -9,6 +9,7 @@ import tqdm
 from logger import logger
 
 from gllm.distributed.comm import IPCPackage, zmqComm
+from gllm.engine.fleet_supervisor import FleetSupervisor
 from gllm.tokenizers.reasoning import decode_stream_delta, reasoning_control_tokens
 from gllm.runtime.id_allocator import IDAllocator
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
@@ -232,11 +233,13 @@ class LLM:
         self._pending_lock = threading.Lock()
 
         # Init workers
+        self.fleet = None  # FleetSupervisor (standalone frontend only)
         if self.standalone_frontend:
+            self.fleet = FleetSupervisor(self, self.dp_size)
             self.num_workers = 0
             self.process_list = []
             self.act_worker_ranks = []
-            self._init_standalone_frontend()
+            self.fleet.connect()
         else:
             self.init_workers()
 
@@ -375,134 +378,6 @@ class LLM:
     # Standalone frontend (decoupled from the worker fleet)
     # ------------------------------------------------------------------
 
-    def _init_standalone_frontend(self):
-        """Wire this process to a separately deployed worker fleet.
-
-        The endpoint file is written by the worker processes
-        (``gllm.entrypoints.worker_server``). We poll it until it appears,
-        then (re)build the frontend ZMQ sockets from the published paths. A
-        later worker restart publishes a new transport uuid; the watcher
-        task started by :meth:`start_schedule_engine` (AsyncLLM) detects it
-        and calls :meth:`reconnect_comm`, so the frontend recovers without a
-        process restart.
-        """
-        from gllm.entrypoints.worker_endpoint import (
-            DEFAULT_POLL_INTERVAL,
-            read_worker_endpoint_file,
-        )
-
-        path = self.worker_endpoint_file
-        deadline = time.time() + 300
-        while True:
-            transport_uuid, endpoints = read_worker_endpoint_file(path)
-            if transport_uuid is not None and endpoints:
-                break
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"No worker endpoint file appeared at {path} within "
-                    f"{deadline - time.time() + 300:.0f}s"
-                )
-            logger.info(
-                "Waiting for worker endpoint file %s (standalone frontend)...", path
-            )
-            time.sleep(DEFAULT_POLL_INTERVAL)
-        logger.info(
-            "Connected to standalone worker fleet (transport uuid %s, ranks %s) via %s",
-            transport_uuid,
-            sorted(endpoints),
-            path,
-        )
-        self._worker_transport_uuid = transport_uuid
-        self._worker_endpoints = endpoints
-        self._build_standalone_frontend_comm(endpoints)
-
-    def _build_standalone_frontend_comm(self, endpoints: dict):
-        """Create/replace the frontend ZMQ sockets for one transport incarnation."""
-        prev = getattr(self, "comm", None)
-        if prev is not None:
-            try:
-                prev.drain_request_buffer()
-            except Exception:
-                pass
-            try:
-                prev.close()
-            except Exception:
-                pass
-            self.comm = None
-        # One transport path per rank; rank 0 carries schedule/output/token.
-        ep = endpoints[0]
-        self.comm = zmqComm(
-            self.host,
-            self.launch_mode,
-            self.master_addr,
-            ep["schedule"],
-            ep["output"],
-            ep["token"],
-            frontend=True,
-            dp_size=self.dp_size,
-            standalone_remote=True,
-        )
-        self.comm.init()
-        # Keep the (stale) self.* paths updated for logging/debugging.
-        self.schedule_path = ep["schedule"]
-        self.output_path = ep["output"]
-        self.token_path = ep["token"]
-
-    def reconnect_comm(self, terminate_reason: Exception = None):
-        """Re-resolve the worker fleet after it restarted (new uuid).
-
-        Called by the standalone watcher from the engine IO executor thread.
-        In-flight zmq messages are lost with the old transport; that is the
-        intended blast radius (a restarted worker loses its KV cache anyway).
-
-        ``terminate_reason``: when given (the watcher caught a worker-down
-        error), it is handed to :meth:`on_standalone_reconnect` AFTER the new
-        transport is up, so the async layer terminates every in-flight client
-        stream and releases its ids as an explicit step of the transition.
-        """
-        from gllm.entrypoints.worker_endpoint import read_worker_endpoint_file
-
-        path = self.worker_endpoint_file
-        deadline = time.time() + 600
-        last_err = None
-        while True:
-            transport_uuid, endpoints = read_worker_endpoint_file(path)
-            if transport_uuid is not None and endpoints:
-                if transport_uuid == getattr(self, "_worker_transport_uuid", None):
-                    # Same incarnation; transient read glitch.
-                    return
-                logger.warning(
-                    "Worker fleet restarted: transport uuid %s -> %s; reconnecting "
-                    "frontend ZMQ transport.",
-                    getattr(self, "_worker_transport_uuid", None),
-                    transport_uuid,
-                )
-                self._worker_transport_uuid = transport_uuid
-                self._worker_endpoints = endpoints
-                self._build_standalone_frontend_comm(endpoints)
-                # The restarted fleet has no memory of these sequences: drop
-                # the frontend-side bookkeeping.
-                with self._pending_lock:
-                    self.wait_lists = []
-                    self.abort_ids = []
-                self.running_maps.clear()
-                # Explicit stream termination + id release for this
-                # transition (overridden by AsyncLLM).
-                self.on_standalone_reconnect(
-                    terminate_reason
-                    or RuntimeError("worker fleet restarted; stale request")
-                )
-                return
-            last_err = "endpoint file absent (worker down?)"
-            if time.time() > deadline:
-                raise RuntimeError(
-                    f"Standby timeout: worker endpoint file {path} not republished "
-                    f"within 600s ({last_err}); restarting the worker fleet will "
-                    f"recover the frontend without a frontend restart."
-                )
-            logger.warning("Worker down; polling %s for republish (%s)", path, last_err)
-            time.sleep(1.0)
-
     def on_standalone_reconnect(self, reason: Exception):
         """Hook for the transport-transition cleanup.
 
@@ -511,85 +386,17 @@ class LLM:
         fail every in-flight stream and release the ids.
         """
 
-    def _fleet_lively(self) -> bool:
-        """Cheap standalone-fleet liveness probe for the dispatch path.
-
-        zmq cannot tell "sent to a dead peer's buffer" from "sent to a live
-        one" (SNDBUF=512MB absorbs either), so the endpoint file is the
-        source of truth: present and freshly heartbeat-ed. Unlike
-        :meth:`check_standalone_worker` this NEVER raises -- a probe error
-        or an unset endpoint (e.g. unit tests) means "unknown", and
-        unknown is treated as live, so dispatch falls through to the
-        bounded non-blocking send.
-        """
-        if not self.standalone_frontend:
-            return True
-        try:
-            from gllm.entrypoints.worker_endpoint import (
-                STALE_AFTER_SECONDS,
-                endpoint_file_age_seconds,
-            )
-
-            path = getattr(self, "worker_endpoint_file", None)
-            if path is None:
-                return True
-            age = endpoint_file_age_seconds(path)
-            return age is not None and age <= STALE_AFTER_SECONDS
-        except Exception:
-            return True
-
     def check_standalone_worker(self):
         """Heartbeat/liveness check for the standalone worker fleet.
 
-        Cheap: one file stat + a JSON read when the mtime changed enough.
-        Raises RuntimeError when the endpoint file has vanished (worker
-        fleet gone) -- the schedule loop converts that into a terminal
-        error for every in-flight async stream instead of hanging them.
+        Delegates to :meth:`FleetSupervisor.heartbeat`: raises
+        RuntimeError when the endpoint file has vanished / gone stale
+        (the schedule loop converts that into a terminal error for every
+        in-flight async stream instead of hanging them); a uuid change
+        (fleet restarted in the background) is handled by
+        :meth:`FleetSupervisor.reconnect` in-process, no raise.
         """
-        from gllm.entrypoints.worker_endpoint import (
-            endpoint_file_age_seconds,
-            read_worker_endpoint_file,
-            STALE_AFTER_SECONDS,
-        )
-
-        path = self.worker_endpoint_file
-        age = endpoint_file_age_seconds(path)
-        # The fleet is "gone" when the endpoint file is absent *or* stale
-        # (mtime older than STALE_AFTER_SECONDS, i.e. the heartbeat thread is
-        # no longer refreshing it -- the SIGKILL / power-loss backstop).
-        gone = age is None or age > STALE_AFTER_SECONDS
-        if gone:
-            # Only declare the fleet dead after a grace period so a brief
-            # atomic-rewrite window (rename) or a one-off slow heartbeat
-            # cannot false-trip. The grace is much shorter than the old 30s
-            # so a crashed worker is recovered quickly.
-            self._gone_since = getattr(self, "_gone_since", None) or time.monotonic()
-            if time.monotonic() - self._gone_since > 3:
-                raise RuntimeError(
-                    f"Worker endpoint file {path} is "
-                    f"{'missing' if age is None else f'stale (age {age:.1f}s)'}; "
-                    f"the worker fleet appears to be down."
-                )
-            return
-        self._gone_since = None
-        transport_uuid, endpoints = read_worker_endpoint_file(path)
-        if transport_uuid is None or not endpoints:
-            # File present but unparseable / empty: treat as gone, with the
-            # same short grace as above.
-            if self._gone_since is None:
-                self._gone_since = time.monotonic()
-            if time.monotonic() - self._gone_since > 3:
-                raise RuntimeError(
-                    f"Worker endpoint file {path} is unreadable; the worker fleet "
-                    f"appears to be down."
-                )
-            return
-        if transport_uuid != getattr(self, "_worker_transport_uuid", None):
-            # The worker fleet restarted in the background; reconnect our
-            # sockets. This runs on the engine IO executor thread, the same
-            # thread that owns the sockets, so the swap is race-free with
-            # send/recv.
-            self.reconnect_comm()
+        self.fleet.heartbeat()
 
     def mainloop(self):
         """Blocking engine loop for a standalone (frontend-less) worker.
@@ -1047,44 +854,12 @@ class LLM:
         ipc_package.abort_ids = abort_ids
         ipc_package.log = True
         if self.standalone_frontend and abort_ids:
-            # Aborts are CLIENT ids; name their session so a surviving
-            # fleet resolves them to the right (possibly other-session)
-            # request instead of whatever shares the bare id.
-            ipc_package.abort_sessions = [
-                getattr(
-                    self.running_maps.get(a)
-                    or next(
-                        (s for s in wait_lists if s.seq_id == a), None),
-                    "frontend_session", self.frontend_epoch)
-                for a in abort_ids]
+            self.fleet.stamp_abort_sessions(ipc_package, abort_ids, wait_lists)
         if self.standalone_frontend:
-            # A DEAD fleet (endpoint file gone/stale) would absorb every
-            # dispatch into the 512MB send buffer and ACK it, so requeue the
-            # pending work instead of shipping it into the void: the liveness
-            # check surfaces the outage and the reconnect hook cleans up.
-            try:
-                fleet_dead = not self._fleet_lively()
-            except Exception:
-                fleet_dead = False
-            # The standalone transport has a peer that can legitimately be
-            # gone; a blocking send would then park the single engine-IO
-            # thread (taking the liveness check and /health down with it).
-            if not fleet_dead and self.comm.send_ipc_package_nonblocking(
-                ipc_package
-            ):
-                return True
-            with self._pending_lock:
-                # Undo the bookkeeping and let the next tick retry.
-                for seq in wait_lists:
-                    self.running_maps.pop(seq.seq_id, None)
-                self.wait_lists = wait_lists + self.wait_lists
-                self.abort_ids = abort_ids + self.abort_ids
-            logger.warning(
-                "Worker transport not ready; requeued %d pending request(s) "
-                "for the next tick.",
-                len(wait_lists),
-            )
-            return False
+            # Dead-fleet protection + bounded non-blocking send live in the
+            # supervisor (FleetSupervisor.ship); refusal requeues for the
+            # next tick.
+            return self.fleet.ship(ipc_package, wait_lists)
         self.comm.send_ipc_package(ipc_package)
         return True
 
