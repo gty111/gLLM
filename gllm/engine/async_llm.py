@@ -97,11 +97,22 @@ class AsyncLLM(LLM):
 
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
+        # Thread-ownership: the standalone frontend's ZMQ sockets are CREATED
+        # by fleet.connect() and then used by the engine IO executor. zmq
+        # sockets must be created and used by the same owner thread, so run
+        # the connect on that same persistent executor (the ctor blocks until
+        # it is done; a standalone frontend always blocks on the endpoint
+        # file here, so this costs no extra wall time).
+        if self.standalone_frontend:
+            self._engine_io_executor.submit(self._fleet_connect_sync).result()
 
     def _init_frontend_comm(self):
         # LLM's synchronous constructor waits for this short task. The same
         # persistent executor later owns every frontend-side send and receive.
         self._engine_io_executor.submit(super()._init_frontend_comm).result()
+
+    def _fleet_connect_sync(self):
+        self.fleet.connect()
 
     async def _run_engine_io(self, func, *args, **kwargs):
         loop = asyncio.get_running_loop()
@@ -178,7 +189,12 @@ class AsyncLLM(LLM):
         if self.standalone_frontend:
             self.check_standalone_worker()
         else:
-            self.check_worker_alive()
+            # check_worker_alive() does sys.exit() on a dead worker; the
+            # probe path must RAISE (the /health handler maps exceptions to
+            # 503) instead of silently killing the frontend process.
+            for i in self.mp_alive:
+                if i == -1:
+                    raise RuntimeError("worker process died")
         return True
 
     async def check_abort_seqs(self):
@@ -220,6 +236,27 @@ class AsyncLLM(LLM):
                     "Engine IO tick failed; failing open in-flight streams "
                     "and retrying: %s", e, exc_info=True)
                 self._fail_open_streams(e)
+                # Classification drives WHICH recovery to run: a fleet-GONE
+                # error enters the in-process standby (reconnect), anything
+                # else just retries at 1 Hz. See _is_fleet_down_error.
+                if self.standalone_frontend and self._is_fleet_down_error(e):
+                    # Fleet fully DOWN (endpoint file gone/stale): enter
+                    # standby -- block on the engine IO thread until the
+                    # fleet republishes (or 600s), then rebuild the
+                    # transport IN-PROCESS. This is the path the uuid-
+                    # CHANGE case cannot take (heartbeat rebuilds inside
+                    # the same tick and never raises), so reconnect()'s
+                    # standby loop is a live branch, not dead code.
+                    # on_standalone_reconnect re-fails the (already
+                    # cleared) streams -- a cheap no-op. If the standby
+                    # times out, the re-raise lands back in this handler
+                    # on the next tick and the loop retries.
+                    try:
+                        await self._run_engine_io(
+                            self.fleet.reconnect, e)
+                    except Exception as re:
+                        logger.error(
+                            "Fleet standby timed out; retrying: %s", re)
                 await asyncio.sleep(1.0)
             await asyncio.sleep(0)
 
@@ -279,6 +316,21 @@ class AsyncLLM(LLM):
         # _rebuild re-mints too; the two are complementary (uuid change
         # vs fail-open-without-uuid-change).
         self.frontend_epoch = random_uuid()
+
+    def _is_fleet_down_error(self, e: Exception) -> bool:
+        """True iff *e* says the worker fleet is GONE (endpoint file
+        missing/stale) -- as opposed to a uuid-change transition (rebuilt
+        inside the tick, never raises here) or an unrelated engine-IO bug
+        (which must keep the 1 Hz retry WITHOUT entering standby).
+
+        String-based on purpose: both fleet-down messages come from
+        ``FleetSupervisor.heartbeat`` and are the ONLY place that emits
+        "Worker endpoint file ... appears to be down"; uuid-change
+        transitions return cleanly (no raise) and genuine IO bugs carry no
+        such phrase, so the match cannot mis-route. See the ``schedule()``
+        handler for the standby vs retry decision this feeds.
+        """
+        return "worker endpoint file" in str(e).lower()
 
     def start_schedule_engine(self):
         # launch schedule engine

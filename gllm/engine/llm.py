@@ -480,12 +480,27 @@ class LLM:
         # socket that no one feeds, so we must NOT run the engine schedule
         # loop here (doing so double-drains / starves the real transport).
         _ml_t0 = time.monotonic()
+        _fe_down_since = None
         while True:
             time.sleep(0.5)
             if not self._watch_worker_process():
                 raise RuntimeError(
                     "Standalone worker child process died; tearing down."
                 )
+            # Frontend-death backstop (keepalive covers the half-open TCP
+            # case in ~90s; a crashed frontend's RST shows up immediately):
+            # once the output leg is broken for a short grace, tear the
+            # fleet down so a restart is fast and clean instead of
+            # buffering into a dead PUSH forever.
+            if getattr(self.comm, "frontend_gone", lambda: False)():
+                _fe_down_since = _fe_down_since or time.monotonic()
+                if time.monotonic() - _fe_down_since > 5.0:
+                    raise RuntimeError(
+                        "Frontend transport leg is down (frontend died?); "
+                        "tearing down the worker fleet."
+                    )
+            else:
+                _fe_down_since = None
             if time.monotonic() - _ml_t0 >= 10.0:
                 logger.info("STANDALONE worker fleet healthy (child alive)")
                 _ml_t0 = time.monotonic()

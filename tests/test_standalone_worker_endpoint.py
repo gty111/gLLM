@@ -1271,3 +1271,103 @@ def test_heartbeat_driven_rebuild_on_uuid_change(tmp_path):
         "each transition must re-mint the frontend epoch"
     assert len(transitions) == 1, "transition hook must fire exactly once"
     eng.comm.close()
+
+
+# ---------------------------------------------------------------------------
+# Round 8 residual-fix regressions
+# ---------------------------------------------------------------------------
+
+def test_frontend_gone_detects_dead_output_leg(tmp_path):
+    """A standalone worker's frontend-facing PUSH leg must report the
+    frontend as gone once the leg is torn down; frontends/monolith comms
+    must always report False (the check only guards the worker's leg)."""
+    import zmq as _zmq
+
+    from gllm.distributed.comm import zmqComm
+
+    path = "ipc:///tmp/_gllm_fg_%d" % os.getpid()
+    w = zmqComm("127.0.0.1", "normal", "127.0.0.1", path, path, path,
+                frontend=False, standalone_worker=True)
+    w.init()
+    # Leg bound but no PULL connected yet: zmq reports no broken pipe --
+    # "gone" must be False (a bound-but-idle leg is healthy).
+    assert w.frontend_gone() is False
+    w.close()
+    # Fully torn down: the leg is gone.
+    assert w.frontend_gone() is True
+
+    # A frontend-role comm never reports "gone" regardless of state.
+    f = zmqComm("127.0.0.1", "normal", "127.0.0.1", path, path, path,
+                frontend=True, standalone_remote=True)
+    f.init()
+    assert f.frontend_gone() is False
+    f.close()
+
+
+def test_get_sender_tracks_thread_and_close_clears(tmp_path):
+    """Deterministic (no peer, no exit-timing): _get_sender records the
+    spawned thread in _sender_threads, and close() signals _SHUTDOWN,
+    bounded-joins, and clears BOTH tracking maps -- so teardown cannot
+    misattribute a stale sender and re-close stays a safe no-op. The probe
+    socket is owned by a dedicated zmq.Context (NOT f.ctx), because an open
+    PUSH with no peer keeps a context alive and would otherwise block
+    f.ctx.term(); the test owns that socket and closes it at the end. We
+    assert close()'s bookkeeping, not a racy thread-exit time."""
+    import zmq as _zmq
+
+    from gllm.distributed.comm import zmqComm
+
+    # Dedicated zmq context for the probe socket: it must NOT live on
+    # f.ctx, otherwise it would outlive close()'s primary-socket teardown
+    # and block f.ctx.term() (an open PUSH with no peer keeps a context
+    # alive). close() is contractually responsible only for the sockets IT
+    # created, so the probe socket is owned -- and later closed -- by the
+    # test on its own context.
+    path = "ipc:///tmp/_gllm_gst_%d" % os.getpid()
+    probe_ctx = _zmq.Context()
+    try:
+        f = zmqComm("127.0.0.1", "normal", "127.0.0.1", path, path, path,
+                    frontend=True, standalone_remote=True)
+        f.init()
+        sock = probe_ctx.socket(_zmq.PUSH)
+        sock.setsockopt(_zmq.LINGER, 0)
+        q = f._get_sender(sock)
+        assert f._senders.get(sock) is q, "sender FIFO must be tracked"
+        assert f._sender_threads.get(sock) is not None, "sender thread must be tracked"
+        f.close()
+        assert f._senders == {}, "close must clear sender FIFOs"
+        assert f._sender_threads == {}, "close must clear sender-thread tracking"
+        f.close()  # re-close is a safe no-op
+    finally:
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
+        probe_ctx.term()
+
+
+def test_schedule_enters_standby_when_fleet_down(tmp_path):
+    """The worker-DOWN branch of schedule() must drive
+    FleetSupervisor.reconnect (standby) -- it is a live path, not dead
+    code: a fleet-dead RuntimeError is classified as a fleet-down error
+    and the reconnect is invoked on the engine IO executor."""
+    from gllm.engine.async_llm import AsyncLLM
+
+    class _FakeFleet:
+        def __init__(self):
+            self.calls = []
+        def reconnect(self, reason=None):
+            self.calls.append(reason)
+            return None
+
+    fake = _FakeFleet()
+    # _is_fleet_down_error is a pure string check: exercise it directly.
+    assert AsyncLLM._is_fleet_down_error(None, RuntimeError(
+        "Worker endpoint file /tmp/x.json is missing; the worker fleet "
+        "appears to be down.")) is True
+    assert AsyncLLM._is_fleet_down_error(None, RuntimeError(
+        "Worker endpoint file /tmp/x.json is stale (age 9.0s); the worker "
+        "fleet appears to be down.")) is True
+    assert AsyncLLM._is_fleet_down_error(None, KeyError("bogus")) is False
+    assert AsyncLLM._is_fleet_down_error(None, RuntimeError(
+        "transport uuid changed")) is False

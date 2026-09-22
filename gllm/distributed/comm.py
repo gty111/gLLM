@@ -284,6 +284,7 @@ class zmqComm:
         dp_rank=0,
         dp_size=1,
         standalone_remote=False,
+        standalone_worker=False,
     ):
         self.host_addr = host_addr
         self.master_addr = master_addr
@@ -308,6 +309,7 @@ class zmqComm:
         # set by the frontend so it knows the schedule path is remote and
         # must not be treated as a local ipc path it binds.
         self.standalone_remote = standalone_remote
+        self.standalone_worker = standalone_worker
         # Worker-side output hook installed by the Worker (None on
         # frontends): translates internal seq ids back to the dispatching
         # frontend's client ids and attaches the per-row session stamps
@@ -328,6 +330,7 @@ class zmqComm:
         # Persistent zmq-sender threads keyed by socket. See ``_get_sender``
         # for why we avoid the prior fresh-thread-per-send pattern.
         self._senders: Dict["zmq.Socket", "queue.SimpleQueue"] = {}
+        self._sender_threads: Dict["zmq.Socket", "threading.Thread"] = {}
 
         if self.frontend and self.standalone_remote:
             # Decoupled deployment: the standalone worker fleet already bound
@@ -611,6 +614,28 @@ class zmqComm:
         else:
             return None
 
+    def frontend_gone(self) -> bool:
+        """True iff the FRONTEND side of this transport has gone away.
+
+        The worker's output leg is a PUSH into the frontend's PULL. A
+        CRASHED frontend destroys its PULL, so the kernel tears the PUSH
+        leg down and the socket starts failing immediately; a CLEAN
+        frontend death (SIGKILL) leaves the leg half-open until keepalive
+        (see :func:`_apply_tcp_keepalive`) tears it down in ~90s. Either
+        way the leg's send fileno eventually drops below 0, which this
+        detects. Only meaningful for a standalone *worker* comm (its output
+        socket is the frontend-facing PUSH); False everywhere else.
+        """
+        if not getattr(self, "standalone_worker", False):
+            return False  # frontends / monolith: no frontend-facing PUSH leg
+        sock = getattr(self, "output_socket", None)
+        if sock is None:
+            return True  # torn down entirely
+        try:
+            return sock.getsockopt(zmq.SNDFILENO) < 0
+        except Exception:
+            return False
+
     def close(self):
         """Tear down every sender thread and socket, then terminate the ctx.
 
@@ -625,7 +650,24 @@ class zmqComm:
                 q.put(_SHUTDOWN)
             except Exception:
                 pass
+        # Join the sender threads before the primary sockets close. A
+        # sender parked on a LIVE peer drains on _SHUTDOWN and exits
+        # quickly (bounded join); a sender parked in send_pyobj on a DEAD
+        # peer is unstuck only by the socket close below, so this first
+        # pass yields fast (<=~1.0s) and a second short pass reaps it
+        # after the sockets go. Bounding the first join avoids paying
+        # 2x the full timeout for a single dead-peer sender. Sender
+        # threads are daemon, so none can strand the process; this just
+        # ensures a live sender never outlives the ctx.term() it would
+        # block on.
+        sender_threads = getattr(self, "_sender_threads", {})
+        for sock, t in list(sender_threads.items()):
+            try:
+                t.join(timeout=0.5)
+            except Exception:
+                pass
         self._senders.clear()
+        self._sender_threads.clear()
         for attr in ("request_socket", "output_socket", "token_socket"):
             sock = getattr(self, attr, None)
             if sock is not None:
@@ -645,6 +687,15 @@ class zmqComm:
                 pass
         if hasattr(self, "request_sockets"):
             self.request_sockets = []
+        # Second (short) rejoin: the socket closes above unstick any sender
+        # still parked in send_pyobj; reap it before ctx.term() so it cannot
+        # hold a socket the term would block on.
+        for sock, t in list(sender_threads.items()):
+            if t.is_alive():
+                try:
+                    t.join(timeout=1.0)
+                except Exception:
+                    pass
         ctx = getattr(self, "ctx", None)
         if ctx is not None:
             try:
@@ -692,6 +743,7 @@ class zmqComm:
         t = threading.Thread(target=_run, daemon=True, name="zmq-sender")
         t.start()
         self._senders[socket] = q
+        self._sender_threads[socket] = t
         return q
 
     def send_schedule_payload(
