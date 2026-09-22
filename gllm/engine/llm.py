@@ -347,24 +347,30 @@ class LLM:
                 "standalone_worker=True requires worker_endpoint_file"
             )
         base_port = getattr(self, "worker_transport_base_port", None)
-        bind_host = self.host or "0.0.0.0"
-        # The worker LISTENS on the bind host (0.0.0.0 = all
-        # interfaces), but a remote frontend cannot dial 0.0.0.0/::;
-        # the published rows must carry a routable address.
-        # --worker-transport-advertise-host (or --master-addr set to a real IP) supplies it.
-        advertise_host = getattr(self, "worker_transport_advertise_host", None) or bind_host
-        if advertise_host in ("0.0.0.0", "::"):
-            raise ValueError(
-                "standalone worker TCP transport would publish a "
-                "wildcard address (remote frontends cannot dial it). "
-                "Pass --worker-transport-advertise-host (e.g. the fleet IP) or "
-                "point --master-addr at a routable interface."
-            )
         self._worker_writer = WorkerEndpointWriter(self.worker_endpoint_file)
         if base_port:
             # tcp:// transports at fixed offsets: schedule=output base,
             # output=+1, token=+2 (per rank 0; other ranks' paths are
             # informational for now).
+            bind_host = self.host or "0.0.0.0"
+            # The worker LISTENS on the bind host (0.0.0.0 = all
+            # interfaces), but a remote frontend cannot dial 0.0.0.0/::;
+            # the published rows must carry a routable address.
+            # --worker-transport-advertise-host (or --master-addr set to
+            # a real IP) supplies it. The check lives in this branch only:
+            # a pure-local ipc:// worker never publishes a dialable
+            # address, so a wildcard bind host is fine there.
+            advertise_host = (
+                getattr(self, "worker_transport_advertise_host", None) or bind_host
+            )
+            if advertise_host in ("0.0.0.0", "::"):
+                raise ValueError(
+                    "standalone worker TCP transport would publish a "
+                    "wildcard address (remote frontends cannot dial it). "
+                    "Pass --worker-transport-advertise-host (e.g. the "
+                    "fleet IP) or point --master-addr at a routable "
+                    "interface."
+                )
             p = int(base_port)
             schedule = f"tcp://{advertise_host}:{p}"
             output = f"tcp://{advertise_host}:{p + 1}"
@@ -372,6 +378,30 @@ class LLM:
         else:
             schedule, output, token = self.schedule_path, self.output_path, self.token_path
         self._worker_writer.set_endpoints({0: {"schedule": schedule, "output": output, "token": token}})
+
+
+    def check_tcp_advertise_host(self) -> None:
+        """Early (pre-weight-load) validation of the TCP advertise host.
+
+        The same rule :meth:`_publish_worker_endpoint` enforces at
+        publish time, checked HERE so a misconfigured cross-machine
+        fleet fails in milliseconds instead of after loading weights
+        (``_publish_worker_endpoint`` runs after ``wait_workers``).
+        No-op for the local ipc:// transport (no base port).
+        """
+        if not getattr(self, "worker_transport_base_port", None):
+            return
+        bind_host = self.host or "0.0.0.0"
+        advertise_host = (
+            getattr(self, "worker_transport_advertise_host", None) or bind_host
+        )
+        if advertise_host in ("0.0.0.0", "::"):
+            raise ValueError(
+                "standalone worker TCP transport would publish a wildcard "
+                "address (remote frontends cannot dial it). Pass "
+                "--worker-transport-advertise-host (e.g. the fleet IP) "
+                "or point --master-addr at a routable interface."
+            )
 
     def _init_frontend_comm(self):
         """Create the frontend ZeroMQ sockets on their owning thread."""

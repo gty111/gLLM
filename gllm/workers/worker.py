@@ -1070,8 +1070,14 @@ class Worker(FrontendMixin, TorchProfilerMixin):
         os._exit(1)
 
 
-def _watch_parent_death() -> None:
+def _parent_watchdog_loop() -> None:
     """Exit this worker child if the fleet parent dies (SIGKILL backstop).
+
+    Runs on its OWN daemon thread (see :func:`start_parent_watchdog`):
+    a synchronous infinite loop would block ``worker.init()`` forever
+    (the child parks before the first CUDA call and the parent's
+    ``wait_workers`` never returns -- this broke every launch, monolith
+    included).
 
     ``daemon=True`` only reaps children on a CLEAN parent exit. If the
     parent is SIGKILLed, the child is orphaned yet keeps holding GPU
@@ -1080,7 +1086,6 @@ def _watch_parent_death() -> None:
     across spawn; PDEATHSIG is fork-only) catches the orphan within one
     interval and lets the restart recover the fleet.
     """
-    import os
     import time
 
     pid = os.getpid()
@@ -1096,8 +1101,25 @@ def _watch_parent_death() -> None:
             os._exit(1)
 
 
+def start_parent_watchdog() -> None:
+    """Arm the parent-death watchdog (idempotent per process).
+
+    Call at the TOP of the spawned-child entry point (``run_worker`` /
+    ``run_overlap_worker``), before ``worker.init()``: the thread starts
+    polling immediately and never blocks the child's main work.
+    """
+    import threading
+
+    t = threading.Thread(
+        target=_parent_watchdog_loop,
+        name="gllm-parent-watchdog",
+        daemon=True,
+    )
+    t.start()
+
+
 def run_worker(worker: Worker):
-    _watch_parent_death()
+    start_parent_watchdog()
     try:
         worker.init()
         while True:

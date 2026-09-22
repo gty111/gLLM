@@ -55,7 +55,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main():
     from logger import logger
 
-    from gllm.engine.llm import LLM
     from gllm.entrypoints import cli_args as ca
     from gllm.runtime.model_loader import quiet_hub_logging
 
@@ -82,6 +81,16 @@ def main():
             args.tp,
         )
 
+    # Fail fast BEFORE the LLM ctor (which spawns the fleet and loads
+    # weights): a TCP transport that would publish an undialable
+    # wildcard must not cost a full model load to discover.
+    from gllm.engine.llm import LLM
+    preflight = LLM.__new__(LLM)
+    preflight.host = args.master_addr if args.master_addr else "0.0.0.0"
+    preflight.worker_transport_base_port = args.worker_transport_base_port
+    preflight.worker_transport_advertise_host = args.worker_transport_advertise_host
+    preflight.check_tcp_advertise_host()
+
     kwargs = ca.engine_kwargs(args)
     kwargs.update(
         host=args.master_addr if args.master_addr else "0.0.0.0",
@@ -93,11 +102,10 @@ def main():
         assigned_layers=None,
         standalone_worker=True,
         standalone_frontend=False,
-        # Advertised tcp host is a transport concern, not in engine_kwargs.
-        worker_transport_advertise_host=worker_transport_advertise_host,
     )
 
     quiet_hub_logging()
+
     engine = LLM(**kwargs)
 
     logger.info(

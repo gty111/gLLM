@@ -181,8 +181,19 @@ worker_unavailable` when it is down.
   comm on the same endpoints: a `PUSH→PULL` leg load-balances across all PULLs,
   so a stray parent PULL on the output leg would silently swallow half the
   worker's output frames.
-* `mp.set_warmup_delay(...)` is set on the spawn context so each GPU child
-  re-reads its own `CUDA_VISIBLE_DEVICES` before any CUDA call — otherwise a
-  parent that probed `torch.cuda` (seeing all GPUs) initialises the primary
-  context on GPU 0 and the child inherits it, allocating on the wrong (often
-  busy) GPU.
+* Spawning uses the `spawn` start method (fresh interpreter per GPU
+  child): no inherited CUDA context, and each child re-reads its own
+  `CUDA_VISIBLE_DEVICES` before any CUDA call. (An older revision set
+  `mp.set_warmup_delay` on the context to defer CUDA init in children;
+  that knob is gone — spawn already gives the fresh-interpreter
+  guarantee, and a silent `set_warmup_delay` no-op would have masked it.)
+* Cross-machine (`tcp://`) deployment requirements: the endpoint file
+  must be readable/writable by BOTH processes (shared filesystem: NFS /
+  a local mount the frontend can reach), since it is the rendezvous;
+  clocks on the two hosts must be roughly synchronized (NTP), because
+  liveness uses the file's `updated_at` staleness window as a
+  SIGKILL/power-loss backstop (the primary restart signal is the
+  transport uuid change, which is clock-independent); and the fixed
+  transport ports (base, base+1, base+2) must be reachable through any
+  intervening firewall from the frontend host to the worker's
+  advertise host.

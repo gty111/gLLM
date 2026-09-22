@@ -122,6 +122,9 @@ class FleetSupervisor:
                 pass
             llm.comm = None
         # One transport path per rank; rank 0 carries schedule/output/token.
+        # (The rank-0 presence check already ran in _rebuild/connect
+        # BEFORE any teardown; this is defense-in-depth for direct
+        # callers.)
         if 0 not in endpoints:
             raise ValueError(
                 f"Malformed endpoint file: no rank-0 row in {sorted(endpoints)!r}; "
@@ -291,12 +294,20 @@ class FleetSupervisor:
         component exists for). Endpoint rows are validated up front:
         a partial/corrupt file is rejected without touching state.
         """
+        # All validation BEFORE the old comm is torn down (inside
+        # _build_comm): a malformed file must not destroy a working
+        # transport, even temporarily.
         for rank, ep in (endpoints or {}).items():
             if not all(k in ep for k in ('schedule', 'output', 'token')):
                 raise ValueError(
                     f"Malformed endpoint file: rank {rank} row lacks "
                     f"schedule/output/token keys: {ep!r}"
                 )
+        if 0 not in (endpoints or {}):
+            raise ValueError(
+                f"Malformed endpoint file: no rank-0 row in {sorted(endpoints or {})!r}; "
+                "the standalone transport connects rank 0 only."
+            )
         # Build FIRST, commit AFTER: the host keeps its old comm until
         # the new one is ready (zmqComm.init raised -> old one intact).
         self._build_comm(endpoints)

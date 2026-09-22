@@ -374,8 +374,11 @@ def test_tcp_pull_bind_roundtrip():
 
     from gllm.utils import make_pull_bind, make_socket
 
-    path = "tcp://127.0.0.1:0"  # can't use :0 for a fixed bind; use real port
-    port = 59991
+    import socket as _socket
+    s = _socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
     path = "tcp://127.0.0.1:%d" % port
     ctx = _zmq.Context()
     pull = make_pull_bind(ctx, path)

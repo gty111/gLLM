@@ -7,6 +7,7 @@ from fastapi import Request
 from logger import logger
 
 from gllm.engine.llm import LLM
+from gllm.utils import random_uuid
 
 
 class AsyncStream:
@@ -270,6 +271,14 @@ class AsyncLLM(LLM):
         with self._pending_lock:
             self.wait_lists = []
             self.abort_ids = []
+        # Re-mint the session epoch: ids recycled after a false trip
+        # (same uuid -- e.g. a SIGSTOP'd fleet whose heartbeat stalled,
+        # or a non-uuid rebuild path) must not let the old fleet's LATE
+        # rows (still carrying the previous epoch's stamps) pass the
+        # stamp gate of the successor requests that reuse those ids.
+        # _rebuild re-mints too; the two are complementary (uuid change
+        # vs fail-open-without-uuid-change).
+        self.frontend_epoch = random_uuid()
 
     def start_schedule_engine(self):
         # launch schedule engine
