@@ -121,7 +121,16 @@ python -m gllm.entrypoints.worker_server \
     --master-addr 127.0.0.1 --master-port 29611 \
     --tp 1 --gpu-memory-util 0.9 \
     [--worker-transport-base-port 50001]   # cross-machine frontends
+    [--worker-transport-advertise-host FLEET_IP]   # see below
 ```
+
+> **Cross-machine tip:** with `--worker-transport-base-port`, the worker
+> *listens* on the bind host (`--master-addr`, `0.0.0.0` = all
+> interfaces) but the endpoint file must carry a *routable* address —
+> frontends on other hosts cannot dial `0.0.0.0`. If
+> `--master-addr` is already a real IP it is reused; otherwise pass
+> `--worker-transport-advertise-host FLEET_IP`. Publishing a wildcard
+> is refused at startup.
 
 ### 2) Launch the stateless frontend (no GPU)
 
@@ -146,10 +155,12 @@ worker_unavailable` when it is down.
 * Single-rank worker fleets are fully supported (`--tp 1`), including the
   cross-machine `tcp://` transport (`--worker-transport-base-port`): the
   worker child binds the exact fixed addresses published in the endpoint
-  file (schedule=base, output=base+1, token=base+2). Multi-rank fleets
-  (TP>1 / PP>1) publish one transport row per rank but the standalone
-  frontend currently connects rank 0's transport; wire the extra ranks up
-  as needed.
+  file (schedule=base, output=base+1, token=base+2), and the published
+  rows use `--worker-transport-advertise-host` (falling back to
+  `--master-addr`) so remote frontends get a dialable address. The
+  published file carries a single rank-0 transport row; multi-rank
+  fleets (TP>1 / PP>1) coordinate internally behind that one leg and
+  are not independently addressable by the frontend yet.
 * Encoder-disaggregation (`lm_server`) and DP-attention per-replica endpoints
   are orthogonal and not combined with standalone mode yet.
 * On a worker *restart* the KV cache is lost (expected — it lived in the dead

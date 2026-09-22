@@ -11,8 +11,11 @@ the thin one-liner touchpoints:
 * LIVENESS -- endpoint-file probes for the dispatch path and the
   heartbeat check (:meth:`lively`, :meth:`heartbeat`);
 * RECONNECT -- detect a worker-fleet restart (new transport uuid) and
-  re-build the transport IN-PROCESS, no frontend process restart
-  (:meth:`reconnect`);
+  re-build the transport IN-PROCESS, no frontend process restart. The
+  heartbeat path does this via :meth:`_rebuild` (reactive, fleet already
+  republished); :meth:`reconnect` is the standby variant that blocks
+  waiting for the new incarnation (fleet fully down, e.g. after a
+  worker-down error surfaced to the schedule loop).
 * DISPATCH GATE -- refuse to ship work into a dead fleet's 512MB send
   buffer, requeueing it for the next tick
   (:meth:`ship`, :meth:`stamp_abort_sessions`).
@@ -31,6 +34,7 @@ import time
 from logger import logger
 
 from gllm.distributed.comm import zmqComm
+from gllm.utils import random_uuid
 
 _GRACE_SECONDS = 3  # tolerate atomic rename / one slow heartbeat
 _CONNECT_TIMEOUT = 300  # initial wait for the endpoint file to appear
@@ -118,6 +122,11 @@ class FleetSupervisor:
                 pass
             llm.comm = None
         # One transport path per rank; rank 0 carries schedule/output/token.
+        if 0 not in endpoints:
+            raise ValueError(
+                f"Malformed endpoint file: no rank-0 row in {sorted(endpoints)!r}; "
+                "the standalone transport connects rank 0 only."
+            )
         ep = endpoints[0]
         llm.comm = zmqComm(
             llm.host,
@@ -271,10 +280,28 @@ class FleetSupervisor:
         endpoints: dict,
         terminate_reason: Exception = None,
     ) -> None:
-        """Swap to a new transport incarnation and run the transition."""
+        """Swap to a new transport incarnation and run the transition.
+
+        ORDER MATTERS (atomicity): the NEW comm is built and fully
+        initialised BEFORE the uuid is committed. If zmqComm.init()
+        fails, the old transport is still in place AND the recorded
+        uuid still differs from the file, so heartbeat() retries the
+        rebuild on the next tick -- a build failure must never wedge
+        the frontend (that would defeat the in-process recovery this
+        component exists for). Endpoint rows are validated up front:
+        a partial/corrupt file is rejected without touching state.
+        """
+        for rank, ep in (endpoints or {}).items():
+            if not all(k in ep for k in ('schedule', 'output', 'token')):
+                raise ValueError(
+                    f"Malformed endpoint file: rank {rank} row lacks "
+                    f"schedule/output/token keys: {ep!r}"
+                )
+        # Build FIRST, commit AFTER: the host keeps its old comm until
+        # the new one is ready (zmqComm.init raised -> old one intact).
+        self._build_comm(endpoints)
         self._worker_transport_uuid = transport_uuid
         self._worker_endpoints = endpoints
-        self._build_comm(endpoints)
         # The restarted fleet has no memory of these sequences: drop the
         # frontend-side bookkeeping.
         llm = self.llm
@@ -282,6 +309,11 @@ class FleetSupervisor:
             llm.wait_lists = []
             llm.abort_ids = []
         llm.running_maps.clear()
+        # Fresh epoch for the new incarnation: a false-trip fail-open
+        # (e.g. a stopped heartbeat) can recycle ids under the SAME
+        # epoch, and the fleet's late rows for those recycled ids must
+        # never pass the stamp gate of the successor requests.
+        llm.frontend_epoch = random_uuid()
         # Explicit stream termination + id release for this transition
         # (LLM base is a no-op; AsyncLLM fails open every stream).
         llm.on_standalone_reconnect(
@@ -298,17 +330,27 @@ class FleetSupervisor:
         the given CLIENT ids: each abort names the session that owns it,
         so a surviving fleet resolves it to the right (possibly
         other-session) request instead of whatever shares the bare id.
+
+        UNRESOLVABLE aborts (no live seq holds the id anymore) are DROPPED
+        rather than stamped with the current epoch: the request already
+        finished, and a stale abort carrying our LIVE epoch could be
+        matched by the fleet against an INNOCENT new request that happens
+        to reuse the id under this epoch. The worker side already ignores
+        stamped aborts that match no live seq, so dropping is lossless.
         """
         llm = self.llm
-        ipc_package.abort_sessions = [
-            getattr(
-                llm.running_maps.get(a)
-                or next((s for s in wait_lists if s.seq_id == a), None),
-                "frontend_session",
-                llm.frontend_epoch,
-            )
-            for a in abort_ids
-        ]
+        stamped_ids, stamped_sessions = [], []
+        for a in abort_ids:
+            live = llm.running_maps.get(a)
+            if live is None:
+                live = next((s for s in wait_lists if s.seq_id == a), None)
+            session = getattr(live, "frontend_session", None)
+            if session is None:
+                continue  # unresolvable: drop, see above
+            stamped_ids.append(a)
+            stamped_sessions.append(session)
+        ipc_package.abort_ids = stamped_ids
+        ipc_package.abort_sessions = stamped_sessions
 
     def ship(self, ipc_package, wait_lists) -> bool:
         """Send *ipc_package* to the fleet with dead-fleet protection.

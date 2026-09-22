@@ -203,16 +203,16 @@ def test_stampless_rows_rejected_when_legacy_not_ok():
 
 
 def test_standalone_apply_drops_stampless_package_whole():
-    # End-to-end through the real LLM._apply_ipc_package row gates: a
-    # standalone frontend applying a completely unstamped package must
-    # drop EVERY row (token AND free) instead of finishing request 0.
+    # End-to-end through the REAL LLM.recv_ipc_package/_apply_ipc_package
+    # row gates: a standalone frontend applying a completely unstamped
+    # package must drop EVERY row (token AND free) instead of finishing
+    # request 0.
     from tests.test_standalone_worker_endpoint import _bare_llm
     from gllm.runtime.sequence import GenerationSequence
 
     eng = _bare_llm()
     seq = GenerationSequence(seq_id=0, token_ids=[1], finish_tokens=None, output_len=8)
     eng.running_maps[0] = seq
-    eng.async_streams = {}  # bare engine: no streams
 
     pkg = IPCPackage([])
     pkg.act_schedule_ids = [0]
@@ -221,14 +221,13 @@ def test_standalone_apply_drops_stampless_package_whole():
     pkg.sessions = None      # stamp-less (the reported exploit shape)
     pkg.free_sessions = None
 
-    # The exact gating expression LLM._apply_ipc_package uses.
-    stamps_ok = pkg.output_stamps_valid()
-    applied = [i for i in range(len(pkg.act_schedule_ids))
-               if pkg.act_session_at(i, eng.frontend_epoch, stamps_ok,
-                                     legacy_ok=False)]
-    freed = [i for i in range(len(pkg.free_ids))
-             if pkg.free_session_at(i, eng.frontend_epoch, stamps_ok,
-                                    legacy_ok=False)]
-    assert applied == [], "stamp-less act row must not be applied"
-    assert freed == [], "stamp-less free row must not retire the request"
+    # Feed the package through the real receive path (comm stubbed so
+    # recv_output delivers exactly this package, then drains to None).
+    from types import SimpleNamespace
+    delivered = [pkg, None]
+    eng.comm = SimpleNamespace(recv_output=lambda: delivered.pop(0))
+    num_finish = eng.recv_ipc_package()
+
+    assert num_finish == 0, "stamp-less packet must not finish anything"
+    assert seq.token_ids == [1], "token must not be appended"
     assert 0 in eng.running_maps, "request 0 must survive a stamp-less packet"

@@ -20,6 +20,9 @@ is a no-op on the monolith path: the guard
 :meth:`_standalone_remap_enabled` keys off the deployment mode, and
 each method early-returns when the worker does not sit behind a
 standalone frontend."""
+from gllm.runtime.id_allocator import INTERNAL_ID_START
+
+
 class FrontendMixin:
     """Translate between frontend client ids and fleet-internal ids.
 
@@ -71,7 +74,7 @@ class FrontendMixin:
             return
         counter = getattr(self, "_next_internal_seq", None)
         if counter is None:
-            counter = self._next_internal_seq = 100000
+            counter = self._next_internal_seq = INTERNAL_ID_START
         # Register the identity AT ADMISSION: the scheduler may free a seq
         # (first token == EOS / max_tokens=1) before it ever produces a
         # non-terminal output row, so identity recorded only at translate

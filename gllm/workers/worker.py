@@ -1070,7 +1070,34 @@ class Worker(FrontendMixin, TorchProfilerMixin):
         os._exit(1)
 
 
+def _watch_parent_death() -> None:
+    """Exit this worker child if the fleet parent dies (SIGKILL backstop).
+
+    ``daemon=True`` only reaps children on a CLEAN parent exit. If the
+    parent is SIGKILLed, the child is orphaned yet keeps holding GPU
+    memory and -- in TCP mode -- the fixed transport base ports, so a
+    replacement fleet can neither bind nor allocate. A ppid poll (safe
+    across spawn; PDEATHSIG is fork-only) catches the orphan within one
+    interval and lets the restart recover the fleet.
+    """
+    import os
+    import time
+
+    pid = os.getpid()
+    parent = os.getppid()
+    while True:
+        time.sleep(2.0)
+        if os.getppid() != parent:
+            logger.error(
+                "Worker child %d: parent %d is gone; exiting to release "
+                "GPU/ports for the replacement fleet.",
+                pid, parent,
+            )
+            os._exit(1)
+
+
 def run_worker(worker: Worker):
+    _watch_parent_death()
     try:
         worker.init()
         while True:

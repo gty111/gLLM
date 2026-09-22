@@ -171,8 +171,25 @@ class WorkerEndpointWriter:
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=1.0)
         try:
-            if os.path.exists(self.path):
-                os.unlink(self.path)
+            # ABA guard: only unlink a file that still carries OUR transport
+            # uuid. Between teardown and this call a SUCCESSOR fleet may have
+            # already published the same path, and removing that fresh file
+            # would blind every frontend to a live worker.
+            try:
+                with open(self.path, "r") as f:
+                    on_disk = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                on_disk = None
+            if on_disk is None:
+                return  # gone (or unreadable) -- nothing to do
+            if on_disk.get("uuid") != self.transport_uuid:
+                logger.warning(
+                    "Not removing worker endpoint file %s: it now belongs to "
+                    "transport %s (this writer owned %s).",
+                    self.path, on_disk.get("uuid"), self.transport_uuid,
+                )
+                return
+            os.unlink(self.path)
             logger.info("Removed worker endpoint file %s", self.path)
         except OSError as e:
             logger.warning("Could not remove worker endpoint file %s: %s", self.path, e)

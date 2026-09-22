@@ -26,6 +26,27 @@ from gllm.utils import make_pull_bind, make_pull_random, make_socket
 
 _SHUTDOWN = object()  # sentinel pushed onto a sender queue to drain it
 
+# TCP keepalive for decoupled (tcp://) transports: a half-open connection
+# (machine/network partition -- no FIN, hours-long default TCP timeout)
+# otherwise keeps stealing a share of the worker's load-balanced output
+# PUSH into dead kernel buffers, and the replacement frontend's requests
+# hang with no error. With keepalive the kernel tears the leg down
+# (~idle + retries) so the partition is detected in minutes, not hours.
+_TCP_KEEPALIVE_IDLE = 60   # seconds of idle before probing
+_TCP_KEEPALIVE_INTERVAL = 10
+_TCP_KEEPALIVE_COUNT = 3
+
+
+def _apply_tcp_keepalive(socket) -> None:
+    """Enable kernel TCP keepalive on a tcp:// socket (no-op for ipc://)."""
+    try:
+        socket.setsockopt(zmq.TCP_KEEPALIVE, 1)
+        socket.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _TCP_KEEPALIVE_IDLE)
+        socket.setsockopt(zmq.TCP_KEEPALIVE_INTERVAL, _TCP_KEEPALIVE_INTERVAL)
+        socket.setsockopt(zmq.TCP_KEEPALIVE_CNT, _TCP_KEEPALIVE_COUNT)
+    except (zmq.ZMQError, AttributeError):
+        pass  # non-tcp transport or libzmq without the options
+
 
 class IPCPackage:
     """One tick of frontend<->worker traffic, in a single pickle.
@@ -330,6 +351,7 @@ class zmqComm:
                 self.output_socket.setsockopt(
                     zmq.RCVBUF, int(0.5 * 1024**3)
                 )
+                _apply_tcp_keepalive(self.output_socket)
             else:
                 self.output_socket = make_socket(self.ctx, self.output_path, zmq.PULL)
             self.token_socket = None
@@ -413,6 +435,7 @@ class zmqComm:
                 push.bind(self.output_path)
                 push.setsockopt(zmq.SNDHWM, 0)
                 push.setsockopt(zmq.SNDBUF, int(0.5 * 1024**3))
+                _apply_tcp_keepalive(push)
                 self.output_socket = push
             else:
                 self.output_socket = make_socket(self.ctx, self.output_path, zmq.PUSH)
@@ -917,7 +940,11 @@ class zmqComm:
         old socket's buffers may hold payloads addressed to a fleet that is
         gone, and a brand-new socket on the same endpoint must start clean.
         ZeroMQ buffers are per-socket, so this is belt-and-braces for the
-        local case where an OS-level endpoint could replay them.
+        local case where an OS-level endpoint could replay them. Note the
+        request leg is a PUSH: PUSH sockets cannot recv (it would raise
+        EFSM / ZMQERRNO), so in practice the loop exits on the first
+        iteration and this is a defensive no-op kept for future socket-type
+        changes.
         """
         sock = getattr(self, "request_socket", None)
         if sock is None:

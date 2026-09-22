@@ -211,6 +211,13 @@ class AsyncLLM(LLM):
                 # :meth:`on_standalone_reconnect` instead. A monolith engine
                 # never raises here in practice (check_worker_alive does
                 # sys.exit), so this is a no-op on the legacy path.
+                # Log UNCONDITIONALLY: a persistent non-fleet exception
+                # (pickle failure, KeyError in _apply_ipc_package, ...)
+                # would otherwise retry silently at 1 Hz forever -- the
+                # service looks alive but never processes another token.
+                logger.error(
+                    "Engine IO tick failed; failing open in-flight streams "
+                    "and retrying: %s", e, exc_info=True)
                 self._fail_open_streams(e)
                 await asyncio.sleep(1.0)
             await asyncio.sleep(0)

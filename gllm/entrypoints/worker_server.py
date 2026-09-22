@@ -93,6 +93,8 @@ def main():
         assigned_layers=None,
         standalone_worker=True,
         standalone_frontend=False,
+        # Advertised tcp host is a transport concern, not in engine_kwargs.
+        worker_transport_advertise_host=worker_transport_advertise_host,
     )
 
     quiet_hub_logging()

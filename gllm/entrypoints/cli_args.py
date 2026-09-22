@@ -337,6 +337,21 @@ def add_decoupled_args(p: argparse.ArgumentParser) -> None:
         ),
     )
 
+    p.add_argument(
+        "--worker-transport-advertise-host",
+        dest="worker_transport_advertise_host",
+        type=str,
+        default=None,
+        help=(
+            "Standalone worker only: hostname/IP to put in the tcp:// "
+            "endpoints PUBLISHED to the rendezvous file. Defaults to the "
+            "bind host (--master-addr; 0.0.0.0 means the wildcard, which "
+            "the worker uses to listen on all interfaces). Remote "
+            "frontends need a routable address, so pass e.g. the fleet "
+            "IP here (or point --master-addr at it)."
+        ),
+    )
+
 
 def add_engine_args(p: argparse.ArgumentParser, *, tp_help: str = None) -> None:
     """Every engine-facing argument both entrypoints share."""
@@ -396,5 +411,8 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
         "worker_endpoint_file": getattr(args, "worker_endpoint_file", None),
         "worker_transport_base_port": getattr(
             args, "worker_transport_base_port", None
+        ),
+        "worker_transport_advertise_host": getattr(
+            args, "worker_transport_advertise_host", None
         ),
     }

@@ -11,7 +11,11 @@ from logger import logger
 from gllm.distributed.comm import IPCPackage, zmqComm
 from gllm.engine.fleet_supervisor import FleetSupervisor
 from gllm.tokenizers.reasoning import decode_stream_delta, reasoning_control_tokens
-from gllm.runtime.id_allocator import IDAllocator
+from gllm.runtime.id_allocator import (
+    CLIENT_ID_END,
+    CLIENT_ID_START,
+    IDAllocator,
+)
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
 from gllm.runtime.sequence import GenerationSequence, resolve_output_len
 from gllm.utils import (
@@ -80,6 +84,7 @@ class LLM:
         mtp_max_batch=0,
         ssm_snapshot_stride_tokens=256,
         worker_transport_base_port=None,
+        worker_transport_advertise_host=None,
         # --- Frontend/worker decoupling (see docs/frontend_worker_decoupling.md) ---
         # ``standalone_frontend=True``: this process is a pure frontend -- it
         # does NOT spawn worker processes and does NOT initialize a GPU. It
@@ -95,8 +100,21 @@ class LLM:
         self.standalone_frontend = bool(standalone_frontend)
         self.standalone_worker = bool(standalone_worker)
         self.worker_endpoint_file = worker_endpoint_file
+        if standalone_frontend and dp_size > 1:
+            # The standalone transport is a SINGLE frontend<->rank-0
+            # leg (FleetSupervisor builds one comm from endpoints[0]);
+            # the DP dispatch branch (send_ipc_package_to_dp / per-rank
+            # request sockets) has no counterpart on that transport, so
+            # the combination would AttributeError every tick. Fail at
+            # construction instead (docs: single-rank fleets only).
+            raise ValueError(
+                "standalone_frontend=True is not supported with "
+                f"dp_size={dp_size} (>1); the decoupled transport is "
+                "single-rank. Launch the fleet with --dp-size 1."
+            )
         self._worker_writer = None  # WorkerEndpointWriter (standalone worker)
         self.worker_transport_base_port = worker_transport_base_port
+        self.worker_transport_advertise_host = worker_transport_advertise_host
         # Frontend session epoch (echoed per output row via
         # IPCPackage.sessions / free_sessions, see
         # Worker.translate_output_for_frontend). Every (re)started frontend
@@ -136,6 +154,8 @@ class LLM:
                 model_path=model_path,
                 schedule_method=schedule_method,
                 model_max_length=model_max_length,
+                mm_processor_min_pixels=mm_processor_min_pixels,
+                mm_processor_max_pixels=mm_processor_max_pixels,
             )
         else:
             self.model_runner = model_runner_cls(
@@ -197,7 +217,7 @@ class LLM:
         self.master_port = master_port
         self.launch_mode = launch_mode
         self.worker_ranks = worker_ranks
-        self.id_allocator = IDAllocator(0, 99999)
+        self.id_allocator = IDAllocator(CLIENT_ID_START, CLIENT_ID_END)
         self.finish_tokens = (
             self.model_runner.model_loader.generation_config.eos_token_id
         )
@@ -280,18 +300,10 @@ class LLM:
         self.num_workers = len(self.act_worker_ranks)
 
         self.ctx = mp.get_context("spawn")
-        # Delay CUDA init in spawned children until the pickled target runs.
-        # Without this, a parent that touched ``torch.cuda`` (e.g. device-count
-        # probes at import) initialises the CUDA primary context on the *first
-        # visible* device, and the child inherits that context even when it
-        # sets its own ``CUDA_VISIBLE_DEVICES`` -- so a GPU-pinned worker would
-        # actually allocate on the wrong (often busy) GPU. The warmup delay
-        # makes each child re-read its own ``CUDA_VISIBLE_DEVICES`` before any
-        # CUDA call, which is exactly what standalone GPU pinning relies on.
-        try:
-            self.ctx.set_warmup_delay(1.0)
-        except Exception:
-            pass
+        # Spawn children start a FRESH interpreter: no inherited CUDA
+        # context, and each re-reads its own CUDA_VISIBLE_DEVICES before
+        # any CUDA call -- standalone GPU pinning relies on that (see
+        # docs/frontend_worker_decoupling.md).
         self.mp_alive = self.ctx.Array("i", [0 for i in range(self.num_workers)])
         self.mp_load_progress = self.ctx.Array(
             "i", [0 for _ in range(self.num_workers * 2)]
@@ -335,16 +347,28 @@ class LLM:
                 "standalone_worker=True requires worker_endpoint_file"
             )
         base_port = getattr(self, "worker_transport_base_port", None)
-        host = self.host or "0.0.0.0"
+        bind_host = self.host or "0.0.0.0"
+        # The worker LISTENS on the bind host (0.0.0.0 = all
+        # interfaces), but a remote frontend cannot dial 0.0.0.0/::;
+        # the published rows must carry a routable address.
+        # --worker-transport-advertise-host (or --master-addr set to a real IP) supplies it.
+        advertise_host = getattr(self, "worker_transport_advertise_host", None) or bind_host
+        if advertise_host in ("0.0.0.0", "::"):
+            raise ValueError(
+                "standalone worker TCP transport would publish a "
+                "wildcard address (remote frontends cannot dial it). "
+                "Pass --worker-transport-advertise-host (e.g. the fleet IP) or "
+                "point --master-addr at a routable interface."
+            )
         self._worker_writer = WorkerEndpointWriter(self.worker_endpoint_file)
         if base_port:
             # tcp:// transports at fixed offsets: schedule=output base,
             # output=+1, token=+2 (per rank 0; other ranks' paths are
             # informational for now).
             p = int(base_port)
-            schedule = f"tcp://{host}:{p}"
-            output = f"tcp://{host}:{p + 1}"
-            token = f"tcp://{host}:{p + 2}"
+            schedule = f"tcp://{advertise_host}:{p}"
+            output = f"tcp://{advertise_host}:{p + 1}"
+            token = f"tcp://{advertise_host}:{p + 2}"
         else:
             schedule, output, token = self.schedule_path, self.output_path, self.token_path
         self._worker_writer.set_endpoints({0: {"schedule": schedule, "output": output, "token": token}})
@@ -393,8 +417,10 @@ class LLM:
         RuntimeError when the endpoint file has vanished / gone stale
         (the schedule loop converts that into a terminal error for every
         in-flight async stream instead of hanging them); a uuid change
-        (fleet restarted in the background) is handled by
-        :meth:`FleetSupervisor.reconnect` in-process, no raise.
+        (fleet restarted in the background) is handled IN-PROCESS by the
+        supervisor's heartbeat-driven :meth:`FleetSupervisor._rebuild`
+        (standby :meth:`FleetSupervisor.reconnect` covers the fully-down
+        case), no raise on that path.
         """
         self.fleet.heartbeat()
 
@@ -409,8 +435,11 @@ class LLM:
         which we push any pending new work and block again. The spawned GPU
         child process is the fleet: if it dies, this parent removes the
         endpoint file (via :meth:`_watch_worker_process`) so a connected
-        frontend detects the crash. Ctrl-C exits the process; the endpoint
-        file is removed via atexit too.
+        frontend detects the crash; the frontend's heartbeat then rebuilds
+        the transport in-process (or enters standby via
+        :meth:`FleetSupervisor.reconnect`) once a new fleet republishes.
+        Ctrl-C exits the process; the endpoint file is removed via atexit
+        too.
         """
         # The request data path is handled entirely by the *worker child*
         # process (frontend PUSH -> child PULL schedule -> GPU -> child PUSH

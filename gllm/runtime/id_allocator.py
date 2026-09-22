@@ -1,6 +1,14 @@
 from collections import OrderedDict
 
 
+CLIENT_ID_START = 0
+CLIENT_ID_END = 99999
+# Fleet-unique INTERNAL ids minted by the standalone worker's
+# FrontendMixin start strictly past the client range, so an internal
+# id can never masquerade as a bare client id on the wire.
+INTERNAL_ID_START = CLIENT_ID_END + 1
+
+
 class IDAllocator:
     """FIFO id pool with O(1) random removal.
 

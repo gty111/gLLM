@@ -417,6 +417,72 @@ def test_metadata_only_preserves_mm_flag(tmp_path):
     assert runner.is_kimi_mm is False
 
 
+def test_metadata_only_resolves_deepseek_encoder_variant():
+    """Round 7 MAJOR: load_metadata hardcodes _deepseek_encoder_variant=None
+    while __init__ derives it from the architecture, so a decoupled DSv3.2
+    frontend would tokenize with the generic path instead of the bundled
+    reference encoder. It must mirror __init__."""
+    from unittest import mock
+    import gllm.runtime.model_runner as mr
+
+    for arch, want in (
+        ("DeepseekV32ForCausalLM", "dsv32"),
+        ("DeepseekV4ForCausalLM", "dsv4"),
+        ("Qwen3ForCausalLM", None),
+    ):
+        fake_loader = mock.Mock()
+        fake_loader.use_mm = False
+        fake_loader.architecture = arch
+        with mock.patch.object(mr, "ModelLoader", return_value=fake_loader), \
+             mock.patch.object(mr.ModelRunner, "resolve_model_max_length",
+                               staticmethod(lambda mml: 4096)), \
+             mock.patch.object(mr, "AutoTokenizer", create=True):
+            runner = mr.ModelRunner.load_metadata(
+                load_format="dummy", model_path="/fake", schedule_method="fcfs"
+            )
+        assert runner._deepseek_encoder_variant == want, arch
+        assert runner._use_dsv32_encoder is (want == "dsv32"), arch
+
+
+def test_metadata_only_threads_pixel_overrides():
+    """Round 7 MAJOR: __init__ applies --mm-processor-min/max-pixels to the
+    image/video processors but load_metadata did not, so the frontend's
+    placeholder expansion diverged from the worker's grid. It must apply the
+    same overrides to the same attributes."""
+    from types import SimpleNamespace
+    from unittest import mock
+    import gllm.runtime.model_runner as mr
+
+    # SimpleNamespaces: load_metadata assigns onto .image_processor, which
+    # is resolved FROM self.processor (mock.child), so asserting on the
+    # runner's actual attribute reads back exactly what was written.
+    img = SimpleNamespace(size={})
+    vid = SimpleNamespace(size={})
+    fake_loader = mock.Mock()
+    fake_loader.use_mm = True
+    fake_loader.architecture = "Qwen3VLForConditionalGeneration"
+    fake_processor = SimpleNamespace(image_processor=img, video_processor=vid)
+    with mock.patch.object(mr, "ModelLoader", return_value=fake_loader), \
+         mock.patch.object(mr.ModelRunner, "resolve_model_max_length",
+                           staticmethod(lambda mml: 4096)), \
+         mock.patch.object(mr, "AutoTokenizer", create=True), \
+         mock.patch.object(mr, "AutoProcessor") as ap:
+        ap.from_pretrained.return_value = fake_processor
+        runner = mr.ModelRunner.load_metadata(
+            load_format="dummy", model_path="/fake", schedule_method="fcfs",
+            mm_processor_min_pixels=256, mm_processor_max_pixels=4096,
+        )
+    ip, vp = runner.image_processor, runner.video_processor
+    assert ip.min_pixels == 256
+    assert ip.size["shortest_edge"] == 256
+    assert vp.min_pixels == 256
+    assert vp.size["shortest_edge"] == 256
+    assert ip.max_pixels == 4096
+    assert ip.size["longest_edge"] == 4096
+    assert vp.max_pixels == 4096
+    assert vp.size["longest_edge"] == 4096
+
+
 # ---------------------------------------------------------------------------
 # Second-round review regressions: P1-B1 (bounded dispatch to a HEALTHY
 # peer), P1-B2 (per-request session stamps on worker output incl. the
@@ -555,13 +621,23 @@ def test_standalone_frontend_tcp_init_roundtrip():
     exchange frames BOTH ways over real TCP -- with the worker-side output
     PUSH binding the advertised address (the old make_socket PUSH connected,
     which is backwards for a remote frontend)."""
+    import socket as _socket
     import zmq as _zmq
 
     from gllm.distributed.comm import IPCPackage, zmqComm
 
-    port = 59970
-    sched = "tcp://127.0.0.1:%d" % port
-    out = "tcp://127.0.0.1:%d" % (port + 1)
+    def find_free_port():
+        s = _socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    base = find_free_port()
+    # NB: port+1 is only collision-safe here because this host's bind
+    # pattern leaves holes; good enough for a loopback roundtrip test.
+    sched = "tcp://127.0.0.1:%d" % base
+    out = "tcp://127.0.0.1:%d" % (base + 1)
 
     # Worker-side sockets: request PULL binds, output PUSH binds (TCP).
     wctx = _zmq.Context()
@@ -1134,4 +1210,61 @@ def test_connect_builds_comm_without_prior_comm_attribute(tmp_path):
     assert eng.comm is not None and eng.comm is not first_comm, \
         "reconnect must swap the transport"
     assert eng.fleet._worker_transport_uuid == "uuid-two"
+    eng.comm.close()
+
+
+def test_heartbeat_driven_rebuild_on_uuid_change(tmp_path):
+    """Round 7: in production the fleet-restart transition runs from the
+    HEARTBEAT (a new uuid on the existing endpoint file triggers the
+    supervisor's reactive _rebuild), not from reconnect()'s standby loop.
+    Cover that path: file present, uuid rotated -> heartbeat swaps the
+    comm, clears bookkeeping, re-mints the frontend epoch and runs the
+    on_standalone_reconnect hook."""
+    import json as _json
+
+    from gllm.engine.fleet_supervisor import FleetSupervisor
+
+    sched = "ipc:///tmp/_gllm_hb_sched_%d" % os.getpid()
+    out = "ipc:///tmp/_gllm_hb_out_%d" % os.getpid()
+    tok = "ipc:///tmp/_gllm_hb_tok_%d" % os.getpid()
+    ep = str(tmp_path / "ep.json")
+    with open(ep, "w") as f:
+        _json.dump({"uuid": "uuid-a",
+                    "endpoints": {"0": {"schedule": sched, "output": out, "token": tok}}}, f)
+
+    eng = _bare_llm()
+    eng.host = "127.0.0.1"
+    eng.master_addr = "127.0.0.1"
+    eng.launch_mode = "normal"
+    eng.worker_endpoint_file = ep
+    if hasattr(eng, "comm"):
+        del eng.comm
+    eng.fleet = FleetSupervisor(eng, eng.dp_size)
+    eng.fleet.connect()
+    first_comm = eng.comm
+    epoch_before = eng.frontend_epoch
+    # Simulate in-flight state the rebuild must discard.
+    from gllm.runtime.sequence import GenerationSequence
+    dummy = GenerationSequence(seq_id=1, token_ids=[1], finish_tokens=None, output_len=8)
+    eng.running_maps[1] = dummy
+    eng.wait_lists = [dummy]
+    eng.abort_ids = [1]
+    transitions = []
+    eng.on_standalone_reconnect = lambda reason: transitions.append(reason)
+
+    # Rotate the fleet: same file, new uuid (the worker's heartbeat
+    # thread refreshed it with a fresh transport identity).
+    with open(ep, "w") as f:
+        _json.dump({"uuid": "uuid-b",
+                    "endpoints": {"0": {"schedule": sched, "output": out, "token": tok}}}, f)
+
+    eng.fleet.heartbeat()
+
+    assert eng.comm is not None and eng.comm is not first_comm, \
+        "heartbeat must swap the transport on a uuid change"
+    assert eng.fleet._worker_transport_uuid == "uuid-b"
+    assert eng.running_maps == {} and eng.wait_lists == [] and eng.abort_ids == []
+    assert eng.frontend_epoch != epoch_before, \
+        "each transition must re-mint the frontend epoch"
+    assert len(transitions) == 1, "transition hook must fire exactly once"
     eng.comm.close()
