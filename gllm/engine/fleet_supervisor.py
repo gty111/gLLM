@@ -289,7 +289,7 @@ class FleetSupervisor:
                     # A FRESH incarnation: the next heartbeat will commit the
                     # _rebuild. (Same-uuid means a transient glitch or the
                     # recorded uuid was never set -- keep polling so the loop
-                    # does not spin on a stale-but-present file.)
+                    # does not spin on a stale-but-present entry.)
                     return True
             if time.time() >= deadline:
                 return False
