@@ -604,21 +604,10 @@ class Worker(FrontendMixin, TorchProfilerMixin):
                 ipc_package = self.comm.recv_ipc_package()
                 if ipc_package is None:
                     break
-                cum.schedule_lists.extend(ipc_package.schedule_lists)
-                cum.abort_ids.extend(ipc_package.abort_ids)
-                # Session stamps ride ALIGNED with abort_ids (see
-                # IPCPackage.abort_sessions). Merging the ids without
-                # their stamps would downgrade the aggregate to legacy
-                # routing and abort EVERY same-id request across
-                # sessions. Backfill so the list stays aligned even when
-                # some packages in the drain are unstamped.
-                in_stamps = getattr(ipc_package, "abort_sessions", None)
-                if in_stamps is None:
-                    in_stamps = [None] * len(ipc_package.abort_ids)
-                if cum.abort_sessions is None:
-                    cum.abort_sessions = [
-                        None] * (len(cum.abort_ids) - len(in_stamps))
-                cum.abort_sessions.extend(in_stamps)
+                # merge_aligned folds schedule_lists AND keeps
+                # abort_sessions positionally aligned with abort_ids
+                # (IPCPackage protocol; never merge the bare id lists).
+                cum.merge_aligned(ipc_package)
                 if ipc_package.log is not None:
                     cum.log = ipc_package.log
                     saw_log_override = True

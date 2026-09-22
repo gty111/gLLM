@@ -845,39 +845,30 @@ class LLM:
             # standalone frontend) and ``None`` on a bare engine such as the
             # standalone *worker* (which has no HTTP streams to feed).
             has_async = isinstance(self.async_streams, dict)
-            # Session isolation: the worker fleet remaps client ids to
-            # internal ids per session (Worker._remap_client_ids) and
-            # translates OUTPUT rows back to client ids with each row's
-            # session stamp (Worker.translate_output_for_frontend). A
-            # restarted frontend's id pool restarts at 0 while a surviving
-            # fleet still emits the dead session's trailing tokens/frees for
-            # numerically-identical ids; apply only rows stamped with OUR
-            # epoch (unstamped rows are dropped, fail-closed).
-            # Stamps are POSITIONAL (aligned with the id lists): a batch
-            # may legally carry the SAME client id twice, once per session
-            # (act_schedule_ids == [0, 0]), so they must never be collapsed
-            # into a dict keyed by client id.
-            act_stamps = getattr(ipc_package, "sessions", None)
-            free_stamps = getattr(ipc_package, "free_sessions", None)
+            # Session isolation (IPCPackage frontend session protocol):
+            # the worker fleet remaps client ids to internal ids per
+            # session (Worker._remap_client_ids) and translates OUTPUT
+            # rows back to client ids with each row's session stamp
+            # (Worker.translate_output_for_frontend). A restarted
+            # frontend's id pool restarts at 0 while a surviving fleet
+            # still emits the dead session's trailing tokens/frees for
+            # numerically-identical ids, so on a standalone frontend
+            # only rows stamped with OUR epoch are applied; on the
+            # monolith the gate is a documented no-op. One O(1)
+            # per-package alignment check feeds the positional row
+            # gates (act_session_at / free_session_at); a malformed
+            # packet fails closed wholesale.
+            stamps_ok = True
+            if self.standalone_frontend:
+                stamps_ok = ipc_package.output_stamps_valid()
 
-            def _foreign(idx, stamps):
-                """True iff this row belongs to a DIFFERENT (dead) session.
-
-                Monolith: never foreign (no session filtering). Standalone:
-                the worker always ships stamp lists aligned with the id
-                lists; a missing/short list or a non-matching stamp means
-                the row is not ours (fail-closed).
-                """
-                if not self.standalone_frontend:
-                    return False
-                return (
-                    stamps is None
-                    or idx >= len(stamps)
-                    or stamps[idx] != self.frontend_epoch
-                )
+            def _ours(row_fn, idx):
+                if self.standalone_frontend:
+                    return row_fn(idx, self.frontend_epoch, stamps_ok)
+                return True
 
             for idx, id in enumerate(ipc_package.act_schedule_ids):
-                if _foreign(idx, act_stamps):
+                if not _ours(ipc_package.act_session_at, idx):
                     continue  # dead session's trailing token
                 # Under overlap scheduling a worker can emit a trailing token
                 # for a sequence it freed one step earlier (EOS detected after
@@ -920,7 +911,7 @@ class LLM:
             # acted token rows. Retire them independently, exactly once.
             retired = []
             for fidx, id in enumerate(ipc_package.free_ids):
-                if _foreign(fidx, free_stamps):
+                if not _ours(ipc_package.free_session_at, fidx):
                     continue  # dead session's free; our running_maps has no key
                 if self.running_maps.pop(id, None) is None:
                     continue

@@ -28,6 +28,45 @@ _SHUTDOWN = object()  # sentinel pushed onto a sender queue to drain it
 
 
 class IPCPackage:
+    """One tick of frontend<->worker traffic, in a single pickle.
+
+    FRONTEND SESSION PROTOCOL (decoupled deployment)
+    ================================================
+
+    Four fields carry session identity across the wire. THREE of them
+    are STAMP LISTS that must stay POSITIONALLY aligned with their id
+    list for the entire lifetime of the package (construction, drain
+    merges, pickling, translation):
+
+    ============================  ========  =====================  ======
+    field                         direction aligns with            set by
+    ============================  ========  =====================  ======
+    ``seq.frontend_session``      req       (per seq object)       frontend
+    ``abort_sessions``            req       ``abort_ids``          frontend
+    ``sessions``                  output    ``act_schedule_ids``   worker
+    ``free_sessions``             output    ``free_ids``           worker
+    ============================  ========  =====================  ======
+
+    * ``None`` on a stamp field means LEGACY/unstamped (monolith path);
+      an empty list is only legal alongside an empty id list.
+    * A batch may legally carry the SAME client id more than once
+      (once per session), so stamps must never be collapsed into a
+      dict keyed by id -- positional order is the contract.
+    * Helpers below (:meth:`merge_aligned`, :meth:`abort_stamps_valid`,
+      :meth:`output_stamps_valid`) are the only sanctioned places to
+      read or extend these pairs; both sides of the wire route through
+      them so the alignment invariant has one definition.
+    * ``seq.frontend_session`` rides inside each pickled
+      :class:`~gllm.runtime.sequence.GenerationSequence` and is
+      echoed back by the worker (``client_seq_id`` / translate) -- it
+      is not a package field, which is why it gets no package-level
+      helper here.
+
+    On the monolith path every stamp field stays ``None`` and the
+    helpers below reduce to no-ops / legacy answers, so the protocol
+    costs nothing when unused.
+    """
+
     def __init__(self, schedule_lists: List[GenerationSequence]):
         # front-end => worker
         self.log = True
@@ -100,6 +139,111 @@ class IPCPackage:
             and len(self.abort_ids) == 0
             and self.control_cmd_code == 0
         )
+
+    # ------------------------------------------------------------------
+    # Frontend session protocol: alignment helpers (see class docstring)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _backfilled(stamps, n_ids):
+        """Stamp list of exactly ``n_ids`` entries, legacy None-filled.
+
+        ``None`` input becomes an all-None list (legacy); a list is
+        trusted to be well-formed (the sender's own helper built it).
+        """
+        if stamps is None:
+            return [None] * n_ids
+        return list(stamps)
+
+    def merge_aligned(self, other: "IPCPackage") -> None:
+        """Fold *other*'s request-dir content into self, PRESERVING the
+        ``abort_ids`` / ``abort_sessions`` positional alignment.
+
+        This is the ONLY sanctioned way to merge drained request
+        packages: merging the bare id lists would silently drop the
+        session stamps and downgrade the aggregate to legacy routing
+        (aborting EVERY same-id request across sessions). Stamps from
+        unstamped packages are backfilled with None so the merged list
+        is always exactly as long as the merged id list.
+        """
+        self.schedule_lists.extend(other.schedule_lists)
+        n_in = len(other.abort_ids)
+        in_stamps = self._backfilled(other.abort_sessions, n_in)
+        if self.abort_sessions is None:
+            base = [None] * len(self.abort_ids)
+        else:
+            base = list(self.abort_sessions)
+        self.abort_ids = self.abort_ids + other.abort_ids
+        self.abort_sessions = base + in_stamps
+
+    def abort_stamps_valid(self) -> bool:
+        """True iff ``abort_sessions`` is absent (legacy/monolith) or
+        exactly as long as ``abort_ids``. Callers (frontend drain) use
+        this to fail closed on malformed packets instead of guessing
+        which session an abort belongs to."""
+        if self.abort_sessions is None:
+            return True
+        return len(self.abort_sessions) == len(self.abort_ids)
+
+    def output_stamps_valid(self) -> bool:
+        """True iff the output stamp lists are absent (legacy/monolith)
+        or exactly as long as their id lists (``sessions`` vs
+        ``act_schedule_ids``, ``free_sessions`` vs ``free_ids``). The
+        standalone frontend applies this before trusting any row."""
+        for stamps, ids in (
+            (self.sessions, self.act_schedule_ids),
+            (self.free_sessions, self.free_ids),
+        ):
+            if stamps is None:
+                continue
+            if len(stamps) != len(ids):
+                return False
+        return True
+
+    def act_session_at(self, idx: int, our_epoch, valid: bool = True) -> bool:
+        """Whether row ``idx`` of ``act_schedule_ids`` belongs to THIS
+        frontend incarnation.
+
+        This is the single sanctioned frontend-side row gate (used by
+        :meth:`LLM._apply_ipc_package`). Semantics:
+
+        * no ``sessions`` list at all -> LEGACY/monolith worker: every
+          row is ours (ids were never remapped, nothing to filter);
+        * malformed list (wrong length) -> every row is foreign
+          (fail closed -- a misaligned stamp cannot be trusted to name
+          a session);
+        * otherwise the row is ours iff ``sessions[idx] == our_epoch``.
+
+        ``valid`` lets the caller short-circuit the WHOLE packet: the
+        frontend checks :meth:`output_stamps_valid` once per package
+        (O(1), no per-row cost) and threads the answer in, so a
+        malformed packet fails closed in one shot instead of row by
+        row. Default ``True`` keeps per-row callers safe.
+
+        A batch may carry the same client id twice (once per session),
+        so the check is strictly positional -- never dict-by-id.
+        """
+        if not valid:
+            return False
+        stamps = self.sessions
+        if stamps is None:
+            return True
+        if idx >= len(stamps):
+            return False
+        return stamps[idx] == our_epoch
+
+    def free_session_at(self, idx: int, our_epoch, valid: bool = True) -> bool:
+        """Same as :meth:`act_session_at` for ``free_ids`` rows
+        (``free_sessions``). Fail-closed on a malformed list (either
+        via ``valid`` or a per-row length miss)."""
+        if not valid:
+            return False
+        stamps = self.free_sessions
+        if stamps is None:
+            return True
+        if idx >= len(stamps):
+            return False
+        return stamps[idx] == our_epoch
 
 
 class zmqComm:

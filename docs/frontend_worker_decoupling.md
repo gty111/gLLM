@@ -79,6 +79,27 @@ request 0, and `abort(0)` from the new session frees only its own
 request. Dispatch is gated by a cheap endpoint-file liveness probe so a
 dead fleet cannot silently absorb requests into its 512MB send buffer.
 
+### Wire protocol (single definition)
+
+The four session fields, their directions, and the **positional
+alignment** contract are defined once on `IPCPackage` (the class
+docstring in `gllm/distributed/comm.py` is the authoritative table).
+All producers/consumers route through the package helpers instead of
+touching the stamp lists directly:
+
+| Helper                        | Side     | Purpose                                    |
+|-------------------------------|----------|--------------------------------------------|
+| `merge_aligned(other)`        | worker   | the ONLY sanctioned drain merge (keeps `abort_sessions` aligned with `abort_ids`) |
+| `abort_stamps_valid()`        | worker   | request-dir alignment predicate            |
+| `output_stamps_valid()`       | frontend | one O(1) per-package alignment check       |
+| `act_session_at(i, epoch)`    | frontend | positional row gate for acted tokens       |
+| `free_session_at(i, epoch)`   | frontend | positional row gate for free rows          |
+
+Malformed stamp lists fail CLOSED: a misaligned packet is dropped
+wholesale rather than guessed, and a missing stamp list is legacy
+(monolith) semantics, never "foreign". Covered by
+`tests/test_ipc_protocol.py`.
+
 ## Crash semantics (verified end-to-end)
 
 | Event                              | Frontend                              | Worker fleet                     |
