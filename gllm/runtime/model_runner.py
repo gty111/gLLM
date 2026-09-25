@@ -5923,7 +5923,14 @@ class OverlapModelRunner(ModelRunner):
             if copy_on_this_rank:
                 with torch.cuda.stream(self.copy_stream):
                     self.copy_stream.wait_stream(self.forward_stream)
+                    # These sources were allocated on ``forward_stream`` and
+                    # die with this call. Without ``record_stream`` the caching
+                    # allocator hands their blocks to the next batch's
+                    # forward-stream allocations while this D2H is still
+                    # queued, and the copy reads that batch's int32 metadata
+                    # as "tokens".
                     if is_first_pp_rank():
+                        next_tokens_gpu.record_stream(self.copy_stream)
                         next_tokens_cpu[:batch_size].copy_(
                             next_tokens_gpu, non_blocking=True
                         )
@@ -5931,6 +5938,8 @@ class OverlapModelRunner(ModelRunner):
                     # ``_collect_batch`` can read them once ``copy_done`` fires.
                     if lp_gpu is not None:
                         sampled, top_vals, top_ids = lp_gpu
+                        for t in lp_gpu:
+                            t.record_stream(self.copy_stream)
                         self._lp_sampled_bufs[buf_idx][:batch_size].copy_(
                             sampled, non_blocking=True
                         )
