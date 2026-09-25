@@ -53,6 +53,8 @@ setup(
         "gllm": [
             "layers/moe/fused_moe_triton/configs/*.json",
             "layers/ops/csrc/*.cu",
+            "layers/quantization/csrc/marlin/*",
+            "layers/quantization/csrc/marlin/include/sgl_kernel/*",
         ],
     },
 )

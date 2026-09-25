@@ -29,6 +29,8 @@ flash-attn-4[cu13]==4.0.0b26
 nvidia-cutlass-dsl[cu13]==4.6.0.dev0 # exact version required by flash-attn-4
 quack-kernels==0.5.3
 torch-c-dlpack-ext==0.1.5
+apache-tvm-ffi>=0.1.12,<0.2 # Marlin JIT compiler and tensor bindings
+ninja # Build Marlin CUDA kernels on first use
 lark>=1.2.2,<2 # Validate Responses custom-tool input grammars
 xgrammar==0.2.7 # Token-level JSON / JSON Schema constrained decoding
 jsonschema>=4.18,<5 # Validate supported schema subset before admission
