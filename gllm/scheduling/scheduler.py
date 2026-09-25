@@ -310,6 +310,27 @@ class Scheduler:
             pass
         stats.record_kv(total, free, util)
 
+    def _record_phase_tokens(self, schedule_seqs):
+        """Split a freshly assembled step into prefill vs decode tokens.
+
+        Rows whose prompt is not fully computed carry a prefill chunk of
+        ``to_compute_token_num`` query tokens; all other rows are decode
+        rows (1 token, or the MTP verify query). Only recorded when
+        metrics are active (``engine_stats`` is None otherwise).
+        """
+        stats = self.engine_stats
+        if stats is None:
+            return
+        prefill = 0
+        decode = 0
+        for seq in schedule_seqs:
+            if seq.computed_prompt:
+                decode += seq.to_compute_token_num
+            else:
+                prefill += seq.to_compute_token_num
+        if prefill or decode:
+            stats.record_phase_tokens(prefill, decode)
+
     def process_output(self):
         if len(self.next_tokens_queue) == 0:
             return None
@@ -578,6 +599,7 @@ class Scheduler:
                 self._recover_stalled_prefills()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
+                self._record_phase_tokens(schedule_seqs)
                 self.observe_idle_tick()
                 return schedule_seqs
 

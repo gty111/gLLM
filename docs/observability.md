@@ -57,6 +57,22 @@ All metric names are prefixed with `gllm_`.
 | `gllm_num_requests_waiting` | Gauge | New sequences awaiting admission (frontend queue) |
 | `gllm_num_steps_total` | Counter | Engine iteration steps |
 | `gllm_iteration_tokens_total` | Counter | Token rows computed per step (prefill + decode) |
+| `gllm_prefill_tokens_total` | Counter | Prompt query tokens scheduled per engine step (actual forward compute, prefill phase) |
+| `gllm_decode_tokens_total` | Counter | Decode query tokens scheduled per engine step (includes the MTP verify query width) |
+
+Throughput should be derived from counters, not the legacy EMA gauge:
+
+```promql
+# Total generated-token throughput
+sum(rate(gllm_generation_tokens_total[1m])) by (instance)
+# Per-phase scheduled throughput
+sum(rate(gllm_prefill_tokens_total[1m])) by (instance)
+sum(rate(gllm_decode_tokens_total[1m])) by (instance)
+```
+
+> Note: `gllm_token_throughput_per_second` is a legacy EMA gauge that only
+> updates on request completion and holds its last value while idle. Prefer
+> the `rate()` expressions above.
 | `gllm_finished_requests_total` | Counter | Sequences that reached a terminal state |
 | `gllm_num_preemptions_total` | Counter | Sequences preempted |
 | `gllm_kv_cache_pages_total` | Gauge | Total KV cache physical pages |

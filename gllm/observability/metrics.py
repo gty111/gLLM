@@ -91,6 +91,9 @@ class EngineStats:
         self.iterations = 0
         self.num_steps = 0
         self.iteration_tokens = 0
+        # Per-phase forward-token accounting (scheduled, per step).
+        self.prefill_tokens = 0
+        self.decode_tokens = 0
         self.preempted_seqs = 0
         self.finished_seqs = 0
         # Absolute gauges, latest snapshot wins.
@@ -121,6 +124,17 @@ class EngineStats:
             self.batch_prefill_seqs = int(num_prefill)
             self.batch_decode_seqs = int(num_decode)
             self.batch_tokens = int(num_tokens)
+
+    def record_phase_tokens(self, prefill_tokens: int, decode_tokens: int):
+        """Accumulate per-phase scheduled token counts for one step.
+
+        Called from the scheduler right after a batch is assembled, using
+        each row's ``to_compute_token_num`` and ``computed_prompt`` split,
+        so the totals reflect actual forward compute per phase.
+        """
+        with self._lock:
+            self.prefill_tokens += int(prefill_tokens)
+            self.decode_tokens += int(decode_tokens)
 
     def sample_package(self, package):
         """Derive iteration-level counters from a finished ``IPCPackage``.
@@ -194,12 +208,16 @@ class EngineStats:
                 "iterations_delta": self.iterations,
                 "num_steps_delta": self.num_steps,
                 "iteration_tokens_delta": self.iteration_tokens,
+                "prefill_tokens_delta": self.prefill_tokens,
+                "decode_tokens_delta": self.decode_tokens,
                 "preempted_seqs_delta": self.preempted_seqs,
                 "finished_seqs_delta": self.finished_seqs,
             }
             self.iterations = 0
             self.num_steps = 0
             self.iteration_tokens = 0
+            self.prefill_tokens = 0
+            self.decode_tokens = 0
             self.preempted_seqs = 0
             self.finished_seqs = 0
             if self.prefix_cache_hit_pages:
@@ -346,6 +364,14 @@ class FrontendMetrics:
         self.iteration_tokens_total = self._c(
             "gllm_iteration_tokens_total",
             "Tokens computed per engine iteration (prefill+decode rows).",
+        )
+        self.prefill_tokens_total = self._c(
+            "gllm_prefill_tokens_total",
+            "Prompt tokens scheduled for forward compute (per engine step).",
+        )
+        self.decode_tokens_total = self._c(
+            "gllm_decode_tokens_total",
+            "Decode query tokens scheduled for forward compute (per engine step).",
         )
         self.num_steps_total = self._c(
             "gllm_num_steps_total", "Engine iterations executed.",
@@ -521,6 +547,10 @@ class FrontendMetrics:
             self.num_steps_total.inc(stats["iterations_delta"])
         if "iteration_tokens_delta" in stats:
             self.iteration_tokens_total.inc(stats["iteration_tokens_delta"])
+        if "prefill_tokens_delta" in stats:
+            self.prefill_tokens_total.inc(stats["prefill_tokens_delta"])
+        if "decode_tokens_delta" in stats:
+            self.decode_tokens_total.inc(stats["decode_tokens_delta"])
         if "finished_seqs_delta" in stats:
             self.finished_requests_total.inc(stats["finished_seqs_delta"])
         if "preempted_seqs_delta" in stats:
