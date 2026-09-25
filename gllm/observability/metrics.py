@@ -233,8 +233,13 @@ _LATENCY_BUCKETS = (
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0,
     1.5, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 30.0, 60.0,
 )
+# Per-request token-length buckets. Dense below 1k tokens (typical chat
+# traffic) and in integer-K increments above, so dashboard heatmaps can label
+# the axis directly in K tokens (1k, 2k, 4k, ..., 128k).
 _TOKEN_BUCKETS = (
-    8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
+    256, 512, 1024,
+    2048, 3072, 4096, 6144, 8192,
+    12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072,
 )
 _BYTES_BUCKETS = (
     1 << 28, 1 << 30, 1 << 32, 1 << 34, 1 << 36, 1 << 38, 1 << 40,
