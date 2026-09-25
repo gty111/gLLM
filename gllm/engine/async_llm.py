@@ -7,6 +7,7 @@ from fastapi import Request
 from logger import logger
 
 from gllm.engine.llm import LLM
+from gllm.utils import StreamOutput
 
 
 class AsyncStream:
@@ -16,6 +17,9 @@ class AsyncStream:
         self._finished = False
         self._raw_request = raw_request
         self._on_abort = on_abort
+        # Tokens observed by the frontend stream consumer (metrics); each
+        # non-abort ``put`` appends >=1 token deltas.
+        self.emitted_tokens = 0
         # The owning GenerationSequence, kept so response builders can report accurate
         # token usage (prompt_len / generated count) and finish_reason once the
         # stream drains. The engine appends generated ids to this same object,
@@ -25,6 +29,8 @@ class AsyncStream:
     def put(self, item: str):
         if self._finished:
             return
+        if isinstance(item, StreamOutput):
+            self.emitted_tokens += 1
         self._queue.put_nowait(item)
 
     def finish(self):
@@ -185,7 +191,17 @@ class AsyncLLM(LLM):
         while True:
             await self.check_abort_seqs()
             await self._run_engine_io(super().schedule)
+            self._observe_queue_gauges()
             await asyncio.sleep(0)
+
+    def _observe_queue_gauges(self):
+        """Refresh running/waiting gauges every schedule tick."""
+        try:
+            with self._pending_lock:
+                waiting = len(self.wait_lists)
+            self.metrics.set_queue_gauges(len(self.running_maps), waiting)
+        except Exception:
+            pass
 
     def start_schedule_engine(self):
         # launch schedule engine

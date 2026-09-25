@@ -32,3 +32,4 @@ torch-c-dlpack-ext==0.1.5
 lark>=1.2.2,<2 # Validate Responses custom-tool input grammars
 xgrammar==0.2.7 # Token-level JSON / JSON Schema constrained decoding
 jsonschema>=4.18,<5 # Validate supported schema subset before admission
+prometheus-client>=0.20.0 # /metrics endpoint (Prometheus observability)

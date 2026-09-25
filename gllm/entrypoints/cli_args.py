@@ -302,6 +302,14 @@ def add_frontend_args(p: argparse.ArgumentParser) -> None:
         "tool_calls. Default: auto-detect from model architecture; pass a "
         "name to override.",
     )
+    p.add_argument(
+        "--enable-metrics",
+        action="store_true",
+        default=False,
+        help="Enable Prometheus metrics collection and the /metrics endpoint. "
+        "Metrics are OFF by default (SGLang-style); pass this flag to turn "
+        "them on.",
+    )
 
 
 def add_engine_args(p: argparse.ArgumentParser, *, tp_help: str = None) -> None:
@@ -358,4 +366,5 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
         "mtp_max_batch": args.mtp_max_batch,
         "mm_processor_min_pixels": args.mm_processor_min_pixels,
         "mm_processor_max_pixels": args.mm_processor_max_pixels,
+        "enable_metrics": args.enable_metrics,
     }

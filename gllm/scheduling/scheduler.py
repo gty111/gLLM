@@ -40,6 +40,16 @@ class Scheduler:
         self.schedule_method = schedule_method
         self.maxd = model_runner.maxd
         self.maxp = model_runner.maxp
+        # Observability: rolling stats shipped to the frontend on each output
+        # IPC package (Prometheus). Created in the worker process; ``None``
+        # when the metrics soft-dependency is absent.
+        from gllm.observability.metrics import EngineStats, metrics_enabled
+
+        self.engine_stats = (
+            EngineStats()
+            if metrics_enabled(getattr(model_runner, "enable_metrics", False))
+            else None
+        )
         self.max_num_batched_tokens = model_runner.max_num_batched_tokens
         self.minp = model_runner.minp
         self.iterp = model_runner.iterp
@@ -252,6 +262,54 @@ class Scheduler:
     def set_log(self, log):
         self.log = log
 
+    def flush_stats(self, ipc_package: Optional[IPCPackage] = None):
+        """Stamp ``ipc_package.stats`` (if given) from the rolling EngineStats.
+
+        The scheduler's rolling state is sampled opportunistically:
+          * :meth:`observe_idle_tick` refreshes queue / KV gauges every tick;
+          * the worker's :meth:`gllm.distributed.comm.zmqComm.send_output`
+            wrapper calls this once per outgoing package (all finalisation
+            paths funnel through it) and :meth:`EngineStats.sample_package`
+            derives the per-package iteration counters.
+
+        Safe to call with no package (pure gauge refresh).
+        """
+        stats = self.engine_stats
+        if stats is None:
+            return
+        if ipc_package is not None:
+            stats.sample_package(ipc_package)
+            stats.record_gpu_memory()
+            ipc_package.stats = stats.snapshot()
+
+    def observe_idle_tick(self):
+        """Refresh queue / KV / batch gauges.
+
+        Called from :meth:`schedule_once` (every scheduling iteration,
+        whether or not it produced a batch) and, as a safety net, from
+        :meth:`process_output` when the non-overlap path runs.
+        """
+        stats = self.engine_stats
+        if stats is None:
+            return
+        running = len(self.seqs_to_decode) + sum(
+            len(batch) for batch in self.batch_running
+        )
+        stats.record_queues(running, len(self.seqs_to_prefill))
+        mm = self.memory_manager
+        try:
+            total = getattr(mm, "num_pages", None)
+            free = mm.get_num_free_pages()
+        except Exception:
+            total, free = None, None
+        util = None
+        try:
+            if total:
+                util = 100.0 * (total - free) / total
+        except Exception:
+            pass
+        stats.record_kv(total, free, util)
+
     def process_output(self):
         if len(self.next_tokens_queue) == 0:
             return None
@@ -260,6 +318,7 @@ class Scheduler:
         next_tokens, logprobs, prompt_logprobs = self.next_tokens_queue.popleft()
 
         ipc_package = IPCPackage([])
+        self.flush_stats(ipc_package)
 
         for idx, seq in enumerate(schedule_seqs):
             seq.computed_token_num += seq.to_compute_token_num
@@ -417,6 +476,8 @@ class Scheduler:
         self._pending_request_errors = {}
         ipc_package.free_ids.extend(ipc_package.request_errors)
         self.abort_ids.difference_update(ipc_package.request_errors)
+        if self.engine_stats is not None:
+            ipc_package.stats = self.engine_stats.snapshot()
         self.check_abort_seqs_list(self.seqs_to_prefill, ipc_package)
         self.check_abort_seqs_list(self.seqs_to_decode, ipc_package)
         if len(ipc_package.free_ids) != 0:
@@ -517,9 +578,12 @@ class Scheduler:
                 self._recover_stalled_prefills()
             if len(schedule_seqs) != 0:
                 self.batch_running.append(schedule_seqs)
+                self.observe_idle_tick()
                 return schedule_seqs
 
+        self.observe_idle_tick()
         return []
+
 
     def get_balanced_decode_token_budget(self, num_total_decode_seqs):
         cohorts = self.decode_cohorts
@@ -666,6 +730,17 @@ class Scheduler:
                 # ``_mm_prepare_cpu`` pass doesn't redo the work.
                 self.model_runner._mm_precompute_hash(seq)
                 self.memory_manager.pre_allocate_computed_page([seq])
+                if self.engine_stats is not None and isinstance(
+                    self.memory_manager, PrefixMemoryManager
+                ):
+                    self.engine_stats.record_prefix_cache(
+                        hit_pages=getattr(
+                            self.memory_manager, "num_hit_pages", 0
+                        ),
+                        alloc_pages=getattr(
+                            self.memory_manager, "num_allocated_pages", 0
+                        ),
+                    )
                 # Full/partial hit post-processing (rollback + hybrid SSM
                 # snapshot restore) lives in PrefixMemoryManager.
             # Encoder-disaggregation overlap gate B (design §6.2): a disagg seq
