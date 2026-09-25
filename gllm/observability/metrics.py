@@ -423,10 +423,6 @@ class FrontendMetrics:
             "gllm_prefix_cache_alloc_pages_total",
             "Cumulative prefix-cache page allocations (worker-reported).",
         )
-        self.prefix_cache_hit_rate = self._g(
-            "gllm_prefix_cache_hit_rate",
-            "Prefix-cache hit rate (hits / (hits + allocs)).",
-        )
         self.uptime_seconds = self._g(
             "gllm_uptime_seconds", "Engine process uptime.",
         )
@@ -587,11 +583,11 @@ class FrontendMetrics:
             self.prefix_cache_alloc_pages_total.inc(
                 stats["prefix_cache_alloc_pages_total"]
             )
-        hit = self.prefix_cache_hit_pages_total._value.get()  # type: ignore[attr-defined]
-        alloc = self.prefix_cache_alloc_pages_total._value.get()  # type: ignore[attr-defined]
-        denom = hit + alloc
-        if denom > 0:
-            self.prefix_cache_hit_rate.set(hit / denom)
+        # The hit *rate* is intentionally not exposed as a gauge: derive it in
+        # Prometheus from the two counters over any window, e.g.
+        #   rate(gllm_prefix_cache_hit_pages_total[5m])
+        #   / rate(gllm_prefix_cache_alloc_pages_total[5m])
+        # which matches the scheduler log's hits/allocs definition.
         self.last_engine_report_seconds.set(time.time())
 
     # -- exposition -------------------------------------------------------------

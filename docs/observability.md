@@ -83,7 +83,14 @@ sum(rate(gllm_decode_tokens_total[1m])) by (instance)
 | `gllm_batch_tokens` | Gauge | Total tokens in the most recent step |
 | `gllm_gpu_memory_allocated_bytes` | Histogram | torch CUDA allocated memory |
 | `gllm_gpu_memory_reserved_bytes` | Histogram | torch CUDA reserved memory |
-| `gllm_prefix_cache_hit_rate` | Gauge | Prefix cache hit rate (hit pages / (hit pages + allocated pages)); only populated with `--enable-prefix-caching` |
+| `gllm_prefix_cache_hit_pages_total` | Counter | Cumulative prefix-cache page hits (worker-reported) |
+| `gllm_prefix_cache_alloc_pages_total` | Counter | Cumulative prefix-cache page allocations (worker-reported) |
+
+Hit rate is derived in PromQL (matches the scheduler log's definition):
+
+```promql
+rate(gllm_prefix_cache_hit_pages_total[5m]) / rate(gllm_prefix_cache_alloc_pages_total[5m])
+```
 | `gllm_uptime_seconds` | Gauge | Process uptime |
 
 ## Architecture

@@ -108,9 +108,10 @@ def test_update_from_engine_stats(m):
     assert "gllm_kv_cache_pages_total" in body
     assert "gllm_kv_cache_usage_pct" in body
     assert "gllm_batch_decode_seqs" in body
-    assert "gllm_prefix_cache_hit_rate" in body
-    # prefix hit rate should be 100/140 ≈ 0.714
-    assert "0.71" in body or "0.714" in body
+    # Hit rate is derived in PromQL from the counters, not exposed as gauge.
+    assert "gllm_prefix_cache_hit_rate" not in body
+    assert "gllm_prefix_cache_hit_pages_total" in body
+    assert "gllm_prefix_cache_alloc_pages_total" in body
 
 def test_metrics_enabled_default_off(m, monkeypatch):
     """Metrics are OFF by default; ON only with the --enable-metrics flag.
