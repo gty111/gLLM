@@ -25,6 +25,7 @@ from gllm.models.weight_loader import (
     contains,
     run_weight_loader,
 )
+from gllm.models.mtp_utils import detached_head
 from gllm.models.weight_utils import (
     copy_single_proj_dim0,
     copy_single_proj_dim1,
@@ -538,9 +539,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # DSpark's parameters live under ``mtp.*`` in the checkpoint, a
         # namespace the rule table above knows nothing about. Detach the head
         # for the base pass and load it separately, as DeepSeek-V3.2 does.
-        dspark = self.dspark
-        self.dspark = None
-        try:
+        with detached_head(self, "dspark") as dspark:
             run_weight_loader(
                 self,
                 weights,
@@ -551,14 +550,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                 ctx=self._make_load_context(weights),
                 src_key_fn=_v4_src_key,
             )
-        finally:
-            self.dspark = dspark
 
         for layer in self.model.layers:
             layer.ffn.experts.process_weights_after_loading()
-        if self.dspark is not None:
-            self.dspark.load_weights(weights, self, mp_load_progress)
-            self.dspark.process_weights_after_loading()
+        if dspark is not None:
+            dspark.load_weights(weights, self, mp_load_progress)
+            dspark.process_weights_after_loading()
 
 
 __all__ = [

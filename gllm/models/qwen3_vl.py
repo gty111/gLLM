@@ -21,15 +21,19 @@ from gllm.models.weight_loader import (
 from gllm.layers.linear import ColumnParallelLinear, RowParallelLinear
 from gllm.distributed.parallel_state import get_tp_size, is_first_pp_rank, is_last_pp_rank
 
-from .qwen2_5_vl import (MultiModalEmbeddings, Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLVideoInputs, 
-                         Qwen2_5_VLVideoPixelInputs, 
-                         Qwen2_5_VisionAttention, Qwen2_5_VisionRotaryEmbedding, 
+from .mixins import NestedLanguageModelMixin
+from .qwen2_5_vl import (MultiModalEmbeddings, Qwen2_5_VLVideoEmbeddingInputs, Qwen2_5_VLVideoInputs,
+                         Qwen2_5_VLVideoPixelInputs,
+                         Qwen2_5_VisionAttention, Qwen2_5_VisionPatchEmbed,
+                         Qwen2_5_VisionRotaryEmbedding,
                          Qwen2_5_VLImageInputs, Qwen2_5_VLImagePixelInputs,
                          Qwen2_5_VLImageEmbeddingInputs)
 from .qwen3 import Qwen3Model, Qwen3ForCausalLM
 
 
-class Qwen3_VisionPatchEmbed(nn.Module):
+class Qwen3_VisionPatchEmbed(Qwen2_5_VisionPatchEmbed):
+    # Same Conv3d patch embed as Qwen2.5-VL, except the projection carries a
+    # bias term.
     def __init__(
         self,
         patch_size: int = 14,
@@ -37,38 +41,13 @@ class Qwen3_VisionPatchEmbed(nn.Module):
         in_channels: int = 3,
         hidden_size: int = 1152,
     ) -> None:
-        super().__init__()
-        self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
-        self.hidden_size = hidden_size
-
-        kernel_size = (temporal_patch_size, patch_size, patch_size)
-        self.proj = nn.Conv3d(
-            in_channels,
-            hidden_size,
-            kernel_size=kernel_size,
-            stride=kernel_size,
+        super().__init__(
+            patch_size=patch_size,
+            temporal_patch_size=temporal_patch_size,
+            in_channels=in_channels,
+            hidden_size=hidden_size,
             bias=True,
-            device="cuda",
         )
-        self._use_linear = torch.__version__.startswith("2.9.")
-        self._input_size = in_channels * temporal_patch_size * patch_size * patch_size
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        L, C = x.shape
-        x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        if self._use_linear:
-            from gllm.layers.conv import conv3d_patch_forward
-            x = conv3d_patch_forward(x, self.proj.weight, self.proj.bias,
-                                     self.hidden_size, self._input_size, self.kernel_size)
-            x = x.view(L, self.hidden_size)
-        else:
-            x = self.proj(x).view(L, self.hidden_size)
-        return x
-
-    @property
-    def kernel_size(self):
-        return (self.temporal_patch_size, self.patch_size, self.patch_size)
     
 class Qwen3_VisionMLP(nn.Module):
     def __init__(
@@ -484,19 +463,14 @@ class Qwen3LLMForCausalLM(Qwen3ForCausalLM):
         self.model = Qwen3LLMModel(config)
 
         if is_last_pp_rank():
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+            )
             if config.tie_word_embeddings:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                )
                 self.lm_head.tie_weights(self.model.embed_tokens)
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                )
 
-class Qwen3VLForConditionalGeneration(nn.Module):
+class Qwen3VLForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
 
     def __init__(self, config, language_model_type=Qwen3LLMForCausalLM):
         super().__init__()
@@ -931,16 +905,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         else:
             assert residual is not None
             return hidden_states, residual
-
-    def compute_logits(
-        self,
-        input_data: InputData,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        return self.language_model.compute_logits(input_data, hidden_states)
-
-    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.language_model.logits_from_hidden(hidden_states)
 
     def embed_multimodal_single(self, **mm_input) -> torch.Tensor:
         """Encode exactly one mm item and return its raw visual embedding.

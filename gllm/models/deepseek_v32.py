@@ -43,6 +43,7 @@ from .deepseek_v2 import (
     DeepseekV2MLAAttention,
     DeepseekV2Model,
 )
+from .mtp_utils import detached_head
 from .utils import extract_rope_config
 
 # Position-axis tile for the DSA decode indexer score (see
@@ -867,13 +868,9 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         # in the checkpoint by its parameter path. The MTP head's params live
         # under ``mtp.*`` (no such checkpoint key -- they are ``model.layers.N.*``)
         # and are loaded separately below, so detach the head for the base pass.
-        mtp = self.mtp
-        self.mtp = None
-        try:
+        with detached_head(self, "mtp") as mtp:
             super().load_weights(weights, mp_load_progress)
-        finally:
-            self.mtp = mtp
         # Then the MTP head's layer-``num_hidden_layers`` weights, reusing this
         # model's own rule table + load context (see DeepseekMTP.load_weights).
-        if self.mtp is not None:
-            self.mtp.load_weights(weights, self, mp_load_progress)
+        if mtp is not None:
+            mtp.load_weights(weights, self, mp_load_progress)

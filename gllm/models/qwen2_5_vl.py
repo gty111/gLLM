@@ -27,6 +27,7 @@ from gllm.layers.linear import (
 from gllm.utils import cast_overflow_tensors
 from gllm.layers.rotary_embedding import apply_rotary_emb
 
+from .mixins import NestedLanguageModelMixin
 from .qwen2 import Qwen2ForCausalLM
 from .weight_loader import (
     LoadContext,
@@ -337,6 +338,7 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
         temporal_patch_size: int = 2,
         in_channels: int = 3,
         hidden_size: int = 1152,
+        bias: bool = False,
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
@@ -349,7 +351,7 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
             hidden_size,
             kernel_size=kernel_size,
             stride=kernel_size,
-            bias=False,
+            bias=bias,
             device="cuda",
         )
         self._use_linear = torch.__version__.startswith("2.9.")
@@ -711,7 +713,7 @@ The output embeddings must be one of the following formats:
 """
 
 
-class Qwen2_5_VLForConditionalGeneration(nn.Module):
+class Qwen2_5_VLForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -1023,12 +1025,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             hidden_states,
             residual,
         )
-
-    def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
-        return self.language_model.compute_logits(input_data, hidden_states)
-
-    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.language_model.logits_from_hidden(hidden_states)
 
     def load_weights(self, weights, mp_load_progress=None):
         if not getattr(self, "skip_language", False) and self.language_model is not None:

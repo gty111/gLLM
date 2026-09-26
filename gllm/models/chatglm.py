@@ -23,6 +23,7 @@ from gllm.layers.linear import (
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 
+from .mixins import StandardCausalLMMixin
 from .weight_loader import (
     LoadContext,
     WeightRule,
@@ -224,7 +225,7 @@ class ChatGLMModel(nn.Module):
         return hidden_states
 
 
-class ChatGLMForCausalLM(nn.Module):
+class ChatGLMForCausalLM(StandardCausalLMMixin, nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -249,19 +250,6 @@ class ChatGLMForCausalLM(nn.Module):
             assert hidden_states is None and residual is None
             hidden_states = input_embeds
         return self.transformer(input_data, hidden_states)
-
-    def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
-        # fetch hidden_states of last token in each seq
-        idx_list = input_data.get_query_start_loc() - 1
-        return self.logits_from_hidden(hidden_states[idx_list[1:]])
-
-    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project the given hidden states to full-vocab logits (all positions).
-
-        Used by the prompt-logprobs path; ``compute_logits`` uses this after
-        selecting each seq's last position.
-        """
-        return self.lm_head(hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed explicit inputs for the generic piecewise graph runner."""

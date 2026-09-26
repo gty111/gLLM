@@ -104,13 +104,11 @@ from gllm.models.weight_loader import (
     h_proj_dim0,
     h_proj_dim1,
     h_qkv_proj_gated,
-    hv_proj_dim0,
-    hv_proj_dim1,
-    hv_qkv_fused_split,
     make_gdn_pre_pass,
-    run_vision_loader,
     run_weight_loader,
 )
+from gllm.models.mixins import StandardCausalLMMixin
+from gllm.models.mtp_utils import detached_head, load_remapped_weights
 from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 
 
@@ -1459,14 +1457,7 @@ class Qwen3_5MTP(nn.Module):
         # embed/lm_head — it shares the base's), so drop it for clarity.
         rules = [r for r in rules if r.name != "embed_lm_head"]
         ctx = parent_lm._make_load_context(weights)
-        for name, p in dict(self.named_parameters()).items():
-            src = self._src_key(name)
-            for rule in rules:
-                if rule.match(src):
-                    rule.handler(ctx, src, p.data)
-                    break
-            else:
-                p.data.copy_(get_tensor_from_dict(weights, src))
+        load_remapped_weights(self, rules, ctx, self._src_key)
 
 
 # ---------------------------------------------------------------------------
@@ -1474,7 +1465,7 @@ class Qwen3_5MTP(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class Qwen3_5ForCausalLM(nn.Module):
+class Qwen3_5ForCausalLM(StandardCausalLMMixin, nn.Module):
     """Text-only Qwen3.5 causal LM."""
 
     def __init__(self, config, model_type=Qwen3_5Model):
@@ -1574,22 +1565,6 @@ class Qwen3_5ForCausalLM(nn.Module):
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.model(input_data, hidden_states, residual)
 
-    def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
-        idx = input_data.get_query_start_loc() - 1
-        return self.logits_from_hidden(hidden_states[idx[1:]])
-
-    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project the given hidden states to full-vocab logits.
-
-        ``compute_logits`` gathers only each seq's last position (for
-        sampling); this projects *every* supplied position and is used by the
-        prompt-logprobs path.
-        """
-        return self.lm_head(hidden_states)
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
-
     # ----- weight loading --------------------------------------------------
 
     # Sub-keys of a GDN block filled en bloc by ``_load_gdn_layer_weights``
@@ -1647,9 +1622,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         # by its parameter path under ``model.*`` / ``lm_head``. The MTP head's
         # params live under ``mtp.*`` (no ``model.layers.N`` path), so detach it
         # for the base pass and load it separately below.
-        mtp = self.mtp
-        self.mtp = None
-        try:
+        with detached_head(self, "mtp") as mtp:
             ctx = self._make_load_context(weights)
             # qkv rule only fires when a full-attention layer exists; if none,
             # ``num_q_rows`` is 0 and no qkv_proj parameters are present anyway.
@@ -1666,12 +1639,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 ctx=ctx,
                 pre_passes=[make_gdn_pre_pass(self.GDN_SUBS, _load_gdn_layer_weights)],
             )
-        finally:
-            self.mtp = mtp
         # Then the MTP head's ``mtp.*`` weights, reusing this model's rule table
         # + load context (see Qwen3_5MTP.load_weights).
-        if self.mtp is not None:
-            self.mtp.load_weights(weights, self, mp_load_progress)
+        if mtp is not None:
+            mtp.load_weights(weights, self, mp_load_progress)
 
 
 # ---------------------------------------------------------------------------
@@ -1681,9 +1652,10 @@ class Qwen3_5ForCausalLM(nn.Module):
 # The VL wrapper is intentionally a thin subclass of
 # :class:`Qwen3VLForConditionalGeneration` so we reuse the entire vision
 # stack (patch embed, vision transformer blocks, deepstack mergers) and only
-# override the language model. The wrapper's ``load_weights`` is reimplemented
-# here because the parent's loader uses Qwen3-text projection names while our
-# language model exposes the GDN/full-attn hybrid names.
+# override the language model. The parent's ``load_weights`` already splits
+# the load into "delegate to ``self.language_model``" + vision rules that are
+# architecture-agnostic (``attn.qkv``/``linear_fc*``), so it is inherited
+# unchanged.
 
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration  # noqa: E402
 
@@ -1714,34 +1686,3 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # the language model by the Qwen3-VL parent.)
         lm = getattr(self, "language_model", None)
         return getattr(lm, "mtp", None) if lm is not None else None
-
-    def load_weights(self, weights, mp_load_progress=None):
-        # Language model load is delegated; it walks ``self.language_model``'s
-        # named_parameters() and slices each tensor for the current TP rank.
-        if not getattr(self, "skip_language", False) and self.language_model is not None:
-            self.language_model.load_weights(weights, mp_load_progress)
-
-        if not is_first_pp_rank():
-            return
-
-        # Encoder-disaggregation LM node skips the vision tower entirely.
-        if getattr(self, "skip_visual", False) or self.visual is None:
-            return
-
-        # Visual tower load: same pattern as ``Qwen3VLForConditionalGeneration``.
-        ctx = LoadContext(
-            weights=weights,
-            num_heads=self.visual.num_heads // get_tp_size(),
-            head_dim=self.visual.hidden_size // self.visual.num_heads,
-            extra={"prefix": "visual."},
-        )
-        rules = [
-            WeightRule(contains("attn.qkv"), hv_qkv_fused_split, "v_qkv"),
-            WeightRule(
-                contains("attn.proj.weight", "linear_fc2.weight"),
-                hv_proj_dim1,
-                "v_proj_dim1",
-            ),
-            WeightRule(contains("linear_fc1"), hv_proj_dim0, "v_fc1"),
-        ]
-        run_vision_loader(self.visual, weights, rules, ctx)

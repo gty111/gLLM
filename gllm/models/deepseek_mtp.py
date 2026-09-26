@@ -29,6 +29,7 @@ from gllm.layers.linear import ReplicatedLinear
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 
 from .deepseek_v32 import DeepseekV32DecoderLayer
+from .mtp_utils import load_remapped_weights, maybe_expert_pool
 
 
 class DeepseekMTP(nn.Module):
@@ -119,37 +120,22 @@ class DeepseekMTP(nn.Module):
         geometry). We remap each of THIS module's parameter names to the
         checkpoint's ``model.layers.{L}.*`` key via :meth:`_src_key`, so the exact
         same handlers that loaded layers 0..60 load the MTP block unchanged.
-        """
-        from .weight_loader import get_tensor_from_dict, moe_expert_load_pool
-        from .weight_utils import copy_single_proj_dim0
 
+        ``shared_head`` is this head's LM head (ParallelLMHead) and
+        ``embed_tokens`` is its VocabParallelEmbedding -- both are dim-0
+        (row/vocab) TP-sharded, like the base lm_head/embed. The base
+        ``contains("embed_tokens","lm_head")`` rule keys off those substrings,
+        which the remapped ``shared_head.head`` key lacks, so these two are
+        routed explicitly through the dim-0 slicer.
+        """
         rules = parent_lm.weight_rules()
         ctx = parent_lm._make_load_context(weights)
-        params = dict(self.named_parameters())
-
-        def _load_all():
-            for name, p in params.items():
-                src = self._src_key(name)
-                # ``shared_head`` is this head's LM head (ParallelLMHead) and
-                # ``embed_tokens`` is its VocabParallelEmbedding -- both are
-                # dim-0 (row/vocab) TP-sharded, like the base lm_head/embed. The
-                # base ``contains("embed_tokens","lm_head")`` rule keys off those
-                # substrings, which the remapped ``shared_head.head`` key lacks,
-                # so route these two explicitly through the dim-0 slicer.
-                if name.startswith("shared_head.") or name.startswith("embed_tokens."):
-                    copy_single_proj_dim0(p.data, get_tensor_from_dict(weights, src))
-                    continue
-                for rule in rules:
-                    if rule.match(src):
-                        rule.handler(ctx, src, p.data)
-                        break
-                else:
-                    p.data.copy_(get_tensor_from_dict(weights, src))
-
-        if ctx.num_experts is not None:
-            with moe_expert_load_pool(ctx.num_experts) as pool:
-                ctx.pool = pool
-                _load_all()
-        else:
-            _load_all()
+        with maybe_expert_pool(ctx):
+            load_remapped_weights(
+                self,
+                rules,
+                ctx,
+                self._src_key,
+                dim0_prefixes=("shared_head.", "embed_tokens."),
+            )
 

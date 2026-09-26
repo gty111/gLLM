@@ -28,6 +28,7 @@ from gllm.layers.linear import (
 from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 
+from .mixins import StandardCausalLMMixin
 from .utils import extract_rope_config
 from .weight_loader import (
     LoadContext,
@@ -221,7 +222,7 @@ class Qwen2Model(nn.Module):
         return self.embed_tokens(input_ids)
 
 
-class Qwen2ForCausalLM(nn.Module):
+class Qwen2ForCausalLM(StandardCausalLMMixin, nn.Module):
     def __init__(self, config, model_type=Qwen2Model):
         super().__init__()
         self.config = config
@@ -245,21 +246,6 @@ class Qwen2ForCausalLM(nn.Module):
 
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.model(input_data, hidden_states, residual)
-
-    def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
-        # fetch hidden_states of last token in each seq
-        idx_list = input_data.get_query_start_loc() - 1
-        return self.logits_from_hidden(hidden_states[idx_list[1:]])
-
-    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project the given hidden states to full-vocab logits.
-
-        ``compute_logits`` gathers only each seq's last position (for
-        sampling); this projects *every* supplied position and is used by the
-        prompt-logprobs path. Keeping it here means LM-head placement (tied
-        weights, TP gather, multimodal nesting) stays a model-internal detail.
-        """
-        return self.lm_head(hidden_states)
 
     def weight_rules(self):
         """Ordered ``(match, handler)`` table for this rank's parameters.
@@ -303,6 +289,3 @@ class Qwen2ForCausalLM(nn.Module):
             start_layer=self.model.start_layer,
             ctx=self._make_load_context(weights),
         )
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
