@@ -220,7 +220,7 @@ class LLM:
             num_worker_start = 0
             for i in self.mp_alive:
                 if i == -1:
-                    sys.exit()
+                    sys.exit(1)
                 num_worker_start += i
             if num_worker_start == self.num_workers:
                 break
@@ -381,7 +381,7 @@ class LLM:
     def check_worker_alive(self):
         for i in self.mp_alive:
             if i == -1:
-                sys.exit()
+                sys.exit(1)
 
     def add_requests(self, requests: List[GenerationSequence]):
         with self._pending_lock:
