@@ -1,48 +1,17 @@
-from types import SimpleNamespace
-
 import pytest
 import torch
 
-from gllm.runtime.model_runner import DisaggSeqState, EmbeddingInfo, ModelRunner
+from gllm.runtime.model_runner import DisaggSeqState, EmbeddingInfo
 from gllm.runtime.sequence import GenerationSequence
-
-
-def make_runner(uses_mrope, tuple_output):
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.uses_mrope = uses_mrope
-    runner.hidden_size = 4
-    runner.input_hidden_states = torch.empty((32, 4))
-    runner.embedding_cache = {}
-    runner.disagg_embeds = {}
-    weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4)
-    calls = []
-
-    def embed(ids, media, mask):
-        calls.append(ids.clone())
-        value = torch.nn.functional.embedding(ids.masked_fill(mask, 0), weight)
-        deepstack = None
-        if media is not None:
-            rows = torch.cat(media)
-            value[mask] = rows[:, :4]
-            if rows.shape[1] > 4:
-                deepstack = torch.zeros((1, ids.numel(), 4), dtype=value.dtype)
-                deepstack[0, mask] = rows[:, 4:]
-        return (value, deepstack) if tuple_output else value
-
-    runner.model = SimpleNamespace(
-        get_mm_placeholder_token_ids=lambda: [126, 127],
-        embed_input_ids=embed,
-    )
-    return runner, weight, calls
 
 
 @pytest.mark.parametrize('uses_mrope', [False, True])
 @pytest.mark.parametrize('tuple_output', [False, True])
 @torch.inference_mode()
-def test_chunks_match_full_embedding_and_keep_no_prompt_tensor(uses_mrope, tuple_output):
+def test_chunks_match_full_embedding_and_keep_no_prompt_tensor(make_mm_runner, uses_mrope, tuple_output):
     if uses_mrope and not torch.cuda.is_available():
         pytest.skip('MRoPE staging requires CUDA pinned memory')
-    runner, weight, calls = make_runner(uses_mrope, tuple_output)
+    runner, weight, calls = make_mm_runner(uses_mrope, tuple_output)
     tokens = [10, 11, 126, 13, 14, 15, 16, 17, 18, 19]
     seq = GenerationSequence(1, tokens, [], output_len=8)
     reference_ids = torch.tensor(tokens).masked_fill(torch.tensor(tokens) >= 126, 0)
@@ -89,8 +58,8 @@ def test_chunks_match_full_embedding_and_keep_no_prompt_tensor(uses_mrope, tuple
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA pinned memory')
 @torch.inference_mode()
-def test_mixed_decode_text_and_cached_image_keep_positions_and_deepstack():
-    runner, weight, calls = make_runner(True, True)
+def test_mixed_decode_text_and_cached_image_keep_positions_and_deepstack(make_mm_runner):
+    runner, weight, calls = make_mm_runner(True, True)
     decode = GenerationSequence(1, [10, 11, 12], [], output_len=8)
     decode.prompt_len = 2
     decode.computed_token_num = 2
@@ -127,8 +96,8 @@ def test_mixed_decode_text_and_cached_image_keep_positions_and_deepstack():
 
 @pytest.mark.parametrize('prefix_start', [0, 2])
 @torch.inference_mode()
-def test_visual_chunks_cross_images_prefix_hits_and_preemption(prefix_start):
-    runner, weight, calls = make_runner(False, True)
+def test_visual_chunks_cross_images_prefix_hits_and_preemption(make_mm_runner, prefix_start):
+    runner, weight, calls = make_mm_runner(False, True)
     runner.mm_embed_cache = {}
     tokens = [10, 126, 126, 126, 20, 127, 127, 30, 31, 32]
     mask = torch.tensor(tokens) >= 126
@@ -179,8 +148,8 @@ def test_visual_chunks_cross_images_prefix_hits_and_preemption(prefix_start):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA pinned memory')
 @torch.inference_mode()
-def test_disaggregated_visual_features_expand_with_ready_prefix():
-    runner, weight, calls = make_runner(True, True)
+def test_disaggregated_visual_features_expand_with_ready_prefix(make_mm_runner):
+    runner, weight, calls = make_mm_runner(True, True)
     tokens = [10, 11, 126, 126, 20, 21, 127, 127, 30]
     mask = torch.tensor(tokens) >= 126
     features = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4) + 1000

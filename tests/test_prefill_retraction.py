@@ -5,30 +5,14 @@ import pytest
 
 from gllm.runtime.sequence import GenerationSequence
 from gllm.scheduling.distributed import DriverPayloadBuilder, FollowerSeqStore
-from test_prefix_cache_reuse import prefix_manager
-from test_scheduler_liveness import scheduler
-
-
-def stalled_requests(*, method="chunked_prefill", count=2, pages_each=5):
-    mm, _, _ = prefix_manager(pages=count * pages_each)
-    s = scheduler(mm, method)
-    requests = []
-    for sid in range(1, count + 1):
-        request = GenerationSequence(sid, [sid] * 128, [], output_len=3)
-        request.page_table = [
-            mm.segment.allocate(request, end)
-            for end in range(16, pages_each * 16 + 1, 16)
-        ]
-        request.computed_token_num = pages_each * 16
-        requests.append(request)
-    s.add_new_requests(requests)
-    return s, requests
 
 
 @pytest.mark.parametrize("method", ["chunked_prefill", "split_pd", "token_throttling"])
 @pytest.mark.parametrize("chunk", [16, 64, 128])
 @pytest.mark.parametrize("count", [2, 3])
-def test_retracted_requests_all_finish_without_errors_or_retraction_loop(method, chunk, count):
+def test_retracted_requests_all_finish_without_errors_or_retraction_loop(
+    stalled_requests, method, chunk, count
+):
     s, requests = stalled_requests(method=method, count=count)
     s.maxp = chunk
     victim = requests[0]
@@ -70,7 +54,7 @@ def test_retracted_requests_all_finish_without_errors_or_retraction_loop(method,
     assert not s._prefill_recovery_ids
 
 
-def test_full_retraction_releases_state_and_preserves_generated_history():
+def test_full_retraction_releases_state_and_preserves_generated_history(stalled_requests):
     s, requests = stalled_requests()
     victim = requests[0]
     # This request already generated tokens before an earlier recompute.
@@ -102,9 +86,9 @@ def test_full_retraction_releases_state_and_preserves_generated_history():
     assert not s._pending_request_errors and not s._pending_follower_frees
 
 
-def test_shared_prefix_remains_owned_by_survivor_until_it_finishes():
+def test_shared_prefix_remains_owned_by_survivor_until_it_finishes(prefix_manager, make_scheduler):
     mm, _, _ = prefix_manager(pages=8)
-    s = scheduler(mm)
+    s = make_scheduler(mm)
     s.maxp = 16
     a = GenerationSequence(1, [7] * 32 + [1] * 80, [], output_len=3)
     b = GenerationSequence(2, [7] * 32 + [2] * 80, [], output_len=3)
@@ -132,7 +116,7 @@ def test_shared_prefix_remains_owned_by_survivor_until_it_finishes():
     assert mm.get_num_free_pages() == 8
 
 
-def test_cancelling_retracted_request_restores_normal_admission():
+def test_cancelling_retracted_request_restores_normal_admission(stalled_requests):
     s, requests = stalled_requests()
     assert not s.schedule_once()
     s.abort_ids.add(requests[0].seq_id)
@@ -141,9 +125,9 @@ def test_cancelling_retracted_request_restores_normal_admission():
     assert not s._prefill_recovery_ids
 
 
-def test_external_image_wait_does_not_fail_a_capacity_blocked_neighbor():
+def test_external_image_wait_does_not_fail_a_capacity_blocked_neighbor(prefix_manager, make_scheduler):
     mm, _, _ = prefix_manager(pages=1)
-    s = scheduler(mm)
+    s = make_scheduler(mm)
     image = GenerationSequence(1, [1] * 16, [], output_len=1)
     image.page_table = [mm.segment.allocate()]
     image.computed_token_num = 8
