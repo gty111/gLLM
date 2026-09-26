@@ -748,31 +748,57 @@ class Worker(TorchProfilerMixin):
             ssm_restores=ssm_restores,
         )
 
-    def _schedule_forward_dp(self):
-        """DP-attention + EP scheduling step (lockstep across replicas).
+    def _dp_forward_barrier(self, real_ntok: int, is_decode: bool):
+        """Cross-DP lockstep barrier: agree on who runs + the graph decision.
 
         Every replica schedules its *own* shard independently, so the batches
         (and even whether a replica has any work) differ per replica. But the
         MoE layers run a collective (all-gather + all-reduce) over the whole DP
         group, so all replicas must enter -- and stay in -- the forward
         together. We enforce that with a single unconditional all-gather of the
-        per-replica token count each iteration:
+        per-replica token count each iteration.
 
-        * if *every* replica is idle, all skip the forward in unison;
-        * otherwise all replicas forward. An idle replica runs a 1-token dummy
-          batch so every kernel still sees >=1 token; its dummy row rides along
-          in the MoE gather and its sampled token is discarded.
+        ``is_decode`` must mark this group's step as pure decode; idle groups
+        pass ``True`` so they don't veto the graph path (their 1-token dummy is
+        a decode step).
 
-        The published forward counts (``set_dp_forward_counts``) tell each MoE
-        layer how to size / slice the gather. There are two shapes:
+        Returns ``(counts_to_publish, padded_size)``, or ``None`` when *every*
+        group is idle -- the caller then skips the forward in unison (a lone
+        MoE collective would hang). ``counts_to_publish`` is what
+        ``set_dp_forward_counts`` (and, under PP, the schedule payload) should
+        carry. The published counts tell each MoE layer how to size / slice the
+        gather, in two shapes:
 
-        * **Pure decode across *all* groups** -> take the CUDA-graph path: pad
-          every group to one common bucket (the smallest captured bucket
+        * **Pure decode across *all* groups** -> the CUDA-graph path: every
+          group publishes one common bucket (the smallest captured bucket
           ``>= max`` over the groups) so the global MoE batch is a static
           ``dp_size * bucket`` (SGLang's MAX_LEN mode) that the captured
           gather/all-reduce can replay.
-        * **Any prefill / mixed / bucket-miss** -> eager, variable-length gather
-          (SGLang's SUM_LEN mode); no graph.
+        * **Any prefill / mixed / bucket-miss** -> eager, variable-length
+          gather (SGLang's SUM_LEN mode); no graph. Idle groups publish their
+          1-token dummy size.
+        """
+        real_counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
+        if sum(real_counts) == 0:
+            return None
+        # Idle replicas pad to a 1-token dummy so all kernels see >=1 token.
+        fwd_counts = [c if c > 0 else 1 for c in real_counts]
+        # Graph only when *every* group is a pure-decode (or idle-dummy) step
+        # and a common captured bucket covers the largest group.
+        padded_size = None
+        if all(bool(d) for d in decode_flags):
+            padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
+        counts_to_publish = (
+            [padded_size] * self.dp_size if padded_size is not None else fwd_counts
+        )
+        return counts_to_publish, padded_size
+
+    def _schedule_forward_dp(self):
+        """DP-attention + EP scheduling step (lockstep across replicas).
+
+        Runs the cross-DP barrier (:meth:`_dp_forward_barrier`), pads an idle
+        local group with a 1-token dummy whose sampled token is discarded, and
+        forwards. TP token fan-out within a DP group is unchanged.
         """
         schedule_seqs = self.scheduler.schedule_once()
         real_ntok = 0
@@ -786,26 +812,17 @@ class Worker(TorchProfilerMixin):
 
         # Unconditional per-iter barrier: agree on who runs and whether the whole
         # world can take the graph path this step.
-        real_counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
-        if sum(real_counts) == 0:
+        barrier = self._dp_forward_barrier(real_ntok, is_decode)
+        if barrier is None:
             return
+        counts_to_publish, padded_size = barrier
 
         # Idle replicas pad to a 1-token dummy so all kernels see >=1 token.
-        fwd_counts = [c if c > 0 else 1 for c in real_counts]
         if real_ntok == 0:
             dummy_seqs = self.model_runner.create_dummy_seqs(1, runtime=True)
             self.model_runner.prepare_input(dummy_seqs)
 
-        # Graph only when *every* group is a pure-decode (or idle-dummy) step and
-        # a common captured bucket covers the largest group.
-        padded_size = None
-        if all(bool(d) for d in decode_flags):
-            padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
-
-        if padded_size is not None:
-            set_dp_forward_counts([padded_size] * self.dp_size)
-        else:
-            set_dp_forward_counts(fwd_counts)
+        set_dp_forward_counts(counts_to_publish)
         try:
             output = self.model_runner.step_once(dp_padded_size=padded_size)
         finally:
@@ -849,21 +866,14 @@ class Worker(TorchProfilerMixin):
             real_ntok = int(self.model_runner.input_data.tokens_cpu.shape[0])
             is_decode = self.model_runner.check_decode_batch()
 
-        real_counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
-        if sum(real_counts) == 0:
+        barrier = self._dp_forward_barrier(real_ntok, is_decode)
+        if barrier is None:
             return
+        counts_to_publish, padded_size = barrier
 
-        fwd_counts = [c if c > 0 else 1 for c in real_counts]
         if real_ntok == 0:
             dummy_seqs = self.model_runner.create_dummy_seqs(1, runtime=True)
             self.model_runner.prepare_input(dummy_seqs)
-
-        padded_size = None
-        if all(bool(d) for d in decode_flags):
-            padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
-        counts_to_publish = (
-            [padded_size] * self.dp_size if padded_size is not None else fwd_counts
-        )
 
         # Ship this column's schedule delta (real work) or a dummy marker to the
         # PP-other stages, piggybacking the agreed DP counts + graph bucket.

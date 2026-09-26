@@ -54,7 +54,6 @@ from dataclasses import dataclass, field
 import torch
 
 from gllm.distributed.parallel_state import (
-    dp_all_gather_meta,
     get_pp_size,
     is_dp_attn,
     is_first_pp_rank,
@@ -933,22 +932,16 @@ class OverlapWorker(Worker):
             else:
                 real_ntok = 0
                 is_decode = True  # idle groups don't veto the graph path
-            counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
-            if sum(counts) == 0:
+            barrier = self._dp_forward_barrier(real_ntok, is_decode)
+            if barrier is None:
                 # Nobody has work: skip the forward in unison, drain the pipe.
                 self._drain_pending()
                 return
+            counts_to_publish, dp_padded_size = barrier
             if input_data is None:
                 input_data = self._build_dummy_input(1)
                 is_dummy = True
-            fwd_counts = [c if c > 0 else 1 for c in counts]
-            if all(bool(d) for d in decode_flags):
-                dp_padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
-            set_dp_forward_counts(
-                [dp_padded_size] * self.dp_size
-                if dp_padded_size is not None
-                else fwd_counts
-            )
+            set_dp_forward_counts(counts_to_publish)
 
         if input_data is not None:
             # Keep the InputData alive in ``_gpu_pending`` until the batch
