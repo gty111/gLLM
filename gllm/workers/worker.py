@@ -378,6 +378,8 @@ class Worker(TorchProfilerMixin):
             # zmq fanout and its own ``_pending_follower_frees``
             # accumulator, so the cursors must be per-rank.
             self.payload_builder = DriverPayloadBuilder()
+            # Stamp Prometheus stats onto every outbound frontend package.
+            self.comm._metrics_hook = self._send_output_metrics
         else:
             # Per-rank state mirror. Replaces the stateless "rebuild
             # InputData from a freshly-pickled GenerationSequence list every iter"
@@ -716,6 +718,20 @@ class Worker(TorchProfilerMixin):
         ipc_package = self.scheduler.process_output()
         if ipc_package is not None and self._polls_frontend():
             self.comm.send_output(ipc_package)
+
+    def _send_output_metrics(self, ipc_package):
+        """Stamp worker Prometheus stats onto an outbound package.
+
+        Funnel point: every overlap / non-overlap finalisation path that ships
+        a package to the frontend goes through here, so this is where the
+        :class:`EngineStats` snapshot (KV / batch / iteration counters) is
+        attached. Overridden to be a no-op on ranks that don't own a scheduler.
+        """
+        try:
+            if getattr(self, "scheduler", None) is not None:
+                self.scheduler.flush_stats(ipc_package)
+        except Exception:
+            pass
 
     def _build_schedule_payload(
         self,

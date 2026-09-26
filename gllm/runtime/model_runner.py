@@ -337,7 +337,12 @@ class ModelRunner:
         mtp_k: int = 3,
         mtp_max_batch: int = 0,
         ssm_snapshot_stride_tokens: int = 256,
+        enable_metrics: bool = False,
     ):
+        # Prometheus opt-in. Stored on the runner so it survives the spawn
+        # pickle into each worker, where ``Scheduler`` reads it to decide
+        # whether to build its :class:`EngineStats` accumulator.
+        self.enable_metrics = bool(enable_metrics)
 
         self.max_num_batched_tokens = (
             maxp if schedule_method in ["chunked_prefill", "split_pd"] else maxp + maxd

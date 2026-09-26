@@ -63,6 +63,11 @@ class IPCPackage:
         # prefill. Each value is the seq's ``prompt_logprobs_data`` list
         # (per prompt position: ``None`` or ``(token_id, logprob, ids, vals)``).
         self.prompt_logprobs = {}
+        # worker => front-end optional stats payload (dict, e.g. KV-cache /
+        # GPU-memory counters collected by ``gllm.observability``). Small and
+        # rarely-changing values; the frontend folds it into its Prometheus
+        # registry. ``None`` when metrics are disabled.
+        self.stats = None
 
     def is_input_empty(self) -> bool:
         """True iff this package carries no front-end => worker work.
@@ -334,7 +339,20 @@ class zmqComm:
             return None
 
     def send_output(self, output):
+        hook = self._metrics_hook
+        if hook is not None and output is not None:
+            try:
+                hook(output)
+            except Exception:
+                pass
         self.output_socket.send_pyobj(output)
+
+    # Hook set by the owning Worker (``Worker._init_role_state``) so that every
+    # package shipped to the frontend -- across all finalisation paths, overlap
+    # and non-overlap alike -- gets the worker's Prometheus stats stamped on it.
+    # ``None`` outside a worker context (e.g. tests / bare comm), in which case
+    # :meth:`send_output` just forwards unchanged.
+    _metrics_hook = None
 
     def recv_output(self):
         if self.output_socket.poll(timeout=0) != 0:

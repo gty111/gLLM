@@ -1,7 +1,9 @@
 import argparse
 import asyncio
 import json
+import os
 import traceback
+import uuid
 from http import HTTPStatus
 from pathlib import Path
 from typing import Optional
@@ -17,6 +19,7 @@ from logger import logger
 from gllm.engine.async_llm import AsyncLLM
 from gllm.runtime.sequence import RequestCapacityError
 from gllm.entrypoints import cli_args
+from gllm.observability.metrics import get_frontend_metrics, set_frontend_model_name
 from gllm.entrypoints.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -67,7 +70,7 @@ def _abort_stream(stream):
 class RequestStreamingResponse(StreamingResponse):
     """Own engine cancellation even while the consumer is blocked in send()."""
 
-    def __init__(self, content, stream):
+    def __init__(self, content, stream, on_complete=None):
         async def with_errors():
             try:
                 async for chunk in content:
@@ -80,6 +83,7 @@ class RequestStreamingResponse(StreamingResponse):
                 yield "event: error\ndata: " + json.dumps(error) + "\n\n"
         super().__init__(content=with_errors(), media_type="text/event-stream")
         self.engine_stream = stream
+        self._on_complete = on_complete
 
     async def __call__(self, scope, receive, send):
         try:
@@ -88,6 +92,11 @@ class RequestStreamingResponse(StreamingResponse):
             # Covers disconnect, send failure, cancellation, and early parser
             # termination. A normally finished stream makes this a no-op.
             _abort_stream(self.engine_stream)
+            if self._on_complete is not None:
+                try:
+                    self._on_complete()
+                except Exception:
+                    pass
 
 
 def _openai_error(
@@ -102,6 +111,61 @@ def _openai_error(
         error=ErrorDetail(message=message, type=error_type, param=param, code=code)
     )
     return JSONResponse(status_code=status_code, content=body.model_dump())
+
+
+def _metrics_request_key(request_id: str) -> str:
+    return f"{id(llm)}:{request_id}"
+
+
+def _metrics_begin(request_id: str, method: str, *, streaming: bool,
+                   prompt_tokens: int) -> None:
+    """Register a request with the frontend metrics registry."""
+    m = get_frontend_metrics()
+    if m.enabled:
+        m.begin_request(
+            _metrics_request_key(request_id), method,
+            streaming=streaming, prompt_tokens=prompt_tokens,
+        )
+
+
+def _metrics_finish(request_id: str, *, error: bool = False,
+                    finish_reason: Optional[str] = None) -> None:
+    """Drop a request from the registry; observes E2E/ITL/token histograms."""
+    m = get_frontend_metrics()
+    if m.enabled:
+        m.finish_request(
+            _metrics_request_key(request_id), error=error,
+            finish_reason=finish_reason,
+        )
+
+
+def _metrics_track_stream(request_id: str, stream):
+    """Bind an AsyncStream to its request so stream events update metrics.
+
+    Called from the entrypoint right after ``add_requests_async`` returns.
+    Wraps ``AsyncStream.put`` so that each token delta observed by the
+    frontend triggers a ``first_token`` / ``token`` observation in
+    :class:`FrontendMetrics`.  Idempotent: a stream can be wrapped at most
+    once, so wrapping multiple times is safe.
+    """
+    m = get_frontend_metrics()
+    if not m.enabled or stream is None:
+        return
+    key = _metrics_request_key(request_id)
+    if getattr(stream, "_metrics_wrapped", False):
+        return
+    orig_put = stream.put
+
+    def patched_put(item):
+        orig_put(item)
+        # StreamOutput carries ``.text``; error / StopAsyncIteration items do not.
+        if not hasattr(item, "text") or isinstance(item, BaseException):
+            return
+        m.first_token(key)
+        m.token(key, 1)
+
+    stream.put = patched_put
+    stream._metrics_wrapped = True
 
 
 def _served_model_ids():
@@ -392,6 +456,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             num_prompt_logprobs=num_prompt_logprobs,
             structured_output=structured_output,
         )
+        # Prometheus: register this request for lifecycle metrics.
+        rid = uuid.uuid4().hex
+        _metrics_begin(rid, "chat_completion", streaming=bool(request.stream),
+                       prompt_tokens=len(token_ids))
+        _metrics_track_stream(rid, stream)
     else:
         return _openai_error(
             "This request exceeds the model's maximum context length.",
@@ -406,7 +475,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         generator = chat_completion_stream_generator(
             stream, request, tool_parser, reasoning_parser
         )
-        return RequestStreamingResponse(generator, stream)
+        return RequestStreamingResponse(
+            generator, stream, on_complete=lambda: _metrics_finish(rid)
+        )
     else:
         try:
             generator = await chat_completion_generator(
@@ -416,6 +487,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
         finally:
             _abort_stream(stream)
+        _metrics_finish(rid)
         return JSONResponse(content=generator.model_dump(exclude_none=True))
 
 
@@ -529,6 +601,11 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         dp_index=getattr(raw_request.app.state, "dp_index", None),
         structured_output=structured_output,
     )
+    # Prometheus: register this request for lifecycle metrics.
+    rid = uuid.uuid4().hex
+    _metrics_begin(rid, "response", streaming=bool(request.stream),
+                   prompt_tokens=len(token_ids))
+    _metrics_track_stream(rid, stream)
     reasoning_parser = create_reasoning_parser(
         getattr(llm.model_runner, "tokenizer", None), token_ids
     )
@@ -565,7 +642,9 @@ async def create_response(request: ResponseRequest, raw_request: Request):
                                 })
                     yield line
             generator = storing_generator()
-        return RequestStreamingResponse(generator, stream)
+        return RequestStreamingResponse(
+            generator, stream, on_complete=lambda: _metrics_finish(rid)
+        )
     try:
         response = await response_completion_generator(
             stream, request, chat_request, tool_parser, reasoning_parser
@@ -574,6 +653,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         return _openai_error(str(exc), status_code=500, code="invalid_tool_output")
     finally:
         _abort_stream(stream)
+        _metrics_finish(rid)
     if request.store:
         normalized_input = (
             [{"type": "message", "role": "user", "content": request.input}]
@@ -636,6 +716,11 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             prompt_logprobs_enabled=prompt_logprobs_enabled,
             num_prompt_logprobs=num_prompt_logprobs,
         )
+        # Prometheus: register this request for lifecycle metrics.
+        rid = uuid.uuid4().hex
+        _metrics_begin(rid, "completion", streaming=bool(request.stream),
+                       prompt_tokens=len(token_ids))
+        _metrics_track_stream(rid, stream)
     else:
         return _openai_error(
             "This request exceeds the model's maximum context length.",
@@ -645,12 +730,15 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
         )
     if request.stream:
         generator = completion_stream_generator(stream, request)
-        return RequestStreamingResponse(generator, stream)
+        return RequestStreamingResponse(
+            generator, stream, on_complete=lambda: _metrics_finish(rid)
+        )
     else:
         try:
             generator = await completion_generator(stream, request)
         finally:
             _abort_stream(stream)
+        _metrics_finish(rid)
         return JSONResponse(content=generator.model_dump())
 
 
@@ -664,6 +752,14 @@ async def start_profile():
 async def stop_profile():
     await llm.stop_profile_async()
     return JSONResponse(content={"message": "Profiler stopped", "success": True})
+
+
+@router.get("/metrics")
+async def metrics_endpoint():
+    """Prometheus text-format scrape endpoint."""
+    m = get_frontend_metrics()
+    body = m.render()
+    return fastapi.Response(content=body, media_type=m.content_type())
 
 
 def _build_app(dp_index=None):
@@ -916,6 +1012,19 @@ def main():
         assigned_layers=args.assigned_layers,
         **cli_args.engine_kwargs(args),
     )
+
+    # Bind the model identity so /metrics request counters carry a real
+    # ``model=`` label (no-op when metrics are disabled).
+    # Prefer the stable HF-style alias (e.g. "Qwen/Qwen3-0.6B") over the raw
+    # checkpoint path for a readable Prometheus label.
+    _mids = {mid for mid in args.model_path.split(os.sep)
+             if mid.startswith("models--")}
+    _label = (
+        sorted(_mids)[0].removeprefix("models--").replace("--", "/")
+        if _mids
+        else (os.path.basename(args.model_path) or args.model_path)
+    )
+    set_frontend_model_name(_label)
 
     resolve_tool_parser(args.tool_call_parser)
 

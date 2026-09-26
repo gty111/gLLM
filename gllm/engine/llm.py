@@ -78,7 +78,15 @@ class LLM:
         mtp_k=3,
         mtp_max_batch=0,
         ssm_snapshot_stride_tokens=256,
+        enable_metrics=False,
     ):
+        # Resolve the Prometheus opt-in and initialise the frontend singleton
+        # *before* anything else touches it, so the serving entrypoint's
+        # request-lifecycle hooks see the correct enabled state.
+        from gllm.observability.metrics import init_frontend_metrics
+
+        init_frontend_metrics(enable_metrics)
+        self.enable_metrics = bool(enable_metrics)
         init_logger()
         self.model_path = model_path
         self.load_format = load_format
@@ -130,6 +138,7 @@ class LLM:
             mtp_k=mtp_k,
             mtp_max_batch=mtp_max_batch,
             ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
+            enable_metrics=enable_metrics,
         )
         self._reasoning_controls = reasoning_control_tokens(self.model_runner.tokenizer)
         self.pp_size = pp_size
@@ -183,6 +192,12 @@ class LLM:
         self.abort_ids: List[int] = []
         self.running_maps: Dict[int, GenerationSequence] = dict()  # seq_id => GenerationSequence
         self.async_streams = None
+        # Prometheus frontend metrics (no-op stand-ins when the soft
+        # dependency is missing or disabled). Created before workers exist so
+        # the serving entrypoint can bind the loaded model identity later.
+        from gllm.observability.metrics import get_frontend_metrics
+
+        self.metrics = get_frontend_metrics()
         # Guards the newly-arrived ``wait_lists`` / ``abort_ids`` hand-off queues.
         # The async server runs both request intake (``add_requests``) and the
         # engine step (``send_ipc_package``) on the event loop's default
@@ -395,7 +410,13 @@ class LLM:
             ipc_package: IPCPackage = self.comm.recv_output()
             if ipc_package is None:
                 break
+            stats = getattr(ipc_package, "stats", None)
             num_finish += self._apply_ipc_package(ipc_package)
+            if stats:
+                self.metrics.update_from_engine_stats(stats)
+                self.metrics.set_queue_gauges(
+                    len(self.running_maps), len(self.wait_lists)
+                )
         return num_finish
 
     def _make_logprob_entry(self, token_id, lp):
