@@ -45,6 +45,7 @@ forward and sampled token tensors flow back to every stage on CUDA streams;
 the worker thread never stages the dependency through CPU or ZMQ.
 """
 
+import dataclasses
 import os
 import queue
 import threading
@@ -64,7 +65,7 @@ from gllm.distributed.parallel_state import (
 from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import OverlapModelRunner
 from gllm.scheduling.scheduler import OverlapScheduler
-from gllm.workers.worker import Worker
+from gllm.workers.worker import Worker, run_worker
 from logger import logger
 
 
@@ -298,31 +299,12 @@ class OverlapWorker(Worker):
             # piggyback on the same delta, matching the non-overlap PP path.
             ctx = self.model_runner._pending_mm_ctx
             if ctx is not None and self.model_runner.uses_mrope:
-                import dataclasses
-
                 payload = dataclasses.replace(
                     payload, mrope_positions=ctx["mrope_positions"]
                 )
             self.comm.send_schedule_payload(payload)
         self.model_runner.prepare_input_gpu()
         return self.model_runner.run_batch_async(dp_padded_size=dp_padded_size)
-
-    def _build_dummy_input(self, size: int = 1) -> InputData:
-        """Build a throwaway ``size``-token decode batch for an idle DP group.
-
-        Idle groups must still enter the forward (its MoE layers run a
-        collective over the whole DP/EP world), so they ride along with a dummy
-        batch whose sampled tokens are discarded. The dummy references the
-        memory manager's dummy pages, so it never touches real KV state.
-        """
-        seqs = self.model_runner.create_dummy_seqs(size, runtime=True)
-        dummy = InputData(
-            use_buffer=False,
-            memory_manager=self.model_runner.memory_manager,
-            max_seq_length=self.model_runner.model_max_length,
-        )
-        dummy.cal_input(seqs)
-        return dummy
 
     def _collect_batch(self, entry) -> None:
         """Wait for a batch's D2H copy and finalize its seq state.
@@ -989,16 +971,8 @@ class OverlapWorker(Worker):
         self._build_prefetched_input()
 
 
-def run_overlap_worker(worker: OverlapWorker):
-    """Tight per-iter loop for the overlap path."""
-    try:
-        worker.init()
-        while True:
-            if worker.pp_rank == 0:
-                worker.run_pp0()
-            else:
-                worker.run_other()
-    except KeyboardInterrupt:
-        worker.handle_keyboardInterrupt()
-    except Exception as e:
-        worker.handle_exception(e)
+# The two worker classes share the per-iter loop contract (``init`` then
+# ``run_pp0`` / ``run_other`` dispatched on ``pp_rank``), so a single entry
+# point in :mod:`gllm.workers.worker` serves both. Kept under its historical
+# name for ``gllm.engine.llm``'s import.
+run_overlap_worker = run_worker

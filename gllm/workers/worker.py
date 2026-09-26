@@ -35,6 +35,7 @@ PP>1 specifics
   pre-refactor).
 """
 
+import dataclasses
 import logging
 import os
 import sys
@@ -391,6 +392,23 @@ class Worker(TorchProfilerMixin):
     # PP-other receive / forward (unchanged behaviour, sockets per-column)
     # ------------------------------------------------------------------
 
+    def _build_dummy_input(self, size: int = 1) -> InputData:
+        """Build a throwaway ``size``-token decode batch for an idle DP group.
+
+        Idle groups must still enter the forward (its MoE layers run a
+        collective over the whole DP/EP world), so they ride along with a dummy
+        batch whose sampled tokens are discarded. The dummy references the
+        memory manager's dummy pages, so it never touches real KV state.
+        """
+        seqs = self.model_runner.create_dummy_seqs(size, runtime=True)
+        dummy = InputData(
+            use_buffer=False,
+            memory_manager=self.model_runner.memory_manager,
+            max_seq_length=self.model_runner.model_max_length,
+        )
+        dummy.cal_input(seqs)
+        return dummy
+
     def recv_schedule_payload(self) -> None:
         """Poll for one :class:`SchedulePayload`, apply it, queue InputData.
 
@@ -432,13 +450,7 @@ class Worker(TorchProfilerMixin):
         # a dummy input of the agreed size so this stage still joins the MoE
         # collective; its sampled output is discarded (never sent to the driver).
         if payload.dp_dummy_size > 0:
-            dummy_seqs = self.model_runner.create_dummy_seqs(payload.dp_dummy_size, runtime=True)
-            input_data = InputData(
-                use_buffer=False,
-                memory_manager=self.model_runner.memory_manager,
-                max_seq_length=self.model_runner.model_max_length,
-            )
-            input_data.cal_input(dummy_seqs)
+            input_data = self._build_dummy_input(payload.dp_dummy_size)
             input_data.dp_counts = payload.dp_counts
             input_data.dp_padded_size = payload.dp_padded_size
             input_data.dp_dummy = True
@@ -793,14 +805,15 @@ class Worker(TorchProfilerMixin):
         )
         return counts_to_publish, padded_size
 
-    def _schedule_forward_dp(self):
-        """DP-attention + EP scheduling step (lockstep across replicas).
+    def _dp_prepare_and_barrier(self, schedule_seqs):
+        """Schedule-side half of the DP lockstep, shared by PP=1 and PP>1.
 
-        Runs the cross-DP barrier (:meth:`_dp_forward_barrier`), pads an idle
-        local group with a 1-token dummy whose sampled token is discarded, and
-        forwards. TP token fan-out within a DP group is unchanged.
+        Measures the local batch (idle groups report 0 tokens / decode so they
+        don't veto the graph path), runs the cross-DP barrier, and pads an idle
+        local group with a 1-token dummy so all kernels see >=1 token. Returns
+        ``(real_ntok, counts_to_publish, padded_size)``, or ``None`` when every
+        group is idle and the caller must skip the forward in unison.
         """
-        schedule_seqs = self.scheduler.schedule_once()
         real_ntok = 0
         # Idle groups have no batch; treat them as decode so they don't veto the
         # graph path (their 1-token dummy is a decode step).
@@ -814,13 +827,27 @@ class Worker(TorchProfilerMixin):
         # world can take the graph path this step.
         barrier = self._dp_forward_barrier(real_ntok, is_decode)
         if barrier is None:
-            return
+            return None
         counts_to_publish, padded_size = barrier
 
         # Idle replicas pad to a 1-token dummy so all kernels see >=1 token.
         if real_ntok == 0:
             dummy_seqs = self.model_runner.create_dummy_seqs(1, runtime=True)
             self.model_runner.prepare_input(dummy_seqs)
+        return real_ntok, counts_to_publish, padded_size
+
+    def _schedule_forward_dp(self):
+        """DP-attention + EP scheduling step (lockstep across replicas).
+
+        Runs the cross-DP barrier (:meth:`_dp_forward_barrier`), pads an idle
+        local group with a 1-token dummy whose sampled token is discarded, and
+        forwards. TP token fan-out within a DP group is unchanged.
+        """
+        schedule_seqs = self.scheduler.schedule_once()
+        prepared = self._dp_prepare_and_barrier(schedule_seqs)
+        if prepared is None:
+            return
+        real_ntok, counts_to_publish, padded_size = prepared
 
         set_dp_forward_counts(counts_to_publish)
         try:
@@ -856,24 +883,11 @@ class Worker(TorchProfilerMixin):
         stages, which replay them without re-running the barrier. Sampled tokens
         come back later from the group's last stage via :meth:`recv_next_tokens`.
         """
-        import dataclasses
-
         schedule_seqs = self.scheduler.schedule_once()
-        real_ntok = 0
-        is_decode = True
-        if schedule_seqs:
-            self.model_runner.prepare_input(schedule_seqs)
-            real_ntok = int(self.model_runner.input_data.tokens_cpu.shape[0])
-            is_decode = self.model_runner.check_decode_batch()
-
-        barrier = self._dp_forward_barrier(real_ntok, is_decode)
-        if barrier is None:
+        prepared = self._dp_prepare_and_barrier(schedule_seqs)
+        if prepared is None:
             return
-        counts_to_publish, padded_size = barrier
-
-        if real_ntok == 0:
-            dummy_seqs = self.model_runner.create_dummy_seqs(1, runtime=True)
-            self.model_runner.prepare_input(dummy_seqs)
+        real_ntok, counts_to_publish, padded_size = prepared
 
         # Ship this column's schedule delta (real work) or a dummy marker to the
         # PP-other stages, piggybacking the agreed DP counts + graph bucket.
@@ -939,8 +953,6 @@ class Worker(TorchProfilerMixin):
         if payload is not None and get_pp_size() > 1:
             # Subsequent PP stages don't run ``_mm_prepare_cpu``,
             # so we ship the m-rope positions we just built.
-            import dataclasses
-
             pp_payload = dataclasses.replace(
                 payload,
                 mrope_positions=(
