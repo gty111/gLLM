@@ -20,13 +20,12 @@ if TYPE_CHECKING:
 
 # Resolved paged-QKV attention backend names, in canonical preference order.
 # Shared validation list: ``gllm.runtime.model_runner`` syntax-checks the
-# configured name against this and ``create_qkv_attention_backend`` re-checks
-# the resolved one; ``gllm.layers.attention.mla`` keeps its own copy pending
-# the layers-side cleanup.
+# configured name against this, ``create_qkv_attention_backend`` re-checks
+# the resolved one, and ``gllm.layers.attention.mla`` validates against it.
 QKV_ATTENTION_BACKENDS = ("fa4", "flashinfer", "fa3")
 
-# Resolved absorbed-MLA decode backend names. Canonical home is the MLA
-# layer; kept here with the QKV names so runners import one module for both.
+# Resolved absorbed-MLA decode backend names, also validated by
+# ``gllm.layers.attention.mla``.
 MLA_DECODE_BACKENDS = ("triton", "flashmla", "fa4")
 
 

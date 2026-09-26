@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from gllm.distributed.parallel_state import get_tp_rank, get_tp_size
+from gllm.distributed.parallel_state import get_tp_size
 from gllm.layers.attention.deepseek_v4.ops import (
     precompute_rope_frequencies,
     serving_max_length,
@@ -46,13 +46,11 @@ class DeepseekV4DSparkAttention(torch.nn.Module):
         self.projections = DeepseekV4AttentionProjections(config)
 
         tp_size = get_tp_size()
-        tp_rank = get_tp_rank()
         local_heads = config.num_attention_heads // tp_size
         self.attn_sink = torch.nn.Parameter(
             torch.empty(local_heads, dtype=torch.float32, device="cuda"),
             requires_grad=False,
         )
-        self._sink_slice = slice(tp_rank * local_heads, (tp_rank + 1) * local_heads)
 
         frequencies = precompute_rope_frequencies(
             self.rope_dim,

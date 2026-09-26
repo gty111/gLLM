@@ -9,7 +9,6 @@ from __future__ import annotations
 import torch
 
 from gllm.distributed.parallel_state import (
-    get_tp_rank,
     get_tp_size,
     tensor_model_parallel_all_reduce,
 )
@@ -70,13 +69,11 @@ class DeepseekV4Attention(torch.nn.Module):
         self.projections = DeepseekV4AttentionProjections(config)
 
         tp_size = get_tp_size()
-        tp_rank = get_tp_rank()
         local_heads = config.num_attention_heads // tp_size
         self.attn_sink = torch.nn.Parameter(
             torch.empty(local_heads, dtype=torch.float32, device="cuda"),
             requires_grad=False,
         )
-        self._sink_slice = slice(tp_rank * local_heads, (tp_rank + 1) * local_heads)
 
         if self.compress_ratio:
             self.compressor = DeepseekV4Compressor(
