@@ -65,6 +65,7 @@ from gllm.distributed.parallel_state import (
     send_pp_data,
     set_dp_forward_counts,
 )
+from gllm.runtime.config import EngineConfig
 from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
 from gllm.runtime.profiler import TorchProfilerMixin
@@ -81,41 +82,35 @@ class Worker(TorchProfilerMixin):
 
     def __init__(
         self,
+        config: EngineConfig,
         model_runner: Union[ModelRunner, OverlapModelRunner],
         local_rank,
         pp_rank,
         tp_rank,
-        pp_size,
-        tp_size,
-        use_ep,
-        master_addr,
-        master_port,
         comm: zmqComm,
         mp_alive,
         mp_load_progress,
-        assigned_layers,
-        schedule_method,
-        disagg_config=None,
     ):
+        self.config = config
         self.model_runner = model_runner
         self.local_rank = local_rank
         self.pp_rank = pp_rank
         self.tp_rank = tp_rank
-        self.pp_size = pp_size
-        self.tp_size = tp_size
-        self.use_ep = use_ep
-        self.master_addr = master_addr
-        self.master_port = master_port
+        self.pp_size = config.pp_size
+        self.tp_size = config.tp_size
+        self.use_ep = config.use_ep
+        self.master_addr = config.master_addr
+        self.master_port = config.master_port
         self.comm = comm
         self.mp_alive = mp_alive
         self.mp_load_progress = mp_load_progress
-        self.assigned_layers = assigned_layers
-        self.schedule_method = schedule_method
+        self.assigned_layers = config.assigned_layers
+        self.schedule_method = config.schedule_method
         self.use_mla = model_runner.model_loader.use_mla
         # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig),
         # pickled here from the parent across the spawn boundary; ``None`` on the
         # monolith path.
-        self.disagg_config = disagg_config
+        self.disagg_config = config.disagg_config
         # Encoder-disaggregation LM-side state, built lazily in :meth:`init` when
         # ``disagg_config.is_lm`` is set. ``_disagg_recv`` (the per-rank NIXL
         # slot pool) lives on *every* PP0 TP rank; ``_disagg_coord`` (the TP0

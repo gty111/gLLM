@@ -56,6 +56,7 @@ from gllm.multimodal.mixin import (  # noqa: F401
     _concat_mrope_positions_pinned as _concat_mrope_positions_pinned,
 )
 from gllm.runtime.async_runtime import FutureIndices, FutureMap, OverlapRuntime
+from gllm.runtime.config import EngineConfig
 from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.runtime.input_data import InputData
 from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
@@ -101,63 +102,42 @@ class DisaggSeqState:
 
 
 class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
-    def __init__(
-        self,
-        load_format: str,
-        model_path: str,
-        gpu_memory_util: float,
-        page_size: int,
-        enable_prefix_caching: bool,
-        maxp,
-        maxd,
-        minp,
-        iterp,
-        init_new_token_ratio,
-        min_new_token_ratio,
-        schedule_method: str,
-        disable_cuda_graph: bool,
-        max_cuda_graph_bs: int,
-        model_max_length: int,
-        piecewise_cuda_graph: Optional[bool] = True,
-        max_piecewise_cuda_graph_tokens: Optional[int] = None,
-        mm_processor_min_pixels: int = None,
-        mm_processor_max_pixels: int = None,
-        skip_visual: bool = False,
-        skip_language: bool = False,
-        attention_backend: str = "flashinfer",
-        mla_decode_backend: str = "fa4",
-        mla_cache_dtype: str = "bf16",
-        mamba_ssm_cache_dtype: str = "auto",
-        mtp_enabled: Optional[bool] = None,
-        mtp_k: int = 3,
-        mtp_max_batch: int = 0,
-        ssm_snapshot_stride_tokens: int = 256,
-    ):
+    def __init__(self, config: EngineConfig):
+        self.config = config
 
         self.max_num_batched_tokens = (
-            maxp if schedule_method in ["chunked_prefill", "split_pd"] else maxp + maxd
+            config.maxp
+            if config.schedule_method in ["chunked_prefill", "split_pd"]
+            else config.maxp + config.maxd
         )
 
         # Concurrent decode slots (SSM arena entries, input buffers, CUDA
         # graph capture). Bounded by ``maxd`` for all schedule methods.
-        self.max_running_seqs = maxd
+        self.max_running_seqs = config.maxd
 
-        self.model_path = model_path
+        self.model_path = config.model_path
+        # Encoder-disaggregation role flags ride in on the config's
+        # ``DisaggConfig`` (None for the monolith).
+        disagg_config = config.disagg_config
+        skip_visual = disagg_config.skip_visual if disagg_config is not None else False
+        skip_language = (
+            disagg_config.skip_language if disagg_config is not None else False
+        )
         self.model_loader = ModelLoader(
-            load_format,
-            model_path,
+            config.load_format,
+            config.model_path,
             self.max_num_batched_tokens,
             skip_visual=skip_visual,
             skip_language=skip_language,
         )
-        self.enable_prefix_caching = enable_prefix_caching
-        self.gpu_memory_util = gpu_memory_util
-        self.page_size = page_size
-        self._piecewise_cuda_graph_cfg = piecewise_cuda_graph
-        self._max_piecewise_cuda_graph_tokens_cfg = max_piecewise_cuda_graph_tokens
+        self.enable_prefix_caching = config.enable_prefix_caching
+        self.gpu_memory_util = config.gpu_memory_util
+        self.page_size = config.page_size
+        self._piecewise_cuda_graph_cfg = config.piecewise_cuda_graph
+        self._max_piecewise_cuda_graph_tokens_cfg = config.max_piecewise_cuda_graph_tokens
         # Recurrent-state (GDN/Mamba) prefix-cache granularity, in tokens.
         # Only meaningful for hybrid models with prefix caching on.
-        self.ssm_snapshot_stride_tokens = ssm_snapshot_stride_tokens
+        self.ssm_snapshot_stride_tokens = config.ssm_snapshot_stride_tokens
         self.tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast] = (
             AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
         )
@@ -174,17 +154,17 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
             "DeepseekV4ForCausalLM": "dsv4",
         }.get(architecture)
         self._use_dsv32_encoder = self._deepseek_encoder_variant == "dsv32"
-        self.maxp = maxp
-        self.maxd = maxd
-        self.minp = minp
-        self.iterp = iterp
+        self.maxp = config.maxp
+        self.maxd = config.maxd
+        self.minp = config.minp
+        self.iterp = config.iterp
         # Adaptive KV-cache admission control (see Scheduler). ``init`` is the
         # starting/relaxed-ceiling fraction of remaining output we reserve for
         # running decodes; ``min`` is the floor the ratio decays toward when
         # the system is stable.
-        self.init_new_token_ratio = init_new_token_ratio
-        self.min_new_token_ratio = min_new_token_ratio
-        self.schedule_method = schedule_method
+        self.init_new_token_ratio = config.init_new_token_ratio
+        self.min_new_token_ratio = config.min_new_token_ratio
+        self.schedule_method = config.schedule_method
         self.sampler = Sampler(self.tokenizer)
         # Per-batch-row generation logprobs from the most recent ``step_once``
         # (non-overlap path); consumed by the worker and carried alongside the
@@ -201,7 +181,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
 
         self.use_mm = self.model_loader.use_mm
         self.use_mla = self.model_loader.use_mla
-        self.attention_backend = (attention_backend or "flashinfer").lower()
+        self.attention_backend = (config.attention_backend or "flashinfer").lower()
         if self.attention_backend not in ("auto", "fa4", "flashinfer", "fa3"):
             raise ValueError(
                 "attention_backend must be 'auto', 'fa4', 'flashinfer', or 'fa3', "
@@ -221,7 +201,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
         # Backend names are syntax-checked here in the parent process. Their
         # hardware/import compatibility is resolved once per worker by
         # ``verify_config`` after that worker selects its CUDA device.
-        self.mla_decode_backend = (mla_decode_backend or "fa4").lower()
+        self.mla_decode_backend = (config.mla_decode_backend or "fa4").lower()
         if self.mla_decode_backend not in ("triton", "flashmla", "fa4"):
             raise ValueError(
                 "mla_decode_backend must be 'fa4', 'flashmla', or 'triton', "
@@ -230,7 +210,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
         # MLA latent KV cache precision (DeepSeek Sparse Attention). "bf16"
         # (default) = full-precision latent cache + dense decode; "fp8" = native
         # FP8-packed cache driving FlashMLA sparse decode on SM90.
-        self.mla_cache_dtype = (mla_cache_dtype or "bf16").lower()
+        self.mla_cache_dtype = (config.mla_cache_dtype or "bf16").lower()
         if self.mla_cache_dtype not in ("bf16", "fp8"):
             raise ValueError(
                 f"mla_cache_dtype must be 'bf16' or 'fp8', got {self.mla_cache_dtype!r}."
@@ -239,7 +219,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
         # "auto" honours the checkpoint's ``mamba_ssm_dtype`` recommendation
         # when present (Qwen3.5 requires float32), otherwise it falls back to
         # the activation dtype. Explicit CLI values override that recommendation.
-        self.mamba_ssm_cache_dtype = (mamba_ssm_cache_dtype or "auto").lower()
+        self.mamba_ssm_cache_dtype = (config.mamba_ssm_cache_dtype or "auto").lower()
         if self.mamba_ssm_cache_dtype not in ("auto", "bfloat16", "float16", "float32"):
             raise ValueError(
                 "mamba_ssm_cache_dtype must be 'auto', 'bfloat16', 'float16' or "
@@ -272,7 +252,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
             or 0
         )
         if (
-            mtp_enabled is None
+            config.mtp_enabled is None
             and self.model_loader.architecture == "DeepseekV4ForCausalLM"
         ):
             # V4's ``mtp.0/1/2`` are a joint noisy-block DSpark model with a
@@ -283,10 +263,10 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
             resolved_mtp_enabled = False
         else:
             resolved_mtp_enabled = (
-                (_num_nextn >= 1) if mtp_enabled is None else bool(mtp_enabled)
+                (_num_nextn >= 1) if config.mtp_enabled is None else bool(config.mtp_enabled)
             )
-        self._mtp_k_cfg = mtp_k
-        self._mtp_max_batch_cfg = mtp_max_batch
+        self._mtp_k_cfg = config.mtp_k
+        self._mtp_max_batch_cfg = config.mtp_max_batch
         self.model_loader.config.mtp_enabled = resolved_mtp_enabled
         # Nested text config (Qwen3.5-VL wrapper) reads ``mtp_enabled`` off its
         # own config object, so mirror the flag there too.
@@ -302,21 +282,25 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
         # ``<|media_pad|>`` per image that must be expanded downstream.
         if self.use_mm and self.is_kimi_mm:
             self.processor = AutoProcessor.from_pretrained(
-                model_path, trust_remote_code=True, use_fast=True
+                self.model_path, trust_remote_code=True, use_fast=True
             )
             self.image_processor = None
             self.video_processor = None
         elif self.use_mm:
-            self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+            self.processor = AutoProcessor.from_pretrained(
+                self.model_path, use_fast=True
+            )
             self.image_processor = self.processor.image_processor
             self.video_processor = self.processor.video_processor
-            if mm_processor_min_pixels is not None:
+            if config.mm_processor_min_pixels is not None:
+                mm_processor_min_pixels = config.mm_processor_min_pixels
                 self.image_processor.min_pixels = mm_processor_min_pixels
                 self.video_processor.min_pixels = mm_processor_min_pixels
                 self.image_processor.size["shortest_edge"] = mm_processor_min_pixels
                 self.video_processor.size["shortest_edge"] = mm_processor_min_pixels
                 logger.info(f"Min pixels: {mm_processor_min_pixels}")
-            if mm_processor_max_pixels is not None:
+            if config.mm_processor_max_pixels is not None:
+                mm_processor_max_pixels = config.mm_processor_max_pixels
                 self.image_processor.max_pixels = mm_processor_max_pixels
                 self.video_processor.max_pixels = mm_processor_max_pixels
                 self.image_processor.size["longest_edge"] = mm_processor_max_pixels
@@ -350,7 +334,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
         self.mm_embed_cache = MultiModalEmbeddingCache(max_entries=64, max_mb=256.0)
 
         # cuda graph
-        self.disable_cuda_graph = disable_cuda_graph
+        self.disable_cuda_graph = config.disable_cuda_graph
         # ``max_cuda_graph_bs`` cannot exceed *either* of two runtime bounds:
         #
         #   * ``maxd`` — the decode batch is hard-capped at ``maxd`` (scheduler)
@@ -372,11 +356,12 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
         # buckets above that bound are never replayed anyway. Clamp to the
         # tighter of the two so users can keep the ``--max-cuda-graph-bs``
         # default without manually matching ``maxd`` / ``maxp``.
-        cuda_graph_cap = min(maxd, self.max_num_batched_tokens)
+        cuda_graph_cap = min(config.maxd, self.max_num_batched_tokens)
+        max_cuda_graph_bs = config.max_cuda_graph_bs
         if not self.disable_cuda_graph and max_cuda_graph_bs > cuda_graph_cap:
             logger.warning(
                 f"max_cuda_graph_bs={max_cuda_graph_bs} exceeds the runtime "
-                f"decode-batch bound min(maxd={maxd}, "
+                f"decode-batch bound min(maxd={config.maxd}, "
                 f"max_num_batched_tokens={self.max_num_batched_tokens})="
                 f"{cuda_graph_cap}; clamping to {cuda_graph_cap}."
             )
@@ -388,7 +373,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
         self.capture_sizes = self._build_capture_sizes(self.max_cuda_graph_bs)
 
         # max length
-        self.model_max_length = self.resolve_model_max_length(model_max_length)
+        self.model_max_length = self.resolve_model_max_length(config.model_max_length)
         # Models size static tables and CUDA-graph-safe static bounds from the
         # config (RoPE tables, worst-case candidate counts). The serving length
         # is the *resolved* runtime limit, which is routinely orders of

@@ -10,6 +10,7 @@ from logger import logger
 
 from gllm.distributed.comm import IPCPackage, zmqComm
 from gllm.tokenizers.reasoning import decode_stream_delta, reasoning_control_tokens
+from gllm.runtime.config import EngineConfig
 from gllm.runtime.id_allocator import IDAllocator
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
 from gllm.runtime.sequence import GenerationSequence, resolve_output_len
@@ -80,39 +81,31 @@ class LLM:
         ssm_snapshot_stride_tokens=256,
     ):
         init_logger()
-        self.model_path = model_path
-        self.load_format = load_format
-        # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig) or
-        # None for the monolith. The role flags feed the model loader (parent
-        # process); the whole object is forwarded to the spawned worker for the
-        # LM-side manager. ``is_disagg_lm`` is the request-time gate read by the
-        # api server (replaces the old GLLM_DISAGG_LM env read).
-        self.disagg_config = disagg_config
-        self.is_disagg_lm = bool(disagg_config is not None and disagg_config.is_lm)
-        skip_visual = disagg_config.skip_visual if disagg_config is not None else False
-        skip_language = (
-            disagg_config.skip_language if disagg_config is not None else False
-        )
-        if overlap_scheduling and pp_size > 1 and dp_size > 1:
-            logger.warning(
-                "overlap_scheduling with combined PP+DP-attention is not yet "
-                "supported; disabling overlap"
-            )
-            overlap_scheduling = False
-        model_runner_cls = OverlapModelRunner if overlap_scheduling else ModelRunner
-        self.model_runner = model_runner_cls(
-            load_format=load_format,
+        # Single configuration object handed to the model runner and the
+        # workers; the kwargs above stay the public constructor signature.
+        config = EngineConfig(
             model_path=model_path,
+            master_addr=master_addr,
+            master_port=master_port,
+            launch_mode=launch_mode,
+            worker_ranks=worker_ranks,
+            load_format=load_format,
             gpu_memory_util=gpu_memory_util,
             page_size=page_size,
-            enable_prefix_caching=enable_prefix_caching,
-            maxp=maxp,
             maxd=maxd,
+            maxp=maxp,
             minp=minp,
             iterp=iterp,
             init_new_token_ratio=init_new_token_ratio,
             min_new_token_ratio=min_new_token_ratio,
+            enable_prefix_caching=enable_prefix_caching,
+            pp_size=pp_size,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            use_ep=use_ep,
+            assigned_layers=assigned_layers,
             schedule_method=schedule_method,
+            overlap_scheduling=overlap_scheduling,
             disable_cuda_graph=disable_cuda_graph,
             piecewise_cuda_graph=piecewise_cuda_graph,
             max_piecewise_cuda_graph_tokens=max_piecewise_cuda_graph_tokens,
@@ -120,8 +113,7 @@ class LLM:
             model_max_length=model_max_length,
             mm_processor_min_pixels=mm_processor_min_pixels,
             mm_processor_max_pixels=mm_processor_max_pixels,
-            skip_visual=skip_visual,
-            skip_language=skip_language,
+            disagg_config=disagg_config,
             attention_backend=attention_backend,
             mla_decode_backend=mla_decode_backend,
             mla_cache_dtype=mla_cache_dtype,
@@ -131,6 +123,26 @@ class LLM:
             mtp_max_batch=mtp_max_batch,
             ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
         )
+        self.config = config
+        self.model_path = config.model_path
+        self.load_format = config.load_format
+        # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig) or
+        # None for the monolith. The role flags feed the model loader (parent
+        # process); the whole object is forwarded to the spawned worker for the
+        # LM-side manager. ``is_disagg_lm`` is the request-time gate read by the
+        # api server (replaces the old GLLM_DISAGG_LM env read).
+        self.disagg_config = config.disagg_config
+        self.is_disagg_lm = bool(disagg_config is not None and disagg_config.is_lm)
+        if config.overlap_scheduling and config.pp_size > 1 and config.dp_size > 1:
+            logger.warning(
+                "overlap_scheduling with combined PP+DP-attention is not yet "
+                "supported; disabling overlap"
+            )
+            config.overlap_scheduling = False
+        model_runner_cls = (
+            OverlapModelRunner if config.overlap_scheduling else ModelRunner
+        )
+        self.model_runner = model_runner_cls(config)
         self._reasoning_controls = reasoning_control_tokens(self.model_runner.tokenizer)
         self.pp_size = pp_size
         self.tp_size = tp_size
@@ -157,6 +169,9 @@ class LLM:
             master_port = str(find_free_port(master_addr))
             logger.info(f"Auto-selected NCCL master_port {master_port}")
         self.master_port = master_port
+        # Workers read the rendezvous port from the shared config, so publish
+        # the auto-selected value back onto it.
+        config.master_port = master_port
         self.launch_mode = launch_mode
         self.worker_ranks = worker_ranks
         self.id_allocator = IDAllocator(0, 99999)
@@ -170,7 +185,7 @@ class LLM:
 
         self.assigned_layers = assigned_layers
         self.schedule_method = schedule_method
-        self.overlap_scheduling = overlap_scheduling
+        self.overlap_scheduling = config.overlap_scheduling
 
         logger.info(f"Schedule method: {schedule_method}")
         if self.overlap_scheduling:
@@ -317,23 +332,17 @@ class LLM:
             dp_size=self.dp_size,
         )
         worker = worker_cls(
+            self.config,
             self.model_runner,
             local_rank,
             pp_rank,
             tp_rank,
-            self.pp_size,
-            self.tp_size,
-            self.use_ep,
-            self.master_addr,
-            self.master_port,
             comm,
             self.mp_alive,
             self.mp_load_progress,
-            self.assigned_layers,
-            self.schedule_method,
-            self.disagg_config,
         )
-        # DP bookkeeping (logging + is_dp_attn); no signature change to Worker.
+        # DP bookkeeping (logging + is_dp_attn); per-replica, set as attributes
+        # rather than growing the Worker signature.
         worker.dp_rank = dp_rank
         worker.dp_size = self.dp_size
         process = self.ctx.Process(

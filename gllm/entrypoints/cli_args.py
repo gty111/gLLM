@@ -19,6 +19,13 @@ difference behind a shared helper.
 """
 
 import argparse
+import dataclasses
+
+from gllm.runtime.config import EngineConfig
+
+# Field names of the engine config; ``engine_kwargs`` forwards exactly the
+# parsed args that match one of these.
+_ENGINE_CONFIG_FIELDS = {f.name for f in dataclasses.fields(EngineConfig)}
 
 
 def add_model_args(p: argparse.ArgumentParser) -> None:
@@ -321,41 +328,25 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
     the group but forgets the kwarg is the failure mode this module exists to
     prevent. Entrypoint-specific kwargs (parallelism topology, disagg config,
     ...) are passed by the caller alongside ``**engine_kwargs(args)``.
+
+    The mapping is derived from :class:`gllm.runtime.config.EngineConfig`:
+    every parsed argument whose name is an ``EngineConfig`` field is forwarded
+    verbatim, so a new engine knob only needs its argparse definition above.
+    Entrypoint-only args (``--host`` / ``--port`` / ...) are not fields and are
+    filtered out. The few args whose *value* or *name* differs from the engine
+    kwarg (``--tp`` -> ``tp_size``; the ``auto``/``on``/``off`` tri-state
+    flags) are converted explicitly below.
     """
-    return {
-        "model_path": args.model_path,
-        "load_format": args.load_format,
-        "model_max_length": args.model_max_length,
-        "master_addr": args.master_addr,
-        "master_port": args.master_port,
-        "tp_size": args.tp,
-        "overlap_scheduling": args.overlap_scheduling,
-        "gpu_memory_util": args.gpu_memory_util,
-        "enable_prefix_caching": args.enable_prefix_caching,
-        "page_size": args.page_size,
-        "attention_backend": args.attention_backend,
-        "mla_decode_backend": args.mla_decode_backend,
-        "mamba_ssm_cache_dtype": args.mamba_ssm_cache_dtype,
-        "ssm_snapshot_stride_tokens": args.ssm_snapshot_stride_tokens,
-        "mla_cache_dtype": args.mla_cache_dtype,
-        "disable_cuda_graph": args.disable_cuda_graph,
-        "piecewise_cuda_graph": {
-            "auto": None,
-            "on": True,
-            "off": False,
-        }[args.piecewise_cuda_graph],
-        "max_piecewise_cuda_graph_tokens": args.max_piecewise_cuda_graph_tokens,
-        "max_cuda_graph_bs": args.max_cuda_graph_bs,
-        "maxd": args.maxd,
-        "maxp": args.maxp,
-        "minp": args.minp,
-        "iterp": args.iterp,
-        "init_new_token_ratio": args.init_new_token_ratio,
-        "min_new_token_ratio": args.min_new_token_ratio,
-        "schedule_method": args.schedule_method,
-        "mtp_enabled": {"auto": None, "on": True, "off": False}[args.mtp_enabled],
-        "mtp_k": args.mtp_k,
-        "mtp_max_batch": args.mtp_max_batch,
-        "mm_processor_min_pixels": args.mm_processor_min_pixels,
-        "mm_processor_max_pixels": args.mm_processor_max_pixels,
+    kwargs = {
+        name: value
+        for name, value in vars(args).items()
+        if name in _ENGINE_CONFIG_FIELDS
     }
+    kwargs["tp_size"] = args.tp
+    kwargs["piecewise_cuda_graph"] = {
+        "auto": None,
+        "on": True,
+        "off": False,
+    }[args.piecewise_cuda_graph]
+    kwargs["mtp_enabled"] = {"auto": None, "on": True, "off": False}[args.mtp_enabled]
+    return kwargs

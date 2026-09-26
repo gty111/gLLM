@@ -32,18 +32,38 @@ class _MtpDeferredRow:
     relay_only: bool = False
 
 
+def _runner_config_field(name):
+    """Pass-through accessor for a scheduling-limit field owned by the runner.
+
+    These used to be copied field-by-field from the model runner at
+    construction time (a snapshot that could go stale, and one more hand-written
+    mapping site). Delegating keeps the runner as the single source of truth
+    while preserving the ``scheduler.maxd`` attribute spelling -- including the
+    tests that override a limit after construction (``s.maxp = chunk`` writes
+    through to the runner).
+    """
+
+    return property(
+        lambda self: getattr(self.model_runner, name),
+        lambda self, value: setattr(self.model_runner, name, value),
+    )
+
+
 class Scheduler:
+    maxd = _runner_config_field("maxd")
+    maxp = _runner_config_field("maxp")
+    max_num_batched_tokens = _runner_config_field("max_num_batched_tokens")
+    minp = _runner_config_field("minp")
+    iterp = _runner_config_field("iterp")
+    page_size = _runner_config_field("page_size")
+    init_new_token_ratio = _runner_config_field("init_new_token_ratio")
+    min_new_token_ratio = _runner_config_field("min_new_token_ratio")
+
     def __init__(self, pp_size, model_runner: ModelRunner, schedule_method):
         self.pp_size = pp_size
         self.model_runner: ModelRunner = model_runner
         self.memory_manager: MemoryManager = model_runner.memory_manager
         self.schedule_method = schedule_method
-        self.maxd = model_runner.maxd
-        self.maxp = model_runner.maxp
-        self.max_num_batched_tokens = model_runner.max_num_batched_tokens
-        self.minp = model_runner.minp
-        self.iterp = model_runner.iterp
-        self.page_size = model_runner.page_size
 
         # --- Adaptive KV-cache admission control (SGLang-style) ---
         # We no longer hold back a *static* page reserve (the old ``kvthresh``).
@@ -55,9 +75,7 @@ class Scheduler:
         # output length we assume it will still generate before finishing. It
         # rises on a preemption event (be conservative -> admit less prefill)
         # and decays back every tick (relax -> admit more prefill when stable).
-        self.init_new_token_ratio = model_runner.init_new_token_ratio
-        self.min_new_token_ratio = model_runner.min_new_token_ratio
-        self.new_token_ratio = self.init_new_token_ratio
+        self.new_token_ratio = model_runner.init_new_token_ratio
         self.new_token_ratio_step = 0.05  # bump up on a preemption event
         self.new_token_ratio_decay = 0.002  # relax per schedule tick
         # Hard floor so prefill never drains the free list to literally empty
