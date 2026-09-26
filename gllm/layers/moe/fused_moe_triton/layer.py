@@ -67,8 +67,6 @@ class FusedMoEMethod(torch.nn.Module):
         global_num_experts: int,
         *,
         use_fp8_w8a8: bool = False,
-        use_int8_w8a16: bool = False,
-        use_int4_w4a16: bool = False,
         block_shape=None,
     ):
         # Import lazily so the generic MoE layer does not depend on the model
@@ -93,8 +91,6 @@ class FusedMoEMethod(torch.nn.Module):
             top_k,
             global_num_experts,
             use_fp8_w8a8,
-            use_int8_w8a16,
-            use_int4_w4a16,
             tuple(block_shape or ()),
             runtime.workspace_token_sizes,
         )
@@ -116,8 +112,6 @@ class FusedMoEMethod(torch.nn.Module):
             config_dtype = get_config_dtype_str(
                 dtype=x.dtype,
                 use_fp8_w8a8=use_fp8_w8a8,
-                use_int8_w8a16=use_int8_w8a16,
-                use_int4_w4a16=use_int4_w4a16,
             )
             workspace = make_fused_moe_workspace(
                 workspace_input,

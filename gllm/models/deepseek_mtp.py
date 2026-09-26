@@ -20,8 +20,6 @@ Used only as the *draft* model in speculative decoding; it shares the target's
 paged KV / DSA-index cache (it is layer_id 61 in the same MemoryManager).
 """
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 

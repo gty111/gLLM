@@ -266,10 +266,6 @@ def round_down(x: int, y: int) -> int:
     return (x // y) * y
 
 
-def ceil_div(a, b):
-    return (a + b - 1) // b
-
-
 def cdiv(a: int, b: int) -> int:
     """Ceiling division."""
     return -(a // -b)

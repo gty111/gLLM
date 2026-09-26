@@ -27,7 +27,7 @@ Key invariants preserved from the old loaders:
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Set
+from typing import Callable, Dict, Optional, Sequence, Set
 
 import torch
 
@@ -242,11 +242,6 @@ def h_proj_dim0(ctx: LoadContext, k: str, p: torch.Tensor) -> None:
     """Column-parallel proj (embed / lm_head / DeepSeek q_proj/kv_b/q_b): TP
     slices the output (row) dim."""
     copy_single_proj_dim0(p, get_tensor_from_dict(ctx.weights, k))
-
-
-def h_default(ctx: LoadContext, k: str, p: torch.Tensor) -> None:
-    """Verbatim copy (norms, biases, scalar params)."""
-    p.copy_(get_tensor_from_dict(ctx.weights, k))
 
 
 # ---- ChatGLM handlers ------------------------------------------------------

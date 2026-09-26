@@ -84,10 +84,6 @@ class MtpQDist:
     idx: Optional[torch.Tensor] = None
     drawn: Optional[torch.Tensor] = None
 
-    @property
-    def is_sparse(self) -> bool:
-        return self.dense is None
-
 
 @dataclass
 class MtpVerifyResult:
@@ -146,10 +142,6 @@ class DisaggSeqState:
     prompt_positions: torch.Tensor  # full-prompt mrope positions
     mrope_position_delta: torch.Tensor
     prompt_len: int
-
-    @property
-    def all_ready(self) -> bool:
-        return all(self.item_ready)
 
 
 # High-id offset for the synthetic ``pad_id``s spliced into the prefix-cache

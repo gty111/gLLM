@@ -36,7 +36,6 @@ from logger import logger
 from gllm.disagg.discovery import (
     make_discovery,
     make_payload,
-    payload_agent_names,
     payload_nixl_metas,
 )
 from gllm.disagg.protocol import EncoderJob, MmItemMeta, emb_notif

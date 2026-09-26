@@ -48,10 +48,6 @@ except Exception as _e:  # pragma: no cover
     _NIXL_IMPORT_ERROR = _e
 
 
-def nixl_available() -> bool:
-    return _NIXL_AVAILABLE
-
-
 @dataclass
 class RemoteRegion:
     """Serializable descriptor of a (sub)region of a *remote* registered tensor.
@@ -102,9 +98,6 @@ class RegHandle:
     base_addr: int
     length: int
     dev_id: int
-
-    def region(self) -> RemoteRegion:
-        raise RuntimeError("Use NixlEndpoint.region(); agent_name lives on the endpoint")
 
 
 class XferHandle:

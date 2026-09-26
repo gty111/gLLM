@@ -362,18 +362,6 @@ def get_dp_forward_counts():
     return _DP_FWD_COUNTS
 
 
-def dp_all_gather_num_tokens(local_ntok: int):
-    """All-gather each replica's forward token count over the DP group.
-
-    Called once per iteration by every replica (an unconditional barrier that
-    keeps the replicas in lockstep). Returns the per-replica counts as a list.
-    """
-    t = torch.tensor([local_ntok], dtype=torch.long, device="cuda")
-    out = torch.empty(_DP_SIZE, dtype=torch.long, device="cuda")
-    dist.all_gather_single(out, t, group=_DP_GROUP)
-    return out.tolist()
-
-
 def dp_all_gather_meta(local_ntok: int, is_decode: bool):
     """All-gather each DP group's ``(token count, is_decode)`` this iteration.
 

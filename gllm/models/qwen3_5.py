@@ -50,13 +50,11 @@ import torch
 from torch import nn
 
 from gllm.distributed.parallel_state import (
-    get_local_rank,
     get_pp_layers,
     get_tp_rank,
     get_tp_size,
     is_first_pp_rank,
     is_last_pp_rank,
-    resolve_pp_layer_idx,
 )
 from gllm.runtime.input_data import InputData
 from gllm.layers.attention.qkv import QKVAttention
@@ -78,7 +76,6 @@ from gllm.layers.ops.fla import (
     RMSNormGated,
     chunk_gated_delta_rule,
     fused_gdn_gating,
-    fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gdn_spec,
 )
@@ -96,8 +93,6 @@ from gllm.runtime.memory_manager import SSMCacheConfig
 from gllm.models.qwen2 import Qwen2MLP
 from gllm.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from gllm.models.weight_utils import (
-    copy_qkv_proj,
-    copy_single_proj_dim0,
     copy_single_proj_dim1,
     get_tensor_from_dict,
 )
@@ -117,7 +112,6 @@ from gllm.models.weight_loader import (
     run_weight_loader,
 )
 from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
-from gllm.utils import get_model_load_pbar
 
 
 _GLOBAL_LAYER_TYPE_ATTRS = ("layer_types", "layers_block_type")

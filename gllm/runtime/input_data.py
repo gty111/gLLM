@@ -12,7 +12,7 @@ from gllm.runtime.forward_metadata import (
 )
 from gllm.runtime.memory_manager import MemoryManager
 from gllm.runtime.sequence import GenerationSequence
-from gllm.utils import async_tensor_h2d, ceil_div, round_down
+from gllm.utils import async_tensor_h2d, cdiv, round_down
 
 
 @dataclass(frozen=True)
@@ -1030,7 +1030,7 @@ class InputData:
                 )
                 max_context_chunk = round_down(max_context_chunk, self.page_size)
 
-                num_chunks = ceil_div(self.max_context_len, max_context_chunk)
+                num_chunks = cdiv(self.max_context_len, max_context_chunk)
 
                 self.chunk_starts_cpu = (
                     torch.arange(

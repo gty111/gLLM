@@ -30,23 +30,15 @@ FP8 block-quant scope:
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
-
-import torch
-from torch import nn
-
 from gllm.distributed.parallel_state import (
     get_ep_rank,
     get_ep_size,
     get_tp_size,
     is_first_pp_rank,
-    is_last_pp_rank,
 )
-from gllm.runtime.input_data import InputData
 from gllm.layers.moe import determine_expert_map
 from gllm.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
-    Qwen3_5GatedDeltaNet,
     Qwen3_5Model,
     _load_gdn_layer_weights,
 )

@@ -187,14 +187,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 
-class DeepseekV4ModelBase(nn.Module):
-    """Embedding, decoder stack, mHC head fold and checkpoint loading.
-
-    Split from :class:`DeepseekV4Model` only so the serving ``forward`` and the
-    parameter/weight plumbing stay separately readable; both are production
-    code.  The token-at-a-time oracles live in
-    :mod:`gllm.models.deepseek_v4_reference`.
-    """
+class DeepseekV4Model(nn.Module):
+    """Embedding, decoder stack, mHC head fold and the packed serving forward."""
 
     def __init__(self, config: Any) -> None:
         super().__init__()
@@ -245,25 +239,6 @@ class DeepseekV4ModelBase(nn.Module):
         return hidden_states.unsqueeze(-2).expand(
             *hidden_states.shape[:-1], self.hc_mult, self.hidden_size
         ).contiguous()
-
-    def _head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = mhc_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            norm_eps=self.norm_eps,
-            hc_mult=self.hc_mult,
-            hc_eps=self.hc_eps,
-        )
-        return self.head(self.norm(hidden_states).float())
-
-
-
-
-
-class DeepseekV4Model(DeepseekV4ModelBase):
-    """Serving model: one packed forward over the paged cache arenas."""
 
     def forward(self, input_data, hidden_states=None, residual=None):
         if hidden_states is None:
@@ -590,5 +565,4 @@ __all__ = [
     "DeepseekV4DecoderLayer",
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
-    "DeepseekV4ModelBase",
 ]

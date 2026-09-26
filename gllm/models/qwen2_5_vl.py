@@ -1,5 +1,5 @@
 from functools import lru_cache, partial
-from typing import Callable, Literal, NamedTuple, Optional, TypedDict, Union
+from typing import Callable, Literal, Optional, TypedDict, Union
 
 import torch
 import torch.nn as nn
@@ -38,11 +38,6 @@ from .weight_loader import (
     hv_qkv_fused_split,
     run_vision_loader,
 )
-
-
-class ImageSize(NamedTuple):
-    width: int
-    height: int
 
 
 # === Vision Inputs === #
