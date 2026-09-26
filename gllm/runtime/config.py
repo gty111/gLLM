@@ -72,3 +72,16 @@ class EngineConfig:
     mm_processor_max_pixels: Optional[int] = None
     # Encoder disaggregation
     disagg_config: Optional[DisaggConfig] = None
+
+    def __post_init__(self):
+        # Internal consistency lives here, next to the fields, so entrypoints
+        # only forward values and never re-validate them.
+        if self.launch_mode not in ("normal", "master", "slave"):
+            raise ValueError(f"Invalid launch_mode: {self.launch_mode!r}")
+        if self.launch_mode != "normal" and not self.worker_ranks:
+            raise ValueError(
+                f"launch_mode={self.launch_mode!r} requires --ranks (worker_ranks)"
+            )
+        for name in ("pp_size", "tp_size", "dp_size"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")

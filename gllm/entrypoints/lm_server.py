@@ -37,6 +37,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Do not load the vision tower; visual embeds arrive over NIXL.",
     )
+    p.add_argument(
+        "--enable-ep",
+        dest="use_ep",
+        action="store_true",
+        default=False,
+        help="Enable expert parallelism (off by default; see api_server --help).",
+    )
     # --- Network / GPU ---
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
@@ -130,13 +137,10 @@ def main():
     import gllm.entrypoints.api_server as api
     from gllm.engine.async_llm import AsyncLLM
 
+    # Every engine knob comes from engine_kwargs; the LM node's fixed role
+    # (normal mode, pp=1) is just the EngineConfig defaults.
     api.llm = AsyncLLM(
         host=args.host,
-        launch_mode="normal",
-        worker_ranks=None,
-        pp_size=1,
-        use_ep=False,
-        assigned_layers=None,
         disagg_config=disagg_config,
         **cli_args.engine_kwargs(args),
     )

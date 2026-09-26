@@ -833,9 +833,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     # Runtime
     # Parallelism
-    parser.add_argument("--pp", type=int, help="Number of pipeline stages", default=1)
+    parser.add_argument("--pp", dest="pp_size", type=int, help="Number of pipeline stages", default=1)
     parser.add_argument(
         "--dp",
+        dest="dp_size",
         type=int,
         help=(
             "Number of data-parallel (DP-attention) replicas. World size is "
@@ -870,7 +871,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--enable-ep",
-        dest="enable_ep",
+        dest="use_ep",
         action="store_true",
         default=False,
         help=(
@@ -896,7 +897,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="normal",
     )
     parser.add_argument(
-        "--ranks", type=str, help="Specify the ranks of worker like 0,1", default=None
+        "--ranks", dest="worker_ranks", type=str, help="Specify the ranks of worker like 0,1", default=None
     )
     # MultiModal
     return parser
@@ -960,14 +961,11 @@ def main():
     args = build_arg_parser().parse_args()
     served_model_names = args.served_model_name
 
+    # All engine knobs flow through engine_kwargs; entrypoints never pass
+    # EngineConfig fields explicitly (single source of truth: the args
+    # namespace).
     llm = AsyncLLM(
         host=args.host,
-        launch_mode=args.launch_mode,
-        worker_ranks=args.ranks,
-        pp_size=args.pp,
-        dp_size=args.dp,
-        use_ep=args.enable_ep,
-        assigned_layers=args.assigned_layers,
         **cli_args.engine_kwargs(args),
     )
 
