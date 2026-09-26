@@ -576,7 +576,7 @@ Three graph families, all captured at init on a dedicated stream:
   slot_mapping / seq_lens in the static input buffers between replays.
   When `_mtp_can_sample`, a second **sampled** draft step is captured
   (`_draft_step_forward_sampled`: forward + `_mtp_probs_static` + Gumbel draw + q
-  stash into `_d_q`), replayed by `_draft_chain_graph_sampled`.
+  stash into `_d_q`), replayed by `_draft_chain_graph(sampled=True)`.
 * **Verify** — `_capture_verify_graphs` captures the uniform `1+k`-query verify
   forward (fp8 decode-sparse kernel via `is_mtp_verify` metadata, see
   `attention.py::_forward_verify_sparse`).
@@ -622,10 +622,10 @@ was removed. Fused C=1 speedup ~2.09×.
 ### 10.9 Key files (as-built)
 
 * `gllm/models/deepseek_mtp.py` — `DeepseekMTP` head (layer-61 nextn block).
-* `gllm/runtime/model_runner.py` — `_mtp_decode` (draft→verify→accept), `_draft_chain_*`,
+* `gllm/speculative/mtp.py` — `_mtp_decode` (draft→verify→accept), `_draft_chain_*`,
   `_capture_{draft,verify}_graphs`, `_gumbel_argmax`, `_mtp_probs_static`,
-  `step_once` fused fast-path, `_record_mtp_metrics`.
-* `gllm/layers/attention.py` — `_forward_verify_sparse` (fp8 verify kernel).
+  `_record_mtp_metrics` (`MtpMixin`, mixed into `gllm/runtime/model_runner.py`).
+* `gllm/layers/attention/mla.py` — `_forward_verify_sparse` (fp8 verify kernel).
 * `gllm/runtime/input_data.py` — `is_mtp_verify` metadata + verify prefill-with-context path.
 * `gllm/workers/overlap.py` — `_run_mtp_sync`, all-rank sampling in `run_batch_async`.
 * `gllm/workers/worker.py` — hard-exit (`os._exit`) crash/shutdown handlers (avoids NCCL

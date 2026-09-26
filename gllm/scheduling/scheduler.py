@@ -669,13 +669,13 @@ class Scheduler:
         # replica. Keep scheduling ordinary one-token decode batches there.
         if is_dp_attn():
             return 1
-        k = int(getattr(self.model_runner, "_mtp_k", 0) or 0)
+        k = int(getattr(self.model_runner, "mtp_k", 0) or 0)
         if k <= 0 or getattr(self.model_runner.model, "mtp", None) is None:
             return 1
         # ``mtp_max_batch`` is a performance gate: batches above it execute the
         # ordinary one-token decode path and must keep their one-token cost.
         max_mtp_batch = int(
-            getattr(self.model_runner, "_mtp_max_batch", 0) or 0
+            getattr(self.model_runner, "mtp_max_batch", 0) or 0
         )
         if max_mtp_batch > 0 and num_decode_seqs > max_mtp_batch:
             return 1

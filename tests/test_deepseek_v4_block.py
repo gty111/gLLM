@@ -66,6 +66,28 @@ class _FFNStub(nn.Module):
         return x + input_ids.to(x.dtype).unsqueeze(-1) * 0.01
 
 
+# Reference-path layer glue, formerly DeepseekV4DecoderLayer.forward_prefill /
+# forward_decode. Production only keeps the paged serving path (forward_paged);
+# these two reproduce the non-paged op order locally so this test can verify
+# mhc ordering against the official reference.
+def _layer_forward_prefill(layer, hidden_states, input_ids, cache=None):
+    layer_input, residual, post, comb = layer._attention_input(hidden_states)
+    attention_output, cache = layer.attn.forward_prefill_with_cache(
+        layer_input, cache
+    )
+    hidden_states = mhc_post(attention_output, residual, post, comb)
+    return layer._ffn(hidden_states, input_ids), cache
+
+
+def _layer_forward_decode(layer, hidden_states, input_ids, *, position, cache):
+    layer_input, residual, post, comb = layer._attention_input(hidden_states)
+    attention_output = layer.attn.forward_decode(
+        layer_input, position=position, cache=cache
+    )
+    hidden_states = mhc_post(attention_output, residual, post, comb)
+    return layer._ffn(hidden_states, input_ids)
+
+
 def _reference(layer, hidden, input_ids):
     attn_input, attn_post, attn_comb = mhc_pre(
         hidden,
@@ -116,11 +138,12 @@ def test_deepseek_v4_block_matches_official_mhc_operation_order():
     input_ids = torch.tensor([[3, 5]], device="cuda")
     expected = _reference(layer, hidden, input_ids)
 
-    prefill, cache = layer.forward_prefill(hidden, input_ids)
+    prefill, cache = _layer_forward_prefill(layer, hidden, input_ids)
     torch.testing.assert_close(prefill, expected, rtol=0, atol=0)
     assert cache == "prefill-cache"
 
-    decoded = layer.forward_decode(
+    decoded = _layer_forward_decode(
+        layer,
         hidden,
         input_ids,
         position=7,

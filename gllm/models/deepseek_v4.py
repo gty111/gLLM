@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from gllm.distributed.parallel_state import get_tp_rank
-from gllm.layers.attention.deepseek_v4.cache import DeepseekV4AttentionCache
 from gllm.layers.attention.deepseek_v4.layer import DeepseekV4Attention
 from gllm.layers.attention.deepseek_v4.ops import serving_max_length
 from gllm.layers.deepseek_v4_mhc import mhc_head, mhc_post, mhc_pre
@@ -132,36 +131,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         output = self.ffn(self.ffn_norm(layer_input), input_ids)
         return mhc_post(output, residual, post, comb)
-
-    def forward_prefill(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        cache: DeepseekV4AttentionCache | None = None,
-    ) -> tuple[torch.Tensor, DeepseekV4AttentionCache]:
-        layer_input, residual, post, comb = self._attention_input(hidden_states)
-        attention_output, cache = self.attn.forward_prefill_with_cache(
-            layer_input, cache
-        )
-        hidden_states = mhc_post(attention_output, residual, post, comb)
-        return self._ffn(hidden_states, input_ids), cache
-
-    def forward_decode(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        *,
-        position: int,
-        cache: DeepseekV4AttentionCache,
-    ) -> torch.Tensor:
-        layer_input, residual, post, comb = self._attention_input(hidden_states)
-        attention_output = self.attn.forward_decode(
-            layer_input,
-            position=position,
-            cache=cache,
-        )
-        hidden_states = mhc_post(attention_output, residual, post, comb)
-        return self._ffn(hidden_states, input_ids)
 
     def forward_paged(
         self,

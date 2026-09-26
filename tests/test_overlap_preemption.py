@@ -93,7 +93,7 @@ def test_mtp_compaction_recalculates_demand_and_avoids_preemption(monkeypatch, l
         monkeypatch, mtp=True, length=length, result=(40, 41)
     )
     if lookahead:
-        s.model_runner._mtp_k = 3
+        s.model_runner.mtp_k = 3
         s.model_runner.model = SimpleNamespace(mtp=object())
     # Optimistic history plus lookahead needs a third page; actual history fits.
     assert len(seq) + lookahead == 33
