@@ -5,28 +5,36 @@ import torch.distributed as dist
 from logger import logger
 
 
-def send_pp_data(output, dst):
+def _send_tensors(output):
+    """Normalize a PP payload to the tuple of tensors to send element-wise."""
     if type(output) == tuple:
         assert len(output) == 2
-        dist.isend(output[0], dst)
-        dist.isend(output[1], dst)
-    else:
-        dist.isend(output, dst)
+        return output
+    return (output,)
+
+
+def send_pp_data(output, dst):
+    for tensor in _send_tensors(output):
+        dist.isend(tensor, dst)
 
 
 def send_pp_data_async(output, dst):
     """Enqueue PP activations and order output-buffer reuse on this stream."""
-    if type(output) == tuple:
-        assert len(output) == 2
-        works = [dist.isend(output[0], dst), dist.isend(output[1], dst)]
-    else:
-        works = [dist.isend(output, dst)]
+    works = [dist.isend(tensor, dst) for tensor in _send_tensors(output)]
     # For NCCL, Work.wait() inserts a dependency on the current CUDA stream;
     # it does not CPU-synchronize in the default non-blocking-wait mode.  This
     # keeps the output buffer alive until the transport has consumed it.
     for work in works:
         work.wait()
     return works
+
+
+def _recv_buffers(num_tokens, recv_hidden_states, recv_residual, has_residual):
+    """Per-element receive buffers for one PP payload, in wire order."""
+    buffers = [recv_hidden_states[:num_tokens]]
+    if has_residual:
+        buffers.append(recv_residual[:num_tokens])
+    return buffers
 
 
 def recv_pp_data_async(
@@ -39,9 +47,10 @@ def recv_pp_data_async(
     so the model forward enqueued immediately afterwards consumes the received
     activation in-order.
     """
-    works = [dist.irecv(recv_hidden_states[:num_tokens], src)]
-    if has_residual:
-        works.append(dist.irecv(recv_residual[:num_tokens], src))
+    works = [
+        dist.irecv(buffer, src)
+        for buffer in _recv_buffers(num_tokens, recv_hidden_states, recv_residual, has_residual)
+    ]
     for work in works:
         work.wait()
     return works
@@ -88,11 +97,8 @@ def recv_pp_tokens_from_last_stage(tokens):
 
 
 def recv_pp_data(src, num_tokens, recv_hidden_states, recv_residual, has_residual):
-    if has_residual:
-        dist.recv(recv_hidden_states[:num_tokens], src)
-        dist.recv(recv_residual[:num_tokens], src)
-    else:
-        dist.recv(recv_hidden_states[:num_tokens], src)
+    for buffer in _recv_buffers(num_tokens, recv_hidden_states, recv_residual, has_residual):
+        dist.recv(buffer, src)
 
 
 def send_obj_list(obj_list, dst):
