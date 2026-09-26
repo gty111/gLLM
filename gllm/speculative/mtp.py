@@ -2642,12 +2642,12 @@ class MtpMixin:
 
 
 def __getattr__(name: str):
-    # ``EmbeddingInfo`` is defined in ``gllm.runtime.model_runner`` (it is
-    # shared with the multimodal embedding cache, which stays there). Resolve
-    # it lazily so this module does not import ``model_runner`` at module
-    # level, which would be circular.
+    # ``EmbeddingInfo`` is defined in ``gllm.multimodal.mixin`` (it is shared
+    # with the multimodal embedding cache there). Resolve it lazily so this
+    # module does not import the mixin at module level, keeping the import
+    # graph one-directional.
     if name == "EmbeddingInfo":
-        from gllm.runtime.model_runner import EmbeddingInfo
+        from gllm.multimodal.mixin import EmbeddingInfo
 
         return EmbeddingInfo
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
