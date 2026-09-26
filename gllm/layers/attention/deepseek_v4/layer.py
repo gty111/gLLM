@@ -1,9 +1,7 @@
 """DeepSeek-V4 sparse attention: the packed, paged serving path.
 
 One padded batch per phase -- decode rows then prefill rows -- over the
-shared KV page table and the request-owned compressor-state arena. The
-token-at-a-time numerical oracles this is verified against live in
-:mod:`gllm.layers.attention.deepseek_v4.reference`.
+shared KV page table and the request-owned compressor-state arena.
 """
 
 from __future__ import annotations
@@ -29,9 +27,6 @@ from gllm.layers.attention.deepseek_v4.ops import (
 from gllm.layers.attention.deepseek_v4.projection import (
     DeepseekV4AttentionProjections,
 )
-from gllm.layers.attention.deepseek_v4.reference import (
-    DeepseekV4AttentionReference,
-)
 
 try:
     from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
@@ -51,13 +46,8 @@ _SPARSE_MLA_HEAD_DIM = 512
 _DEFAULT_COMPRESSED_POOL = 512
 
 
-class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
-    """V4 sparse attention over the paged KV / compressor-state arenas.
-
-    The token-at-a-time oracles the packed paths are verified against are
-    inherited from :class:`DeepseekV4AttentionReference`; nothing in this class
-    calls them.
-    """
+class DeepseekV4Attention(torch.nn.Module):
+    """V4 sparse attention over the paged KV / compressor-state arenas."""
 
     def __init__(self, layer_id: int, config) -> None:
         super().__init__()
@@ -162,10 +152,10 @@ class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
     ) -> torch.Tensor:
         """Serve one packed batch: fused decode rows first, then prefill rows.
 
-        There is deliberately no fallback here.  This used to drop to
-        :meth:`forward_paged_reference` -- a Python token-at-a-time loop --
-        whenever a precondition was unmet, which turned a configuration mistake
-        into a silent ~100x slowdown rather than an error.
+        There is deliberately no fallback here.  This used to drop to a
+        Python token-at-a-time oracle loop whenever a precondition was
+        unmet, which turned a configuration mistake into a silent ~100x
+        slowdown rather than an error.
         """
         segment = input_data.memory_manager.segment
         if segment is None:
@@ -239,8 +229,7 @@ class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
 
         Existing raw/compressed KV and recurrent compressor states are gathered
         from the request-owned arenas.  Every new suffix is projected and
-        compressed in bulk, so prefill never falls back to the token-wise
-        numerical oracle.
+        compressed in bulk, so prefill never needs a token-wise loop.
         """
         meta = input_data.metadata
         prefill = meta.prefill

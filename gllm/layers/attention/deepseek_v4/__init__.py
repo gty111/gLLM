@@ -10,6 +10,5 @@ verified on its own:
 * :mod:`compressor` -- the learned KV pooling and its request-owned state.
 * :mod:`indexer` -- the C4 lightning indexer that selects compressed rows.
 * :mod:`layer` -- the serving layer: paged prefill/decode over the cache arenas.
-* :mod:`reference` -- token-at-a-time numerical oracles used by tests only.
 * :mod:`dspark` -- the DSpark speculative block attention stage.
 """

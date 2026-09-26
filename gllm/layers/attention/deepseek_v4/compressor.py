@@ -1,4 +1,4 @@
-"""Reference learned KV pooling for DeepSeek-V4 compressed attention."""
+"""Learned KV pooling for DeepSeek-V4 compressed attention."""
 
 from __future__ import annotations
 
@@ -55,53 +55,6 @@ def _validate_inputs(
             f"ape must have shape {(ratio, coff * head_dim)}, got {ape.shape}"
         )
     return kv.shape[0], kv.shape[1], head_dim, overlap
-
-
-def compress_prefill(
-    kv: torch.Tensor,
-    score: torch.Tensor,
-    ape: torch.Tensor,
-    ratio: int,
-) -> tuple[torch.Tensor | None, CompressorState]:
-    """Compress a start-position-zero prefill and retain decode state."""
-    batch, sequence_length, head_dim, overlap = _validate_inputs(
-        kv, score, ape, ratio
-    )
-    state = make_compressor_state(
-        batch, ratio, head_dim, device=kv.device
-    )
-    cutoff = sequence_length - sequence_length % ratio
-    remainder = sequence_length - cutoff
-    offset = ratio if overlap else 0
-
-    if overlap and cutoff >= ratio:
-        state.kv[:, :ratio].copy_(kv[:, cutoff - ratio : cutoff])
-        state.score[:, :ratio].copy_(
-            score[:, cutoff - ratio : cutoff] + ape
-        )
-    if remainder:
-        state.kv[:, offset : offset + remainder].copy_(kv[:, cutoff:])
-        state.score[:, offset : offset + remainder].copy_(
-            score[:, cutoff:] + ape[:remainder]
-        )
-    if cutoff == 0:
-        return None, state
-
-    full_kv = kv[:, :cutoff].unflatten(1, (-1, ratio))
-    full_score = score[:, :cutoff].unflatten(1, (-1, ratio)) + ape
-    if overlap:
-        chunks = full_kv.shape[1]
-        overlap_kv = full_kv.new_zeros(batch, chunks, 2 * ratio, head_dim)
-        overlap_score = full_score.new_full(
-            (batch, chunks, 2 * ratio, head_dim), -torch.inf
-        )
-        overlap_kv[:, :, ratio:] = full_kv[..., head_dim:]
-        overlap_score[:, :, ratio:] = full_score[..., head_dim:]
-        overlap_kv[:, 1:, :ratio] = full_kv[:, :-1, :, :head_dim]
-        overlap_score[:, 1:, :ratio] = full_score[:, :-1, :, :head_dim]
-        full_kv, full_score = overlap_kv, overlap_score
-    compressed = (full_kv * full_score.softmax(dim=2)).sum(dim=2)
-    return compressed, state
 
 
 def compress_prefill_batch(
@@ -196,8 +149,8 @@ def compress_prefill_continue_batch(
     ``state`` is the request-owned compressor state after ``starts`` tokens.
     The returned tensor contains only newly completed compression groups,
     padded on the group dimension; ``counts`` identifies the valid prefix for
-    each row.  This is the bulk counterpart of repeatedly calling
-    :func:`compress_decode` for a chunked/continuation prefill.
+    each row.  This is the bulk counterpart of advancing a
+    chunked/continuation prefill one token at a time.
     """
     batch, sequence_length, head_dim, overlap = _validate_inputs(
         kv, score, ape, ratio
@@ -321,58 +274,6 @@ def compress_prefill_continue_batch(
     return compressed, state, counts
 
 
-def compress_decode(
-    kv: torch.Tensor,
-    score: torch.Tensor,
-    ape: torch.Tensor,
-    ratio: int,
-    position: int,
-    state: CompressorState,
-) -> torch.Tensor | None:
-    """Consume one decode token and emit a compressed row at each boundary."""
-    batch, sequence_length, head_dim, overlap = _validate_inputs(
-        kv, score, ape, ratio
-    )
-    if sequence_length != 1:
-        raise ValueError("decode compressor expects exactly one token")
-    coff = 1 + overlap
-    expected_state = (batch, coff * ratio, coff * head_dim)
-    if state.kv.shape != expected_state or state.score.shape != expected_state:
-        raise ValueError(f"compressor state must have shape {expected_state}")
-
-    cursor = position % ratio
-    score = score + ape[cursor]
-    boundary = (position + 1) % ratio == 0
-    if overlap:
-        state.kv[:, ratio + cursor].copy_(kv[:, 0])
-        state.score[:, ratio + cursor].copy_(score[:, 0])
-        if not boundary:
-            return None
-        pooled_kv = torch.cat(
-            [state.kv[:, :ratio, :head_dim], state.kv[:, ratio:, head_dim:]],
-            dim=1,
-        )
-        pooled_score = torch.cat(
-            [
-                state.score[:, :ratio, :head_dim],
-                state.score[:, ratio:, head_dim:],
-            ],
-            dim=1,
-        )
-        output = (pooled_kv * pooled_score.softmax(dim=1)).sum(
-            dim=1, keepdim=True
-        )
-        state.kv[:, :ratio].copy_(state.kv[:, ratio:])
-        state.score[:, :ratio].copy_(state.score[:, ratio:])
-        return output
-
-    state.kv[:, cursor].copy_(kv[:, 0])
-    state.score[:, cursor].copy_(score[:, 0])
-    if not boundary:
-        return None
-    return (state.kv * state.score.softmax(dim=1)).sum(dim=1, keepdim=True)
-
-
 def compress_decode_batch(
     kv: torch.Tensor,
     score: torch.Tensor,
@@ -491,30 +392,13 @@ class DeepseekV4Compressor(torch.nn.Module):
         fp8_fake_quantize_inplace(value[..., : -self.rope_dim], group_size=64)
         return value
 
-    def prefill(
-        self,
-        hidden_states: torch.Tensor,
-        frequencies: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, CompressorState]:
-        kv, score = self.project(hidden_states)
-        compressed, state = compress_prefill(
-            kv, score, self.ape, self.compress_ratio
-        )
-        count = hidden_states.shape[1] // self.compress_ratio
-        if frequencies.shape[0] != count:
-            raise ValueError(
-                f"compressor prefill needs {count} RoPE rows, got "
-                f"{frequencies.shape[0]}"
-            )
-        return self._finalize(compressed, frequencies), state
-
     def prefill_batch(
         self,
         hidden_states: torch.Tensor,
         frequencies: torch.Tensor,
         lengths: torch.Tensor,
     ) -> tuple[torch.Tensor | None, CompressorState, torch.Tensor]:
-        """Vectorized variable-length counterpart of :meth:`prefill`."""
+        """Compress a padded variable-length prefill batch in one pass."""
         kv, score = self.project(hidden_states)
         compressed, state, counts = compress_prefill_batch(
             kv, score, self.ape, self.compress_ratio, lengths
@@ -554,29 +438,6 @@ class DeepseekV4Compressor(torch.nn.Module):
             )
         return self._finalize(compressed, frequencies), state, counts
 
-    def decode(
-        self,
-        hidden_states: torch.Tensor,
-        frequency: torch.Tensor,
-        *,
-        position: int,
-        state: CompressorState,
-    ) -> torch.Tensor | None:
-        kv, score = self.project(hidden_states)
-        compressed = compress_decode(
-            kv,
-            score,
-            self.ape,
-            self.compress_ratio,
-            position,
-            state,
-        )
-        if compressed is None:
-            return None
-        if frequency.ndim == 1:
-            frequency = frequency.unsqueeze(0)
-        return self._finalize(compressed, frequency)
-
     def decode_batch(
         self,
         hidden_states: torch.Tensor,
@@ -585,7 +446,7 @@ class DeepseekV4Compressor(torch.nn.Module):
         positions: torch.Tensor,
         state: CompressorState,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Vectorized heterogeneous-position counterpart of :meth:`decode`."""
+        """Consume a heterogeneous-position one-token decode batch."""
         kv, score = self.project(hidden_states)
         compressed, boundary = compress_decode_batch(
             kv,
@@ -601,9 +462,7 @@ class DeepseekV4Compressor(torch.nn.Module):
 __all__ = [
     "CompressorState",
     "DeepseekV4Compressor",
-    "compress_decode",
     "compress_decode_batch",
-    "compress_prefill",
     "compress_prefill_batch",
     "compress_prefill_continue_batch",
     "make_compressor_state",
