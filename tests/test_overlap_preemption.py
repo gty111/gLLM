@@ -52,7 +52,7 @@ def setup_pending(monkeypatch, *, mtp=False, length=32, result=(40,)):
         ))
     else:
         deferred = s.process_output_deferred([7])
-        s.model_runner._next_tokens_bufs = [torch.tensor(result)]
+        s.model_runner.next_tokens_bufs = [torch.tensor(result)]
         w._gpu_pending.append(_PendingBatch(
             copy_done=SimpleNamespace(synchronize=lambda: events.append("settled")),
             batch_size=1, buf_idx=0, future_slot_ids=[7], deferred=deferred,
@@ -182,7 +182,7 @@ def test_multiple_future_slots_are_finalized_before_reprefill(monkeypatch):
     s.seqs_to_decode.clear()
     s.batch_running.append([seq])
     deferred = s.process_output_deferred([8])
-    s.model_runner._next_tokens_bufs.append(torch.tensor([41]))
+    s.model_runner.next_tokens_bufs.append(torch.tensor([41]))
     w._gpu_pending.append(_PendingBatch(
         copy_done=SimpleNamespace(synchronize=lambda: events.append("settled")),
         batch_size=1, buf_idx=1, future_slot_ids=[8], deferred=deferred,

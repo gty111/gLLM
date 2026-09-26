@@ -70,6 +70,35 @@ from gllm.speculative.staging import MtpStagingBuffers
 from gllm.tokenizers.mixin import TokenizerMixin
 
 
+def apply_mm_processor_pixels(
+    image_processor,
+    video_processor,
+    *,
+    min_pixels: Optional[int] = None,
+    max_pixels: Optional[int] = None,
+) -> None:
+    """Apply mm processor min/max pixel bounds to the image/video processors.
+
+    Shared by :class:`ModelRunner` and
+    :class:`gllm.runtime.vision_encoder_runner.VisionEncoderRunner` so the
+    monolith and the encoder-disaggregation paths resize identically. Sets
+    both the ``*_pixels`` attributes and the ``size`` edge entries the HF
+    processors actually consult.
+    """
+    if min_pixels is not None:
+        image_processor.min_pixels = min_pixels
+        video_processor.min_pixels = min_pixels
+        image_processor.size["shortest_edge"] = min_pixels
+        video_processor.size["shortest_edge"] = min_pixels
+        logger.info(f"Min pixels: {min_pixels}")
+    if max_pixels is not None:
+        image_processor.max_pixels = max_pixels
+        video_processor.max_pixels = max_pixels
+        image_processor.size["longest_edge"] = max_pixels
+        video_processor.size["longest_edge"] = max_pixels
+        logger.info(f"Max pixels: {max_pixels}")
+
+
 @dataclass
 class DisaggSeqState:
     """Per-seq encoder-disaggregation overlap state (design §6.2).
@@ -292,20 +321,12 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
             )
             self.image_processor = self.processor.image_processor
             self.video_processor = self.processor.video_processor
-            if config.mm_processor_min_pixels is not None:
-                mm_processor_min_pixels = config.mm_processor_min_pixels
-                self.image_processor.min_pixels = mm_processor_min_pixels
-                self.video_processor.min_pixels = mm_processor_min_pixels
-                self.image_processor.size["shortest_edge"] = mm_processor_min_pixels
-                self.video_processor.size["shortest_edge"] = mm_processor_min_pixels
-                logger.info(f"Min pixels: {mm_processor_min_pixels}")
-            if config.mm_processor_max_pixels is not None:
-                mm_processor_max_pixels = config.mm_processor_max_pixels
-                self.image_processor.max_pixels = mm_processor_max_pixels
-                self.video_processor.max_pixels = mm_processor_max_pixels
-                self.image_processor.size["longest_edge"] = mm_processor_max_pixels
-                self.video_processor.size["longest_edge"] = mm_processor_max_pixels
-                logger.info(f"Max pixels: {mm_processor_max_pixels}")
+            apply_mm_processor_pixels(
+                self.image_processor,
+                self.video_processor,
+                min_pixels=config.mm_processor_min_pixels,
+                max_pixels=config.mm_processor_max_pixels,
+            )
 
         # lazy init
         self.model: torch.nn.Module = None
@@ -583,6 +604,33 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin):
         if sizes[-1] != max_bs:
             sizes.append(max_bs)
         return list(reversed(sizes))
+
+    # ------------------------------------------------------------------
+    # Read-only facades over private runner state. Workers / the scheduler
+    # consume these; the underscored attributes remain the writer-side
+    # representation. All are populated in ``init`` (or ``__init__`` where
+    # noted) and read only afterwards.
+    # ------------------------------------------------------------------
+
+    @property
+    def last_logprobs(self):
+        """Per-batch-row generation logprobs from the latest ``step_once``."""
+        return self._last_logprobs
+
+    @property
+    def last_prompt_logprobs(self):
+        """Prompt logprobs that finished prefill on the latest forward."""
+        return self._last_prompt_logprobs
+
+    @property
+    def mtp_k(self) -> int:
+        """Draft-chain length of the MTP head (0 when MTP is unavailable)."""
+        return self._mtp_k
+
+    @property
+    def mtp_max_batch(self) -> int:
+        """Batch-size performance gate for MTP; 0 disables the gate."""
+        return self._mtp_max_batch
 
     def init(self, mp_load_progress=None):
         self.verify_config()
@@ -1828,6 +1876,43 @@ class OverlapModelRunner(ModelRunner):
         # mismatch was letting TP ranks subtly drift over many decode
         # iterations and produce the long-generation repetition loops.
         super().capture_graph(stream=self.forward_stream)
+
+    # ------------------------------------------------------------------
+    # Read-only facades over the overlap-only state built by
+    # ``_init_overlap_buffers`` during ``init``; consumed by OverlapWorker.
+    # ------------------------------------------------------------------
+
+    @property
+    def overlap_depth(self) -> int:
+        """How many launched batches may stay un-retired."""
+        return self._overlap_depth
+
+    @property
+    def num_output_bufs(self) -> int:
+        """Pinned staging slots for sampled tokens / logprobs."""
+        return self._num_output_bufs
+
+    @property
+    def next_tokens_bufs(self):
+        """Pinned CPU staging slots for sampled tokens, keyed by buf idx."""
+        return self._next_tokens_bufs
+
+    @property
+    def lp_sampled_bufs(self):
+        return self._lp_sampled_bufs
+
+    @property
+    def lp_topval_bufs(self):
+        return self._lp_topval_bufs
+
+    @property
+    def lp_topid_bufs(self):
+        return self._lp_topid_bufs
+
+    @property
+    def pending_mm_ctx(self):
+        """mm prep context carried between the CPU and GPU input-prep phases."""
+        return self._pending_mm_ctx
 
     def _init_overlap_buffers(self, num_prefill_chunks: int = 256) -> None:
         device = self.forward_stream.device

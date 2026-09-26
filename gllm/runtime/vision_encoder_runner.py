@@ -29,6 +29,7 @@ from gllm.runtime.model_loader import ModelLoader
 from gllm.runtime.model_runner import (
     MultiModalEmbeddingCache,
     _build_item_content_hash,
+    apply_mm_processor_pixels,
 )
 
 
@@ -64,16 +65,12 @@ class VisionEncoderRunner:
         self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
         self.image_processor = self.processor.image_processor
         self.video_processor = self.processor.video_processor
-        if mm_processor_min_pixels is not None:
-            self.image_processor.min_pixels = mm_processor_min_pixels
-            self.video_processor.min_pixels = mm_processor_min_pixels
-            self.image_processor.size["shortest_edge"] = mm_processor_min_pixels
-            self.video_processor.size["shortest_edge"] = mm_processor_min_pixels
-        if mm_processor_max_pixels is not None:
-            self.image_processor.max_pixels = mm_processor_max_pixels
-            self.video_processor.max_pixels = mm_processor_max_pixels
-            self.image_processor.size["longest_edge"] = mm_processor_max_pixels
-            self.video_processor.size["longest_edge"] = mm_processor_max_pixels
+        apply_mm_processor_pixels(
+            self.image_processor,
+            self.video_processor,
+            min_pixels=mm_processor_min_pixels,
+            max_pixels=mm_processor_max_pixels,
+        )
 
         # Per-replica content-hash -> embedding dedup cache (design §4.2.1).
         self.mm_embed_cache = MultiModalEmbeddingCache(

@@ -549,8 +549,8 @@ class Worker(TorchProfilerMixin):
                     self.comm.send_tokens(
                         (
                             output,
-                            self.model_runner._last_logprobs,
-                            self.model_runner._last_prompt_logprobs,
+                            self.model_runner.last_logprobs,
+                            self.model_runner.last_prompt_logprobs,
                         )
                     )
             elif not is_last_pp_rank():
@@ -863,7 +863,7 @@ class Worker(TorchProfilerMixin):
         next_tokens = output
         # PP=1: the output rank (this group's tp0, == the frontend poller) holds
         # the logprobs locally; other TP ranks' scheduler output is discarded.
-        logprobs = self.model_runner._last_logprobs if is_output_rank() else None
+        logprobs = self.model_runner.last_logprobs if is_output_rank() else None
         if get_tp_size() > 1:
             next_tokens = self.comm.broadcast_tokens_to_tp(
                 next_tokens if is_output_rank() else None
@@ -969,7 +969,7 @@ class Worker(TorchProfilerMixin):
             # Generation logprobs (if any) are computed on the output rank in
             # ``step_once`` and stashed on the runner as a per-batch-row list.
             logprobs = (
-                self.model_runner._last_logprobs if is_output_rank() else None
+                self.model_runner.last_logprobs if is_output_rank() else None
             )
             if get_pp_size() == 1:
                 # PP=1: every TP rank is also a column driver and
@@ -1003,7 +1003,7 @@ class Worker(TorchProfilerMixin):
                     (
                         next_tokens,
                         logprobs,
-                        self.model_runner._last_prompt_logprobs,
+                        self.model_runner.last_prompt_logprobs,
                     )
                 )
             # last-PP TP>0 ranks for PP>1: discard ``next_tokens``;

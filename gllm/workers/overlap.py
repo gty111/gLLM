@@ -175,11 +175,11 @@ class OverlapWorker(Worker):
         # 2014 / 2020 / 2023 tok/s at depth 1 / 2 / 3 / 4 / 6 -- flat from 4
         # on, and depth also delays output publication and EOS detection by
         # that many launches, so the runner settles on ``pp_size + 2``.
-        self._collect_lag = self.model_runner._overlap_depth
+        self._collect_lag = self.model_runner.overlap_depth
         logger.info(
             f"overlap collect lag {self._collect_lag} "
             f"(pp {get_pp_size()}, output bufs "
-            f"{self.model_runner._num_output_bufs})"
+            f"{self.model_runner.num_output_bufs})"
         )
         # Fixed after ``init``: DP-attention + EP needs the per-iter cross-DP
         # barrier + dummy-batch lockstep in ``run_pp0``; plain TP does not.
@@ -297,7 +297,7 @@ class OverlapWorker(Worker):
                 raise RuntimeError("PP overlap batch is missing its schedule payload")
             # Multimodal m-rope positions are computed in the PP0 CPU phase and
             # piggyback on the same delta, matching the non-overlap PP path.
-            ctx = self.model_runner._pending_mm_ctx
+            ctx = self.model_runner.pending_mm_ctx
             if ctx is not None and self.model_runner.uses_mrope:
                 payload = dataclasses.replace(
                     payload, mrope_positions=ctx["mrope_positions"]
@@ -386,10 +386,10 @@ class OverlapWorker(Worker):
         keys into by ``batch_idx``.
         """
         mr = self.model_runner
-        sampled = mr._lp_sampled_bufs[buf_idx][:batch_size].tolist()
+        sampled = mr.lp_sampled_bufs[buf_idx][:batch_size].tolist()
         if lp_k > 0:
-            ids = mr._lp_topid_bufs[buf_idx][:batch_size, :lp_k].tolist()
-            vals = mr._lp_topval_bufs[buf_idx][:batch_size, :lp_k].tolist()
+            ids = mr.lp_topid_bufs[buf_idx][:batch_size, :lp_k].tolist()
+            vals = mr.lp_topval_bufs[buf_idx][:batch_size, :lp_k].tolist()
         else:
             ids = [[] for _ in range(batch_size)]
             vals = [[] for _ in range(batch_size)]
@@ -405,7 +405,7 @@ class OverlapWorker(Worker):
             return
         entry.copy_done.synchronize()
         if entry.deferred is not None:
-            entry.tokens = self.model_runner._next_tokens_bufs[entry.buf_idx][
+            entry.tokens = self.model_runner.next_tokens_bufs[entry.buf_idx][
                 : entry.batch_size
             ].tolist()
 
@@ -709,7 +709,7 @@ class OverlapWorker(Worker):
         # the default stream. Make that work wait for the verify/state commit.
         default_stream.wait_stream(forward_stream)
         if next_tokens is not None:
-            self.scheduler.add_next_tokens(next_tokens, self.model_runner._last_logprobs)
+            self.scheduler.add_next_tokens(next_tokens, self.model_runner.last_logprobs)
             ipc_package = self.scheduler.process_output()
             if ipc_package is not None and self._polls_frontend():
                 self.comm.send_output(ipc_package)
@@ -745,7 +745,7 @@ class OverlapWorker(Worker):
                     (
                         "overlap_logprobs",
                         logprobs,
-                        self.model_runner._last_prompt_logprobs,
+                        self.model_runner.last_prompt_logprobs,
                     )
                 )
             batch = _PendingBatch(
@@ -827,7 +827,7 @@ class OverlapWorker(Worker):
 
         current.deferred = self.scheduler.process_mtp_output_deferred(
             decode_rows=len(batch.decode),
-            width=1 + self.model_runner._mtp_k,
+            width=1 + self.model_runner.mtp_k,
         )
         self._mtp_pending.append(current)
 
