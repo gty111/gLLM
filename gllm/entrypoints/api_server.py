@@ -50,6 +50,7 @@ from gllm.utils import find_free_ports, make_async
 router = APIRouter()
 
 llm: AsyncLLM = None
+served_model_names: list[str] = []
 # Resolved once at startup (see ``run`` / ``__main__``): turns model-native
 # tool-call markup into structured ``tool_calls``. ``None`` => model has no
 # known tool-call format, raw text passes through as content.
@@ -106,7 +107,7 @@ def _openai_error(
 def _served_model_ids():
     """Return stable aliases for the one checkpoint loaded by this server."""
     model_path = str(getattr(llm, "model_path", ""))
-    ids = {model_path}
+    ids = {model_path, *served_model_names}
     parts = Path(model_path).parts
     for part in parts:
         if part.startswith("models--"):
@@ -129,6 +130,8 @@ def _validate_model(model: str):
 
 
 def _public_model_id():
+    if served_model_names:
+        return served_model_names[0]
     aliases = [
         model_id
         for model_id in _served_model_ids()
@@ -768,7 +771,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Uvicorn HTTP port (auto-selects a free port when unset).",
         default=None,
     )
-    # Model
+    parser.add_argument(
+        "--served-model-name",
+        action="append",
+        default=[],
+        help="Additional model ID accepted by the OpenAI API; may be repeated.",
+    )
     # Runtime
     # Parallelism
     parser.add_argument("--pp", type=int, help="Number of pipeline stages", default=1)
@@ -893,9 +901,10 @@ def main():
     quiet_hub_logging()
     # ``llm`` is the module-level handle every route reads; this used to be a
     # plain module-scope assignment under ``if __name__ == "__main__"``.
-    global llm
+    global llm, served_model_names
 
     args = build_arg_parser().parse_args()
+    served_model_names = args.served_model_name
 
     llm = AsyncLLM(
         host=args.host,
