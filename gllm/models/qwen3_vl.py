@@ -256,7 +256,6 @@ class Qwen3_VisionTransformer(nn.Module):
                     use_postshuffle_norm=True,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
-                    attention_backend=attention_backend,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
