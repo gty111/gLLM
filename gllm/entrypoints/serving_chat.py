@@ -3,6 +3,7 @@ import secrets
 import time
 
 from gllm.engine.async_llm import AsyncStream
+from gllm.entrypoints.common import build_usage, get_finish_reason
 from gllm.entrypoints.protocol import (
     ChatCompletionLogProb,
     ChatCompletionLogProbs,
@@ -17,7 +18,6 @@ from gllm.entrypoints.protocol import (
 )
 from gllm.tokenizers.tool_parsers import ToolParser, ToolParseError
 from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
-from gllm.utils import build_usage, get_finish_reason
 
 
 def _token_str(entry, as_token_ids):

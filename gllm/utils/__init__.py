@@ -166,11 +166,8 @@ def make_pull_random(ctx, host):
     return socket, port
 
 
-temp_dir = tempfile.gettempdir()
-
-
 def get_lock(model_name_or_path: Union[str, Path], cache_dir: Optional[str] = None):
-    lock_dir = cache_dir or temp_dir
+    lock_dir = cache_dir or tempfile.gettempdir()
     model_name_or_path = str(model_name_or_path)
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
     model_name = model_name_or_path.replace("/", "-")
@@ -311,35 +308,13 @@ def unify_decode(tokenizer, token_ids, skip_special_tokens: bool = True):
     return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
 
-def get_finish_reason(seq) -> Optional[str]:
-    """Best-effort OpenAI ``finish_reason`` for a completed sequence.
+def __getattr__(name: str):
+    # Backwards-compatible lazy re-exports: the OpenAI response constructors
+    # live in ``gllm.entrypoints.common`` (which owns ``protocol``). Importing
+    # them here at module top would be circular, because
+    # ``gllm.entrypoints.protocol`` itself imports ``random_uuid`` from here.
+    if name in ("get_finish_reason", "build_usage"):
+        from gllm.entrypoints import common
 
-    ``length`` when the output-length cap was hit, ``stop`` when generation
-    ended on an EOS/finish token, else ``stop`` as a generic fallback (e.g. an
-    aborted/disconnected request). Returns ``None`` if no tokens were produced.
-    """
-    if seq is None or not seq.token_ids:
-        return None
-    generated = len(seq.token_ids) - seq.raw_prompt_len
-    if not seq.ignore_eos and seq.token_ids[-1] in seq.finish_tokens:
-        return "stop"
-    if generated >= seq.output_len:
-        return "length"
-    return "stop"
-
-
-def build_usage(seq):
-    """OpenAI token-usage block computed from a (possibly finished) sequence."""
-    # Imported lazily: ``gllm.entrypoints.protocol`` imports from this module,
-    # so a top-level import here would be circular.
-    from gllm.entrypoints.protocol import UsageInfo
-
-    if seq is None:
-        return UsageInfo()
-    prompt_tokens = seq.raw_prompt_len
-    completion_tokens = max(0, len(seq.token_ids) - seq.raw_prompt_len)
-    return UsageInfo(
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=prompt_tokens + completion_tokens,
-    )
+        return getattr(common, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

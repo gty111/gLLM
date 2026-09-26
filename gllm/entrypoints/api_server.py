@@ -57,6 +57,17 @@ served_model_names: list[str] = []
 tool_parser = None
 response_store = ResponseStore()
 
+# One executor wrapper per callable, built on first use: ``make_async``
+# allocates a closure, so calling it per request would allocate per request.
+_async_wrappers = {}
+
+
+def _async(func):
+    wrapper = _async_wrappers.get(func)
+    if wrapper is None:
+        wrapper = _async_wrappers[func] = make_async(func)
+    return wrapper
+
 
 def _abort_stream(stream):
     abort = getattr(stream, "abort", None)
@@ -178,13 +189,57 @@ async def _prepare_output_format(fmt, token_ids, *, tools=None, custom_formats=N
     from gllm.structured_output import prepare_output
 
     runner = getattr(llm, "model_runner", None)
-    return await make_async(prepare_output)(
+    return await _async(prepare_output)(
         fmt, getattr(runner, "tokenizer", None),
         getattr(getattr(runner, "model_loader", None), "vocab_size", 0),
         getattr(llm, "finish_tokens", ()), token_ids,
         tools=tools, parser_name=getattr(tool_parser, "name", None),
         custom_formats=custom_formats, parallel_tool_calls=parallel_tool_calls,
     )
+
+
+class _UnsupportedMMInput(Exception):
+    """A request carried media the loaded model cannot consume."""
+
+
+async def _tokenize_messages(messages, effective_tools, chat_template_kwargs,
+                             *, check_mm_support=False):
+    """Tokenize chat messages into ``(token_ids, mm_contents, mm_items)``.
+
+    Shared by the chat-completions and responses endpoints. Encoder-
+    disaggregation frontend (design §3.1 / §5.4): tokenize the *text only*
+    into a skeleton (one sentinel per item) and ship the raw items to the
+    encoder via the LM PP0 worker. The LM never opens pixels and never
+    carries ``mm_contents``. Falls back to the monolith processor path for
+    text requests and when disaggregation is off.
+    """
+    mm_contents = await _async(llm.model_runner.extract_modify_mm)(messages)
+    if check_mm_support and mm_contents is not None and not llm.model_runner.use_mm:
+        raise _UnsupportedMMInput("The loaded model does not support image inputs.")
+    disagg = getattr(llm, "is_disagg_lm", False)
+    mm_items = None
+    if disagg and mm_contents is not None:
+        mm_items = await _async(llm.model_runner.extract_mm_items_ordered)(messages)
+        token_ids = await _async(llm.model_runner.encode_skeleton)(
+            messages, chat_template_kwargs=chat_template_kwargs or None
+        )
+        mm_contents = None  # LM holds no pixels; embeddings arrive over NIXL
+    else:
+        token_ids = await _async(llm.model_runner.encode)(
+            messages,
+            chat=True,
+            has_mm=mm_contents is not None,
+            chat_template_kwargs=chat_template_kwargs or None,
+            # Serialize the pydantic tool schemas to plain dicts; the chat
+            # templates (and Kimi's ``encode_tools_to_typescript_style``)
+            # expect JSON-like dicts, not pydantic models.
+            tools=(
+                [t.model_dump(exclude_none=True, by_alias=True) for t in effective_tools]
+                if effective_tools
+                else None
+            ),
+        )
+    return token_ids, mm_contents, mm_items
 
 
 def _validate_chat_capabilities(request: ChatCompletionRequest):
@@ -351,40 +406,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     effective_tools = request.tools if request.tool_choice != "none" else None
     chat_template_kwargs = _chat_template_kwargs(request)
 
-    mm_contents = await make_async(llm.model_runner.extract_modify_mm)(request.messages)
-    # Encoder-disaggregation frontend (design §3.1 / §5.4): tokenize the *text
-    # only* into a skeleton (one sentinel per item) and ship the raw items to
-    # the encoder via the LM PP0 worker. The LM never opens pixels and never
-    # carries ``mm_contents``. Falls back to the monolith processor path for
-    # text requests and when disaggregation is off.
-    disagg = getattr(llm, "is_disagg_lm", False)
-    mm_items = None
-    if disagg and mm_contents is not None:
-        mm_items = await make_async(llm.model_runner.extract_mm_items_ordered)(
-            request.messages
-        )
-        token_ids = await make_async(llm.model_runner.encode_skeleton)(
-            request.messages, chat_template_kwargs=chat_template_kwargs or None
-        )
-        mm_contents = None  # LM holds no pixels; embeddings arrive over NIXL
-    else:
-        token_ids = await make_async(llm.model_runner.encode)(
-            request.messages,
-            chat=True,
-            has_mm=mm_contents is not None,
-            chat_template_kwargs=chat_template_kwargs or None,
-            # Serialize the pydantic tool schemas to plain dicts; the chat
-            # templates (and Kimi's ``encode_tools_to_typescript_style``)
-            # expect JSON-like dicts, not pydantic models.
-            tools=(
-                [
-                    t.model_dump(exclude_none=True, by_alias=True)
-                    for t in effective_tools
-                ]
-                if effective_tools
-                else None
-            ),
-        )
+    token_ids, mm_contents, mm_items = await _tokenize_messages(
+        request.messages, effective_tools, chat_template_kwargs
+    )
     # OpenAI deprecated ``max_tokens`` for chat completions in favor of
     # ``max_completion_tokens`` but most clients (including curl examples,
     # the OpenAI Python SDK pre-1.40, and ``benchmark_serving.py``) still
@@ -493,8 +517,8 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         # File URLs involve blocking I/O; keep them off the FastAPI event loop
         # while building the native text/image message.
         if request.store:
-            request = await make_async(snapshot_response_files)(request)
-        chat_request = await make_async(make_chat_request)(request)
+            request = await _async(snapshot_response_files)(request)
+        chat_request = await _async(make_chat_request)(request)
     except ValueError as exc:
         param, message = exc.args if len(exc.args) == 2 else ("input", str(exc))
         return _unsupported(param, message)
@@ -502,40 +526,12 @@ async def create_response(request: ResponseRequest, raw_request: Request):
     effective_tools = chat_request.tools if chat_request.tool_choice != "none" else None
     chat_template_kwargs = _chat_template_kwargs(chat_request)
     try:
-        mm_contents = await make_async(llm.model_runner.extract_modify_mm)(
-            chat_request.messages
+        token_ids, mm_contents, mm_items = await _tokenize_messages(
+            chat_request.messages, effective_tools, chat_template_kwargs,
+            check_mm_support=True,
         )
-        if mm_contents is not None and not llm.model_runner.use_mm:
-            return _unsupported(
-                "input",
-                "The loaded model does not support image inputs.",
-            )
-        disagg = getattr(llm, "is_disagg_lm", False)
-        mm_items = None
-        if disagg and mm_contents is not None:
-            mm_items = await make_async(llm.model_runner.extract_mm_items_ordered)(
-                chat_request.messages
-            )
-            token_ids = await make_async(llm.model_runner.encode_skeleton)(
-                chat_request.messages,
-                chat_template_kwargs=chat_template_kwargs or None,
-            )
-            mm_contents = None
-        else:
-            token_ids = await make_async(llm.model_runner.encode)(
-                chat_request.messages,
-                chat=True,
-                has_mm=mm_contents is not None,
-                chat_template_kwargs=chat_template_kwargs or None,
-                tools=(
-                    [
-                        tool.model_dump(exclude_none=True, by_alias=True)
-                        for tool in effective_tools
-                    ]
-                    if effective_tools
-                    else None
-                ),
-            )
+    except _UnsupportedMMInput as exc:
+        return _unsupported("input", str(exc))
     except (TypeError, ValueError, TemplateError) as exc:
         return _openai_error(str(exc), param="input", code="invalid_input")
 
@@ -629,7 +625,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if capability_error:
         return capability_error
     if isinstance(request.prompt, str):
-        token_ids = await make_async(llm.model_runner.encode)(request.prompt)
+        token_ids = await _async(llm.model_runner.encode)(request.prompt)
     else:
         # Tokenized prompts must reach the engine unchanged: decoding and
         # re-encoding can merge token boundaries or alter special tokens.

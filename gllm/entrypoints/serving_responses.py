@@ -14,12 +14,13 @@ from PIL import Image
 from logger import logger
 
 from gllm.engine.async_llm import AsyncStream
+from gllm.entrypoints.common import build_usage, get_finish_reason
 from gllm.entrypoints.protocol import ChatCompletionRequest, DeltaMessage, ResponseRequest
 from gllm.entrypoints.response_tools import bind_custom_parser, chat_tools, output_tool_call, tool_specs
 from gllm.entrypoints.serving_chat import chat_completion_generator
 from gllm.tokenizers.tool_parsers import ToolParser, ToolParseError
 from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
-from gllm.utils import build_usage, get_finish_reason, random_uuid
+from gllm.utils import random_uuid
 
 _MAX_INLINE_FILE_BYTES = 50 * 1024 * 1024
 _TEXT_EXTENSIONS = {
