@@ -1,23 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""An example showing how to use vLLM to serve multimodal models
-and run online serving with OpenAI client.
+"""An example showing how to use gLLM to serve multimodal models
+and run online serving with the OpenAI client.
 
-Launch the vLLM server with the following command:
+Launch the gLLM server with the following command:
 
 (single image inference with Llava)
-vllm serve llava-hf/llava-1.5-7b-hf
+python -m gllm.entrypoints.api_server --model-path llava-hf/llava-1.5-7b-hf
 
 (multi-image inference with Phi-3.5-vision-instruct)
-vllm serve microsoft/Phi-3.5-vision-instruct --runner generate \
-    --trust-remote-code --max-model-len 4096 --limit-mm-per-prompt '{"image":2}'
-
-(audio inference with Ultravox)
-vllm serve fixie-ai/ultravox-v0_5-llama-3_2-1b \
-    --max-model-len 4096 --trust-remote-code
+python -m gllm.entrypoints.api_server --model-path microsoft/Phi-3.5-vision-instruct \
+    --max-model-len 4096
 
 run the script with
-python openai_chat_completion_client_for_multimodal.py --chat-type audio
+python mm_chat.py --chat-type single-image
 """
 
 import base64
@@ -31,13 +26,13 @@ from openai.types.model import Model
 
 def get_first_model(client: OpenAI) -> str:
     """
-    Get the first model from the vLLM server.
+    Get the first model from the gLLM server.
     """
     try:
         models: SyncPage[Model] = client.models.list()
     except APIConnectionError as e:
         raise RuntimeError(
-            "Failed to get the list of models from the vLLM server at "
+            "Failed to get the list of models from the gLLM server at "
             f"{client.base_url} with API key {client.api_key}. Check\n"
             "1. the server is running\n"
             "2. the server URL is correct\n"
@@ -45,7 +40,7 @@ def get_first_model(client: OpenAI) -> str:
         ) from e
 
     if len(models.data) == 0:
-        raise RuntimeError(f"No models found on the vLLM server at {client.base_url}")
+        raise RuntimeError(f"No models found on the gLLM server at {client.base_url}")
 
     return models.data[0].id
 
@@ -163,7 +158,7 @@ example_function_map = {
 def parse_args():
     parser = ArgumentParser(
         description="Demo on using OpenAI client for online serving with "
-        "multimodal language models served with vLLM."
+        "multimodal language models served with gLLM."
     )
     parser.add_argument(
         "--chat-type",
@@ -178,7 +173,7 @@ def parse_args():
 
 
 def main(args) -> None:
-    # Modify OpenAI's API key and API base to use vLLM's API server.
+    # Modify OpenAI's API key and API base to use gLLM's API server.
     openai_api_key = "EMPTY"
     openai_api_base = f"http://localhost:{args.port}/v1"
 

@@ -242,34 +242,70 @@ async def _tokenize_messages(messages, effective_tools, chat_template_kwargs,
     return token_ids, mm_contents, mm_items
 
 
+# Fields the chat-completions endpoint honors (or deliberately tolerates).
+# Everything else on ChatCompletionRequest that carries a non-default value
+# is rejected by _reject_unsupported_params below, so newly added schema
+# fields are refused by default instead of silently ignored.
+_CHAT_SUPPORTED_PARAMS = frozenset({
+    # Core request.
+    "messages", "model",
+    # Sampling.
+    "logprobs", "top_logprobs", "max_tokens", "max_completion_tokens",
+    "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos",
+    "prompt_logprobs",
+    # Output / streaming.
+    "response_format", "stream", "stream_options",
+    # Reasoning and template controls.
+    "reasoning_effort", "chat_template_kwargs",
+    # Tools (validated individually below). function_call/functions are the
+    # deprecated wire aliases the schema translates into tool_choice/tools.
+    "tools", "tool_choice", "parallel_tool_calls",
+    "function_call", "functions",
+    # Accepted and ignored (OpenAI compatibility).
+    "service_tier", "request_id", "return_tokens_as_token_ids",
+    # Rejected selectively below: only "text" modalities and empty stop.
+    "modalities", "stop",
+})
+
+_COMPLETION_SUPPORTED_PARAMS = frozenset({
+    "model", "prompt",
+    "logprobs", "prompt_logprobs", "max_tokens",
+    "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos",
+    "stream", "stream_options",
+    # Rejected selectively below: non-empty stop.
+    "stop",
+})
+
+
+def _reject_unsupported_params(request, supported, extra_accepted=None):
+    """Reject any field outside ``supported`` that carries a non-default value.
+
+    ``None`` and the schema default always pass; ``extra_accepted`` maps a
+    field name to additional tolerated values (e.g. best_of=1).
+    """
+    for name, field in type(request).model_fields.items():
+        if name in supported:
+            continue
+        value = getattr(request, name)
+        if value is None or value == field.get_default(call_default_factory=True):
+            continue
+        if extra_accepted and value in extra_accepted.get(name, ()):
+            continue
+        return _unsupported(name)
+    return None
+
+
 def _validate_chat_capabilities(request: ChatCompletionRequest):
     model_error = _validate_model(request.model)
     if model_error:
         return model_error
-    checks = [
-        (request.n not in (None, 1), "n"),
-        (request.frequency_penalty not in (None, 0, 0.0), "frequency_penalty"),
-        (request.presence_penalty not in (None, 0, 0.0), "presence_penalty"),
-        (request.logit_bias is not None, "logit_bias"),
-        (request.seed is not None, "seed"),
-        (bool(request.stop), "stop"),
-        (request.store is True, "store"),
-        (request.audio is not None, "audio"),
-        (bool(request.modalities and "audio" in request.modalities), "modalities"),
-        (request.moderation is not None, "moderation"),
-        (request.prediction is not None, "prediction"),
-        (request.prompt_cache_options is not None, "prompt_cache_options"),
-        (request.prompt_cache_key is not None, "prompt_cache_key"),
-        (request.prompt_cache_retention is not None, "prompt_cache_retention"),
-        (request.metadata is not None, "metadata"),
-        (request.user is not None, "user"),
-        (request.safety_identifier is not None, "safety_identifier"),
-        (request.verbosity is not None, "verbosity"),
-        (request.web_search_options is not None, "web_search_options"),
-    ]
-    for condition, param in checks:
-        if condition:
-            return _unsupported(param)
+    unsupported = _reject_unsupported_params(request, _CHAT_SUPPORTED_PARAMS)
+    if unsupported:
+        return unsupported
+    if bool(request.stop):
+        return _unsupported("stop")
+    if request.modalities and "audio" in request.modalities:
+        return _unsupported("modalities")
     format_error = _validate_output_format(
         request.response_format, "response_format",
         request.tools if request.tool_choice != "none" else None,
@@ -294,22 +330,13 @@ def _validate_completion_capabilities(request: CompletionRequest):
     model_error = _validate_model(request.model)
     if model_error:
         return model_error
-    checks = [
-        (request.n != 1, "n"),
-        (request.best_of not in (None, 1), "best_of"),
-        (request.echo is True, "echo"),
-        (request.frequency_penalty not in (None, 0, 0.0), "frequency_penalty"),
-        (request.presence_penalty not in (None, 0, 0.0), "presence_penalty"),
-        (request.logit_bias is not None, "logit_bias"),
-        (request.seed is not None, "seed"),
-        (bool(request.stop), "stop"),
-        (request.suffix is not None, "suffix"),
-        (request.user is not None, "user"),
-        (request.response_format is not None, "response_format"),
-    ]
-    for condition, param in checks:
-        if condition:
-            return _unsupported(param)
+    unsupported = _reject_unsupported_params(
+        request, _COMPLETION_SUPPORTED_PARAMS, {"best_of": (1,)}
+    )
+    if unsupported:
+        return unsupported
+    if bool(request.stop):
+        return _unsupported("stop")
     return None
 
 
