@@ -14,22 +14,7 @@ from logger import logger
 from safetensors import safe_open
 from transformers import AutoConfig, GenerationConfig
 
-from gllm.models.chatglm import ChatGLMForCausalLM
-from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
-from gllm.models.deepseek_v32 import DeepseekV32ForCausalLM
-from gllm.models.deepseek_v4 import DeepseekV4ForCausalLM
-from gllm.models.kimi_k25 import KimiK25ForConditionalGeneration
-from gllm.models.llama import LlamaForCausalLM
-from gllm.models.mixtral import MixtralForCausalLM
-from gllm.models.qwen2 import Qwen2ForCausalLM
-from gllm.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
-from gllm.models.qwen2_moe import Qwen2MoeForCausalLM
-from gllm.models.qwen3 import Qwen3ForCausalLM
-from gllm.models.qwen3_5 import Qwen3_5ForConditionalGeneration
-from gllm.models.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
-from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
-from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from gllm.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from gllm.models import MODEL_ARCH_REGISTRY
 from gllm.utils import get_lock
 
 
@@ -397,6 +382,18 @@ def propagate_serving_config(
                 setattr(sub, field, getattr(config, field))
 
 
+def _arch_capabilities(architecture: str) -> Dict[str, bool]:
+    """Capability flags for an architecture; all-False for unknown names.
+
+    Unknown architectures must not raise here: ``load_config`` reads the
+    capability properties before ``get_model_type`` runs, and the old
+    membership tests silently returned False. The "unsupported model" error
+    is raised exactly once, in ``get_model_type``.
+    """
+    entry = MODEL_ARCH_REGISTRY.get(architecture)
+    return entry[1] if entry is not None else {}
+
+
 class ModelLoader:
     def __init__(
         self,
@@ -561,7 +558,7 @@ class ModelLoader:
         # and ignore the real ``lm_head.weight``. See
         # :func:`propagate_tie_word_embeddings`.
         propagate_tie_word_embeddings(self.config)
-        if self.architecture == "KimiK25ForConditionalGeneration":
+        if _arch_capabilities(self.architecture).get("normalize_kimi_quant", False):
             self._normalize_kimi_quant_config()
         self.quantization_config = getattr(self.config, "quantization_config", None)
         self.config.use_mla = self.use_mla
@@ -580,71 +577,24 @@ class ModelLoader:
 
     @property
     def use_mla(self):
-        return self.architecture in [
-            "DeepseekV2ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "DeepseekV4ForCausalLM",
-            "KimiK25ForConditionalGeneration",
-        ]
+        return _arch_capabilities(self.architecture).get("mla", False)
 
     @property
     def use_mm(self):
-        return self.architecture in ["Qwen2_5_VLForConditionalGeneration",
-                                     "Qwen3VLForConditionalGeneration",
-                                     "Qwen3VLMoeForConditionalGeneration",
-                                     "Qwen3_5ForConditionalGeneration",
-                                     "Qwen3_5MoeForConditionalGeneration",
-                                     "KimiK25ForConditionalGeneration"]
+        return _arch_capabilities(self.architecture).get("mm", False)
 
     @property
     def use_hybrid_state(self):
         """Whether the model has linear-attention (Mamba/GDN) layers that need
         a recurrent-state cache *in addition to* the regular KV cache.
         """
-        return self.architecture in ["Qwen3_5ForConditionalGeneration",
-                                     "Qwen3_5MoeForConditionalGeneration"]
+        return _arch_capabilities(self.architecture).get("hybrid", False)
 
     def get_model_type(self):
-        model_type = None
-        if self.architecture == "LlamaForCausalLM":
-            model_type = LlamaForCausalLM
-        elif self.architecture == "ChatGLMModel":
-            model_type = ChatGLMForCausalLM
-        elif self.architecture == "Qwen2ForCausalLM":
-            model_type = Qwen2ForCausalLM
-        elif self.architecture == "Qwen3ForCausalLM":
-            model_type = Qwen3ForCausalLM
-        elif self.architecture == "Qwen2MoeForCausalLM":
-            model_type = Qwen2MoeForCausalLM
-        elif self.architecture == "Qwen3MoeForCausalLM":
-            model_type = Qwen3MoeForCausalLM
-        elif self.architecture == "MixtralForCausalLM":
-            model_type = MixtralForCausalLM
-        elif (
-            self.architecture == "DeepseekV2ForCausalLM"
-            or self.architecture == "DeepseekV3ForCausalLM"
-        ):
-            model_type = DeepseekV2ForCausalLM
-        elif self.architecture == "DeepseekV32ForCausalLM":
-            model_type = DeepseekV32ForCausalLM
-        elif self.architecture == "DeepseekV4ForCausalLM":
-            model_type = DeepseekV4ForCausalLM
-        elif self.architecture == "Qwen2_5_VLForConditionalGeneration":
-            model_type = Qwen2_5_VLForConditionalGeneration
-        elif self.architecture == "Qwen3VLForConditionalGeneration":
-            model_type = Qwen3VLForConditionalGeneration
-        elif self.architecture == "Qwen3VLMoeForConditionalGeneration":
-            model_type = Qwen3VLMoeForConditionalGeneration
-        elif self.architecture == "Qwen3_5ForConditionalGeneration":
-            model_type = Qwen3_5ForConditionalGeneration
-        elif self.architecture == "Qwen3_5MoeForConditionalGeneration":
-            model_type = Qwen3_5MoeForConditionalGeneration
-        elif self.architecture == "KimiK25ForConditionalGeneration":
-            model_type = KimiK25ForConditionalGeneration
-        else:
+        entry = MODEL_ARCH_REGISTRY.get(self.architecture)
+        if entry is None:
             raise Exception(f"Unsupported model: {self.architecture}")
-        return model_type
+        return entry[0]
 
     def _normalize_kimi_quant_config(self):
         """Translate Kimi's compressed-tensors config into gLLM's int4-MoE hint.
