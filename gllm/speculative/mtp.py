@@ -545,29 +545,69 @@ class MtpMixin:
         return (q.float() / noise).argmax(dim=-1).to(torch.int64)
 
     @torch.inference_mode()
-    def _draft_chain_eager_sampled(
-        self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen, sparse=False
+    def _draft_chain_eager(
+        self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen=None, sparse=False
     ):
-        """Eager draft chain that SAMPLES each draft token (for rejection mode).
+        """Eager k-step MTP draft chain (fallback / graph-disabled path).
 
-        Same forward structure as ``_draft_chain_eager`` but instead of argmax it
-        draws each draft token from the per-seq transformed distribution ``q`` and
-        records that ``q`` so the accept step can compute ``min(1, p/q)`` and the
-        residual ``(p-q)+``. Returns ``(drafts, q)`` where ``drafts`` is per-seq
-        ``[d1..dk]`` (CPU ints) and ``q`` is an :class:`MtpQDist` -- sparse
-        (top-k support) when ``sparse``, dense ``[nd, k, vocab]`` otherwise.
+        One per-step D2H (``.tolist()``) instead of a ``.item()`` per token --
+        unavoidable in the eager path since the next step's positions/slots are
+        rebuilt from python token_ids each step.
+
+        Two modes, differing only in how each step's draft token is picked (the
+        ``sample_step`` closure below; the seq-state advance, ``prepare_input``,
+        ``mtp.forward`` and penalty application are shared):
+
+        * **greedy** (``gen=None``): argmax. Returns ``drafts`` = per-seq
+          ``[d1..dk]`` (CPU ints).
+        * **sampled** (``gen`` given, rejection mode): draws each draft token
+          from the per-seq transformed distribution ``q`` and records that ``q``
+          so the accept step can compute ``min(1, p/q)`` and the residual
+          ``(p-q)+``. Returns ``(drafts, q)`` where ``q`` is an
+          :class:`MtpQDist` -- sparse (top-k support) when ``sparse``, dense
+          ``[nd, k, vocab]`` otherwise.
         """
         mtp = self.model.mtp
         dev = hidden.device
         drafts_cols = [[] for _ in range(nd)]
         tok = torch.tensor(x1, device=dev, dtype=torch.int64)
         cur_hidden = hidden
+        sampled = gen is not None
         q_steps, qv_steps, qi_steps, qd_steps = [], [], [], []
         penalties = getattr(self, "_mtp_penalties", None)
         penalty_history = penalties.history.clone() if penalties is not None else None
-        if sparse:
+
+        if not sampled:
+            def sample_step(logits):
+                return logits.argmax(dim=-1).to(torch.int64)
+        elif sparse:
             temps, top_ks, top_ps = self._mtp_sample_params(decode_seqs, dev)
             k_pad = self._mtp_kpad(decode_seqs)
+
+            def sample_step(logits):
+                qv, qi = self._mtp_sparse_probs(logits, temps, top_ks, top_ps, k_pad)
+                col = torch.multinomial(qv, num_samples=1, generator=gen)
+                tok = qi.gather(1, col).squeeze(1).to(torch.int64)
+                tok = self._mtp_bcast_tp(tok)
+                # After the TP broadcast the drawn token may come from rank 0, so
+                # look its probability up by id rather than by column.
+                qd = (qv * (qi == tok.unsqueeze(1)).to(qv.dtype)).sum(dim=1)
+                qv_steps.append(qv)
+                qi_steps.append(qi)
+                qd_steps.append(qd)
+                return tok
+        else:
+            def sample_step(logits):
+                q = self._mtp_probs_from_logits(logits, decode_seqs)  # [nd, vocab]
+                tok = (
+                    torch.multinomial(q, num_samples=1, generator=gen)
+                    .squeeze(1)
+                    .to(torch.int64)
+                )
+                tok = self._mtp_bcast_tp(tok)
+                q_steps.append(q)
+                return tok
+
         for j in range(k):
             for i, s in enumerate(decode_seqs):
                 s.computed_token_num = (
@@ -587,33 +627,17 @@ class MtpMixin:
                 apply_speculative_penalties(
                     logits, penalty_history, penalties.values, tok[:, None], update_history=True,
                 )
-            # Sample one draft token per seq from q (TP-synced generator), then
-            # broadcast TP-rank-0's picks so every rank feeds the SAME token into
-            # the next draft forward (multinomial isn't TP-deterministic).
-            if sparse:
-                qv, qi = self._mtp_sparse_probs(logits, temps, top_ks, top_ps, k_pad)
-                col = torch.multinomial(qv, num_samples=1, generator=gen)
-                tok = qi.gather(1, col).squeeze(1).to(torch.int64)
-                tok = self._mtp_bcast_tp(tok)
-                # After the TP broadcast the drawn token may come from rank 0, so
-                # look its probability up by id rather than by column.
-                qd = (qv * (qi == tok.unsqueeze(1)).to(qv.dtype)).sum(dim=1)
-                qv_steps.append(qv)
-                qi_steps.append(qi)
-                qd_steps.append(qd)
-            else:
-                q = self._mtp_probs_from_logits(logits, decode_seqs)  # [nd, vocab]
-                tok = (
-                    torch.multinomial(q, num_samples=1, generator=gen)
-                    .squeeze(1)
-                    .to(torch.int64)
-                )
-                tok = self._mtp_bcast_tp(tok)
-                q_steps.append(q)
+            # Sampled mode: draw one draft token per seq from q (TP-synced
+            # generator), then broadcast TP-rank-0's picks so every rank feeds
+            # the SAME token into the next draft forward (multinomial isn't
+            # TP-deterministic).
+            tok = sample_step(logits)
             tok_cpu = tok.tolist()
             for i in range(nd):
                 drafts_cols[i].append(tok_cpu[i])
             cur_hidden = out_hidden
+        if not sampled:
+            return drafts_cols
         if sparse:
             return drafts_cols, self._q_sparse(
                 torch.stack(qv_steps, dim=1),
@@ -622,88 +646,91 @@ class MtpMixin:
             )
         return drafts_cols, self._q_dense(torch.stack(q_steps, dim=1))
 
-    @torch.inference_mode()
-    def _draft_chain_eager(self, decode_seqs, orig_tokens, x1, hidden, k, nd):
-        """Eager k-step MTP draft chain (fallback / graph-disabled path).
-
-        One D2H at the end (a ``[nd, k]`` tensor -> list) instead of a ``.item()``
-        per token per step. Returns ``drafts`` = per-seq ``[d1..dk]`` (CPU ints).
-        """
-        mtp = self.model.mtp
-        dev = hidden.device
-        drafts_cols = [[] for _ in range(nd)]
-        tok = torch.tensor(x1, device=dev, dtype=torch.int64)
-        cur_hidden = hidden
-        penalties = getattr(self, "_mtp_penalties", None)
-        penalty_history = penalties.history.clone() if penalties is not None else None
-        for j in range(k):
-            for i, s in enumerate(decode_seqs):
-                s.computed_token_num = (
-                    len(orig_tokens[i]) + j + MTP_DRAFT_POS_OFFSET
-                )
-                s.to_compute_token_num = 1
-                s.to_compute_tokens = [x1[i] if j == 0 else drafts_cols[i][-1]]
-            self.prepare_input(decode_seqs)
-            self._prepare_attention_metadata(self.input_data)
-            out_hidden = mtp.forward(self.input_data, cur_hidden, tok)
-            logits = mtp.logits_from_hidden(out_hidden)
-            if penalties is not None:
-                apply_speculative_penalties(
-                    logits, penalty_history, penalties.values, tok[:, None], update_history=True,
-                )
-            tok = logits.argmax(dim=-1).to(torch.int64)
-            # Need python token_ids for the next step's slot bookkeeping, so this
-            # step's tokens must be materialized before building step j+1. Keep a
-            # single per-step D2H (unavoidable in the eager path since positions/
-            # slots are rebuilt from python token_ids each step).
-            tok_cpu = tok.tolist()
-            for i in range(nd):
-                drafts_cols[i].append(tok_cpu[i])
-            cur_hidden = out_hidden
-        return drafts_cols
+    def _draft_chain_eager_sampled(
+        self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen, sparse=False
+    ):
+        """Sampled-mode shorthand for :meth:`_draft_chain_eager` (kept for
+        callers/tests that predate the merge of the two eager chains)."""
+        # Dispatch through the mixin class (not ``self._draft_chain_eager``):
+        # tests drive this with a duck-typed ``SimpleNamespace`` runner.
+        return MtpMixin._draft_chain_eager(
+            self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen=gen, sparse=sparse
+        )
 
     @torch.inference_mode()
-    def _draft_chain_graph(self, decode_seqs, orig_tokens, x1, hidden, k, nd):
+    def _draft_chain_graph(
+        self, decode_seqs, orig_tokens, x1, hidden, k, nd, sampled=False, sparse=False
+    ):
         """CUDA-graph k-step MTP draft chain.
 
-        Captures ONE draft-step graph per exact batch size ``nd`` (lazily) and
-        replays it k times. Between replays, tok/hidden/positions/slot_mapping/
-        seq_lens are advanced **in place on the GPU** (no Python/H2D/.item()),
-        so the whole chain has zero per-step host overhead and a single D2H at
-        the end. The captured graph runs ``mtp.forward`` over ``self.input_data``
-        with the MTP head's ``prev_hidden``/``input_ids`` aliased to static
-        buffers ``self._d_hidden``/``self._d_tok``; its argmax is written to
-        ``self._d_next_tok`` and post-block hidden to ``self._d_out_hidden``.
+        Replays the per-bucket draft-step graph (captured lazily by
+        ``_capture_draft_graphs``) k times. Between replays, tok/hidden/
+        positions/slot_mapping/seq_lens are advanced **in place on the GPU**
+        (no Python/H2D/.item()), so the whole chain has zero per-step host
+        overhead. The captured graph runs ``mtp.forward`` with the MTP head's
+        ``prev_hidden``/``input_ids`` aliased to the static buffers
+        ``self._d_hidden``/``self._d_tok``; its output token lands in
+        ``self._d_next_tok`` and post-block hidden in ``self._d_out_hidden``.
 
-        Requires all seqs share one page-table width and per-step positions stay
-        within the pre-allocated draft slots. Falls back is handled by the caller
-        (this is only entered when ``nd <= max bucket``).
+        Two modes, sharing the bucket pick, the static-buffer fill and the
+        replay-advance loop (all host-side code; the captured graph content
+        was fixed at capture time):
+
+        * **greedy** (``sampled=False``): replays the argmax draft step.
+          Returns ``None`` and stashes the GPU draft tensor in
+          ``self._drafts_gpu`` -- materializing it here is a blocking D2H
+          (~0.55 ms at nd=64); host-side readers go through
+          :meth:`_drafts_host`.
+        * **sampled** (rejection mode): replays the Gumbel-max sampled draft
+          step (top-k-sparse variant when ``sparse``). Between replays the
+          drawn token is broadcast across TP (host side, OUTSIDE the graph):
+          the captured default-generator RNG is not guaranteed identical
+          across ranks. Returns ``(drafts, q)`` -- per-seq ``[d1..dk]`` CPU
+          ints (the rejection accept walks drafts host-side) and an
+          :class:`MtpQDist`.
+
+        KV pages for the whole speculative window were pre-allocated once by
+        ``_mtp_decode``, so the page tables are frozen for this step. Falls
+        back to the eager chain when no captured bucket fits.
         """
         dev = hidden.device
         page_sz = self.memory_manager.page_size
 
         # Smallest captured bucket >= nd (sorted() ascending, take the first
-        # match). Fall back to eager if this batch size wasn't captured at init.
-        graphs = self._draft_size_to_graph
+        # match). ``sparse``: every request restricts top_k, so the batch can
+        # use the captured top-k-sparse draft step (one topk instead of a
+        # full-vocab softmax + two renorm passes per step).
         penalties = getattr(self, "_mtp_penalties", None)
-        if penalties is not None:
-            graphs = self._draft_penalty_graphs["greedy"]
+        if not sampled:
+            graphs = self._draft_size_to_graph
+            if penalties is not None:
+                graphs = self._draft_penalty_graphs["greedy"]
+        else:
+            graphs = (
+                self._draft_size_to_graph_sampled_sparse
+                if sparse
+                else self._draft_size_to_graph_sampled
+            )
+            if penalties is not None:
+                graphs = self._draft_penalty_graphs["sparse" if sparse else "dense"]
         bucket = None
         for b in sorted(graphs):
             if b >= nd:
                 bucket = b
                 break
         if bucket is None:
+            # Fall back to eager if this batch size wasn't captured at init.
+            if not sampled:
+                return self._draft_chain_eager(
+                    decode_seqs, orig_tokens, x1, hidden, k, nd
+                )
+            gen = self._mtp_rng_step(dev)
             return self._draft_chain_eager(
-                decode_seqs, orig_tokens, x1, hidden, k, nd
+                decode_seqs, orig_tokens, x1, hidden, k, nd, gen=gen, sparse=sparse
             )
         g = graphs[bucket]
         if penalties is not None:
             self._stage_draft_penalties(penalties, nd, bucket)
-
-        # KV pages for the whole speculative window were pre-allocated once by
-        # ``_mtp_decode`` (draft writes ctx..ctx+k-1, verify ctx..ctx+k), so the
-        # page tables are already frozen for this step -- nothing to do here.
 
         # Fill the static draft-input buffers IN PLACE for this step (the captured
         # graph reads these exact buffers). Padded rows [nd:bucket] are written
@@ -745,133 +772,24 @@ class MtpMixin:
         self._d_hidden[:nd].copy_(hidden)
         if bucket > nd:
             self._d_hidden[nd:bucket].zero_()
-
-        base_pos = self._d_base_pos[:bucket]
-        base_pos.copy_(self._draft_input.positions[:bucket])
-        block_table = self._draft_input.block_table[:bucket]
-        row_idx = self._d_row_idx[:bucket]
-
-        def _slot_for(pos):
-            blk = block_table[row_idx, (pos // page_sz)]
-            return blk.to(torch.int64) * page_sz + (pos % page_sz)
-
-        for j in range(k):
-            if j > 0:
-                self._d_tok[:bucket].copy_(self._d_next_tok[:bucket])
-                self._d_hidden[:bucket].copy_(self._d_out_hidden[:bucket])
-                new_pos = base_pos + j
-                self._draft_input.positions[:bucket].copy_(new_pos)
-                self._draft_input.slot_mapping[:bucket].copy_(_slot_for(new_pos))
-                # ``decode_seq_lens`` is MLA-only metadata (set in
-                # ``_cal_mla_metadata``); non-MLA models advance only
-                # ``seq_lens``, which the GDN/full-attn decode kernels read.
-                if self.use_mla:
-                    self._draft_input.decode_seq_lens[:bucket].add_(1)
-                self._draft_input.seq_lens[:bucket].add_(1)
-            g.replay()
-            self._d_drafts[:nd, j].copy_(self._d_next_tok[:nd])
-
-        # Stash the GPU draft tensor and return ``None`` for the host copy:
-        # ``.tolist()`` here is a blocking D2H that stalls the host on the whole
-        # draft chain (~0.55 ms at nd=64) only to hand the accept loop token ids
-        # it now gets from the single end-of-step packed D2H. Paths that truly
-        # need host-side drafts go through :meth:`_drafts_host`.
-        self._drafts_gpu = self._d_drafts[:nd, :k]
-        return None
-
-    @torch.inference_mode()
-    def _draft_chain_graph_sampled(
-        self, decode_seqs, orig_tokens, x1, hidden, k, nd, sparse=False
-    ):
-        """CUDA-graph k-step SAMPLED (rejection) MTP draft chain.
-
-        Mirrors :meth:`_draft_chain_graph` but replays the sampled draft step
-        (Gumbel-max draw + q-dist stash). Between replays the drawn token is
-        broadcast across TP (host side, OUTSIDE the graph) so every rank feeds
-        the same token into the next step -- the Gumbel-max RNG (default CUDA
-        generator, captured) is not guaranteed identical across ranks, so we
-        sync the token explicitly rather than rely on RNG lockstep. Returns
-        ``(drafts, q)`` -- ``drafts`` per-seq ``[d1..dk]`` (CPU ints) and ``q`` an
-        :class:`MtpQDist` (sparse top-k support when ``sparse``, else dense
-        ``[nd, k, vocab]``). Falls back to eager if the bucket wasn't captured.
-        """
-        dev = hidden.device
-        page_sz = self.memory_manager.page_size
-        # ``sparse``: every request restricts top_k, so the batch can use the
-        # captured top-k-sparse draft step (one topk instead of a full-vocab
-        # softmax + two renorm passes per step).
-        graphs = (
-            self._draft_size_to_graph_sampled_sparse
-            if sparse
-            else self._draft_size_to_graph_sampled
-        )
-        penalties = getattr(self, "_mtp_penalties", None)
-        if penalties is not None:
-            graphs = self._draft_penalty_graphs["sparse" if sparse else "dense"]
-        bucket = None
-        for b in sorted(graphs.keys()):
-            if b >= nd:
-                bucket = b
-                break
-        if bucket is None:
-            gen = self._mtp_rng_step(dev)
-            return self._draft_chain_eager_sampled(
-                decode_seqs, orig_tokens, x1, hidden, k, nd, gen, sparse=sparse
-            )
-        g = graphs[bucket]
-        if penalties is not None:
-            self._stage_draft_penalties(penalties, nd, bucket)
-
-        # KV pages for the whole speculative window were pre-allocated once by
-        # ``_mtp_decode``; fill the static draft buffers the same way the greedy
-        # graph chain does (GPU-native prep, CPU builders as the fallback).
-        gp = self._mtp_gpu_prep_batch(decode_seqs, orig_tokens, x1, bucket)
-        if gp is not None:
-            ForwardMetadataPlan.uniform_gpu(
-                num_rows=bucket,
-                qlen=1,
-                is_mtp_verify=False,
-            ).materialize(
-                self._draft_input,
-                gp.draft_materializer(seqs=decode_seqs),
-            )
-        else:
-            for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i]) + MTP_DRAFT_POS_OFFSET
-                s.to_compute_token_num = 1
-                s.to_compute_tokens = [x1[i]]
-            pad_seqs = (
-                self.create_dummy_seqs(bucket - nd, runtime=True) if bucket > nd else []
-            )
-            graph_seqs = list(decode_seqs) + pad_seqs
-            self._draft_input.cal_and_set_input(graph_seqs)
-        self._d_nd = bucket
-        if gp is not None:
-            self._d_tok[:nd].copy_(gp.x1_gpu(nd))
-        else:
-            self._d_tok[:nd].copy_(torch.tensor(x1, device=dev, dtype=torch.int64))
-        if bucket > nd:
-            self._d_tok[nd:bucket].zero_()
-        self._d_hidden[:nd].copy_(hidden)
-        if bucket > nd:
-            self._d_hidden[nd:bucket].zero_()
-        # Fill per-seq sampling params into the static buffers the graph reads.
-        # Via the pinned staging (D2D copies here) -- the previous
-        # ``torch.tensor(list, device=cuda)`` form was three pageable H2Ds, i.e.
-        # three implicit stream syncs per draft chain.
-        _temps, _top_ks, _top_ps = self._mtp_sample_params(decode_seqs, dev)
-        self._d_temp[:nd, 0].copy_(_temps.squeeze(1))
-        self._d_topk[:nd].copy_(_top_ks)
-        self._d_topp[:nd].copy_(_top_ps)
-        V = self.memory_manager.vocab_size
-        if bucket > nd:  # padded rows: harmless greedy-ish params
-            self._d_temp[nd:bucket].fill_(1.0)
-            # ``top_k = 1`` (not ``vocab``): on the sparse path an unrestricted
-            # ``top_k`` clamps the tie threshold to the last column of the window,
-            # which always trips the tie-overflow counter. Padded rows' output is
-            # discarded, so pick the value that keeps the diagnostic meaningful.
-            self._d_topk[nd:bucket].fill_(1)
-            self._d_topp[nd:bucket].fill_(1.0)
+        if sampled:
+            # Fill per-seq sampling params into the static buffers the graph
+            # reads. Via the pinned staging (D2D copies here) -- the previous
+            # ``torch.tensor(list, device=cuda)`` form was three pageable H2Ds,
+            # i.e. three implicit stream syncs per draft chain.
+            _temps, _top_ks, _top_ps = self._mtp_sample_params(decode_seqs, dev)
+            self._d_temp[:nd, 0].copy_(_temps.squeeze(1))
+            self._d_topk[:nd].copy_(_top_ks)
+            self._d_topp[:nd].copy_(_top_ps)
+            if bucket > nd:  # padded rows: harmless greedy-ish params
+                self._d_temp[nd:bucket].fill_(1.0)
+                # ``top_k = 1`` (not ``vocab``): on the sparse path an
+                # unrestricted ``top_k`` clamps the tie threshold to the last
+                # column of the window, which always trips the tie-overflow
+                # counter. Padded rows' output is discarded, so pick the value
+                # that keeps the diagnostic meaningful.
+                self._d_topk[nd:bucket].fill_(1)
+                self._d_topp[nd:bucket].fill_(1.0)
 
         base_pos = self._d_base_pos[:bucket]
         base_pos.copy_(self._draft_input.positions[:bucket])
@@ -897,26 +815,34 @@ class MtpMixin:
                     self._draft_input.decode_seq_lens[:bucket].add_(1)
                 self._draft_input.seq_lens[:bucket].add_(1)
             g.replay()
-            # TP-sync the drawn token (Gumbel RNG isn't guaranteed identical
-            # across ranks); broadcast BEFORE it seeds the next step's forward.
-            self._mtp_bcast_tp(self._d_next_tok[:bucket])
+            if sampled:
+                # TP-sync the drawn token (Gumbel RNG isn't guaranteed identical
+                # across ranks); broadcast BEFORE it seeds the next step's
+                # forward.
+                self._mtp_bcast_tp(self._d_next_tok[:bucket])
             self._d_drafts[:nd, j].copy_(self._d_next_tok[:nd])
-            if sparse:
-                step_qv.append(self._d_qv[:nd].clone())
-                step_qi.append(self._d_qi[:nd].clone())
-                # The broadcast above can replace this rank's drawn token with
-                # rank 0's, so re-derive the drawn probability by token id rather
-                # than trusting the in-graph ``_d_qd`` column lookup.
-                step_qd.append(
-                    (
-                        self._d_qv[:nd]
-                        * (self._d_qi[:nd] == self._d_next_tok[:nd].unsqueeze(1))
-                    ).sum(dim=1)
-                )
-            else:
-                step_q.append(self._d_q[:nd].clone())
+            if sampled:
+                if sparse:
+                    step_qv.append(self._d_qv[:nd].clone())
+                    step_qi.append(self._d_qi[:nd].clone())
+                    # The broadcast above can replace this rank's drawn token
+                    # with rank 0's, so re-derive the drawn probability by token
+                    # id rather than trusting the in-graph ``_d_qd`` column
+                    # lookup.
+                    step_qd.append(
+                        (
+                            self._d_qv[:nd]
+                            * (self._d_qi[:nd] == self._d_next_tok[:nd].unsqueeze(1))
+                        ).sum(dim=1)
+                    )
+                else:
+                    step_q.append(self._d_q[:nd].clone())
 
-        drafts_gpu = self._d_drafts[:nd, :k]
+        # Stash the GPU draft tensor so the verify prep / accept step can take
+        # the tokens straight from the device.
+        self._drafts_gpu = self._d_drafts[:nd, :k]
+        if not sampled:
+            return None
         if sparse:
             q = self._q_sparse(
                 torch.stack(step_qv, dim=1),  # [nd, k, k_pad]
@@ -925,12 +851,7 @@ class MtpMixin:
             )
         else:
             q = self._q_dense(torch.stack(step_q, dim=1))  # [nd, k, vocab]
-        # Stash the GPU copy so the verify prep can take the tokens straight from
-        # the device. The rejection accept still walks the drafts host-side (it
-        # slices the committed prefix per seq), so materialize them here -- one
-        # D2H, same as before.
-        self._drafts_gpu = drafts_gpu
-        mat = drafts_gpu.tolist()
+        mat = self._drafts_gpu.tolist()
         return [mat[i] for i in range(nd)], q
 
     @torch.inference_mode()
@@ -1111,7 +1032,7 @@ class MtpMixin:
         per-seq sampling params (``_d_temp``/``_d_topk``/``_d_topp``) are static
         buffers filled before each replay. RNG uses the default CUDA generator
         (advances across replays); TP consistency is enforced by broadcasting the
-        drawn token between replays in :meth:`_draft_chain_graph_sampled` (host
+        drawn token between replays in :meth:`_draft_chain_graph` (host
         side, outside the graph).
         """
         nd = self._d_nd
@@ -2054,24 +1975,25 @@ class MtpMixin:
                     else self._draft_size_to_graph_sampled
                 )
                 if self._mtp_draft_graph and _sg and nd <= max(_sg.keys()):
-                    drafts, q_dists = self._draft_chain_graph_sampled(
+                    drafts, q_dists = self._draft_chain_graph(
                         decode_seqs,
                         orig_tokens,
                         x1_tokens,
                         hidden,
                         k,
                         nd,
+                        sampled=True,
                         sparse=_sparse,
                     )
                 else:
-                    drafts, q_dists = self._draft_chain_eager_sampled(
+                    drafts, q_dists = self._draft_chain_eager(
                         decode_seqs,
                         orig_tokens,
                         x1,
                         hidden,
                         k,
                         nd,
-                        gen,
+                        gen=gen,
                         sparse=_sparse,
                     )
             elif (
