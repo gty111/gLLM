@@ -321,6 +321,13 @@ def add_engine_args(p: argparse.ArgumentParser, *, tp_help: str = None) -> None:
     add_mm_processor_args(p)
 
 
+# Args defined by entrypoints' own parsers (api_server.build_arg_parser) whose
+# dest happens to match an EngineConfig field, and which those entrypoints pass
+# to the engine explicitly alongside ``**engine_kwargs(args)``. Forwarding them
+# here too would duplicate the kwarg (TypeError: multiple values).
+_ENTRYPOINT_MANAGED = frozenset({"launch_mode", "assigned_layers"})
+
+
 def engine_kwargs(args: argparse.Namespace) -> dict:
     """Engine constructor kwargs for the arguments added by :func:`add_engine_args`.
 
@@ -340,7 +347,7 @@ def engine_kwargs(args: argparse.Namespace) -> dict:
     kwargs = {
         name: value
         for name, value in vars(args).items()
-        if name in _ENGINE_CONFIG_FIELDS
+        if name in _ENGINE_CONFIG_FIELDS and name not in _ENTRYPOINT_MANAGED
     }
     kwargs["tp_size"] = args.tp
     kwargs["piecewise_cuda_graph"] = {
