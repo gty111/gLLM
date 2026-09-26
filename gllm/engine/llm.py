@@ -488,7 +488,7 @@ class LLM:
                 if self.running_maps.pop(id, None) is None:
                     continue
                 retired.append(id)
-                stream = self.async_streams.pop(id, None)
+                stream = self.async_streams.pop(id, None) if self.async_streams else None
                 if stream is not None:
                     error = getattr(ipc_package, "request_errors", {}).get(id)
                     if error:
