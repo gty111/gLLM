@@ -68,9 +68,9 @@ class LinearBase(torch.nn.Module):
             )
             self.register_parameter("weight", weight)
         elif self.quant_config["quant_method"] == "fp8":
-            if get_device_capability() < 89:
+            if get_device_capability() < 80:
                 raise Exception(
-                    f"FP8 quantizaiton method is not supported on device capability less than 89 (current is {get_device_capability()})"
+                    f"FP8 quantization requires SM80 or newer (current is {get_device_capability()})"
                 )
             self.activation_scheme = self.quant_config["activation_scheme"]
             # ``scale_fmt="ue8m0"`` (DeepSeek-V3.2) rounds FP8 group scales to
@@ -147,6 +147,10 @@ class LinearBase(torch.nn.Module):
             return torch.nn.functional.linear
         elif self.quant_config["quant_method"] == "fp8":
             assert self.block_quant
+            if get_device_capability() < 89:
+                from gllm.layers.quantization.fp8_marlin import FP8MarlinMethod
+
+                return FP8MarlinMethod()
             return partial(
                 fp8LinearMethod,
                 block_size=self.weight_block_size,

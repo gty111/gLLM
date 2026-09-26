@@ -1,0 +1,6 @@
+Marlin kernels and support headers adapted from SGLang (Apache-2.0).
+Source: https://github.com/sgl-project/sglang/tree/9784d5f979c9eaa5a6d9b31e596a7a73cb76dab8/python/sglang/kernels/jit
+Original paths: csrc/gemm/marlin and include/sgl_kernel.
+Original copyright notices are retained in each file.
+gLLM changes: instantiate only FP8 GEMM variants in gptq_marlin.cuh.
+Python packing/scale permutations adapted from python/sglang/srt/layers/quantization/marlin_utils_fp8.py and marlin_utils.py at the same revision.
