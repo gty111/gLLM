@@ -18,6 +18,18 @@ if TYPE_CHECKING:
     from gllm.runtime.input_data import InputData
 
 
+# Resolved paged-QKV attention backend names, in canonical preference order.
+# Shared validation list: ``gllm.runtime.model_runner`` syntax-checks the
+# configured name against this and ``create_qkv_attention_backend`` re-checks
+# the resolved one; ``gllm.layers.attention.mla`` keeps its own copy pending
+# the layers-side cleanup.
+QKV_ATTENTION_BACKENDS = ("fa4", "flashinfer", "fa3")
+
+# Resolved absorbed-MLA decode backend names. Canonical home is the MLA
+# layer; kept here with the QKV names so runners import one module for both.
+MLA_DECODE_BACKENDS = ("triton", "flashmla", "fa4")
+
+
 @dataclass
 class PagedAttentionMetadata:
     block_table: torch.Tensor
@@ -449,7 +461,7 @@ def create_qkv_attention_backend(
 ) -> QKVAttentionBackend:
     """Construct the QKV backend selected by configuration validation."""
     resolved = (resolved or "").lower()
-    if resolved not in ("fa4", "flashinfer", "fa3"):
+    if resolved not in QKV_ATTENTION_BACKENDS:
         raise ValueError(
             "attention_backend must already be resolved to 'fa4' or "
             f"'flashinfer' or 'fa3', got {resolved!r}."
