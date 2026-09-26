@@ -144,6 +144,108 @@ class Scheduler:
         self._pending_follower_frees = []
         return out
 
+    def _retire_seq(self, seq, ipc_package, defer_frees=None):
+        """Retire a finished / aborted seq: notify both free listeners and
+        release its pages.
+
+        Two free notifications per retirement:
+
+        * ``ipc_package.free_ids`` goes to the *frontend* (so it can stop
+          tracking the seq and emit the final response);
+        * ``_pending_follower_frees`` goes to the PP-other followers, which
+          hold their own per-seq mirror (``FollowerSeqStore`` + VL
+          ``embedding_cache`` row) and are told via the next schedule payload
+          (see :meth:`consume_pending_follower_frees`).
+
+        ``_overlap_freed`` latches the retirement so a later overlap finalize /
+        abort pass skips the seq instead of double-freeing it.
+
+        ``defer_frees`` (overlap only): when a successor batch was launched
+        before this output was collected it may still be reading the seq's
+        KV/SSM pages. Retirement is still logically immediate, but the seq is
+        collected into ``defer_frees`` and the caller releases its pages at the
+        successor's completion boundary instead of freeing right away.
+        """
+        ipc_package.free_ids.append(seq.seq_id)
+        self._pending_follower_frees.append(seq.seq_id)
+        seq._overlap_freed = True
+        if defer_frees is None:
+            self.model_runner.free(seq)
+        else:
+            defer_frees.append(seq)
+        # A retired decode seq may still sit in the wait queue (overlap paths
+        # requeue in-flight seqs); the sync path's seq comes from
+        # ``batch_running``, hence the tolerant remove.
+        try:
+            self.seqs_to_decode.remove(seq)
+        except ValueError:
+            pass
+
+    def _log_batch_stats(
+        self,
+        num_total_decode_seqs,
+        prefill_batched_token_nums,
+        decode_batch,
+        num_wait_tokens=None,
+    ):
+        """Periodic ``#wait #run #prefill #decode memory_util`` status line.
+
+        Every TP/PP rank runs an identical copy of the scheduler, so logging
+        the batch stats on all of them floods the console with N duplicate
+        lines per tick. Restrict to the driver of each DP replica (stage-0,
+        TP-0), so every DP group reports its own batch stats exactly once.
+
+        ``num_wait_tokens`` (token-throttling only) extends the ``#wait`` field
+        with the waiting-token count.
+        """
+        if not (
+            self.log
+            and get_pp_rank() == 0
+            and get_tp_rank() == 0
+            and time.time() - self.log_time > 1
+        ):
+            return
+        self.log_time = time.time()
+        if num_wait_tokens is None:
+            log_info = (
+                "#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%"
+                % (
+                    len(self.seqs_to_prefill),
+                    num_total_decode_seqs,
+                    prefill_batched_token_nums,
+                    len(decode_batch),
+                    "%.2f" % self.memory_manager.get_memory_util(),
+                )
+            )
+        else:
+            log_info = (
+                "#wait: %4d/%8d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%"
+                % (
+                    len(self.seqs_to_prefill),
+                    num_wait_tokens,
+                    num_total_decode_seqs,
+                    prefill_batched_token_nums,
+                    len(decode_batch),
+                    "%.2f" % self.memory_manager.get_memory_util(),
+                )
+            )
+        if isinstance(self.memory_manager, PrefixMemoryManager):
+            log_info += " cache_hit_rate: %5s %%" % (
+                "%.2f" % self.memory_manager.get_cache_hit_rate()
+            )
+        logger.info(log_info)
+
+    def _decay_token_ratio(self):
+        """Relax the adaptive prefill reserve a touch each tick.
+
+        Preemptions push ``new_token_ratio`` back up; the decay keeps us from
+        being permanently over-conservative.
+        """
+        self.new_token_ratio = max(
+            self.min_new_token_ratio,
+            self.new_token_ratio - self.new_token_ratio_decay,
+        )
+
     def dispatch_schedule_method(self):
         if self.schedule_method in ["split_pd", "chunked_prefill"]:
             return self.chunked_prefill
@@ -326,14 +428,7 @@ class Scheduler:
                     committed[:kept] if isinstance(tok, list) else tok
                 )
             if seq.is_finish:
-                ipc_package.free_ids.append(seq.seq_id)
-                # Mirror the free to follower-side state cleanup. ``free_ids``
-                # in ``ipc_package`` goes to the *frontend* (so it can stop
-                # tracking the seq and emit the final response); followers
-                # need their own notification path because they hold the
-                # FollowerSeq mirror + VL ``embedding_cache`` row.
-                self._pending_follower_frees.append(seq.seq_id)
-                self.model_runner.free(seq)
+                self._retire_seq(seq, ipc_package)
             elif seq.computed_prompt:
                 self.seqs_to_decode.appendleft(seq)
             else:  # unfinished prefill seqs
@@ -850,40 +945,10 @@ class Scheduler:
                 fallback_budget, token_budget=self.max_num_batched_tokens
             )
 
-        # Every TP/PP rank runs an identical copy of the scheduler, so logging
-        # the batch stats on all of them floods the console with N duplicate
-        # lines per tick. Restrict to the driver of each DP replica (stage-0,
-        # TP-0), so every DP group reports its own batch stats exactly once.
-        if (
-            self.log
-            and get_pp_rank() == 0
-            and get_tp_rank() == 0
-            and time.time() - self.log_time > 1
-        ):
-            self.log_time = time.time()
-            log_info = (
-                "#wait: %4d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%"
-                % (
-                    len(self.seqs_to_prefill),
-                    num_total_decode_seqs,
-                    prefill_batched_token_nums,
-                    len(decode_batch),
-                    "%.2f" % self.memory_manager.get_memory_util(),
-                )
-            )
-            if isinstance(self.memory_manager, PrefixMemoryManager):
-                log_info += " cache_hit_rate: %5s %%" % (
-                    "%.2f" % self.memory_manager.get_cache_hit_rate()
-                )
-                logger.info(log_info)
-            else:
-                logger.info(log_info)
-        # Change 2: relax the reserve a touch each tick; preemptions push it
-        # back up. Keeps us from being permanently over-conservative.
-        self.new_token_ratio = max(
-            self.min_new_token_ratio,
-            self.new_token_ratio - self.new_token_ratio_decay,
+        self._log_batch_stats(
+            num_total_decode_seqs, prefill_batched_token_nums, decode_batch
         )
+        self._decay_token_ratio()
         # first decode, then prefill
         return decode_batch + prefill_batch
 
@@ -944,40 +1009,13 @@ class Scheduler:
             mtp_eligible=True,
         )
 
-        # Every TP/PP rank runs an identical copy of the scheduler, so logging
-        # the batch stats on all of them floods the console with N duplicate
-        # lines per tick. Restrict to the driver of each DP replica (stage-0,
-        # TP-0), so every DP group reports its own batch stats exactly once.
-        if (
-            self.log
-            and get_pp_rank() == 0
-            and get_tp_rank() == 0
-            and time.time() - self.log_time > 1
-        ):
-            self.log_time = time.time()
-            log_info = (
-                "#wait: %4d/%8d #run: %4d #prefill: %4d #decode: %4d memory_util: %5s %%"
-                % (
-                    len(self.seqs_to_prefill),
-                    self.num_wait_tokens,
-                    num_total_decode_seqs,
-                    prefill_batched_token_nums,
-                    len(decode_batch),
-                    "%.2f" % self.memory_manager.get_memory_util(),
-                )
-            )
-            if isinstance(self.memory_manager, PrefixMemoryManager):
-                log_info += " cache_hit_rate: %5s %%" % (
-                    "%.2f" % self.memory_manager.get_cache_hit_rate()
-                )
-                logger.info(log_info)
-            else:
-                logger.info(log_info)
-        # Change 2: relax the reserve a touch each tick (see chunked_prefill).
-        self.new_token_ratio = max(
-            self.min_new_token_ratio,
-            self.new_token_ratio - self.new_token_ratio_decay,
+        self._log_batch_stats(
+            num_total_decode_seqs,
+            prefill_batched_token_nums,
+            decode_batch,
+            num_wait_tokens=self.num_wait_tokens,
         )
+        self._decay_token_ratio()
         # first decode, then prefill
         return decode_batch + prefill_batch
 
@@ -1172,21 +1210,7 @@ class OverlapScheduler(Scheduler):
                 self._attach_prompt_logprobs(ipc_package, seq)
 
             if seq.is_finish:
-                ipc_package.free_ids.append(seq.seq_id)
-                self._pending_follower_frees.append(seq.seq_id)
-                seq._overlap_freed = True
-                if defer_frees is None:
-                    self.model_runner.free(seq)
-                else:
-                    # The successor was launched before this output was
-                    # collected and may still be touching the sequence's KV/SSM
-                    # pages.  Logical retirement is immediate, but physical
-                    # release belongs to the successor completion boundary.
-                    defer_frees.append(seq)
-                try:
-                    self.seqs_to_decode.remove(seq)
-                except ValueError:
-                    pass
+                self._retire_seq(seq, ipc_package, defer_frees)
         return ipc_package if (
             ipc_package.act_schedule_ids or ipc_package.free_ids
         ) else None
@@ -1228,14 +1252,7 @@ class OverlapScheduler(Scheduler):
             self._attach_prompt_logprobs(ipc_package, seq)
 
             if seq.is_finish:
-                ipc_package.free_ids.append(seq.seq_id)
-                self._pending_follower_frees.append(seq.seq_id)
-                seq._overlap_freed = True
-                self.model_runner.free(seq)
-                try:
-                    self.seqs_to_decode.remove(seq)
-                except ValueError:
-                    pass
+                self._retire_seq(seq, ipc_package)
 
         return ipc_package if (
             ipc_package.act_schedule_ids or ipc_package.free_ids
@@ -1292,25 +1309,7 @@ class OverlapScheduler(Scheduler):
             generated_len = placeholder_pos + 1 - seq.raw_prompt_len
             is_max_len = generated_len >= seq.output_len
             if seq.computed_prompt and (is_eos or is_max_len):
-                ipc_package.free_ids.append(seq.seq_id)
-                # Followers also need to drop this seq from their
-                # ``FollowerSeqStore`` (and the VL ``embedding_cache``).
-                # We piggyback on the next ``send_schedule_payload`` call;
-                # see ``Scheduler.consume_pending_follower_frees``.
-                self._pending_follower_frees.append(seq.seq_id)
-                seq._overlap_freed = True
-                if defer_frees is None:
-                    self.model_runner.free(seq)
-                else:
-                    # A successor was launched before this output was
-                    # collected and may still be reading the sequence's pages.
-                    # Retire it logically now; the caller releases the pages at
-                    # that successor's completion boundary.
-                    defer_frees.append(seq)
-                try:
-                    self.seqs_to_decode.remove(seq)
-                except ValueError:
-                    pass
+                self._retire_seq(seq, ipc_package, defer_frees)
 
         return ipc_package if (
             ipc_package.act_schedule_ids or ipc_package.free_ids
