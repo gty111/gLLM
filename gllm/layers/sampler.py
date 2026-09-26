@@ -1,8 +1,33 @@
 import torch
-from flashinfer.sampling import top_k_top_p_sampling_from_probs
+
+try:
+    from flashinfer.sampling import top_k_top_p_sampling_from_probs
+except (ImportError, OSError):  # FlashInfer is unavailable on ROCm.
+    top_k_top_p_sampling_from_probs = None
 
 from gllm.runtime.input_data import InputData
 from gllm.layers.repetition_penalty import apply_scaling_penalties
+
+
+def _top_k_top_p_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+) -> torch.Tensor:
+    """Apply joint top-k/top-p filtering and sample without FlashInfer."""
+    values, token_ids = probs.float().sort(dim=-1, descending=True)
+    ranks = torch.arange(values.shape[-1], device=values.device).unsqueeze(0)
+    ks = torch.where(top_ks <= 0, values.shape[-1], top_ks).unsqueeze(1)
+    values = values.masked_fill(ranks >= ks, 0.0)
+
+    ps = top_ps.to(values.dtype).unsqueeze(1)
+    cumulative = values.cumsum(dim=-1)
+    # Keep the token that first brings the cumulative probability above p.
+    excluded = (cumulative - values > ps) & (ps > 0) & (ps < 1)
+    values = values.masked_fill(excluded, 0.0)
+    values = values / values.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    sampled_ranks = torch.multinomial(values, 1)
+    return token_ids.gather(1, sampled_ranks).squeeze(1)
 
 
 def _fused_top_k_top_p_sample(
@@ -10,7 +35,9 @@ def _fused_top_k_top_p_sample(
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
 ) -> torch.Tensor:
-    """Fused top-k / top-p sampling via FlashInfer."""
+    """Use FlashInfer when available, otherwise sample with PyTorch."""
+    if top_k_top_p_sampling_from_probs is None:
+        return _top_k_top_p_torch(probs, top_ks, top_ps)
     return top_k_top_p_sampling_from_probs(
         probs.float().contiguous(),
         top_ks.to(torch.int32),
