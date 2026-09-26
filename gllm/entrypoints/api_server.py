@@ -145,6 +145,22 @@ def _unsupported(param: str, detail: Optional[str] = None):
     return _openai_error(message, param=param, code="unsupported_parameter")
 
 
+def _resolve_logprobs(count, enabled):
+    """Clamp a requested top-logprobs count to the OpenAI ceiling of 20.
+
+    ``None``/falsy ``count`` means "report only the sampled token"."""
+    return min(count or 0, 20) if enabled else 0
+
+
+def _context_length_error(param: str):
+    return _openai_error(
+        "This request exceeds the model's maximum context length.",
+        HTTPStatus.BAD_REQUEST.value,
+        param=param,
+        code="context_length_exceeded",
+    )
+
+
 def _validate_output_format(fmt, param, tools=None, ignore_eos=False):
     from gllm.structured_output import normalize_format
 
@@ -188,6 +204,12 @@ def _validate_chat_capabilities(request: ChatCompletionRequest):
         (request.moderation is not None, "moderation"),
         (request.prediction is not None, "prediction"),
         (request.prompt_cache_options is not None, "prompt_cache_options"),
+        (request.prompt_cache_key is not None, "prompt_cache_key"),
+        (request.prompt_cache_retention is not None, "prompt_cache_retention"),
+        (request.metadata is not None, "metadata"),
+        (request.user is not None, "user"),
+        (request.safety_identifier is not None, "safety_identifier"),
+        (request.verbosity is not None, "verbosity"),
         (request.web_search_options is not None, "web_search_options"),
     ]
     for condition, param in checks:
@@ -210,6 +232,29 @@ def _validate_chat_capabilities(request: ChatCompletionRequest):
             "tool_choice",
             "This runtime supports tool_choice='none' and 'auto'; forced and allowed tool choices are not enforceable by the loaded model.",
         )
+    return None
+
+
+def _validate_completion_capabilities(request: CompletionRequest):
+    model_error = _validate_model(request.model)
+    if model_error:
+        return model_error
+    checks = [
+        (request.n != 1, "n"),
+        (request.best_of not in (None, 1), "best_of"),
+        (request.echo is True, "echo"),
+        (request.frequency_penalty not in (None, 0, 0.0), "frequency_penalty"),
+        (request.presence_penalty not in (None, 0, 0.0), "presence_penalty"),
+        (request.logit_bias is not None, "logit_bias"),
+        (request.seed is not None, "seed"),
+        (bool(request.stop), "stop"),
+        (request.suffix is not None, "suffix"),
+        (request.user is not None, "user"),
+        (request.response_format is not None, "response_format"),
+    ]
+    for condition, param in checks:
+        if condition:
+            return _unsupported(param)
     return None
 
 
@@ -359,10 +404,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # (0-20) is how many alternatives to report per token. Clamp to the OpenAI
     # ceiling to bound the per-step top-k work.
     logprobs_enabled = bool(request.logprobs)
-    num_top_logprobs = min(request.top_logprobs or 0, 20) if logprobs_enabled else 0
+    num_top_logprobs = _resolve_logprobs(request.top_logprobs, logprobs_enabled)
     prompt_logprobs_enabled = request.prompt_logprobs is not None
-    num_prompt_logprobs = (
-        min(request.prompt_logprobs, 20) if prompt_logprobs_enabled else 0
+    num_prompt_logprobs = _resolve_logprobs(
+        request.prompt_logprobs, prompt_logprobs_enabled
     )
     if llm.check_seq_length(token_ids, max_output_tokens):
         try:
@@ -393,12 +438,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             structured_output=structured_output,
         )
     else:
-        return _openai_error(
-            "This request exceeds the model's maximum context length.",
-            HTTPStatus.BAD_REQUEST.value,
-            param="messages",
-            code="context_length_exceeded",
-        )
+        return _context_length_error("messages")
     reasoning_parser = create_reasoning_parser(
         getattr(llm.model_runner, "tokenizer", None), token_ids
     )
@@ -500,11 +540,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         return _openai_error(str(exc), param="input", code="invalid_input")
 
     if not llm.check_seq_length(token_ids, request.max_output_tokens):
-        return _openai_error(
-            "This request exceeds the model's maximum context length.",
-            param="input",
-            code="context_length_exceeded",
-        )
+        return _context_length_error("input")
     try:
         from gllm.entrypoints.response_tools import custom_tool_formats
 
@@ -589,9 +625,9 @@ async def create_response(request: ResponseRequest, raw_request: Request):
 
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
-    model_error = _validate_model(request.model)
-    if model_error:
-        return model_error
+    capability_error = _validate_completion_capabilities(request)
+    if capability_error:
+        return capability_error
     if isinstance(request.prompt, str):
         token_ids = await make_async(llm.model_runner.encode)(request.prompt)
     else:
@@ -615,10 +651,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     # to report (the sampled token's logprob is always included). ``None`` /
     # unset disables it. Clamp to the OpenAI ceiling.
     logprobs_enabled = request.logprobs is not None
-    num_top_logprobs = min(request.logprobs or 0, 20) if logprobs_enabled else 0
+    num_top_logprobs = _resolve_logprobs(request.logprobs, logprobs_enabled)
     prompt_logprobs_enabled = request.prompt_logprobs is not None
-    num_prompt_logprobs = (
-        min(request.prompt_logprobs, 20) if prompt_logprobs_enabled else 0
+    num_prompt_logprobs = _resolve_logprobs(
+        request.prompt_logprobs, prompt_logprobs_enabled
     )
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(
@@ -637,12 +673,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             num_prompt_logprobs=num_prompt_logprobs,
         )
     else:
-        return _openai_error(
-            "This request exceeds the model's maximum context length.",
-            HTTPStatus.BAD_REQUEST.value,
-            param="prompt",
-            code="context_length_exceeded",
-        )
+        return _context_length_error("prompt")
     if request.stream:
         generator = completion_stream_generator(stream, request)
         return RequestStreamingResponse(generator, stream)
