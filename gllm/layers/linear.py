@@ -21,7 +21,6 @@ class LinearBase(torch.nn.Module):
     Args:
         input_size: input dimension of the linear layer.
         output_size: output dimension of the linear layer.
-        bias: If true, add bias.
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
@@ -39,7 +38,6 @@ class LinearBase(torch.nn.Module):
     ):
         super().__init__()
 
-        # Keep input parameters
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
@@ -196,8 +194,6 @@ class RowParallelLinear(LinearBase):
                        to all GPUs, otherwise, every GPU will have its output
                        which is Y = X_iA_i
         quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict, including all parents
-                        (e.g. model.layers.0.down_proj)
         return_bias: If true, return bias together with outputs in forward pass.
     """
 
@@ -263,7 +259,6 @@ class RowParallelLinear(LinearBase):
             )
             input_parallel = splitted_input[tp_rank].contiguous()
 
-        # Matrix multiply.
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
 
@@ -292,9 +287,6 @@ class ColumnParallelLinear(LinearBase):
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
         bias: If true, add bias.
-        gather_output: If true, call all-gather on output and make Y available
-                       to all GPUs, otherwise, every GPU will have its output
-                       which is Y_i = XA_i
         skip_bias_add: This was added to enable performance optimizations where
                        bias can be fused with other element-wise operations. we
                        skip adding bias but instead return it.
@@ -302,8 +294,6 @@ class ColumnParallelLinear(LinearBase):
         quant_config: Quantization configure.
         output_sizes: list of output sizes packed into one output, like for QKV
                        the list would be size 3.
-        prefix: The name of the layer in the state dict, including all parents
-                        (e.g. model.layers.0.qkv_proj)
     """
 
     def __init__(
@@ -363,7 +353,6 @@ class ColumnParallelLinear(LinearBase):
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
 
-        # Matrix multiply.
         output_parallel = self.quant_method(input_, self.weight, bias=bias)
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
@@ -382,16 +371,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         input_size: input dimension of the linear layer.
         output_sizes: list of output dimensions of the linear layer.
         bias: If true, add bias.
-        gather_output: If true, call all-gather on output and make the output
-                       available to all GPUs, otherwise, every GPU will have
-                       its own output.
         skip_bias_add: This was added to enable performance optimizations where
                        bias can be fused with other element-wise operations. we
                        skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict, including all parents
-                        (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
     """
 
@@ -443,8 +427,6 @@ class QKVParallelLinear(ColumnParallelLinear):
                        skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict, including all parents
-                        (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
     """
 
@@ -506,10 +488,7 @@ class ReplicatedLinear(LinearBase):
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict, including all parents
-                        (e.g. model.layers.0.qkv_proj)
         return_bias: If true, return bias together with outputs in forward pass.
-        disable_tp: Take no effect for replicated linear layers.
     """
 
     def __init__(

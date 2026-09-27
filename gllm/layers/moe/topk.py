@@ -177,7 +177,6 @@ def fused_grouped_topk(
     return topk_values.to(torch.float32), topk_indices.to(torch.int32)
 
 
-# This is used by the Deepseek-V2 and Deepseek-V3 model
 def grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -265,7 +264,6 @@ def grouped_topk(
             scores.view(num_token, num_expert_group, -1).max(dim=-1).values
         )  # [n, n_group]
 
-    # For batch invariance, use sorted=True to ensure deterministic expert selection
     use_sorted = False
     group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=use_sorted)[
         1
@@ -304,19 +302,11 @@ def fused_topk(
 ):
     """Pure-bf16 / fp16 top-k softmax for ungrouped MoE routers (e.g. Qwen3-MoE).
 
-    The previous implementation had two redundant kernels per MoE layer:
-      1. ``gating_output.float()`` -- pointless cast, the sgl-kernel
-         topk_softmax handles bf16/fp16 logits directly;
-      2. ``topk_weights / topk_weights.sum(dim=-1, keepdim=True)`` -- a
-         reduce + an elementwise division to renormalise top-k weights,
-         already supported in-kernel via ``renormalize=True``.
-
-    With 48 MoE layers x 100 decode forwards that's ~15k saved kernel
-    launches per profile window on Qwen3-VL-30B-A3B-Instruct TP=4 (= less
-    rank-0 CPU pressure between AR ops, on top of the direct ~20 ms GPU
-    saving). SGLang's trace shows the same one-launch pattern --
-    ``topkGatingSoftmax<bf16, top_k=8, n_expert=128, ...>`` followed by no
-    Python-side post-processing.
+    One launch per MoE layer: the sgl-kernel topk_softmax consumes bf16/fp16
+    logits directly and renormalizes in-kernel (``renormalize=True``), so no
+    ``.float()`` cast or follow-up ``weights / weights.sum()`` is needed.
+    Measured on Qwen3-VL-30B-A3B-Instruct TP=4 (48 MoE layers) this saves
+    ~15k kernel launches and ~20 ms GPU time per 100 decode forwards.
     """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -343,7 +333,6 @@ def select_experts(
     scoring_func: str = "softmax",
     e_score_correction_bias: Optional[torch.Tensor] = None,
 ):
-    # DeepSeekv2 uses grouped_top_k
     if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None

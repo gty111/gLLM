@@ -14,12 +14,6 @@ from gllm.layers.ops.fla.utils import input_guard
 BT_LIST = [8, 16, 32, 64, 128]
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]
-#     ],
-#     key=["D"],
-# )
 @triton.jit
 def l2norm_fwd_kernel1(
     x,
@@ -37,20 +31,11 @@ def l2norm_fwd_kernel1(
     b_x = tl.load(x + cols, mask=mask, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=0)
     b_rstd = 1 / tl.sqrt(b_var + eps)
-    # tl.store(Rstd + i_t, rstd)
     # Normalize and apply linear transformation
     b_y = b_x * b_rstd
     tl.store(y + cols, b_y, mask=mask)
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BT": BT}, num_warps=num_warps)
-#         for num_warps in [1, 2, 4, 8, 16]
-#         for BT in BT_LIST
-#     ],
-#     key=["D"],
-# )
 @triton.jit
 def l2norm_fwd_kernel(
     x,
@@ -137,7 +122,6 @@ def l2norm_fwd(
         y = torch.empty(x_shape_og, dtype=output_dtype, device=x.device)
     assert y.stride(-1) == 1
     R, D = x.numel() // x.shape[-1], x.shape[-1]
-    # rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BD = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))

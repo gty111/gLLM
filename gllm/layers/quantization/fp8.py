@@ -322,7 +322,6 @@ def fp8LinearMethod(
     round_scale: bool = False,
 ):
     assert input_scale is None
-    # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
@@ -443,10 +442,8 @@ def w8a8_block_fp8_matmul(
 
     configs = None
     if configs:
-        # Get the optimal config if there is one
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
     else:
-        # Default config
         # Block-wise quant: BLOCK_SIZE_N must be divisible by block_size[0]
         # BLOCK_SIZE_K must be divisible by block_size[1]
         config = {
@@ -600,7 +597,6 @@ def _per_token_group_quant_fp8(
     """
     groups_per_row = y_num_columns // group_size
 
-    # Map the program id to the row of X and Y it should compute.
     g_id = tl.program_id(0)
     row = g_id // groups_per_row
     row_g_id = g_id % groups_per_row
@@ -619,7 +615,6 @@ def _per_token_group_quant_fp8(
     mask = cols < group_size
 
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / fp8_max
     if ROUND_SCALE:
@@ -774,7 +769,6 @@ def _per_token_group_quant_fp8_colmajor(
     """
     groups_per_row = y_num_columns // group_size
 
-    # Map the program id to the row of X and Y it should compute.
     g_id = tl.program_id(0)
     row = g_id // groups_per_row
     row_g_id = g_id % groups_per_row
@@ -801,7 +795,6 @@ def _per_token_group_quant_fp8_colmajor(
     mask = cols < group_size
 
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    # Quant
     _absmax = tl.maximum(tl.max(tl.abs(y)), eps)
     y_s = _absmax / fp8_max
     if ROUND_SCALE:
@@ -890,7 +883,6 @@ def per_token_group_quant_fp8(
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     BLOCK = triton.next_power_of_2(N)
-    # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
     if column_major_scales:

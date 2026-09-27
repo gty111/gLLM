@@ -150,7 +150,6 @@ class MLAAttention:
         attn_out = flash_attn_varlen_func(
             q=q,
             k=k,
-            # FlashInfer accepts a value head dimension distinct from Q/K, so
             # The value head dimension may differ from Q/K for MLA.
             v=v,
             return_softmax_lse=return_softmax_lse,
@@ -159,7 +158,6 @@ class MLAAttention:
             **kwargs,
         )
 
-        # Unpack the output if there are multiple results.
         rest = None
         if isinstance(attn_out, tuple):
             attn_out, *rest = attn_out
@@ -208,7 +206,7 @@ class MLAAttention:
         # Adjust output buffer shape back to the original (B, N * V)
         N, B, V = out.shape
         out.resize_((B, N * V))
-        out.copy_(out_new)  # Copy result
+        out.copy_(out_new)
 
     def _compute_prefill_context(
         self,
@@ -552,7 +550,6 @@ class MLAAttention:
                 suffix_lse=suffix_lse,
             )
 
-        # unpad if necessary
         if self._pad_v:
             output = output[..., : v.shape[-1]]
 
@@ -793,7 +790,7 @@ class MLAAttention:
 
         o, lse = flash_mla_with_kvcache(
             q=q,
-            k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),  # add head dim of 1
+            k_cache=kv_c_and_k_pe_cache.unsqueeze(-2),
             block_table=decode_meta.block_table,
             cache_seqlens=decode_meta.seq_lens,
             head_dim_v=self.kv_lora_rank,
@@ -830,7 +827,6 @@ class MLAAttention:
         )
         lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
 
-        # For batch invariance, use only 1 split to ensure deterministic reduction
         num_kv_splits = 4
 
         # TODO(lucas) Allocate ahead of time
@@ -847,12 +843,10 @@ class MLAAttention:
             device=q.device,
         )
 
-        # Add a head dim of 1
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
         kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
-        # Run MQA
         decode_attention_fwd(
             q,
             kv_c_and_k_pe_cache,
@@ -929,7 +923,6 @@ class MLAAttention:
         prefill_k_pe = k_pe[num_decode_tokens:]
         prefill_k_c_normed = k_c_normed[num_decode_tokens:]
 
-        # write the latent and rope to kv cache
         if kv_cache.numel() > 0:
             if getattr(input_data.memory_manager, "mla_cache_fp8", False):
                 # DeepSeek Sparse Attention: native FP8-packed MLA latent cache
@@ -991,7 +984,6 @@ class MLAAttention:
                 decode_q, kv_cache, attn_metadata, topk_indices=decode_topk_indices
             )
 
-            # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])
 
         return output_padded

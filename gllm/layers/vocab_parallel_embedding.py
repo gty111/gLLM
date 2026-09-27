@@ -81,7 +81,6 @@ class VocabParallelEmbeddingShardIndices:
         return self.num_org_elements_padded + self.num_added_elements_padded
 
     def __post_init__(self):
-        # sanity checks
         assert self.padded_org_vocab_start_index <= self.padded_org_vocab_end_index
         assert self.padded_added_vocab_start_index <= self.padded_added_vocab_end_index
 
@@ -159,8 +158,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         params_dtype: type of the parameters.
         org_num_embeddings: original vocabulary size (without LoRA).
         padding_size: padding size for the vocabulary.
-        quant_config: quant config for the layer
-        prefix: full name of the layer in the state dict
     """  # noqa: E501
 
     def __init__(
@@ -173,7 +170,6 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
 
-        # Keep the input dimensions.
         tp_rank = get_tp_rank()
         self.tp_size = get_tp_size()
         self.num_embeddings = num_embeddings
@@ -200,7 +196,6 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
-        # Divide the weight matrix along the vocaburaly dimension.
         self.num_added_embeddings = self.num_embeddings - self.org_vocab_size
         self.num_embeddings_per_partition = divide(
             self.num_embeddings_padded, self.tp_size
@@ -267,7 +262,6 @@ class VocabParallelEmbedding(torch.nn.Module):
                 num_added_embeddings_padded, tp_rank, tp_size, offset=org_vocab_size
             )
         )
-        # remove padding
         org_vocab_start_index = min(padded_org_vocab_start_index, org_vocab_size)
         org_vocab_end_index = min(padded_org_vocab_end_index, org_vocab_size)
         added_vocab_start_index = min(padded_added_vocab_start_index, vocab_size)
@@ -285,7 +279,6 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def forward(self, input_):
         if self.tp_size > 1:
-            # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
                 input_,
                 self.shard_indices.org_vocab_start_index,
@@ -297,15 +290,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
 
-        # Get the embeddings.
         output_parallel = torch.nn.functional.embedding(
             masked_input.long(), self.weight
         )
 
         if self.tp_size > 1:
-            # Mask the output embedding.
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            # Reduce across all the model parallel GPUs.
             output = tensor_model_parallel_all_reduce(output_parallel)
             return output
         else:
@@ -365,7 +355,6 @@ class ParallelLMHead(VocabParallelEmbedding):
 
         logits = input_
         if self.tp_size > 1:
-            # Gather logits for TP
             logits = tensor_model_parallel_all_gather(logits)
 
         # Remove paddings in vocab (if any).

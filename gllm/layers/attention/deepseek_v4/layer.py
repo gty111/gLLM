@@ -149,10 +149,9 @@ class DeepseekV4Attention(torch.nn.Module):
     ) -> torch.Tensor:
         """Serve one packed batch: fused decode rows first, then prefill rows.
 
-        There is deliberately no fallback here.  This used to drop to a
-        Python token-at-a-time oracle loop whenever a precondition was
-        unmet, which turned a configuration mistake into a silent ~100x
-        slowdown rather than an error.
+        There is deliberately no fallback here: an unmet precondition is a
+        configuration error and must fail loudly, not silently degrade to a
+        token-at-a-time oracle loop.
         """
         segment = input_data.memory_manager.segment
         if segment is None:
@@ -314,10 +313,9 @@ class DeepseekV4Attention(torch.nn.Module):
 
         # Store *after* the prefix read. The pool spans ``W-1+L`` positions
         # while the ring holds only ``W``, so writing this chunk first would
-        # overwrite prefix rows it still needs: at W=128 a chunk starting at
-        # position 130 lands on ring rows 2.. while the prefix still needs
-        # rows 3..127. Only the last W rows of the chunk are worth keeping --
-        # earlier ones could not be read back by any later step.
+        # overwrite prefix rows it still needs. Only the last W rows of the
+        # chunk are worth keeping -- earlier ones could not be read back by
+        # any later step.
         keep = columns >= (lengths - window_size).clamp_min(0).unsqueeze(1)
         keep &= valid_tokens
         if keep.any():
@@ -624,8 +622,7 @@ class DeepseekV4Attention(torch.nn.Module):
                 else max(1, (input_data.max_seq_len + ratio - 1) // ratio)
             )
             # Every layer sharing this ratio builds the same candidate grid and
-            # resolves it to the same pages; 21 C4 layers and 20 C128 layers
-            # each did that independently.
+            # resolves it to the same pages; build it once per forward.
             grid_key = ("grid", ratio, max_compressed)
             if grid_key not in cache:
                 logical = torch.arange(
