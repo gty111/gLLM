@@ -16,7 +16,10 @@ from logger import logger
 from gllm.engine.async_llm import AsyncStream
 from gllm.entrypoints.common import build_usage, get_finish_reason
 from gllm.entrypoints.protocol import ChatCompletionRequest, DeltaMessage, ResponseRequest
-from gllm.entrypoints.response_tools import bind_custom_parser, chat_tools, output_tool_call, tool_specs
+from gllm.entrypoints.response_tools import (
+    TOOL_SEARCH_NAME, bind_custom_parser, chat_tools, output_tool_call,
+    search_output_specs, tool_specs, validate_client_search_item,
+)
 from gllm.entrypoints.serving_chat import chat_completion_generator
 from gllm.tokenizers.tool_parsers import ToolParser, ToolParseError
 from gllm.tokenizers.reasoning import ThinkParser, split_reasoning_stream
@@ -264,6 +267,20 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
         if not isinstance(item, dict):
             raise ValueError(param, "Input items must be strings or objects.")
         item_type = item.get("type")
+        if item_type == "tool_search_call":
+            validate_client_search_item(item, param)
+            if not isinstance(item.get("arguments"), dict):
+                raise ValueError(f"{param}.arguments", "Tool search arguments must be an object.")
+            item = {"type": "function_call", "call_id": item["call_id"],
+                    "name": TOOL_SEARCH_NAME, "arguments": json.dumps(item["arguments"], ensure_ascii=False)}
+            item_type = "function_call"
+        elif item_type == "tool_search_output":
+            discovered = search_output_specs(item, param)
+            # Definitions are supplied through the active tool schemas. Keep the
+            # result in its original turn without duplicating those schemas.
+            messages.append({"role": "tool", "tool_call_id": item["call_id"],
+                             "content": json.dumps({"available_tools": list(discovered)}, ensure_ascii=False)})
+            continue
         if item_type == "reasoning":
             # Allow stateless replay of our own output. Previous-turn thoughts
             # are not user messages and must not be folded into answer text.
@@ -360,11 +377,13 @@ def _previous_output_to_input_items(prev_response: dict) -> list:
             if item.get("namespace"):
                 entry["namespace"] = item["namespace"]
             items.append(entry)
+        elif item_type == "tool_search_call":
+            items.append(copy.deepcopy(item))
     return items
 
 
-def response_tools_to_chat(tools):
-    return chat_tools(tools)
+def response_tools_to_chat(tools, input_items=None):
+    return chat_tools(tools, input_items)
 
 
 def make_chat_request(request: ResponseRequest) -> ChatCompletionRequest:
@@ -376,7 +395,7 @@ def make_chat_request(request: ResponseRequest) -> ChatCompletionRequest:
             "max_completion_tokens": request.max_output_tokens,
             "temperature": request.temperature,
             "top_p": request.top_p,
-            "tools": response_tools_to_chat(request.tools),
+            "tools": response_tools_to_chat(request.tools, request.input),
             "tool_choice": request.tool_choice,
             "parallel_tool_calls": request.parallel_tool_calls,
             "reasoning_effort": effort,
@@ -417,7 +436,7 @@ def _base_response(request: ResponseRequest, *, response_id: str, created_at: in
         "store": bool(request.store),
         "temperature": request.temperature,
         "text": request.text or {"format": {"type": "text"}},
-        "tool_choice": request.tool_choice or ("auto" if request.tools else "none"),
+        "tool_choice": request.tool_choice or ("auto" if tool_specs(request.tools, request.input) else "none"),
         "tools": request.tools or [],
         "top_p": request.top_p,
         "truncation": request.truncation or "disabled",
@@ -473,7 +492,7 @@ async def response_completion_generator(
     tool_parser: ToolParser = None,
     reasoning_parser: ThinkParser = None,
 ):
-    tool_parser = bind_custom_parser(tool_parser, request.tools)
+    tool_parser = bind_custom_parser(tool_parser, request.tools, request.input)
     response_id = f"resp_{random_uuid()}"
     created_at = int(time.time())
     response = _base_response(request, response_id=response_id, created_at=created_at)
@@ -516,7 +535,7 @@ async def response_completion_generator(
             }
         )
     if choice.message.tool_calls:
-        specs = tool_specs(request.tools)
+        specs = tool_specs(request.tools, request.input)
         for tool_call in choice.message.tool_calls:
             output.append(output_tool_call(tool_call, specs))
     response.update(
@@ -544,7 +563,7 @@ async def response_stream_generator(
     reasoning_parser: ThinkParser = None,
 ):
     """Translate engine deltas directly into Responses API SSE events."""
-    tool_parser = bind_custom_parser(tool_parser, request.tools)
+    tool_parser = bind_custom_parser(tool_parser, request.tools, request.input)
     sequence = 0
 
     def event(event_type, **payload):
@@ -575,7 +594,7 @@ async def response_stream_generator(
     message_done = False
     outputs = []
     next_output_index = 0
-    specs = tool_specs(request.tools)
+    specs = tool_specs(request.tools, request.input)
     expose_reasoning = (request.reasoning or {}).get("summary") != "none"
     reasoning_id = None
     reasoning_index = None
@@ -779,6 +798,16 @@ async def response_stream_generator(
                     )
                     yield _sse(event("response.failed", response=failed))
                     return
+                if item["type"] == "tool_search_call":
+                    yield _sse(event(
+                        "response.output_item.added", output_index=output_index,
+                        item={**item, "status": "in_progress", "arguments": {}},
+                    ))
+                    yield _sse(event(
+                        "response.output_item.done", output_index=output_index, item=item,
+                    ))
+                    outputs.append(item)
+                    continue
                 custom = item["type"] == "custom_tool_call"
                 field = "input" if custom else "arguments"
                 arguments = item[field]
@@ -839,7 +868,7 @@ async def response_stream_generator(
             **_response_completion_fields(
                 finish_reason, reasoning_parser,
                 bool(message_text.strip()) or any(
-                    item["type"] in ("function_call", "custom_tool_call")
+                    item["type"] in ("function_call", "custom_tool_call", "tool_search_call")
                     for item in outputs
                 ),
                 tool_error=tool_error,

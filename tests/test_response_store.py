@@ -23,6 +23,35 @@ def test_store_put_get_roundtrip():
     assert store.get("resp_1") is None
 
 
+def test_previous_response_id_loads_client_search_results(monkeypatch):
+    seen, raw = _mock_endpoint(monkeypatch)
+
+    def encode(messages, **kwargs):
+        seen.update(messages=messages, **kwargs)
+        return [1, 2]
+
+    api_server.llm.model_runner.encode = encode
+    call = {"type": "tool_search_call", "id": "ts_1", "call_id": "search_1",
+            "execution": "client", "status": "completed", "arguments": {"query": "lookup"}}
+    api_server.response_store.put("resp_search", {
+        "model": "test", "input_items": [{"role": "user", "content": "Find the lookup tool."}],
+        "response": {"output": [call]},
+    })
+    output = {"type": "tool_search_output", "execution": "client", "call_id": "search_1",
+              "tools": [{"type": "function", "name": "lookup", "defer_loading": True,
+                         "parameters": {"type": "object", "properties": {}}}]}
+    result = asyncio.run(api_server.create_response(ResponseRequest(
+        model="test", previous_response_id="resp_search", input=[output], store=True,
+    ), raw))
+    assert result.status_code == 200, result.body
+    assert [t["function"]["name"] for t in seen["tools"]] == ["lookup"]
+    assert list(seen["messages"][1]["tool_calls"])[0]["id"] == "search_1"
+    assert seen["messages"][2]["tool_call_id"] == "search_1"
+    assert api_server.response_store.get("resp_new")["input_items"] == [
+        {"role": "user", "content": "Find the lookup tool."}, call, output,
+    ]
+
+
 def test_store_evicts_oldest():
     store = ResponseStore(max_entries=2)
     store.put("a", {"response": {"id": "a"}, "input_items": [], "model": "test"})

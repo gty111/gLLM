@@ -563,7 +563,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
 
         structured_output = await _prepare_output_format(
             (request.text or {}).get("format"), token_ids, tools=effective_tools,
-            custom_formats=custom_tool_formats(request.tools) if effective_tools else None,
+            custom_formats=custom_tool_formats(request.tools, request.input) if effective_tools else None,
             parallel_tool_calls=request.parallel_tool_calls is not False,
         )
     except (ValueError, RuntimeError, ImportError) as exc:
