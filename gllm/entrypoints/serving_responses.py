@@ -297,9 +297,7 @@ def response_input_to_messages(request: ResponseRequest) -> List[Dict[str, Any]]
             output = item.get("output", "")
             if isinstance(output, list):
                 parts, has_media = _response_content_parts(output, f"{param}.output")
-                if has_media:
-                    raise ValueError(param, "Multimodal tool outputs are not supported yet.")
-                output = "".join(part["text"] for part in parts)
+                output = parts if has_media else "".join(part["text"] for part in parts)
             elif not isinstance(output, str):
                 output = json.dumps(output, ensure_ascii=False)
             messages.append(

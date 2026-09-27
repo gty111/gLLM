@@ -45,8 +45,18 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
     """
 
 
+class MultimodalToolMessageParam(TypedDict):
+    role: Literal["tool"]
+    tool_call_id: str
+    # The SDK tool schema accepts only text and validates Iterable lazily.
+    # Keep native media in a concrete list for extraction before tokenization.
+    content: Union[str, List[ChatCompletionContentPartParam]]
+
+
 ChatCompletionMessageParam = Union[
-    openai.types.chat.ChatCompletionMessageParam, CustomChatCompletionMessageParam
+    MultimodalToolMessageParam,
+    openai.types.chat.ChatCompletionMessageParam,
+    CustomChatCompletionMessageParam,
 ]
 
 
