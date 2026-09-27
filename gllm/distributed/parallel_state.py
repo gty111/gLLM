@@ -630,7 +630,6 @@ def get_pp_layers(num_layers):
     return assigned_layers
 
 
-# Set the correct layer index for PP
 def resolve_pp_layer_idx(layer_name, idx, start_layer_idx):
     if "layers" in layer_name:
         layer_name_list = layer_name.split(".")
@@ -658,11 +657,8 @@ def tensor_model_parallel_all_gather(input_: torch.Tensor, dim=-1) -> torch.Tens
     # stack-style all-gather has compatibility issues with
     # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
     output_size = (input_size[0] * get_tp_size(),) + input_size[1:]
-    # Allocate output tensor.
     output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
-    # All-gather.
     dist.all_gather_single(output_tensor, input_, group=get_tp_group())
-    # Reshape
     output_tensor = output_tensor.reshape((get_tp_size(),) + input_size)
     output_tensor = output_tensor.movedim(0, dim)
     output_tensor = output_tensor.reshape(
@@ -684,14 +680,9 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 
     Return semantics: callers must use the returned tensor; the custom-AR
     path may return a buffer distinct from ``input_`` (out-of-place
-    kernel). Every existing call site already obeys this contract
-    (``output = tensor_model_parallel_all_reduce(...)``), so we deliberately
-    *do not* mirror the result back into ``input_``. The previous
-    ``input_.copy_(out)`` write-back was issuing one ``memcpy32_post`` per
-    AR (~31 ms / 1.7 s total GPU on a 60-prompt decode-heavy profile -- a
-    pure 2 % waste with no semantic benefit; SGLang doesn't do the copy
-    either, which is exactly the source of its memcpy32_post=0 in our
-    side-by-side trace comparison).
+    kernel). Do NOT mirror the result back into ``input_`` -- that extra
+    device copy per AR is pure overhead with no semantic benefit (SGLang
+    doesn't do it either).
     """
     # Import lazily to avoid a circular import at module init (parallel state is
     # imported by gllm.distributed.cuda_wrapper transitively via ``logger``).
@@ -753,10 +744,8 @@ def split_tensor_along_last_dim(
     Returns:
         A list of Tensors
     """
-    # Get the size and dimension.
     last_dim = tensor.dim() - 1
     last_dim_size = divide(tensor.size()[last_dim], num_partitions)
-    # Split.
     tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
     # NOTE: torch.split does not create contiguous tensors by default.
     if contiguous_split_chunks:

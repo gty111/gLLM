@@ -130,7 +130,7 @@ class LLM:
         # None for the monolith. The role flags feed the model loader (parent
         # process); the whole object is forwarded to the spawned worker for the
         # LM-side manager. ``is_disagg_lm`` is the request-time gate read by the
-        # api server (replaces the old GLLM_DISAGG_LM env read).
+        # api server.
         self.disagg_config = config.disagg_config
         self.is_disagg_lm = bool(disagg_config is not None and disagg_config.is_lm)
         if config.overlap_scheduling and config.pp_size > 1 and config.dp_size > 1:
@@ -193,7 +193,6 @@ class LLM:
                 "Overlap scheduling enabled (FutureMap + CPU/GPU overlap, TP/PP)"
             )
 
-        # Interact with workers
         self.wait_lists: List[GenerationSequence] = []
         self.abort_ids: List[int] = []
         self.running_maps: Dict[int, GenerationSequence] = dict()  # seq_id => GenerationSequence
@@ -209,10 +208,8 @@ class LLM:
         # high concurrency). Snapshot-and-clear under the lock makes it atomic.
         self._pending_lock = threading.Lock()
 
-        # Init workers
         self.init_workers()
 
-        # wait worker start
         self.wait_workers()
 
     def wait_workers(self):

@@ -1,7 +1,7 @@
 """LM-side encoder disaggregation: per-rank receiver + TP0 coordinator.
 
 Native LM tensor parallelism (``tp_size >= 1``, ``pp_size == 1``) is supported by
-splitting the old monolithic manager into two roles (design: "control
+splitting the manager into two roles (design: "control
 centralized, data multi-write"):
 
 * :class:`DisaggReceiver` -- one per **every PP0 TP rank**. Owns that rank's

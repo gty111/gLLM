@@ -188,7 +188,6 @@ class AsyncLLM(LLM):
             await asyncio.sleep(0)
 
     def start_schedule_engine(self):
-        # launch schedule engine
         self._schedule_task = asyncio.get_event_loop().create_task(self.schedule())
         self._schedule_task.add_done_callback(_log_task_completion)
         self.schedule_engine = asyncio.shield(self._schedule_task)

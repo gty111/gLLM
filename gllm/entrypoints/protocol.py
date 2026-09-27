@@ -250,15 +250,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
     verbosity: Optional[Literal["low", "medium", "high"]] = None
     web_search_options: Optional[Dict[str, Any]] = None
 
-    # --8<-- [start:chat-completion-sampling-params]
     # vLLM-extension sampling knobs accepted by the wire schema
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
     ignore_eos: bool = False
     prompt_logprobs: Optional[int] = None
-    # --8<-- [end:chat-completion-sampling-params]
 
-    # --8<-- [start:chat-completion-extra-params]
     chat_template_kwargs: Optional[dict[str, Any]] = Field(
         default=None,
         description=(
@@ -282,8 +279,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "that are not JSON-encodable can be identified."
         ),
     )
-
-    # --8<-- [end:chat-completion-extra-params]
 
     @model_validator(mode="before")
     @classmethod
@@ -367,14 +362,11 @@ class CompletionRequest(OpenAIBaseModel):
     top_p: Optional[float] = None
     user: Optional[str] = None
 
-    # doc: begin-completion-sampling-params
     # vLLM-extension sampling knobs accepted by the wire schema
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
     ignore_eos: Optional[bool] = False
-    # doc: end-completion-sampling-params
 
-    # doc: begin-completion-extra-params
     response_format: Optional[ResponseFormat] = Field(
         default=None,
         description=(
@@ -383,8 +375,6 @@ class CompletionRequest(OpenAIBaseModel):
             "supported."
         ),
     )
-
-    # doc: end-completion-extra-params
 
     @model_validator(mode="before")
     @classmethod

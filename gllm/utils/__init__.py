@@ -193,8 +193,7 @@ def set_weight_attrs(
 ):
     """Set attributes on a weight tensor.
 
-    This method is used to set attributes on a weight tensor. This method
-    will not overwrite existing attributes.
+    This method will not overwrite existing attributes.
 
     Args:
         weight: The weight tensor.

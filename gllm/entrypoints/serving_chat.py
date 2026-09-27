@@ -144,14 +144,10 @@ async def chat_completion_stream_generator(
             obfuscation=secrets.token_urlsafe(8) if include_obfuscation else None,
         )
 
-    # The first OpenAI chat stream delta establishes the assistant role. It is
-    # emitted lazily, immediately before whatever chunk actually leaves first.
-    #
-    # Sending it at admission instead -- before the engine has produced
-    # anything -- makes every standard client's TTFT measure queue-admission
-    # latency rather than time to first token. On a 1024-token prompt that read
-    # 37.7 ms against a real first token at 634.5 ms, so benchmark TTFT was
-    # understated ~17x and the prefill time it hid was amortized into TPOT.
+    # The first OpenAI chat stream delta establishes the assistant role. Emit
+    # it lazily, immediately before the first real chunk: sending it at
+    # admission would make clients measure TTFT as queue-admission latency
+    # rather than time to first token.
     role_pending = True
 
     def role_event() -> str:

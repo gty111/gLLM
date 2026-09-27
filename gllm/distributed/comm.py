@@ -132,28 +132,16 @@ class zmqComm:
             self.output_socket = make_socket(self.ctx, self.output_path, zmq.PULL)
             return
 
-        # ------------------------------------------------------------------
-        # Worker-process socket layout (per-column scheduler design)
-        # ------------------------------------------------------------------
-        #
-        # Pre-refactor topology (rank-0-centric):
-        #   * rank 0 ran the only Scheduler and pushed ``SchedulePayload``
-        #     to every other rank: one per TP follower on PP-0 plus one
-        #     per PP-other rank.
-        #   * Tokens flowed output_rank -> rank 0 over a single PULL.
-        #
-        # New topology: every PP-0 TP rank is a *column driver*. Column
+        # Worker socket layout: every PP-0 TP rank is a *column driver*. Column
         # ``k`` consists of (PP=0,TP=k), (PP=1,TP=k), ..., (PP=N-1,TP=k);
         # the driver runs its own deterministic scheduler and only sends
         # ``SchedulePayload`` to *its own column's* PP-other ranks. New
         # requests / aborts / control commands arrive at rank 0 from the
         # frontend and are fanned out to PP=0 TP peers via zmq PUSH/PULL
-        # (:meth:`broadcast_input_to_tp`). The earlier NCCL flag-broadcast
-        # implementation contended with the model's per-layer all-reduce
-        # for NVLink and inflated decode-AR tail latency by ~70 ms /
-        # decode-heavy profile; profile shows ~1 % of decode iters had
-        # a 5-9 ms NCCL-AR spike that disappears with the zmq path
-        # since zmq stays on the CPU and never touches NVLink.
+        # (:meth:`broadcast_input_to_tp`). The fan-out deliberately avoids
+        # NCCL: a NCCL broadcast shares NVLink with the model's per-layer
+        # all-reduce and produced 5-9 ms decode-AR tail spikes on ~1 % of
+        # decode iters; zmq stays on the CPU and never touches NVLink.
         # Tokens still funnel through rank 0 (output_rank still uses a
         # single PULL into rank 0); rank 0 NCCL-broadcasts the result
         # within the PP-0 TP group via :meth:`broadcast_tokens_to_tp`.
@@ -390,14 +378,12 @@ class zmqComm:
     ):
         """Ship one :class:`SchedulePayload` to this column's PP-other ranks.
 
-        With the per-column scheduler design TP synchronization no
-        longer goes through zmq -- each PP-0 TP rank runs its own
-        deterministic scheduler and broadcasts new front-end work via
-        NCCL (:meth:`broadcast_input_to_tp`). The only zmq schedule
-        traffic that remains is the PP=0 TP=k -> PP=p TP=k path for
-        ``p > 0``, which still benefits from the delta-style payload
-        because we don't have a CPU-side group covering "this column"
-        cheaply.
+        With the per-column scheduler design each PP-0 TP rank runs its
+        own deterministic scheduler and fans new front-end work out via
+        :meth:`broadcast_input_to_tp`. The only zmq schedule traffic that
+        remains is the PP=0 TP=k -> PP=p TP=k path for ``p > 0``, which
+        still benefits from the delta-style payload because we don't have
+        a CPU-side group covering "this column" cheaply.
 
         Callers must be PP=0 ranks (see :meth:`init`); we no longer
         differentiate "first PP" vs "other PP" follower groups because
@@ -441,20 +427,13 @@ class zmqComm:
     # messages (new requests, aborts, control commands). Rank-0 polls
     # the front-end zmq socket, aggregates whatever is waiting into a
     # single :class:`IPCPackage`, and ships that to its peer column
-    # drivers via the dedicated zmq fan-out set up in :meth:`init`.
+    # drivers via the dedicated zmq fan-out set up in :meth:`init`
+    # (zmq, not NCCL, for the NVLink-contention reason documented there).
     #
-    # The earlier implementation used a NCCL ``broadcast`` on the
-    # dedicated IPC group ( ``_IPC_TP_GROUP`` ): cheap on average (~5
-    # us) but it shared NVLink with the model's per-layer all-reduce,
-    # which forced occasional 5-9 ms tail spikes when the broadcast
-    # collided with a forward-path AR. The zmq fan-out below stays on
-    # the CPU and never touches NVLink, eliminating that contention.
-    #
-    # Determinism rule (unchanged from the NCCL version): every PP=0
-    # TP rank MUST call this every iteration in the same order. Rank
-    # 0 sends EXACTLY ONE pyobj per iter (possibly ``None``); peers
-    # block-recv exactly once. Skipping the call would desync the
-    # column-driver schedulers across TP ranks.
+    # Determinism rule: every PP=0 TP rank MUST call this every iteration
+    # in the same order. Rank 0 sends EXACTLY ONE pyobj per iter (possibly
+    # ``None``); peers block-recv exactly once. Skipping the call would
+    # desync the column-driver schedulers across TP ranks.
 
     def _ensure_tp_broadcast_state(self) -> None:
         """Lazy init of state used by :meth:`broadcast_tokens_to_tp`.
@@ -498,8 +477,7 @@ class zmqComm:
         * Must NOT be called from PP-other ranks (their column gets
           updates over :meth:`send_schedule_payload` instead).
 
-        See module-level comment above for why this no longer rides
-        NCCL.
+        See the section comment above for why this does not ride NCCL.
         """
         if get_tp_size() <= 1:
             return ipc_package

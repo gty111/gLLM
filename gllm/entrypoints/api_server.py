@@ -436,16 +436,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     token_ids, mm_contents, mm_items = await _tokenize_messages(
         request.messages, effective_tools, chat_template_kwargs
     )
-    # OpenAI deprecated ``max_tokens`` for chat completions in favor of
-    # ``max_completion_tokens`` but most clients (including curl examples,
-    # the OpenAI Python SDK pre-1.40, and ``benchmark_serving.py``) still
-    # send the legacy field. Honour it as a fallback so the decode cap
-    # actually takes effect — otherwise a request without
-    # ``max_completion_tokens`` decodes until EOS / model_max_length,
-    # which on a broken model produces thousands of garbage tokens.
-    # Pydantic intentionally warns whenever the deprecated attribute is read,
-    # even when the client did not send it.  Read the validated fallback from
-    # the model storage so modern requests do not produce a spurious warning.
+    # OpenAI deprecated ``max_tokens`` in favor of ``max_completion_tokens``
+    # but many clients still send the legacy field; honour it as a fallback.
+    # Pydantic warns whenever the deprecated attribute is read, even when the
+    # client did not send it, so read it from the model storage instead.
     max_output_tokens = (
         request.max_completion_tokens
         if request.max_completion_tokens is not None
@@ -831,8 +825,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Additional model ID accepted by the OpenAI API; may be repeated.",
     )
-    # Runtime
-    # Parallelism
     parser.add_argument("--pp", dest="pp_size", type=int, help="Number of pipeline stages", default=1)
     parser.add_argument(
         "--dp",
@@ -888,7 +880,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15",
         default=None,
     )
-    # Token Throttling
     # Multi-Node deployment
     parser.add_argument(
         "--launch-mode",
@@ -899,7 +890,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ranks", dest="worker_ranks", type=str, help="Specify the ranks of worker like 0,1", default=None
     )
-    # MultiModal
     return parser
 
 
@@ -954,8 +944,7 @@ def main():
     from gllm.runtime.model_loader import quiet_hub_logging
 
     quiet_hub_logging()
-    # ``llm`` is the module-level handle every route reads; this used to be a
-    # plain module-scope assignment under ``if __name__ == "__main__"``.
+    # ``llm`` is the module-level handle every route reads.
     global llm, served_model_names
 
     args = build_arg_parser().parse_args()
