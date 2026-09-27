@@ -101,7 +101,7 @@ def apply_mm_processor_pixels(
 
 @dataclass
 class DisaggSeqState:
-    """Per-seq encoder-disaggregation overlap state (design §6.2).
+    """Per-seq encoder-disaggregation overlap state.
 
     Owned by the :class:`ModelRunner` (keyed by ``seq_id``) so it is immune to
     the scheduler's chunked-prefill ``deepcopy`` of the :class:`GenerationSequence`. The
@@ -340,7 +340,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         # embedding cache: seq_id => embedding
         self.embedding_cache: Dict[int, EmbeddingInfo] = {}
 
-        # Encoder-disaggregation overlap (design §6.2): seq_id => per-item
+        # Encoder-disaggregation overlap: seq_id => per-item
         # readiness + embeddings for seqs admitted before all their visual
         # embeddings arrived. Populated by the LM disagg manager; consumed by
         # the scheduler (gate B) and the embed path. Empty for the monolith.
@@ -1455,7 +1455,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         st.item_ready[ordered_idx] = True
 
     def disagg_prefill_limit(self, seq: GenerationSequence) -> Optional[int]:
-        """Gate-B upper bound (design §6.2): the largest token position this
+        """Gate-B upper bound: the largest token position this
         seq may prefill up to this round = the start of the first image span
         whose embedding hasn't landed yet (or ``prompt_len`` if all ready).
         ``None`` for non-disagg seqs (no cap).

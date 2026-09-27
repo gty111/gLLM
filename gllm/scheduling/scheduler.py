@@ -683,7 +683,7 @@ class Scheduler:
             has_scheduled_decode or bool(self.seqs_to_decode or self.batch_running)
             or any(self._owns_cache(seq) for seq in self.seqs_to_prefill)
         )
-        # Encoder-disaggregation overlap (design §6.2): seqs whose next chunk is
+        # Encoder-disaggregation overlap: seqs whose next chunk is
         # entirely blocked behind a not-yet-ready image span are parked here and
         # re-queued after this round (no slot/page allocation, no ordering loss).
         deferred_disagg_seqs: List[GenerationSequence] = []
@@ -761,7 +761,7 @@ class Scheduler:
                 self.memory_manager.pre_allocate_computed_page([seq])
                 # Full/partial hit post-processing (rollback + hybrid SSM
                 # snapshot restore) lives in PrefixMemoryManager.
-            # Encoder-disaggregation overlap gate B (design §6.2): a disagg seq
+            # Encoder-disaggregation overlap gate B: a disagg seq
             # may only prefill up to the first image span whose embedding hasn't
             # landed yet (positions are known -- gate A -- but the visual data
             # isn't visible). ``disagg_prefill_limit`` returns ``None`` for

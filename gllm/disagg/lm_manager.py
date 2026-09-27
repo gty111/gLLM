@@ -1,8 +1,8 @@
 """LM-side encoder disaggregation: per-rank receiver + TP0 coordinator.
 
 Native LM tensor parallelism (``tp_size >= 1``, ``pp_size == 1``) is supported by
-splitting the manager into two roles (design: "control
-centralized, data multi-write"):
+splitting the manager into two roles ("control centralized,
+data multi-write"):
 
 * :class:`DisaggReceiver` -- one per **every PP0 TP rank**. Owns that rank's
   NIXL receive slot pool (a persistent registered GPU tensor
@@ -64,7 +64,7 @@ class _PendingItem:
     # returned to the free list). The actual clone out of the slot pool happens
     # per-rank when the event is applied; the coordinator only tracks emission.
     slot_freed: bool = False
-    # Phase 8 failure handling (design §5.5.2): the raw item content is retained
+    # Phase 8 failure handling: the raw item content is retained
     # so the watchdog can RE-DISPATCH the EncoderJob to another replica if the
     # original encoder crashes / goes silent. Dropped once the item is done.
     content: object = None
@@ -304,14 +304,14 @@ class DisaggCoordinator:
         self.num_ranks = len(rank_handshakes)
         self.slot_stride_bytes = recv.slot_stride_bytes
 
-        # Phase 6 intra-request encode/prefill overlap (design §6.2). When on,
+        # Phase 6 intra-request encode/prefill overlap. When on,
         # a seq is admitted as soon as all meta arrive and prefill advances
         # per-item under the two-layer gate. When off (default), admission waits
         # for *all* embeddings (Phase 3b timing) -> single-chunk prefill, which
         # is byte-identical to the unchunked monolith (used as a determinism
         # baseline). Set GLLM_DISAGG_OVERLAP=1 to enable overlap.
         self.overlap = os.environ.get("GLLM_DISAGG_OVERLAP", "0") != "0"
-        # Phase 8 watchdog (design §5.5.2): an in-flight item whose encoder has
+        # Phase 8 watchdog: an in-flight item whose encoder has
         # gone silent or left the pool is re-dispatched to a live replica,
         # reusing the same slot (idempotent overwrite). After
         # ``max_redispatch_attempts`` we stop retrying that item.
@@ -374,7 +374,7 @@ class DisaggCoordinator:
         # Publish self (all rank agent metas + the single TP0 meta intake) +
         # watch encoders. We do NOT block on encoders: text-only requests serve
         # immediately, and mm requests queue in the admission queue until a
-        # replica connects (any start order, design §7.3.4).
+        # replica connects (any start order).
         self.disc = make_discovery(self.discovery_endpoint)
         self.disc.publish(
             "lm",
@@ -466,7 +466,7 @@ class DisaggCoordinator:
         except Exception:
             pass
         self.nixl.disconnect(conn.agent_name)
-        # Phase 8 (design §5.5.2): orphan any in-flight item routed to the
+        # Phase 8: orphan any in-flight item routed to the
         # departed replica so the watchdog re-dispatches it immediately.
         orphaned = 0
         for ps in self._pending.values():
@@ -518,7 +518,7 @@ class DisaggCoordinator:
         """Send (or re-send) the EncoderJob for ``item`` to a live encoder.
 
         Re-dispatch reuses the same ``slot_id`` (same registered NIXL regions):
-        the encoder overwrites them idempotently (design §5.5.3). Returns False
+        the encoder overwrites them idempotently. Returns False
         if no encoder is currently live (caller retries on a later poll)."""
         conn = self._pick_encoder(avoid=avoid)
         if conn is None:
@@ -593,7 +593,7 @@ class DisaggCoordinator:
                 f"routing=[{routing}] across {len(self._encoders)} encoder(s)"
             )
             # Drop the raw mm payload off the *sequence* now that it's on its way:
-            # the LM/KV path never holds pixels (design §3.1 / §4.4). The
+            # the LM/KV path never holds pixels. The
             # coordinator keeps a transient per-item copy only for re-dispatch.
             seq.mm_items = None
             seq.mm_contents = None
@@ -649,7 +649,7 @@ class DisaggCoordinator:
             return
         item = ps.items[meta.item_idx]
         if item.meta is not None:
-            # Idempotent (design §5.5.3): a re-dispatched (or duplicated) job
+            # Idempotent: a re-dispatched (or duplicated) job
             # re-sends meta. The processor_config_hash gate (§5.4.4) guarantees
             # any replica yields the same content_hash/num_tokens; verify and
             # drop the duplicate. A mismatch means inconsistent processor config
@@ -703,7 +703,7 @@ class DisaggCoordinator:
     def _check_watchdog(self, events: DisaggEvents) -> None:
         """Re-dispatch in-flight items whose encoder crashed/went silent.
 
-        Triggers (design §5.5.2): the item's encoder left the pool (orphaned,
+        Triggers: the item's encoder left the pool (orphaned,
         ``encoder_identity is None``) or no meta/embedding landed within
         ``redispatch_timeout_s``. Re-dispatch reuses the same slot and avoids the
         suspect replica when another is available.

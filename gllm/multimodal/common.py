@@ -1,10 +1,10 @@
 """Shared multimodal helpers for encoder disaggregation.
 
 Phase 2a: the Frontend must tokenize the *text only* (no image IO, no
-processor, no pixel work -- design §3.1 / §4.4) and emit a **skeleton**
+processor, no pixel work) and emit a **skeleton**
 token-id list with exactly one placeholder sentinel per mm item. The LM PP0
 later expands each sentinel into ``N_vis_i`` ``<|image_pad|>`` tokens once the
-encoder reports ``num_tokens_i`` (design §5.4).
+encoder reports ``num_tokens_i``.
 
 Validated invariant (Qwen3.5-VL): expanding the skeleton's i-th sentinel into
 ``N_vis_i`` copies of the same placeholder id byte-reconstructs the monolith's

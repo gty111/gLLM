@@ -114,8 +114,7 @@ def _build_item_content_hash(
     The encoder runs the processor on a *single* image, so its ``pixel_values``
     already equals ``pixel_chunk_i`` and its ``grid_thw`` is ``[1, 3]``; we take
     row 0 to match the monolith's 1-D grid tensor exactly. This determinism is
-    what lets the LM's prefix-cache pad ids agree across the two paths
-    (design §5.4.4).
+    what lets the LM's prefix-cache pad ids agree across the two paths.
     """
     if isinstance(grid_thw, torch.Tensor) and grid_thw.ndim == 2:
         thw = grid_thw[0]
@@ -300,7 +299,7 @@ class MmMixin:
 
             in_decode = False
             if seq.seq_id in self.disagg_embeds:
-                # Encoder-disaggregation overlap (design §6.2): this seq was
+                # Encoder-disaggregation overlap: this seq was
                 # admitted before all its visual embeddings landed. Embed only
                 # the span-aligned *ready prefix*; rebuild when more items land.
                 self._mm_disagg_collect(
@@ -351,7 +350,7 @@ class MmMixin:
                     input_ids_cpu = pre["input_ids_cpu"]
                     is_multimodal_cpu = pre["is_multimodal_cpu"]
                     mm_bundle_key = pre["mm_bundle_key"]
-                    # Encoder-disaggregation (design §5.3): the per-item visual
+                    # Encoder-disaggregation: the per-item visual
                     # embeddings were produced on the encoder and NIXL-written
                     # into the LM slot pool, then cloned into this tuple by the
                     # LM disagg manager. When present, ``_mm_prepare_gpu`` uses
@@ -478,7 +477,7 @@ class MmMixin:
         prefill_works: List[Dict],
         batch_positions: List[torch.Tensor],
     ) -> None:
-        """Build the prefill work for an overlap disagg seq (design §6.2).
+        """Build the prefill work for an overlap disagg seq.
 
         Positions come from the full-prompt mrope grid (all grids known once
         meta arrived). Encoded visual rows cover the ready prefix; refresh them

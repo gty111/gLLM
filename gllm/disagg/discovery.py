@@ -1,4 +1,4 @@
-"""Dynamic discovery for encoder disaggregation (design §7.3).
+"""Dynamic discovery for encoder disaggregation.
 
 The Encoder and LM servers are fully decoupled processes: neither knows the
 other's address at launch. They find each other through a shared *registry*

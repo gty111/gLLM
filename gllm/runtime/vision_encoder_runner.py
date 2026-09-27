@@ -6,8 +6,7 @@ A single Encoder replica (one process, one GPU) owns the full visual stack:
                     --hash------->  content_hash (prefix-cache key, §5.4.4)
                     --ViT--------->  [N_vis_i, visual_dim*(1+L)] embedding
 
-and nothing else: no language model, no KV cache, no scheduler, no sampler
-(design §4.2). The embedding is then NIXL-written straight to the LM PP0
+and nothing else: no language model, no KV cache, no scheduler, no sampler. The embedding is then NIXL-written straight to the LM PP0
 worker (wired in later phases); this module is purely the compute side.
 
 Numerical equivalence with the monolith is preserved by reusing the exact
@@ -72,7 +71,7 @@ class VisionEncoderRunner:
             max_pixels=mm_processor_max_pixels,
         )
 
-        # Per-replica content-hash -> embedding dedup cache (design §4.2.1).
+        # Per-replica content-hash -> embedding dedup cache.
         self.mm_embed_cache = MultiModalEmbeddingCache(
             max_entries=256, max_mb=mm_embed_cache_mb
         )
@@ -131,7 +130,7 @@ class VisionEncoderRunner:
         raise ValueError(f"unknown modality {modality!r}")
 
     def num_vis_tokens(self, grid_thw: torch.Tensor) -> int:
-        """N_vis = prod(grid_thw) / spatial_merge_size**2 (design §2.1)."""
+        """N_vis = prod(grid_thw) / spatial_merge_size**2."""
         merge = self.spatial_merge_size
         return int(grid_thw.prod().item()) // (merge * merge)
 

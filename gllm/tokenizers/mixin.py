@@ -126,7 +126,7 @@ class TokenizerMixin:
         return unify_decode(self.tokenizer, token_ids)
 
     def encode_skeleton(self, messages, chat_template_kwargs: Optional[Dict] = None):
-        """Text-only tokenization with one sentinel per mm item (design §5.4).
+        """Text-only tokenization with one sentinel per mm item.
 
         Used by the disaggregated LM frontend instead of the multimodal
         ``processor.apply_chat_template``: no pixels are opened or processed

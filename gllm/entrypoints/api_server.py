@@ -207,7 +207,7 @@ async def _tokenize_messages(messages, effective_tools, chat_template_kwargs,
     """Tokenize chat messages into ``(token_ids, mm_contents, mm_items)``.
 
     Shared by the chat-completions and responses endpoints. Encoder-
-    disaggregation frontend (design §3.1 / §5.4): tokenize the *text only*
+    disaggregation frontend: tokenize the *text only*
     into a skeleton (one sentinel per item) and ship the raw items to the
     encoder via the LM PP0 worker. The LM never opens pixels and never
     carries ``mm_contents``. Falls back to the monolith processor path for
