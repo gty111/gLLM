@@ -153,17 +153,75 @@ def test_snapshot_preserves_filename_and_tool_item_identity(monkeypatch, tool):
     assert "file_url" in part
 
 
-def test_image_file_snapshot_replays_same_pixels(monkeypatch):
+@pytest.mark.parametrize("kind", ["message", "function_call_output", "custom_tool_call_output"])
+def test_image_file_snapshot_replays_same_pixels(monkeypatch, kind):
     data = io.BytesIO()
     Image.new("RGB", (2, 2), color="red").save(data, format="PNG")
     monkeypatch.setattr(serving_responses, "_download_file", lambda *args: (
         data.getvalue(), None, "original.png",
     ))
-    request = ResponseRequest(model="test", input=[{"role": "user", "content": [
-        {"type": "input_file", "file_url": "https://example.invalid/image"},
-    ]}])
+    parts = [{"type": "input_file", "file_url": "https://example.invalid/image"}]
+    item = ({"role": "user", "content": parts} if kind == "message" else
+            {"type": kind, "call_id": "view-1", "output": parts})
+    request = ResponseRequest(model="test", input=[{"role": "user", "content": "Describe it."}, item])
     frozen = serving_responses.snapshot_response_files(request)
     monkeypatch.setattr(serving_responses, "_download_file", lambda *args: pytest.fail("Re-downloaded image"))
-    image = serving_responses.response_input_to_messages(frozen)[0]["content"][0]["image"]
+    image = serving_responses.make_chat_request(frozen).messages[-1]["content"][0]["image"]
     assert image.size == (2, 2)
     assert image.getpixel((0, 0)) == (255, 0, 0)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("custom", [False, True])
+def test_tool_image_survives_endpoint_and_previous_response(monkeypatch, streaming, custom):
+    from gllm.multimodal.mixin import MmMixin
+
+    seen, raw = endpoint(monkeypatch)
+    runner = api_server.llm.model_runner
+    runner.use_mm = True
+
+    def extract(messages):
+        seen["media"] = MmMixin.extract_modify_mm(None, messages)
+        return seen["media"]
+
+    runner.extract_modify_mm = extract
+    image_url = "data:image/png;base64,AAAA"
+    call = {"type": "custom_tool_call" if custom else "function_call",
+            "call_id": "view-1", "name": "view_image"}
+    call.update({"input": "plot.png"} if custom else {"arguments": '{"path":"plot.png"}'})
+    output = {"type": "custom_tool_call_output" if custom else "function_call_output",
+              "call_id": "view-1", "output": [{"type": "input_image", "image_url": image_url}]}
+    req = ResponseRequest(model="test", store=True, stream=streaming, input=[
+        {"role": "user", "content": "Describe the image."}, call, output,
+    ])
+    first = asyncio.run(consume(req, raw))
+    assert seen["media"] == {"image": [image_url], "video": []}
+    assert seen["messages"][-1]["tool_call_id"] == "view-1"
+    stored = api_server.response_store.get(first["id"])
+    assert stored["input_items"][-1] == output
+    frozen = json.dumps(stored)
+    seen.clear()
+    asyncio.run(consume(ResponseRequest(
+        model="test", input="Describe it again.", previous_response_id=first["id"],
+        stream=streaming, store=False,
+    ), raw))
+    assert seen["media"] == {"image": [image_url], "video": []}
+    assert next(m for m in seen["messages"] if m["role"] == "tool")["tool_call_id"] == "view-1"
+    assert json.dumps(stored) == frozen
+
+
+def test_tool_image_is_rejected_for_text_only_model(monkeypatch):
+    from gllm.multimodal.mixin import MmMixin
+
+    _, raw = endpoint(monkeypatch)
+    runner = api_server.llm.model_runner
+    runner.use_mm = False
+    runner.extract_modify_mm = lambda messages: MmMixin.extract_modify_mm(None, messages)
+    response = asyncio.run(api_server.create_response(ResponseRequest(model="test", input=[
+        {"role": "user", "content": "Describe it."},
+        {"type": "function_call_output", "call_id": "view-1", "output": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ]},
+    ]), raw))
+    assert response.status_code == 400
+    assert "does not support image inputs" in json.loads(response.body)["error"]["message"]

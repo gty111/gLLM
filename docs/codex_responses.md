@@ -43,7 +43,12 @@ addresses refer to that machine. Tool execution remains the client's responsibil
   corresponding `response.custom_tool_call_input.*` events.
 - Stateless continuation with `function_call_output` or `custom_tool_call_output`.
   Send the original user message and accumulated history on each request. Tool
-  outputs may be strings or arrays of text content parts.
+  Outputs may be strings or arrays of text, image, and supported file parts.
+  Image results retain their tool-call identity and their order relative to
+  text, and use the same vision path as user images. Image URLs/data URLs and
+  inline image files require a vision-capable model and chat template; text
+  files are expanded into text. Files API IDs, PDF files, and audio remain
+  unsupported. Stored continuations also retain these tool results.
   Consecutive call items attach to the preceding assistant message, preserving
   its text and call order. This keeps a progress statement and its calls inside
   one assistant message in the model's chat template. User/tool/instruction
@@ -90,8 +95,7 @@ requests return HTTP 500 with `invalid_tool_output`; streams terminate with a
 `response.failed` event using the Responses error code `server_error` and a
 diagnostic message. Invalid grammar definitions are rejected before inference.
 
-Hosted tools, forced tool choices, stored responses, `previous_response_id`,
-background requests, and multimodal tool results are not supported. Unsupported
+Hosted tools, forced tool choices, and background requests are not supported. Unsupported
 capabilities return an error. This endpoint does not implement the complete
 OpenAI Responses API.
 
