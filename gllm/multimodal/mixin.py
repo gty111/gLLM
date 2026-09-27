@@ -273,13 +273,22 @@ class MmMixin:
                     # mrope (Qwen-VL): decode positions are extrapolated from
                     # the prefill-time ``mrope_position_delta`` stashed in the
                     # embedding cache, so the entry must exist here.
-                    embedding_info = self.embedding_cache[seq.seq_id]
-                    position = MRotaryEmbedding.get_next_input_positions(
-                        embedding_info.mrope_position_delta,
-                        seq.computed_token_num,
-                        seq.seq_len,
-                    )
-                    batch_positions.append(torch.tensor(position, device="cpu"))
+                    embedding_info = self.embedding_cache.get(seq.seq_id)
+                    if embedding_info is None:
+                        # Runtime dummy seq (e.g. DP idle-group padding): never
+                        # passed admission, so it has no cache entry -- the same
+                        # KeyError hazard the Kimi branch below documents. The
+                        # dummy's output rows are discarded, so any well-formed
+                        # positions (3 mrope rows) are fine.
+                        p = seq.computed_token_num
+                        batch_positions.append(torch.tensor([[p]] * 3, device="cpu"))
+                    else:
+                        position = MRotaryEmbedding.get_next_input_positions(
+                            embedding_info.mrope_position_delta,
+                            seq.computed_token_num,
+                            seq.seq_len,
+                        )
+                        batch_positions.append(torch.tensor(position, device="cpu"))
                 else:
                     # Kimi: plain 1-D positions. These are discarded by the
                     # caller (``set_mrope_position`` is skipped for Kimi; the
