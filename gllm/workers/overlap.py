@@ -45,6 +45,7 @@ forward and sampled token tensors flow back to every stage on CUDA streams;
 the worker thread never stages the dependency through CPU or ZMQ.
 """
 
+import dataclasses
 import os
 import queue
 import threading
@@ -54,7 +55,6 @@ from dataclasses import dataclass, field
 import torch
 
 from gllm.distributed.parallel_state import (
-    dp_all_gather_meta,
     get_pp_size,
     is_dp_attn,
     is_first_pp_rank,
@@ -65,7 +65,7 @@ from gllm.distributed.parallel_state import (
 from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import OverlapModelRunner
 from gllm.scheduling.scheduler import OverlapScheduler
-from gllm.workers.worker import Worker
+from gllm.workers.worker import Worker, run_worker
 from logger import logger
 
 
@@ -175,11 +175,11 @@ class OverlapWorker(Worker):
         # 2014 / 2020 / 2023 tok/s at depth 1 / 2 / 3 / 4 / 6 -- flat from 4
         # on, and depth also delays output publication and EOS detection by
         # that many launches, so the runner settles on ``pp_size + 2``.
-        self._collect_lag = self.model_runner._overlap_depth
+        self._collect_lag = self.model_runner.overlap_depth
         logger.info(
             f"overlap collect lag {self._collect_lag} "
             f"(pp {get_pp_size()}, output bufs "
-            f"{self.model_runner._num_output_bufs})"
+            f"{self.model_runner.num_output_bufs})"
         )
         # Fixed after ``init``: DP-attention + EP needs the per-iter cross-DP
         # barrier + dummy-batch lockstep in ``run_pp0``; plain TP does not.
@@ -214,10 +214,6 @@ class OverlapWorker(Worker):
         # once and the correct re-prefill boundary.
         return self._publish_mtp_relay_only() or changed
 
-    # ------------------------------------------------------------------
-    # Forward-pipeline helpers
-    # ------------------------------------------------------------------
-    #
     # ``recv_ipc_package`` / ``check_abort_seqs`` / ``_translate_control_cmd``
     # are inherited unchanged from :class:`Worker`. The new column-driver
     # base class already runs them on every PP=0 TP rank with the zmq
@@ -248,20 +244,14 @@ class OverlapWorker(Worker):
     def _build_prefetched_input(self) -> None:
         """Schedule the next batch locally; no inter-TP zmq send.
 
-        Pre-refactor we'd build a delta-style :class:`SchedulePayload`
-        and ship it to TP followers here so their ``cal_input``
-        overlapped with ours. With the column-driver design every TP
-        rank reaches this method on its own schedule loop, runs the
-        same deterministic scheduler against the same state, and
-        builds its own ``InputData`` -- so there's nothing to send.
+        With the column-driver design every TP rank runs the same
+        deterministic scheduler against the same state and builds its own
+        ``InputData`` -- so there is nothing to send.
         """
-        # Drain the scheduler's pending-follower-frees accumulator
-        # every iter. Pre-refactor, ``Worker._build_schedule_payload``
-        # consumed it on the way to building the per-iter delta
-        # payload; the new design has no payload to build (PP=1, no
-        # followers), so the list would otherwise grow unbounded as
-        # seqs hit max_len / EOS. Cheap (a list = []) and keeps
-        # peak-memory predictable.
+        # Drain the scheduler's pending-follower-frees accumulator every
+        # iter: under PP=1 there is no payload build to consume it, so the
+        # list would otherwise grow unbounded as seqs hit max_len / EOS.
+        # Cheap (a list = []) and keeps peak-memory predictable.
         with torch.profiler.record_function("gllm::schedule_and_cpu_prepare"):
             schedule_seqs = self.scheduler.schedule_once()
             if get_pp_size() > 1:
@@ -297,33 +287,14 @@ class OverlapWorker(Worker):
                 raise RuntimeError("PP overlap batch is missing its schedule payload")
             # Multimodal m-rope positions are computed in the PP0 CPU phase and
             # piggyback on the same delta, matching the non-overlap PP path.
-            ctx = self.model_runner._pending_mm_ctx
+            ctx = self.model_runner.pending_mm_ctx
             if ctx is not None and self.model_runner.uses_mrope:
-                import dataclasses
-
                 payload = dataclasses.replace(
                     payload, mrope_positions=ctx["mrope_positions"]
                 )
             self.comm.send_schedule_payload(payload)
         self.model_runner.prepare_input_gpu()
         return self.model_runner.run_batch_async(dp_padded_size=dp_padded_size)
-
-    def _build_dummy_input(self, size: int = 1) -> InputData:
-        """Build a throwaway ``size``-token decode batch for an idle DP group.
-
-        Idle groups must still enter the forward (its MoE layers run a
-        collective over the whole DP/EP world), so they ride along with a dummy
-        batch whose sampled tokens are discarded. The dummy references the
-        memory manager's dummy pages, so it never touches real KV state.
-        """
-        seqs = self.model_runner.create_dummy_seqs(size, runtime=True)
-        dummy = InputData(
-            use_buffer=False,
-            memory_manager=self.model_runner.memory_manager,
-            max_seq_length=self.model_runner.model_max_length,
-        )
-        dummy.cal_input(seqs)
-        return dummy
 
     def _collect_batch(self, entry) -> None:
         """Wait for a batch's D2H copy and finalize its seq state.
@@ -405,10 +376,10 @@ class OverlapWorker(Worker):
         keys into by ``batch_idx``.
         """
         mr = self.model_runner
-        sampled = mr._lp_sampled_bufs[buf_idx][:batch_size].tolist()
+        sampled = mr.lp_sampled_bufs[buf_idx][:batch_size].tolist()
         if lp_k > 0:
-            ids = mr._lp_topid_bufs[buf_idx][:batch_size, :lp_k].tolist()
-            vals = mr._lp_topval_bufs[buf_idx][:batch_size, :lp_k].tolist()
+            ids = mr.lp_topid_bufs[buf_idx][:batch_size, :lp_k].tolist()
+            vals = mr.lp_topval_bufs[buf_idx][:batch_size, :lp_k].tolist()
         else:
             ids = [[] for _ in range(batch_size)]
             vals = [[] for _ in range(batch_size)]
@@ -424,18 +395,17 @@ class OverlapWorker(Worker):
             return
         entry.copy_done.synchronize()
         if entry.deferred is not None:
-            entry.tokens = self.model_runner._next_tokens_bufs[entry.buf_idx][
+            entry.tokens = self.model_runner.next_tokens_bufs[entry.buf_idx][
                 : entry.batch_size
             ].tolist()
 
     def _retire_loop(self) -> None:
         """Drain launched batches' completion events off the driver thread.
 
-        The driver used to block here itself. Averaged over a run that looks
-        harmless -- it has milliseconds of slack per iteration -- but the block
-        is not spread evenly. Only the wait and the D2H read move; the
-        scheduler finalize stays on the driver, because every column driver
-        must run it in the same order.
+        Blocking on the driver looks harmless (milliseconds of slack per
+        iteration on average) but the block is not spread evenly. Only the
+        wait and the D2H read move; the scheduler finalize stays on the
+        driver, because every column driver must run it in the same order.
         """
         armed = False
         while True:
@@ -479,14 +449,10 @@ class OverlapWorker(Worker):
         """Retire batches beyond the collect lag, oldest first.
 
         Blocking here does gate the launch rate -- the driver waits on batch k
-        before it may issue k + depth -- and that loop is visible as a stall
-        recurring every ``depth + 1`` launches (nsys: the driver sits in
-        ``sem_wait`` for 26 ms of a long gap, against 0 in a normal one).
-        Breaking the gate does remove the stall, confirmed by nsys, and it
-        makes throughput *worse*: 2036.7 -> 2012.7 tok/s, 0/6 paired wins.
-        The GPU is not starved during those stalls -- it still has queued work
-        -- so letting the driver run further ahead only costs more in-flight
-        input staging. The gate stays.
+        before it may issue k + depth. Removing the gate was measured to make
+        throughput *worse* (2036.7 -> 2012.7 tok/s): the GPU is not starved
+        during those stalls, so letting the driver run further ahead only
+        costs more in-flight input staging. The gate stays.
         """
         while len(self._gpu_pending) > self._collect_lag:
             self._collect_batch(self._take_oldest())
@@ -716,11 +682,10 @@ class OverlapWorker(Worker):
         # batch bookkeeping when the fused fast path is guaranteed to be taken.
         # MTP graphs are captured on ``OverlapModelRunner.forward_stream`` (see
         # its ``capture_graph`` override), so replay and every metadata/state
-        # update feeding that replay must run on the same stream. Previously
-        # this synchronous bypass executed on the caller's default stream. That
-        # violated the capture/replay stream contract and also raced SSM block
-        # zero/free operations against the next verify, causing silent GDN state
-        # drift and eventually illegal memory accesses on long generations.
+        # update feeding that replay must run on the same stream; running this
+        # step on the caller's default stream would violate the capture/replay
+        # stream contract and race SSM block zero/free operations against the
+        # next verify (silent GDN state drift, illegal memory accesses).
         next_tokens, default_stream, forward_stream = self._launch_mtp_step(
             batch, asynchronous=False
         )
@@ -728,7 +693,7 @@ class OverlapWorker(Worker):
         # the default stream. Make that work wait for the verify/state commit.
         default_stream.wait_stream(forward_stream)
         if next_tokens is not None:
-            self.scheduler.add_next_tokens(next_tokens, self.model_runner._last_logprobs)
+            self.scheduler.add_next_tokens(next_tokens, self.model_runner.last_logprobs)
             ipc_package = self.scheduler.process_output()
             if ipc_package is not None and self._polls_frontend():
                 self.comm.send_output(ipc_package)
@@ -764,7 +729,7 @@ class OverlapWorker(Worker):
                     (
                         "overlap_logprobs",
                         logprobs,
-                        self.model_runner._last_prompt_logprobs,
+                        self.model_runner.last_prompt_logprobs,
                     )
                 )
             batch = _PendingBatch(
@@ -846,7 +811,7 @@ class OverlapWorker(Worker):
 
         current.deferred = self.scheduler.process_mtp_output_deferred(
             decode_rows=len(batch.decode),
-            width=1 + self.model_runner._mtp_k,
+            width=1 + self.model_runner.mtp_k,
         )
         self._mtp_pending.append(current)
 
@@ -933,22 +898,16 @@ class OverlapWorker(Worker):
             else:
                 real_ntok = 0
                 is_decode = True  # idle groups don't veto the graph path
-            counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
-            if sum(counts) == 0:
+            barrier = self._dp_forward_barrier(real_ntok, is_decode)
+            if barrier is None:
                 # Nobody has work: skip the forward in unison, drain the pipe.
                 self._drain_pending()
                 return
+            counts_to_publish, dp_padded_size = barrier
             if input_data is None:
                 input_data = self._build_dummy_input(1)
                 is_dummy = True
-            fwd_counts = [c if c > 0 else 1 for c in counts]
-            if all(bool(d) for d in decode_flags):
-                dp_padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
-            set_dp_forward_counts(
-                [dp_padded_size] * self.dp_size
-                if dp_padded_size is not None
-                else fwd_counts
-            )
+            set_dp_forward_counts(counts_to_publish)
 
         if input_data is not None:
             # Keep the InputData alive in ``_gpu_pending`` until the batch
@@ -996,16 +955,8 @@ class OverlapWorker(Worker):
         self._build_prefetched_input()
 
 
-def run_overlap_worker(worker: OverlapWorker):
-    """Tight per-iter loop for the overlap path."""
-    try:
-        worker.init()
-        while True:
-            if worker.pp_rank == 0:
-                worker.run_pp0()
-            else:
-                worker.run_other()
-    except KeyboardInterrupt:
-        worker.handle_keyboardInterrupt()
-    except Exception as e:
-        worker.handle_exception(e)
+# The two worker classes share the per-iter loop contract (``init`` then
+# ``run_pp0`` / ``run_other`` dispatched on ``pp_rank``), so a single entry
+# point in :mod:`gllm.workers.worker` serves both. Kept under its historical
+# name for ``gllm.engine.llm``'s import.
+run_overlap_worker = run_worker

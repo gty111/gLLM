@@ -23,6 +23,7 @@ from gllm.layers.linear import (
 from gllm.layers.rotary_embedding import RotaryEmbedding
 from gllm.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 
+from .mixins import StandardCausalLMMixin
 from .weight_loader import (
     LoadContext,
     WeightRule,
@@ -133,9 +134,7 @@ class GLMBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, input_data: InputData):
         # hidden_states: [num_tokens, h]
-        # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
-        # Residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
         else:
@@ -150,10 +149,8 @@ class GLMBlock(nn.Module):
 
         layernorm_input = residual + attention_output
 
-        # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
 
-        # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
         else:
@@ -188,7 +185,6 @@ class GLMTransformer(nn.Module):
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         for layer in self.layers:
             hidden_states = layer(hidden_states, input_data)
-        # Final layer norm.
         if is_last_pp_rank():
             if self.post_layer_norm:
                 hidden_states = self.final_layernorm(hidden_states)
@@ -219,12 +215,11 @@ class ChatGLMModel(nn.Module):
         if is_first_pp_rank() and hidden_states is None:
             hidden_states = self.embedding(input_data.get_tokens())
 
-        # Run encoder.
         hidden_states = self.encoder(input_data, hidden_states)
         return hidden_states
 
 
-class ChatGLMForCausalLM(nn.Module):
+class ChatGLMForCausalLM(StandardCausalLMMixin, nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -249,19 +244,6 @@ class ChatGLMForCausalLM(nn.Module):
             assert hidden_states is None and residual is None
             hidden_states = input_embeds
         return self.transformer(input_data, hidden_states)
-
-    def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
-        # fetch hidden_states of last token in each seq
-        idx_list = input_data.get_query_start_loc() - 1
-        return self.logits_from_hidden(hidden_states[idx_list[1:]])
-
-    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project the given hidden states to full-vocab logits (all positions).
-
-        Used by the prompt-logprobs path; ``compute_logits`` uses this after
-        selecting each seq's last position.
-        """
-        return self.lm_head(hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embed explicit inputs for the generic piecewise graph runner."""

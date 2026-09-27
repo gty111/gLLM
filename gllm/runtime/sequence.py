@@ -70,9 +70,7 @@ class GenerationSequence:
         # lengths before constructing a sequence. Profiling callers pass an
         # explicit budget as well; there is no context-independent fallback.
         self.output_len = output_len
-        # used for detokenize
         self.cur_length = self.prompt_len
-        # used for sample
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
@@ -99,7 +97,6 @@ class GenerationSequence:
         # used for prefix cache and chunked prefill
         self.computed_token_num = 0
         self.to_compute_token_num = 0
-        # used for abort
         self.is_abort = False
         # DP-attention request pinning: when the frontend exposes one HTTP
         # endpoint per DP replica (``--endpoint-per-dp``), the endpoint that
@@ -107,7 +104,6 @@ class GenerationSequence:
         # lives there. ``None`` => frontend round-robins across replicas (the
         # default single-endpoint behaviour).
         self.target_dp: Optional[int] = None
-        # used for multimodal input
         self.mm_contents = mm_contents
         # used to remove redundant token_ids
         self.to_compute_tokens = None
@@ -126,8 +122,8 @@ class GenerationSequence:
         # non-MTP / non-hybrid seqs (those use the scalar ``recurrent_state_slot``).
         # ``ssm_num_accepted`` persists the last accepted-token count so the
         # next verify's recurrent kernel resumes from column ``num_accepted-1``
-        # (1 = neutral: resume from column 0). See the column protocol in
-        # ``MemoryManager.commit_ssm_checkpoint`` documents the commit protocol.
+        # (1 = neutral: resume from column 0). The commit protocol is
+        # documented in ``SSMSegment.commit_blocks``.
         self.ssm_block_table: Optional[list] = None
         self.ssm_num_accepted: int = 1
         # True only between overlap-MTP's optimistic fixed-width reservation

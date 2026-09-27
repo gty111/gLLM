@@ -176,9 +176,7 @@ class MtpGpuPrep:
         self.bucket = 0
         self._staged = (-1, -1)
 
-    # ------------------------------------------------------------------
     # host -> device: per-sequence facts
-    # ------------------------------------------------------------------
     def _arange(self, n: int, dtype=torch.int64) -> torch.Tensor:
         key = (n, dtype)
         ar = self._ar_cache.get(key)
@@ -324,9 +322,7 @@ class MtpGpuPrep:
         """Bind this persistent writer to one mixed-forward GPU patch."""
         return MtpMixedPatchMaterializer(self, drafts_gpu)
 
-    # ------------------------------------------------------------------
     # device: per-token arrays straight into the static input buffers
-    # ------------------------------------------------------------------
     def _fill_common(self, input_data, qlen: int, positions_2d: torch.Tensor):
         """Shared writes for a uniform ``qlen``-per-row batch.
 

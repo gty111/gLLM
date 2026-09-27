@@ -57,6 +57,17 @@ served_model_names: list[str] = []
 tool_parser = None
 response_store = ResponseStore()
 
+# One executor wrapper per callable, built on first use: ``make_async``
+# allocates a closure, so calling it per request would allocate per request.
+_async_wrappers = {}
+
+
+def _async(func):
+    wrapper = _async_wrappers.get(func)
+    if wrapper is None:
+        wrapper = _async_wrappers[func] = make_async(func)
+    return wrapper
+
 
 def _abort_stream(stream):
     abort = getattr(stream, "abort", None)
@@ -145,6 +156,22 @@ def _unsupported(param: str, detail: Optional[str] = None):
     return _openai_error(message, param=param, code="unsupported_parameter")
 
 
+def _resolve_logprobs(count, enabled):
+    """Clamp a requested top-logprobs count to the OpenAI ceiling of 20.
+
+    ``None``/falsy ``count`` means "report only the sampled token"."""
+    return min(count or 0, 20) if enabled else 0
+
+
+def _context_length_error(param: str):
+    return _openai_error(
+        "This request exceeds the model's maximum context length.",
+        HTTPStatus.BAD_REQUEST.value,
+        param=param,
+        code="context_length_exceeded",
+    )
+
+
 def _validate_output_format(fmt, param, tools=None, ignore_eos=False):
     from gllm.structured_output import normalize_format
 
@@ -162,7 +189,7 @@ async def _prepare_output_format(fmt, token_ids, *, tools=None, custom_formats=N
     from gllm.structured_output import prepare_output
 
     runner = getattr(llm, "model_runner", None)
-    return await make_async(prepare_output)(
+    return await _async(prepare_output)(
         fmt, getattr(runner, "tokenizer", None),
         getattr(getattr(runner, "model_loader", None), "vocab_size", 0),
         getattr(llm, "finish_tokens", ()), token_ids,
@@ -171,28 +198,114 @@ async def _prepare_output_format(fmt, token_ids, *, tools=None, custom_formats=N
     )
 
 
+class _UnsupportedMMInput(Exception):
+    """A request carried media the loaded model cannot consume."""
+
+
+async def _tokenize_messages(messages, effective_tools, chat_template_kwargs,
+                             *, check_mm_support=False):
+    """Tokenize chat messages into ``(token_ids, mm_contents, mm_items)``.
+
+    Shared by the chat-completions and responses endpoints. Encoder-
+    disaggregation frontend: tokenize the *text only*
+    into a skeleton (one sentinel per item) and ship the raw items to the
+    encoder via the LM PP0 worker. The LM never opens pixels and never
+    carries ``mm_contents``. Falls back to the monolith processor path for
+    text requests and when disaggregation is off.
+    """
+    mm_contents = await _async(llm.model_runner.extract_modify_mm)(messages)
+    if check_mm_support and mm_contents is not None and not llm.model_runner.use_mm:
+        raise _UnsupportedMMInput("The loaded model does not support image inputs.")
+    disagg = getattr(llm, "is_disagg_lm", False)
+    mm_items = None
+    if disagg and mm_contents is not None:
+        mm_items = await _async(llm.model_runner.extract_mm_items_ordered)(messages)
+        token_ids = await _async(llm.model_runner.encode_skeleton)(
+            messages, chat_template_kwargs=chat_template_kwargs or None
+        )
+        mm_contents = None  # LM holds no pixels; embeddings arrive over NIXL
+    else:
+        token_ids = await _async(llm.model_runner.encode)(
+            messages,
+            chat=True,
+            has_mm=mm_contents is not None,
+            chat_template_kwargs=chat_template_kwargs or None,
+            # Serialize the pydantic tool schemas to plain dicts; the chat
+            # templates (and Kimi's ``encode_tools_to_typescript_style``)
+            # expect JSON-like dicts, not pydantic models.
+            tools=(
+                [t.model_dump(exclude_none=True, by_alias=True) for t in effective_tools]
+                if effective_tools
+                else None
+            ),
+        )
+    return token_ids, mm_contents, mm_items
+
+
+# Fields the chat-completions endpoint honors (or deliberately tolerates).
+# Everything else on ChatCompletionRequest that carries a non-default value
+# is rejected by _reject_unsupported_params below, so newly added schema
+# fields are refused by default instead of silently ignored.
+_CHAT_SUPPORTED_PARAMS = frozenset({
+    # Core request.
+    "messages", "model",
+    # Sampling.
+    "logprobs", "top_logprobs", "max_tokens", "max_completion_tokens",
+    "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos",
+    "prompt_logprobs",
+    # Output / streaming.
+    "response_format", "stream", "stream_options",
+    # Reasoning and template controls.
+    "reasoning_effort", "chat_template_kwargs",
+    # Tools (validated individually below). function_call/functions are the
+    # deprecated wire aliases the schema translates into tool_choice/tools.
+    "tools", "tool_choice", "parallel_tool_calls",
+    "function_call", "functions",
+    # Accepted and ignored (OpenAI compatibility).
+    "service_tier", "request_id", "return_tokens_as_token_ids",
+    # Rejected selectively below: only "text" modalities and empty stop.
+    "modalities", "stop",
+})
+
+_COMPLETION_SUPPORTED_PARAMS = frozenset({
+    "model", "prompt",
+    "logprobs", "prompt_logprobs", "max_tokens",
+    "temperature", "top_p", "top_k", "repetition_penalty", "ignore_eos",
+    "stream", "stream_options",
+    # Rejected selectively below: non-empty stop.
+    "stop",
+})
+
+
+def _reject_unsupported_params(request, supported, extra_accepted=None):
+    """Reject any field outside ``supported`` that carries a non-default value.
+
+    ``None`` and the schema default always pass; ``extra_accepted`` maps a
+    field name to additional tolerated values (e.g. best_of=1).
+    """
+    for name, field in type(request).model_fields.items():
+        if name in supported:
+            continue
+        value = getattr(request, name)
+        if value is None or value == field.get_default(call_default_factory=True):
+            continue
+        if extra_accepted and value in extra_accepted.get(name, ()):
+            continue
+        return _unsupported(name)
+    return None
+
+
 def _validate_chat_capabilities(request: ChatCompletionRequest):
     model_error = _validate_model(request.model)
     if model_error:
         return model_error
-    checks = [
-        (request.n not in (None, 1), "n"),
-        (request.frequency_penalty not in (None, 0, 0.0), "frequency_penalty"),
-        (request.presence_penalty not in (None, 0, 0.0), "presence_penalty"),
-        (request.logit_bias is not None, "logit_bias"),
-        (request.seed is not None, "seed"),
-        (bool(request.stop), "stop"),
-        (request.store is True, "store"),
-        (request.audio is not None, "audio"),
-        (bool(request.modalities and "audio" in request.modalities), "modalities"),
-        (request.moderation is not None, "moderation"),
-        (request.prediction is not None, "prediction"),
-        (request.prompt_cache_options is not None, "prompt_cache_options"),
-        (request.web_search_options is not None, "web_search_options"),
-    ]
-    for condition, param in checks:
-        if condition:
-            return _unsupported(param)
+    unsupported = _reject_unsupported_params(request, _CHAT_SUPPORTED_PARAMS)
+    if unsupported:
+        return unsupported
+    if bool(request.stop):
+        return _unsupported("stop")
+    if request.modalities and "audio" in request.modalities:
+        return _unsupported("modalities")
     format_error = _validate_output_format(
         request.response_format, "response_format",
         request.tools if request.tool_choice != "none" else None,
@@ -210,6 +323,20 @@ def _validate_chat_capabilities(request: ChatCompletionRequest):
             "tool_choice",
             "This runtime supports tool_choice='none' and 'auto'; forced and allowed tool choices are not enforceable by the loaded model.",
         )
+    return None
+
+
+def _validate_completion_capabilities(request: CompletionRequest):
+    model_error = _validate_model(request.model)
+    if model_error:
+        return model_error
+    unsupported = _reject_unsupported_params(
+        request, _COMPLETION_SUPPORTED_PARAMS, {"best_of": (1,)}
+    )
+    if unsupported:
+        return unsupported
+    if bool(request.stop):
+        return _unsupported("stop")
     return None
 
 
@@ -306,50 +433,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     effective_tools = request.tools if request.tool_choice != "none" else None
     chat_template_kwargs = _chat_template_kwargs(request)
 
-    mm_contents = await make_async(llm.model_runner.extract_modify_mm)(request.messages)
-    # Encoder-disaggregation frontend (design §3.1 / §5.4): tokenize the *text
-    # only* into a skeleton (one sentinel per item) and ship the raw items to
-    # the encoder via the LM PP0 worker. The LM never opens pixels and never
-    # carries ``mm_contents``. Falls back to the monolith processor path for
-    # text requests and when disaggregation is off.
-    disagg = getattr(llm, "is_disagg_lm", False)
-    mm_items = None
-    if disagg and mm_contents is not None:
-        mm_items = await make_async(llm.model_runner.extract_mm_items_ordered)(
-            request.messages
-        )
-        token_ids = await make_async(llm.model_runner.encode_skeleton)(
-            request.messages, chat_template_kwargs=chat_template_kwargs or None
-        )
-        mm_contents = None  # LM holds no pixels; embeddings arrive over NIXL
-    else:
-        token_ids = await make_async(llm.model_runner.encode)(
-            request.messages,
-            chat=True,
-            has_mm=mm_contents is not None,
-            chat_template_kwargs=chat_template_kwargs or None,
-            # Serialize the pydantic tool schemas to plain dicts; the chat
-            # templates (and Kimi's ``encode_tools_to_typescript_style``)
-            # expect JSON-like dicts, not pydantic models.
-            tools=(
-                [
-                    t.model_dump(exclude_none=True, by_alias=True)
-                    for t in effective_tools
-                ]
-                if effective_tools
-                else None
-            ),
-        )
-    # OpenAI deprecated ``max_tokens`` for chat completions in favor of
-    # ``max_completion_tokens`` but most clients (including curl examples,
-    # the OpenAI Python SDK pre-1.40, and ``benchmark_serving.py``) still
-    # send the legacy field. Honour it as a fallback so the decode cap
-    # actually takes effect — otherwise a request without
-    # ``max_completion_tokens`` decodes until EOS / model_max_length,
-    # which on a broken model produces thousands of garbage tokens.
-    # Pydantic intentionally warns whenever the deprecated attribute is read,
-    # even when the client did not send it.  Read the validated fallback from
-    # the model storage so modern requests do not produce a spurious warning.
+    token_ids, mm_contents, mm_items = await _tokenize_messages(
+        request.messages, effective_tools, chat_template_kwargs
+    )
+    # OpenAI deprecated ``max_tokens`` in favor of ``max_completion_tokens``
+    # but many clients still send the legacy field; honour it as a fallback.
+    # Pydantic warns whenever the deprecated attribute is read, even when the
+    # client did not send it, so read it from the model storage instead.
     max_output_tokens = (
         request.max_completion_tokens
         if request.max_completion_tokens is not None
@@ -359,10 +449,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # (0-20) is how many alternatives to report per token. Clamp to the OpenAI
     # ceiling to bound the per-step top-k work.
     logprobs_enabled = bool(request.logprobs)
-    num_top_logprobs = min(request.top_logprobs or 0, 20) if logprobs_enabled else 0
+    num_top_logprobs = _resolve_logprobs(request.top_logprobs, logprobs_enabled)
     prompt_logprobs_enabled = request.prompt_logprobs is not None
-    num_prompt_logprobs = (
-        min(request.prompt_logprobs, 20) if prompt_logprobs_enabled else 0
+    num_prompt_logprobs = _resolve_logprobs(
+        request.prompt_logprobs, prompt_logprobs_enabled
     )
     if llm.check_seq_length(token_ids, max_output_tokens):
         try:
@@ -393,12 +483,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             structured_output=structured_output,
         )
     else:
-        return _openai_error(
-            "This request exceeds the model's maximum context length.",
-            HTTPStatus.BAD_REQUEST.value,
-            param="messages",
-            code="context_length_exceeded",
-        )
+        return _context_length_error("messages")
     reasoning_parser = create_reasoning_parser(
         getattr(llm.model_runner, "tokenizer", None), token_ids
     )
@@ -453,8 +538,8 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         # File URLs involve blocking I/O; keep them off the FastAPI event loop
         # while building the native text/image message.
         if request.store:
-            request = await make_async(snapshot_response_files)(request)
-        chat_request = await make_async(make_chat_request)(request)
+            request = await _async(snapshot_response_files)(request)
+        chat_request = await _async(make_chat_request)(request)
     except ValueError as exc:
         param, message = exc.args if len(exc.args) == 2 else ("input", str(exc))
         return _unsupported(param, message)
@@ -462,49 +547,17 @@ async def create_response(request: ResponseRequest, raw_request: Request):
     effective_tools = chat_request.tools if chat_request.tool_choice != "none" else None
     chat_template_kwargs = _chat_template_kwargs(chat_request)
     try:
-        mm_contents = await make_async(llm.model_runner.extract_modify_mm)(
-            chat_request.messages
+        token_ids, mm_contents, mm_items = await _tokenize_messages(
+            chat_request.messages, effective_tools, chat_template_kwargs,
+            check_mm_support=True,
         )
-        if mm_contents is not None and not llm.model_runner.use_mm:
-            return _unsupported(
-                "input",
-                "The loaded model does not support image inputs.",
-            )
-        disagg = getattr(llm, "is_disagg_lm", False)
-        mm_items = None
-        if disagg and mm_contents is not None:
-            mm_items = await make_async(llm.model_runner.extract_mm_items_ordered)(
-                chat_request.messages
-            )
-            token_ids = await make_async(llm.model_runner.encode_skeleton)(
-                chat_request.messages,
-                chat_template_kwargs=chat_template_kwargs or None,
-            )
-            mm_contents = None
-        else:
-            token_ids = await make_async(llm.model_runner.encode)(
-                chat_request.messages,
-                chat=True,
-                has_mm=mm_contents is not None,
-                chat_template_kwargs=chat_template_kwargs or None,
-                tools=(
-                    [
-                        tool.model_dump(exclude_none=True, by_alias=True)
-                        for tool in effective_tools
-                    ]
-                    if effective_tools
-                    else None
-                ),
-            )
+    except _UnsupportedMMInput as exc:
+        return _unsupported("input", str(exc))
     except (TypeError, ValueError, TemplateError) as exc:
         return _openai_error(str(exc), param="input", code="invalid_input")
 
     if not llm.check_seq_length(token_ids, request.max_output_tokens):
-        return _openai_error(
-            "This request exceeds the model's maximum context length.",
-            param="input",
-            code="context_length_exceeded",
-        )
+        return _context_length_error("input")
     try:
         from gllm.entrypoints.response_tools import custom_tool_formats
 
@@ -589,11 +642,11 @@ async def create_response(request: ResponseRequest, raw_request: Request):
 
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
-    model_error = _validate_model(request.model)
-    if model_error:
-        return model_error
+    capability_error = _validate_completion_capabilities(request)
+    if capability_error:
+        return capability_error
     if isinstance(request.prompt, str):
-        token_ids = await make_async(llm.model_runner.encode)(request.prompt)
+        token_ids = await _async(llm.model_runner.encode)(request.prompt)
     else:
         # Tokenized prompts must reach the engine unchanged: decoding and
         # re-encoding can merge token boundaries or alter special tokens.
@@ -615,10 +668,10 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     # to report (the sampled token's logprob is always included). ``None`` /
     # unset disables it. Clamp to the OpenAI ceiling.
     logprobs_enabled = request.logprobs is not None
-    num_top_logprobs = min(request.logprobs or 0, 20) if logprobs_enabled else 0
+    num_top_logprobs = _resolve_logprobs(request.logprobs, logprobs_enabled)
     prompt_logprobs_enabled = request.prompt_logprobs is not None
-    num_prompt_logprobs = (
-        min(request.prompt_logprobs, 20) if prompt_logprobs_enabled else 0
+    num_prompt_logprobs = _resolve_logprobs(
+        request.prompt_logprobs, prompt_logprobs_enabled
     )
     if llm.check_seq_length(token_ids, request.max_tokens):
         stream = await llm.add_requests_async(
@@ -637,12 +690,7 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             num_prompt_logprobs=num_prompt_logprobs,
         )
     else:
-        return _openai_error(
-            "This request exceeds the model's maximum context length.",
-            HTTPStatus.BAD_REQUEST.value,
-            param="prompt",
-            code="context_length_exceeded",
-        )
+        return _context_length_error("prompt")
     if request.stream:
         generator = completion_stream_generator(stream, request)
         return RequestStreamingResponse(generator, stream)
@@ -777,11 +825,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Additional model ID accepted by the OpenAI API; may be repeated.",
     )
-    # Runtime
-    # Parallelism
-    parser.add_argument("--pp", type=int, help="Number of pipeline stages", default=1)
+    parser.add_argument("--pp", dest="pp_size", type=int, help="Number of pipeline stages", default=1)
     parser.add_argument(
         "--dp",
+        dest="dp_size",
         type=int,
         help=(
             "Number of data-parallel (DP-attention) replicas. World size is "
@@ -816,7 +863,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--enable-ep",
-        dest="enable_ep",
+        dest="use_ep",
         action="store_true",
         default=False,
         help=(
@@ -833,7 +880,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15",
         default=None,
     )
-    # Token Throttling
     # Multi-Node deployment
     parser.add_argument(
         "--launch-mode",
@@ -842,9 +888,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="normal",
     )
     parser.add_argument(
-        "--ranks", type=str, help="Specify the ranks of worker like 0,1", default=None
+        "--ranks", dest="worker_ranks", type=str, help="Specify the ranks of worker like 0,1", default=None
     )
-    # MultiModal
     return parser
 
 
@@ -899,21 +944,17 @@ def main():
     from gllm.runtime.model_loader import quiet_hub_logging
 
     quiet_hub_logging()
-    # ``llm`` is the module-level handle every route reads; this used to be a
-    # plain module-scope assignment under ``if __name__ == "__main__"``.
+    # ``llm`` is the module-level handle every route reads.
     global llm, served_model_names
 
     args = build_arg_parser().parse_args()
     served_model_names = args.served_model_name
 
+    # All engine knobs flow through engine_kwargs; entrypoints never pass
+    # EngineConfig fields explicitly (single source of truth: the args
+    # namespace).
     llm = AsyncLLM(
         host=args.host,
-        launch_mode=args.launch_mode,
-        worker_ranks=args.ranks,
-        pp_size=args.pp,
-        dp_size=args.dp,
-        use_ep=args.enable_ep,
-        assigned_layers=args.assigned_layers,
         **cli_args.engine_kwargs(args),
     )
 

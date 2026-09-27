@@ -4,6 +4,7 @@ from torch import nn
 from gllm.distributed.parallel_state import is_first_pp_rank
 from gllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 from gllm.models.kimi_k25_vision import KimiPatchMerger, KimiVisionTower
+from gllm.models.mixins import NestedLanguageModelMixin
 from gllm.models.utils import _merge_multimodal_embeddings
 
 
@@ -141,7 +142,7 @@ def build_kimi_input_ids(text, messages, processor, tokenizer, pad_id):
     return out
 
 
-class KimiK25ForConditionalGeneration(nn.Module):
+class KimiK25ForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
     """Kimi-K2.5 multimodal runtime: MoonViT3d vision tower + PatchMerger
     projector on top of a DeepSeek-V3 language backbone.
 
@@ -273,15 +274,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
             multimodal_embeddings=multimodal_embeddings,
         )
 
-    # ------------------------------------------------------------------
     def forward(self, input_data, hidden_states=None, residual=None):
         return self.language_model(input_data, hidden_states, residual)
-
-    def compute_logits(self, input_data, hidden_states: torch.Tensor):
-        return self.language_model.compute_logits(input_data, hidden_states)
-
-    def logits_from_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.language_model.logits_from_hidden(hidden_states)
 
     def load_weights(self, weights, mp_load_progress=None):
         # 1) Language model: the checkpoint namespaces the DeepSeek backbone

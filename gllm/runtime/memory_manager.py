@@ -20,11 +20,6 @@ from gllm.utils import async_tensor_h2d, get_dtype_bytes
 # 128-wide tiles (one fp32 scale per tile), matching FlashMLA's packed layout.
 _DSA_FP8_TILE = 128
 
-# DSA indexer scoring always uses deep_gemm FP8 MQA-logits kernels; decode needs a
-# persistent paged FP8 index-K cache in the 132-byte block-contiguous layout
-# ``get_paged_mqa_logits_metadata`` / ``fp8_paged_mqa_logits`` expect (per page:
-# [page_size*128 fp8 bytes][page_size*4 fp32-scale bytes]).
-
 
 @dataclass
 class DeepseekV4KVCacheConfig:
@@ -573,8 +568,6 @@ class SSMSegment(RecurrentStateSegment):
         ):
             raise ValueError(self.temporal_state.shape)
 
-        # Dummy slot that padded rows / unused pointers can refer to without
-        # aliasing any real state.
         self._reserve_dummy_slot()
 
         # Optional CUDA stream that ``copy_state`` (the prefix-cache restore)
@@ -588,12 +581,6 @@ class SSMSegment(RecurrentStateSegment):
         # ``None`` (non-overlap) keeps the restore on the single default stream,
         # where it is already serialized with the forward.
         self.restore_stream: Optional["torch.cuda.Stream"] = None
-
-    # --- block lifecycle ------------------------------------------------
-    #
-    # A "block" holds one full per-layer GDN recurrent state. Sequences borrow
-    # one block for their rolling state; MTP verify borrows extra transient
-    # blocks for per-token checkpoints.
 
     def _reset_block(self, block: int) -> None:
         def _zero():
@@ -633,8 +620,6 @@ class SSMSegment(RecurrentStateSegment):
             self._reset_block(blk)
         self.cache_arena.allocator.free(self.arena_type, real_blocks)
 
-    # --- prefix-cache cached-state blocks ------------------------------
-
     def allocate_snapshot(self) -> Optional[int]:
         # PrefixSegment owns same-type replacement and protects live readers
         # and pending writes. This low-level allocation only uses free extents.
@@ -653,8 +638,6 @@ class SSMSegment(RecurrentStateSegment):
 
     def num_free_snapshot(self) -> int:
         return self.num_free_blocks()
-
-    # --- transfer -------------------------------------------------------
 
     def copy_state(
         self,
@@ -705,8 +688,6 @@ class SSMSegment(RecurrentStateSegment):
             return self.conv_state, self.temporal_state
         raise ValueError(f"unknown SSM state kind: {kind!r}")
 
-    # --- MTP verify checkpoint commit ----------------------------------
-    #
     # An MTP verify forward runs the GDN recurrent kernel over [x1, d1..dk] and
     # checkpoints the state after each token into transient arena entries (one
     # entry per verify step, per sequence).
@@ -1007,7 +988,6 @@ class MemoryManager:
         self.cache_arena: Optional[CacheArena] = None
         self.segment: Union[Segment, PrefixSegment] = None
 
-        # --- Persistent repetition-penalty mask pool --------------------
         # Lazily allocated on the first batch that actually uses a non-1.0
         # ``repetition_penalty`` (so workloads that never set one pay nothing,
         # not even GPU memory). ``_rep_pool`` is a ``[num_slots + 1, vocab]``
@@ -1467,8 +1447,6 @@ class MemoryManager:
         self.free_recurrent_slot(seq)
         self.free_rep_slot(seq)
 
-    # --- Repetition-penalty mask pool lifecycle ---------------------------
-
     def _ensure_rep_pool(self) -> None:
         if self._rep_pool is not None:
             return
@@ -1618,8 +1596,6 @@ class MemoryManager:
         self._rep_pool[slot_t, token_t] = penalty_t
         mask[row_t, token_t] = penalty_t
 
-    # --- recurrent working-slot lifecycle ---------------------------------
-    #
     # No-ops for models without per-request recurrent state
     # (``recurrent_segment is None``). Otherwise the scheduler calls
     # ``allocate_recurrent_slot`` on a sequence's first schedule (mirroring how
@@ -1676,11 +1652,6 @@ class MemoryManager:
 
     def get_memory_free(self):
         return self.get_num_free_pages() / self.num_pages
-
-
-# ---------------------------------------------------------------------------
-# Prefix cache
-# ---------------------------------------------------------------------------
 
 
 # 64-bit nonzero seed for the chained prefix hash. Mixing a constant in
@@ -1814,7 +1785,6 @@ class PrefixMemoryManager(MemoryManager):
                 self.segment.ssm_snapshot_stride,
             )
 
-        # Cache-hit-rate stats.
         self.num_allocated_pages = 0
         self.num_hit_pages = 0
 
@@ -1888,17 +1858,13 @@ class PrefixMemoryManager(MemoryManager):
         full_hit = seq.computed_token_num >= len(seq)
         # KNOWN RESIDUAL (MTP): a draft head sharing these pages stores a
         # SHIFTED entry -- position ``p`` holds
-        # ``(target_hidden[p], embed(token[p+1]))``.  At the deepest cached
-        # position ``C-1`` that next token is this request's first token
-        # OUTSIDE the shared prefix, so exactly ONE reused head entry was
-        # written for someone else's continuation (every shallower entry is
-        # genuinely reusable).  Handing a token back would repair it, but on a
-        # hybrid model ``computed_token_num`` is pinned to an SSM *snapshot*
-        # boundary: giving back one page makes ``_restore_ssm_working_state``
-        # walk to the previous snapshot and discard a whole
-        # ``ssm_snapshot_stride_tokens`` window.  Measured on Qwen3.8-27B with
-        # a prefix-repetition workload that is -36% output throughput to buy
-        # +0.01 acceptance length, so the stale entry is deliberately kept.
+        # ``(target_hidden[p], embed(token[p+1]))``, so exactly one reused
+        # head entry was written for someone else's continuation. Handing a
+        # token back would repair it, but on a hybrid model
+        # ``computed_token_num`` is pinned to an SSM *snapshot* boundary:
+        # giving back one page discards a whole ``ssm_snapshot_stride_tokens``
+        # window. Measured -36% output throughput for +0.01 acceptance
+        # length, so the stale entry is deliberately kept.
         if is_hybrid:
             if full_hit:
                 seq.computed_token_num -= self.page_size
@@ -1959,8 +1925,7 @@ class PrefixMemoryManager(MemoryManager):
         so it only ever runs once ``token_ids[pos]`` holds the *real* sampled
         token. Under overlap scheduling the freshly scheduled decode token is a
         negative placeholder until finalized; registering at allocation time
-        would hash the placeholder id and poison the cache (see
-        ``docs/prefix_cache_overlap_poisoning.md``).
+        would hash the placeholder id and poison the cache.
         """
         n = pos + 1
         if n % self.page_size != 0:
@@ -2088,8 +2053,6 @@ class PrefixSegment(Segment):
         ]
         self._ssm_snapshot_lru: "OrderedDict[int, None]" = OrderedDict()
         self._ssm_snapshot_pins: Dict[int, int] = {}
-
-    # --- public API ---------------------------------------------------------
 
     def evict_arena_slot(self, page_num: int) -> None:
         """Invalidate an unpinned KV entry before another arena type reuses it."""

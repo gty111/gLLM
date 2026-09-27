@@ -13,9 +13,9 @@ diverge in two places that matter for gLLM:
    *prompt*, not in ``output_ids``. If we mirrored sglang verbatim,
    greedy decoding with ``repetition_penalty=1.05`` from
    ``generation_config.json`` would still happily spell the same reply
-   token-by-token (see the "Can you tell a long long story?" repro). So
-   we seed the mask with **every token in the sequence history** -- prompt and
-   generated alike, as required by the OpenAI-compatible request semantics.
+   token-by-token. So we seed the mask with **every token in the sequence
+   history** -- prompt and generated alike, as required by the
+   OpenAI-compatible request semantics.
 
 2. **Where the mask lives.** SGLang keeps a persistent ``[batch, vocab]``
    tensor on the orchestrator and updates it incrementally with one

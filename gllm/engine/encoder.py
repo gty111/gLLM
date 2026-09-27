@@ -1,7 +1,7 @@
 """Encoder-side serving loop: ZMQ EncoderJob intake -> ViT -> NIXL write.
 
 Coordinates a :class:`gllm.runtime.vision_encoder_runner.VisionEncoderRunner`
-with the disaggregation control and data planes (design §4.2 / §5):
+with the disaggregation control and data planes:
 
     for each EncoderJob(seq, item, modality, content, remote_slots):
         mm_input, grid = processor(content)            # CPU pixel IO
@@ -15,7 +15,7 @@ with the disaggregation control and data planes (design §4.2 / §5):
 
 Sending the meta *before* the ViT is the whole point of the per-item channel:
 it lets the LM expand its skeleton token-ids and build the prefix-cache key
-while the (slower) ViT + transfer are still in flight (design §5.4 / §6).
+while the (slower) ViT + transfer are still in flight.
 
 Phase 3b processes one job at a time (single in-flight transfer per encoder),
 which keeps the persistent send buffer race-free without a ring. Per-item
@@ -36,7 +36,6 @@ from logger import logger
 from gllm.disagg.discovery import (
     make_discovery,
     make_payload,
-    payload_agent_names,
     payload_nixl_metas,
 )
 from gllm.disagg.protocol import EncoderJob, MmItemMeta, emb_notif
@@ -97,7 +96,7 @@ class Encoder:
         self.lm_agent_names: List[str] = []
         self.lm_zmq_addr: Optional[str] = None
         self.lm_payload: Optional[dict] = None  # last LM payload (for re-handshake)
-        # NIXL write resilience (design §5.5): retry a failed write with a
+        # NIXL write resilience: retry a failed write with a
         # re-handshake before giving up, so a transient transport hiccup (e.g.
         # mid-wireup REMOTE_DISCONNECT) does not kill the whole replica.
         self.write_max_attempts = 3
@@ -129,7 +128,7 @@ class Encoder:
         self.send_reg = self.nixl.register(self.send_buf)
 
         # Publish self into the registry + start watching for the LM. We do NOT
-        # block here: the LM may come up later (any start order, design §7.3.4).
+        # block here: the LM may come up later (any start order).
         # The serve loop drains discovery events and (re)connects dynamically.
         self.disc = make_discovery(self.discovery_endpoint)
         self.disc.publish(
@@ -294,7 +293,7 @@ class Encoder:
         # rank's reserved slot, sub-sized to the actual item. A single notif is
         # sent to TP0 *after* all writes complete, so TP0's ready gate means
         # "every rank's write landed". Retried with a re-handshake on transient
-        # transport failure (design §5.5).
+        # transport failure.
         nbytes = num_tokens * self.feat_dim * self.send_buf.element_size()
         remotes = [rs.with_offset(0, nbytes) for rs in job.remote_slots]
         self._write_with_retry(src, remotes, job)

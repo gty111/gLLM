@@ -14,11 +14,6 @@ import triton
 import triton.language as tl
 
 
-# =============================================================================
-# reshape_and_cache_flash
-# =============================================================================
-
-
 @triton.jit
 def _reshape_and_cache_flash_kernel(
     key_ptr,
@@ -51,11 +46,9 @@ def _reshape_and_cache_flash_kernel(
         - one token (program_id(0))
         - one block of heads (program_id(1))
     """
-    # program ids
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
 
-    # slot mapping
     slot_idx = tl.load(slot_mapping_ptr + token_idx)
 
     if slot_idx < 0:
@@ -64,7 +57,6 @@ def _reshape_and_cache_flash_kernel(
     block_idx = slot_idx // block_size
     block_offset = slot_idx % block_size
 
-    # head range
     head_idx = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
     head_mask = head_idx < num_heads
 
@@ -74,7 +66,6 @@ def _reshape_and_cache_flash_kernel(
     offs = head_idx[:, None] * head_size + dim_idx[None, :]
     mask = head_mask[:, None] & (dim_idx[None, :] < head_size)
 
-    # source load
     src_key = token_idx * key_stride + offs
     src_value = token_idx * value_stride + offs
 
@@ -152,10 +143,6 @@ def reshape_and_cache_flash(
     )
 
 
-# =============================================================================
-# concat_and_cache_mla
-# =============================================================================
-
 
 @triton.jit
 def _concat_and_cache_mla_kernel(
@@ -189,7 +176,6 @@ def _concat_and_cache_mla_kernel(
     """
     token_idx = tl.program_id(0)
 
-    # slot mapping
     slot_idx = tl.load(slot_mapping_ptr + token_idx)
 
     if slot_idx < 0:
@@ -198,12 +184,10 @@ def _concat_and_cache_mla_kernel(
     block_idx = slot_idx // block_size
     block_offset = slot_idx % block_size
 
-    # Load kv_c part
     c_offs = tl.arange(0, BLOCK_D_C)
     c_mask = c_offs < kv_c_dim
     kv_c = tl.load(kv_c_ptr + token_idx * kv_c_stride + c_offs, mask=c_mask)
 
-    # Load k_pe part
     pe_offs = tl.arange(0, BLOCK_D_PE)
     pe_mask = pe_offs < k_pe_dim
     k_pe = tl.load(k_pe_ptr + token_idx * k_pe_stride + pe_offs, mask=pe_mask)
@@ -214,7 +198,6 @@ def _concat_and_cache_mla_kernel(
         kv_c = kv_c / scale
         k_pe = k_pe / scale
 
-    # Store concatenated [kv_c | k_pe] to cache
     tgt_base = block_idx * cache_stride_block + block_offset * total_dim
 
     tl.store(kv_cache_ptr + tgt_base + c_offs, kv_c, mask=c_mask)
@@ -272,10 +255,6 @@ def concat_and_cache_mla(
     )
 
 
-# =============================================================================
-# concat_and_cache_mla_fp8  (native FP8 MLA cache, DeepSeek Sparse Attention)
-# =============================================================================
-#
 # FlashMLA's sparse decode kernel reads a paged FP8 latent cache in a fixed
 # 656-byte-per-token layout (for the standard MLA dims kv_lora_rank=512,
 # qk_rope_head_dim=64):
@@ -389,10 +368,6 @@ def concat_and_cache_mla_fp8(
     )
 
 
-# =============================================================================
-# gather_and_dequant_mla_fp8  (read back native FP8 MLA cache -> bf16)
-# =============================================================================
-#
 # Inverse of ``concat_and_cache_mla_fp8``: gathers a sequence's tokens from the
 # 656-byte FP8-packed paged cache and *dequantizes* them back to a contiguous
 # bf16 ``[gathered_tokens, kv_lora_rank + qk_rope_head_dim]`` buffer, which the
@@ -516,10 +491,6 @@ def gather_and_dequant_mla_fp8(
     )
 
 
-# =============================================================================
-# dequant_mla_fp8_flat  (whole-cache FP8 -> bf16 latent, physical-slot indexed)
-# =============================================================================
-#
 # Dequantizes the 656-byte FP8-packed MLA cache into a flat, physical-slot-indexed
 # bf16 latent buffer ``[num_slots, kv_lora_rank + qk_rope_head_dim]``. Unlike
 # ``gather_and_dequant_mla_fp8`` (which packs a batch's sequences contiguously by
@@ -606,10 +577,6 @@ def dequant_mla_fp8_flat(
     return dst
 
 
-# =============================================================================
-# dequant_mla_fp8_slots  (dequant only referenced slots -> full-width bf16 buf)
-# =============================================================================
-#
 # Gather-only variant of ``dequant_mla_fp8_flat``: dequantizes ONLY the physical
 # slots listed in ``slot_ids`` (the unique slots the DSA prefill top-k actually
 # references) into a full-width ``[num_slots, dim]`` bf16 buffer. Unreferenced
@@ -699,10 +666,6 @@ def dequant_mla_fp8_slots(
     return dst
 
 
-# =============================================================================
-# store_index_k_fp8  (write DSA indexer key into the paged FP8 index-K cache)
-# =============================================================================
-#
 # Quantizes each token's index key ``[index_head_dim]`` (bf16) to e4m3 + one fp32
 # scale (amax/448) and writes it into the block-contiguous paged FP8 index cache
 # that ``deep_gemm.fp8_paged_mqa_logits`` reads. Per page (page_size tokens) the
@@ -782,10 +745,6 @@ def store_index_k_fp8(
     )
 
 
-# =============================================================================
-# gather_and_maybe_dequant_cache
-# =============================================================================
-
 @triton.jit
 def _gather_and_maybe_dequant_cache_kernel(
     src_cache_ptr,
@@ -820,7 +779,6 @@ def _gather_and_maybe_dequant_cache_kernel(
     pos_in_seq = tl.program_id(0)
     batch_idx = tl.program_id(1)
 
-    # Determine the sequence range for this batch item
     seq_start = tl.load(cu_seq_lens_ptr + batch_idx)
     seq_end = tl.load(cu_seq_lens_ptr + batch_idx + 1)
     seq_len = seq_end - seq_start
@@ -828,13 +786,11 @@ def _gather_and_maybe_dequant_cache_kernel(
     if pos_in_seq >= seq_len:
         return
 
-    # Determine the actual position in the KV cache
     if HAS_SEQ_STARTS:
         actual_pos = tl.load(seq_starts_ptr + batch_idx) + pos_in_seq
     else:
         actual_pos = pos_in_seq
 
-    # Look up the block in the block table
     block_idx_in_table = actual_pos // block_size
     block_offset = actual_pos % block_size
 
@@ -842,7 +798,6 @@ def _gather_and_maybe_dequant_cache_kernel(
         block_table_ptr + batch_idx * block_table_stride + block_idx_in_table
     )
 
-    # Load from cache
     dim_offs = tl.arange(0, BLOCK_D)
     dim_mask = dim_offs < total_dim
 
@@ -851,12 +806,10 @@ def _gather_and_maybe_dequant_cache_kernel(
     )
     data = tl.load(src_cache_ptr + src_offset, mask=dim_mask)
 
-    # Optional dequantization
     if USE_SCALE:
         scale = tl.load(scale_ptr)
         data = data * scale
 
-    # Store to destination
     dst_offset = (seq_start + pos_in_seq) * dst_stride + dim_offs
     tl.store(dst_ptr + dst_offset, data, mask=dim_mask)
 
@@ -891,7 +844,6 @@ def gather_and_maybe_dequant_cache(
 
     BLOCK_D = triton.next_power_of_2(total_dim)
 
-    # Determine max sequence length for grid sizing
     max_seq_len = int((cu_seq_lens[1:] - cu_seq_lens[:-1]).max().item())
 
     grid = (max_seq_len, batch_size)

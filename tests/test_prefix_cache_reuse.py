@@ -3,10 +3,8 @@ import random
 from types import SimpleNamespace
 
 import pytest
-import torch
 
-from gllm.runtime.cache_arena import CacheArenaAllocator, CacheArena
-from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager, PrefixSegment
+from gllm.runtime.cache_arena import CacheArenaAllocator
 from gllm.runtime.sequence import GenerationSequence
 
 
@@ -108,29 +106,7 @@ def test_repeated_exact_slot_hits_bound_stale_heap_entries():
     assert arena.allocate("kv", 6) == [1, 2, 3, 4, 5, 0]
 
 
-def prefix_manager(pages=128):
-    base = MemoryManager(0.85, num_layers=1, dtype=torch.bfloat16, page_size=16,
-                         kv_head_num=1, kv_head_dim=8, vocab_size=1024)
-    layout = base._kv_cache_layout()
-    arena = CacheArena(torch.empty(pages * layout.entry_bytes, dtype=torch.uint8),
-                       physical_page_bytes=layout.entry_bytes)
-    cache = arena.register_cache(layout)
-    segment = PrefixSegment(1, 16, 1, 8, False, cache)
-    arena.allocator.set_evictor(cache.name, segment.evict_arena_slot)
-    manager = PrefixMemoryManager.__new__(PrefixMemoryManager)
-    manager.segment = segment
-    manager.page_size = 16
-    manager.ssm_segment = manager.dsv4_state_segment = None
-    manager.num_allocated_pages = manager.num_hit_pages = 0
-    return manager, arena, cache
-
-
-def populate(segment, seq):
-    seq.page_table = [segment.allocate(seq, end)
-                      for end in range(16, len(seq.token_ids) + 1, 16)]
-
-
-def test_parallel_decode_does_not_destroy_recently_released_prefix():
+def test_parallel_decode_does_not_destroy_recently_released_prefix(prefix_manager, populate):
     manager, arena, cache = prefix_manager()
     seg = manager.segment
     long = GenerationSequence(1, list(range(512)), [], output_len=16)
@@ -146,7 +122,7 @@ def test_parallel_decode_does_not_destroy_recently_released_prefix():
     assert continuation.computed_token_num == 512
 
 
-def test_shared_pages_only_become_reclaimable_after_last_reference():
+def test_shared_pages_only_become_reclaimable_after_last_reference(prefix_manager, populate):
     manager, arena, cache = prefix_manager(pages=4)
     seg = manager.segment
     a = GenerationSequence(1, list(range(64)), [], output_len=16)
@@ -245,7 +221,7 @@ def test_batch_retains_wide_slots_and_preserves_live_ownership():
 
 
 @pytest.mark.parametrize("miss_page", [0, 1, 3])
-def test_batch_lookup_stops_at_first_miss_and_hashes_lazily(miss_page):
+def test_batch_lookup_stops_at_first_miss_and_hashes_lazily(prefix_manager, populate, miss_page):
     manager, arena, cache = prefix_manager(8)
     seq = GenerationSequence(1, list(range(64)), [], output_len=16)
     populate(manager.segment, seq)
@@ -258,7 +234,7 @@ def test_batch_lookup_stops_at_first_miss_and_hashes_lazily(miss_page):
     assert len(continuation._page_hashes) == miss_page + 1
 
 
-def test_batch_lookup_uses_multimodal_hash_source_and_invalidates_old_hashes():
+def test_batch_lookup_uses_multimodal_hash_source_and_invalidates_old_hashes(prefix_manager, populate):
     manager, arena, cache = prefix_manager(8)
     seg = manager.segment
     seq = GenerationSequence(1, [7] * 64, [], output_len=16)
@@ -274,7 +250,7 @@ def test_batch_lookup_uses_multimodal_hash_source_and_invalidates_old_hashes():
     assert continuation.computed_token_num == 64
 
 
-def test_batch_lookup_canary_mismatch_does_not_pin_page():
+def test_batch_lookup_canary_mismatch_does_not_pin_page(prefix_manager, populate):
     manager, arena, cache = prefix_manager(8)
     seq = GenerationSequence(1, list(range(64)), [], output_len=16)
     populate(manager.segment, seq)
@@ -287,7 +263,7 @@ def test_batch_lookup_canary_mismatch_does_not_pin_page():
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
-def test_batch_full_hit_preserves_rollback_and_shared_references(hybrid):
+def test_batch_full_hit_preserves_rollback_and_shared_references(prefix_manager, populate, hybrid):
     manager, arena, cache = prefix_manager(8)
     seq = GenerationSequence(1, list(range(64)), [], output_len=16)
     populate(manager.segment, seq)
@@ -312,7 +288,7 @@ def test_batch_full_hit_preserves_rollback_and_shared_references(hybrid):
 
 @pytest.mark.parametrize("last_snapshot_filled", [False, True])
 def test_batch_lookup_pins_all_pages_before_restoring_filled_snapshot(
-    monkeypatch, last_snapshot_filled
+    prefix_manager, populate, monkeypatch, last_snapshot_filled
 ):
     monkeypatch.setattr("gllm.runtime.memory_manager.get_pp_size", lambda: 1)
     manager, arena, cache = prefix_manager(16)
@@ -346,7 +322,7 @@ def test_batch_lookup_pins_all_pages_before_restoring_filled_snapshot(
     assert continuation.page_table == seq.page_table
 
 
-def test_unregistered_tail_is_used_before_cached_full_pages():
+def test_unregistered_tail_is_used_before_cached_full_pages(prefix_manager, populate):
     manager, arena, cache = prefix_manager(pages=3)
     seg = manager.segment
     seq = GenerationSequence(1, list(range(33)), [], output_len=16)
@@ -358,7 +334,7 @@ def test_unregistered_tail_is_used_before_cached_full_pages():
     assert seg.allocate() == seq.page_table[0]
 
 
-def test_single_page_release_retains_valid_cache_priority():
+def test_single_page_release_retains_valid_cache_priority(prefix_manager, populate):
     manager, arena, cache = prefix_manager(pages=3)
     seg = manager.segment
     seq = GenerationSequence(1, list(range(16)), [], output_len=16)
@@ -367,7 +343,7 @@ def test_single_page_release_retains_valid_cache_priority():
     assert seg.allocate() != seq.page_table[0]
 
 
-def test_snapshot_is_kept_until_its_cached_kv_page_is_actually_reused():
+def test_snapshot_is_kept_until_its_cached_kv_page_is_actually_reused(prefix_manager, populate):
     manager, arena, cache = prefix_manager(pages=3)
     seg = manager.segment
     seq = GenerationSequence(1, list(range(16)), [], output_len=16)
@@ -418,7 +394,7 @@ def test_retain_hit_avoids_per_page_cache_priority_rebuild(monkeypatch):
     assert updates == []
 
 
-def test_released_page_with_replaced_hash_mapping_becomes_uncached():
+def test_released_page_with_replaced_hash_mapping_becomes_uncached(prefix_manager, populate):
     manager, arena, cache = prefix_manager(pages=3)
     seg = manager.segment
     a = GenerationSequence(1, list(range(16)), [], output_len=16)

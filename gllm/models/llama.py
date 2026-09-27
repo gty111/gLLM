@@ -1,14 +1,8 @@
-from typing import Optional
-
 import torch
-from torch import nn
 
 from gllm.runtime.input_data import InputData
-from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
 from gllm.layers.attention.base import AttentionLayerBase
 from gllm.layers.attention.qkv import QKVAttention
-from gllm.layers.fused_allreduce_norm import defer_reduce, maybe_fused_norm
-from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from gllm.layers.rotary_embedding import (
     LinearScalingRotaryEmbedding,
@@ -16,14 +10,8 @@ from gllm.layers.rotary_embedding import (
     RotaryEmbedding,
 )
 
-from .qwen2 import Qwen2ForCausalLM, Qwen2MLP, Qwen2Model
+from .qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM, Qwen2Model
 from .utils import extract_rope_config
-
-
-class LlamaMLP(Qwen2MLP):
-
-    def __init__(self, config):
-        super().__init__(config, False)
 
 
 class LlamaAttention(AttentionLayerBase):
@@ -102,60 +90,12 @@ class LlamaAttention(AttentionLayerBase):
         return output
 
 
-class LlamaDecoderLayer(nn.Module):
-    supports_piecewise_cuda_graph = True
-
+class LlamaDecoderLayer(Qwen2DecoderLayer):
+    # Qwen2DecoderLayer's default mlp_type is Qwen2MLP(config) ==
+    # Qwen2MLP(config, shared_expert=False), which is exactly what Llama wants;
+    # only the attention (rope_scaling branches) differs.
     def __init__(self, layer_id: int, config):
-        super().__init__()
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = LlamaAttention(layer_id, config)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.mlp = LlamaMLP(config)
-        # Hand each output projection's all-reduce to the norm that consumes
-        # it, so one flashinfer kernel does all-reduce + residual add + norm.
-        # ``defer_reduce`` reports whether it could, and ``maybe_fused_norm``
-        # falls back to the plain norm when it could not.
-        self._fuse_attn = defer_reduce(self.self_attn)
-        self._fuse_mlp = defer_reduce(self.mlp)
-        # ``_fuse_input`` is whether the tensor arriving at ``input_layernorm``
-        # is still a per-rank partial. That depends on the *predecessor*, not on
-        # this layer, so the model sets it after building the stack (see
-        # ``_link_fused_reduces``): layer 0 of any stage always receives a
-        # reduced tensor -- an embedding, or a value the previous PP stage
-        # reduced before sending -- and the default here keeps a standalone
-        # layer (the MTP block) safe.
-        self._fuse_input = False
-
-
-    def forward(
-        self,
-        input_data: InputData,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-    ):
-        # residual connection and input layernorm
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = maybe_fused_norm(
-                hidden_states, residual, self.input_layernorm, self._fuse_input
-            )
-
-        # self attention
-        hidden_states, residual = piecewise_dynamic_tensor(
-            lambda x: self.self_attn(input_data, x), hidden_states, residual
-        )
-
-        # post attention layernorm
-        hidden_states, residual = maybe_fused_norm(
-            hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
-        )
-
-        # mlp
-        hidden_states = self.mlp(hidden_states)
-
-        return hidden_states, residual
+        super().__init__(layer_id, config, attention_type=LlamaAttention)
 
 
 class LlamaModel(Qwen2Model):

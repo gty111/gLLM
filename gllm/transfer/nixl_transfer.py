@@ -6,15 +6,15 @@ gLLM-flavoured interface used by the encoder-disaggregation data plane:
     Encoder (initiator) ---- NIXL WRITE (GPU->GPU) ----> LM PP0 Worker (target)
 
 The only payload this layer is ever used for is the per-item *visual
-embedding* tensor (see ``docs/encoder_disaggregation_design.md`` §1.2.1 and
-§5.2). It is deliberately agnostic to that fact -- it just moves contiguous
-GPU tensors between two registered memory regions -- but no other gLLM
-subsystem should reuse it to ship KV cache / hidden state / sampling output.
+embedding* tensor. It is deliberately agnostic to
+that fact -- it just moves contiguous GPU tensors between two registered
+memory regions -- but no other gLLM subsystem should reuse it to ship KV
+cache / hidden state / sampling output.
 
 Design notes
 ------------
 * The initiator side ("encoder") issues ``WRITE`` because a write costs one
-  fewer round trip than a read (design §4.1).
+  fewer round trip than a read.
 * The target side ("LM") pre-registers a persistent slot-pool tensor once and
   hands out :class:`RemoteRegion` descriptors (one per slot) to the initiator
   via the control plane; the initiator then writes directly into the slot's
@@ -46,10 +46,6 @@ except Exception as _e:  # pragma: no cover
     nixl_agent_config = None  # type: ignore
     _NIXL_AVAILABLE = False
     _NIXL_IMPORT_ERROR = _e
-
-
-def nixl_available() -> bool:
-    return _NIXL_AVAILABLE
 
 
 @dataclass
@@ -102,9 +98,6 @@ class RegHandle:
     base_addr: int
     length: int
     dev_id: int
-
-    def region(self) -> RemoteRegion:
-        raise RuntimeError("Use NixlEndpoint.region(); agent_name lives on the endpoint")
 
 
 class XferHandle:

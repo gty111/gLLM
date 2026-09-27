@@ -468,7 +468,6 @@ def causal_conv1d_fn(
         stride_istate_seq = conv_states.stride(0)
         stride_istate_dim = conv_states.stride(1)
         stride_istate_token = conv_states.stride(2)
-        # assert stride_istate_dim == 1
     if out.dim() == 2:
         stride_o_seq = 0
         stride_o_dim = out.stride(0)
@@ -557,7 +556,6 @@ def causal_conv1d_fn(
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
-        # launch_cooperative_grid=True
         BLOCK_M=8,
         BLOCK_N=256,
         num_stages=2,
@@ -650,7 +648,6 @@ def _causal_conv1d_update_kernel(
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
 
     if IS_CONTINUOUS_BATCHING:
-        # mask = idx_seq < batch
         conv_state_batch_coord = tl.load(
             conv_state_indices_ptr + idx_seq * stride_state_indices
         ).to(tl.int64)

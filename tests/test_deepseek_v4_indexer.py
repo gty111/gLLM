@@ -1,10 +1,7 @@
 import pytest
 import torch
-from types import SimpleNamespace
 
-from gllm.layers.attention.deepseek_v4.ops import precompute_rope_frequencies
 from gllm.layers.attention.deepseek_v4.indexer import (
-    DeepseekV4Indexer,
     causal_indexer_topk,
     indexer_scores,
     mxfp4_fake_quantize,
@@ -71,65 +68,6 @@ def test_indexer_query_accepts_tp_local_heads_with_global_scaling():
     expected_weights = weights * (128**-0.5 * 64**-0.5)
     torch.testing.assert_close(actual_query, expected_query, rtol=0, atol=0)
     torch.testing.assert_close(actual_weights, expected_weights, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_indexer_module_prefill_applies_causal_compressed_limits():
-    if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native block FP8 path requires Blackwell")
-    pytest.importorskip("deep_gemm")
-    from deep_gemm.utils import per_block_cast_to_fp8
-
-    config = SimpleNamespace(
-        hidden_size=128,
-        q_lora_rank=128,
-        index_n_heads=4,
-        index_head_dim=128,
-        index_topk=8,
-        qk_rope_head_dim=64,
-        rms_norm_eps=1e-6,
-        quantization_config={
-            "quant_method": "fp8",
-            "activation_scheme": "dynamic",
-            "weight_block_size": [128, 128],
-            "scale_fmt": "ue8m0",
-        },
-    )
-    torch.manual_seed(53)
-    module = DeepseekV4Indexer(config)
-    w = torch.randn_like(module.wq_b.weight, dtype=torch.bfloat16) * 0.03
-    wq, ws = per_block_cast_to_fp8(w, use_ue8m0=True, gran_k=128)
-    module.wq_b.weight.data.copy_(wq)
-    module.wq_b.weight_scale_inv.data.copy_(ws)
-    module.weights_proj.weight.data.normal_(std=0.03)
-    module.compressor.wkv.weight.data.normal_(std=0.03)
-    module.compressor.wgate.weight.data.normal_(std=0.03)
-    module.compressor.ape.data.normal_(std=0.03)
-
-    hidden = torch.randn(1, 8, 128, device="cuda", dtype=torch.bfloat16) * 0.2
-    q_lora = torch.randn_like(hidden) * 0.2
-    frequencies = precompute_rope_frequencies(
-        64,
-        8,
-        original_sequence_length=0,
-        base=40000.0,
-        factor=1.0,
-        beta_fast=32,
-        beta_slow=1,
-        device="cuda",
-    )
-    indices, compressed, _ = module.prefill(
-        hidden,
-        q_lora,
-        frequencies,
-        frequencies[0:8:4],
-        offset=8,
-    )
-    assert compressed.shape == (1, 2, 128)
-    assert indices.shape == (1, 8, 2)
-    assert torch.all(indices[:, :3] == -1)
-    assert set(indices[0, 3].tolist()) == {-1, 8}
-    assert torch.all(indices[0, 7] >= 8)
 
 
 # --- fused MXFP4 QAT kernel ----------------------------------------------

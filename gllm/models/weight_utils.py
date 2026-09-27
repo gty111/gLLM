@@ -332,9 +332,9 @@ def load_fused_w13_stacked(
 
     EP-off + TP>1 fast path: replaces the per-expert Python loop with two
     bulk slice + permute + H2D copies (one for the gate half, one for the
-    up half). Per :commit:`df725dd`, the per-expert slicing path was
-    ~4m23s for Qwen3-VL-30B-A3B because each ``w13_weight[e][:, slice]``
-    view is doubly non-contiguous after ``.permute(1, 0)``.
+    up half). The per-expert slicing path took ~4m23s for Qwen3-VL-30B-A3B
+    because each ``w13_weight[e][:, slice]`` view is doubly non-contiguous
+    after ``.permute(1, 0)``.
 
     EP-on (or TP==1) slow path: per-expert loop, optionally threaded.
     """

@@ -1,4 +1,4 @@
-"""Standalone discovery registry for encoder disaggregation (design §7.3.2).
+"""Standalone discovery registry for encoder disaggregation.
 
 A tiny, dependency-free ZMQ rendezvous service that the LM and Encoder servers
 publish to and watch -- the network (etcd-style) registry. Start one of these

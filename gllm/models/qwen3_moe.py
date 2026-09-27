@@ -4,17 +4,12 @@ from .qwen2_moe import Qwen2MoeModel, Qwen2MoeSparseMoeBlock
 from .qwen3 import Qwen3Attention as Qwen3MoeAttention
 
 
-class Qwen3MoeSparseMoeBlock(Qwen2MoeSparseMoeBlock):
-    def __init__(self, config):
-        super().__init__(config)
-
-
 class Qwen3MoeDecoderLayer(Qwen2MoeDecoderLayer):
     def __init__(
         self,
         layer_id,
         config,
-        moe_block_type=Qwen3MoeSparseMoeBlock,
+        moe_block_type=Qwen2MoeSparseMoeBlock,
         mlp_type=Qwen3MoeMLP,
         attn_type=Qwen3MoeAttention,
     ):

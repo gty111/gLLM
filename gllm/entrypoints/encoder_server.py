@@ -2,11 +2,10 @@
 
 Phase 1 scope: load the vision tower + processor and idle, advertising
 readiness. Later phases attach the ZMQ EncoderJob intake, NIXL send segment,
-discovery publish/watch, and the per-item processor->ViT->NIXL-write loop
-(design §4.2 / §7).
+discovery publish/watch, and the per-item processor->ViT->NIXL-write loop.
 
 This is a standalone process: it does NOT import the LM scheduler / worker
-machinery. Startup is fully decoupled from the LM server (design §7.3).
+machinery. Startup is fully decoupled from the LM server.
 
     python -m gllm.entrypoints.encoder_server \
         --model-path /path/to/Qwen3.5-VL --encoder-gpu 2 \
@@ -23,7 +22,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="gLLM Encoder Server (vision-only)")
     p.add_argument("--model-path", required=True, type=str)
     p.add_argument("--load-format", choices=["auto", "dummy"], default="auto")
-    # This process owns exactly one GPU (design §3.2 / §7.2.2).
+    # This process owns exactly one GPU.
     p.add_argument("--encoder-gpu", type=int, default=0)
     # ZMQ job-intake endpoint; peers discover this via the registry, never
     # hard-coded. Port 0 = ephemeral (default; fine same-host / multi-replica).
@@ -32,7 +31,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # host is --advertise-host. (The NIXL data-plane endpoint is auto-negotiated
     # via metadata, so it needs no fixed listen port.)
     p.add_argument("--zmq-listen", type=str, default="0.0.0.0:0")
-    # Service-group membership + discovery (design §7.3).
+    # Service-group membership + discovery.
     p.add_argument("--service-name", type=str, default="gllm-lm-prod")
     p.add_argument(
         "--discovery-endpoint",
@@ -77,7 +76,7 @@ def main():
     # gllm.disagg.config.DisaggConfig.
 
     # Pin this process to its single physical GPU by selecting the device
-    # directly (design §3.2 mutual-exclusion invariant). We do this instead of
+    # directly. We do this instead of
     # masking with CUDA_VISIBLE_DEVICES because the gllm import chain can create
     # a CUDA context on device 0 before any in-process env mask would take
     # effect; ``set_device`` picks the physical ordinal regardless and must run

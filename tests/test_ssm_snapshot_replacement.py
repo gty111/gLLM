@@ -2,32 +2,35 @@ import pytest
 
 from gllm.runtime.memory_manager import SSMSegment
 from gllm.runtime.sequence import GenerationSequence
-from test_prefix_cache_reuse import populate, prefix_manager
 
 
-def snapshot_manager(num_pages=16, input_tokens=64):
-    manager, arena, cache = prefix_manager(num_pages)
-    for name in ("state", "snapshot"):
-        arena.register_cache_type(name, 4 * cache.layout.entry_bytes, prefer_high=True)
-    ssm = SSMSegment.__new__(SSMSegment)
-    ssm.cache_arena = arena
-    ssm.arena_type = "state"
-    ssm.snapshot_arena_type = "snapshot"
-    ssm.dummy_working_slot = -1
-    values = {}
-    ssm._reset_block = lambda slot: values.pop(slot, None)
-    ssm.copy_state = lambda src_kind, src, dst_kind, dst: values.__setitem__(dst, values[src])
-    manager.ssm_segment = manager.segment.ssm_segment = ssm
-    manager._pending_ssm_restores = {}
-    manager._ssm_restore_pins = {}
-    seg = manager.segment
-    arena.allocator.set_reclaimer(
-        "snapshot", seg.reclaim_one_ssm_snapshot, seg.num_reclaimable_ssm_snapshots
-    )
-    seq = GenerationSequence(1, list(range(input_tokens)), [], output_len=16)
-    populate(seg, seq)
-    working = arena.allocator.allocate("state")[0]
-    return manager, arena.allocator, seq, working, values
+@pytest.fixture
+def snapshot_manager(prefix_manager, populate):
+    def build(num_pages=16, input_tokens=64):
+        manager, arena, cache = prefix_manager(num_pages)
+        for name in ("state", "snapshot"):
+            arena.register_cache_type(name, 4 * cache.layout.entry_bytes, prefer_high=True)
+        ssm = SSMSegment.__new__(SSMSegment)
+        ssm.cache_arena = arena
+        ssm.arena_type = "state"
+        ssm.snapshot_arena_type = "snapshot"
+        ssm.dummy_working_slot = -1
+        values = {}
+        ssm._reset_block = lambda slot: values.pop(slot, None)
+        ssm.copy_state = lambda src_kind, src, dst_kind, dst: values.__setitem__(dst, values[src])
+        manager.ssm_segment = manager.segment.ssm_segment = ssm
+        manager._pending_ssm_restores = {}
+        manager._ssm_restore_pins = {}
+        seg = manager.segment
+        arena.allocator.set_reclaimer(
+            "snapshot", seg.reclaim_one_ssm_snapshot, seg.num_reclaimable_ssm_snapshots
+        )
+        seq = GenerationSequence(1, list(range(input_tokens)), [], output_len=16)
+        populate(seg, seq)
+        working = arena.allocator.allocate("state")[0]
+        return manager, arena.allocator, seq, working, values
+
+    return build
 
 
 def save(seg, page, value, values):
@@ -38,7 +41,7 @@ def save(seg, page, value, values):
     return slot
 
 
-def test_full_pool_replaces_oldest_snapshot_and_keeps_latest_boundary_advancing():
+def test_full_pool_replaces_oldest_snapshot_and_keeps_latest_boundary_advancing(snapshot_manager):
     manager, allocator, seq, working, values = snapshot_manager()
     seg = manager.segment
     pages = seq.page_table
@@ -57,7 +60,7 @@ def test_full_pool_replaces_oldest_snapshot_and_keeps_latest_boundary_advancing(
             assert values[recent] == 32
 
 
-def test_continuation_restores_latest_boundary_after_snapshot_pool_fills(monkeypatch):
+def test_continuation_restores_latest_boundary_after_snapshot_pool_fills(snapshot_manager, monkeypatch):
     monkeypatch.setattr("gllm.runtime.memory_manager.get_pp_size", lambda: 1)
     manager, allocator, seq, working, values = snapshot_manager(48, 512)
     seg = manager.segment
@@ -83,7 +86,7 @@ def test_continuation_restores_latest_boundary_after_snapshot_pool_fills(monkeyp
     assert manager.num_hit_pages == 32
 
 
-def test_pending_batch_targets_are_not_evicted_or_reported_reclaimable():
+def test_pending_batch_targets_are_not_evicted_or_reported_reclaimable(snapshot_manager):
     manager, allocator, seq, working, values = snapshot_manager()
     seg = manager.segment
     a, b, c, _ = seq.page_table
@@ -104,7 +107,7 @@ def test_pending_batch_targets_are_not_evicted_or_reported_reclaimable():
     assert not seg.page2ssm_snapshot_valid[c]
 
 
-def test_memory_util_counts_only_non_reclaimable_physical_pages():
+def test_memory_util_counts_only_non_reclaimable_physical_pages(snapshot_manager):
     manager, allocator, seq, working, values = snapshot_manager()
     seg = manager.segment
     assert seg.get_memory_util() == 50.0
@@ -125,7 +128,7 @@ def test_memory_util_counts_only_non_reclaimable_physical_pages():
     assert seg.get_memory_util() == 25.0
 
 
-def test_existing_snapshot_write_target_is_protected_until_republished():
+def test_existing_snapshot_write_target_is_protected_until_republished(snapshot_manager):
     manager, allocator, seq, working, values = snapshot_manager()
     seg = manager.segment
     a, b, c, _ = seq.page_table
@@ -141,7 +144,7 @@ def test_existing_snapshot_write_target_is_protected_until_republished():
 
 
 @pytest.mark.parametrize("pp_size", [1, 2])
-def test_restore_source_survives_working_allocation_reclamation(monkeypatch, pp_size):
+def test_restore_source_survives_working_allocation_reclamation(snapshot_manager, monkeypatch, pp_size):
     monkeypatch.setattr("gllm.runtime.memory_manager.get_pp_size", lambda: pp_size)
     manager, allocator, seq, working, values = snapshot_manager()
     seg = manager.segment
@@ -175,7 +178,7 @@ def test_restore_source_survives_working_allocation_reclamation(monkeypatch, pp_
 
 
 @pytest.mark.parametrize("raises", [False, True])
-def test_failed_restore_releases_its_source_pin(monkeypatch, raises):
+def test_failed_restore_releases_its_source_pin(snapshot_manager, monkeypatch, raises):
     monkeypatch.setattr("gllm.runtime.memory_manager.get_pp_size", lambda: 1)
     manager, allocator, seq, working, values = snapshot_manager()
     seg = manager.segment

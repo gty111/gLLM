@@ -1,9 +1,7 @@
 """DeepSeek-V4 sparse attention: the packed, paged serving path.
 
 One padded batch per phase -- decode rows then prefill rows -- over the
-shared KV page table and the request-owned compressor-state arena. The
-token-at-a-time numerical oracles this is verified against live in
-:mod:`gllm.layers.attention.deepseek_v4.reference`.
+shared KV page table and the request-owned compressor-state arena.
 """
 
 from __future__ import annotations
@@ -11,7 +9,6 @@ from __future__ import annotations
 import torch
 
 from gllm.distributed.parallel_state import (
-    get_tp_rank,
     get_tp_size,
     tensor_model_parallel_all_reduce,
 )
@@ -28,9 +25,6 @@ from gllm.layers.attention.deepseek_v4.ops import (
 )
 from gllm.layers.attention.deepseek_v4.projection import (
     DeepseekV4AttentionProjections,
-)
-from gllm.layers.attention.deepseek_v4.reference import (
-    DeepseekV4AttentionReference,
 )
 
 try:
@@ -51,13 +45,8 @@ _SPARSE_MLA_HEAD_DIM = 512
 _DEFAULT_COMPRESSED_POOL = 512
 
 
-class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
-    """V4 sparse attention over the paged KV / compressor-state arenas.
-
-    The token-at-a-time oracles the packed paths are verified against are
-    inherited from :class:`DeepseekV4AttentionReference`; nothing in this class
-    calls them.
-    """
+class DeepseekV4Attention(torch.nn.Module):
+    """V4 sparse attention over the paged KV / compressor-state arenas."""
 
     def __init__(self, layer_id: int, config) -> None:
         super().__init__()
@@ -80,13 +69,11 @@ class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
         self.projections = DeepseekV4AttentionProjections(config)
 
         tp_size = get_tp_size()
-        tp_rank = get_tp_rank()
         local_heads = config.num_attention_heads // tp_size
         self.attn_sink = torch.nn.Parameter(
             torch.empty(local_heads, dtype=torch.float32, device="cuda"),
             requires_grad=False,
         )
-        self._sink_slice = slice(tp_rank * local_heads, (tp_rank + 1) * local_heads)
 
         if self.compress_ratio:
             self.compressor = DeepseekV4Compressor(
@@ -162,10 +149,9 @@ class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
     ) -> torch.Tensor:
         """Serve one packed batch: fused decode rows first, then prefill rows.
 
-        There is deliberately no fallback here.  This used to drop to
-        :meth:`forward_paged_reference` -- a Python token-at-a-time loop --
-        whenever a precondition was unmet, which turned a configuration mistake
-        into a silent ~100x slowdown rather than an error.
+        There is deliberately no fallback here: an unmet precondition is a
+        configuration error and must fail loudly, not silently degrade to a
+        token-at-a-time oracle loop.
         """
         segment = input_data.memory_manager.segment
         if segment is None:
@@ -239,8 +225,7 @@ class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
 
         Existing raw/compressed KV and recurrent compressor states are gathered
         from the request-owned arenas.  Every new suffix is projected and
-        compressed in bulk, so prefill never falls back to the token-wise
-        numerical oracle.
+        compressed in bulk, so prefill never needs a token-wise loop.
         """
         meta = input_data.metadata
         prefill = meta.prefill
@@ -328,10 +313,9 @@ class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
 
         # Store *after* the prefix read. The pool spans ``W-1+L`` positions
         # while the ring holds only ``W``, so writing this chunk first would
-        # overwrite prefix rows it still needs: at W=128 a chunk starting at
-        # position 130 lands on ring rows 2.. while the prefix still needs
-        # rows 3..127. Only the last W rows of the chunk are worth keeping --
-        # earlier ones could not be read back by any later step.
+        # overwrite prefix rows it still needs. Only the last W rows of the
+        # chunk are worth keeping -- earlier ones could not be read back by
+        # any later step.
         keep = columns >= (lengths - window_size).clamp_min(0).unsqueeze(1)
         keep &= valid_tokens
         if keep.any():
@@ -638,8 +622,7 @@ class DeepseekV4Attention(DeepseekV4AttentionReference, torch.nn.Module):
                 else max(1, (input_data.max_seq_len + ratio - 1) // ratio)
             )
             # Every layer sharing this ratio builds the same candidate grid and
-            # resolves it to the same pages; 21 C4 layers and 20 C128 layers
-            # each did that independently.
+            # resolves it to the same pages; build it once per forward.
             grid_key = ("grid", ratio, max_compressed)
             if grid_key not in cache:
                 logical = torch.arange(

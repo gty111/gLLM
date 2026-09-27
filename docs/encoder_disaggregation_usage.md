@@ -337,13 +337,11 @@ byte-for-byte (greedy decoding + prefix cache, cold == warm).
 python -m gllm.entrypoints.api_server --model-path $MODEL --port 8200 \
     --pp 1 --tp 1 --disable-cuda-graph &
 
-# Compare disagg(8100) vs mono(8200)
-python tests/disagg_vlbug_check.py \
-    --disagg-port 8100 --mono-port 8200 \
-    --image /tmp/test_img.png --repeats 3 --max-tokens 128
+# Then send the same image request to both stacks (e.g. with
+# examples/mm_chat.py or curl) and diff the responses byte-for-byte.
 ```
 
-Expect `ALL GOOD: True` (`disagg == monolith: True`, no SVG).
+Expect identical outputs (`disagg == monolith`).
 
 > Note: with chunked prefill, bf16 rounding at chunk boundaries causes *expected*
 > tiny numerical differences (independent of disaggregation); under greedy

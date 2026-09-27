@@ -4,15 +4,9 @@ from __future__ import annotations
 
 import torch
 
-from gllm.distributed.parallel_state import (
-    get_tp_size,
-    tensor_model_parallel_all_reduce,
-)
+from gllm.distributed.parallel_state import get_tp_size
 from gllm.layers.attention.deepseek_v4.ops import apply_rope_inplace
-from gllm.layers.attention.deepseek_v4.compressor import (
-    CompressorState,
-    DeepseekV4Compressor,
-)
+from gllm.layers.attention.deepseek_v4.compressor import DeepseekV4Compressor
 from gllm.layers.linear import ColumnParallelLinear
 from gllm.layers.ops.deepseek_v4 import mxfp4_fake_quantize_fused
 
@@ -182,100 +176,6 @@ class DeepseekV4Indexer(torch.nn.Module):
             head_weights,
             num_heads=self.num_heads,
         )
-
-    def select(
-        self,
-        query: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        head_weights: torch.Tensor,
-        *,
-        start_pos: int,
-        offset: int,
-    ) -> torch.Tensor:
-        scores = indexer_scores(query, compressed_kv, head_weights)
-        if get_tp_size() > 1:
-            scores = tensor_model_parallel_all_reduce(scores)
-        return causal_indexer_topk(
-            scores,
-            compress_ratio=self.compress_ratio,
-            start_pos=start_pos,
-            topk=self.topk,
-            offset=offset,
-        )
-
-    def prefill(
-        self,
-        hidden_states: torch.Tensor,
-        q_lora: torch.Tensor,
-        query_frequencies: torch.Tensor,
-        compressed_frequencies: torch.Tensor,
-        *,
-        offset: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, CompressorState]:
-        query, weights = self.prepare_query(
-            hidden_states, q_lora, query_frequencies
-        )
-        compressed, state = self.compressor.prefill(
-            hidden_states, compressed_frequencies
-        )
-        if compressed is None:
-            empty = torch.empty(
-                hidden_states.shape[0],
-                hidden_states.shape[1],
-                0,
-                dtype=torch.int32,
-                device=hidden_states.device,
-            )
-            return empty, compressed, state
-        indices = self.select(
-            query,
-            compressed,
-            weights,
-            start_pos=0,
-            offset=offset,
-        )
-        return indices, compressed, state
-
-    def decode(
-        self,
-        hidden_states: torch.Tensor,
-        q_lora: torch.Tensor,
-        query_frequency: torch.Tensor,
-        compressed_frequency: torch.Tensor,
-        compressed_cache: torch.Tensor,
-        *,
-        position: int,
-        offset: int,
-        state: CompressorState,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Update the C4 index cache and select positions for one token.
-
-        The compressor update intentionally precedes scoring. At a C4 boundary
-        the just-completed compressed key is a legal candidate for the current
-        query in the official inference order.
-        """
-        if hidden_states.shape[1] != 1:
-            raise ValueError("V4 indexer decode expects exactly one token")
-        query, weights = self.prepare_query(
-            hidden_states, q_lora, query_frequency
-        )
-        compressed = self.compressor.decode(
-            hidden_states,
-            compressed_frequency,
-            position=position,
-            state=state,
-        )
-        count = (position + 1) // self.compress_ratio
-        if compressed is not None:
-            compressed_cache[:, count - 1 : count].copy_(compressed)
-        indices = self.select(
-            query,
-            compressed_cache[:, :count],
-            weights,
-            start_pos=position,
-            offset=offset,
-        )
-        return indices, compressed
 
 
 __all__ = [

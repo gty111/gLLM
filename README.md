@@ -135,7 +135,7 @@ python examples/chat_client.py --port $PORT
 ### Evaluate Output Quality
 ```bash
 # Launch server first
-python benchmarks/evaluate_MMLU_pro.py --model $MODEL
+python benchmarks/evaluate_mmlu_pro.py --model $MODEL
 ```
 
 ## Supported Models

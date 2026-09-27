@@ -6,8 +6,7 @@ A single Encoder replica (one process, one GPU) owns the full visual stack:
                     --hash------->  content_hash (prefix-cache key, §5.4.4)
                     --ViT--------->  [N_vis_i, visual_dim*(1+L)] embedding
 
-and nothing else: no language model, no KV cache, no scheduler, no sampler
-(design §4.2). The embedding is then NIXL-written straight to the LM PP0
+and nothing else: no language model, no KV cache, no scheduler, no sampler. The embedding is then NIXL-written straight to the LM PP0
 worker (wired in later phases); this module is purely the compute side.
 
 Numerical equivalence with the monolith is preserved by reusing the exact
@@ -29,6 +28,7 @@ from gllm.runtime.model_loader import ModelLoader
 from gllm.runtime.model_runner import (
     MultiModalEmbeddingCache,
     _build_item_content_hash,
+    apply_mm_processor_pixels,
 )
 
 
@@ -64,18 +64,14 @@ class VisionEncoderRunner:
         self.processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
         self.image_processor = self.processor.image_processor
         self.video_processor = self.processor.video_processor
-        if mm_processor_min_pixels is not None:
-            self.image_processor.min_pixels = mm_processor_min_pixels
-            self.video_processor.min_pixels = mm_processor_min_pixels
-            self.image_processor.size["shortest_edge"] = mm_processor_min_pixels
-            self.video_processor.size["shortest_edge"] = mm_processor_min_pixels
-        if mm_processor_max_pixels is not None:
-            self.image_processor.max_pixels = mm_processor_max_pixels
-            self.video_processor.max_pixels = mm_processor_max_pixels
-            self.image_processor.size["longest_edge"] = mm_processor_max_pixels
-            self.video_processor.size["longest_edge"] = mm_processor_max_pixels
+        apply_mm_processor_pixels(
+            self.image_processor,
+            self.video_processor,
+            min_pixels=mm_processor_min_pixels,
+            max_pixels=mm_processor_max_pixels,
+        )
 
-        # Per-replica content-hash -> embedding dedup cache (design §4.2.1).
+        # Per-replica content-hash -> embedding dedup cache.
         self.mm_embed_cache = MultiModalEmbeddingCache(
             max_entries=256, max_mb=mm_embed_cache_mb
         )
@@ -96,9 +92,6 @@ class VisionEncoderRunner:
             "VisionEncoderRunner ready: vision tower loaded, language model skipped"
         )
 
-    # ------------------------------------------------------------------
-    # CPU: processor + grid + token count + content hash (per item)
-    # ------------------------------------------------------------------
     def run_processor(
         self, content, modality: str
     ) -> Tuple[Dict, torch.Tensor]:
@@ -130,7 +123,6 @@ class VisionEncoderRunner:
                 "pixel_values_videos": out["pixel_values_videos"],
                 "video_grid_thw": grid_thw,
             }
-            # carry through optional video timing kwargs if present
             for k in ("second_per_grid_ts", "timestamps"):
                 if k in out:
                     mm_input[k] = out[k]
@@ -138,7 +130,7 @@ class VisionEncoderRunner:
         raise ValueError(f"unknown modality {modality!r}")
 
     def num_vis_tokens(self, grid_thw: torch.Tensor) -> int:
-        """N_vis = prod(grid_thw) / spatial_merge_size**2 (design §2.1)."""
+        """N_vis = prod(grid_thw) / spatial_merge_size**2."""
         merge = self.spatial_merge_size
         return int(grid_thw.prod().item()) // (merge * merge)
 
@@ -148,9 +140,6 @@ class VisionEncoderRunner:
             pixel = mm_input.get("pixel_values_videos")
         return _build_item_content_hash(pixel, grid_thw)
 
-    # ------------------------------------------------------------------
-    # GPU: ViT (per item), with per-replica dedup cache
-    # ------------------------------------------------------------------
     @torch.inference_mode()
     def encode(self, mm_input: Dict, content_hash: bytes) -> torch.Tensor:
         cached = self.mm_embed_cache.get(content_hash)

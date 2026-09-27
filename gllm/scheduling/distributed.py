@@ -87,16 +87,12 @@ Design notes
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
 import torch
 
 from gllm.runtime.sequence import GenerationSequence
-
-# ---------------------------------------------------------------------------
-# Wire-format dataclasses (pickled by zmq)
-# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -245,9 +241,180 @@ class SchedulePayload:
         )
 
 
-# ---------------------------------------------------------------------------
-# Driver-side builder (rank-0)
-# ---------------------------------------------------------------------------
+# Mirroring one ``GenerationSequence`` attribute used to mean editing 4-5
+# places in parallel (``SeqRegister`` / ``SeqUpdate`` /
+# ``DriverPayloadBuilder.build`` / ``FollowerSeq.__init__`` +
+# ``apply_update``); missing any one of them was a silent wire bug. Now each
+# mirrored field is declared ONCE below, and ``build`` / ``__init__`` /
+# ``apply_update`` are generic loops over the table. Adding a field = adding
+# one table row plus the dataclass field; ``_validate_field_table`` (run at
+# import) refuses to start when the two drift apart.
+#
+# The table does NOT change the wire format: ``SeqRegister`` / ``SeqUpdate``
+# keep their hand-declared dataclass fields in the same order, and every
+# getter reproduces the exact value the old hand-written code shipped (the
+# table is validated against the dataclasses field-by-field, in order).
+
+_SKIP = object()  # ``put`` marker: the mirror consumes the field indirectly
+_NO_SEED = object()  # ``seed`` marker: ``FollowerSeq`` does not seed the attr
+
+
+class _BuildCtx:
+    """Per-``build`` scratch handed to field getters: the call parameters
+    (``use_mm``, ``ssm_restores``) plus the per-seq page-delta results
+    (``new_page_ids`` / ``page_table_reset`` / ``new_page_snap_slots``) that
+    several ``SeqUpdate`` getters consume. The page delta itself is computed
+    by ``build``'s cursor logic *before* the generic update loop runs."""
+
+    __slots__ = (
+        "use_mm", "ssm_restores", "new_page_ids", "page_table_reset",
+        "new_page_snap_slots",
+    )
+
+    def __init__(self, use_mm: bool, ssm_restores):
+        self.use_mm = use_mm
+        self.ssm_restores = ssm_restores
+
+
+class _SeqField:
+    """Wire contract for one mirrored ``GenerationSequence`` field.
+
+    ``name`` is the field on ``SeqRegister`` / ``SeqUpdate``; table order must
+    match the dataclass field (== wire) order. ``get(seq, ctx)`` extracts the
+    value driver-side (default ``getattr(seq, name)``); ``put(mirror, msg)``
+    absorbs it follower-side (default ``setattr`` of the same-named
+    attribute), or ``_SKIP`` when the mirror consumes the field indirectly.
+    ``seed`` is the value a fresh :class:`FollowerSeq` assigns an update field
+    before the first ``apply_update`` (``_NO_SEED`` = don't seed).
+    """
+
+    __slots__ = ("name", "get", "put", "seed")
+
+    def __init__(self, name, *, get=None, put=None, seed=_NO_SEED):
+        self.name = name
+        self.get = get or (lambda seq, ctx: getattr(seq, name))
+        self.put = put or (lambda m, msg: setattr(m, name, getattr(msg, name)))
+        self.seed = seed
+
+
+def _put_to_compute_tokens(mirror, upd) -> None:
+    mirror.to_compute_tokens = upd.to_compute_tokens
+    if mirror._keeps_token_ids and upd.to_compute_tokens:
+        # Append only the actually-new tokens, taking just the suffix the
+        # mirror doesn't already have. This handles decode (always +1 token
+        # after prefill done) and chunked-prefill carry-over without
+        # duplicating the prompt window copied at register time.
+        assert mirror.token_ids is not None
+        new_end = upd.computed_token_num + upd.to_compute_token_num
+        cur_end = len(mirror.token_ids)
+        if new_end > cur_end:
+            mirror.token_ids.extend(
+                upd.to_compute_tokens[cur_end - upd.computed_token_num :]
+            )
+
+
+def _put_prompt_len_update(mirror, upd) -> None:
+    # ``None`` on every ordinary iter; set when preemption moves the prefill
+    # boundary past already-generated tokens.
+    if upd.prompt_len is not None:
+        mirror.prompt_len = upd.prompt_len
+
+
+def _get_structured_output_history(seq, ctx):
+    # Only the final re-prefill chunk ships committed outputs for grammar
+    # recovery. Ordinary decode needs no full token-history mirror.
+    if (
+        getattr(seq, "structured_output", None) is not None
+        and seq.raw_prompt_len < seq.prompt_len
+        and seq.computed_token_num < seq.prompt_len <= seq.seq_len
+    ):
+        return list(seq.token_ids[seq.raw_prompt_len : seq.prompt_len])
+    return None
+
+
+_REGISTER_FIELDS = (
+    _SeqField("seq_id"),
+    # ``list(...)``: detach from the driver's ``token_ids``, which keeps
+    # mutating (``seq.append`` / placeholder rewrites in ``OverlapScheduler``).
+    _SeqField("prompt_token_ids", put=_SKIP,  # seeds the gated token_ids mirror
+              get=lambda seq, ctx: list(seq.token_ids[: seq.prompt_len])),
+    _SeqField("prompt_len"),
+    _SeqField("finish_tokens", get=lambda seq, ctx: list(seq.finish_tokens)),
+    _SeqField("ignore_eos"),
+    _SeqField("output_len"),
+    _SeqField("temperature"),
+    _SeqField("top_p"),
+    _SeqField("top_k"),
+    _SeqField("repetition_penalty"),
+    _SeqField("logprobs_enabled"),
+    _SeqField("num_top_logprobs"),
+    _SeqField("prompt_logprobs_enabled"),
+    _SeqField("num_prompt_logprobs"),
+    _SeqField("raw_prompt_len"),
+    # Small dict of refs / URLs / bytes; mutated only in ``extract_modify_mm``
+    # before the seq is ever scheduled, so effectively immutable here.
+    _SeqField("mm_contents",
+              get=lambda seq, ctx: seq.mm_contents if ctx.use_mm else None),
+    # Gate on rep penalty (needs token_ids on *every* decode for the per-vocab
+    # mask), not on ``mm_contents`` (a one-shot uncached-prefill read).
+    _SeqField("needs_token_id_accumulation", put=_SKIP,  # feeds _keeps_token_ids
+              get=lambda seq, ctx: seq.repetition_penalty != 1.0),
+    _SeqField("structured_output",
+              get=lambda seq, ctx: getattr(seq, "structured_output", None)),
+)
+
+_UPDATE_FIELDS = (
+    _SeqField("seq_id", put=_SKIP),  # the mirror's identity, set at register
+    _SeqField("computed_token_num", seed=0),
+    _SeqField("to_compute_token_num", seed=0),
+    # ``list(...)`` snapshot detaches from later ``seq.token_ids`` mutation.
+    _SeqField("to_compute_tokens", put=_put_to_compute_tokens, seed=None,
+              get=lambda seq, ctx: list(seq[seq.computed_token_num : seq.seq_len])),
+    # Order-sensitive on the follower (re-baseline BEFORE appending the tail),
+    # so ``apply_update`` applies the page-table pair explicitly.
+    _SeqField("new_page_ids", put=_SKIP, get=lambda seq, ctx: ctx.new_page_ids),
+    _SeqField("page_table_reset", put=_SKIP,
+              get=lambda seq, ctx: ctx.page_table_reset),
+    _SeqField("recurrent_state_slot", seed=None),
+    _SeqField("ssm_block_table", seed=None),
+    _SeqField("ssm_num_accepted", seed=1),
+    # Read off the ``SeqUpdate`` by the worker's ``_mirror_ssm_snapshot_slots``;
+    # the mirror itself stores nothing.
+    _SeqField("new_page_snap_slots", put=_SKIP,
+              get=lambda seq, ctx: ctx.new_page_snap_slots),
+    _SeqField("ssm_restore_src_slot", seed=None,
+              get=lambda seq, ctx: (ctx.ssm_restores.get(seq.seq_id)
+                                    if ctx.ssm_restores else None)),
+    _SeqField("prompt_len", put=_put_prompt_len_update),  # register seeds it
+    _SeqField("structured_output_history", seed=None,
+              get=_get_structured_output_history),
+)
+
+
+def _validate_field_table() -> None:
+    """Refuse to import when the table and the wire dataclasses drift apart.
+
+    Guards the classic "added the field in one place" bug: every dataclass
+    field must be table-driven, in wire order, and every ``_SKIP`` field must
+    have its explicit follower-side handling acknowledged here. (The
+    ``FollowerSeq`` slot layout is derived from the table, so it cannot
+    drift.)
+    """
+    reg = [spec.name for spec in _REGISTER_FIELDS]
+    upd = [spec.name for spec in _UPDATE_FIELDS]
+    assert reg == [f.name for f in fields(SeqRegister)], f"register drift: {reg}"
+    assert upd == [f.name for f in fields(SeqUpdate)], f"update drift: {upd}"
+    skipped = {
+        spec.name
+        for spec in _REGISTER_FIELDS + _UPDATE_FIELDS
+        if spec.put is _SKIP
+    }
+    # Each _SKIP field needs explicit handling in FollowerSeq / the worker;
+    # extend this set (and that handling) when adding one.
+    assert skipped == {
+        "prompt_token_ids", "needs_token_id_accumulation", "seq_id",
+        "new_page_ids", "page_table_reset", "new_page_snap_slots",
+    }, f"unexpected _SKIP fields: {skipped}"
 
 
 class DriverPayloadBuilder:
@@ -274,15 +441,11 @@ class DriverPayloadBuilder:
         self._last_pages_len: Dict[int, int] = {}
         self._last_cache_epoch: Dict[int, int] = {}
 
-    # ------------------------------------------------------------------ free
-
     def forget(self, seq_id: int) -> None:
         """Drop driver-side tracking for a seq the followers will free."""
         self._known.discard(seq_id)
         self._last_pages_len.pop(seq_id, None)
         self._last_cache_epoch.pop(seq_id, None)
-
-    # ------------------------------------------------------------------ build
 
     def build(
         self,
@@ -307,55 +470,19 @@ class DriverPayloadBuilder:
         """
         registers: List[SeqRegister] = []
         updates: List[SeqUpdate] = []
+        ctx = _BuildCtx(use_mm=use_mm, ssm_restores=ssm_restores)
 
         for seq in scheduled_seqs:
             sid = seq.seq_id
             if sid not in self._known:
-                # Decide whether the follower needs to keep accumulating
-                # token_ids over the seq's lifetime. ``mm_contents`` is
-                # only consulted by ``_mm_prepare_cpu`` for *uncached*
-                # prefill seqs (a one-shot read), so we don't gate on
-                # it; we gate on rep penalty, which needs token_ids on
-                # *every* decode for the per-vocab mask. We also keep
-                # token_ids alive for any VL seq for the duration of
-                # its prefill so ``_mm_prepare_cpu``'s
-                # ``torch.tensor(seq.token_ids, ...)`` + ``isin`` path
-                # has a full prompt to walk.
-                needs_token_id_accumulation = (
-                    seq.repetition_penalty != 1.0
-                )
+                # Table-driven: every immutable field is extracted by its
+                # ``_REGISTER_FIELDS`` getter (see the field table above).
                 registers.append(
                     SeqRegister(
-                        seq_id=sid,
-                        # ``list(...)`` to materialize a fresh list so
-                        # the follower's mirror doesn't accidentally
-                        # alias the driver's ``GenerationSequence.token_ids``
-                        # (which the driver continues to mutate via
-                        # ``seq.append`` / placeholder rewrites in
-                        # ``OverlapScheduler``).
-                        prompt_token_ids=list(seq.token_ids[: seq.prompt_len]),
-                        prompt_len=seq.prompt_len,
-                        finish_tokens=list(seq.finish_tokens),
-                        ignore_eos=seq.ignore_eos,
-                        output_len=seq.output_len,
-                        temperature=seq.temperature,
-                        top_p=seq.top_p,
-                        top_k=seq.top_k,
-                        repetition_penalty=seq.repetition_penalty,
-                        logprobs_enabled=seq.logprobs_enabled,
-                        num_top_logprobs=seq.num_top_logprobs,
-                        prompt_logprobs_enabled=seq.prompt_logprobs_enabled,
-                        num_prompt_logprobs=seq.num_prompt_logprobs,
-                        raw_prompt_len=seq.raw_prompt_len,
-                        # ``mm_contents`` is a small dict of refs / URLs
-                        # / bytes; pickle-by-reference is fine. The
-                        # driver mutates it only in
-                        # ``extract_modify_mm`` *before* the seq is
-                        # ever scheduled, so it's effectively
-                        # immutable here.
-                        mm_contents=seq.mm_contents if use_mm else None,
-                        needs_token_id_accumulation=needs_token_id_accumulation,
-                        structured_output=getattr(seq, "structured_output", None),
+                        **{
+                            spec.name: spec.get(seq, ctx)
+                            for spec in _REGISTER_FIELDS
+                        }
                     )
                 )
                 self._known.add(sid)
@@ -390,33 +517,12 @@ class DriverPayloadBuilder:
                     for p in new_page_ids
                 ]
 
+            ctx.new_page_ids = new_page_ids
+            ctx.page_table_reset = page_table_reset
+            ctx.new_page_snap_slots = new_page_snap_slots
             updates.append(
                 SeqUpdate(
-                    seq_id=sid,
-                    computed_token_num=seq.computed_token_num,
-                    to_compute_token_num=seq.to_compute_token_num,
-                    # ``list(...)`` snapshot to detach from any later
-                    # mutation of ``seq.token_ids`` by the main loop.
-                    to_compute_tokens=list(
-                        seq[seq.computed_token_num : seq.seq_len]
-                    ),
-                    new_page_ids=new_page_ids,
-                    page_table_reset=page_table_reset,
-                    recurrent_state_slot=seq.recurrent_state_slot,
-                    ssm_block_table=seq.ssm_block_table,
-                    ssm_num_accepted=seq.ssm_num_accepted,
-                    new_page_snap_slots=new_page_snap_slots,
-                    ssm_restore_src_slot=(
-                        ssm_restores.get(sid) if ssm_restores else None
-                    ),
-                    prompt_len=seq.prompt_len,
-                    structured_output_history=(
-                        list(seq.token_ids[seq.raw_prompt_len:seq.prompt_len])
-                        if getattr(seq, "structured_output", None) is not None
-                        and seq.raw_prompt_len < seq.prompt_len
-                        and seq.computed_token_num < seq.prompt_len <= seq.seq_len
-                        else None
-                    ),
+                    **{spec.name: spec.get(seq, ctx) for spec in _UPDATE_FIELDS}
                 )
             )
 
@@ -434,11 +540,6 @@ class DriverPayloadBuilder:
             control_cmd=control_cmd,
             control_data=control_data,
         )
-
-
-# ---------------------------------------------------------------------------
-# Follower-side mirror
-# ---------------------------------------------------------------------------
 
 
 class FollowerSeq:
@@ -461,45 +562,42 @@ class FollowerSeq:
       ``_mm_prepare_cpu`` is never called for this seq.
     """
 
-    __slots__ = (
-        "__weakref__",
-        "structured_output",
-        "structured_output_history",
-        "seq_id",
-        "prompt_len",
-        "token_ids",
-        "page_table",
-        "computed_token_num",
-        "to_compute_token_num",
-        "to_compute_tokens",
-        "mm_contents",
-        "temperature",
-        "top_p",
-        "top_k",
-        "repetition_penalty",
-        "finish_tokens",
-        "ignore_eos",
-        "output_len",
-        "_keeps_token_ids",
-        "logprobs_enabled",
-        "num_top_logprobs",
-        "prompt_logprobs_enabled",
-        "num_prompt_logprobs",
-        "raw_prompt_len",
-        "prompt_logprobs_data",
-        "rep_slot",
-        "rep_filled",
-        "recurrent_state_slot",
-        "ssm_block_table",
-        "ssm_num_accepted",
-        "ssm_restore_src_slot",
+    # Slot layout is *derived* from the field table (plus the follower-local
+    # state below), so a new mirrored field gets its slot by construction and
+    # ``_validate_field_table`` only has to guard table/dataclass drift.
+    __slots__ = ("__weakref__",) + tuple(
+        dict.fromkeys(
+            [
+                spec.name
+                for spec in _REGISTER_FIELDS + _UPDATE_FIELDS
+                if spec.put is not _SKIP
+            ]
+            # Not wire-driven: the gated token-history mirror + page table,
+            # the ``_keeps_token_ids`` gate, and follower-local scratch.
+            + [
+                "token_ids",
+                "page_table",
+                "_keeps_token_ids",
+                "prompt_logprobs_data",
+                "rep_slot",
+                "rep_filled",
+            ]
+        )
     )
 
     def __init__(self, reg: SeqRegister, mm_needs_token_ids: bool = False):
-        self.seq_id = reg.seq_id
-        self.structured_output = reg.structured_output
-        self.structured_output_history = None
-        self.prompt_len = reg.prompt_len
+        # Table-driven: plain register-field copies (see ``_REGISTER_FIELDS``).
+        for spec in _REGISTER_FIELDS:
+            if spec.put is not _SKIP:
+                spec.put(self, reg)
+        # Seed the per-iter update fields. ``computed_token_num`` and friends
+        # are overwritten by the very first ``apply_update`` (which always
+        # lands together with the register), so the seeds just need to be
+        # well-typed. (``recurrent_state_slot`` mirrors the hybrid/SSM working
+        # slot; ``_cal_ssm_metadata`` reads it.)
+        for spec in _UPDATE_FIELDS:
+            if spec.put is not _SKIP and spec.seed is not _NO_SEED:
+                setattr(self, spec.name, spec.seed)
         # Keep token_ids alive throughout the seq's lifetime when:
         #   * VL: ``_mm_prepare_cpu`` walks the prompt to build the
         #     ``is_multimodal`` mask AND to compute MROPE positions on the
@@ -527,50 +625,20 @@ class FollowerSeq:
             list(reg.prompt_token_ids) if self._keeps_token_ids else None
         )
         self.page_table: List[int] = []
-        # ``computed_token_num`` and friends are overwritten by the
-        # very first ``apply_update`` (which always lands together with
-        # the register), so the seed values just need to be
-        # well-typed.
-        self.computed_token_num = 0
-        self.to_compute_token_num = 0
-        self.to_compute_tokens: Optional[List[int]] = None
-        # Hybrid/SSM working-slot mirror; overwritten by ``apply_update`` every
-        # iter (``None`` for non-hybrid models). ``_cal_ssm_metadata`` reads it.
-        self.recurrent_state_slot: Optional[int] = None
-        self.ssm_block_table: Optional[List[int]] = None
-        self.ssm_num_accepted: int = 1
-        # One-shot prefix-cache-hit restore signal (snapshot slot -> working
-        # slot copy the follower must run before its next forward). Reset to
-        # ``None`` by every ``apply_update`` so it only fires on the hit iter.
-        self.ssm_restore_src_slot: Optional[int] = None
-        self.mm_contents = reg.mm_contents
-        self.temperature = reg.temperature
-        self.top_p = reg.top_p
-        self.top_k = reg.top_k
-        self.repetition_penalty = reg.repetition_penalty
-        self.finish_tokens = reg.finish_tokens
-        self.ignore_eos = reg.ignore_eos
-        self.output_len = reg.output_len
-        self.logprobs_enabled = reg.logprobs_enabled
-        self.num_top_logprobs = reg.num_top_logprobs
-        # Prompt-logprobs mirror. ``_compute_prompt_logprobs`` reads
+        # Prompt-logprobs accumulator. ``_compute_prompt_logprobs`` reads
         # ``prompt_logprobs_enabled`` / ``num_prompt_logprobs`` / ``raw_prompt_len``
-        # and accumulates into ``prompt_logprobs_data`` (same shape as the real
-        # ``GenerationSequence``). No ``_prompt_logprobs_sent`` latch is needed: the
-        # follower emits each completed list exactly once via the runner's
-        # ``_last_prompt_logprobs`` (keyed on the prefill-completing step), and
-        # decode steps are skipped by the ``computed_prompt`` gate.
-        self.prompt_logprobs_enabled = reg.prompt_logprobs_enabled
-        self.num_prompt_logprobs = reg.num_prompt_logprobs
-        self.raw_prompt_len = reg.raw_prompt_len
+        # (table-driven above) and accumulates into ``prompt_logprobs_data``
+        # (same shape as the real ``GenerationSequence``). No
+        # ``_prompt_logprobs_sent`` latch is needed: the follower emits each
+        # completed list exactly once via the runner's ``_last_prompt_logprobs``
+        # (keyed on the prefill-completing step), and decode steps are skipped
+        # by the ``computed_prompt`` gate.
         self.prompt_logprobs_data = None
         # Follower-local slot in this stage's repetition-penalty pool.  The
         # driver's slot id is intentionally not mirrored: every stage owns an
         # independent MemoryManager and allocates/frees its own rows.
         self.rep_slot = None
         self.rep_filled = 0
-
-    # ---- duck-typed GenerationSequence surface --------------------------------------
 
     @property
     def seq_len(self) -> int:
@@ -598,45 +666,23 @@ class FollowerSeq:
             )
         return self.token_ids[key]
 
-    # ---- update plumbing --------------------------------------------------
-
     def apply_update(self, upd: SeqUpdate) -> None:
         """In-place absorb a per-iter delta from the driver."""
-        self.computed_token_num = upd.computed_token_num
-        self.to_compute_token_num = upd.to_compute_token_num
-        self.to_compute_tokens = upd.to_compute_tokens
-        self.recurrent_state_slot = upd.recurrent_state_slot
-        self.ssm_block_table = upd.ssm_block_table
-        self.ssm_num_accepted = upd.ssm_num_accepted
-        self.ssm_restore_src_slot = upd.ssm_restore_src_slot
-        if upd.prompt_len is not None:
-            self.prompt_len = upd.prompt_len
-        self.structured_output_history = upd.structured_output_history
+        # Table-driven field copies, in ``_UPDATE_FIELDS`` (== wire) order.
+        # ``to_compute_tokens``'s put also folds the new tokens into the
+        # gated ``token_ids`` mirror (``computed_token_num`` /
+        # ``to_compute_token_num`` are applied earlier in this same loop).
+        for spec in _UPDATE_FIELDS:
+            if spec.put is not _SKIP:
+                spec.put(self, upd)
 
+        # The page-table pair is order-sensitive -- re-baseline BEFORE
+        # appending the tail -- so it stays an explicit step.
         if upd.page_table_reset is not None:
             # Preemption / first scheduling.
             self.page_table = list(upd.page_table_reset)
         if upd.new_page_ids:
             self.page_table.extend(upd.new_page_ids)
-
-        if self._keeps_token_ids and upd.to_compute_tokens:
-            # Append only the actually-new tokens. For an uncached
-            # prefill chunk this is just the chunk that's about to be
-            # consumed (and it already exists in ``token_ids`` since
-            # ``__init__`` materialized the prompt -- we skip the
-            # extend in that case to avoid duplicating the prompt).
-            assert self.token_ids is not None
-            new_end = upd.computed_token_num + upd.to_compute_token_num
-            cur_end = len(self.token_ids)
-            if new_end > cur_end:
-                # Take only the suffix that we don't already have. This
-                # handles both decode (always +1 token after prefill
-                # done) and chunked-prefill carry-over without
-                # duplicating the prompt window we copied at register
-                # time.
-                self.token_ids.extend(
-                    upd.to_compute_tokens[cur_end - upd.computed_token_num :]
-                )
 
 
 class FollowerSeqStore:
@@ -677,11 +723,9 @@ class FollowerSeqStore:
         but cheap to be defensive about) does the right thing.
         """
         for reg in payload.registers:
-            # Overwrite an existing entry rather than asserting -- if
-            # rank-0's registry believes the follower needs a fresh
-            # register (e.g. after a state-sync recovery in a future
-            # PD-disagg path), it would resend. Today this branch is
-            # never hit under normal operation.
+            # Overwrite an existing entry rather than asserting -- a resent
+            # register (e.g. after a state-sync recovery) must not crash the
+            # follower.
             self._table[reg.seq_id] = FollowerSeq(
                 reg, mm_needs_token_ids=self._mm_needs_token_ids
             )
@@ -718,6 +762,11 @@ class FollowerSeqStore:
 
     def active_count(self) -> int:
         return len(self._table)
+
+
+# Import-time guard: the field table, the wire dataclasses and the
+# ``FollowerSeq`` slot layout must agree (see ``_validate_field_table``).
+_validate_field_table()
 
 
 __all__ = [

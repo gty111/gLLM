@@ -29,10 +29,8 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, inte
     x_pass = x[..., rot_dim:]
 
     if not interleaved:
-        # NeoX style: split into first half and second half
         x1, x2 = x_rot.chunk(2, dim=-1)
     else:
-        # GPT-J style: interleaved pairs
         x1 = x_rot[..., ::2]
         x2 = x_rot[..., 1::2]
     o1 = x1 * cos - x2 * sin
@@ -275,7 +273,6 @@ def _yarn_find_correction_dim(
     )
 
 
-# yarn functions
 # Inverse dim formula to find dim based on number of rotations
 def yarn_find_correction_dim(
     num_rotations: int,
@@ -417,9 +414,6 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         return cache
 
 
-# --------mrope--------------
-
-
 @triton.jit
 def _triton_qwen2vl_mrope_forward(
     q_ptr,
@@ -444,14 +438,9 @@ def _triton_qwen2vl_mrope_forward(
     # and supports cos and sin cache with shape (3, num_tokens, head_dim // 2)
     # instead of (3, bsz, seq_len, head_dim)
     pid = tl.program_id(0)
-    # locate start address
     q_ptr = q_ptr + pid * (n_qh * hd)
     k_ptr = k_ptr + pid * (n_kh * hd)
 
-    # ####################################################################
-    # get the cos(mθ_{i...d/2}) and sin(mθ_{i...d/2}) for token position
-    # m of this program instance
-    # ####################################################################
     # Note: cos and sin now have shape (3, num_tokens, head_dim // 2)
 
     half_rd = rd // 2
@@ -468,7 +457,6 @@ def _triton_qwen2vl_mrope_forward(
         t_end = mrope_section_t
         h_end = t_end + mrope_section_h
 
-        # Updated stride calculation for half head_dim
         t_cos = cos + pid * half_rd
         h_cos = t_cos + num_tokens * half_rd
         w_cos = h_cos + num_tokens * half_rd
@@ -490,11 +478,6 @@ def _triton_qwen2vl_mrope_forward(
         cos_row = t_cos_row + h_cos_row + w_cos_row
         sin_row = t_sin_row + h_sin_row + w_sin_row
 
-    # ####################################################################
-    # Load the left and right half of q and k for the current
-    # program instance (i.e. for the current token) separately
-    # ####################################################################
-    # left half of the head
     first_half_q_offsets = (
         tl.arange(0, pad_n_qh)[:, None] * hd
         + tl.arange(0, pad_hd // 2)[None, :]
@@ -516,7 +499,6 @@ def _triton_qwen2vl_mrope_forward(
         sin_row.dtype
     )
 
-    # right half of the head
     second_half_q_offsets = first_half_q_offsets + (rd // 2)
     second_half_k_offsets = first_half_k_offsets + (rd // 2)
     second_q_mask = first_q_mask

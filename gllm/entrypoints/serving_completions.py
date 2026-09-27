@@ -1,6 +1,7 @@
 import time
 
 from gllm.engine.async_llm import AsyncStream
+from gllm.entrypoints.common import build_usage, get_finish_reason
 from gllm.entrypoints.protocol import (
     CompletionLogProbs,
     CompletionRequest,
@@ -9,7 +10,7 @@ from gllm.entrypoints.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
 )
-from gllm.utils import build_usage, get_finish_reason, random_uuid
+from gllm.utils import random_uuid
 
 
 def _build_completion_logprobs(entries, text_offset_start=0):

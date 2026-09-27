@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from gllm.distributed.parallel_state import get_tp_rank
-from gllm.layers.attention.deepseek_v4.cache import DeepseekV4AttentionCache
 from gllm.layers.attention.deepseek_v4.layer import DeepseekV4Attention
 from gllm.layers.attention.deepseek_v4.ops import serving_max_length
 from gllm.layers.deepseek_v4_mhc import mhc_head, mhc_post, mhc_pre
@@ -25,6 +24,7 @@ from gllm.models.weight_loader import (
     contains,
     run_weight_loader,
 )
+from gllm.models.mtp_utils import detached_head
 from gllm.models.weight_utils import (
     copy_single_proj_dim0,
     copy_single_proj_dim1,
@@ -132,36 +132,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         output = self.ffn(self.ffn_norm(layer_input), input_ids)
         return mhc_post(output, residual, post, comb)
 
-    def forward_prefill(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        cache: DeepseekV4AttentionCache | None = None,
-    ) -> tuple[torch.Tensor, DeepseekV4AttentionCache]:
-        layer_input, residual, post, comb = self._attention_input(hidden_states)
-        attention_output, cache = self.attn.forward_prefill_with_cache(
-            layer_input, cache
-        )
-        hidden_states = mhc_post(attention_output, residual, post, comb)
-        return self._ffn(hidden_states, input_ids), cache
-
-    def forward_decode(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        *,
-        position: int,
-        cache: DeepseekV4AttentionCache,
-    ) -> torch.Tensor:
-        layer_input, residual, post, comb = self._attention_input(hidden_states)
-        attention_output = self.attn.forward_decode(
-            layer_input,
-            position=position,
-            cache=cache,
-        )
-        hidden_states = mhc_post(attention_output, residual, post, comb)
-        return self._ffn(hidden_states, input_ids)
-
     def forward_paged(
         self,
         input_data,
@@ -187,14 +157,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 
-class DeepseekV4ModelBase(nn.Module):
-    """Embedding, decoder stack, mHC head fold and checkpoint loading.
-
-    Split from :class:`DeepseekV4Model` only so the serving ``forward`` and the
-    parameter/weight plumbing stay separately readable; both are production
-    code.  The token-at-a-time oracles live in
-    :mod:`gllm.models.deepseek_v4_reference`.
-    """
+class DeepseekV4Model(nn.Module):
+    """Embedding, decoder stack, mHC head fold and the packed serving forward."""
 
     def __init__(self, config: Any) -> None:
         super().__init__()
@@ -245,25 +209,6 @@ class DeepseekV4ModelBase(nn.Module):
         return hidden_states.unsqueeze(-2).expand(
             *hidden_states.shape[:-1], self.hc_mult, self.hidden_size
         ).contiguous()
-
-    def _head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = mhc_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            norm_eps=self.norm_eps,
-            hc_mult=self.hc_mult,
-            hc_eps=self.hc_eps,
-        )
-        return self.head(self.norm(hidden_states).float())
-
-
-
-
-
-class DeepseekV4Model(DeepseekV4ModelBase):
-    """Serving model: one packed forward over the paged cache arenas."""
 
     def forward(self, input_data, hidden_states=None, residual=None):
         if hidden_states is None:
@@ -563,9 +508,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # DSpark's parameters live under ``mtp.*`` in the checkpoint, a
         # namespace the rule table above knows nothing about. Detach the head
         # for the base pass and load it separately, as DeepSeek-V3.2 does.
-        dspark = self.dspark
-        self.dspark = None
-        try:
+        with detached_head(self, "dspark") as dspark:
             run_weight_loader(
                 self,
                 weights,
@@ -576,19 +519,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                 ctx=self._make_load_context(weights),
                 src_key_fn=_v4_src_key,
             )
-        finally:
-            self.dspark = dspark
 
         for layer in self.model.layers:
             layer.ffn.experts.process_weights_after_loading()
-        if self.dspark is not None:
-            self.dspark.load_weights(weights, self, mp_load_progress)
-            self.dspark.process_weights_after_loading()
+        if dspark is not None:
+            dspark.load_weights(weights, self, mp_load_progress)
+            dspark.process_weights_after_loading()
 
 
 __all__ = [
     "DeepseekV4DecoderLayer",
     "DeepseekV4ForCausalLM",
     "DeepseekV4Model",
-    "DeepseekV4ModelBase",
 ]

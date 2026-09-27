@@ -13,8 +13,6 @@ Public surface (re-exported here for convenience):
 * :func:`fused_recurrent_gated_delta_rule` /
   :func:`fused_recurrent_gated_delta_rule_packed_decode` — recurrent decode
   kernel for GDN (single-token state update).
-* :func:`fused_sigmoid_gating_delta_rule_update` — sigmoid-gated variant of
-  the recurrent decode kernel.
 * :func:`fused_gdn_gating` — fused ``(A_log, a, b, dt_bias) -> (g, beta)``
   precompute used before :func:`chunk_gated_delta_rule`.
 * :func:`rms_norm_gated` / :class:`RMSNormGated` — fused RMSNorm + sigmoid
@@ -26,11 +24,7 @@ from gllm.layers.ops.fla.fused_gdn_gating import fused_gdn_gating
 from gllm.layers.ops.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
-    fused_recurrent_gated_delta_rule_update,
     fused_recurrent_gdn_spec,
-)
-from gllm.layers.ops.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
 )
 from gllm.layers.ops.fla.layernorm_gated import RMSNorm as RMSNormGated
 from gllm.layers.ops.fla.layernorm_gated import rms_norm_gated
@@ -41,8 +35,6 @@ __all__ = [
     "fused_gdn_gating",
     "fused_recurrent_gated_delta_rule",
     "fused_recurrent_gated_delta_rule_packed_decode",
-    "fused_recurrent_gated_delta_rule_update",
     "fused_recurrent_gdn_spec",
-    "fused_sigmoid_gating_delta_rule_update",
     "rms_norm_gated",
 ]

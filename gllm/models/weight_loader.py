@@ -27,7 +27,7 @@ Key invariants preserved from the old loaders:
 """
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Set
+from typing import Callable, Dict, Optional, Sequence, Set
 
 import torch
 
@@ -244,11 +244,6 @@ def h_proj_dim0(ctx: LoadContext, k: str, p: torch.Tensor) -> None:
     copy_single_proj_dim0(p, get_tensor_from_dict(ctx.weights, k))
 
 
-def h_default(ctx: LoadContext, k: str, p: torch.Tensor) -> None:
-    """Verbatim copy (norms, biases, scalar params)."""
-    p.copy_(get_tensor_from_dict(ctx.weights, k))
-
-
 # ---- ChatGLM handlers ------------------------------------------------------
 # ChatGLM stores QKV as one fused ``query_key_value`` tensor (sliced by
 # precomputed q/k index bounds) and the MLP gate+up as one fused
@@ -442,9 +437,9 @@ def h_qkv_proj_gated(ctx: LoadContext, k: str, p: torch.Tensor) -> None:
     already doubled for the gate). For the plain weight tensor each head spans
     ``head_dim`` rows. For an FP8 ``weight_scale_inv`` tensor the rows are
     block-quantized, so each head spans ``head_dim // block_n`` scale rows;
-    we derive that per-head stride from the source shape instead of hardcoding
-    it (the old code collapsed it to ``1``, which corrupted the K/V offsets and
-    crashed on block-quantized checkpoints such as Qwen3.5-27B-FP8).
+    we derive that per-head stride from the source shape rather than
+    hardcoding it to 1, which would corrupt the K/V offsets on
+    block-quantized checkpoints.
     """
     w = ctx.weights
     src_q = get_tensor_from_dict(w, k.replace("qkv_proj", "q_proj"))

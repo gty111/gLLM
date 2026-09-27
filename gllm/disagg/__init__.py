@@ -1,4 +1,4 @@
-"""Encoder-disaggregation control + data plane (design §4-§6).
+"""Encoder-disaggregation control + data plane.
 
 This package wires the Encoder node (vision-only ViT,
 :mod:`gllm.runtime.vision_encoder_runner`) to the LM PP0 worker:

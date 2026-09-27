@@ -8,11 +8,11 @@ expert gate that the Qwen3.5-MoE checkpoint always ships).
 
 The VL wrapper (``Qwen3_5MoeForConditionalGeneration``) keeps the same
 shape as ``Qwen3_5ForConditionalGeneration``: a thin subclass of
-``Qwen3VLForConditionalGeneration`` that plugs in this language model.
-Vision tower load is intentionally a best-effort copy of the existing
-Qwen3.5 dense VL path. The checkpoint's ``mtp.*`` MTP head is loaded when
-MTP is enabled (its block is a MoE decoder layer, like every other layer
-here -- the MoE/dense dispatch is inside ``Qwen3_5DecoderLayer``).
+``Qwen3VLForConditionalGeneration`` that plugs in this language model and
+inherits the parent's vision-tower load unchanged. The checkpoint's
+``mtp.*`` MTP head is loaded when MTP is enabled (its block is a MoE
+decoder layer, like every other layer here -- the MoE/dense dispatch is
+inside ``Qwen3_5DecoderLayer``).
 
 FP8 block-quant scope:
 
@@ -30,30 +30,20 @@ FP8 block-quant scope:
 
 from __future__ import annotations
 
-from typing import Iterable, Optional
-
-import torch
-from torch import nn
-
 from gllm.distributed.parallel_state import (
     get_ep_rank,
     get_ep_size,
     get_tp_size,
-    is_first_pp_rank,
-    is_last_pp_rank,
 )
-from gllm.runtime.input_data import InputData
 from gllm.layers.moe import determine_expert_map
 from gllm.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
-    Qwen3_5GatedDeltaNet,
     Qwen3_5Model,
     _load_gdn_layer_weights,
 )
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from gllm.models.weight_utils import get_tensor_from_dict
+from gllm.models.mtp_utils import load_remapped_weights
 from gllm.models.weight_loader import (
-    LoadContext,
     WeightRule,
     contains,
     h_gate_up,
@@ -62,27 +52,9 @@ from gllm.models.weight_loader import (
     h_qkv_proj_gqa,
     h_w13_hybrid,
     h_w2_hybrid,
-    hv_proj_dim0,
-    hv_proj_dim1,
-    hv_qkv_fused_split,
     make_gdn_pre_pass,
-    run_vision_loader,
     run_weight_loader,
 )
-
-
-class Qwen3_5MoeLLMModel(Qwen3_5Model):
-    """Drop-in subclass that simply forwards through the base model.
-
-    Exists so ``Qwen3_5MoeLLMForCausalLM`` can plug a custom ``Model`` into
-    the existing ``Qwen3_5ForCausalLM`` infrastructure without leaking
-    "is this MoE?" awareness into ``Qwen3_5Model.__init__``. The MoE/dense
-    dispatch happens inside ``Qwen3_5DecoderLayer`` via
-    ``_is_moe_text_config``.
-    """
-
-    def __init__(self, config):
-        super().__init__(config)
 
 
 class Qwen3_5MoeLLMForCausalLM(Qwen3_5ForCausalLM):
@@ -96,7 +68,9 @@ class Qwen3_5MoeLLMForCausalLM(Qwen3_5ForCausalLM):
     """
 
     def __init__(self, config):
-        super().__init__(config, model_type=Qwen3_5MoeLLMModel)
+        # The MoE/dense dispatch happens inside ``Qwen3_5DecoderLayer`` via
+        # ``_is_moe_text_config``, so the plain ``Qwen3_5Model`` suffices.
+        super().__init__(config, model_type=Qwen3_5Model)
 
     def _make_load_context(self, weights):
         ctx = super()._make_load_context(weights)
@@ -169,19 +143,19 @@ class Qwen3_5MoeLLMForCausalLM(Qwen3_5ForCausalLM):
         # shares the base model's), so drop it.
         rules = [r for r in self.weight_rules() if r.name != "embed_lm_head"]
         filled = set()
-        for name, p in mtp.named_parameters():
-            local_key = f"mtp.{name}"
-            if local_key not in parameters:
-                continue
-            src = mtp._src_key(name)
-            for rule in rules:
-                if rule.match(src):
-                    rule.handler(ctx, src, p.data)
-                    break
-            else:
-                p.data.copy_(get_tensor_from_dict(ctx.weights, src))
-            filled.add(local_key)
+
+        def _after(name):
+            filled.add(f"mtp.{name}")
             update()
+
+        load_remapped_weights(
+            mtp,
+            rules,
+            ctx,
+            mtp._src_key,
+            skip=lambda name: f"mtp.{name}" not in parameters,
+            after=_after,
+        )
         return filled
 
     def load_weights(self, weights, mp_load_progress=None):
@@ -243,38 +217,3 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # captures no draft/verify graphs and never speculates.
         lm = getattr(self, "language_model", None)
         return getattr(lm, "mtp", None) if lm is not None else None
-
-    def load_weights(self, weights, mp_load_progress=None):
-        """Load language model weights; vision tower load is a best-effort
-        bf16 path that mirrors :class:`Qwen3_5ForConditionalGeneration`.
-
-        ``model.*``, ``lm_head``, ``visual.*`` and -- when MTP is enabled --
-        the ``mtp.*`` head are loaded (the language model handles the
-        two-pass split; see ``Qwen3_5MoeLLMForCausalLM.load_weights``).
-        """
-        if not getattr(self, "skip_language", False) and self.language_model is not None:
-            self.language_model.load_weights(weights, mp_load_progress)
-
-        if not is_first_pp_rank():
-            return
-
-        # Encoder-disaggregation LM node skips the vision tower entirely.
-        if getattr(self, "skip_visual", False) or self.visual is None:
-            return
-
-        ctx = LoadContext(
-            weights=weights,
-            num_heads=self.visual.num_heads // get_tp_size(),
-            head_dim=self.visual.hidden_size // self.visual.num_heads,
-            extra={"prefix": "visual."},
-        )
-        rules = [
-            WeightRule(contains("attn.qkv"), hv_qkv_fused_split, "v_qkv"),
-            WeightRule(
-                contains("attn.proj.weight", "linear_fc2.weight"),
-                hv_proj_dim1,
-                "v_proj_dim1",
-            ),
-            WeightRule(contains("linear_fc1"), hv_proj_dim0, "v_fc1"),
-        ]
-        run_vision_loader(self.visual, weights, rules, ctx)

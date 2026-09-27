@@ -44,18 +44,15 @@ def _batched_rotary_embedding_kernel(
     head_block_idx = tl.program_id(1)
     is_key = tl.program_id(2)  # 0 = query, 1 = key
 
-    # Determine number of heads for this pass
     total_heads = tl.where(is_key == 0, num_heads, num_kv_heads)
 
     head_idx = head_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
     head_mask = head_idx < total_heads
 
-    # Compute effective position
     pos = tl.load(positions_ptr + token_idx)
     offset = tl.load(cos_sin_cache_offsets_ptr + token_idx)
     effective_pos = pos + offset
 
-    # Load cos and sin from cache
     # cos_sin_cache layout: [max_positions, rot_dim]
     # First rot_dim//2 elements are cos, next rot_dim//2 are sin
     half_rot_dim = rot_dim // 2
@@ -68,7 +65,6 @@ def _batched_rotary_embedding_kernel(
     cos_val = tl.load(cos_ptr, mask=dim_mask, other=0.0)
     sin_val = tl.load(sin_ptr, mask=dim_mask, other=0.0)
 
-    # Select tensor pointer and stride
     if is_key == 0:
         tensor_ptr = query_ptr
         tensor_stride = query_stride
@@ -76,11 +72,8 @@ def _batched_rotary_embedding_kernel(
         tensor_ptr = key_ptr
         tensor_stride = key_stride
 
-    # Process each head in this block
     # For NeoX-style: x = [x1, x2], rotated = [x1*cos - x2*sin, x2*cos + x1*sin]
     # For GPT-J-style: x = [x0, x1, x2, x3, ...], pairs are (x0,x1), (x2,x3), ...
-
-    # We process one head at a time within the block
     for h_offset in range(BLOCK_H):
         h = head_block_idx * BLOCK_H + h_offset
         if h >= total_heads:
@@ -89,7 +82,6 @@ def _batched_rotary_embedding_kernel(
         base = token_idx * tensor_stride + h * head_size
 
         if IS_NEOX:
-            # NeoX rotation: split into first half and second half
             x1 = tl.load(tensor_ptr + base + dim_offs, mask=dim_mask, other=0.0)
             x2 = tl.load(
                 tensor_ptr + base + half_rot_dim + dim_offs, mask=dim_mask, other=0.0
@@ -103,7 +95,6 @@ def _batched_rotary_embedding_kernel(
                 tensor_ptr + base + half_rot_dim + dim_offs, new_x2, mask=dim_mask
             )
         else:
-            # GPT-J rotation: interleaved pairs (x0, x1), (x2, x3), ...
             pair_offs = tl.arange(0, BLOCK_D)
             pair_mask = pair_offs < half_rot_dim
 

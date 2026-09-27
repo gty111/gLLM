@@ -38,7 +38,8 @@ class DisaggConfig:
 
     # --- LM-side manager (built on the PP0 driver in
     # ``Worker._maybe_init_disagg``). When ``is_lm`` is False the worker runs as
-    # a plain monolith / text-only LM and never builds an ``LMDisaggManager``.
+    # a plain monolith / text-only LM and never builds the LM-side
+    # receiver/coordinator (``gllm.disagg.lm_manager``).
     is_lm: bool = False
     discovery_endpoint: str = ""
     # ``None`` -> the worker derives ``f"lm{rank}"`` (the rank is only known in
@@ -47,7 +48,7 @@ class DisaggConfig:
     processor_config_hash: str = ""
     advertise_host: str = "127.0.0.1"
     meta_bind: str = "tcp://0.0.0.0:0"
-    # ``None`` -> fall back to the ``LMDisaggManager`` default.
+    # ``None`` -> fall back to the LM-side manager's default.
     num_slots: Optional[int] = None
     max_vis_tokens: Optional[int] = None
     encoder_dp: int = 1

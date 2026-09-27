@@ -5,28 +5,36 @@ import torch.distributed as dist
 from logger import logger
 
 
-def send_pp_data(output, dst):
+def _send_tensors(output):
+    """Normalize a PP payload to the tuple of tensors to send element-wise."""
     if type(output) == tuple:
         assert len(output) == 2
-        dist.isend(output[0], dst)
-        dist.isend(output[1], dst)
-    else:
-        dist.isend(output, dst)
+        return output
+    return (output,)
+
+
+def send_pp_data(output, dst):
+    for tensor in _send_tensors(output):
+        dist.isend(tensor, dst)
 
 
 def send_pp_data_async(output, dst):
     """Enqueue PP activations and order output-buffer reuse on this stream."""
-    if type(output) == tuple:
-        assert len(output) == 2
-        works = [dist.isend(output[0], dst), dist.isend(output[1], dst)]
-    else:
-        works = [dist.isend(output, dst)]
+    works = [dist.isend(tensor, dst) for tensor in _send_tensors(output)]
     # For NCCL, Work.wait() inserts a dependency on the current CUDA stream;
     # it does not CPU-synchronize in the default non-blocking-wait mode.  This
     # keeps the output buffer alive until the transport has consumed it.
     for work in works:
         work.wait()
     return works
+
+
+def _recv_buffers(num_tokens, recv_hidden_states, recv_residual, has_residual):
+    """Per-element receive buffers for one PP payload, in wire order."""
+    buffers = [recv_hidden_states[:num_tokens]]
+    if has_residual:
+        buffers.append(recv_residual[:num_tokens])
+    return buffers
 
 
 def recv_pp_data_async(
@@ -39,9 +47,10 @@ def recv_pp_data_async(
     so the model forward enqueued immediately afterwards consumes the received
     activation in-order.
     """
-    works = [dist.irecv(recv_hidden_states[:num_tokens], src)]
-    if has_residual:
-        works.append(dist.irecv(recv_residual[:num_tokens], src))
+    works = [
+        dist.irecv(buffer, src)
+        for buffer in _recv_buffers(num_tokens, recv_hidden_states, recv_residual, has_residual)
+    ]
     for work in works:
         work.wait()
     return works
@@ -88,11 +97,8 @@ def recv_pp_tokens_from_last_stage(tokens):
 
 
 def recv_pp_data(src, num_tokens, recv_hidden_states, recv_residual, has_residual):
-    if has_residual:
-        dist.recv(recv_hidden_states[:num_tokens], src)
-        dist.recv(recv_residual[:num_tokens], src)
-    else:
-        dist.recv(recv_hidden_states[:num_tokens], src)
+    for buffer in _recv_buffers(num_tokens, recv_hidden_states, recv_residual, has_residual):
+        dist.recv(buffer, src)
 
 
 def send_obj_list(obj_list, dst):
@@ -362,18 +368,6 @@ def get_dp_forward_counts():
     return _DP_FWD_COUNTS
 
 
-def dp_all_gather_num_tokens(local_ntok: int):
-    """All-gather each replica's forward token count over the DP group.
-
-    Called once per iteration by every replica (an unconditional barrier that
-    keeps the replicas in lockstep). Returns the per-replica counts as a list.
-    """
-    t = torch.tensor([local_ntok], dtype=torch.long, device="cuda")
-    out = torch.empty(_DP_SIZE, dtype=torch.long, device="cuda")
-    dist.all_gather_single(out, t, group=_DP_GROUP)
-    return out.tolist()
-
-
 def dp_all_gather_meta(local_ntok: int, is_decode: bool):
     """All-gather each DP group's ``(token count, is_decode)`` this iteration.
 
@@ -636,7 +630,6 @@ def get_pp_layers(num_layers):
     return assigned_layers
 
 
-# Set the correct layer index for PP
 def resolve_pp_layer_idx(layer_name, idx, start_layer_idx):
     if "layers" in layer_name:
         layer_name_list = layer_name.split(".")
@@ -664,11 +657,8 @@ def tensor_model_parallel_all_gather(input_: torch.Tensor, dim=-1) -> torch.Tens
     # stack-style all-gather has compatibility issues with
     # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
     output_size = (input_size[0] * get_tp_size(),) + input_size[1:]
-    # Allocate output tensor.
     output_tensor = torch.empty(output_size, dtype=input_.dtype, device=input_.device)
-    # All-gather.
     dist.all_gather_single(output_tensor, input_, group=get_tp_group())
-    # Reshape
     output_tensor = output_tensor.reshape((get_tp_size(),) + input_size)
     output_tensor = output_tensor.movedim(0, dim)
     output_tensor = output_tensor.reshape(
@@ -690,14 +680,9 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 
     Return semantics: callers must use the returned tensor; the custom-AR
     path may return a buffer distinct from ``input_`` (out-of-place
-    kernel). Every existing call site already obeys this contract
-    (``output = tensor_model_parallel_all_reduce(...)``), so we deliberately
-    *do not* mirror the result back into ``input_``. The previous
-    ``input_.copy_(out)`` write-back was issuing one ``memcpy32_post`` per
-    AR (~31 ms / 1.7 s total GPU on a 60-prompt decode-heavy profile -- a
-    pure 2 % waste with no semantic benefit; SGLang doesn't do the copy
-    either, which is exactly the source of its memcpy32_post=0 in our
-    side-by-side trace comparison).
+    kernel). Do NOT mirror the result back into ``input_`` -- that extra
+    device copy per AR is pure overhead with no semantic benefit (SGLang
+    doesn't do it either).
     """
     # Import lazily to avoid a circular import at module init (parallel state is
     # imported by gllm.distributed.cuda_wrapper transitively via ``logger``).
@@ -759,10 +744,8 @@ def split_tensor_along_last_dim(
     Returns:
         A list of Tensors
     """
-    # Get the size and dimension.
     last_dim = tensor.dim() - 1
     last_dim_size = divide(tensor.size()[last_dim], num_partitions)
-    # Split.
     tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
     # NOTE: torch.split does not create contiguous tensors by default.
     if contiguous_split_chunks:

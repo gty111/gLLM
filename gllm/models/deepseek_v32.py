@@ -10,40 +10,32 @@ lightweight side path (``self_attn.indexer.{wq_b, wk, k_norm, weights_proj}``)
 that scores every cached key against each query and keeps only the top
 ``index_topk`` (2048) tokens, which are then fed as a sparse mask into MLA
 attention. For any sequence no longer than ``index_topk`` the top-k selects
-*all* keys, so DSA is mathematically identical to dense MLA there.
-
-Staged bring-up:
-
-* **Stage 1 (this file's initial form):** construct the indexer so its weights
-  load, but run the inherited *dense* MLA forward. Exact for context
-  <= ``index_topk``; an approximation (attends to all keys) beyond it.
-* **Stage 3/4 (TODO):** feed the indexer's top-k selection into the sparse
-  FlashMLA kernels (``flash_mla_with_kvcache(indices=...)`` /
-  ``flash_mla_sparse_fwd``) for true sparse attention at long context.
+*all* keys, so DSA is mathematically identical to dense MLA there — that is
+the correctness oracle used to validate the sparse path.
 
 Reference: HuggingFace ``transformers>=5.11`` ``modeling_deepseek_v32`` /
 ``modular_deepseek_v32`` (the concise diff-from-V3).
 """
 
+from functools import partial
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from gllm.distributed.parallel_state import get_pp_layers, is_first_pp_rank, is_last_pp_rank
+from gllm.distributed.parallel_state import is_last_pp_rank
 from gllm.runtime.input_data import InputData
-from gllm.layers.layernorm import RMSNorm
 from gllm.layers.linear import ReplicatedLinear
 from gllm.layers.rotary_embedding import YaRNScalingRotaryEmbedding
-from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
 from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2ForCausalLM,
     DeepseekV2MLAAttention,
+    DeepseekV2Model,
 )
-from .qwen2_moe import Qwen2MoeForCausalLM
+from .mtp_utils import detached_head
 from .utils import extract_rope_config
 
 # Position-axis tile for the DSA decode indexer score (see
@@ -80,10 +72,6 @@ class DeepseekV32Indexer(nn.Module):
     applies **non-interleaved (neox / half-split) RoPE** to the first
     ``qk_rope_head_dim`` dims of its head -- hence its own rotary embedding
     instance with ``is_neox_style=True``.
-
-    NOTE: not yet wired into the attention hot path (see module docstring); the
-    module exists so its weights load, and its ``forward`` is validated /
-    consumed in the sparse-attention stages.
     """
 
     def __init__(self, config, layer_id: int):
@@ -805,62 +793,28 @@ class DeepseekV32DecoderLayer(DeepseekV2DecoderLayer):
         self.self_attn = DeepseekV32MLAAttention(layer_id, config)
 
 
-class DeepseekV32Model(nn.Module):
-    """Same as :class:`DeepseekV2Model` but built from
-    :class:`DeepseekV32DecoderLayer` (indexer-carrying attention).
-
-    :class:`DeepseekV2Model` hardcodes ``DeepseekV2DecoderLayer`` in its layer
-    list and takes no decoder-layer-type parameter, so the layer construction is
-    reproduced here with the V3.2 decoder layer. Everything else (PP layer
-    range, embedding, final norm, forward) is identical.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-
-        if is_first_pp_rank():
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size, config.hidden_size
-            )
-        self.start_layer, self.end_layer = get_pp_layers(config.num_hidden_layers)
-        self.layers = nn.ModuleList(
-            [
-                DeepseekV32DecoderLayer(i, i - self.start_layer, config)
-                for i in range(self.start_layer, self.end_layer)
-            ]
-        )
-        if is_last_pp_rank():
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(self, input_data: InputData, hidden_states=None, residual=None):
-        if is_first_pp_rank() and hidden_states is None:
-            hidden_states = self.embed_tokens(input_data.get_tokens())
-        for layer in self.layers:
-            hidden_states, residual = layer(input_data, hidden_states, residual)
-        if is_last_pp_rank():
-            hidden_states, _ = self.norm(hidden_states, residual)
-            return hidden_states
-        return hidden_states, residual
-
-
 class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
     """DeepSeek-V3.2 causal LM.
 
     Inherits every V3 weight rule and MoE/MLA loading logic from
-    :class:`DeepseekV2ForCausalLM`; only the backing model class differs (V3.2
-    decoder layers with the DSA indexer). The indexer's replicated linears /
-    norms are not matched by any MLA / MoE / dense rule, so they fall through to
-    the default verbatim copy in the weight loader -- exactly right for unsharded
-    parameters (FP8 ``weight`` + ``weight_scale_inv``, LayerNorm weight/bias,
-    bf16 ``weights_proj``).
-
-    ``DeepseekV2ForCausalLM.__init__`` hardcodes ``DeepseekV2Model``, so this
-    bypasses it and calls the grandparent (:class:`Qwen2MoeForCausalLM`) with the
-    V3.2 model class, then reproduces the tiny MLA ``head_dim`` derivation.
+    :class:`DeepseekV2ForCausalLM`; only the backing model differs: it is
+    :class:`DeepseekV2Model` parameterized with
+    ``decoder_layer_type=DeepseekV32DecoderLayer`` (V3.2 decoder layers with
+    the DSA indexer), so V3.2 also gets the fused all-reduce/norm wiring
+    (``link_fused_reduces``) and the PP-boundary tail reduce. The indexer's
+    replicated linears / norms are not matched by any MLA / MoE / dense rule,
+    so they fall through to the default verbatim copy in the weight loader --
+    exactly right for unsharded parameters (FP8 ``weight`` +
+    ``weight_scale_inv``, LayerNorm weight/bias, bf16 ``weights_proj``).
     """
 
     def __init__(self, config):
-        Qwen2MoeForCausalLM.__init__(self, config, model_type=DeepseekV32Model)
+        super().__init__(
+            config,
+            model_type=partial(
+                DeepseekV2Model, decoder_layer_type=DeepseekV32DecoderLayer
+            ),
+        )
         attn = self.model.layers[0].self_attn
         # V3.2 is always MLA (loader forces config.use_mla=True).
         self.head_dim = attn.kv_lora_rank + attn.qk_rope_head_dim
@@ -902,13 +856,9 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         # in the checkpoint by its parameter path. The MTP head's params live
         # under ``mtp.*`` (no such checkpoint key -- they are ``model.layers.N.*``)
         # and are loaded separately below, so detach the head for the base pass.
-        mtp = self.mtp
-        self.mtp = None
-        try:
+        with detached_head(self, "mtp") as mtp:
             super().load_weights(weights, mp_load_progress)
-        finally:
-            self.mtp = mtp
         # Then the MTP head's layer-``num_hidden_layers`` weights, reusing this
         # model's own rule table + load context (see DeepseekMTP.load_weights).
-        if self.mtp is not None:
-            self.mtp.load_weights(weights, self, mp_load_progress)
+        if mtp is not None:
+            mtp.load_weights(weights, self, mp_load_progress)

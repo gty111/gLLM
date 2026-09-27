@@ -1,8 +1,8 @@
-"""LM Server entrypoint for encoder disaggregation (design §7.2.1).
+"""LM Server entrypoint for encoder disaggregation.
 
 The LM node = Frontend + Router + Scheduler + PP0 Worker + KV/SSM cache, but
 WITHOUT the vision tower (``--skip-visual``). It always does prefill + decode
-itself (no PD split; design §1.2). Phase 1 scope: start with the vision tower
+itself (no PD split). Phase 1 scope: start with the vision tower
 skipped and serve text-only requests (byte-identical to the monolith text
 path). The NIXL receive slot pool, the per-item meta aggregator, the router,
 and discovery are layered on in Phases 3-5.
@@ -37,6 +37,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Do not load the vision tower; visual embeds arrive over NIXL.",
     )
+    p.add_argument(
+        "--enable-ep",
+        dest="use_ep",
+        action="store_true",
+        default=False,
+        help="Enable expert parallelism (off by default; see api_server --help).",
+    )
     # --- Network / GPU ---
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
@@ -68,7 +75,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "detects the routable egress IP toward the discovery server; pass an "
         "explicit IP to override, or '127.0.0.1' for single-node loopback.",
     )
-    # Receive slot pool (design §5.3). Used from Phase 3b.
+    # Receive slot pool. Used from Phase 3b.
     p.add_argument("--mm-recv-slots", type=int, default=None)
     p.add_argument("--mm-max-vis-tokens", type=int, default=None)
     p.add_argument(
@@ -91,7 +98,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main():
     args = build_arg_parser().parse_args()
 
-    # Pin the LM to its physical GPU(s) before any CUDA init (design §3.2). For
+    # Pin the LM to its physical GPU(s) before any CUDA init. For
     # tp_size>1 the visible-device list length must match --tp (the spawned
     # workers use local ranks 0..tp-1 as cuda:0..tp-1 within this mask).
     lm_gpus = [g.strip() for g in str(args.lm_gpu).split(",") if g.strip() != ""]
@@ -130,13 +137,10 @@ def main():
     import gllm.entrypoints.api_server as api
     from gllm.engine.async_llm import AsyncLLM
 
+    # Every engine knob comes from engine_kwargs; the LM node's fixed role
+    # (normal mode, pp=1) is just the EngineConfig defaults.
     api.llm = AsyncLLM(
         host=args.host,
-        launch_mode="normal",
-        worker_ranks=None,
-        pp_size=1,
-        use_ep=False,
-        assigned_layers=None,
         disagg_config=disagg_config,
         **cli_args.engine_kwargs(args),
     )

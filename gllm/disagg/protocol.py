@@ -1,4 +1,4 @@
-"""Wire formats for the encoder-disaggregation control plane (design §5.2).
+"""Wire formats for the encoder-disaggregation control plane.
 
 All messages are plain dataclasses shipped as pickled python objects over ZMQ
 PUSH/PULL sockets. They are intentionally tiny -- the bulk payload (the visual
@@ -22,7 +22,7 @@ class EncoderJob:
 
     ``content`` is the *raw* mm reference (image URL / path / base64 / video
     ref) exactly as the OpenAI request carried it -- the encoder owns all pixel
-    IO + processing (design §3.1).
+    IO + processing.
 
     Under LM tensor parallelism the *same* visual embedding is needed (full,
     un-sharded) on every LM TP rank, so the embedding is multi-written: one
@@ -49,8 +49,7 @@ class EncoderJob:
     remote_slots: List[RemoteRegion] = field(default_factory=list)
     slot_id: int = -1
     # LM meta-channel (TP0) + per-rank NIXL agent names so a freshly discovered
-    # encoder can reply without a separate registry round-trip (design §5.2 /
-    # §7.3). ``lm_agent_names[0]`` is TP0 and is the single notification target.
+    # encoder can reply without a separate registry round-trip. ``lm_agent_names[0]`` is TP0 and is the single notification target.
     lm_meta_addr: str = ""
     lm_agent_names: List[str] = field(default_factory=list)
 
@@ -59,7 +58,7 @@ class EncoderJob:
 class MmItemMeta:
     """Encoder -> LM PP0: per-item position/shape/hash, sent *before* the ViT.
 
-    This is the control-plane half of the per-item channel (design §5.4): it
+    This is the control-plane half of the per-item channel: it
     lets PP0 expand the skeleton sentinel into ``num_tokens`` placeholder ids
     and build the prefix-cache key (``content_hash``) without waiting for the
     embedding bytes. The embedding-ready signal is delivered separately as a

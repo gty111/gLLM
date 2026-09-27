@@ -31,10 +31,10 @@ PP>1 specifics
 * Sampling: every last-PP TP rank computes logits + samples in
   :meth:`ModelRunner.step_once`, but only the ``output_rank`` token
   list is shipped back. The other last-PP TP ranks do redundant
-  sampling work that the design tolerates (it was already this way
-  pre-refactor).
+  sampling work that the design tolerates.
 """
 
+import dataclasses
 import logging
 import os
 import sys
@@ -65,6 +65,7 @@ from gllm.distributed.parallel_state import (
     send_pp_data,
     set_dp_forward_counts,
 )
+from gllm.runtime.config import EngineConfig
 from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
 from gllm.runtime.profiler import TorchProfilerMixin
@@ -81,41 +82,35 @@ class Worker(TorchProfilerMixin):
 
     def __init__(
         self,
+        config: EngineConfig,
         model_runner: Union[ModelRunner, OverlapModelRunner],
         local_rank,
         pp_rank,
         tp_rank,
-        pp_size,
-        tp_size,
-        use_ep,
-        master_addr,
-        master_port,
         comm: zmqComm,
         mp_alive,
         mp_load_progress,
-        assigned_layers,
-        schedule_method,
-        disagg_config=None,
     ):
+        self.config = config
         self.model_runner = model_runner
         self.local_rank = local_rank
         self.pp_rank = pp_rank
         self.tp_rank = tp_rank
-        self.pp_size = pp_size
-        self.tp_size = tp_size
-        self.use_ep = use_ep
-        self.master_addr = master_addr
-        self.master_port = master_port
+        self.pp_size = config.pp_size
+        self.tp_size = config.tp_size
+        self.use_ep = config.use_ep
+        self.master_addr = config.master_addr
+        self.master_port = config.master_port
         self.comm = comm
         self.mp_alive = mp_alive
         self.mp_load_progress = mp_load_progress
-        self.assigned_layers = assigned_layers
-        self.schedule_method = schedule_method
+        self.assigned_layers = config.assigned_layers
+        self.schedule_method = config.schedule_method
         self.use_mla = model_runner.model_loader.use_mla
         # Encoder-disaggregation config (gllm.disagg.config.DisaggConfig),
         # pickled here from the parent across the spawn boundary; ``None`` on the
         # monolith path.
-        self.disagg_config = disagg_config
+        self.disagg_config = config.disagg_config
         # Encoder-disaggregation LM-side state, built lazily in :meth:`init` when
         # ``disagg_config.is_lm`` is set. ``_disagg_recv`` (the per-rank NIXL
         # slot pool) lives on *every* PP0 TP rank; ``_disagg_coord`` (the TP0
@@ -389,12 +384,24 @@ class Worker(TorchProfilerMixin):
             self.follower_store = FollowerSeqStore(
                 mm_needs_token_ids=self.model_runner.use_mm,
             )
-            # Input data for each rank except 0
             self.schedule_queue = deque()
 
-    # ------------------------------------------------------------------
-    # PP-other receive / forward (unchanged behaviour, sockets per-column)
-    # ------------------------------------------------------------------
+    def _build_dummy_input(self, size: int = 1) -> InputData:
+        """Build a throwaway ``size``-token decode batch for an idle DP group.
+
+        Idle groups must still enter the forward (its MoE layers run a
+        collective over the whole DP/EP world), so they ride along with a dummy
+        batch whose sampled tokens are discarded. The dummy references the
+        memory manager's dummy pages, so it never touches real KV state.
+        """
+        seqs = self.model_runner.create_dummy_seqs(size, runtime=True)
+        dummy = InputData(
+            use_buffer=False,
+            memory_manager=self.model_runner.memory_manager,
+            max_seq_length=self.model_runner.model_max_length,
+        )
+        dummy.cal_input(seqs)
+        return dummy
 
     def recv_schedule_payload(self) -> None:
         """Poll for one :class:`SchedulePayload`, apply it, queue InputData.
@@ -437,13 +444,7 @@ class Worker(TorchProfilerMixin):
         # a dummy input of the agreed size so this stage still joins the MoE
         # collective; its sampled output is discarded (never sent to the driver).
         if payload.dp_dummy_size > 0:
-            dummy_seqs = self.model_runner.create_dummy_seqs(payload.dp_dummy_size, runtime=True)
-            input_data = InputData(
-                use_buffer=False,
-                memory_manager=self.model_runner.memory_manager,
-                max_seq_length=self.model_runner.model_max_length,
-            )
-            input_data.cal_input(dummy_seqs)
+            input_data = self._build_dummy_input(payload.dp_dummy_size)
             input_data.dp_counts = payload.dp_counts
             input_data.dp_padded_size = payload.dp_padded_size
             input_data.dp_dummy = True
@@ -510,7 +511,6 @@ class Worker(TorchProfilerMixin):
     def forward_pp(self):
         if len(self.schedule_queue) != 0:
             input_data: InputData = self.schedule_queue.popleft()
-            # pp last rank => pp next rank
             recv_pp_data(
                 get_last_pp_rank(),
                 input_data.tokens_cpu.shape[0],
@@ -542,16 +542,12 @@ class Worker(TorchProfilerMixin):
                     self.comm.send_tokens(
                         (
                             output,
-                            self.model_runner._last_logprobs,
-                            self.model_runner._last_prompt_logprobs,
+                            self.model_runner.last_logprobs,
+                            self.model_runner.last_prompt_logprobs,
                         )
                     )
             elif not is_last_pp_rank():
                 send_pp_data(output, get_next_pp_rank())
-
-    # ------------------------------------------------------------------
-    # PP=0 column driver: input distribution, scheduling, forward, output
-    # ------------------------------------------------------------------
 
     def _polls_frontend(self) -> bool:
         """Whether this rank talks to the frontend (polls requests / sends output).
@@ -753,33 +749,60 @@ class Worker(TorchProfilerMixin):
             ssm_restores=ssm_restores,
         )
 
-    def _schedule_forward_dp(self):
-        """DP-attention + EP scheduling step (lockstep across replicas).
+    def _dp_forward_barrier(self, real_ntok: int, is_decode: bool):
+        """Cross-DP lockstep barrier: agree on who runs + the graph decision.
 
         Every replica schedules its *own* shard independently, so the batches
         (and even whether a replica has any work) differ per replica. But the
         MoE layers run a collective (all-gather + all-reduce) over the whole DP
         group, so all replicas must enter -- and stay in -- the forward
         together. We enforce that with a single unconditional all-gather of the
-        per-replica token count each iteration:
+        per-replica token count each iteration.
 
-        * if *every* replica is idle, all skip the forward in unison;
-        * otherwise all replicas forward. An idle replica runs a 1-token dummy
-          batch so every kernel still sees >=1 token; its dummy row rides along
-          in the MoE gather and its sampled token is discarded.
+        ``is_decode`` must mark this group's step as pure decode; idle groups
+        pass ``True`` so they don't veto the graph path (their 1-token dummy is
+        a decode step).
 
-        The published forward counts (``set_dp_forward_counts``) tell each MoE
-        layer how to size / slice the gather. There are two shapes:
+        Returns ``(counts_to_publish, padded_size)``, or ``None`` when *every*
+        group is idle -- the caller then skips the forward in unison (a lone
+        MoE collective would hang). ``counts_to_publish`` is what
+        ``set_dp_forward_counts`` (and, under PP, the schedule payload) should
+        carry. The published counts tell each MoE layer how to size / slice the
+        gather, in two shapes:
 
-        * **Pure decode across *all* groups** -> take the CUDA-graph path: pad
-          every group to one common bucket (the smallest captured bucket
+        * **Pure decode across *all* groups** -> the CUDA-graph path: every
+          group publishes one common bucket (the smallest captured bucket
           ``>= max`` over the groups) so the global MoE batch is a static
           ``dp_size * bucket`` (SGLang's MAX_LEN mode) that the captured
           gather/all-reduce can replay.
-        * **Any prefill / mixed / bucket-miss** -> eager, variable-length gather
-          (SGLang's SUM_LEN mode); no graph.
+        * **Any prefill / mixed / bucket-miss** -> eager, variable-length
+          gather (SGLang's SUM_LEN mode); no graph. Idle groups publish their
+          1-token dummy size.
         """
-        schedule_seqs = self.scheduler.schedule_once()
+        real_counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
+        if sum(real_counts) == 0:
+            return None
+        # Idle replicas pad to a 1-token dummy so all kernels see >=1 token.
+        fwd_counts = [c if c > 0 else 1 for c in real_counts]
+        # Graph only when *every* group is a pure-decode (or idle-dummy) step
+        # and a common captured bucket covers the largest group.
+        padded_size = None
+        if all(bool(d) for d in decode_flags):
+            padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
+        counts_to_publish = (
+            [padded_size] * self.dp_size if padded_size is not None else fwd_counts
+        )
+        return counts_to_publish, padded_size
+
+    def _dp_prepare_and_barrier(self, schedule_seqs):
+        """Schedule-side half of the DP lockstep, shared by PP=1 and PP>1.
+
+        Measures the local batch (idle groups report 0 tokens / decode so they
+        don't veto the graph path), runs the cross-DP barrier, and pads an idle
+        local group with a 1-token dummy so all kernels see >=1 token. Returns
+        ``(real_ntok, counts_to_publish, padded_size)``, or ``None`` when every
+        group is idle and the caller must skip the forward in unison.
+        """
         real_ntok = 0
         # Idle groups have no batch; treat them as decode so they don't veto the
         # graph path (their 1-token dummy is a decode step).
@@ -791,26 +814,31 @@ class Worker(TorchProfilerMixin):
 
         # Unconditional per-iter barrier: agree on who runs and whether the whole
         # world can take the graph path this step.
-        real_counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
-        if sum(real_counts) == 0:
-            return
+        barrier = self._dp_forward_barrier(real_ntok, is_decode)
+        if barrier is None:
+            return None
+        counts_to_publish, padded_size = barrier
 
         # Idle replicas pad to a 1-token dummy so all kernels see >=1 token.
-        fwd_counts = [c if c > 0 else 1 for c in real_counts]
         if real_ntok == 0:
             dummy_seqs = self.model_runner.create_dummy_seqs(1, runtime=True)
             self.model_runner.prepare_input(dummy_seqs)
+        return real_ntok, counts_to_publish, padded_size
 
-        # Graph only when *every* group is a pure-decode (or idle-dummy) step and
-        # a common captured bucket covers the largest group.
-        padded_size = None
-        if all(bool(d) for d in decode_flags):
-            padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
+    def _schedule_forward_dp(self):
+        """DP-attention + EP scheduling step (lockstep across replicas).
 
-        if padded_size is not None:
-            set_dp_forward_counts([padded_size] * self.dp_size)
-        else:
-            set_dp_forward_counts(fwd_counts)
+        Runs the cross-DP barrier (:meth:`_dp_forward_barrier`), pads an idle
+        local group with a 1-token dummy whose sampled token is discarded, and
+        forwards. TP token fan-out within a DP group is unchanged.
+        """
+        schedule_seqs = self.scheduler.schedule_once()
+        prepared = self._dp_prepare_and_barrier(schedule_seqs)
+        if prepared is None:
+            return
+        real_ntok, counts_to_publish, padded_size = prepared
+
+        set_dp_forward_counts(counts_to_publish)
         try:
             output = self.model_runner.step_once(dp_padded_size=padded_size)
         finally:
@@ -824,7 +852,7 @@ class Worker(TorchProfilerMixin):
         next_tokens = output
         # PP=1: the output rank (this group's tp0, == the frontend poller) holds
         # the logprobs locally; other TP ranks' scheduler output is discarded.
-        logprobs = self.model_runner._last_logprobs if is_output_rank() else None
+        logprobs = self.model_runner.last_logprobs if is_output_rank() else None
         if get_tp_size() > 1:
             next_tokens = self.comm.broadcast_tokens_to_tp(
                 next_tokens if is_output_rank() else None
@@ -844,31 +872,11 @@ class Worker(TorchProfilerMixin):
         stages, which replay them without re-running the barrier. Sampled tokens
         come back later from the group's last stage via :meth:`recv_next_tokens`.
         """
-        import dataclasses
-
         schedule_seqs = self.scheduler.schedule_once()
-        real_ntok = 0
-        is_decode = True
-        if schedule_seqs:
-            self.model_runner.prepare_input(schedule_seqs)
-            real_ntok = int(self.model_runner.input_data.tokens_cpu.shape[0])
-            is_decode = self.model_runner.check_decode_batch()
-
-        real_counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)
-        if sum(real_counts) == 0:
+        prepared = self._dp_prepare_and_barrier(schedule_seqs)
+        if prepared is None:
             return
-
-        fwd_counts = [c if c > 0 else 1 for c in real_counts]
-        if real_ntok == 0:
-            dummy_seqs = self.model_runner.create_dummy_seqs(1, runtime=True)
-            self.model_runner.prepare_input(dummy_seqs)
-
-        padded_size = None
-        if all(bool(d) for d in decode_flags):
-            padded_size = self.model_runner.dp_select_bucket(max(fwd_counts))
-        counts_to_publish = (
-            [padded_size] * self.dp_size if padded_size is not None else fwd_counts
-        )
+        real_ntok, counts_to_publish, padded_size = prepared
 
         # Ship this column's schedule delta (real work) or a dummy marker to the
         # PP-other stages, piggybacking the agreed DP counts + graph bucket.
@@ -904,17 +912,13 @@ class Worker(TorchProfilerMixin):
         schedule_seqs = self.scheduler.schedule_once()
         if len(schedule_seqs) == 0:
             return
-        # Every PP-0 column driver builds its own per-column delta
-        # payload (cursors are per-rank). For ``pp_size > 1`` the
-        # payload also carries ``mrope_positions`` for VL models,
-        # which only get computed inside ``prepare_input``, so the
-        # send to PP-other followers must happen *after* local input
-        # prep. (Pre-refactor we used to do an extra "early send" to
-        # TP followers without ``mrope_positions`` so their
-        # ``cal_input`` could overlap with ours, but with the
-        # per-column scheduler design TP followers no longer exist.)
-        # For ``pp_size == 1`` ``send_schedule_payload`` is an inline
-        # no-op since this column has no PP-other followers.
+        # Each PP-0 column driver builds its own per-column delta payload
+        # (cursors are per-rank). For ``pp_size > 1`` the payload also carries
+        # ``mrope_positions`` for VL models, which only get computed inside
+        # ``prepare_input``, so the send to PP-other followers must happen
+        # *after* local input prep. For ``pp_size == 1``
+        # ``send_schedule_payload`` is an inline no-op since this column has no
+        # PP-other followers.
         payload = self._build_schedule_payload(schedule_seqs)
         # One authoritative call: decides whether this iteration speculates
         # (cached for the gate sites in prep / ``step_once``) and times the
@@ -934,8 +938,6 @@ class Worker(TorchProfilerMixin):
         if payload is not None and get_pp_size() > 1:
             # Subsequent PP stages don't run ``_mm_prepare_cpu``,
             # so we ship the m-rope positions we just built.
-            import dataclasses
-
             pp_payload = dataclasses.replace(
                 payload,
                 mrope_positions=(
@@ -952,7 +954,7 @@ class Worker(TorchProfilerMixin):
             # Generation logprobs (if any) are computed on the output rank in
             # ``step_once`` and stashed on the runner as a per-batch-row list.
             logprobs = (
-                self.model_runner._last_logprobs if is_output_rank() else None
+                self.model_runner.last_logprobs if is_output_rank() else None
             )
             if get_pp_size() == 1:
                 # PP=1: every TP rank is also a column driver and
@@ -986,13 +988,12 @@ class Worker(TorchProfilerMixin):
                     (
                         next_tokens,
                         logprobs,
-                        self.model_runner._last_prompt_logprobs,
+                        self.model_runner.last_prompt_logprobs,
                     )
                 )
             # last-PP TP>0 ranks for PP>1: discard ``next_tokens``;
             # they don't drive a scheduler.
         else:
-            # PP-0 / mid-PP ranks: send hidden states downstream.
             send_pp_data(output, get_next_pp_rank())
 
     def run_pp0(self):
@@ -1029,11 +1030,9 @@ class Worker(TorchProfilerMixin):
         # op that needs every rank to participate, but a crashed rank means the
         # group is already unhealthy -- the other ranks are still blocked in the
         # in-flight NCCL collective (e.g. forward's all-reduce) and will never
-        # join the destroy, so ``destroy_process_group`` blocks forever inside
-        # NCCL. That is the "worker hangs on exit" symptom: the process never
-        # reaches ``os._exit`` and never releases its ~96GB, so the whole group
-        # has to be killed by hand. ``os._exit`` skips atexit/GC and lets the OS
-        # reclaim the CUDA context / NCCL fds / memory immediately; the parent's
+        # join the destroy, so ``destroy_process_group`` would block forever
+        # inside NCCL. ``os._exit`` skips atexit/GC and lets the OS reclaim the
+        # CUDA context / NCCL fds / memory immediately; the parent's
         # ``mp_alive == -1`` watchdog then tears down the rest of the group.
         self.mp_alive[self.local_rank] = -1
         sys.stdout.flush()
