@@ -10,8 +10,7 @@ Architectural cheat-sheet (Qwen3.5-0.8B config):
   the kernel (sglang Qwen3.5 ``self_attention``).
 * MRoPE with ``partial_rotary_factor = 0.25`` (so only the first
   ``head_dim * 0.25`` dims of q/k are rotated) and ``mrope_interleaved =
-  True``. Phase D wires the interleaved MRoPE through ``MRotaryEmbedding``;
-  here we just propagate the factor.
+  True`` (wired through ``MRotaryEmbedding``).
 * GDN linear-attention layer (Gated DeltaNet, fused-projection variant):
 
       x  -> in_proj_qkvz -> [Q, K, V, Z]   (MergedColumnParallelLinear of
@@ -797,7 +796,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 query_start_loc,
                 getattr(input_data, "seq_lens_cpu", None),
             )
-            # Phase G.3: persist the just-computed state into a snapshot arena
+            # Persist the just-computed state into a snapshot arena
             # entry for seqs whose chunk ended on an eligible page boundary.
             # ``InputData`` borrows the entry lazily for this forward. This is
             # how cross-seq prefix-cache hits later restore the GDN
@@ -1062,11 +1061,10 @@ class Qwen3_5Model(nn.Module):
         # The last PP rank needs the token embedding too when it carries a
         # tied LM head, or an MTP head: the head embeds the token it drafts
         # from (``Qwen3_5MTP._embed``), and with an untied checkpoint nothing
-        # else would put the table on that rank -- it used to fail at the
-        # first draft step with a bare ``no attribute '_embed'``. The base
-        # loader keys off ``named_parameters()``, so simply owning the module
-        # is enough for ``model.embed_tokens.weight`` to be loaded here; the
-        # cost is one extra copy of the table on that rank.
+        # else would put the table on that rank. The base loader keys off
+        # ``named_parameters()``, so simply owning the module is enough for
+        # ``model.embed_tokens.weight`` to be loaded here; the cost is one
+        # extra copy of the table on that rank.
         needs_embed_for_head = is_last_pp_rank() and (
             getattr(config, "tie_word_embeddings", False) or _use_mtp(config)
         )
@@ -1207,9 +1205,8 @@ def _load_gdn_layer_weights(layer: Qwen3_5GatedDeltaNet, prefix: str, weights):
     ``in_proj_qkvz`` / ``in_proj_ba`` parameters that match sglang's layout.
 
     All slicing is TP-rank-local: the source checkpoint stores the full
-    tensors and we keep only this rank's share. The slicing pattern matches
-    ``mamba_v2_sharded_weight_loader`` (per-component sharding along output
-    dim).
+    tensors and we keep only this rank's share (per-component sharding along
+    the output dim).
 
     When the linear projections are FP8 block-quantized
     (``in_proj_qkv``/``in_proj_z``/``out_proj`` on the Qwen3.5-MoE-FP8
@@ -1297,7 +1294,6 @@ def _load_gdn_layer_weights(layer: Qwen3_5GatedDeltaNet, prefix: str, weights):
         )
 
 
-# ---------------------------------------------------------------------------
 def _use_mtp(config) -> bool:
     """Whether an MTP head will be built for this config.
 

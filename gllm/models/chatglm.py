@@ -134,9 +134,7 @@ class GLMBlock(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, input_data: InputData):
         # hidden_states: [num_tokens, h]
-        # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
-        # Residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
         else:
@@ -151,10 +149,8 @@ class GLMBlock(nn.Module):
 
         layernorm_input = residual + attention_output
 
-        # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
 
-        # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
         else:
@@ -189,7 +185,6 @@ class GLMTransformer(nn.Module):
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
         for layer in self.layers:
             hidden_states = layer(hidden_states, input_data)
-        # Final layer norm.
         if is_last_pp_rank():
             if self.post_layer_norm:
                 hidden_states = self.final_layernorm(hidden_states)
@@ -220,7 +215,6 @@ class ChatGLMModel(nn.Module):
         if is_first_pp_rank() and hidden_states is None:
             hidden_states = self.embedding(input_data.get_tokens())
 
-        # Run encoder.
         hidden_states = self.encoder(input_data, hidden_states)
         return hidden_states
 

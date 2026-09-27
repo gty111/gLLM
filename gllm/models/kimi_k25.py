@@ -274,7 +274,6 @@ class KimiK25ForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
             multimodal_embeddings=multimodal_embeddings,
         )
 
-    # ------------------------------------------------------------------
     def forward(self, input_data, hidden_states=None, residual=None):
         return self.language_model(input_data, hidden_states, residual)
 

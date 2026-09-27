@@ -172,7 +172,6 @@ class Qwen2DecoderLayer(nn.Module):
             lambda x: self.self_attn(input_data, x), hidden_states, residual
         )
 
-        # Fully Connected
         hidden_states, residual = maybe_fused_norm(
             hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
         )

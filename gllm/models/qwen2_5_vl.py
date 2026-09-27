@@ -199,7 +199,6 @@ class Qwen2_5_VisionAttention(nn.Module):
         attention_backend: str = "flashinfer",
     ) -> None:
         super().__init__()
-        # Per attention head and per partition values.
         self.tp_size = get_tp_size()
         self.tp_rank = get_tp_rank()
         self.hidden_size_per_attention_head = divide(projection_size, num_heads)
@@ -613,7 +612,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         x: torch.Tensor,
         grid_thw: list[list[int]],
     ) -> torch.Tensor:
-        # patchify
         seq_len, _ = x.size()
         rotary_pos_emb = []
         window_index: list = []
@@ -658,7 +656,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         cu_seqlens = torch.cumsum(cu_seqlens, dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
-        # transformers
         # pre-compute seqlens for window/full attn to reduce cuMemcpy operations
         max_seqlen_full = self.compute_attn_mask_seqlen(cu_seqlens)
         max_seqlen_window = self.compute_attn_mask_seqlen(cu_window_seqlens)
@@ -696,7 +693,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         if hidden_states.dtype == torch.float16:
             hidden_states = cast_overflow_tensors(hidden_states)
 
-        # adapter
         hidden_states = self.merger(hidden_states)
         reverse_indices = torch.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
@@ -723,7 +719,7 @@ class Qwen2_5_VLForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
         # Encoder-disaggregation: the LM node skips the vision tower (visual
         # embeddings arrive over NIXL from a separate encoder process); the
         # encoder node skips the language model. See
-        # docs/encoder_disaggregation_design.md §4.3. Qwen2.5-VL has no
+        # docs/encoder_disaggregation_usage.md. Qwen2.5-VL has no
         # deepstack, so the per-item embedding is plain ``[N_vis, visual_dim]``.
         self.skip_visual = getattr(config, "skip_visual", False)
         if self.skip_visual or not is_first_pp_rank():
@@ -887,7 +883,6 @@ class Qwen2_5_VLForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
             pixel_values = image_input["pixel_values"]
             image_embeds = self.visual(pixel_values, grid_thw=grid_thw_list)
 
-        # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
         sizes = grid_thw.prod(-1) // merge_size // merge_size
 
@@ -907,7 +902,6 @@ class Qwen2_5_VLForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
             pixel_values_videos = video_input["pixel_values_videos"]
             video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw_list)
 
-        # Split concatenated embeddings for each video item.
         merge_size = self.visual.spatial_merge_size
         sizes = grid_thw.prod(-1) // merge_size // merge_size
 
@@ -941,8 +935,6 @@ class Qwen2_5_VLForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
         if not mm_input_by_modality:
             return []
 
-        # The result multimodal_embeddings is tuple of tensors, with each
-        # tensor correspoending to a multimodal data item (image or video).
         multimodal_embeddings: tuple[torch.Tensor, ...] = ()
 
         # NOTE: It is important to iterate over the keys in this dictionary
@@ -961,7 +953,7 @@ class Qwen2_5_VLForConditionalGeneration(NestedLanguageModelMixin, nn.Module):
         """Encode exactly one mm item and return its raw visual embedding.
 
         Thin wrapper over :meth:`embed_multimodal` for the per-item encoder
-        path (encoder disaggregation, design §4.2.1): ``mm_input`` carries a
+        path (encoder disaggregation): ``mm_input`` carries a
         single image/video item. Returns the ``[N_vis_i, visual_dim]`` tensor
         that is the i-th element of the monolith's ``embed_multimodal`` tuple,
         so the encoder output is numerically identical to the monolith.

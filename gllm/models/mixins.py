@@ -21,7 +21,6 @@ class StandardCausalLMMixin:
     backbone ``self.model`` that itself exposes ``embed_input_ids``."""
 
     def compute_logits(self, input_data: InputData, hidden_states: torch.Tensor):
-        # fetch hidden_states of last token in each seq
         idx_list = input_data.get_query_start_loc() - 1
         return self.logits_from_hidden(hidden_states[idx_list[1:]])
 

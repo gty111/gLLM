@@ -100,7 +100,6 @@ class MixtralDecoderLayer(nn.Module):
             lambda x: self.self_attn(input_data, x), hidden_states, residual
         )
 
-        # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.block_sparse_moe(hidden_states)
         return hidden_states, residual

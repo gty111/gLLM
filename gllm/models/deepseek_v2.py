@@ -372,7 +372,6 @@ class DeepseekV2MLAAttention(AttentionLayerBase):
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
-        # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
         q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
@@ -435,7 +434,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -447,7 +445,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             lambda x: self.self_attn(input_data, x), hidden_states, residual
         )
 
-        # Fully Connected
         hidden_states, residual = maybe_fused_norm(
             hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
         )

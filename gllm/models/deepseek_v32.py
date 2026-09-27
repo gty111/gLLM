@@ -10,16 +10,8 @@ lightweight side path (``self_attn.indexer.{wq_b, wk, k_norm, weights_proj}``)
 that scores every cached key against each query and keeps only the top
 ``index_topk`` (2048) tokens, which are then fed as a sparse mask into MLA
 attention. For any sequence no longer than ``index_topk`` the top-k selects
-*all* keys, so DSA is mathematically identical to dense MLA there.
-
-Staged bring-up:
-
-* **Stage 1 (this file's initial form):** construct the indexer so its weights
-  load, but run the inherited *dense* MLA forward. Exact for context
-  <= ``index_topk``; an approximation (attends to all keys) beyond it.
-* **Stage 3/4 (TODO):** feed the indexer's top-k selection into the sparse
-  FlashMLA kernels (``flash_mla_with_kvcache(indices=...)`` /
-  ``flash_mla_sparse_fwd``) for true sparse attention at long context.
+*all* keys, so DSA is mathematically identical to dense MLA there — that is
+the correctness oracle used to validate the sparse path.
 
 Reference: HuggingFace ``transformers>=5.11`` ``modeling_deepseek_v32`` /
 ``modular_deepseek_v32`` (the concise diff-from-V3).
@@ -80,10 +72,6 @@ class DeepseekV32Indexer(nn.Module):
     applies **non-interleaved (neox / half-split) RoPE** to the first
     ``qk_rope_head_dim`` dims of its head -- hence its own rotary embedding
     instance with ``is_neox_style=True``.
-
-    NOTE: not yet wired into the attention hot path (see module docstring); the
-    module exists so its weights load, and its ``forward`` is validated /
-    consumed in the sparse-attention stages.
     """
 
     def __init__(self, config, layer_id: int):
