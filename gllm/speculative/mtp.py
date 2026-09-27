@@ -1133,6 +1133,8 @@ class MtpMixin:
             # (``mm_prepare_inputs``) finds a position delta for this dummy --
             # but ONLY if this id isn't already a live entry (never clobber).
             if self.use_mm and self.uses_mrope and sid not in self.embedding_cache:
+                from gllm.multimodal.mixin import EmbeddingInfo
+
                 self.embedding_cache[sid] = EmbeddingInfo(
                     mrope_position_delta=torch.zeros(1, dtype=torch.long, device="cuda"),
                 )
