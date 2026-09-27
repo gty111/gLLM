@@ -35,6 +35,13 @@ addresses refer to that machine. Tool execution remains the client's responsibil
 
 ## Supported tool flow
 
+- Client-executed tool search (`type: "tool_search", execution: "client"`).
+  Search calls return native `tool_search_call` items with object arguments;
+  the client performs discovery and returns `tool_search_output` with the
+  discovered function/custom tools or namespaces. Those definitions become
+  callable on subsequent turns, including stored continuations. Tools marked
+  `defer_loading: true` are omitted until discovered. Hosted tool search is
+  not supported.
 - Function tools and custom tools, including tools grouped in a namespace.
   Namespaces require `name`, `description`, and `tools`. Two namespaces may use
   the same leaf tool name; calls retain their namespace in the response and history.
