@@ -93,9 +93,6 @@ class VisionEncoderRunner:
             "VisionEncoderRunner ready: vision tower loaded, language model skipped"
         )
 
-    # ------------------------------------------------------------------
-    # CPU: processor + grid + token count + content hash (per item)
-    # ------------------------------------------------------------------
     def run_processor(
         self, content, modality: str
     ) -> Tuple[Dict, torch.Tensor]:
@@ -127,7 +124,6 @@ class VisionEncoderRunner:
                 "pixel_values_videos": out["pixel_values_videos"],
                 "video_grid_thw": grid_thw,
             }
-            # carry through optional video timing kwargs if present
             for k in ("second_per_grid_ts", "timestamps"):
                 if k in out:
                     mm_input[k] = out[k]
@@ -145,9 +141,6 @@ class VisionEncoderRunner:
             pixel = mm_input.get("pixel_values_videos")
         return _build_item_content_hash(pixel, grid_thw)
 
-    # ------------------------------------------------------------------
-    # GPU: ViT (per item), with per-replica dedup cache
-    # ------------------------------------------------------------------
     @torch.inference_mode()
     def encode(self, mm_input: Dict, content_hash: bytes) -> torch.Tensor:
         cached = self.mm_embed_cache.get(content_hash)

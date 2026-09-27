@@ -214,10 +214,6 @@ class OverlapWorker(Worker):
         # once and the correct re-prefill boundary.
         return self._publish_mtp_relay_only() or changed
 
-    # ------------------------------------------------------------------
-    # Forward-pipeline helpers
-    # ------------------------------------------------------------------
-    #
     # ``recv_ipc_package`` / ``check_abort_seqs`` / ``_translate_control_cmd``
     # are inherited unchanged from :class:`Worker`. The new column-driver
     # base class already runs them on every PP=0 TP rank with the zmq
@@ -248,20 +244,14 @@ class OverlapWorker(Worker):
     def _build_prefetched_input(self) -> None:
         """Schedule the next batch locally; no inter-TP zmq send.
 
-        Pre-refactor we'd build a delta-style :class:`SchedulePayload`
-        and ship it to TP followers here so their ``cal_input``
-        overlapped with ours. With the column-driver design every TP
-        rank reaches this method on its own schedule loop, runs the
-        same deterministic scheduler against the same state, and
-        builds its own ``InputData`` -- so there's nothing to send.
+        With the column-driver design every TP rank runs the same
+        deterministic scheduler against the same state and builds its own
+        ``InputData`` -- so there is nothing to send.
         """
-        # Drain the scheduler's pending-follower-frees accumulator
-        # every iter. Pre-refactor, ``Worker._build_schedule_payload``
-        # consumed it on the way to building the per-iter delta
-        # payload; the new design has no payload to build (PP=1, no
-        # followers), so the list would otherwise grow unbounded as
-        # seqs hit max_len / EOS. Cheap (a list = []) and keeps
-        # peak-memory predictable.
+        # Drain the scheduler's pending-follower-frees accumulator every
+        # iter: under PP=1 there is no payload build to consume it, so the
+        # list would otherwise grow unbounded as seqs hit max_len / EOS.
+        # Cheap (a list = []) and keeps peak-memory predictable.
         with torch.profiler.record_function("gllm::schedule_and_cpu_prepare"):
             schedule_seqs = self.scheduler.schedule_once()
             if get_pp_size() > 1:
@@ -412,11 +402,10 @@ class OverlapWorker(Worker):
     def _retire_loop(self) -> None:
         """Drain launched batches' completion events off the driver thread.
 
-        The driver used to block here itself. Averaged over a run that looks
-        harmless -- it has milliseconds of slack per iteration -- but the block
-        is not spread evenly. Only the wait and the D2H read move; the
-        scheduler finalize stays on the driver, because every column driver
-        must run it in the same order.
+        Blocking on the driver looks harmless (milliseconds of slack per
+        iteration on average) but the block is not spread evenly. Only the
+        wait and the D2H read move; the scheduler finalize stays on the
+        driver, because every column driver must run it in the same order.
         """
         armed = False
         while True:
@@ -460,14 +449,10 @@ class OverlapWorker(Worker):
         """Retire batches beyond the collect lag, oldest first.
 
         Blocking here does gate the launch rate -- the driver waits on batch k
-        before it may issue k + depth -- and that loop is visible as a stall
-        recurring every ``depth + 1`` launches (nsys: the driver sits in
-        ``sem_wait`` for 26 ms of a long gap, against 0 in a normal one).
-        Breaking the gate does remove the stall, confirmed by nsys, and it
-        makes throughput *worse*: 2036.7 -> 2012.7 tok/s, 0/6 paired wins.
-        The GPU is not starved during those stalls -- it still has queued work
-        -- so letting the driver run further ahead only costs more in-flight
-        input staging. The gate stays.
+        before it may issue k + depth. Removing the gate was measured to make
+        throughput *worse* (2036.7 -> 2012.7 tok/s): the GPU is not starved
+        during those stalls, so letting the driver run further ahead only
+        costs more in-flight input staging. The gate stays.
         """
         while len(self._gpu_pending) > self._collect_lag:
             self._collect_batch(self._take_oldest())
@@ -697,11 +682,10 @@ class OverlapWorker(Worker):
         # batch bookkeeping when the fused fast path is guaranteed to be taken.
         # MTP graphs are captured on ``OverlapModelRunner.forward_stream`` (see
         # its ``capture_graph`` override), so replay and every metadata/state
-        # update feeding that replay must run on the same stream. Previously
-        # this synchronous bypass executed on the caller's default stream. That
-        # violated the capture/replay stream contract and also raced SSM block
-        # zero/free operations against the next verify, causing silent GDN state
-        # drift and eventually illegal memory accesses on long generations.
+        # update feeding that replay must run on the same stream; running this
+        # step on the caller's default stream would violate the capture/replay
+        # stream contract and race SSM block zero/free operations against the
+        # next verify (silent GDN state drift, illegal memory accesses).
         next_tokens, default_stream, forward_stream = self._launch_mtp_step(
             batch, asynchronous=False
         )

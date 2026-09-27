@@ -31,8 +31,7 @@ PP>1 specifics
 * Sampling: every last-PP TP rank computes logits + samples in
   :meth:`ModelRunner.step_once`, but only the ``output_rank`` token
   list is shipped back. The other last-PP TP ranks do redundant
-  sampling work that the design tolerates (it was already this way
-  pre-refactor).
+  sampling work that the design tolerates.
 """
 
 import dataclasses
@@ -385,12 +384,7 @@ class Worker(TorchProfilerMixin):
             self.follower_store = FollowerSeqStore(
                 mm_needs_token_ids=self.model_runner.use_mm,
             )
-            # Input data for each rank except 0
             self.schedule_queue = deque()
-
-    # ------------------------------------------------------------------
-    # PP-other receive / forward (unchanged behaviour, sockets per-column)
-    # ------------------------------------------------------------------
 
     def _build_dummy_input(self, size: int = 1) -> InputData:
         """Build a throwaway ``size``-token decode batch for an idle DP group.
@@ -517,7 +511,6 @@ class Worker(TorchProfilerMixin):
     def forward_pp(self):
         if len(self.schedule_queue) != 0:
             input_data: InputData = self.schedule_queue.popleft()
-            # pp last rank => pp next rank
             recv_pp_data(
                 get_last_pp_rank(),
                 input_data.tokens_cpu.shape[0],
@@ -555,10 +548,6 @@ class Worker(TorchProfilerMixin):
                     )
             elif not is_last_pp_rank():
                 send_pp_data(output, get_next_pp_rank())
-
-    # ------------------------------------------------------------------
-    # PP=0 column driver: input distribution, scheduling, forward, output
-    # ------------------------------------------------------------------
 
     def _polls_frontend(self) -> bool:
         """Whether this rank talks to the frontend (polls requests / sends output).
@@ -923,17 +912,13 @@ class Worker(TorchProfilerMixin):
         schedule_seqs = self.scheduler.schedule_once()
         if len(schedule_seqs) == 0:
             return
-        # Every PP-0 column driver builds its own per-column delta
-        # payload (cursors are per-rank). For ``pp_size > 1`` the
-        # payload also carries ``mrope_positions`` for VL models,
-        # which only get computed inside ``prepare_input``, so the
-        # send to PP-other followers must happen *after* local input
-        # prep. (Pre-refactor we used to do an extra "early send" to
-        # TP followers without ``mrope_positions`` so their
-        # ``cal_input`` could overlap with ours, but with the
-        # per-column scheduler design TP followers no longer exist.)
-        # For ``pp_size == 1`` ``send_schedule_payload`` is an inline
-        # no-op since this column has no PP-other followers.
+        # Each PP-0 column driver builds its own per-column delta payload
+        # (cursors are per-rank). For ``pp_size > 1`` the payload also carries
+        # ``mrope_positions`` for VL models, which only get computed inside
+        # ``prepare_input``, so the send to PP-other followers must happen
+        # *after* local input prep. For ``pp_size == 1``
+        # ``send_schedule_payload`` is an inline no-op since this column has no
+        # PP-other followers.
         payload = self._build_schedule_payload(schedule_seqs)
         # One authoritative call: decides whether this iteration speculates
         # (cached for the gate sites in prep / ``step_once``) and times the
@@ -1009,7 +994,6 @@ class Worker(TorchProfilerMixin):
             # last-PP TP>0 ranks for PP>1: discard ``next_tokens``;
             # they don't drive a scheduler.
         else:
-            # PP-0 / mid-PP ranks: send hidden states downstream.
             send_pp_data(output, get_next_pp_rank())
 
     def run_pp0(self):
@@ -1046,11 +1030,9 @@ class Worker(TorchProfilerMixin):
         # op that needs every rank to participate, but a crashed rank means the
         # group is already unhealthy -- the other ranks are still blocked in the
         # in-flight NCCL collective (e.g. forward's all-reduce) and will never
-        # join the destroy, so ``destroy_process_group`` blocks forever inside
-        # NCCL. That is the "worker hangs on exit" symptom: the process never
-        # reaches ``os._exit`` and never releases its ~96GB, so the whole group
-        # has to be killed by hand. ``os._exit`` skips atexit/GC and lets the OS
-        # reclaim the CUDA context / NCCL fds / memory immediately; the parent's
+        # join the destroy, so ``destroy_process_group`` would block forever
+        # inside NCCL. ``os._exit`` skips atexit/GC and lets the OS reclaim the
+        # CUDA context / NCCL fds / memory immediately; the parent's
         # ``mp_alive == -1`` watchdog then tears down the rest of the group.
         self.mp_alive[self.local_rank] = -1
         sys.stdout.flush()

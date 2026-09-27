@@ -8,10 +8,8 @@ class IDAllocator:
     prefix cache hits the most --- ``popleft``-style allocation,
     ``allocate(id)`` for cache hits, and ``free`` --- are O(1). The
     previous ``deque``-based implementation paid O(n) per cache hit
-    because ``deque.remove`` is linear, which dominated CPU time during
-    long-context prefill (see profile in benchmarks/results: with
-    ~70k free pages and a 48% cache hit rate the deque path can spend
-    seconds per request on remove() alone).
+    because ``deque.remove`` is linear: with ~70k free pages and a 48%
+    cache hit rate that path spent seconds per request on remove() alone.
 
     ``free`` re-inserts at the back to keep the FIFO order so recently
     freed pages stay warm for the prefix cache, mirroring the original

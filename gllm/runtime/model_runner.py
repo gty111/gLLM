@@ -366,11 +366,8 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         #     sequences writes ``B`` token-rows into the shared activation
         #     buffers (``input_hidden_states`` / ``residual`` / PP recv), which
         #     are sized to ``max_num_batched_tokens``. Under ``chunked_prefill``
-        #     / ``split_pd`` that equals ``maxp``, so a small ``--maxp`` (below
-        #     the ``--max-cuda-graph-bs`` default of 512) would overflow those
-        #     buffers *during capture* — e.g. ``--maxp 256`` tried to write 512
-        #     rows into a 256-row buffer and crashed with a shape mismatch on
-        #     ``ssm_state_indices`` / the output hidden states.
+        #     / ``split_pd`` that equals ``maxp``, so a small ``--maxp`` would
+        #     overflow those buffers *during capture*.
         #
         # A real forward never batches more than ``max_num_batched_tokens``
         # tokens (decode eats into the same per-tick budget as prefill), so
@@ -393,7 +390,6 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         # At runtime the actual batch is padded up to the nearest bucket.
         self.capture_sizes = self._build_capture_sizes(self.max_cuda_graph_bs)
 
-        # max length
         self.model_max_length = self.resolve_model_max_length(config.model_max_length)
         # Models size static tables and CUDA-graph-safe static bounds from the
         # config (RoPE tables, worst-case candidate counts). The serving length
@@ -409,13 +405,11 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         # ``InputData``'s per-token buffers are sized ``model_max_length`` (the
         # longest single sequence), but a prefill batch may carry
         # ``max_num_batched_tokens`` (= ``maxp``) tokens. With ``maxp >
-        # model_max_length`` the very first thing that happens -- the profile
-        # run's full-size dummy prefill -- overflows those buffers and dies deep
-        # inside ``copy_to_input_buffer`` with a bare shape mismatch
-        # (``size of tensor a (4096) must match tensor b (8192)``), which says
-        # nothing about the actual misconfiguration. Clamp + say so instead: a
-        # prefill batch can never usefully exceed one sequence's max length,
-        # since chunked prefill already splits longer prompts.
+        # model_max_length`` the profile run's full-size dummy prefill would
+        # overflow those buffers and die deep inside ``copy_to_input_buffer``
+        # with a bare shape mismatch. Clamp + say so instead: a prefill batch
+        # can never usefully exceed one sequence's max length, since chunked
+        # prefill already splits longer prompts.
         if self.max_num_batched_tokens > self.model_max_length:
             logger.warning(
                 f"maxp/max_num_batched_tokens={self.max_num_batched_tokens} "
@@ -585,12 +579,10 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
             capability[1],
         )
 
-    # ------------------------------------------------------------------
     # Read-only facades over private runner state. Workers / the scheduler
     # consume these; the underscored attributes remain the writer-side
     # representation. All are populated in ``init`` (or ``__init__`` where
     # noted) and read only afterwards.
-    # ------------------------------------------------------------------
 
     @property
     def last_logprobs(self):
@@ -683,19 +675,18 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
             # DSA MLA latent cache precision: FP8-packed only when explicitly
             # requested (drives SM90 sparse decode); default bf16 + dense decode.
             mla_cache_fp8=(self.mla_cache_dtype == "fp8"),
-            # MTP draft-chain length for hybrid GDN models: each running seq may
-            # claim 1+mtp_k working/checkpoint entries from the cache arena.
-            # 0 for non-MTP or non-hybrid.
             # Recurrent-state prefix-cache granularity (tokens). Rounded to
             # whole pages by ``PrefixMemoryManager.init``.
             ssm_snapshot_stride_tokens=self.ssm_snapshot_stride_tokens,
+            # MTP draft-chain length for hybrid GDN models: each running seq may
+            # claim 1+mtp_k working/checkpoint entries from the cache arena.
+            # 0 for non-MTP or non-hybrid.
             mtp_k=(
                 self._mtp_k
                 if (ssm_cache_config is not None and self.mtp_enabled)
                 else 0
             ),
         )
-        # Input buffer
         self.input_data = InputData(
             max_running_seqs=self.max_running_seqs,
             max_seq_length=self.model_max_length,
@@ -733,7 +724,6 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         self.input_residual = torch.zeros(
             (self.max_num_batched_tokens, self.hidden_size), device=device
         )
-        # Output buffer
         self.output_hidden_states = torch.zeros(
             (self.max_num_batched_tokens, self.hidden_size), device=device
         )
@@ -952,7 +942,6 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         # Bumped once per ``_mtp_decode`` so the GPU prep can memoize its
         # per-step staging across the draft and verify phases.
         self._mtp_prep_epoch = 0
-        # Profile run
         self.profile_run()
         # Init KV cache at last; only reserve the dummy page when CUDA graphs
         # are actually enabled so we don't waste memory otherwise.
@@ -1445,10 +1434,6 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
             self.output_residual[:num_cal_tokens],
         )
 
-    # ------------------------------------------------------------------
-    # Encoder-disaggregation overlap (design §6.2)
-    # ------------------------------------------------------------------
-
     def disagg_register(self, seq_id: int, state: DisaggSeqState) -> None:
         """Register a disagg seq for overlapped, readiness-gated prefill.
 
@@ -1496,9 +1481,8 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         ``OverlapScheduler.process_output_finalize`` after overwriting the
         placeholder). Keeping the trigger here -- rather than inside
         ``MemoryManager.pre_allocate_page`` -- guarantees the hash is only ever
-        computed over real tokens, never an unfinalized overlap placeholder
-        (see ``docs/prefix_cache_overlap_poisoning.md``). No-op for caches
-        without prefix support.
+        computed over real tokens, never an unfinalized overlap placeholder.
+        No-op for caches without prefix support.
         """
         self.memory_manager.register_decode_boundary(seq, pos)
 
@@ -1522,11 +1506,9 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         the next ``pre_allocate_page`` would happily re-hand it to a
         different seq mid-flight.
 
-        What followers *do* need to release on free is the
-        ``embedding_cache`` row (VL only, first PP rank only) -- the
-        existing code path never reached this because the follower
-        was stateless about seq lifetimes pre-refactor, which leaked
-        a multimodal-embedding tensor per finished VL request.
+        Followers *do* need to release the ``embedding_cache`` row on free
+        (VL only, first PP rank only) -- otherwise each finished VL request
+        leaks a multimodal-embedding tensor.
         """
         self._mtp_relay.pop(seq_id, None)
         if self.use_mm and is_first_pp_rank():
@@ -1540,12 +1522,9 @@ class OverlapModelRunner(ModelRunner):
     def init(self, mp_load_progress=None):
         # Create the overlap CUDA streams BEFORE ``super().init()`` so that
         # ``capture_graph`` (invoked from inside ``super().init()``) can use
-        # ``forward_stream`` as the capture stream. Capturing on the same
-        # stream that ``run_batch_async`` replays on keeps the NCCL kernels
-        # baked into the graph tied to a single CUDA stream across capture
-        # and replay -- mismatch had caused TP ranks to subtly disagree
-        # after many decode steps and surface as repetition loops in long
-        # generations.
+        # ``forward_stream`` as the capture stream. Capture stream must equal
+        # replay stream: a mismatch makes the NCCL kernels baked into the
+        # graph drift TP ranks out of lockstep over many decode steps.
         device = torch.device(f"cuda:{get_local_rank()}")
         self.overlap_runtime = OverlapRuntime(device)
         self.forward_stream = self.overlap_runtime.forward_stream
@@ -1563,20 +1542,12 @@ class OverlapModelRunner(ModelRunner):
         self._init_overlap_buffers()
 
     def capture_graph(self, stream: Optional[torch.cuda.Stream] = None):
-        # Capture on ``forward_stream`` so capture stream == replay stream.
-        # NCCL kernels (e.g. ``embed_tokens`` all_reduce, layer all_reduces)
-        # baked into the graph stay tied to the same CUDA stream across
-        # capture and replay. Without this they were captured on a fresh
-        # private stream that ``torch.cuda.graph`` allocates by default,
-        # then replayed on ``forward_stream`` -- the resulting NCCL/stream
-        # mismatch was letting TP ranks subtly drift over many decode
-        # iterations and produce the long-generation repetition loops.
+        # Capture stream must equal replay stream (see ``init``), or NCCL
+        # kernels baked into the graph drift TP ranks out of lockstep.
         super().capture_graph(stream=self.forward_stream)
 
-    # ------------------------------------------------------------------
     # Read-only facades over the overlap-only state built by
     # ``_init_overlap_buffers`` during ``init``; consumed by OverlapWorker.
-    # ------------------------------------------------------------------
 
     @property
     def overlap_depth(self) -> int:
@@ -1889,21 +1860,15 @@ class OverlapModelRunner(ModelRunner):
             lp_k = None
             lp_gpu = None
             # Determinism/deadlock note: ``compute_logits`` all-gathers, so EVERY
-            # TP rank holds full logits and CAN sample. Historically only the
-            # output rank sampled (others received the broadcast), but under
-            # non-greedy sampling that made the output rank do a heavier kernel
-            # (multi-round rejection sampling) than its peers every step. In the
-            # overlap pipeline that per-rank GPU-time asymmetry lets ranks drift
-            # out of lockstep, and the get_tp_group collective sequence
-            # (graph all-reduce -> LM-head all-gather -> token broadcast) then
-            # interleaves across iterations -> NCCL deadlock (greedy's argmax is
-            # cheap enough to hide it, which is why it only surfaced with
-            # sampling). Fix: run the SAMPLER on every rank so the per-iteration
-            # GPU work + collective cadence is identical across ranks. The result
-            # still diverges by fp all-reduce epsilon (sampling amplifies it), so
-            # the broadcast below keeps the output rank's draw authoritative for
-            # correctness -- but the timing is now symmetric, which is what makes
-            # the pipeline deadlock-free by construction.
+            # TP rank holds full logits and CAN sample -- and under the overlap
+            # pipeline every rank MUST. If only the output rank ran the (heavier,
+            # multi-round rejection) sampling kernel, the per-rank GPU-time
+            # asymmetry would drift ranks out of lockstep and interleave the
+            # get_tp_group collective sequence (graph all-reduce -> LM-head
+            # all-gather -> token broadcast) across iterations -> NCCL deadlock.
+            # All ranks therefore run the sampler for timing symmetry; the
+            # broadcast below keeps the output rank's draw authoritative for
+            # correctness (sampling amplifies fp all-reduce epsilon).
             _all_greedy = all(s.top_k == 1 for s in self.input_data.seqs)
             # MTP verifies on every TP rank, including greedy batches. Keep
             # grammar histories alive on all ranks already during prefill and

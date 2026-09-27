@@ -61,10 +61,10 @@ class CudaGraphMixin:
         ``torch.cuda.graph`` otherwise allocates a brand-new private stream
         each call, which is fine for kernels but interacts poorly with
         captured NCCL ops if replay later happens on a *different* stream
-        (the symptom we hit in TP+overlap runs was gradual KV-cache drift
-        between TP ranks surfacing as repetition loops). Subclasses that
-        replay on a known stream (e.g. ``OverlapModelRunner.forward_stream``)
-        should pass that same stream here so capture and replay agree.
+        (capture/replay stream mismatch lets TP ranks drift over long runs).
+        Subclasses that replay on a known stream (e.g.
+        ``OverlapModelRunner.forward_stream``) should pass that same stream
+        here so capture and replay agree.
         """
         # Raw ``CUDAGraph.capture_begin`` (used by the piecewise segment
         # runner) is illegal on CUDA's default stream. The overlap runner

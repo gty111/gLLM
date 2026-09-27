@@ -94,10 +94,6 @@ import torch
 
 from gllm.runtime.sequence import GenerationSequence
 
-# ---------------------------------------------------------------------------
-# Wire-format dataclasses (pickled by zmq)
-# ---------------------------------------------------------------------------
-
 
 @dataclass(slots=True)
 class SeqRegister:
@@ -245,10 +241,6 @@ class SchedulePayload:
         )
 
 
-# ---------------------------------------------------------------------------
-# Seq field table -- the single source of truth for the register/update protocol
-# ---------------------------------------------------------------------------
-#
 # Mirroring one ``GenerationSequence`` attribute used to mean editing 4-5
 # places in parallel (``SeqRegister`` / ``SeqUpdate`` /
 # ``DriverPayloadBuilder.build`` / ``FollowerSeq.__init__`` +
@@ -425,11 +417,6 @@ def _validate_field_table() -> None:
     }, f"unexpected _SKIP fields: {skipped}"
 
 
-# ---------------------------------------------------------------------------
-# Driver-side builder (rank-0)
-# ---------------------------------------------------------------------------
-
-
 class DriverPayloadBuilder:
     """Builds :class:`SchedulePayload` from rank-0 scheduler state.
 
@@ -454,15 +441,11 @@ class DriverPayloadBuilder:
         self._last_pages_len: Dict[int, int] = {}
         self._last_cache_epoch: Dict[int, int] = {}
 
-    # ------------------------------------------------------------------ free
-
     def forget(self, seq_id: int) -> None:
         """Drop driver-side tracking for a seq the followers will free."""
         self._known.discard(seq_id)
         self._last_pages_len.pop(seq_id, None)
         self._last_cache_epoch.pop(seq_id, None)
-
-    # ------------------------------------------------------------------ build
 
     def build(
         self,
@@ -557,11 +540,6 @@ class DriverPayloadBuilder:
             control_cmd=control_cmd,
             control_data=control_data,
         )
-
-
-# ---------------------------------------------------------------------------
-# Follower-side mirror
-# ---------------------------------------------------------------------------
 
 
 class FollowerSeq:
@@ -662,8 +640,6 @@ class FollowerSeq:
         self.rep_slot = None
         self.rep_filled = 0
 
-    # ---- duck-typed GenerationSequence surface --------------------------------------
-
     @property
     def seq_len(self) -> int:
         return self.computed_token_num + self.to_compute_token_num
@@ -689,8 +665,6 @@ class FollowerSeq:
                 "needs_token_id_accumulation and is not VL."
             )
         return self.token_ids[key]
-
-    # ---- update plumbing --------------------------------------------------
 
     def apply_update(self, upd: SeqUpdate) -> None:
         """In-place absorb a per-iter delta from the driver."""
@@ -749,11 +723,9 @@ class FollowerSeqStore:
         but cheap to be defensive about) does the right thing.
         """
         for reg in payload.registers:
-            # Overwrite an existing entry rather than asserting -- if
-            # rank-0's registry believes the follower needs a fresh
-            # register (e.g. after a state-sync recovery in a future
-            # PD-disagg path), it would resend. Today this branch is
-            # never hit under normal operation.
+            # Overwrite an existing entry rather than asserting -- a resent
+            # register (e.g. after a state-sync recovery) must not crash the
+            # follower.
             self._table[reg.seq_id] = FollowerSeq(
                 reg, mm_needs_token_ids=self._mm_needs_token_ids
             )

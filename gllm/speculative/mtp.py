@@ -297,15 +297,12 @@ class MtpMixin:
                 )
                 self._mtp_tie_overflow.zero_()
         self._mtp_sampling_seen = False
-        # reset window
         self._mtp_m_drafts = 0
         self._mtp_m_accepted = 0
         self._mtp_m_pos = [0] * k
         self._mtp_m_t0 = now
 
-    # ------------------------------------------------------------------
     # MTP rejection sampling (lossless speculative decoding under sampling)
-    # ------------------------------------------------------------------
     def _mtp_rng_step(self, device):
         """Return a TP-synchronized ``torch.Generator`` seeded for this step.
 
@@ -650,7 +647,7 @@ class MtpMixin:
         self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen, sparse=False
     ):
         """Sampled-mode shorthand for :meth:`_draft_chain_eager` (kept for
-        callers/tests that predate the merge of the two eager chains)."""
+        callers/tests)."""
         # Dispatch through the mixin class (not ``self._draft_chain_eager``):
         # tests drive this with a duck-typed ``SimpleNamespace`` runner.
         return MtpMixin._draft_chain_eager(
@@ -926,7 +923,6 @@ class MtpMixin:
             seqs = self.create_dummy_seqs(bucket)
             self._draft_input.cal_and_set_input(seqs)
             self._d_nd = bucket
-            # seed dummy head inputs
             self._d_tok[:bucket].zero_()
             self._d_hidden[:bucket].zero_()
             # warm up JIT outside capture
@@ -1490,9 +1486,6 @@ class MtpMixin:
         )
         return gp
 
-    # ------------------------------------------------------------------
-    # MTP draft-head KV synchronization
-    # ------------------------------------------------------------------
     # The Qwen3.5 MTP head is a full-attention decoder layer that owns one KV
     # layer (``kv_layer_id == num_kv_layers``) of the SHARED paged arena and
     # attends over the sequence's whole context.  The arena is allocated with

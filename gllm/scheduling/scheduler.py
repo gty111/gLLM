@@ -87,19 +87,14 @@ class Scheduler:
         # against 2088 for three of 16.
         self.decode_cohorts = max(1, self.pp_size)
 
-        # seqs to schedule
         self.seqs_to_prefill: deque[GenerationSequence] = deque()
         self.seqs_to_decode: deque[GenerationSequence] = deque()
-        # running batch
         self.batch_running = deque()
-        # next tokens
         self.next_tokens_queue = deque()
         self.log_time = 0
-        # preempt seqs
         self.num_preempt_seqs = 0
         self.log_num_preempt_seqs = 0
         self.delta_log_num_preempt_seqs = 10
-        # num wait tokens
         self.num_wait_tokens = 0
         # Deterministic rotating jitter for the decode-token-budget split (see
         # ``get_balanced_decode_token_budget``). Replaces a ``random.randint``
@@ -110,7 +105,6 @@ class Scheduler:
         # (and PP hidden-state exchange). A rotating counter advanced in lockstep
         # by every rank keeps the split deterministic and TP-consistent.
         self._decode_budget_jitter = 0
-        # abort ids
         self.abort_ids = set()
         self._pending_request_errors = {}
         self._blocked_prefills = []
@@ -123,7 +117,6 @@ class Scheduler:
         # cache pressure; synchronous workers have nothing to retire.
         self.preemption_barrier = None
         self._preemption_barrier_epoch = 0
-        # log
         self.log = True
         # Seq-ids that finished / aborted since the last time we built a
         # schedule payload for the followers. The worker drains this on
@@ -134,7 +127,6 @@ class Scheduler:
         # case (no further schedules ever happen) leaks at most the
         # currently-tracked seqs at process exit, which is fine.
         self._pending_follower_frees: List[int] = []
-        # schedule method
         self.schedule = self.dispatch_schedule_method()
 
     def consume_pending_follower_frees(self) -> List[int]:
@@ -484,8 +476,8 @@ class Scheduler:
         self.seqs_to_prefill.extendleft(preempt_seqs)
 
         if preempt_seqs:
-            # Change 2: a preemption means we under-reserved. Bump the ratio so
-            # the next prefill admission backs off (decayed back when stable).
+            # A preemption means we under-reserved. Bump the ratio so the
+            # next prefill admission backs off (decayed back when stable).
             self.new_token_ratio = min(
                 1.0, self.new_token_ratio + self.new_token_ratio_step
             )
@@ -589,22 +581,13 @@ class Scheduler:
         logger.warning("Rejecting request %s: cannot fit alone in the cache", victim.seq_id)
 
     def schedule_once(self):
-        """Pick a batch from the queues; followers no longer get a GenerationSequence list.
+        """Pick a batch from the queues; return the live GenerationSequence objects.
 
-        Previously this method returned a *deep-ish* copy of the batch's
-        ``GenerationSequence`` objects (``post_schedule`` shallow-copied each seq and
-        stripped token_ids / extracted ``to_compute_tokens``) so that the
-        zmq sender thread could safely pickle them while the main thread
-        kept mutating the originals.
-
-        With the delta-broadcast (``gllm/scheduling/distributed.py``) the worker
-        snapshots whatever state the followers actually need into a
-        :class:`SchedulePayload` at send time, so we just hand back the
-        *real* ``GenerationSequence`` objects -- no copy, no token_ids stripping.
-        The rank-0 paths that still read from the returned list
-        (``prepare_input`` for the local ``InputData``, the
-        deferred-output processing in :class:`OverlapScheduler`) want
-        the live ``GenerationSequence`` anyway.
+        The worker snapshots whatever state the followers actually need into a
+        :class:`SchedulePayload` (``gllm/scheduling/distributed.py``) at send
+        time, so the seqs need no copy / token_ids stripping for pickling
+        safety. The rank-0 consumers (``prepare_input``, the deferred-output
+        processing in :class:`OverlapScheduler`) want the live objects anyway.
         """
         if self._prefill_recovery_ids:
             live_ids = {seq.seq_id for seq in self.seqs_to_prefill}
@@ -769,13 +752,11 @@ class Scheduler:
                 # content-derived pad ids before the lookup, otherwise
                 # two requests with different images but the same raw
                 # ``<|image_pad|>`` placeholders collide and the second
-                # request reuses the first's KV at the image span. This
-                # used to surface as "second image gets described as the
-                # first" and forced ``--no-enable-prefix-caching`` for
-                # VL deployments. ``_mm_precompute_hash`` is a no-op for
-                # text-only seqs and for non-VL models, and stashes the
-                # heavy image_processor output on the seq so the later
-                # ``_mm_prepare_cpu`` pass doesn't redo the work.
+                # request reuses the first's KV at the image span.
+                # ``_mm_precompute_hash`` is a no-op for text-only seqs and
+                # for non-VL models, and stashes the heavy image_processor
+                # output on the seq so the later ``_mm_prepare_cpu`` pass
+                # doesn't redo the work.
                 self.model_runner._mm_precompute_hash(seq)
                 self.memory_manager.pre_allocate_computed_page([seq])
                 # Full/partial hit post-processing (rollback + hybrid SSM
@@ -821,12 +802,11 @@ class Scheduler:
                 seq.to_compute_token_num = prefill_token_budget
             # Hybrid + prefix caching: a recurrent state can only be captured for
             # the boundary a chunk *ends* on, so land the cut on the state grid.
-            # A chunk ending mid-grid caches nothing, and then every later prefix
-            # hit is rejected on its SSM half -- that is why the hit rate was a
-            # flat 0% for prompts that prefilled in a single chunk. Aligning down
-            # costs one extra prefill step for such a prompt (same total tokens)
-            # and in exchange makes its prefix reusable. It never grows a chunk
-            # and is a no-op for prompts shorter than one stride.
+            # A chunk ending mid-grid caches nothing, which would make every
+            # later prefix hit fail on its SSM half. Aligning down costs one
+            # extra prefill step for such a prompt (same total tokens) and in
+            # exchange makes its prefix reusable. It never grows a chunk and is
+            # a no-op for prompts shorter than one stride.
             stride = self._ssm_snapshot_stride_tokens()
             if stride:
                 end = seq.computed_token_num + seq.to_compute_token_num
@@ -896,7 +876,6 @@ class Scheduler:
         # of it into this tick's decode batch).
         reserve_pages = self._decode_reserve_pages()
 
-        # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
         decode_token_budget = self.get_balanced_decode_token_budget(
             num_total_decode_seqs
@@ -954,7 +933,6 @@ class Scheduler:
     def token_throttling(self):
         # Pages to keep free for the in-flight decode batch (anti-preemption).
         reserve_pages = self._decode_reserve_pages()
-        # prefill
         prefill_token_budget = self.maxp
         if get_world_size() > 1:
             self.update_num_wait_tokens()
@@ -985,7 +963,6 @@ class Scheduler:
             reserve_pages=reserve_pages,
         )
 
-        # decode
         num_total_decode_seqs = self.get_num_decode_seqs()
         decode_token_budget = self.get_balanced_decode_token_budget(
             num_total_decode_seqs
@@ -1287,8 +1264,7 @@ class OverlapScheduler(Scheduler):
             # Now that the placeholder holds the real sampled token, register
             # the prefix-cache hash for any page boundary it completed. Decode
             # boundary registration lives only here / in process_output (never
-            # in pre_allocate_page) so it is always computed over real tokens
-            # (see docs/prefix_cache_overlap_poisoning.md).
+            # in pre_allocate_page) so it is always computed over real tokens.
             self.model_runner.register_decode_page_hash(seq, placeholder_pos)
 
             if seq.computed_prompt:

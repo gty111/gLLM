@@ -564,14 +564,13 @@ class ModelLoader:
         self.config.use_mla = self.use_mla
         self.config.use_hybrid_state = self.use_hybrid_state
         self.config.max_num_batched_tokens = self.max_num_batched_tokens
-        # Encoder-disaggregation role flags (docs/encoder_disaggregation_design.md
-        # §4.3 / §7.2.1). The LM node passes ``skip_visual=True`` so the VL
-        # wrapper does not construct / load the vision tower; the visual
-        # embeddings instead arrive over NIXL from the encoder process. The
-        # encoder passes ``skip_language=True`` to build ONLY the vision tower
-        # (no language model, KV cache, scheduler, or sampler). Both default to
-        # False so the monolith path is unaffected. See
-        # ``gllm.disagg.config.DisaggConfig``.
+        # Encoder-disaggregation role flags. The LM node passes
+        # ``skip_visual=True`` so the VL wrapper does not construct / load the
+        # vision tower; the visual embeddings instead arrive over NIXL from the
+        # encoder process. The encoder passes ``skip_language=True`` to build
+        # ONLY the vision tower (no language model, KV cache, scheduler, or
+        # sampler). Both default to False so the monolith path is unaffected.
+        # See ``gllm.disagg.config.DisaggConfig``.
         self.config.skip_visual = self.skip_visual
         self.config.skip_language = self.skip_language
 
@@ -656,11 +655,9 @@ class ModelLoader:
 
         torch.set_default_dtype(self.dtype)
 
-        # Load weights to CPU memory
         if self.load_format == "auto":
             self.load_weights()
 
-        # Init model whose weights are on GPU memory
         free_gpu_memory_before, _ = torch.cuda.mem_get_info()
         model = model_type(self.config)
         non_cuda_parameters = [
@@ -702,7 +699,6 @@ class ModelLoader:
             f"Model weights {model_size_gb} GB"
         )
 
-        # Load weights from CPU memory to GPU memory
         if self.load_format == "auto":
             model.load_weights(self.weights, mp_load_progress)
             # Release lazily-opened safetensors handles / mmaps now that every

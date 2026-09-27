@@ -41,7 +41,6 @@ class PrebuiltCpuMetadataMaterializer:
         input_data._copy_prebuilt_cpu_metadata(self.source)
 
 
-# Input of model forward
 class InputData:
     def __init__(
         self,
@@ -899,37 +898,16 @@ class InputData:
     def _cal_block_table(self, seqs: List[GenerationSequence]):
         block_tables_list = [seq.page_table for seq in seqs]
         bs = len(block_tables_list)
-        # Previously we (1) allocated a temporary ``np.full((bs, max_num_block),
-        # 0)`` (~1 MB on Qwen3-0.6B with model_max_length=131072 / page_size=16
-        # -> max_num_block=8192) and zero-filled it, (2) sparsely filled the
-        # ragged page-table rows into it, then (3) allocated a same-shape
-        # pinned tensor and copied the numpy buffer into it (a 1 MB host-to-
-        # pinned memcpy). Profiler showed that final ``out.copy_(...)`` taking
-        # 4-9 ms per batch -- it dominated cal_input. The host-side ``copy_``
-        # itself is normally <30us for 1 MB; the inflated wall-clock comes
-        # from (a) writing 1 MB twice (zero the numpy buffer, then memcpy
-        # it into the pinned buffer) which is bandwidth-bound and contends
-        # with the prior batch's still-in-flight H2D issued from the same
-        # caching-host-allocator pool, and (b) cold-page touches on freshly
-        # handed-out pinned slabs.
-        #
-        # Skip the intermediate numpy buffer: get a numpy view onto the pinned
-        # tensor directly, zero only that view, then sparsely fill. This drops
-        # one 1 MB CPU write and the from_numpy bookkeeping. Microbench shows
-        # ~2.9x speedup, real workload sees _cal_block_table mean drop from
-        # ~3.2ms to <1ms. See ``_cal_query_start_loc`` for why
-        # ``device="cpu"`` is required (default device is CUDA under
-        # ``ModelLoader``).
+        # Write straight into a numpy view of the pinned tensor (no
+        # intermediate numpy buffer + host ``copy_`` round-trip; the extra
+        # 1 MB write dominated ``cal_input`` at ~3.2 ms/batch, now <1 ms).
+        # See ``_cal_query_start_loc`` for why ``device="cpu"`` is required
+        # (default device is CUDA under ``ModelLoader``).
         #
         # Width: only allocate / fill / H2D ``max_blocks_used`` columns
         # instead of the full ``self.max_num_block`` (= ceil(model_max_length /
-        # page_size); e.g. 16384 for Qwen3-30B-A3B's 256K context). At bs=64
-        # that's 64 * 16384 * 4 = 4 MiB of int32 per forward, of which only
-        # the first ``ceil(max(seq_len)/page_size)`` columns are non-zero (the
-        # rest is dead padding). Torch-profiler tracing on Qwen3-30B-A3B
-        # TP=4 with conc=32 showed this single copy accounting for ~80 ms of
-        # ``Memcpy HtoD (Pinned -> Device)`` per 64-prompt run; SGLang at the
-        # same config does ~0 such copies. The paged QKV backend only reads up to
+        # page_size)); everything beyond ``ceil(max(seq_len)/page_size)`` is
+        # dead padding. The paged QKV backend only reads up to
         # ``cache_seqlens[i] / page_size`` columns per row in the persistent
         # device-side ``block_table`` buffer, so leaving stale data beyond
         # ``max_blocks_used`` is safe. ``copy_to_input_buffer`` H2Ds only
@@ -956,17 +934,12 @@ class InputData:
 
     def _cal_slot_mapping(self, seqs: List[GenerationSequence]):
         # Same motivation as ``_cal_position``: write straight into a pinned
-        # tensor's numpy view. The original double-Python-loop
-        # ("for seq -> for i in range(...)") plus ``slot_mapping.append(...)``
-        # was the largest remaining ``cal_input`` sub-op after the
-        # ``_cal_block_table`` fix -- profiler showed ~226 us mean per batch
-        # because every prefill iter does 1024 Python int boxings (and the
-        # ``seq.page_table[i // page_size]`` lookup walks a Python list each
-        # time). For prefill seqs we vectorize via numpy: precompute the
-        # token index range, derive ``(page_idx, slot_idx)`` with integer
-        # ops, then ``page_table_np[page_idx] * page_size + slot_idx`` in a
-        # single numpy expression. Decode (n == 1) keeps a fast scalar path
-        # because the numpy overhead would dominate one-element batches.
+        # tensor's numpy view. For prefill seqs we vectorize via numpy:
+        # precompute the token index range, derive ``(page_idx, slot_idx)``
+        # with integer ops, then ``page_table_np[page_idx] * page_size +
+        # slot_idx`` in a single numpy expression. Decode (n == 1) keeps a
+        # fast scalar path because the numpy overhead would dominate
+        # one-element batches.
         # Microbench: ~8x faster on a 4x1024 prefill batch, ~1.3x on a 32x1
         # decode batch.
         page_size = self.page_size
@@ -999,7 +972,6 @@ class InputData:
         return self.slot_mapping[: self.slot_mapping_cpu.shape[0]]
 
     def _cal_mla_metadata(self, seqs: List[GenerationSequence]):
-        # Construct MLA-related metadata
         self.num_actual_tokens = self.tokens_cpu.shape[0]
 
         query_seq_lens = self.query_start_loc_cpu[1:] - self.query_start_loc_cpu[:-1]
@@ -1085,11 +1057,9 @@ class InputData:
 
         num_pad = padded_size - num_real_tokens
 
-        # tokens: pad with 0
+        # tokens / positions / mrope_positions: pad with 0
         self.tokens[num_real_tokens:padded_size].zero_()
-        # positions: pad with 0
         self.positions[num_real_tokens:padded_size].zero_()
-        # mrope_positions: pad with 0
         self.mrope_positions[:, num_real_tokens:padded_size].zero_()
         # slot_mapping: pad with dummy slot so writes go to the reserved page
         self.slot_mapping[num_real_tokens:padded_size].fill_(dummy_slot)
@@ -1215,8 +1185,6 @@ class MLACommonPrefillMetadata:
 
     @dataclass
     class ChunkedContextMetadata:
-        # New for MLA (compared to the explicit-QKV path)
-        # For handling chunked prefill
         cu_seq_lens: torch.Tensor
         starts: torch.Tensor
         seq_tot: list[int]
@@ -1238,13 +1206,9 @@ class MLACommonPrefillMetadata:
 
 @dataclass
 class MLACommonMetadata:
-    """Metadata for MLACommon.
+    """Metadata for MLACommon."""
 
-    NOTE: Please read the comment at the top of the file before trying to
-    understand this class
-    """
-
-    # NOTE(sang): Definition of context_len, query_len, and seq_len.
+    # Definition of context_len, query_len, and seq_len:
     # |---------- N-1 iteration --------|
     # |---------------- N iteration ---------------------|
     # |- tokenA -|......................|-- newTokens ---|
@@ -1255,8 +1219,6 @@ class MLACommonMetadata:
     num_actual_tokens: int  # Number of tokens excluding padding.
     slot_mapping: torch.Tensor
 
-    # New for MLA (compared to the explicit-QKV path)
-    # For handling prefill decode split
     num_decodes: int
     num_decode_tokens: int
     num_prefills: int

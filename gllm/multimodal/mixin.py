@@ -632,15 +632,12 @@ class MmMixin:
         raw ``<|image_pad|>`` placeholder id.
 
         The scheduler calls ``pre_allocate_computed_page`` for every new
-        seq *before* ``_mm_prepare_cpu`` runs. The default cache key
-        function ``_default_cache_key_fn`` reads ``seq.hash_token_ids``
-        if present and otherwise falls back to ``seq.token_ids``;
-        before this hook existed, that fallback meant every image-bearing
-        request used the same placeholder ids at the image span and the
-        second request would silently reuse the first request's KV
-        pages at the image positions -- producing answers about the
-        wrong image (the symptom that previously forced
-        ``--no-enable-prefix-caching`` for VL).
+        seq *before* ``_mm_prepare_cpu`` runs. The prefix-cache hash reads
+        ``seq.hash_token_ids`` when present and otherwise falls back to
+        ``seq.token_ids``; without this hook the fallback makes every
+        image-bearing request share the same placeholder ids at the image
+        span, so a second request would silently reuse the first request's
+        KV pages there (wrong-image answers).
 
         Side effects:
             * ``seq.hash_token_ids`` is populated when the prompt has
