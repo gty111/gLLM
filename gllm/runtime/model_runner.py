@@ -853,9 +853,9 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         # instead of synchronizing on ``Tensor.cpu()`` in the launch call.
         self._mtp_async_state: Optional[MtpAsyncBatchState] = None
         self._mtp_async_publish = False
-        # One-shot warning when a multimodal prompt has to skip the head KV
-        # pass (image placeholder ids do not embed to the prompt's real
-        # features, so replaying the head over them would poison its cache).
+        # One-shot warning for unsupported visual KV refresh (e.g. a last PP
+        # stage without the encoder's features). Qwen's local encoder supplies
+        # shifted visual rows, including prefill chunk-boundary lookahead.
         self._mtp_kv_sync_mm_warned = False
         # Batch-adaptive MTP gate. Speculating multiplies the per-step target
         # work by ``1+k``; it wins only

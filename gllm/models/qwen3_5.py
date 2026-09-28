@@ -1337,6 +1337,8 @@ class Qwen3_5MTP(nn.Module):
     positions with KV derived from authoritative target hidden states.
     """
 
+    supports_visual_inputs = True
+
     def __init__(self, config, kv_layer_id: int, parent_model: "Qwen3_5Model"):
         super().__init__()
         self.config = config
@@ -1374,6 +1376,8 @@ class Qwen3_5MTP(nn.Module):
         input_data: InputData,
         prev_hidden: torch.Tensor,
         input_ids: torch.Tensor,
+        *,
+        visual_inputs=None,
     ) -> torch.Tensor:
         """Return the MTP block's post-norm hidden state ``[num_tokens, hidden]``.
 
@@ -1382,7 +1386,17 @@ class Qwen3_5MTP(nn.Module):
         at each of those positions (the token the draft is conditioned on).
         """
         embed = self._embed
-        if (
+        if visual_inputs is not None:
+            # Prefill KV refresh pairs target_hidden[p] with the actual input
+            # embedding at p+1, including encoded image/video rows. Decode and
+            # text-only refresh keep the fused gather/norm path below.
+            indices, visual = visual_inputs
+            embedded = embed(input_ids)
+            embedded.index_copy_(0, indices, visual.to(dtype=embedded.dtype))
+            e = self.pre_fc_norm_embedding(embedded)
+            h = self.pre_fc_norm_hidden(prev_hidden)
+            eh = torch.cat([e, h], dim=-1)
+        elif (
             getattr(embed, "tp_size", 1) == 1
             and input_ids.is_cuda
             and input_ids.is_contiguous()

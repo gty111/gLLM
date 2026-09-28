@@ -788,6 +788,10 @@ class MmMixin:
         is irrelevant.
         """
         device = self.input_hidden_states.device
+        # Forward-stream-owned references, consumed by the MTP KV refresh
+        # before the next GPU prep. Keep visual rows only, never full prompt
+        # embeddings; the request cache may be released on the final chunk.
+        self._mtp_prefill_visual = {}
         batch_embeddings: List[torch.Tensor] = []
         # Per-chunk deepstack tensors aligned 1-1 with ``batch_embeddings``.
         # ``None`` means "no deepstack contribution for this chunk" (decode
@@ -852,6 +856,12 @@ class MmMixin:
                 mask_cpu = mask[start:end]
                 visual_start = int(mask[:start].sum())
                 visual_count = int(mask_cpu.sum())
+                if getattr(self, "mtp_enabled", False) and getattr(
+                    getattr(self.model, "mtp", None), "supports_visual_inputs", False
+                ):
+                    self._mtp_prefill_visual[seq.seq_id] = self._mtp_visual_chunk(
+                        seq, embedding_info, visual_start
+                    )
                 if visual_count:
                     # Slice by placeholder ordinal, not by image boundaries:
                     # chunks and prefix hits may start in the middle of an image.
@@ -926,6 +936,28 @@ class MmMixin:
                 offset += n
 
         return torch.concat(batch_embeddings)
+
+    def _mtp_visual_chunk(self, seq, info, visual_start):
+        """Visual replacements for the MTP input shifted one token left.
+
+        Include the *next* chunk's first visual row when the boundary splits
+        an image. Indices are computed on CPU, so no CUDA nonzero/sum or D2H
+        synchronization is needed. Deepstack residuals belong to the target
+        layers, not to the MTP head's input embedding.
+        """
+        start, end = seq.computed_token_num, seq.seq_len
+        mask = info.is_multimodal_cpu
+        shifted_end = min(end + 1, seq.prompt_len)
+        if shifted_end > mask.numel():
+            # A disaggregated encoder has not supplied the lookahead row yet.
+            return None
+        indices = mask[start + 1:shifted_end].nonzero(as_tuple=True)[0]
+        first = visual_start + int(mask[start])
+        visual = info.multimodal_embeddings
+        values = None if indices.numel() == 0 else visual[
+            first:first + indices.numel(), :self.hidden_size
+        ]
+        return start, end, indices, values
 
     @torch.inference_mode()
     def mm_prepare_inputs(self, seqs: List[GenerationSequence]):
