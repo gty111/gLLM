@@ -1515,15 +1515,22 @@ class MtpMixin:
             return False
         if getattr(self.model, "mtp", None) is None:
             return False
-        if any(getattr(s, "mm_contents", None) is not None for s in input_data.seqs):
-            # A placeholder image token id does not embed to the feature the
-            # target actually consumed, so replaying the head over it would
-            # write KV the draft must not read.  Skip (and say so once).
+        mm_seqs = [s for s in input_data.seqs
+                   if getattr(s, "mm_contents", None) is not None]
+        mm_prefills = [s for s in mm_seqs if not s.computed_prompt]
+        visual_chunks = getattr(self, "_mtp_prefill_visual", {})
+        if mm_seqs and (
+            not is_first_pp_rank()
+            or not getattr(self.model.mtp, "supports_visual_inputs", False)
+            or any(visual_chunks.get(s.seq_id) is None for s in mm_prefills)
+        ):
+            # The last PP rank must own the shifted visual rows. Partial
+            # encoder delivery may also lack the next chunk's first row.
             if not self._mtp_kv_sync_mm_warned:
                 self._mtp_kv_sync_mm_warned = True
                 logger.warning(
-                    "MTP head KV sync skips multimodal prompts; speculative "
-                    "acceptance for those requests stays degraded."
+                    "MTP head KV sync lacks shifted visual embeddings for this "
+                    "backend, pipeline stage, or partial encoder result."
                 )
             return False
         return True
@@ -1609,7 +1616,40 @@ class MtpMixin:
         # A replayed CUDA graph leaves the plan's python-side attention object
         # empty; re-prepare it before this eager single-layer pass.
         self._prepare_attention_metadata(input_data)
-        self.model.mtp.forward(input_data, target_hidden[:ntok], shifted)
+        visual_inputs = self._mtp_shifted_visual_inputs(input_data)
+        if visual_inputs is None:
+            self.model.mtp.forward(input_data, target_hidden[:ntok], shifted)
+        else:
+            self.model.mtp.forward(
+                input_data, target_hidden[:ntok], shifted, visual_inputs=visual_inputs
+            )
+        self._mtp_prefill_visual = {}
+
+    def _mtp_shifted_visual_inputs(self, input_data):
+        """Pack per-request visual patches into this batch's shifted layout."""
+        chunks = getattr(self, "_mtp_prefill_visual", {})
+        if not chunks:
+            return None
+        offsets, values = [], []
+        for row, seq in enumerate(input_data.seqs):
+            if seq.computed_prompt or getattr(seq, "mm_contents", None) is None:
+                continue
+            chunk = chunks.get(seq.seq_id)
+            if chunk is None:
+                continue
+            start, end, indices, visual = chunk
+            if (start, end) != (seq.computed_token_num, seq.seq_len):
+                raise RuntimeError("MTP visual inputs do not match the scheduled prefill span")
+            if indices.numel():
+                offsets.append(indices + int(input_data.query_start_loc_cpu[row]))
+                values.append(visual)
+        if not offsets:
+            return None
+        indices = torch.cat(offsets)
+        if input_data.tokens.is_cuda:
+            indices = indices.pin_memory()
+        return (indices.to(input_data.tokens.device, non_blocking=True),
+                torch.cat(values))
 
     def _drafts_host(self, drafts, nd: int, kk: int):
         """Host-side ``[nd][kk]`` draft token ids, materializing on demand.
