@@ -113,12 +113,11 @@ class _MtpBatchPlan:
     """
 
     speculate: bool = False
-    greedy: bool = False
     decode_ids: tuple = ()
 
     @property
     def use_async(self) -> bool:
-        return self.speculate and self.greedy
+        return self.speculate
 
 
 @dataclass(frozen=True)
@@ -579,18 +578,8 @@ class OverlapWorker(Worker):
         )
         if not speculate:
             return _MtpBatchPlan()
-        seqs = self._prefetched_input.seqs
-        greedy = all(
-            s.top_k == 1
-            and not (
-                s.temperature > 1e-5
-                and abs(s.temperature - 1.0) > 1e-5
-            )
-            for s in seqs
-        )
         return _MtpBatchPlan(
             speculate=True,
-            greedy=greedy,
             decode_ids=tuple(s.seq_id for s in decode),
         )
 
@@ -675,7 +664,7 @@ class OverlapWorker(Worker):
             self._commit_mtp_sync(batch)
 
     def _commit_mtp_sync(self, batch: _MtpBatch) -> None:
-        """Launch and immediately commit a sampling/non-overlappable MTP step."""
+        """Launch and immediately commit a non-overlappable MTP step."""
         # A fused MTP step runs no decode forward, so building the decode
         # batch's per-token input arrays here would be immediately overwritten
         # by the draft/verify prep inside ``_mtp_decode``. Skip straight to the

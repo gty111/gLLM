@@ -15,7 +15,6 @@ from logger import logger
 from tqdm import tqdm
 
 from gllm.distributed.parallel_state import (
-    get_ipc_tp_group,
     get_local_rank,
     get_rank,
     get_tp_group,
@@ -208,12 +207,24 @@ class MtpMixin:
         """
         state = self._mtp_async_state
         n = len(seqs)
+        sampled = self._mtp_can_sample and any(
+            (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5)
+            or s.top_k != 1 for s in seqs
+        )
+        if sampled:
+            graphs = (self._draft_size_to_graph_sampled_sparse
+                      if self._mtp_sparse_eligible(seqs)
+                      else self._draft_size_to_graph_sampled)
+        else:
+            graphs = self._draft_size_to_graph
         return bool(
             n
             and state is not None
             and state.can_remap([s.seq_id for s in seqs])
             and self._mtp_gpu_prep_on
-            and any(b >= n for b in self._draft_size_to_graph)
+            and self._mtp_draft_graph
+            and self._mtp_verify_graph
+            and any(b >= n for b in graphs)
             and any(b >= n for b in self._verify_size_to_graph)
         )
 
@@ -393,19 +404,24 @@ class MtpMixin:
         if self._sp_host_f is None:
             b = max(self.max_running_seqs, 1)
             self._sp_host_f = torch.empty(
-                (2, b), dtype=torch.float32, device="cpu", pin_memory=True
+                (2, 2, b), dtype=torch.float32, device="cpu", pin_memory=True
             )
             self._sp_host_k = torch.empty(
-                b, dtype=torch.int32, device="cpu", pin_memory=True
+                (2, b), dtype=torch.int32, device="cpu", pin_memory=True
             )
             self._sp_dev_f = torch.empty((2, b), dtype=torch.float32, device=dev)
             self._sp_dev_k = torch.empty(b, dtype=torch.int32, device=dev)
-        hf, hk = self._sp_host_f.numpy(), self._sp_host_k.numpy()
+        # At most two MTP steps are in flight. The worker collects N before
+        # launching N+2, so alternating host slots cannot overwrite an H2D
+        # still consumed by N. Device destinations are reused in stream order.
+        slot = self._mtp_prep_epoch % 2
+        host_f, host_k = self._sp_host_f[slot], self._sp_host_k[slot]
+        hf, hk = host_f.numpy(), host_k.numpy()
         hf[0, :n] = [s.temperature if s.temperature > 1e-5 else 1.0 for s in seqs]
         hf[1, :n] = [s.top_p for s in seqs]
         hk[:n] = [s.top_k if s.top_k != -1 else V for s in seqs]
-        self._sp_dev_f[:, :n].copy_(self._sp_host_f[:, :n], non_blocking=True)
-        self._sp_dev_k[:n].copy_(self._sp_host_k[:n], non_blocking=True)
+        self._sp_dev_f[:, :n].copy_(host_f[:, :n], non_blocking=True)
+        self._sp_dev_k[:n].copy_(host_k[:n], non_blocking=True)
         return (
             self._sp_dev_f[0, :n].unsqueeze(1),
             self._sp_dev_k[:n],
@@ -682,9 +698,9 @@ class MtpMixin:
           step (top-k-sparse variant when ``sparse``). Between replays the
           drawn token is broadcast across TP (host side, OUTSIDE the graph):
           the captured default-generator RNG is not guaranteed identical
-          across ranks. Returns ``(drafts, q)`` -- per-seq ``[d1..dk]`` CPU
-          ints (the rejection accept walks drafts host-side) and an
-          :class:`MtpQDist`.
+          across ranks. Returns ``(None, q)`` and stashes the GPU draft
+          tensor just like greedy mode. The accept step consumes that tensor
+          and an :class:`MtpQDist` without materializing CPU token lists.
 
         KV pages for the whole speculative window were pre-allocated once by
         ``_mtp_decode``, so the page tables are frozen for this step. Falls
@@ -848,8 +864,10 @@ class MtpMixin:
             )
         else:
             q = self._q_dense(torch.stack(step_q, dim=1))  # [nd, k, vocab]
-        mat = self._drafts_gpu.tolist()
-        return [mat[i] for i in range(nd)], q
+        # Both sampling modes pass drafts directly to verify/accept on device.
+        # Reading them here would wait for the entire draft chain and break
+        # launch-current/collect-previous overlap before target verification.
+        return None, q
 
     @torch.inference_mode()
     def _ensure_draft_buffers(self):
@@ -1914,11 +1932,11 @@ class MtpMixin:
             for s in decode_seqs
         )
         self._mtp_sampling_seen |= _rej_active
-        # Greedy mixed batches use the same GPU completion as pure decode.  The
+        # Greedy and sampled batches share the same GPU completion contract.  The
         # completion carries variable-width decode commits followed by the
         # one-token prefill samples, while freshly completed prefills are also
         # appended to the live request-id keyed relay state.
-        _async_accept = self._mtp_async_publish and not _rej_active
+        _async_accept = self._mtp_async_publish
         # Preserve the scheduler-owned sequence view while draft/verify uses
         # compact ``to_compute_tokens`` suffixes. ``token_ids`` itself remains
         # untouched: copying every request's full context each step made host
@@ -1980,7 +1998,7 @@ class MtpMixin:
         # Two paths: a CUDA-graph replay path (``_mtp_draft_graph``) that captures
         # one draft-step graph per decode bucket and replays it k times with
         # in-place GPU buffer advance (no per-step Python / H2D / .item()); and an
-        # eager fallback. Both produce ``drafts`` = per-seq [d1..dk] on CPU.
+        # eager fallback. Only the eager fallback materializes CPU drafts.
         # ``_rej_active`` (computed above for the x1 broadcast) also selects the
         # sampling draft chain, which keeps the per-step draft dist ``q``.
         _use_rej = _rej_active
@@ -1994,8 +2012,7 @@ class MtpMixin:
         # (The graph draft path uses the default CUDA generator internally and
         # broadcasts its tokens, so it doesn't consume ``gen``.)
         gen = self._mtp_rng_step(dev) if _use_rej else None
-        # Reset the GPU-draft stash; only the greedy graph draft chain fills it
-        # (the accept step reads it to skip an H2D of the host drafts list).
+        # Both graph chains fill the GPU stash; eager fallbacks return lists.
         self._drafts_gpu = None
         with torch.profiler.record_function("gllm::mtp_draft_chain"):
             if _use_rej:
@@ -2250,64 +2267,17 @@ class MtpMixin:
             if sparse:
                 # Map the drawn column back to a token id.
                 bonus_gpu = p_row_idx.gather(1, bonus_gpu.unsqueeze(1)).squeeze(1)
-            # ONE D2H: [n_accepted | bonus | drafts...] -- same packing as the
-            # greedy accept, so the draft chain's tokens also arrive here.
-            rows = [na_gpu.to(torch.int64), bonus_gpu.to(torch.int64)]
-            if d_gpu is not None:
-                rows.extend(d_gpu.t())
-            packed_cpu = torch.stack(rows).cpu()  # [2+kk, nd]
-            na_cpu = packed_cpu[0].tolist()
-            bonus_cpu2 = packed_cpu[1].tolist()
-            drafts_cpu = packed_cpu[2:].t().tolist() if d_gpu is not None else None
-            # Batch-gather the per-seq draft-seed hidden (verify row
-            # ``i*qlen + na``) in one op instead of nd tiny clones.
-            bonus_hidden_all = v_hidden.index_select(0, seq_ar * qlen + na_l)
-            for i, s in enumerate(decode_seqs):
-                na = na_cpu[i]
-                committed = [x1[i]] + (drafts_cpu[i][:na] if na else [])
-                # Relay the bonus as next step's x1; do NOT commit it now.
-                new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
-                n_accepted[i] = na
-                results[i] = committed
-            # The accept decisions used per-rank distributions (p/q differ by fp
-            # all-reduce epsilon across TP ranks) + per-rank RNG draws, so
-            # ``results`` / ``n_accepted`` / the relayed bonus can diverge. Make
-            # TP-rank-0's decisions authoritative: broadcast a padded token grid
-            # (committed lists) + the relayed bonus token, then every rank rebuilds
-            # identical state. (Draft tokens were already broadcast; the accept +
-            # bonus draws happen here.)
+            # Rank zero's acceptance must win BEFORE gathering hidden state,
+            # committing penalties or publishing the next GPU relay. Use the
+            # model TP communicator so collectives retain forward-stream order.
             if get_tp_size() > 1:
-                # ``results`` holds [x1 + accepted_drafts]; the bonus is relay-only.
-                maxlen = kk + 1
-                grid = torch.full((nd, maxlen), -1, dtype=torch.int64, device=dev)
-                lens = torch.zeros(nd, dtype=torch.int64, device=dev)
-                bonus_t = torch.zeros(nd, dtype=torch.int64, device=dev)
-                if get_tp_rank() == 0:
-                    for i in range(nd):
-                        c = results[i]
-                        lens[i] = len(c)
-                        grid[i, : len(c)] = torch.tensor(
-                            c, dtype=torch.int64, device=dev
-                        )
-                        bonus_t[i] = new_relay[decode_seqs[i].seq_id][0]
-                src = get_rank() - get_tp_rank()
-                dist.broadcast(lens, src=src, group=get_ipc_tp_group())
-                dist.broadcast(grid, src=src, group=get_ipc_tp_group())
-                dist.broadcast(bonus_t, src=src, group=get_ipc_tp_group())
-                lens_cpu = lens.cpu().tolist()
-                grid_cpu = grid.cpu().tolist()
-                bonus_cpu = bonus_t.cpu().tolist()
-                for i in range(nd):
-                    n = lens_cpu[i]
-                    results[i] = grid_cpu[i][:n]
-                    n_accepted[i] = max(0, n - 1)
-                    # Adopt rank-0's bonus token; keep this rank's own hidden
-                    # (only seeds the next draft, whose token is broadcast).
-                    _, h = new_relay[decode_seqs[i].seq_id]
-                    new_relay[decode_seqs[i].seq_id] = (bonus_cpu[i], h)
-                # The persistent penalty history must adopt rank 0's accepted
-                # prefix, just like the CPU sequence/relay state above.
-                na_gpu = lens - 1
+                decisions = torch.stack((na_gpu, bonus_gpu))
+                self._mtp_bcast_tp(decisions)
+                na_gpu, bonus_gpu = decisions.unbind(0)
+                na_l = na_gpu.to(torch.long)
+            drafts_gpu = d_gpu
+            next_bonus = bonus_gpu
+            bonus_hidden_all = v_hidden.index_select(0, seq_ar * qlen + na_l)
         else:
             # --- 3. Greedy accept per seq (vectorized on GPU). ---
             # Verify inputs per seq are [x1, d1..dk] at positions start..start+k.
@@ -2345,83 +2315,85 @@ class MtpMixin:
             # ``i*qlen + na``) instead of nd separate per-seq ``.clone()``s.
             bonus_rows = seq_ar * qlen + na_l
             bonus_hidden_all = v_hidden.index_select(0, bonus_rows)  # [nd, H]
-            if _async_accept:
-                if self._mtp_penalties is not None:
-                    self._mtp_penalties.commit(penalty_candidates, na_gpu)
-                state = self._mtp_async_state
-                seq_ids = tuple(s.seq_id for s in decode_seqs)
-                if state is None:
-                    state = MtpAsyncBatchState(
-                        max_batch_size=self.max_running_seqs,
-                        k=kk,
-                        hidden_size=bonus_hidden_all.shape[-1],
-                        hidden_dtype=bonus_hidden_all.dtype,
-                        device=dev,
-                    )
-                    self._mtp_async_state = state
-                if not state.matches(seq_ids):
-                    if any(state._busy):
-                        raise RuntimeError(
-                            "MTP async cohort changed before pending completion was collected"
-                        )
-                    self._mtp_staging.install_ctx_host_np[:nd] = [
-                        len(t) for t in orig_tokens
-                    ]
-                    state.install(
-                        seq_ids,
-                        self._mtp_staging.install_ctx_host[:nd],
-                        x1_gpu,
-                        hidden,
-                    )
-                with torch.profiler.record_function("gllm::mtp_accept_publish"):
-                    completion = state.publish(
-                        current_x1=x1_gpu,
-                        drafts=(
-                            drafts_gpu
-                            if drafts_gpu is not None
-                            else torch.empty((nd, 0), dtype=torch.int64, device=dev)
-                        ),
-                        num_accepted_drafts=na_gpu,
-                        next_bonus=vp[seq_ar, na_l],
-                        next_hidden=bonus_hidden_all,
-                        producer_stream=torch.cuda.current_stream(),
-                        extra_tokens=prefill_tokens_gpu,
-                        extra_seq_ids=tuple(s.seq_id for s in extra_prefill_seqs),
-                        new_state_seq_ids=new_state_seq_ids,
-                        new_state_context_lens=new_state_context_lens,
-                        new_state_tokens=new_state_tokens,
-                        new_state_hidden=new_state_hidden,
-                    )
-                # All speculative GenerationSequence mutations are host bookkeeping only;
-                # restore them now.  The completion event orders the later CPU
-                # finalize after verify/accept and the D2H record.
-                if structured_active:
-                    self.sampler._structured.record_speculative(structured_active, completion)
-                restore()
-                return completion
+            next_bonus = vp[seq_ar, na_l]
 
-            # Synchronous fallback: ONE D2H per step carries everything the
-            # host still needs.  This must stay after the async early return;
-            # doing it before that branch silently serialized overlap MTP.
-            #   row 0        : n_accepted
-            #   row 1        : the relayed bonus token
-            #   rows 2..2+kk : the draft token grid (transposed)
-            rows = [na_gpu.to(torch.int64)]
-            rows.append(vp[seq_ar, na_gpu.to(torch.long)].to(torch.int64))
-            if drafts_gpu is not None:
-                rows.extend(drafts_gpu.to(torch.int64).t())
-            packed_cpu = torch.stack(rows).cpu()  # [2+kk, nd]
-            na_cpu = packed_cpu[0].tolist()
-            bonus_cpu2 = packed_cpu[1].tolist()
-            drafts_cpu = packed_cpu[2:].t().tolist() if drafts_gpu is not None else None
-            for i, s in enumerate(decode_seqs):
-                na = na_cpu[i]
-                n_accepted[i] = na
-                # committed = x1 + the accepted draft prefix.
-                results[i] = [x1[i]] + (drafts_cpu[i][:na] if na else [])
-                # Bonus token from the on-device gather; bonus hidden is row i of
-                # the batched gather and only seeds the next draft.
-                new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
+        if _async_accept:
+            if self._mtp_penalties is not None:
+                self._mtp_penalties.commit(penalty_candidates, na_gpu)
+            state = self._mtp_async_state
+            seq_ids = tuple(s.seq_id for s in decode_seqs)
+            if state is None:
+                state = MtpAsyncBatchState(
+                    max_batch_size=self.max_running_seqs,
+                    k=kk,
+                    hidden_size=bonus_hidden_all.shape[-1],
+                    hidden_dtype=bonus_hidden_all.dtype,
+                    device=dev,
+                )
+                self._mtp_async_state = state
+            if not state.matches(seq_ids):
+                if any(state._busy):
+                    raise RuntimeError(
+                        "MTP async cohort changed before pending completion was collected"
+                    )
+                self._mtp_staging.install_ctx_host_np[:nd] = [
+                    len(t) for t in orig_tokens
+                ]
+                state.install(
+                    seq_ids,
+                    self._mtp_staging.install_ctx_host[:nd],
+                    x1_gpu,
+                    hidden,
+                )
+            with torch.profiler.record_function("gllm::mtp_accept_publish"):
+                completion = state.publish(
+                    current_x1=x1_gpu,
+                    drafts=(
+                        drafts_gpu
+                        if drafts_gpu is not None
+                        else torch.empty((nd, 0), dtype=torch.int64, device=dev)
+                    ),
+                    num_accepted_drafts=na_gpu,
+                    next_bonus=next_bonus,
+                    next_hidden=bonus_hidden_all,
+                    producer_stream=torch.cuda.current_stream(),
+                    extra_tokens=prefill_tokens_gpu,
+                    extra_seq_ids=tuple(s.seq_id for s in extra_prefill_seqs),
+                    new_state_seq_ids=new_state_seq_ids,
+                    new_state_context_lens=new_state_context_lens,
+                    new_state_tokens=new_state_tokens,
+                    new_state_hidden=new_state_hidden,
+                )
+            # All speculative GenerationSequence mutations are host bookkeeping only;
+            # restore them now.  The completion event orders the later CPU
+            # finalize after verify/accept and the D2H record.
+            if structured_active:
+                self.sampler._structured.record_speculative(structured_active, completion)
+            restore()
+            return completion
+
+        # Synchronous fallback: ONE D2H per step carries everything the
+        # host still needs.  This must stay after the async early return;
+        # doing it before that branch silently serialized overlap MTP.
+        #   row 0        : n_accepted
+        #   row 1        : the relayed bonus token
+        #   rows 2..2+kk : the draft token grid (transposed)
+        rows = [na_gpu.to(torch.int64)]
+        rows.append(next_bonus.to(torch.int64))
+        if drafts_gpu is not None:
+            rows.extend(drafts_gpu.to(torch.int64).t())
+        packed_cpu = torch.stack(rows).cpu()  # [2+kk, nd]
+        na_cpu = packed_cpu[0].tolist()
+        bonus_cpu2 = packed_cpu[1].tolist()
+        drafts_cpu = packed_cpu[2:].t().tolist() if drafts_gpu is not None else None
+        for i, s in enumerate(decode_seqs):
+            na = na_cpu[i]
+            n_accepted[i] = na
+            # committed = x1 + the accepted draft prefix.
+            results[i] = [x1[i]] + (drafts_cpu[i][:na] if na else [])
+            # Bonus token from the on-device gather; bonus hidden is row i of
+            # the batched gather and only seeds the next draft.
+            new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
 
         if self._mtp_penalties is not None:
             self._mtp_penalties.commit(penalty_candidates, na_gpu)
@@ -2470,17 +2442,11 @@ class MtpMixin:
         return results + prefill_tokens
 
     def step_once_mtp_async(self) -> MtpAsyncCompletion:
-        """Enqueue one greedy fused-MTP step without waiting for its D2H result.
+        """Enqueue a greedy or sampled MTP step with deferred host output.
 
-        Sampling/rejection MTP intentionally falls back to the synchronous path:
-        its TP-authoritative accept broadcast currently materializes CPU lists.
+        Acceptance and relay state stay on device; the overlap worker collects
+        this completion only after launching its successor when chaining fits.
         """
-        seqs = self.input_data.seqs[: self.input_data.num_decodes]
-        if any(
-            (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5) or s.top_k != 1
-            for s in seqs
-        ):
-            raise RuntimeError("async MTP currently requires greedy requests")
         self._mtp_async_publish = True
         try:
             completion = self.step_once()

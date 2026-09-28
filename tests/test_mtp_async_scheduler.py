@@ -1,6 +1,8 @@
 from collections import deque
 from types import SimpleNamespace
 
+import pytest
+
 from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.workers.overlap import OverlapWorker
 from gllm.scheduling.scheduler import OverlapScheduler
@@ -269,7 +271,8 @@ def test_mtp_verify_rows_reject_noncontiguous_mixed_layout():
         raise AssertionError("noncontiguous MTP rows were accepted")
 
 
-def test_overlap_worker_builds_one_mtp_plan_for_pure_and_mixed_batches():
+@pytest.mark.parametrize("top_k", [1, 20, -1])
+def test_overlap_worker_builds_one_mtp_plan_for_pure_and_mixed_batches(top_k):
     worker = OverlapWorker.__new__(OverlapWorker)
     worker._dp = False
     decisions = []
@@ -279,11 +282,13 @@ def test_overlap_worker_builds_one_mtp_plan_for_pure_and_mixed_batches():
     )
 
     pure_seqs = [_decode_seq(31), _decode_seq(32)]
+    for seq in pure_seqs:
+        seq.top_k = top_k
     worker._prefetched_input = SimpleNamespace(
         seqs=pure_seqs, num_decodes=2, num_prefills=0
     )
     pure = worker._plan_mtp_batch()
-    assert pure.speculate and pure.greedy and pure.use_async
+    assert pure.speculate and pure.use_async
     assert pure.decode_ids == (31, 32)
 
     prefill = GenerationSequence(33, [1, 2], [], output_len=8, temperature=0, top_k=1)
@@ -293,7 +298,7 @@ def test_overlap_worker_builds_one_mtp_plan_for_pure_and_mixed_batches():
         seqs=[pure_seqs[0], prefill], num_decodes=1, num_prefills=1
     )
     mixed = worker._plan_mtp_batch()
-    assert mixed.speculate and mixed.decode_ids == (31,)
+    assert mixed.speculate and mixed.use_async and mixed.decode_ids == (31,)
     assert decisions == [2, 1]
 
 

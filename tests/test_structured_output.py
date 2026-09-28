@@ -382,11 +382,11 @@ def test_speculative_mixed_rows_and_prior_plain_pending(backend):
     assert backend.states[a].history == [ord('1'), ord('2'), 128]
 
 
-def test_structured_mtp_keeps_async_greedy_acceptance():
+def test_structured_mtp_keeps_async_acceptance():
     from gllm.workers.overlap import _MtpBatchPlan
 
-    assert _MtpBatchPlan(speculate=True, greedy=True).use_async
-    assert not _MtpBatchPlan(speculate=True, greedy=False).use_async
+    assert _MtpBatchPlan(speculate=True).use_async
+    assert not _MtpBatchPlan().use_async
 
 
 def test_grammar_valid_but_target_rejected_draft_does_not_leak(backend):
@@ -403,7 +403,8 @@ def test_grammar_valid_but_target_rejected_draft_does_not_leak(backend):
     assert backend.states[a].history == list(map(ord, '"a'))
 
 
-def test_mixed_structured_prefill_selects_async_mtp_plan():
+@pytest.mark.parametrize("top_k", [1, 20, -1])
+def test_mixed_structured_prefill_selects_async_mtp_plan(top_k):
     from gllm.workers.overlap import OverlapWorker
 
     worker = OverlapWorker.__new__(OverlapWorker)
@@ -412,7 +413,7 @@ def test_mixed_structured_prefill_selects_async_mtp_plan():
     decode, prefill = seq(seq_id=1), seq(seq_id=2)
     decode.structured_output = None
     decode.computed_token_num = 1
-    decode.top_k = prefill.top_k = 1
+    decode.top_k = prefill.top_k = top_k
     decode.temperature = prefill.temperature = 0
     worker._prefetched_input = SimpleNamespace(seqs=[decode, prefill], num_decodes=1, num_prefills=1)
     plan = worker._plan_mtp_batch()
