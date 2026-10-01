@@ -1586,10 +1586,14 @@ class MemoryManager:
         if not rows:
             return
 
+        # Pinned + non_blocking: this runs on ``forward_stream`` right after the
+        # forward is enqueued, and a pageable ``as_tensor(..., device=cuda)``
+        # copy would block the host until that whole forward finished,
+        # serializing the overlap pipeline.
         device = input_data.tokens.device
-        row_t = torch.as_tensor(rows, dtype=torch.long, device=device)
-        slot_t = torch.as_tensor(slots, dtype=torch.long, device=device)
-        penalty_t = torch.as_tensor(penalties, dtype=self.dtype, device=device)
+        row_t = async_tensor_h2d(rows, torch.long, device, True)
+        slot_t = async_tensor_h2d(slots, torch.long, device, True)
+        penalty_t = async_tensor_h2d(penalties, self.dtype, device, True)
         # Ordinary overlap decode has one input token per decode row and decode
         # rows form the leading batch partition.
         token_t = input_data.tokens[:num_decodes].index_select(0, row_t)
