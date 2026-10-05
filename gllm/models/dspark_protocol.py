@@ -41,9 +41,9 @@ class DSparkForwardProtocol(ABC):
 
     The pipeline they name is::
 
-        prefill(target hidden)         -> per-stage target-history caches
-        forward_draft(anchor + noise)  -> draft hidden, draft token ids
-        forward_head(draft hidden)     -> output ids, logits, confidence
+        prefill(target hidden)              -> per-stage target-history caches
+        forward_draft(anchor + noise)       -> draft hidden, draft token ids
+        forward_head(draft hidden + anchor) -> output ids, logits, confidence
 
     Cache objects are opaque to the caller: whatever :meth:`prefill` returns is
     handed straight back to :meth:`forward_draft`.  That keeps this contract
@@ -78,11 +78,15 @@ class DSparkForwardProtocol(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the noisy draft block and return ``(hidden, draft_ids)``.
 
-        The implementation builds the ``block_size``-wide noisy block itself
-        from the anchor in ``input_ids`` (slot 0 is the real token, the rest
-        are the checkpoint's mask/noise id) and attends it against ``caches``.
-        ``draft_ids`` is returned alongside the hidden states because the
-        Markov head conditions on the previous token of each position.
+        ``input_ids`` is the anchor, shaped ``[B]`` or ``[B, 1]``.  The
+        implementation builds the ``block_size``-wide noisy block itself from
+        it (slot 0 is the real token, the rest are the checkpoint's mask/noise
+        id) and attends that block against ``caches``.
+
+        ``draft_ids`` is the block that was run, returned for the caller's own
+        bookkeeping.  It is *not* the ``input_ids`` of :meth:`forward_head`:
+        the head takes the anchor again and generates its own per-position
+        Markov conditioning tokens internally.
         """
 
     @abstractmethod
@@ -94,6 +98,11 @@ class DSparkForwardProtocol(ABC):
         sample: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply the LM head, the Markov correction and the confidence head.
+
+        ``input_ids`` is the anchor, ``[B]`` or ``[B, 1]`` -- the same tensor
+        :meth:`forward_draft` takes, not the drafted block it returns.  Each
+        position's Markov conditioning token is the token sampled here at the
+        position before it, so the head never needs the noisy ``draft_ids``.
 
         Returns ``(output_ids, logits, confidence)``: the ``block_size + 1``
         token ids with the anchor first, the corrected logits per drafted
