@@ -19,6 +19,7 @@ from gllm.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from gllm.models.dspark_protocol import DSparkForwardProtocol
 from gllm.models.weight_loader import WeightRule, contains, run_weight_loader
 
 from .deepseek_v4 import DeepseekV4DecoderLayer, _v4_src_key
@@ -62,7 +63,7 @@ class DeepseekV4DSparkBlock(DeepseekV4DecoderLayer):
         return self._ffn(hidden_states, input_ids)
 
 
-class DeepseekV4DSpark(nn.Module):
+class DeepseekV4DSpark(nn.Module, DSparkForwardProtocol):
     """Reference DSpark data flow for the three native ``mtp.*`` stages.
 
     This module intentionally remains separate from gLLM's sequential NextN
