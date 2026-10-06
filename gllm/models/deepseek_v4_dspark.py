@@ -19,6 +19,10 @@ from gllm.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from gllm.models.dspark_protocol import (
+    DSparkCheckpointMapping,
+    DSparkForwardProtocol,
+)
 from gllm.models.weight_loader import WeightRule, contains, run_weight_loader
 
 from .deepseek_v4 import DeepseekV4DecoderLayer, _v4_src_key
@@ -62,7 +66,67 @@ class DeepseekV4DSparkBlock(DeepseekV4DecoderLayer):
         return self._ffn(hidden_states, input_ids)
 
 
-class DeepseekV4DSpark(nn.Module):
+class DeepseekV4DSparkMapping(DSparkCheckpointMapping):
+    """Maps the DSpark module tree onto DeepSeek-V4's ``mtp.*`` checkpoint keys.
+
+    The three stages are ``mtp.0/1/2``.  Everything that is logically the
+    *head* of the joint model -- the final norm, the mHC head fold, the Markov
+    correction and the confidence head -- is stored on the last stage, and the
+    target-hidden projection on the first, so a module path alone never says
+    which stage holds its checkpoint tensor.
+    """
+
+    def __init__(self, parent: nn.Module, dspark: "DeepseekV4DSpark") -> None:
+        self.parent = parent
+        self.dspark = dspark
+        self.num_stages = dspark.num_stages
+
+    def checkpoint_key(self, key: str) -> str:
+        last = f"mtp.{self.num_stages - 1}"
+        if key.startswith("blocks."):
+            return _v4_src_key("mtp." + key[len("blocks.") :])
+        if key.startswith("main_"):
+            return _v4_src_key(f"mtp.0.{key}")
+        if key.startswith("markov_w"):
+            name = key.split(".", 1)[0]
+            return f"{last}.markov_head.{name}.weight"
+        if key.startswith("confidence_proj"):
+            return f"{last}.confidence_head.proj.weight"
+        return _v4_src_key(f"{last}.{key}")
+
+    def weight_rules(self):
+        """Reuse the target model's rules; only the DSpark head params differ."""
+        from .deepseek_v4 import _h_fp32, _h_vocab_shard
+
+        return [
+            WeightRule(contains("markov_w"), _h_vocab_shard, "dspark_markov"),
+            WeightRule(contains("confidence_proj"), _h_fp32, "dspark_confidence"),
+        ] + self.parent.weight_rules()
+
+    def load_context(self, weights):
+        """Bind the two lookups the shared handlers cannot derive from a key."""
+        ctx = self.parent._make_load_context(weights)
+        last = self.num_stages - 1
+        ctx.extra["vocab_shards"].update(
+            {
+                f"mtp.{last}.markov_head.markov_w1.weight": (
+                    self.dspark.markov_w1.shard_indices
+                ),
+                f"mtp.{last}.markov_head.markov_w2.weight": (
+                    self.dspark.markov_w2.shard_indices
+                ),
+            }
+        )
+        ctx.extra["experts"].update(
+            {
+                f"mtp.{stage}.ffn.experts": block.ffn.experts
+                for stage, block in enumerate(self.dspark.blocks)
+            }
+        )
+        return ctx
+
+
+class DeepseekV4DSpark(nn.Module, DSparkForwardProtocol):
     """Reference DSpark data flow for the three native ``mtp.*`` stages.
 
     This module intentionally remains separate from gLLM's sequential NextN
@@ -248,66 +312,18 @@ class DeepseekV4DSpark(nn.Module):
         ).squeeze(-1)
         return output_ids, logits, confidence
 
-
-
-    def _src_key(self, key: str) -> str:
-        """Map a DSpark parameter path to its ``mtp.*`` checkpoint key.
-
-        The three stages are ``mtp.0/1/2``; everything that is logically the
-        *head* of the joint model (final norm, mHC head fold, Markov
-        correction, confidence head) is stored on the last stage, and the
-        target-hidden projection on the first.
-        """
-        last = f"mtp.{self.num_stages - 1}"
-        if key.startswith("blocks."):
-            return _v4_src_key("mtp." + key[len("blocks.") :])
-        if key.startswith("main_"):
-            return _v4_src_key(f"mtp.0.{key}")
-        if key.startswith("markov_w"):
-            name = key.split(".", 1)[0]
-            return f"{last}.markov_head.{name}.weight"
-        if key.startswith("confidence_proj"):
-            return f"{last}.confidence_head.proj.weight"
-        return _v4_src_key(f"{last}.{key}")
-
-    def weight_rules(self, parent):
-        """Reuse the target model's rules; only the head params differ."""
-        from .deepseek_v4 import _h_fp32, _h_vocab_shard
-
-        return [
-            WeightRule(contains("markov_w"), _h_vocab_shard, "dspark_markov"),
-            WeightRule(contains("confidence_proj"), _h_fp32, "dspark_confidence"),
-        ] + parent.weight_rules()
-
     @torch.no_grad()
     def load_weights(self, weights, parent, mp_load_progress=None) -> None:
-        ctx = parent._make_load_context(weights)
-        last = self.num_stages - 1
-        ctx.extra["vocab_shards"].update(
-            {
-                f"mtp.{last}.markov_head.markov_w1.weight": (
-                    self.markov_w1.shard_indices
-                ),
-                f"mtp.{last}.markov_head.markov_w2.weight": (
-                    self.markov_w2.shard_indices
-                ),
-            }
-        )
-        ctx.extra["experts"].update(
-            {
-                f"mtp.{stage}.ffn.experts": block.ffn.experts
-                for stage, block in enumerate(self.blocks)
-            }
-        )
+        mapping = DeepseekV4DSparkMapping(parent, self)
         run_weight_loader(
             self,
             weights,
-            self.weight_rules(parent),
+            mapping.weight_rules(),
             mp_load_progress,
             pp_idx_offset=2,
             start_layer=0,
-            ctx=ctx,
-            src_key_fn=self._src_key,
+            ctx=mapping.load_context(weights),
+            src_key_fn=mapping.checkpoint_key,
         )
 
     def process_weights_after_loading(self) -> None:
@@ -315,4 +331,8 @@ class DeepseekV4DSpark(nn.Module):
             block.ffn.experts.process_weights_after_loading()
 
 
-__all__ = ["DeepseekV4DSpark", "DeepseekV4DSparkBlock"]
+__all__ = [
+    "DeepseekV4DSpark",
+    "DeepseekV4DSparkBlock",
+    "DeepseekV4DSparkMapping",
+]
