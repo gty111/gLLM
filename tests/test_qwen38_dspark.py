@@ -11,10 +11,12 @@ path that maps to a checkpoint key which does not exist.
 """
 
 import pytest
+import torch
 
 from gllm.models.qwen38_dspark import (
     Qwen38DSparkConfig,
     Qwen38DSparkMapping,
+    _rope_cache_length,
     _spread_target_layers,
 )
 
@@ -140,6 +142,43 @@ def test_config_rejects_a_checkpoint_without_a_noise_token():
         Qwen38DSparkConfig.from_dict(flat)
 
 
+def test_rope_cache_spans_the_serving_window_not_its_square():
+    """A regression here asked YaRN for ~4 GiB instead of ~128 MiB.
+
+    ``YaRNScalingRotaryEmbedding`` builds ``max_position_embeddings *
+    scaling_factor`` cache rows, so the length handed to it has to be the one
+    *before* scaling.  Passing the published ``max_position_embeddings``
+    (262144) at factor 32 asked for 8.4M rows; the serving window only needs
+    the 262144 that ``original_max_position_embeddings`` implies.
+    """
+    config = Qwen38DSparkConfig.from_dict(PUBLISHED_CONFIG)
+    factor = float(config.rope_scaling["factor"])
+
+    rows = _rope_cache_length(config)
+    assert rows == config.rope_scaling["original_max_position_embeddings"] == 8192
+    # The invariant that broke: the cache lands on the serving window, i.e.
+    # pre-scaling rows times the factor, not the factor applied twice.
+    assert int(rows * factor) == config.max_position_embeddings == 262144
+    # ~128 MiB at head_dim 128 in fp32.  A doubled window is ~4 GiB.
+    assert rows * config.head_dim * 4 <= 256 * 1024 * 1024
+
+    # A config that omits the pre-scaling length must still land on the serving
+    # window rather than past it.
+    bare = Qwen38DSparkConfig.from_dict(
+        {
+            **PUBLISHED_CONFIG,
+            "rope_scaling": {"rope_type": "yarn", "factor": 32.0},
+        }
+    )
+    assert int(_rope_cache_length(bare) * 32.0) == bare.max_position_embeddings
+
+    # Without scaling there is nothing to undo.
+    plain = Qwen38DSparkConfig.from_dict(
+        {**PUBLISHED_CONFIG, "rope_scaling": None}
+    )
+    assert _rope_cache_length(plain) == plain.max_position_embeddings
+
+
 def test_checkpoint_key_is_identity_over_the_real_key_set():
     """A standalone drafter reuses its module names as checkpoint names.
 
@@ -207,3 +246,226 @@ def test_markov_rule_wins_over_the_catch_all():
     )
 
     assert markov_index < catch_all_index
+
+
+# --- GPU forward path -------------------------------------------------------
+
+
+def _tensor_config():
+    """A tiny stand-in with the same *structure* as the published config."""
+    return Qwen38DSparkConfig(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        rms_norm_eps=1e-6,
+        vocab_size=128,
+        block_size=5,
+        target_layer_ids=(0, 1),
+        mask_token_id=127,
+        markov_rank=8,
+        rope_theta=10000.0,
+        max_position_embeddings=64,
+        rope_scaling=None,
+    )
+
+
+def _build_model(config):
+    """Construct on CUDA under the loader's default dtype.
+
+    ``model_loader`` calls ``torch.set_default_dtype(self.dtype)`` before
+    building a model, and every layer here relies on that -- a direct
+    construction without it comes out fp32 and will not matmul against bf16
+    activations.
+    """
+    from gllm.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        return Qwen38DSpark(config, embed=embed, lm_head=lm_head)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+def _rows(config, context_len):
+    """A ``[1, context_len, taps * hidden]`` block of target hidden states."""
+    return torch.randn(
+        1, context_len, config.target_hidden_size,
+        device="cuda", dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_real_config_rope_cache_is_not_multiplied_twice():
+    """Guard the *call site*, not just the arithmetic above.
+
+    ``_build_rope`` has to hand YaRN the pre-scaling length.  Building the real
+    cache from the published config is the only way to catch someone bypassing
+    ``_rope_cache_length`` -- a regression would allocate ~4 GiB here before
+    the assertion fires, which is exactly the failure this test exists to
+    prevent from shipping.
+    """
+    from gllm.models.qwen38_dspark import _build_rope
+
+    config = Qwen38DSparkConfig.from_dict(PUBLISHED_CONFIG)
+    rope = _build_rope(config)
+
+    rows, width = rope.cos_sin_cache.shape
+    assert width == config.head_dim
+    # 8192 x 32, i.e. the serving window -- not 262144 x 32.
+    assert rows == config.max_position_embeddings == 262_144
+
+
+# --- cache statefulness: context accumulates across draft steps -------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_forward_draft_appends_its_context_to_the_cache():
+    """One draft step grows the history by exactly the new context rows."""
+    config = _tensor_config()
+    model = _build_model(config)
+    torch.manual_seed(9)
+
+    prompt_len = 6
+    prompt = _rows(config, prompt_len)
+    new_context = _rows(config, 1)
+    anchor = torch.tensor([5], device="cuda")
+
+    cache = model.prefill(prompt, anchor)
+    assert cache.context_length() == prompt_len
+
+    model.forward_draft(
+        new_context, anchor, start_pos=prompt_len + 1, caches=cache
+    )
+
+    assert cache.context_length() == prompt_len + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_two_consecutive_draft_steps_reuse_the_grown_cache():
+    """The second step builds on the first instead of replaying the prefix.
+
+    Two routes reach the same state:
+
+    * ``prefill(prompt)`` then a step for ``row_a`` and a step for ``row_b``;
+    * ``prefill(prompt ++ row_a)`` then a step for ``row_b``.
+
+    The second step's hidden states have to agree.  If the first route
+    re-projected the prefix, or handed ``row_b`` a position range that
+    overlapped ``row_a``, the two would diverge.
+    """
+    config = _tensor_config()
+    model = _build_model(config)
+    torch.manual_seed(11)
+
+    prompt_len = 6
+    prompt = _rows(config, prompt_len)
+    row_a = _rows(config, 1)
+    row_b = _rows(config, 1)
+    anchor = torch.tensor([5], device="cuda")
+
+    cache = model.prefill(prompt, anchor)
+    model.forward_draft(row_a, anchor, start_pos=prompt_len + 1, caches=cache)
+    assert cache.context_length() == prompt_len + 1
+    stepped, _ = model.forward_draft(
+        row_b, anchor, start_pos=prompt_len + 2, caches=cache
+    )
+    assert cache.context_length() == prompt_len + 2
+
+    reference_cache = model.prefill(torch.cat([prompt, row_a], dim=1), anchor)
+    assert reference_cache.context_length() == prompt_len + 1
+    one_shot, _ = model.forward_draft(
+        row_b, anchor, start_pos=prompt_len + 2, caches=reference_cache
+    )
+
+    # bf16: the two routes batch their matmuls differently, so this is a
+    # closeness check rather than bit equality.  A wrong position range moves
+    # the rotation far more than this tolerance.
+    torch.testing.assert_close(stepped, one_shot, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_draft_noise_never_enters_the_cache():
+    """The history holds context only -- the block is attended and dropped.
+
+    SpecForge appends both halves and then ``crop(start)``s the tail back off;
+    the end state has to match that.  A leak would show up as ``noise_width``
+    extra rows, and the rows that do land have to be exactly what a prefill of
+    the same context produces.
+    """
+    config = _tensor_config()
+    model = _build_model(config)
+    torch.manual_seed(13)
+
+    prompt_len = 6
+    prompt = _rows(config, prompt_len)
+    new_row = _rows(config, 1)
+    anchor = torch.tensor([5], device="cuda")
+
+    cache = model.prefill(prompt, anchor)
+    model.forward_draft(new_row, anchor, start_pos=prompt_len + 1, caches=cache)
+
+    # The noisy block is ``noise_width`` rows wide; only context may land.
+    assert model.noise_width > 1
+    assert cache.context_length() == prompt_len + 1
+
+    expected = model.prefill(torch.cat([prompt, new_row], dim=1), anchor)
+    for got, want in zip(cache.keys, expected.keys):
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+    for got, want in zip(cache.values, expected.values):
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_forward_draft_and_head_run_end_to_end():
+    """The real check: the module tree actually forwards.
+
+    Shapes carry the meaning here -- ``forward_head`` must emit
+    ``block_size + 1`` ids (anchor first) over ``block_size`` proposal
+    positions, and that width has to come out of a ``block_size + 1``-row
+    noisy block.
+    """
+    config = _tensor_config()
+    torch.manual_seed(7)
+    model = _build_model(config)
+
+    # The checkpoint counts the verifier width; the contract counts proposals.
+    assert model.block_size == config.block_size - 1
+    assert model.noise_width == config.block_size
+
+    batch, prompt_len = 1, 6
+    prompt = torch.randn(
+        batch, prompt_len, config.target_hidden_size,
+        device="cuda", dtype=torch.bfloat16,
+    )
+    anchor = torch.tensor([3] * batch, device="cuda")
+
+    cache = model.prefill(prompt, anchor)
+    assert cache.context_length() == prompt_len
+
+    current = torch.randn(
+        batch, 1, config.target_hidden_size, device="cuda", dtype=torch.bfloat16
+    )
+    hidden, draft_ids = model.forward_draft(
+        current, anchor, start_pos=prompt_len + 1, caches=cache
+    )
+    assert hidden.shape == (batch, model.noise_width, config.hidden_size)
+    assert draft_ids.shape == (batch, model.noise_width)
+    assert draft_ids[0, 0].item() == 3
+    assert (draft_ids[0, 1:] == config.mask_token_id).all()
+
+    ids, logits, confidence = model.forward_head(hidden, anchor)
+    assert ids.shape == (batch, model.block_size + 1)
+    assert logits.shape == (batch, model.block_size, config.vocab_size)
+    assert confidence.shape == (batch, model.block_size)
+    assert ids[0, 0].item() == 3
+    assert not torch.isnan(hidden).any()
