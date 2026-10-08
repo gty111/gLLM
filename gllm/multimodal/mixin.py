@@ -464,95 +464,6 @@ class MmMixin:
             "num_decode_tokens": num_decode_tokens,
         }
 
-    @staticmethod
-    def _disagg_item_ready_end(st: "DisaggSeqState", i: int) -> int:
-        """End of item ``i``'s ready part: its span end when complete,
-        otherwise the position of its first visual token whose embedding row
-        has not landed (the span start when none has)."""
-        start, end = st.item_span[i]
-        if st.item_ready[i]:
-            return end
-        rows = st.item_rows[i] if st.item_rows else 0
-        if rows == 0:
-            return start
-        mm_pos = st.is_multimodal_cpu[start:end].nonzero(as_tuple=True)[0]
-        return end if rows >= mm_pos.numel() else start + int(mm_pos[rows])
-
-    @staticmethod
-    def _disagg_ready_len(st: "DisaggSeqState") -> int:
-        """Length of the ready prefix ``[0, ready_len)``.
-
-        Stops at the first visual token (in token order) whose embedding has
-        not landed, regardless of whether a later item happens to be ready: a
-        prefix past it would have more ``is_multimodal`` positions than
-        gathered embedding rows and the merge would misalign. A segment-streamed
-        item contributes its landed rows.
-        """
-        rl = st.prompt_len
-        for i in range(st.num_items):
-            if not st.item_ready[i]:
-                rl = min(rl, MmMixin._disagg_item_ready_end(st, i))
-        return rl
-
-    def _mm_disagg_collect(
-        self,
-        seq: GenerationSequence,
-        st: "DisaggSeqState",
-        prefill_works: List[Dict],
-        batch_positions: List[torch.Tensor],
-    ) -> None:
-        """Build the prefill work for an overlap disagg seq.
-
-        Positions come from the full-prompt mrope grid (all grids known once
-        meta arrived). Encoded visual rows cover the ready prefix; refresh them
-        (kind ``uncached``) whenever the scheduler advances past the cached
-        ``coverage_len`` because more items became ready, otherwise the cached
-        rows are re-sliced for the current chunk (kind ``cached``).
-        """
-        batch_positions.append(
-            st.prompt_positions[:, seq.computed_token_num : seq.seq_len]
-        )
-        info = self.embedding_cache.get(seq.seq_id)
-        need_build = info is None or info.is_multimodal_cpu is None or (
-            info.coverage_len is not None and seq.seq_len > info.coverage_len
-        )
-        if not need_build:
-            prefill_works.append({"kind": "cached", "seq": seq, "embedding_info": info})
-            return
-        ready_len = self._disagg_ready_len(st)
-        # Gather the ready-prefix items in token-span order so the concatenated
-        # embeddings line up 1-1 with the ``is_multimodal`` True positions. An
-        # item cut by ``ready_len`` (segment-streamed, partially landed)
-        # contributes the rows of its visual tokens before ``ready_len``.
-        ready_items = [
-            i for i in range(st.num_items) if st.item_span[i][0] < ready_len
-        ]
-        ready_items.sort(key=lambda i: st.item_span[i][0])
-        ready_embeds = []
-        for i in ready_items:
-            start, end = st.item_span[i]
-            if end <= ready_len:
-                ready_embeds.append(st.item_embed[i])
-                continue
-            n = int(st.is_multimodal_cpu[start:ready_len].sum())
-            if n:
-                ready_embeds.append(st.item_buffer[i][:n])
-        ready_embeds = tuple(ready_embeds)
-        prefill_works.append(
-            {
-                "kind": "uncached",
-                "seq": seq,
-                "input_ids_cpu": st.input_ids_cpu[:ready_len],
-                "is_multimodal_cpu": st.is_multimodal_cpu[:ready_len],
-                "mm_input": {},
-                "mm_embeddings": ready_embeds if ready_embeds else None,
-                "prompt_positions": st.prompt_positions,
-                "mrope_position_delta": st.mrope_position_delta,
-                "mm_bundle_key": None,
-                "coverage_len": ready_len,
-            }
-        )
-
     def _mm_run_processor(
         self, seq: GenerationSequence
     ) -> Tuple[Dict, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -914,7 +825,7 @@ class MmMixin:
                 # visual tensors after prefill has completed.
                 embedding_info.multimodal_embeddings = None
                 embedding_info.is_multimodal_cpu = None
-                self.disagg_embeds.pop(seq.seq_id, None)
+                self._disagg_free(seq.seq_id)
 
             batch_embeddings.append(embedding)
             batch_deepstack.append(deepstack_chunk)

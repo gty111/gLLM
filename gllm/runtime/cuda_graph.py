@@ -235,7 +235,7 @@ class CudaGraphMixin:
                 finally:
                     self.memory_manager.free(seq)
                     self.embedding_cache.pop(seq_id, None)
-                    self.disagg_embeds.pop(seq_id, None)
+                    self._disagg_free(seq_id)
 
         if stream is not None:
             stream.synchronize()

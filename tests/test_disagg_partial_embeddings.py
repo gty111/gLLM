@@ -10,8 +10,7 @@ from gllm.disagg.protocol import (
     parse_emb_notif,
     parse_emb_partial_notif,
 )
-from gllm.multimodal.mixin import MmMixin
-from gllm.runtime.model_runner import DisaggSeqState, ModelRunner
+from gllm.disagg.runner_mixin import DisaggMixin, DisaggSeqState
 
 
 def test_partial_notif_roundtrip_and_disjoint_from_full():
@@ -49,21 +48,21 @@ def _state():
 
 
 def _add(st, i, rows, end, final):
-    ModelRunner.disagg_add_embedding(
+    DisaggMixin.disagg_add_embedding(
         SimpleNamespace(disagg_embeds={0: st}), 0, i, rows, end, final
     )
 
 
 def test_ready_len_follows_landed_rows():
     st = _state()
-    assert MmMixin._disagg_ready_len(st) == 3  # nothing landed
+    assert DisaggMixin._disagg_ready_len(st) == 3  # nothing landed
     _add(st, 0, torch.ones(4, 2), 4, True)
-    assert MmMixin._disagg_ready_len(st) == 9  # image done, video untouched
+    assert DisaggMixin._disagg_ready_len(st) == 9  # image done, video untouched
     _add(st, 1, torch.full((3, 2), 2.0), 3, False)
     # 3 video rows -> visual positions 9, 11, 12 ready; next visual is 13
-    assert MmMixin._disagg_ready_len(st) == 13
+    assert DisaggMixin._disagg_ready_len(st) == 13
     _add(st, 1, torch.full((5, 2), 3.0), 8, True)
-    assert MmMixin._disagg_ready_len(st) == 20
+    assert DisaggMixin._disagg_ready_len(st) == 20
     assert st.item_embed[1].shape[0] == 8 and st.item_buffer[1] is None
     assert torch.equal(st.item_embed[1][:3], torch.full((3, 2), 2.0))
     assert torch.equal(st.item_embed[1][3:], torch.full((5, 2), 3.0))
@@ -76,10 +75,10 @@ def test_collect_gathers_partial_rows_in_order():
     works = []
     runner = SimpleNamespace(
         embedding_cache={},
-        _disagg_ready_len=MmMixin._disagg_ready_len,
+        _disagg_ready_len=DisaggMixin._disagg_ready_len,
     )
     seq = SimpleNamespace(seq_id=0, computed_token_num=0, seq_len=13)
-    MmMixin._mm_disagg_collect(runner, seq, st, works, [])
+    DisaggMixin._mm_disagg_collect(runner, seq, st, works, [])
     (work,) = works
     assert work["coverage_len"] == 13
     embeds = work["mm_embeddings"]

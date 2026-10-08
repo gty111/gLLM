@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from gllm.runtime.model_runner import DisaggSeqState, EmbeddingInfo
+from gllm.disagg.runner_mixin import DisaggSeqState
+from gllm.runtime.model_runner import EmbeddingInfo
 from gllm.runtime.sequence import GenerationSequence
 
 
