@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from attr import Factory, dataclass
 from logger import logger
 from transformers import (
     AutoProcessor,
@@ -42,6 +41,7 @@ from gllm.layers.attention.qkv_backends import (
     create_qkv_attention_backend,
     find_qkv_attention_layers,
 )
+from gllm.disagg.runner_mixin import DisaggMixin
 from gllm.layers.sampler import Sampler
 from gllm.multimodal.mixin import (
     EmbeddingInfo,
@@ -54,6 +54,8 @@ from gllm.multimodal.mixin import (  # noqa: F401
     _build_item_content_hash as _build_item_content_hash,
     _concat_mrope_positions_pinned as _concat_mrope_positions_pinned,
 )
+# Re-exported from its historical location for callers and tests.
+from gllm.disagg.runner_mixin import DisaggSeqState as DisaggSeqState  # noqa: F401
 from gllm.runtime.async_runtime import FutureIndices, FutureMap, OverlapRuntime
 from gllm.runtime.config import EngineConfig
 from gllm.runtime.cuda_graph import CudaGraphMixin
@@ -99,43 +101,7 @@ def apply_mm_processor_pixels(
         logger.info(f"Max pixels: {max_pixels}")
 
 
-@dataclass
-class DisaggSeqState:
-    """Per-seq encoder-disaggregation overlap state.
-
-    Owned by the :class:`ModelRunner` (keyed by ``seq_id``) so it is immune to
-    the scheduler's chunked-prefill ``deepcopy`` of the :class:`GenerationSequence`. The
-    LM disagg manager fills ``item_embed[i]`` (and flips ``item_ready[i]``) as
-    each item's visual embedding lands over NIXL; the scheduler reads
-    ``item_ready`` for the two-layer prefill gate and the model runner reads
-    ``item_embed`` to embed the ready prefix.
-
-    Items are stored in **image-then-video order** (the order
-    ``model.embed_multimodal`` returns its tuple in, which is what the merge
-    expects). Each carries its ``[span_start, span_end)`` in the *expanded*
-    token sequence so gate B and the ready-prefix embed can be computed.
-    """
-
-    num_items: int
-    item_span: List[Tuple[int, int]]  # ordered: (start, end) in tokens
-    item_modality: List[str]
-    item_ready: List[bool]
-    item_embed: List[Optional[torch.Tensor]]  # ordered, filled on NIXL notif
-    image_grid_thw: Optional[torch.Tensor]
-    video_grid_thw: Optional[torch.Tensor]
-    input_ids_cpu: torch.Tensor  # full expanded prompt ids (cpu)
-    is_multimodal_cpu: torch.Tensor  # full mask (cpu)
-    prompt_positions: torch.Tensor  # full-prompt mrope positions
-    mrope_position_delta: torch.Tensor
-    prompt_len: int
-    # Segment-streamed items (video): rows ``[0, item_rows[i])`` have landed so
-    # far, copied into a per-item buffer sized for the whole item, which
-    # becomes ``item_embed[i]`` when the item completes (no further copy).
-    item_rows: List[int] = Factory(list)
-    item_buffer: List[Optional[torch.Tensor]] = Factory(list)
-
-
-class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
+class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin):
     def __init__(self, config: EngineConfig):
         self.config = config
 
@@ -345,11 +311,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         # embedding cache: seq_id => embedding
         self.embedding_cache: Dict[int, EmbeddingInfo] = {}
 
-        # Encoder-disaggregation overlap: seq_id => per-item
-        # readiness + embeddings for seqs admitted before all their visual
-        # embeddings arrived. Populated by the LM disagg manager; consumed by
-        # the scheduler (gate B) and the embed path. Empty for the monolith.
-        self.disagg_embeds: Dict[int, DisaggSeqState] = {}
+        self._init_disagg_state()
 
         # Multimodal vision-tower output cache, keyed by the content hash of
         # the prompt's MM items. Hits skip ``model.embed_multimodal``
@@ -1439,71 +1401,6 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
             self.output_residual[:num_cal_tokens],
         )
 
-    def disagg_register(self, seq_id: int, state: DisaggSeqState) -> None:
-        """Register a disagg seq for overlapped, readiness-gated prefill.
-
-        Called by the LM disagg manager once *all* per-item ``MmItemMeta`` have
-        arrived (positions/hashes determined; gate A satisfied) but before the
-        visual embeddings have necessarily landed. The embeddings are filled in
-        progressively via :meth:`disagg_add_embedding`.
-        """
-        self.disagg_embeds[seq_id] = state
-
-    def disagg_add_embedding(
-        self,
-        seq_id: int,
-        ordered_idx: int,
-        rows: torch.Tensor,
-        rows_end: int,
-        final: bool,
-    ) -> None:
-        """Record rows ``[rows_end - len(rows), rows_end)`` of one item's
-        visual embedding (NIXL write landed). ``final`` completes the item.
-
-        A whole item arrives as one final call and is stored as is. Segment-
-        streamed rows are copied into a buffer allocated once for the whole
-        item, so readers can slice the landed prefix without concatenating.
-        ``rows`` may be a view of the receive slot; it is consumed here.
-        """
-        st = self.disagg_embeds.get(seq_id)
-        if st is None:
-            return
-        lo = rows_end - rows.shape[0]
-        buf = st.item_buffer[ordered_idx]
-        if final and lo == 0 and buf is None:
-            st.item_embed[ordered_idx] = rows
-        else:
-            if buf is None:
-                start, end = st.item_span[ordered_idx]
-                total = int(st.is_multimodal_cpu[start:end].sum())
-                buf = rows.new_empty((total, rows.shape[1]))
-                st.item_buffer[ordered_idx] = buf
-            buf[lo:rows_end].copy_(rows)
-            if final:
-                st.item_embed[ordered_idx] = buf
-                st.item_buffer[ordered_idx] = None
-        st.item_rows[ordered_idx] = rows_end
-        if final:
-            st.item_ready[ordered_idx] = True
-
-    def disagg_prefill_limit(self, seq: GenerationSequence) -> Optional[int]:
-        """Gate-B upper bound: the largest token position this
-        seq may prefill up to this round = the start of the first image span
-        whose embedding hasn't landed yet (or ``prompt_len`` if all ready).
-        ``None`` for non-disagg seqs (no cap).
-
-        This deliberately matches :meth:`_disagg_ready_len` (the embed coverage)
-        so the scheduler never advances ``computed_token_num`` past the embed
-        coverage -- even when a prefix-cache hit would otherwise jump the cursor
-        over an item whose embedding is still in flight. Such a (rare) seq waits
-        for the embedding to land, then proceeds; the encoder's own embed cache
-        keeps that wait short for repeated content.
-        """
-        st = self.disagg_embeds.get(seq.seq_id)
-        if st is None:
-            return None
-        return self._disagg_ready_len(st)
-
     def register_decode_page_hash(self, seq: GenerationSequence, pos: int) -> None:
         """Register the prefix-cache page hash for a decode boundary the seq
         just completed with a *real* (finalized) token at ``seq.token_ids[pos]``.
@@ -1526,7 +1423,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq.seq_id, None)
-            self.disagg_embeds.pop(seq.seq_id, None)
+            self._disagg_free(seq.seq_id)
 
     def free_follower_state(self, seq_id: int) -> None:
         """Drop per-seq cache on a TP/PP follower; does **not** touch pages.
@@ -1545,7 +1442,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         self._mtp_relay.pop(seq_id, None)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq_id, None)
-            self.disagg_embeds.pop(seq_id, None)
+            self._disagg_free(seq_id)
 
 
 class OverlapModelRunner(ModelRunner):

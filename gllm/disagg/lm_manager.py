@@ -52,8 +52,9 @@ from gllm.disagg.protocol import (
     parse_emb_notif,
     parse_emb_partial_notif,
 )
+from gllm.disagg.runner_mixin import DisaggSeqState
 from gllm.layers.rotary_embedding import MRotaryEmbedding
-from gllm.runtime.model_runner import DisaggSeqState, ModelRunner
+from gllm.runtime.model_runner import ModelRunner
 from gllm.runtime.sequence import resolve_output_len
 from gllm.transfer.nixl_transfer import NixlEndpoint, RemoteRegion
 
