@@ -325,6 +325,93 @@ def test_real_config_rope_cache_is_not_multiplied_twice():
     assert rows == config.max_position_embeddings == 262_144
 
 
+def _source_for(key, shape, dtype):
+    '''Deterministic synthetic checkpoint tensor for one key.'''
+    generator = torch.Generator().manual_seed(abs(hash(key)) % (2**31))
+    return (torch.randn(shape, generator=generator) * 0.1).to(dtype)
+
+
+def _build_synthetic_checkpoint(model, config):
+    '''Build the exact key set the Qwen3.8 mapping expects to read.'''
+    mapping = Qwen38DSparkMapping(model)
+    weights = {}
+    for path, param in model.named_parameters():
+        key = mapping.checkpoint_key(path)
+        if key.endswith('mlp.gate_up_proj.weight'):
+            half = param.shape[0] // 2
+            gate_key = key.replace('gate_up_proj', 'gate_proj')
+            up_key = key.replace('gate_up_proj', 'up_proj')
+            weights[gate_key] = _source_for(
+                gate_key, (half, param.shape[1]), param.dtype
+            )
+            weights[up_key] = _source_for(
+                up_key, (half, param.shape[1]), param.dtype
+            )
+        elif key in (
+            'markov_head.markov_w1.weight',
+            'markov_head.markov_w2.weight',
+        ):
+            weights[key] = _source_for(
+                key, (config.vocab_size, param.shape[1]), param.dtype
+            )
+        else:
+            weights[key] = _source_for(key, tuple(param.shape), param.dtype)
+    return weights
+
+
+def _assert_loaded_checkpoint(model, weights):
+    '''Every model parameter must equal its checkpoint tensor or fused slice.'''
+    mapping = Qwen38DSparkMapping(model)
+    for path, param in model.named_parameters():
+        key = mapping.checkpoint_key(path)
+        if key.endswith('mlp.gate_up_proj.weight'):
+            half = param.shape[0] // 2
+            gate_key = key.replace('gate_up_proj', 'gate_proj')
+            up_key = key.replace('gate_up_proj', 'up_proj')
+            torch.testing.assert_close(
+                param[:half].float().cpu(),
+                weights[gate_key].float(),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                param[half:].float().cpu(),
+                weights[up_key].float(),
+                rtol=0,
+                atol=0,
+            )
+        else:
+            torch.testing.assert_close(
+                param.float().cpu(),
+                weights[key].float(),
+                rtol=0,
+                atol=0,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_load_weights_round_trips_the_synthetic_checkpoint():
+    '''Exercise the complete checkpoint mapping through the real loader.
+
+    The layer keys have no model. prefix.  Passing the usual
+    pp_idx_offset=2 would make resolve_pp_layer_idx try to parse
+    self_attn as the layer number and fail before any weight is copied.
+    '''
+    config = _tensor_config()
+    model = _build_model(config)
+    weights = _build_synthetic_checkpoint(model, config)
+
+    assert set(weights) == set(_checkpoint_keys(config.num_hidden_layers))
+
+    model._embed[0].weight.data.fill_(17)
+    model._lm_head[0].weight.data.fill_(23)
+
+    model.load_weights(weights)
+
+    _assert_loaded_checkpoint(model, weights)
+    assert torch.all(model._embed[0].weight == 17)
+    assert torch.all(model._lm_head[0].weight == 23)
+
 # --- cache statefulness: context accumulates across draft steps -------------
 
 
