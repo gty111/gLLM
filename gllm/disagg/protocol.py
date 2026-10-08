@@ -82,6 +82,25 @@ def emb_notif(seq_id: int, item_idx: int) -> bytes:
     return f"emb:{seq_id}:{item_idx}".encode()
 
 
+def emb_partial_notif(seq_id: int, item_idx: int, rows: int) -> bytes:
+    """Encoder -> LM TP0: rows ``[0, rows)`` of the item's embedding have
+    landed in every rank's slot (segment-streamed video). The final segment is
+    signalled with the regular :func:`emb_notif`."""
+    return f"embp:{seq_id}:{item_idx}:{rows}".encode()
+
+
+def parse_emb_partial_notif(msg: bytes) -> Optional[Tuple[int, int, int]]:
+    """Inverse of :func:`emb_partial_notif`; ``None`` for anything else."""
+    try:
+        s = msg.decode()
+        if not s.startswith("embp:"):
+            return None
+        _, sid, iid, rows = s.split(":")
+        return int(sid), int(iid), int(rows)
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
 def parse_emb_notif(msg: bytes) -> Optional[Tuple[int, int]]:
     """Inverse of :func:`emb_notif`; returns ``None`` for unrelated notifs.
 

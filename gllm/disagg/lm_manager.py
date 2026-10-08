@@ -46,7 +46,12 @@ import torch
 from logger import logger
 
 from gllm.disagg.discovery import make_discovery, make_payload, payload_nixl_meta
-from gllm.disagg.protocol import EncoderJob, MmItemMeta, parse_emb_notif
+from gllm.disagg.protocol import (
+    EncoderJob,
+    MmItemMeta,
+    parse_emb_notif,
+    parse_emb_partial_notif,
+)
 from gllm.layers.rotary_embedding import MRotaryEmbedding
 from gllm.runtime.model_runner import DisaggSeqState, ModelRunner
 from gllm.runtime.sequence import resolve_output_len
@@ -60,6 +65,10 @@ class _PendingItem:
     slot_id: int
     meta: Optional[MmItemMeta] = None
     embedding_ready: bool = False
+    # Segment-streamed items (video): rows ``[0, ready_rows)`` have landed
+    # (partial notifs); ``emitted_rows`` have been turned into EMB_READY events.
+    ready_rows: int = 0
+    emitted_rows: int = 0
     # Set once the EMB_READY event for this item has been emitted (its slot
     # returned to the free list). The actual clone out of the slot pool happens
     # per-rank when the event is applied; the coordinator only tracks emission.
@@ -139,9 +148,11 @@ class DisaggEvents:
     # (expanded ``GenerationSequence``, freshly-built :class:`DisaggSeqState`):
     # register the state + add the seq to the scheduler.
     admits: List[Tuple[object, DisaggSeqState]] = field(default_factory=list)
-    # (seq_id, ordered_idx, slot_id, num_tokens): clone the embedding from this
-    # rank's *own* slot pool into ``model_runner.disagg_embeds``.
-    emb_ready: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    # (seq_id, ordered_idx, slot_id, row_start, row_end, final): clone rows
+    # ``[row_start, row_end)`` of the item's embedding from this rank's *own*
+    # slot pool into ``model_runner.disagg_embeds``. Whole items arrive as one
+    # ``(0, num_tokens, True)`` event; segment-streamed items as several.
+    emb_ready: List[Tuple[int, int, int, int, int, bool]] = field(default_factory=list)
     # seq_ids to abort: an *already-admitted* seq whose encode failed
     # unrecoverably (watchdog gave up). Fanned out so every column drops it from
     # its scheduler in the same iteration (model_runner.free reclaims the page /
@@ -247,11 +258,16 @@ class DisaggReceiver:
         """
         torch.cuda.synchronize(self.device)
 
+    def slot_rows(self, slot_id: int, start: int, end: int) -> torch.Tensor:
+        """View of rows ``[start, end)`` of a slot (no copy). Only valid until
+        the item's final EMB_READY frees the slot: consume it immediately."""
+        return self.slot_pool[slot_id, start:end, :]
+
     @torch.inference_mode()
-    def clone_slot(self, slot_id: int, num_tokens: int) -> torch.Tensor:
-        """Clone one item's embedding out of the local slot pool. Call
-        :meth:`sync` once before a batch of clones."""
-        return self.slot_pool[slot_id, :num_tokens, :].clone()
+    def clone_slot(self, slot_id: int, num_tokens: int, start: int = 0) -> torch.Tensor:
+        """Clone rows ``[start, num_tokens)`` of one item's embedding out of the
+        local slot pool. Call :meth:`sync` once before a batch of clones."""
+        return self.slot_pool[slot_id, start:num_tokens, :].clone()
 
 
 class DisaggCoordinator:
@@ -679,6 +695,10 @@ class DisaggCoordinator:
         notifs = self.nixl.poll_notifs()
         for _agent, msgs in notifs.items():
             for msg in msgs:
+                partial = parse_emb_partial_notif(msg)
+                if partial is not None:
+                    self._apply_partial_notif(*partial)
+                    continue
                 parsed = parse_emb_notif(msg)
                 if parsed is None:
                     continue
@@ -791,6 +811,19 @@ class DisaggCoordinator:
                 # worker's existing abort_ids path; we only free NIXL slots.
                 self._abort_pending(seq_id)
 
+    def _apply_partial_notif(self, seq_id: int, item_idx: int, rows: int) -> None:
+        """Rows ``[0, rows)`` of a segment-streamed item have landed."""
+        ps = self._pending.get(seq_id)
+        if ps is None or not 0 <= item_idx < len(ps.items):
+            return
+        item = ps.items[item_idx]
+        if item.embedding_ready or rows <= item.ready_rows:
+            return
+        item.ready_rows = rows
+        # Progress counts as liveness for the re-dispatch watchdog: a long
+        # video streams for longer than ``redispatch_timeout_s`` in total.
+        item.dispatched_at = time.monotonic()
+
     def poll(self) -> DisaggEvents:
         """Drive the control plane one step; return this iteration's events."""
         events = DisaggEvents()
@@ -850,12 +883,21 @@ class DisaggCoordinator:
         if ps.ordered is None:
             return
         for o, it in enumerate(ps.ordered):
-            if not it.embedding_ready or it.slot_freed:
+            if it.slot_freed:
                 continue
-            events.emb_ready.append((ps.seq.seq_id, o, it.slot_id, it.meta.num_tokens))
-            self._free_slots.append(it.slot_id)
-            it.slot_freed = True
-            it.content = None  # done: drop retained payload (no re-dispatch)
+            n = it.meta.num_tokens
+            upto = n if it.embedding_ready else min(it.ready_rows, n)
+            if upto <= it.emitted_rows:
+                continue
+            final = it.embedding_ready
+            events.emb_ready.append(
+                (ps.seq.seq_id, o, it.slot_id, it.emitted_rows, upto, final)
+            )
+            it.emitted_rows = upto
+            if final:
+                self._free_slots.append(it.slot_id)
+                it.slot_freed = True
+                it.content = None  # done: drop retained payload (no re-dispatch)
 
     # ------------------------------------------------------------------
     # Admit: build expanded token-ids + grids + DisaggSeqState (== monolith)
@@ -952,6 +994,8 @@ class DisaggCoordinator:
             item_modality=[it.modality for it in ordered],
             item_ready=[False] * len(ordered),
             item_embed=[None] * len(ordered),
+            item_rows=[0] * len(ordered),
+            item_buffer=[None] * len(ordered),
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             input_ids_cpu=input_ids_cpu,

@@ -66,8 +66,9 @@ cases (sections 7 and 9).
 ## 3. Supported models
 
 Encoder disaggregation is wired for the Qwen-VL families (LM side skips the
-vision tower, encoder side skips the language model, and output stays
-byte-identical to the monolith). Verified:
+vision tower, encoder side skips the language model, and image output stays
+byte-identical to the monolith; video is decoded differently on the encoder —
+see section 6.1). Verified:
 
 | Model | Architecture | Notes |
 |-------|--------------|-------|
@@ -91,6 +92,15 @@ byte-identical to the monolith). Verified:
   Make sure the target card is free.
 - Keep the LM↔encoder NIXL traffic within the same NUMA domain (cross-NUMA UCX
   wireup can fail — see section 9).
+- Video inputs on the encoder use **torchcodec**, which needs the FFmpeg shared
+  libraries (`libavcodec`, `libavformat`, ...) on the library path. Without
+  them the encoder logs a warning and falls back to whole-video PyAV decoding
+  (no NVDEC, no segmenting/streaming).
+- **NVDEC** (GPU video decoding, the default) additionally needs the driver's
+  `libnvcuvid.so`, shipped in the `libnvidia-decode-<driver>` package and only
+  present in containers started with the `video` driver capability
+  (`NVIDIA_DRIVER_CAPABILITIES=compute,utility,video`). If it is missing the
+  encoder logs `NVDEC unavailable ...` and decodes on the CPU instead.
 - `python` below refers to the gLLM environment's interpreter; `$MODEL` is the
   path to a supported model directory.
 
@@ -187,6 +197,15 @@ You normally only need `--model-path`, the GPU index, the LM `--port`, and
 | `--max-vis-tokens` (encoder) | `16384` | Upper bound on N_vis per item; sizes the send buffer. |
 | `--mm-embed-cache-size` (encoder) | `256` (MB) | Per-replica content_hash→embedding dedup cache. |
 
+### Video decoding (encoder)
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--video-decode-device` | `auto` | `auto` = NVDEC when torchcodec + `libnvcuvid` are usable, else multi-threaded CPU; `cuda` / `cpu` to force. |
+| `--video-decode-segments` | `16` | Time segments per video; each is decoded, preprocessed, encoded and sent on its own (`1` = whole video). |
+| `--video-decode-workers` | `8` | Concurrent segment decoders (NVDEC sessions or CPU decoders), shared by all requests. |
+| `--video-decode-threads` | `0` | FFmpeg threads per CPU decoder (`0` = auto). |
+
 ### Environment variables
 
 | Variable | Default | Purpose |
@@ -216,6 +235,40 @@ between requests. The LM tracks two gates per request:
 Note: regardless of this flag, the LM can still prefill/decode request A while
 the encoders work on request B — that cross-request pipelining is inherent to
 the two-plane design and is not gated by `GLLM_DISAGG_OVERLAP`.
+
+### 6.1 Encoder pipeline and segment-streamed video
+
+The encoder serves items through a cross-request pipeline
+(`gllm/engine/encoder_pipeline.py`): a planning pool computes each item's grid,
+token count and hash; decode workers decode and preprocess *segments* (a whole
+image, or one time slice of a video) from a shared priority queue (FCFS by
+arrival, then segment order); a GPU thread runs the ViT; the main thread posts
+the NIXL writes asynchronously and notifies the LM. Planning, decoding, ViT and
+transfer of different requests overlap.
+
+Videos are split into `--video-decode-segments` time segments:
+
+- The token count is derived from the container metadata and the processor's
+  sampling/resize rule, so `MmItemMeta` (gate A) is sent **before decoding**.
+- Segments are decoded concurrently; each segment is preprocessed with the
+  whole-video resize target and encoded on its own. Qwen-VL vision towers
+  attend within a temporal patch group, so the concatenated segment embeddings
+  are bit-identical to encoding the whole video at once.
+- Each segment is written to its row range of the LM slot and announced with a
+  partial notification (`embp:seq:item:rows`); the last one sends the regular
+  `emb:seq:item`. With `GLLM_DISAGG_OVERLAP=1` the LM prefills the landed rows
+  while later segments are still being decoded/encoded; with `0` it still
+  waits for the whole item.
+
+Differences from the monolith for video:
+
+- Frames are decoded with torchcodec (NVDEC or FFmpeg) instead of PyAV;
+  YUV→RGB rounding differs by up to a few levels per channel, so video
+  embeddings are not byte-identical to the monolith (images are unaffected).
+- A streamed video's content hash (prefix-cache / embed-cache key) is derived
+  from the source (bytes, or path + size + mtime + head/tail bytes) and the
+  sampling plan, not from pixel values, so it differs from the monolith's hash.
+- Only the sampled frames are decoded (the monolith decodes every frame).
 
 ---
 
@@ -341,7 +394,8 @@ python -m gllm.entrypoints.api_server --model-path $MODEL --port 8200 \
 # examples/mm_chat.py or curl) and diff the responses byte-for-byte.
 ```
 
-Expect identical outputs (`disagg == monolith`).
+Expect identical outputs (`disagg == monolith`) for images. Video requests are
+not byte-identical (different decoder, see section 6.1).
 
 > Note: with chunked prefill, bf16 rounding at chunk boundaries causes *expected*
 > tiny numerical differences (independent of disaggregation); under greedy

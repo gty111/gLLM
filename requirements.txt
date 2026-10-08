@@ -10,6 +10,7 @@ logger
 # pyproject.toml routes uv's PyTorch resolution to the CUDA 13.0 wheel index.
 torch==2.13.0+cu130
 torchvision==0.28.0+cu130
+torchcodec==0.15.0+cu130 # NVDEC video decoding on encoder-disaggregated nodes
 cuda-python>=13
 zmq
 aiohttp
