@@ -567,13 +567,13 @@ def test_apply_disagg_events_admits_and_embeddings():
     seq = SimpleNamespace(seq_id=3)
     events = SimpleNamespace(
         admits=[(seq, "state")],
-        emb_ready=[(3, 0, 7, 12)],
+        emb_ready=[(3, 0, 7, 0, 12, True)],
         aborts=[9],
     )
     worker = make_worker(
         model_runner=SimpleNamespace(
             disagg_register=lambda *a: registered.append(a),
-            disagg_set_embedding=lambda *a: embedded.append(a),
+            disagg_add_embedding=lambda *a: embedded.append(a),
         ),
         scheduler=SimpleNamespace(
             add_new_requests=added.append,
@@ -581,14 +581,14 @@ def test_apply_disagg_events_admits_and_embeddings():
         ),
         _disagg_recv=SimpleNamespace(
             sync=lambda: synced.append(True),
-            clone_slot=lambda slot, ntok: f"emb{slot}",
+            clone_slot=lambda slot, ntok, start=0: f"emb{slot}[{start}:{ntok}]",
         ),
     )
     worker._apply_disagg_events(events)
     assert registered == [(3, "state"), ("abort", [9])]
     assert added == [[seq]]
     assert synced == [True]
-    assert embedded == [(3, 0, "emb7")]
+    assert embedded == [(3, 0, "emb7[0:12]", 12, True)]
 
 
 # ------------------------------------------------------------------

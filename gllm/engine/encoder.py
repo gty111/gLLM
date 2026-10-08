@@ -1,25 +1,22 @@
 """Encoder-side serving loop: ZMQ EncoderJob intake -> ViT -> NIXL write.
 
 Coordinates a :class:`gllm.runtime.vision_encoder_runner.VisionEncoderRunner`
-with the disaggregation control and data planes:
+with the disaggregation control and data planes. Items flow through the
+cross-request pipeline in :mod:`gllm.engine.encoder_pipeline`, one segment
+(a video time slice, or a whole image) at a time:
 
-    for each EncoderJob(seq, item, modality, content, remote_slots):
-        mm_input, grid = processor(content)            # CPU pixel IO
-        push MmItemMeta(num_tokens, grid, hash) -----> LM TP0  (before ViT!)
-        vis = ViT(mm_input)                            # GPU [N_vis, feat_dim]
-        send_buf[:N_vis].copy_(vis)
-        for r in remote_slots:                         # one per LM TP rank
-            nixl.write(send_buf[:N_vis] -> r)          # multi-write, no notif
-        wait(all handles)                              # reuse send_buf safely
-        nixl.notify(TP0, "emb:seq:item")               # single ready signal
+    EncoderJob(seq, item, modality, content, remote_slots)
+      plan:    grid / token count / hash (no decoding)
+               push MmItemMeta(num_tokens, grid, hash) --> LM TP0 (gate A)
+      decode:  segment frames -> preprocess            (NVDEC / CPU workers)
+      encode:  ViT(segment) -> staging rows of send_buf (GPU thread)
+      send:    nixl.write(rows -> slot rows) for every LM TP rank, then
+               nixl.notify(TP0, "embp:seq:item:rows" ... "emb:seq:item")
 
-Sending the meta *before* the ViT is the whole point of the per-item channel:
-it lets the LM expand its skeleton token-ids and build the prefix-cache key
-while the (slower) ViT + transfer are still in flight.
-
-Phase 3b processes one job at a time (single in-flight transfer per encoder),
-which keeps the persistent send buffer race-free without a ring. Per-item
-pipelining + Encoder DP is Phase 5.
+Sending the meta before any decoding lets the LM expand its skeleton
+token-ids and build the prefix-cache key while decoding, ViT and transfer are
+still in flight; partial notifications let it prefill the landed prefix.
+All ZMQ and NIXL calls stay on the main (serve) thread.
 """
 
 from __future__ import annotations
@@ -38,7 +35,13 @@ from gllm.disagg.discovery import (
     make_payload,
     payload_nixl_metas,
 )
-from gllm.disagg.protocol import EncoderJob, MmItemMeta, emb_notif
+from gllm.disagg.protocol import (
+    EncoderJob,
+    MmItemMeta,
+    emb_notif,
+    emb_partial_notif,
+)
+from gllm.engine.encoder_pipeline import EncoderPipeline
 from gllm.runtime.vision_encoder_runner import VisionEncoderRunner
 from gllm.transfer.nixl_transfer import NixlEndpoint
 
@@ -217,34 +220,8 @@ class Encoder:
         self.lm_zmq_addr = None
 
     # ------------------------------------------------------------------
-    # Per-item processing is split into two phases so a *batch* of drained
-    # jobs can emit ALL their metadata (gate A) before ANY ViT runs (design
-    # §6.2). Metadata only needs the cheap CPU processor (grid_thw -> num_tokens
-    # + content_hash), so completing gate A for the whole batch up front lets
-    # the LM start prefilling the ready prefix while the (heavy, serialized)
-    # ViTs for the remaining items are still running -- widening the
-    # encode/prefill overlap window from "one ViT" to the full encode spread.
-    @torch.inference_mode()
-    def _prepare_job(self, job: EncoderJob) -> dict:
-        """Phase A: CPU processor + send :class:`MmItemMeta` (gate A).
-
-        Returns the state needed by :meth:`_encode_and_write` (phase B).
-        """
-        mm_input, grid_thw = self.runner.run_processor(job.content, job.modality)
-        num_tokens = self.runner.num_vis_tokens(grid_thw)
-        chash = self.runner.content_hash(mm_input, grid_thw)
-        logger.debug(
-            f"[encoder {self.encoder_id}] handling seq={job.seq_id} "
-            f"item={job.item_idx} modality={job.modality} "
-            f"slot={job.slot_id} num_tokens={num_tokens}"
-        )
-
-        if num_tokens > self.max_vis_tokens:
-            raise ValueError(
-                f"item needs {num_tokens} vis tokens > max_vis_tokens "
-                f"{self.max_vis_tokens}; raise --max-vis-tokens"
-            )
-
+    def _send_meta(self, job: EncoderJob, num_tokens: int, grid_thw, chash: bytes) -> None:
+        """Gate A: tell the LM the item's token count / grid / hash."""
         meta = MmItemMeta(
             seq_id=job.seq_id,
             item_idx=job.item_idx,
@@ -256,86 +233,6 @@ class Encoder:
             slot_id=job.slot_id,
         )
         self.meta_sock.send(pickle.dumps(meta))
-        return {
-            "job": job,
-            "mm_input": mm_input,
-            "chash": chash,
-            "num_tokens": num_tokens,
-        }
-
-    @torch.inference_mode()
-    def _encode_and_write(self, prep: dict) -> None:
-        """Phase B: ViT (with dedup cache) -> staging buffer -> NIXL WRITE."""
-        job: EncoderJob = prep["job"]
-        num_tokens: int = prep["num_tokens"]
-
-        # ViT (with per-replica dedup cache), then stage into the send buf.
-        vis = self.runner.encode(prep["mm_input"], prep["chash"])
-        assert vis.shape[0] == num_tokens, (
-            f"ViT rows {vis.shape[0]} != predicted {num_tokens}"
-        )
-        assert vis.shape[1] == self.feat_dim, (
-            f"ViT feat_dim {vis.shape[1]} != slot feat_dim {self.feat_dim}"
-        )
-        src = self.send_buf[:num_tokens]
-        src.copy_(vis.to(self.send_buf.dtype))
-        # The NIXL WRITE below is a UCX RDMA read of ``src`` issued OUTSIDE the
-        # CUDA stream (``agent.transfer`` reads the raw device pointer), so it
-        # does not honor stream ordering against the async ``copy_`` above.
-        # Without this barrier the transport can ship stale/partial send-buffer
-        # bytes whenever writes are issued back-to-back (batched phase B / high
-        # concurrency) -- landing the WRONG image's embedding in the LM slot
-        # (cross-request visual contamination). Make the copy fully visible to
-        # the transport before launching the transfer.
-        torch.cuda.synchronize()
-
-        # NIXL multi-WRITE: the full (un-sharded) embedding lands in every LM TP
-        # rank's reserved slot, sub-sized to the actual item. A single notif is
-        # sent to TP0 *after* all writes complete, so TP0's ready gate means
-        # "every rank's write landed". Retried with a re-handshake on transient
-        # transport failure.
-        nbytes = num_tokens * self.feat_dim * self.send_buf.element_size()
-        remotes = [rs.with_offset(0, nbytes) for rs in job.remote_slots]
-        self._write_with_retry(src, remotes, job)
-
-    def _write_with_retry(self, src, remotes, job: EncoderJob) -> None:
-        notif = emb_notif(job.seq_id, job.item_idx)
-        # TP0 is the single notification target (rank 0 in the agent list / the
-        # owner of the first slot region).
-        notif_target = (
-            job.lm_agent_names[0]
-            if job.lm_agent_names
-            else remotes[0].agent_name
-        )
-        last_err: Optional[BaseException] = None
-        for attempt in range(1, self.write_max_attempts + 1):
-            try:
-                # Write the full embedding into each LM TP rank's slot
-                # (sequentially: one in-flight transfer at a time keeps the
-                # shared send buffer race-free, same invariant as the single
-                # write). No per-write notif -- a single notif is sent to TP0
-                # only after every rank's write has landed, so TP0's ready gate
-                # means "all ranks done".
-                for remote in remotes:
-                    handle = self.nixl.write(src, remote, notif_msg=b"")
-                    self.nixl.wait(handle)
-                    self.nixl.release(handle)
-                self.nixl.notify(notif_target, notif)
-                return
-            except Exception as e:  # transport hiccup: re-handshake + retry
-                last_err = e
-                logger.warning(
-                    f"[encoder {self.encoder_id}] NIXL write seq={job.seq_id} "
-                    f"item={job.item_idx} attempt {attempt}/"
-                    f"{self.write_max_attempts} failed: {type(e).__name__}: {e}"
-                )
-                if attempt < self.write_max_attempts:
-                    time.sleep(0.1 * attempt)  # linear backoff
-                    self._reconnect_lm()
-        raise RuntimeError(
-            f"NIXL write seq={job.seq_id} item={job.item_idx} failed after "
-            f"{self.write_max_attempts} attempts: {last_err!r}"
-        )
 
     def _reconnect_lm(self) -> None:
         """Drop + re-add the LM remote agent to rebuild a stale UCX endpoint."""
@@ -360,65 +257,163 @@ class Encoder:
             time.sleep(sleep_s)
         return False
 
+    def _recv_jobs(self) -> List[EncoderJob]:
+        """Drain every currently-available job from the intake socket."""
+        batch: List[EncoderJob] = []
+        while True:
+            try:
+                raw = self.job_sock.recv(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                return batch
+            job: EncoderJob = pickle.loads(raw)
+            self._jobs_seen += 1
+            if self._jobs_seen <= self._fail_first_n:
+                logger.error(
+                    f"[encoder {self.encoder_id}] FAULT-INJECT drop job "
+                    f"seq={job.seq_id} item={job.item_idx} "
+                    f"({self._jobs_seen}/{self._fail_first_n})"
+                )
+                continue
+            if not self._ensure_lm():
+                logger.error(
+                    f"[encoder {self.encoder_id}] dropping job seq={job.seq_id} "
+                    f"item={job.item_idx}: no LM connected"
+                )
+                continue
+            batch.append(job)
+
     def serve_forever(self) -> None:
+        """Main loop of the pipelined encoder: job intake, meta, and every NIXL
+        operation stay on this thread; planning, decoding and the ViT run on
+        :class:`EncoderPipeline` threads, overlapped across requests."""
+        pipe = EncoderPipeline(
+            self.runner,
+            self.send_buf,
+            decode_workers=self.runner.video_loader.num_workers,
+        )
         poller = zmq.Poller()
         poller.register(self.job_sock, zmq.POLLIN)
+        inflight: List[dict] = []
+        last_disc = 0.0
         logger.info(f"[encoder {self.encoder_id}] serving jobs")
         while True:
-            # Pick up LM (re)connections / departures before touching jobs.
-            self._drain_discovery()
-            socks = dict(poller.poll(timeout=1000))
-            if self.job_sock not in socks:
-                continue
-            # Drain every currently-available job into one batch so we can run
-            # the cheap CPU/meta phase for ALL of them before any heavy ViT.
-            batch: List[EncoderJob] = []
-            while True:
-                try:
-                    raw = self.job_sock.recv(flags=zmq.NOBLOCK)
-                except zmq.Again:
-                    break
-                job: EncoderJob = pickle.loads(raw)
-                self._jobs_seen += 1
-                if self._jobs_seen <= self._fail_first_n:
-                    logger.error(
-                        f"[encoder {self.encoder_id}] FAULT-INJECT drop job "
-                        f"seq={job.seq_id} item={job.item_idx} "
-                        f"({self._jobs_seen}/{self._fail_first_n})"
-                    )
-                    continue
-                if not self._ensure_lm():
-                    logger.error(
-                        f"[encoder {self.encoder_id}] dropping job seq={job.seq_id} "
-                        f"item={job.item_idx}: no LM connected"
-                    )
-                    continue
-                batch.append(job)
+            now = time.monotonic()
+            if now - last_disc > 0.1:
+                self._drain_discovery()
+                last_disc = now
+            timeout_ms = 1 if (inflight or pipe.busy) else 50
+            socks = dict(poller.poll(timeout=timeout_ms))
+            if self.job_sock in socks:
+                for job in self._recv_jobs():
+                    pipe.submit(job)
 
-            # Phase A: processor + emit meta (gate A) for the whole batch first.
-            preps: List[dict] = []
-            for job in batch:
-                try:
-                    preps.append(self._prepare_job(job))
-                except Exception as e:  # pragma: no cover - operational guard
+            for w in pipe.poll_planned():
+                job = w.job
+                if w.num_tokens > self.max_vis_tokens:
                     logger.error(
                         f"[encoder {self.encoder_id}] job seq={job.seq_id} "
-                        f"item={job.item_idx} dropped in prepare: "
-                        f"{type(e).__name__}: {e}"
+                        f"item={job.item_idx} needs {w.num_tokens} vis tokens > "
+                        f"max_vis_tokens {self.max_vis_tokens}; dropped"
                     )
-
-            # Phase B: ViT + NIXL write (gate B), serialized (shared send buf).
-            for prep in preps:
-                job = prep["job"]
+                    continue
                 try:
-                    self._encode_and_write(prep)
-                except Exception as e:  # pragma: no cover - operational guard
-                    # Drop this item but KEEP serving: one bad item (e.g. a
-                    # dead transport to the LM) must not take the whole replica
-                    # out of the DP pool. The LM's in-flight job stays unacked;
-                    # re-dispatch to a healthy replica is the Phase 8 watchdog.
+                    self._send_meta(job, w.num_tokens, w.grid_thw, w.chash)
+                except Exception as e:
                     logger.error(
                         f"[encoder {self.encoder_id}] job seq={job.seq_id} "
-                        f"item={job.item_idx} dropped after error: "
-                        f"{type(e).__name__}: {e}"
+                        f"item={job.item_idx} meta send failed: {e}"
                     )
+                    continue
+                pipe.start(w)
+
+            for w, seg, off, rows in pipe.poll_staged():
+                if w.failed:
+                    pipe.staging.free(off, rows)
+                    continue
+                t = {"w": w, "seg": seg, "off": off, "rows": rows, "attempt": 0}
+                if self._post_segment(t):
+                    inflight.append(t)
+                else:
+                    self._abandon(pipe, t)
+
+            still: List[dict] = []
+            for t in inflight:
+                try:
+                    done = all(self.nixl.is_done(h) for h in t["handles"])
+                except Exception as e:
+                    self._release_handles(t)
+                    logger.warning(
+                        f"[encoder {self.encoder_id}] NIXL write seq="
+                        f"{t['w'].job.seq_id} seg={t['seg']} failed: {e}"
+                    )
+                    self._reconnect_lm()
+                    if self._post_segment(t):
+                        still.append(t)
+                    else:
+                        self._abandon(pipe, t)
+                    continue
+                if not done:
+                    still.append(t)
+                    continue
+                self._release_handles(t)
+                w = t["w"]
+                pipe.segment_written(w, t["seg"], t["off"], t["rows"])
+                self._notify_progress(w)
+            inflight = still
+
+    def _post_segment(self, t: dict) -> bool:
+        """Post the NIXL writes of one staged segment to every LM TP rank's
+        slot (rows ``seg_rows[seg]``). False after ``write_max_attempts``."""
+        w, seg = t["w"], t["seg"]
+        lo, hi = w.seg_rows[seg]
+        row_bytes = self.feat_dim * self.send_buf.element_size()
+        src = self.send_buf[t["off"] : t["off"] + t["rows"]]
+        while t["attempt"] < self.write_max_attempts:
+            t["attempt"] += 1
+            try:
+                t["handles"] = [
+                    self.nixl.write(src, rs.with_offset(lo * row_bytes, (hi - lo) * row_bytes))
+                    for rs in w.job.remote_slots
+                ]
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"[encoder {self.encoder_id}] NIXL post seq={w.job.seq_id} "
+                    f"seg={seg} attempt {t['attempt']}/{self.write_max_attempts}: {e}"
+                )
+                time.sleep(0.1 * t["attempt"])
+                self._reconnect_lm()
+        return False
+
+    def _release_handles(self, t: dict) -> None:
+        for h in t.get("handles", []):
+            self.nixl.release(h)
+        t["handles"] = []
+
+    def _abandon(self, pipe: "EncoderPipeline", t: dict) -> None:
+        w = t["w"]
+        pipe.staging.free(t["off"], t["rows"])
+        if not w.failed:
+            w.failed = True
+            logger.error(
+                f"[encoder {self.encoder_id}] job seq={w.job.seq_id} "
+                f"item={w.job.item_idx} dropped: NIXL write failed; LM watchdog "
+                "will re-dispatch"
+            )
+
+    def _notify_progress(self, w) -> None:
+        """Announce the item's landed rows to LM TP0 as a growing prefix."""
+        rows = w.done_prefix_rows()
+        if rows <= w.notified_rows or w.failed:
+            return
+        job = w.job
+        target = (
+            job.lm_agent_names[0] if job.lm_agent_names else job.remote_slots[0].agent_name
+        )
+        msg = (
+            emb_notif(job.seq_id, job.item_idx)
+            if rows == w.num_tokens
+            else emb_partial_notif(job.seq_id, job.item_idx, rows)
+        )
+        self.nixl.notify(target, msg)
+        w.notified_rows = rows

@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from attr import dataclass
+from attr import Factory, dataclass
 from logger import logger
 from transformers import (
     AutoProcessor,
@@ -128,6 +128,11 @@ class DisaggSeqState:
     prompt_positions: torch.Tensor  # full-prompt mrope positions
     mrope_position_delta: torch.Tensor
     prompt_len: int
+    # Segment-streamed items (video): rows ``[0, item_rows[i])`` have landed so
+    # far, copied into a per-item buffer sized for the whole item, which
+    # becomes ``item_embed[i]`` when the item completes (no further copy).
+    item_rows: List[int] = Factory(list)
+    item_buffer: List[Optional[torch.Tensor]] = Factory(list)
 
 
 class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
@@ -1440,19 +1445,46 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
         Called by the LM disagg manager once *all* per-item ``MmItemMeta`` have
         arrived (positions/hashes determined; gate A satisfied) but before the
         visual embeddings have necessarily landed. The embeddings are filled in
-        progressively via :meth:`disagg_set_embedding`.
+        progressively via :meth:`disagg_add_embedding`.
         """
         self.disagg_embeds[seq_id] = state
 
-    def disagg_set_embedding(
-        self, seq_id: int, ordered_idx: int, embed: torch.Tensor
+    def disagg_add_embedding(
+        self,
+        seq_id: int,
+        ordered_idx: int,
+        rows: torch.Tensor,
+        rows_end: int,
+        final: bool,
     ) -> None:
-        """Record one item's visual embedding (NIXL write completed)."""
+        """Record rows ``[rows_end - len(rows), rows_end)`` of one item's
+        visual embedding (NIXL write landed). ``final`` completes the item.
+
+        A whole item arrives as one final call and is stored as is. Segment-
+        streamed rows are copied into a buffer allocated once for the whole
+        item, so readers can slice the landed prefix without concatenating.
+        ``rows`` may be a view of the receive slot; it is consumed here.
+        """
         st = self.disagg_embeds.get(seq_id)
         if st is None:
             return
-        st.item_embed[ordered_idx] = embed
-        st.item_ready[ordered_idx] = True
+        lo = rows_end - rows.shape[0]
+        buf = st.item_buffer[ordered_idx]
+        if final and lo == 0 and buf is None:
+            st.item_embed[ordered_idx] = rows
+        else:
+            if buf is None:
+                start, end = st.item_span[ordered_idx]
+                total = int(st.is_multimodal_cpu[start:end].sum())
+                buf = rows.new_empty((total, rows.shape[1]))
+                st.item_buffer[ordered_idx] = buf
+            buf[lo:rows_end].copy_(rows)
+            if final:
+                st.item_embed[ordered_idx] = buf
+                st.item_buffer[ordered_idx] = None
+        st.item_rows[ordered_idx] = rows_end
+        if final:
+            st.item_ready[ordered_idx] = True
 
     def disagg_prefill_limit(self, seq: GenerationSequence) -> Optional[int]:
         """Gate-B upper bound: the largest token position this

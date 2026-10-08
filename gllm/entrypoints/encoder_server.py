@@ -44,6 +44,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Per-replica content_hash->embed dedup cache size (MB)")
     p.add_argument("--mm-processor-min-pixels", type=int, default=None)
     p.add_argument("--mm-processor-max-pixels", type=int, default=None)
+    p.add_argument(
+        "--video-decode-device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="Where to decode video frames. 'auto' (default) uses NVDEC via "
+        "torchcodec when available and keeps frames on the GPU for the video "
+        "processor; it falls back to multi-threaded CPU decoding when "
+        "torchcodec or the driver's libnvcuvid.so is missing.",
+    )
+    p.add_argument(
+        "--video-decode-threads",
+        type=int,
+        default=0,
+        help="FFmpeg threads for CPU video decoding (0 = auto)",
+    )
+    p.add_argument(
+        "--video-decode-segments",
+        type=int,
+        default=16,
+        help="Split each video's sampled frames into this many time segments, "
+        "decoded concurrently and preprocessed / encoded / sent to the LM one "
+        "segment at a time (1 = whole-video, no streaming). With "
+        "GLLM_DISAGG_OVERLAP=1 the LM prefills landed segments early.",
+    )
+    p.add_argument(
+        "--video-decode-workers",
+        type=int,
+        default=8,
+        help="Concurrent segment decoders (NVDEC sessions or CPU decoders)",
+    )
     p.add_argument("--nixl-backend", choices=["UCX"], default="UCX")
     p.add_argument(
         "--advertise-host",
@@ -105,6 +135,10 @@ def main():
         mm_processor_min_pixels=args.mm_processor_min_pixels,
         mm_processor_max_pixels=args.mm_processor_max_pixels,
         mm_embed_cache_mb=args.mm_embed_cache_size,
+        video_decode_device=args.video_decode_device,
+        video_decode_threads=args.video_decode_threads,
+        video_decode_segments=args.video_decode_segments,
+        video_decode_workers=args.video_decode_workers,
     )
     runner.init()
 

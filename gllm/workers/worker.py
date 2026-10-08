@@ -339,9 +339,17 @@ class Worker(TorchProfilerMixin):
             self.scheduler.add_new_requests([seq])
         if events.emb_ready:
             self._disagg_recv.sync()
-            for seq_id, ordered_idx, slot_id, num_tokens in events.emb_ready:
-                emb = self._disagg_recv.clone_slot(slot_id, num_tokens)
-                self.model_runner.disagg_set_embedding(seq_id, ordered_idx, emb)
+            for seq_id, ordered_idx, slot_id, lo, hi, final in events.emb_ready:
+                # Whole items are cloned out of the slot (it is freed now);
+                # streamed rows are copied into the item's own buffer by
+                # ``disagg_add_embedding`` right away, so a view suffices.
+                if final and lo == 0:
+                    emb = self._disagg_recv.clone_slot(slot_id, hi)
+                else:
+                    emb = self._disagg_recv.slot_rows(slot_id, lo, hi)
+                self.model_runner.disagg_add_embedding(
+                    seq_id, ordered_idx, emb, hi, final
+                )
         if events.aborts:
             # An admitted seq whose encode failed unrecoverably (coordinator
             # watchdog gave up). Drop it from every column's scheduler in this
