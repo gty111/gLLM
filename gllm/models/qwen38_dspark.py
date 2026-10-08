@@ -56,6 +56,7 @@ from gllm.models.weight_loader import (
     h_gate_up,
     h_proj_dim0,
     h_proj_dim1,
+    run_weight_loader,
 )
 from gllm.models.weight_utils import get_tensor_from_dict
 
@@ -540,6 +541,21 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
             torch.cat([proposal_hidden, markov_hidden], dim=-1)
         ).squeeze(-1)
         return output_ids, logits, confidence
+
+    @torch.no_grad()
+    def load_weights(self, weights, mp_load_progress=None) -> None:
+        """Load the standalone draft checkpoint through the shared mapping."""
+        mapping = Qwen38DSparkMapping(self)
+        run_weight_loader(
+            self,
+            weights,
+            mapping.weight_rules(),
+            mp_load_progress,
+            pp_idx_offset=1,
+            start_layer=0,
+            ctx=mapping.load_context(weights),
+            src_key_fn=mapping.checkpoint_key,
+        )
 
 
 def _tp_size() -> int:
