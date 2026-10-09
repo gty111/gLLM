@@ -155,20 +155,25 @@ def test_disaggregated_visual_features_expand_with_ready_prefix(make_mm_runner):
     mask = torch.tensor(tokens) >= 126
     features = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4) + 1000
     seq = GenerationSequence(5, tokens, [], output_len=8, mm_contents={'image': ['first', 'second'], 'video': []})
+    # Embedding rows live in arena pages of 2 rows: item 0 in page 2, item 1
+    # in page 0 (pages need not be in order).
+    pool = torch.zeros(3, 2, 4)
+    pool[2], pool[0] = features[:2], features[2:]
+    runner.disagg_attach_pool(pool, 2)
     state = DisaggSeqState(
         num_items=2, item_span=[(2, 4), (6, 8)], item_modality=['image', 'image'],
-        item_ready=[True, False], item_embed=[features[:2], None],
+        item_ready=[True, False],
         image_grid_thw=None, video_grid_thw=None, input_ids_cpu=torch.tensor(tokens),
         is_multimodal_cpu=mask, prompt_positions=torch.arange(20, 29).expand(3, -1),
         mrope_position_delta=20, prompt_len=len(tokens),
+        item_rows=[2, 0], item_pages=[[2], [0]],
     )
-    runner.disagg_embeds[seq.seq_id] = state
+    runner.disagg_register(seq.seq_id, state)
     expected = weight[torch.tensor(tokens).masked_fill(mask, 0)].clone()
     expected[mask] = features
     for start, end in [(0, 3), (3, 6), (6, 9)]:
         if start == 6:
-            state.item_ready[1] = True
-            state.item_embed[1] = features[2:]
+            runner.disagg_mark_ready(seq.seq_id, 1, 2, True)
         seq.computed_token_num = start
         seq.to_compute_token_num = end - start
         output, positions = runner.mm_prepare_inputs([seq])

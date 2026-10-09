@@ -131,6 +131,7 @@ def test_disagg_budget_uses_expanded_image_prompt(monkeypatch, requested, expect
     pending = _PendingSeq(seq, [SimpleNamespace(
         item_idx=0, modality="image",
         meta=SimpleNamespace(num_tokens=4, grid_thw=(1, 2, 2), content_hash="image"),
+        pages=[0],
     )])
     coordinator = DisaggCoordinator.__new__(DisaggCoordinator)
     coordinator.image_token_id = 126

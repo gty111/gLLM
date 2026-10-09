@@ -157,11 +157,6 @@ def _flatten_embeddings(embeddings: NestedTensors) -> torch.Tensor:
     if isinstance(embeddings, torch.Tensor):
         # Flatten all but the last dimension.
         return embeddings.flatten(0, -2)
-    if len(embeddings) == 1:
-        # A single item needs no copy (large video embeddings are re-gathered
-        # every time a disaggregated seq's ready prefix grows).
-        return _flatten_embeddings(embeddings[0])
-
     return torch.cat(tuple(_flatten_embeddings(t) for t in embeddings))
 
 

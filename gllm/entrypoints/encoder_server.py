@@ -87,7 +87,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max-vis-tokens",
         type=int,
         default=16384,
-        help="Upper bound on N_vis per item; sizes the registered send buffer",
+        help="Rows of the registered (paged) send buffer; one image or video "
+        "segment must fit",
     )
     return p
 

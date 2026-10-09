@@ -52,8 +52,11 @@ vision-light workloads.
 Two planes:
 
 - **Control plane (ZMQ):** the LM pushes `EncoderJob`s to encoders; encoders
-  push `MmItemMeta` (per-item metadata) back to the LM.
-- **Data plane (NIXL/UCX):** visual embedding tensors go GPU→GPU directly.
+  push `MmItemMeta` (per-item metadata) back to the LM, which replies with the
+  cache-arena pages for the item's rows (`EmbTarget`).
+- **Data plane (NIXL/UCX):** visual embedding rows go GPU→GPU directly, from
+  the encoder's paged send buffer into those pages of the LM's cache arena
+  (on every LM TP rank). Prefill reads them in place.
 
 **Discovery does the wiring for you.** Once every process points at the same
 discovery endpoint, hosts/ports are advertised and resolved automatically — you
@@ -194,7 +197,7 @@ You normally only need `--model-path`, the GPU index, the LM `--port`, and
 | `--meta-port` (LM) | `0` (ephemeral) | Fixed port for the per-item meta intake (pin it behind a firewall). |
 | `--nixl-backend` (LM / encoder) | `UCX` | NIXL transport backend. The data-plane endpoint is auto-negotiated via the exchanged metadata, so there is no port to configure (UCX picks ephemeral ports; same-host encoders need no distinct NIXL port). |
 | `--zmq-listen` (encoder) | `0.0.0.0:0` | Job control-plane port (ephemeral by default). |
-| `--max-vis-tokens` (encoder) | `16384` | Upper bound on N_vis per item; sizes the send buffer. |
+| `--max-vis-tokens` (encoder) | `16384` | Rows of the paged send buffer; one image or video segment must fit. |
 | `--mm-embed-cache-size` (encoder) | `256` (MB) | Per-replica content_hash→embedding dedup cache. |
 
 ### Video decoding (encoder)
@@ -211,7 +214,7 @@ You normally only need `--model-path`, the GPU index, the LM `--port`, and
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `GLLM_DISAGG_OVERLAP` | `0` | **Intra-request** encode/prefill overlap (see below). |
-| `GLLM_DISAGG_REDISPATCH_TIMEOUT_S` | `20.0` | Re-dispatch in-flight jobs after this timeout (watchdog). |
+| `GLLM_DISAGG_REDISPATCH_TIMEOUT_S` | `20.0` | Move an item to another encoder after this long without progress. With a single encoder the item keeps waiting (the encoder is busy, not dead: dead encoders drop out of discovery, and encoders report failed items for immediate re-dispatch). |
 | `GLLM_DISAGG_MAX_REDISPATCH` | `5` | Max re-dispatch attempts per item. |
 | `GLLM_ENC_FAIL_FIRST_N` | `0` | **Test only:** make an encoder drop its first N jobs to exercise re-dispatch. |
 
@@ -254,7 +257,7 @@ Videos are split into `--video-decode-segments` time segments:
   whole-video resize target and encoded on its own. Qwen-VL vision towers
   attend within a temporal patch group, so the concatenated segment embeddings
   are bit-identical to encoding the whole video at once.
-- Each segment is written to its row range of the LM slot and announced with a
+- Each segment is written to its rows' LM pages and announced with a
   partial notification (`embp:seq:item:rows`); the last one sends the regular
   `emb:seq:item`. With `GLLM_DISAGG_OVERLAP=1` the LM prefills the landed rows
   while later segments are still being decoded/encoded; with `0` it still
@@ -316,6 +319,12 @@ LRU order when KV or live recurrent state needs space.
   A larger stride reduces snapshot-copy work at the cost of recomputing a
   longer prefix tail after a cache hit.
 - Dense models use the existing KV-only allocation path.
+
+Visual embeddings received from encoders live in the same arena (`mm_embed`
+pages, sized by the item's actual row count) from the moment the item's meta
+arrives until the request's prefill has consumed them; allocating them may
+evict idle prefix-cache pages. They may hold at most a quarter of the arena,
+so requests waiting on encoders cannot starve running requests' KV cache.
 
 ---
 
