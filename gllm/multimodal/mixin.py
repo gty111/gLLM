@@ -749,22 +749,25 @@ class MmMixin:
                 if work["kind"] == "uncached":
                     from gllm.models.utils import _flatten_embeddings
 
-                    # These may come from a local encoder, the visual feature
-                    # cache, or the ready prefix of a disaggregated encoder.
+                    # These come from a local encoder or the visual feature
+                    # cache; a disaggregated encoder's ready prefix arrives as
+                    # ``visual_rows`` read in place from arena pages.
+                    visual_rows = work.get("visual_rows")
                     mm_embeddings = work.get("mm_embeddings")
                     mm_input = work["mm_input"]
-                    if mm_embeddings is None and mm_input:
+                    if visual_rows is None and mm_embeddings is None and mm_input:
                         bundle_key = work.get("mm_bundle_key")
                         mm_embeddings = self.mm_embed_cache.get(bundle_key)
                         if mm_embeddings is None:
                             mm_embeddings = self.model.embed_multimodal(**mm_input)
                             if bundle_key is not None:
                                 self.mm_embed_cache.put(bundle_key, mm_embeddings)
-                    visual_rows = (
-                        _flatten_embeddings(mm_embeddings)
-                        if mm_embeddings is not None and len(mm_embeddings) > 0
-                        else None
-                    )
+                    if visual_rows is None:
+                        visual_rows = (
+                            _flatten_embeddings(mm_embeddings)
+                            if mm_embeddings is not None and len(mm_embeddings) > 0
+                            else None
+                        )
                     mask = work["is_multimodal_cpu"]
                     expected = int(mask.sum())
                     actual = visual_rows.shape[0] if visual_rows is not None else 0

@@ -75,9 +75,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "detects the routable egress IP toward the discovery server; pass an "
         "explicit IP to override, or '127.0.0.1' for single-node loopback.",
     )
-    # Receive slot pool. Used from Phase 3b.
-    p.add_argument("--mm-recv-slots", type=int, default=None)
-    p.add_argument("--mm-max-vis-tokens", type=int, default=None)
     p.add_argument(
         "--encoder-dp",
         type=int,
@@ -130,8 +127,6 @@ def main():
         disagg_config.advertise_host = advertise_host
         disagg_config.meta_bind = f"tcp://0.0.0.0:{int(args.meta_port)}"
         disagg_config.nixl_backend = args.nixl_backend
-        disagg_config.num_slots = args.mm_recv_slots
-        disagg_config.max_vis_tokens = args.mm_max_vis_tokens
         disagg_config.encoder_dp = max(1, args.encoder_dp)
 
     import gllm.entrypoints.api_server as api

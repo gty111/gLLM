@@ -48,8 +48,5 @@ class DisaggConfig:
     processor_config_hash: str = ""
     advertise_host: str = "127.0.0.1"
     meta_bind: str = "tcp://0.0.0.0:0"
-    # ``None`` -> fall back to the LM-side manager's default.
-    num_slots: Optional[int] = None
-    max_vis_tokens: Optional[int] = None
     encoder_dp: int = 1
     nixl_backend: str = "UCX"

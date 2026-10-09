@@ -450,6 +450,7 @@ def _ipc_worker(monkeypatch, tp_size=1, pp_size=1):
     worker = make_worker(
         rank=0,
         _disagg_coord=None,
+        _disagg_recv=None,
         _is_disagg_lm=False,
         scheduler=SimpleNamespace(
             add_new_requests=admitted.append,
@@ -563,32 +564,40 @@ def test_apply_disagg_events_none_is_noop():
 
 
 def test_apply_disagg_events_admits_and_embeddings():
-    registered, added, embedded, synced = [], [], [], []
+    calls, added = [], []
     seq = SimpleNamespace(seq_id=3)
     events = SimpleNamespace(
         admits=[(seq, "state")],
-        emb_ready=[(3, 0, 7, 0, 12, True)],
+        allocs=[(4, 0, 2)],
+        emb_ready=[(3, 0, 0, 12, True)],
+        frees=[8],
         aborts=[9],
     )
     worker = make_worker(
         model_runner=SimpleNamespace(
-            disagg_register=lambda *a: registered.append(a),
-            disagg_add_embedding=lambda *a: embedded.append(a),
+            disagg_register=lambda *a: calls.append(("register",) + a),
+            disagg_mark_ready=lambda *a: calls.append(("ready",) + a),
+            disagg_alloc_pages=lambda reqs: calls.append(("alloc", reqs)) or [[5, 6]],
+            disagg_free_pages=lambda ids: calls.append(("free", ids)),
         ),
         scheduler=SimpleNamespace(
             add_new_requests=added.append,
-            add_abort_ids=lambda ids: registered.append(("abort", ids)),
+            add_abort_ids=lambda ids: calls.append(("abort", ids)),
         ),
-        _disagg_recv=SimpleNamespace(
-            sync=lambda: synced.append(True),
-            clone_slot=lambda slot, ntok, start=0: f"emb{slot}[{start}:{ntok}]",
+        _disagg_coord=SimpleNamespace(
+            on_pages=lambda reqs, pages: calls.append(("on_pages", reqs, pages))
         ),
     )
     worker._apply_disagg_events(events)
-    assert registered == [(3, "state"), ("abort", [9])]
+    assert calls == [
+        ("free", [8]),
+        ("alloc", [(4, 0, 2)]),
+        ("on_pages", [(4, 0, 2)], [[5, 6]]),
+        ("register", 3, "state"),
+        ("ready", 3, 0, 12, True),
+        ("abort", [9]),
+    ]
     assert added == [[seq]]
-    assert synced == [True]
-    assert embedded == [(3, 0, "emb7[0:12]", 12, True)]
 
 
 # ------------------------------------------------------------------

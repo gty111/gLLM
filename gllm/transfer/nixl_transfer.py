@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -257,6 +257,40 @@ class NixlEndpoint:
                 f"NIXL transfer to {remote.agent_name} failed to launch"
             )
         return XferHandle(handle, src, remote)
+
+    def write_descs(
+        self,
+        local: List[Tuple[int, int, int]],
+        remote: List[Tuple[int, int, int]],
+        agent_name: str,
+        notif_msg: bytes = b"",
+    ) -> XferHandle:
+        """One WRITE of several ``(addr, nbytes, dev)`` pieces of registered
+        local VRAM into the paired pieces of ``agent_name``'s registered VRAM
+        (paged layouts on either side)."""
+        assert len(local) == len(remote) and all(
+            a[1] == b[1] for a, b in zip(local, remote)
+        ), "local/remote descriptor lengths must pair up"
+        assert agent_name in self._remote_agents, (
+            f"remote agent {agent_name!r} not connected; call connect() "
+            "with its metadata first"
+        )
+        handle = self.agent.initialize_xfer(
+            "WRITE",
+            self.agent.get_xfer_descs(local, "VRAM"),
+            self.agent.get_xfer_descs(remote, "VRAM"),
+            agent_name,
+            notif_msg,
+        )
+        if self.agent.transfer(handle) == "ERR":
+            raise RuntimeError(f"NIXL transfer to {agent_name} failed to launch")
+        remote_region = RemoteRegion(
+            agent_name=agent_name,
+            base_addr=remote[0][0],
+            length=sum(r[1] for r in remote),
+            dev_id=remote[0][2],
+        )
+        return XferHandle(handle, None, remote_region)
 
     def is_done(self, h: XferHandle) -> bool:
         state = self.agent.check_xfer_state(h.nixl_handle)

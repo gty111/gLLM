@@ -104,7 +104,7 @@ def _make_mm_runner(uses_mrope, tuple_output):
     runner.hidden_size = 4
     runner.input_hidden_states = torch.empty((32, 4))
     runner.embedding_cache = {}
-    runner.disagg_embeds = {}
+    runner._init_disagg_state()
     weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4)
     calls = []
 

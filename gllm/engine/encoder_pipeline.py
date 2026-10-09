@@ -7,14 +7,15 @@ stages concurrently across
 requests, at the granularity of *segments* (a time slice of a video, or a
 whole image):
 
-    main thread    ZMQ job intake, MmItemMeta out, every NIXL call (posting
-                   writes, polling completions, in-order notifications)
+    main thread    ZMQ job intake, MmItemMeta out, LM page targets in, every
+                   NIXL call (posting writes, polling completions, in-order
+                   notifications)
     plan pool      open the video container / run the image processor; yields
                    the grid (token count) and content hash -- no decoding
     decode workers pop the highest-priority pending segment of *any* request,
                    decode + preprocess it (NVDEC/CPU), hand it to the GPU stage
     GPU thread     pops the highest-priority decoded segment, runs the ViT and
-                   stages the rows in a registered send buffer
+                   stages the rows in pages of a registered send buffer
 
 Segments of one item may finish out of order; the LM is notified of each
 item's landed rows strictly as a growing prefix (``embp`` partial notifs, then
@@ -36,50 +37,60 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from logger import logger
 
+from gllm.disagg.paging import embed_layout, num_pages, row_index
+from gllm.runtime.cache_arena import CacheArena
 
-class StagingAllocator:
-    """First-fit allocator over the rows of the registered send buffer.
 
-    Allocations block until enough contiguous rows are free, which also
-    back-pressures the GPU stage when the transport falls behind.
+class PagedStaging:
+    """Paged staging rows over the registered send buffer.
+
+    The buffer is a :class:`CacheArena` of fixed-size row pages, so an item or
+    segment takes any free pages (no contiguous run, no fragmentation).
+    Allocations block until enough pages are free, which also back-pressures
+    the GPU stage when the transport (or the LM's page supply) falls behind.
     """
 
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self._free: List[Tuple[int, int]] = [(0, capacity)]  # sorted (start, len)
+    def __init__(self, backing: torch.Tensor, dtype: torch.dtype, feat_dim: int,
+                 rows_per_page: int):
+        layout = embed_layout("staging", feat_dim, dtype, rows_per_page)
+        page_bytes = layout.entry_bytes
+        if page_bytes != rows_per_page * feat_dim * torch.empty((), dtype=dtype).element_size():
+            raise ValueError("staging rows must pack pages exactly")
+        self.arena = CacheArena(backing, page_bytes)
+        self.cache = self.arena.register_cache(layout)
+        self.rows_per_page = rows_per_page
+        self.num_pages = self.cache.num_slots
+        self.capacity = self.num_pages * rows_per_page
+        # Page ``p`` holds flat rows ``[p * rows_per_page, (p + 1) * rows_per_page)``.
+        self.rows = backing.view(dtype).view(-1, feat_dim)
+        self.row_bytes = self.rows.stride(0) * self.rows.element_size()
         self._cv = threading.Condition()
 
-    def alloc(self, rows: int) -> int:
+    def alloc(self, rows: int) -> List[int]:
         if rows > self.capacity:
             raise ValueError(f"{rows} rows exceed staging capacity {self.capacity}")
+        n = num_pages(rows, self.rows_per_page)
         with self._cv:
             while True:
-                for i, (start, length) in enumerate(self._free):
-                    if length >= rows:
-                        if length == rows:
-                            self._free.pop(i)
-                        else:
-                            self._free[i] = (start + rows, length - rows)
-                        return start
+                pages = self.arena.allocator.allocate("staging", n)
+                if pages is not None:
+                    return pages
                 self._cv.wait()
 
-    def free(self, start: int, rows: int) -> None:
+    def free(self, pages: List[int]) -> None:
         with self._cv:
-            self._free.append((start, rows))
-            self._free.sort()
-            merged: List[Tuple[int, int]] = []
-            for s, n in self._free:
-                if merged and merged[-1][0] + merged[-1][1] == s:
-                    merged[-1] = (merged[-1][0], merged[-1][1] + n)
-                else:
-                    merged.append((s, n))
-            self._free = merged
+            self.arena.allocator.free("staging", pages)
             self._cv.notify_all()
+
+    def row_index(self, pages: List[int], rows: int) -> torch.Tensor:
+        """Flat row ids of rows ``[0, rows)`` staged in ``pages``."""
+        page, off = row_index(pages, rows, self.rows_per_page)
+        return torch.tensor(page) * self.rows_per_page + torch.tensor(off)
 
     @property
     def free_rows(self) -> int:
         with self._cv:
-            return sum(n for _, n in self._free)
+            return self.arena.allocator.num_free_slots("staging") * self.rows_per_page
 
 
 class _PriorityQueue:
@@ -172,19 +183,20 @@ class EncoderPipeline:
     def __init__(
         self,
         runner,
-        send_buf: torch.Tensor,
+        staging: PagedStaging,
         *,
         decode_workers: int = 8,
         plan_workers: int = 4,
         max_ready_segments: Optional[int] = None,
     ):
         self.runner = runner
-        self.send_buf = send_buf
-        self.device = send_buf.device
-        self.staging = StagingAllocator(send_buf.shape[0])
+        self.staging = staging
+        self.device = staging.rows.device
         self._order = itertools.count()
         self._plan_pool = ThreadPoolExecutor(plan_workers, thread_name_prefix="enc-plan")
         self._planned: List[Tuple[object, Future]] = []
+        self.dropped: List[object] = []  # jobs whose plan failed
+        self.failed: "queue.Queue[WorkItem]" = queue.Queue()  # failed in decode / ViT
         self._decode_q = _PriorityQueue()
         self._ready_q = _PriorityQueue()
         self._staged: "queue.Queue[tuple]" = queue.Queue()
@@ -214,13 +226,15 @@ class EncoderPipeline:
 
     def poll_planned(self) -> List[WorkItem]:
         """Planned items, in submission order; the caller sends their meta and
-        then calls :meth:`start`. Failed plans are logged and dropped."""
+        then calls :meth:`start`. Failed plans are logged and their jobs
+        appended to :attr:`dropped`."""
         out = []
         while self._planned and self._planned[0][1].done():
             job, fut = self._planned.pop(0)
             try:
                 out.append(fut.result())
             except Exception as e:
+                self.dropped.append(job)
                 logger.error(
                     f"[encoder] job seq={job.seq_id} item={job.item_idx} dropped "
                     f"in plan: {type(e).__name__}: {e}"
@@ -240,7 +254,7 @@ class EncoderPipeline:
             self._ready_q.put(w.priority(0), (w, 0, None, None, False))
 
     def poll_staged(self) -> List[tuple]:
-        """``(work, seg, staging_offset, rows)`` whose embedding rows are in
+        """``(work, seg, staging_pages, rows)`` whose embedding rows are in
         the send buffer and visible to the transport."""
         out = []
         while True:
@@ -249,9 +263,9 @@ class EncoderPipeline:
             except queue.Empty:
                 return out
 
-    def segment_written(self, w: WorkItem, seg: int, offset: int, rows: int) -> None:
-        """The segment's NIXL writes landed: recycle its staging rows."""
-        self.staging.free(offset, rows)
+    def segment_written(self, w: WorkItem, seg: int, pages: List[int]) -> None:
+        """The segment's NIXL writes landed: recycle its staging pages."""
+        self.staging.free(pages)
         w.seg_done[seg] = True
 
     @property
@@ -370,13 +384,16 @@ class EncoderPipeline:
                             self.runner.mm_embed_cache.put(w.chash, (full,))
                             w.seg_embeds = {}
                     rows = hi - lo
-                    off = self.staging.alloc(rows)
-                    self.send_buf[off : off + rows].copy_(vis.to(self.send_buf.dtype))
+                    pages = self.staging.alloc(rows)
+                    st = self.staging
+                    st.rows.index_copy_(
+                        0, st.row_index(pages, rows).to(self.device), vis.to(st.rows.dtype)
+                    )
                     # NIXL reads the raw device pointer outside CUDA stream
                     # order; make the staged rows visible before handing off.
                     if self.device.type == "cuda":
                         torch.cuda.current_stream().synchronize()
-                    self._staged.put((w, seg, off, rows))
+                    self._staged.put((w, seg, pages, rows))
                 except Exception as e:
                     self._fail(w, f"encode segment {seg}", e)
                 finally:
@@ -388,7 +405,8 @@ class EncoderPipeline:
         if not w.failed:
             w.failed = True
             w.seg_embeds = {}
+            self.failed.put(w)
             logger.error(
                 f"[encoder] job seq={w.job.seq_id} item={w.job.item_idx} failed "
-                f"({what}): {type(e).__name__}: {e}; LM watchdog will re-dispatch"
+                f"({what}): {type(e).__name__}: {e}; LM will re-dispatch"
             )

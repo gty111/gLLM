@@ -8,38 +8,45 @@ import torch
 
 from gllm.engine.encoder_pipeline import (
     EncoderPipeline,
-    StagingAllocator,
+    PagedStaging,
     WorkItem,
     _PriorityQueue,
     video_segment_rows,
 )
 
 
-def test_staging_allocator_first_fit_and_coalesce():
-    a = StagingAllocator(10)
-    x, y, z = a.alloc(4), a.alloc(3), a.alloc(3)
-    assert (x, y, z) == (0, 4, 7) and a.free_rows == 0
-    a.free(y, 3)
-    assert a.alloc(2) == 4
-    a.free(x, 4)
-    a.free(4, 2)
-    a.free(z, 3)
-    assert a.free_rows == 10 and a.alloc(10) == 0
+def _staging(rows, feat=4, per_page=2):
+    backing = torch.zeros(rows * feat * 4, dtype=torch.uint8)
+    return PagedStaging(backing, torch.float32, feat, per_page)
+
+
+def test_paged_staging_takes_any_free_pages():
+    st = _staging(10)
+    assert st.num_pages == 5 and st.capacity == 10
+    x, y, z = st.alloc(4), st.alloc(3), st.alloc(2)
+    assert len(x) == 2 and len(y) == 2 and len(z) == 1 and st.free_rows == 0
+    st.free(y)
+    st.free(z)
+    # Non-adjacent free pages still serve a 5-row request.
+    w = st.alloc(5)
+    assert sorted(w) == sorted(y + z) and st.free_rows == 0
+    idx = st.row_index(w, 5)
+    assert idx.tolist() == [w[0] * 2, w[0] * 2 + 1, w[1] * 2, w[1] * 2 + 1, w[2] * 2]
     with pytest.raises(ValueError):
-        a.alloc(11)
+        st.alloc(11)
 
 
-def test_staging_allocator_blocks_until_free():
-    a = StagingAllocator(4)
-    a.alloc(4)
+def test_paged_staging_blocks_until_free():
+    st = _staging(4)
+    pages = st.alloc(4)
     got = []
-    t = threading.Thread(target=lambda: got.append(a.alloc(2)))
+    t = threading.Thread(target=lambda: got.append(st.alloc(2)))
     t.start()
     time.sleep(0.05)
     assert got == []
-    a.free(0, 4)
+    st.free(pages)
     t.join(1)
-    assert got == [0]
+    assert len(got) == 1 and len(got[0]) == 1
 
 
 def test_priority_queue_orders_and_closes():
@@ -107,9 +114,10 @@ def _run(pipe, jobs, timeout=10):
         for w in pipe.poll_planned():
             pipe.start(w)
             started += 1
-        for w, seg, off, rows in pipe.poll_staged():
-            staged.append((w, seg, pipe.send_buf[off : off + rows].clone()))
-            pipe.segment_written(w, seg, off, rows)
+        for w, seg, pages, rows in pipe.poll_staged():
+            st = pipe.staging
+            staged.append((w, seg, st.rows[st.row_index(pages, rows)].clone()))
+            pipe.segment_written(w, seg, pages)
         if started == len(jobs) and not pipe.busy:
             break
         time.sleep(0.001)
@@ -118,7 +126,7 @@ def _run(pipe, jobs, timeout=10):
 
 def test_pipeline_streams_all_segments_with_correct_rows():
     runner = _FakeRunner(n_seg=4)
-    pipe = EncoderPipeline(runner, torch.zeros(8, 4), decode_workers=3, max_ready_segments=2)
+    pipe = EncoderPipeline(runner, _staging(8), decode_workers=3, max_ready_segments=2)
     jobs = [SimpleNamespace(seq_id=i, item_idx=0, modality="video", content=f"v{i}") for i in range(3)]
     staged = _run(pipe, jobs)
     pipe.close()
@@ -134,7 +142,7 @@ def test_pipeline_overlaps_requests():
     # Each segment takes 50 ms to decode; 2 videos x 4 segments on 8 workers
     # finish together instead of back to back.
     runner = _FakeRunner(n_seg=4, delay=lambda job, seg: 0.05)
-    pipe = EncoderPipeline(runner, torch.zeros(16, 4), decode_workers=8)
+    pipe = EncoderPipeline(runner, _staging(16), decode_workers=8)
     jobs = [SimpleNamespace(seq_id=i, item_idx=0, modality="video", content=f"v{i}") for i in range(2)]
     t0 = time.monotonic()
     staged = _run(pipe, jobs)
@@ -150,7 +158,7 @@ def test_pipeline_drops_failed_item_but_serves_others():
                 raise RuntimeError("corrupt segment")
             return super().prepare_video_segment(plan, lo, hi)
 
-    pipe = EncoderPipeline(Failing(n_seg=3), torch.zeros(8, 4), decode_workers=2)
+    pipe = EncoderPipeline(Failing(n_seg=3), _staging(8), decode_workers=2)
     jobs = [SimpleNamespace(seq_id=i, item_idx=0, modality="video", content=c)
             for i, c in enumerate(["bad", "good"])]
     staged = _run(pipe, jobs)

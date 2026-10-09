@@ -113,7 +113,7 @@ class Worker(TorchProfilerMixin):
         self.disagg_config = config.disagg_config
         # Encoder-disaggregation LM-side state, built lazily in :meth:`init` when
         # ``disagg_config.is_lm`` is set. ``_disagg_recv`` (the per-rank NIXL
-        # slot pool) lives on *every* PP0 TP rank; ``_disagg_coord`` (the TP0
+        # receiver over the cache arena) lives on *every* PP0 TP rank; ``_disagg_coord`` (the TP0
         # control plane) lives only on TP0 (== rank 0). ``_is_disagg_lm`` is the
         # cheap per-iter routing flag (true on every column). All ``None`` /
         # False on the monolith.
@@ -234,10 +234,10 @@ class Worker(TorchProfilerMixin):
 
         Gated by ``disagg_config.is_lm`` (the entrypoint builds the config; see
         ``gllm.disagg.config.DisaggConfig``). Each PP0 TP rank builds a
-        :class:`DisaggReceiver` (its own NIXL slot pool); the per-rank NIXL
+        :class:`DisaggReceiver` (its arena registered with NIXL); the per-rank NIXL
         handshakes are gathered to TP0, which additionally builds the
         :class:`DisaggCoordinator` (control plane). TP>1 is supported natively:
-        the encoder multi-writes the full embedding into every rank's pool and
+        the encoder multi-writes the full embedding into every rank's arena and
         the coordinator fans its decisions out as per-iter events (see
         :meth:`recv_ipc_package`).
         """
@@ -251,24 +251,17 @@ class Worker(TorchProfilerMixin):
         self._is_disagg_lm = True
         lm_id = cfg.lm_id if cfg.lm_id is not None else "lm0"
 
-        # LMDisaggManager defaults (num_slots=32, max_vis_tokens=16384) stay the
-        # single source of truth when the operator didn't pin them.
-        num_slots = cfg.num_slots if cfg.num_slots is not None else 32
-        max_vis_tokens = cfg.max_vis_tokens if cfg.max_vis_tokens is not None else 16384
-
         recv = DisaggReceiver(
             self.model_runner,
             lm_id=lm_id,
             tp_rank=self.tp_rank,
-            num_slots=num_slots,
-            max_vis_tokens=max_vis_tokens,
             nixl_backend=cfg.nixl_backend,
         )
         recv.setup()
         self._disagg_recv = recv
 
-        # Gather every PP0 TP rank's NIXL handshake (agent meta + slot-pool
-        # region) to TP0 so the coordinator can pack one slot region per rank
+        # Gather every PP0 TP rank's NIXL handshake (agent meta + arena
+        # region) to TP0 so the coordinator can pack every rank's region
         # into each EncoderJob and publish all agent metas to discovery. This is
         # a one-time, non-hot-path all-gather over the TP group.
         handshake = recv.handshake()
@@ -291,7 +284,6 @@ class Worker(TorchProfilerMixin):
                 processor_config_hash=cfg.processor_config_hash,
                 advertise_host=cfg.advertise_host,
                 meta_bind=cfg.meta_bind,
-                num_slots=num_slots,
                 nixl_backend=cfg.nixl_backend,
                 encoder_dp=cfg.encoder_dp,
             )
@@ -328,28 +320,25 @@ class Worker(TorchProfilerMixin):
         Runs identically on every PP0 TP rank (TP0 applies the authoritative
         objects it built; peers apply their freshly-pickled copies). ``ADMIT``
         registers the gate state + adds the expanded seq to this column's
-        scheduler; ``EMB_READY`` clones the embedding out of *this rank's* local
-        slot pool. Keeping both on the same fanned-out stream guarantees every
-        column mutates its scheduler / model runner in lockstep.
+        scheduler; ``ALLOC`` / ``FREE`` change *this rank's* cache arena;
+        ``EMB_READY`` advances readiness (the rows are read in place later).
+        Keeping all of them on the same fanned-out stream guarantees every
+        column mutates its scheduler / model runner / arena in lockstep.
         """
         if not events:
             return
+        mr = self.model_runner
+        if events.frees:
+            mr.disagg_free_pages(events.frees)
+        if events.allocs:
+            pages = mr.disagg_alloc_pages(events.allocs)
+            if self._disagg_coord is not None:
+                self._disagg_coord.on_pages(events.allocs, pages)
         for seq, state in events.admits:
-            self.model_runner.disagg_register(seq.seq_id, state)
+            mr.disagg_register(seq.seq_id, state)
             self.scheduler.add_new_requests([seq])
-        if events.emb_ready:
-            self._disagg_recv.sync()
-            for seq_id, ordered_idx, slot_id, lo, hi, final in events.emb_ready:
-                # Whole items are cloned out of the slot (it is freed now);
-                # streamed rows are copied into the item's own buffer by
-                # ``disagg_add_embedding`` right away, so a view suffices.
-                if final and lo == 0:
-                    emb = self._disagg_recv.clone_slot(slot_id, hi)
-                else:
-                    emb = self._disagg_recv.slot_rows(slot_id, lo, hi)
-                self.model_runner.disagg_add_embedding(
-                    seq_id, ordered_idx, emb, hi, final
-                )
+        for seq_id, ordered_idx, _lo, hi, final in events.emb_ready:
+            mr.disagg_mark_ready(seq_id, ordered_idx, hi, final)
         if events.aborts:
             # An admitted seq whose encode failed unrecoverably (coordinator
             # watchdog gave up). Drop it from every column's scheduler in this
@@ -582,6 +571,10 @@ class Worker(TorchProfilerMixin):
         bandwidth that would otherwise contend with the model's
         per-layer all-reduce.
         """
+        if self._disagg_recv is not None:
+            # Return embedding pages freed by earlier iterations before this
+            # iteration's events, identically on every rank.
+            self.model_runner.disagg_tick()
         cum: Optional[IPCPackage] = None
         if self._polls_frontend():
             cum = IPCPackage([])
@@ -640,8 +633,8 @@ class Worker(TorchProfilerMixin):
             self._apply_disagg_events(cum.disagg_events)
         if cum.abort_ids:
             self.scheduler.add_abort_ids(cum.abort_ids)
-            # TP0 also reclaims any coordinator-held NIXL receive slots for
-            # aborted seqs still pending pre-admission (the scheduler-side
+            # TP0 also releases the embedding pages of aborted seqs still
+            # pending pre-admission (the scheduler-side
             # teardown above already covers admitted seqs on every column).
             if self._disagg_coord is not None:
                 self._disagg_coord.abort(cum.abort_ids)

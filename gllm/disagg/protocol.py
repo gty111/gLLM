@@ -18,20 +18,19 @@ from gllm.transfer.nixl_transfer import RemoteRegion
 
 @dataclass
 class EncoderJob:
-    """LM PP0 -> Encoder: "encode this one mm item into that one slot".
+    """LM PP0 -> Encoder: "encode this one mm item".
 
     ``content`` is the *raw* mm reference (image URL / path / base64 / video
     ref) exactly as the OpenAI request carried it -- the encoder owns all pixel
     IO + processing.
 
-    Under LM tensor parallelism the *same* visual embedding is needed (full,
-    un-sharded) on every LM TP rank, so the embedding is multi-written: one
-    NIXL region per LM TP rank in ``remote_slots`` (rank order; index 0 == TP0),
-    all sharing the same ``slot_id``. The encoder writes all of them and then
-    sends a *single* notification to TP0 (``lm_agent_names[0]``), so TP0's
-    embedding-ready gate implicitly means "every rank's write landed". For
-    ``tp_size == 1`` both lists have length one and this reduces to the original
-    single-write path.
+    The job carries no destination: the LM learns the item's row count from
+    :class:`MmItemMeta`, allocates that many embedding pages in its cache arena
+    and replies with an :class:`EmbTarget`. Under LM tensor parallelism the
+    *same* embedding is needed on every LM TP rank, so it is multi-written into
+    every rank's arena (``dst_regions``, rank order; index 0 == TP0) at the
+    same page ids, and a *single* notification goes to TP0
+    (``lm_agent_names[0]``).
     """
 
     seq_id: int
@@ -42,16 +41,35 @@ class EncoderJob:
     item_idx: int
     modality: str  # "image" | "video"
     content: object
-    # One pre-registered NIXL slot region per LM TP rank (rank order). The
-    # encoder WRITEs the embedding into each; ``slot_id`` (identical across
-    # ranks) is echoed back in the notification so the LM can match the write to
-    # the reservation.
-    remote_slots: List[RemoteRegion] = field(default_factory=list)
-    slot_id: int = -1
+    # Each LM TP rank's whole registered arena, plus its embedding page layout
+    # (identical across ranks): page ``p`` row ``r`` is at byte
+    # ``p * dst_page_stride + r * row_bytes`` of the region.
+    dst_regions: List[RemoteRegion] = field(default_factory=list)
+    dst_page_stride: int = 0
+    dst_rows_per_page: int = 0
     # LM meta-channel (TP0) + per-rank NIXL agent names so a freshly discovered
     # encoder can reply without a separate registry round-trip. ``lm_agent_names[0]`` is TP0 and is the single notification target.
     lm_meta_addr: str = ""
     lm_agent_names: List[str] = field(default_factory=list)
+
+
+@dataclass
+class EmbTarget:
+    """LM PP0 -> Encoder (job channel): the arena pages, in row order, that
+    rows of item ``(seq_id, item_idx)`` must be written to on every LM rank."""
+
+    seq_id: int
+    item_idx: int
+    pages: List[int]
+
+
+@dataclass
+class EmbCancel:
+    """LM PP0 -> Encoder (job channel): stop working on (and writing) item
+    ``(seq_id, item_idx)``; it was re-dispatched to another encoder."""
+
+    seq_id: int
+    item_idx: int
 
 
 @dataclass
@@ -72,7 +90,6 @@ class MmItemMeta:
     feat_dim: int
     grid_thw: Tuple[int, ...]
     content_hash: bytes
-    slot_id: int = -1
     # Optional carry-through for video m-rope timing (unused for images).
     second_per_grid_ts: Optional[float] = None
 
@@ -84,9 +101,27 @@ def emb_notif(seq_id: int, item_idx: int) -> bytes:
 
 def emb_partial_notif(seq_id: int, item_idx: int, rows: int) -> bytes:
     """Encoder -> LM TP0: rows ``[0, rows)`` of the item's embedding have
-    landed in every rank's slot (segment-streamed video). The final segment is
+    landed in every rank's pages (segment-streamed video). The final segment is
     signalled with the regular :func:`emb_notif`."""
     return f"embp:{seq_id}:{item_idx}:{rows}".encode()
+
+
+def emb_fail_notif(seq_id: int, item_idx: int) -> bytes:
+    """Encoder -> LM TP0: this replica gave up on the item (bad input,
+    transfer failure, ...); the LM re-dispatches it right away."""
+    return f"embf:{seq_id}:{item_idx}".encode()
+
+
+def parse_emb_fail_notif(msg: bytes) -> Optional[Tuple[int, int]]:
+    """Inverse of :func:`emb_fail_notif`; ``None`` for anything else."""
+    try:
+        s = msg.decode()
+        if not s.startswith("embf:"):
+            return None
+        _, sid, iid = s.split(":")
+        return int(sid), int(iid)
+    except (UnicodeDecodeError, ValueError):
+        return None
 
 
 def parse_emb_partial_notif(msg: bytes) -> Optional[Tuple[int, int, int]]:
