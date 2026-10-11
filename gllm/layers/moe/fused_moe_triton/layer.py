@@ -99,12 +99,16 @@ class FusedMoEMethod(torch.nn.Module):
         # shared across layers instead of retaining one maximum-token workspace
         # per layer. Standalone callers without a runner-owned registry keep
         # the historical per-layer cache.
-        workspace_cache = getattr(runtime, "workspaces", self._piecewise_workspaces)
+        workspace_cache = getattr(
+            runtime, "workspaces", self._piecewise_workspaces
+        )
         workspace = workspace_cache.get(key)
         if workspace is None:
             workspace_input = x
             if x.shape[0] != workspace_tokens:
-                workspace_input = x.new_empty((workspace_tokens, x.shape[-1]))
+                workspace_input = x.new_empty(
+                    (workspace_tokens, x.shape[-1])
+                )
             config_dtype = get_config_dtype_str(
                 dtype=x.dtype,
                 use_fp8_w8a8=use_fp8_w8a8,
@@ -194,7 +198,9 @@ class FusedMoEMethod(torch.nn.Module):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        workspace = self._piecewise_workspace(layer, x, top_k, global_num_experts)
+        workspace = self._piecewise_workspace(
+            layer, x, top_k, global_num_experts
+        )
         with use_fused_moe_workspace(workspace):
             return fused_experts(
                 hidden_states=x,
@@ -499,9 +505,7 @@ class Int4FlashInferMoEMethod(FusedMoEMethod):
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if activation != "silu":
-            raise ValueError(
-                f"int4_moe only supports silu activation, got {activation}"
-            )
+            raise ValueError(f"int4_moe only supports silu activation, got {activation}")
         if apply_router_weight_on_input:
             raise ValueError(
                 "FlashInfer MXINT4 MoE does not support applying router "
@@ -513,7 +517,9 @@ class Int4FlashInferMoEMethod(FusedMoEMethod):
             global_num_experts = layer.w13_weight_packed.shape[0]
         local_expert_offset = 0
         if expert_map is not None:
-            local_expert_offset = layer.ep_rank * (global_num_experts // layer.ep_size)
+            local_expert_offset = layer.ep_rank * (
+                global_num_experts // layer.ep_size
+            )
 
         return ops.flashinfer_mxint4_moe(
             hidden_states=x,
@@ -750,7 +756,9 @@ def determine_expert_map(
     local_num_experts = global_num_experts // ep_size
 
     # Create a tensor of size num_experts filled with -1
-    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32, device="cuda")
+    expert_map = torch.full(
+        (global_num_experts,), -1, dtype=torch.int32, device="cuda"
+    )
     # Create a expert map for the local experts
     if ep_rank < (ep_size - 1):
         # Each non-last rank gets local_num_experts experts.

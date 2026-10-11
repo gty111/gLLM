@@ -238,7 +238,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
             )
         # MLA latent KV cache precision (DeepSeek Sparse Attention). "bf16"
         # (default) = full-precision latent cache + dense decode; "fp8" = native
-        # FP8-packed cache for FlashMLA sparse decode.
+        # FP8-packed cache driving FlashMLA sparse decode on SM90.
         self.mla_cache_dtype = (config.mla_cache_dtype or "bf16").lower()
         if self.mla_cache_dtype not in ("bf16", "fp8"):
             raise ValueError(
@@ -464,7 +464,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
                 backend_errors[candidate] = "TRT-LLM/XQA paged KV is unsupported on SM8x"
                 continue
             if candidate == "fa3" and capability[0] not in (8, 9):
-                backend_errors[candidate] = "SGL kernel FlashAttention-3 is unsupported on this device"
+                backend_errors[candidate] = "SGL kernel FlashAttention-3 requires SM8x or SM90"
                 continue
             if candidate == "fa4" and capability[0] not in (9, 10, 11):
                 backend_errors[candidate] = (
@@ -673,7 +673,7 @@ class ModelRunner(MtpMixin, MmMixin, TokenizerMixin, CudaGraphMixin):
             # MLA rope head dim (needed to size the native FP8 MLA cache for DSA).
             qk_rope_head_dim=getattr(self.model, "qk_rope_head_dim", 0),
             # DSA MLA latent cache precision: FP8-packed only when explicitly
-            # requested for sparse decode; default bf16 + dense decode.
+            # requested (drives SM90 sparse decode); default bf16 + dense decode.
             mla_cache_fp8=(self.mla_cache_dtype == "fp8"),
             # Recurrent-state prefix-cache granularity (tokens). Rounded to
             # whole pages by ``PrefixMemoryManager.init``.

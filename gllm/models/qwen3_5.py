@@ -1256,7 +1256,9 @@ class Qwen3_5Model(nn.Module):
             if self._fuse_tail:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             return hidden_states, residual
-        # The MTP head consumes the post-norm output.
+        # The MTP head consumes this POST-norm output, matching vLLM
+        # (``target_hidden_states = hidden_states``) and sglang
+        # (``spec_info.hidden_states``); the pre-norm residual is not it.
         hidden_states, _ = maybe_fused_norm(
             hidden_states, residual, self.norm, self._fuse_tail
         )

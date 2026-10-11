@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+
 _EPILOGUE_TILE_M = 128
 _BLOCK_K = 128
 
@@ -116,7 +117,7 @@ def bf16_moe_support_reason(layer: torch.nn.Module) -> Optional[str]:
     if not torch.cuda.is_available():
         return "CUDA is unavailable"
     if torch.cuda.get_device_capability()[0] != 10:
-        return "TRT-LLM BF16 MoE is unsupported on this device"
+        return "TRT-LLM BF16 MoE requires an SM100-family GPU"
     try:
         from flashinfer.fused_moe import trtllm_bf16_moe
     except (ImportError, AttributeError) as exc:
@@ -184,11 +185,9 @@ def convert_bf16_moe_weights(
         row_indices: torch.Tensor,
     ) -> None:
         rows = expert.shape[0]
-        source = (
-            expert.view(torch.uint8)
-            .view(rows, output.shape[0], _BLOCK_K)
-            .permute(1, 0, 2)
-        )
+        source = expert.view(torch.uint8).view(
+            rows, output.shape[0], _BLOCK_K
+        ).permute(1, 0, 2)
         torch.index_select(
             source,
             1,

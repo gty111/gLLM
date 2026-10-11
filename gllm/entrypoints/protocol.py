@@ -260,7 +260,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     verbosity: Optional[Literal["low", "medium", "high"]] = None
     web_search_options: Optional[Dict[str, Any]] = None
 
-    # Additional sampling knobs accepted by the wire schema
+    # vLLM-extension sampling knobs accepted by the wire schema
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
     ignore_eos: bool = False
@@ -372,7 +372,7 @@ class CompletionRequest(OpenAIBaseModel):
     top_p: Optional[float] = None
     user: Optional[str] = None
 
-    # Additional sampling knobs accepted by the wire schema
+    # vLLM-extension sampling knobs accepted by the wire schema
     top_k: Optional[int] = None
     repetition_penalty: Optional[float] = None
     ignore_eos: Optional[bool] = False

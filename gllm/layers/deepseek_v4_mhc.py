@@ -215,7 +215,8 @@ def hc_split_sinkhorn(
     over a 4x4 matrix, run twice per decoder layer; on 43 layers that was the
     single largest cost in a single-request decode step, larger than every GEMM
     combined. The fused kernel is one launch and normalizes in a different
-    summation order, so it agrees to ~1e-6 relative rather than bitwise.
+    summation order, so it agrees to ~1e-6 relative rather than bitwise -- the
+    same trade vLLM and SGLang make with their TileLang mHC kernels.
     """
     if (
         mixes.is_cuda

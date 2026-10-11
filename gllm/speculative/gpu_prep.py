@@ -1,9 +1,14 @@
 """GPU-native input preparation for the MTP draft / verify forwards.
 
-Draft and verify inputs derive from per-sequence facts already known by the
-engine. Building per-token arrays and dummy padding objects on the host
-repeats that work for every phase. Verify token IDs already live on the GPU
-as the draft chain's output; page tables still come from the host allocator.
+Motivation (measured on Qwen3.5-0.8B, 1×H200, 64 concurrent greedy decodes with
+host-side phase profiling): one fused MTP step cost ~12.4 ms, of which ~4.3 ms was
+**host** time spent rebuilding input arrays in Python -- ``cal_input`` for the
+draft batch (0.5 ms) and for the verify batch (1.5 ms), the per-seq GPU
+context-length bookkeeping (2.1 ms) and the dummy pad-``GenerationSequence`` objects the
+padded buckets needed. All of that is pure overhead: the arrays are simple
+affine functions of *per-sequence* facts the engine already knows, and the
+verify batch's token ids already live on the GPU (they are the draft chain's
+output). Only the sequences' page tables genuinely have to cross the PCIe bus.
 
 This module removes that host work by keeping a persistent batch representation:
 

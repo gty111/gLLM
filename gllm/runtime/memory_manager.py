@@ -769,8 +769,8 @@ class Segment:
         self.index_head_dim = index_head_dim
         # DeepSeek Sparse Attention: the MLA latent cache is stored in FlashMLA's
         # FP8 packed layout (656 bytes/token) only when ``mla_cache_fp8`` is
-        # explicitly enabled, using the sparse decode kernel's packed layout.
-        # Default is a plain
+        # explicitly enabled -- that layout is what the SM90 *sparse* decode
+        # kernel reads (bf16 sparse decode is Blackwell-only). Default is a plain
         # bf16 latent cache + dense decode, which is exact for prompts <=
         # index_topk. Every non-DSA model keeps its bf16 latent cache unchanged.
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
@@ -981,7 +981,7 @@ class MemoryManager:
         self.qk_rope_head_dim = qk_rope_head_dim
         # Whether the MLA latent cache is stored natively in FP8 (DSA). Default
         # is bf16 (full precision, dense decode); FP8-packed is opt-in and only
-        # needed by the selected FlashMLA sparse decode kernel for long
+        # needed to drive FlashMLA's *sparse* decode kernel on SM90 for long
         # context (> index_topk). DSA on bf16 runs dense decode, which is exact
         # for prompts <= index_topk (the sparse top-k would select every key).
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8

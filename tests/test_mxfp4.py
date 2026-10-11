@@ -23,7 +23,7 @@ def test_e8m0_to_float32_rejects_non_e8m0():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_deepgemm_mxfp4_linear_matches_dequantized_oracle():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native FP8-by-FP4 DeepGEMM is unsupported on this device")
+        pytest.skip("native FP8-by-FP4 DeepGEMM requires Blackwell")
 
     pytest.importorskip("deep_gemm")
     from deep_gemm.utils import (
@@ -55,7 +55,7 @@ def test_deepgemm_mxfp4_linear_matches_dequantized_oracle():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_deepgemm_mxfp4_expert_matches_reference_order():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native FP8-by-FP4 DeepGEMM is unsupported on this device")
+        pytest.skip("native FP8-by-FP4 DeepGEMM requires Blackwell")
 
     pytest.importorskip("deep_gemm")
     from deep_gemm.utils import (

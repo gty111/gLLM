@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FP8 weights with FP16/BF16 Tensor Core compute using Marlin.
+"""FP8 weights with FP16/BF16 Tensor Core compute on SM80--SM88.
 
 Packing and scale permutations are adapted from SGLang; see csrc/marlin/NOTICE.
 The checkpoint layout is kept until model-specific loading has completed.

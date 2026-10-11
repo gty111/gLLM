@@ -142,7 +142,7 @@ def test_sparse_attention_sink_matches_scalar_reference():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_sglang_sparse_prefill_matches_reference_with_tp_head_padding():
     if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("the installed sparse prefill backend is unsupported on this device")
+        pytest.skip("SGLang FlashMLA sparse prefill test targets SM100")
     pytest.importorskip("sgl_kernel")
 
     torch.manual_seed(33)
@@ -177,7 +177,7 @@ def test_sglang_sparse_prefill_matches_reference_with_tp_head_padding():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_flashinfer_dsv4_decode_matches_sparse_reference():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("FlashInfer sparse MLA is unsupported on this device")
+        pytest.skip("FlashInfer DeepSeek-V4 sparse MLA requires Blackwell")
     pytest.importorskip("flashinfer")
     from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 

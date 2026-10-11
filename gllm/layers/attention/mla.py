@@ -28,8 +28,9 @@ except Exception as _e:  # pragma: no cover - depends on hardware / build
     _fa4_varlen_func = None
     _FA4_IMPORT_ERROR = _e
 
-# FlashMLA is optional and depends on the device, driver and installed build.
-# Keep the default Triton decode backend usable when the extension is absent.
+# FlashMLA (DeepSeek SM90 MLA decode kernel) is optional: the extension only
+# loads on Hopper with a recent CUDA driver. Import lazily so the default
+# Triton decode backend keeps working when it is unavailable.
 try:
     from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
     from sgl_kernel.flash_mla import flash_mla_sparse_fwd
@@ -377,7 +378,7 @@ class MLAAttention:
             indices = indices.unsqueeze(1)  # (num_q, 1, topk)
 
         # FlashMLA's sparse prefill kernel requires the query head count to be a
-        # multiple of 64 or 128, depending on the selected kernel. Under TP the
+        # multiple of 64 (SM90/Hopper) or 128 (SM100+/Blackwell). Under TP the
         # per-rank head count is smaller (e.g. 128/8=16), so zero-pad the head
         # axis up to the required multiple and trim the output back (matches
         # SGLang's NSA backend).
@@ -727,7 +728,7 @@ class MLAAttention:
 
         # DeepSeek Sparse Attention (V3.2): when the indexer supplies per-query
         # top-k indices (already transformed to absolute physical KV slots), run
-        # the sparse FlashMLA decode. The selected kernel requires the FP8
+        # the *sparse* FlashMLA decode. On SM90 (Hopper) this requires the FP8
         # packed KV cache -- ``kv_c_and_k_pe_cache`` is then float8 with the
         # 656-byte packed last dim. Metadata + kernel both take
         # ``is_fp8_kvcache=True``; ``causal=False`` because the top-k set is

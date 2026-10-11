@@ -68,7 +68,7 @@ class LinearBase(torch.nn.Module):
         elif self.quant_config["quant_method"] == "fp8":
             if get_device_capability() < 80:
                 raise Exception(
-                    f"FP8 quantization is unsupported on this device (capability is {get_device_capability()})"
+                    f"FP8 quantization requires SM80 or newer (current is {get_device_capability()})"
                 )
             self.activation_scheme = self.quant_config["activation_scheme"]
             # ``scale_fmt="ue8m0"`` (DeepSeek-V3.2) rounds FP8 group scales to

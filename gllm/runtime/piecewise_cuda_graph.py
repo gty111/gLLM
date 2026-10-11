@@ -24,8 +24,9 @@ class PiecewiseCapture:
         # All piecewise graphs may use one pool when replay is serialized on
         # one stream and no graph-owned tensor is live across a segment. The
         # runner enforces the latter by copying every eager input, passthrough,
-        # and final output into persistent external buffers. Alternative
-        # bucket graphs may reuse scratch addresses without retaining the
+        # and final output into persistent external buffers. This is the same
+        # lifetime rule used by vLLM's global CUDA graph pool: alternative
+        # bucket graphs may then reuse scratch addresses without retaining the
         # sum of every bucket's peak activation footprint.
         self.graph_pool = graph_pool if graph_pool is not None else []
         self.segments: list[Callable[[], object]] = []
@@ -240,9 +241,9 @@ class PiecewiseRuntime:
             bridged_passthrough.append(bridged)
 
         # Adjacent boundaries use different buffers; boundary i+2 may safely
-        # reuse boundary i's storage of the same shape because graph i+1 and its eager call are
+        # reuse boundary i's storage because graph i+1 and its eager call are
         # ordered on the same replay stream. This bounds persistent eager
-        # activations at two max-token buffers per shape, regardless of layer count.
+        # activations at two max-token buffers regardless of layer count.
         buffer_slot = break_index % 2
         expected_shape = (
             self.workspace_tokens,
@@ -378,14 +379,18 @@ class PiecewiseGraphRunner:
         while max_capture_size > interval_start:
             interval_end = min(max_capture_size, interval_start * 2)
             step = interval_start // 4
-            sizes.extend(range(interval_start + step, interval_end + 1, step))
+            sizes.extend(
+                range(interval_start + step, interval_end + 1, step)
+            )
             if sizes[-1] != interval_end:
                 sizes.append(interval_end)
             interval_start *= 2
         return sorted(set(sizes))
 
     def bucket_for(self, num_tokens: int) -> Optional[int]:
-        return next((size for size in self.capture_sizes if size >= num_tokens), None)
+        return next(
+            (size for size in self.capture_sizes if size >= num_tokens), None
+        )
 
     def can_run(self, num_tokens: int) -> bool:
         return self.bucket_for(num_tokens) is not None

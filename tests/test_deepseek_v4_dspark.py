@@ -79,7 +79,7 @@ def _initialize(module):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dspark_prefill_populates_official_circular_window():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native block FP8 backend is unsupported on this device")
+        pytest.skip("native block FP8 path requires Blackwell")
     pytest.importorskip("deep_gemm")
     torch.manual_seed(503)
     module = DeepseekV4DSparkAttention(43, _config())
@@ -99,7 +99,7 @@ def test_dspark_prefill_populates_official_circular_window():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dspark_draft_attention_matches_official_reference_composition():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native block FP8 backend is unsupported on this device")
+        pytest.skip("native block FP8 path requires Blackwell")
     pytest.importorskip("deep_gemm")
     torch.manual_seed(509)
     module = DeepseekV4DSparkAttention(43, _config())

@@ -22,8 +22,8 @@ Arithmetic matches the reference: fp32 accumulation, same operation order, and
 a split-K reduction with fixed summation order so results are reproducible run
 to run. ``tests/test_mhc.py`` pins all of it against a plain-PyTorch oracle.
 
-The Triton implementation is kept in-tree and requires no additional kernel
-build dependency.
+vLLM and SGLang fuse the same region with TileLang kernels; this is the Triton
+equivalent, kept in-tree so the model has no new build dependency.
 """
 
 from __future__ import annotations

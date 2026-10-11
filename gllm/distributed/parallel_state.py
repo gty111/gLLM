@@ -672,7 +672,8 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 
     Fast path: when an NVLink-P2P-capable ``CustomAllreduce`` has been
     initialised and the message fits its registered staging window, route
-    through ``sgl_kernel``'s two-shot AR kernel for small decode messages.
+    through ``sgl_kernel``'s two-shot AR kernel (~3-5x lower latency than
+    NCCL's RING_LL for the <1 MB / small-batch decode regime on H100).
 
     Fall back to ``dist.all_reduce`` otherwise (custom AR disabled, too
     large a tensor, non-contiguous input, etc.).

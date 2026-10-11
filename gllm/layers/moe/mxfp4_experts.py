@@ -1,9 +1,8 @@
 """Native MXFP4 routed experts.
 
 The explicit DeepGEMM expert loop mirrors the DeepSeek-V4 reference and remains
-the numerical oracle. When the grouped backend is supported, loaded weights
-are converted once to the FlashInfer/TRT-LLM layout and evaluated by one routed
-MoE operation.
+the numerical oracle.  On Blackwell, loaded weights are converted once to the
+FlashInfer/TRT-LLM layout and evaluated by one grouped routed-MoE operation.
 """
 
 from __future__ import annotations
@@ -25,7 +24,7 @@ from gllm.layers.quantization.mxfp4 import prepare_mxfp4_scale
 
 
 def _can_use_flashinfer_mxfp4_moe() -> bool:
-    """Return whether the device and installed stack support the grouped kernel."""
+    """Return whether the installed stack has the Blackwell grouped kernel."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
         return False
     try:

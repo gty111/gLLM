@@ -32,7 +32,9 @@ def test_piecewise_cuda_graph_defaults_on_for_cli_and_library():
     add_runtime_args(parser)
     assert parser.parse_args([]).piecewise_cuda_graph == "on"
     assert (
-        inspect.signature(LLM.__init__).parameters["piecewise_cuda_graph"].default
+        inspect.signature(LLM.__init__)
+        .parameters["piecewise_cuda_graph"]
+        .default
         is True
     )
 
@@ -181,7 +183,8 @@ def test_many_eager_boundaries_use_only_two_ping_pong_buffers():
     )
     runtime.capture = _Capture()
     outputs = [
-        runtime.dynamic_tensor(lambda value: value, torch.zeros(8, 4)) for _ in range(7)
+        runtime.dynamic_tensor(lambda value: value, torch.zeros(8, 4))
+        for _ in range(7)
     ]
     assert len(shared) == 2
     assert outputs[0].data_ptr() == outputs[2].data_ptr()
@@ -363,7 +366,7 @@ def test_sm8x_selects_and_probes_fa3(monkeypatch, capability, requested):
 
 def test_sm8x_failed_fa3_probe_reports_all_backends(monkeypatch):
     def fail(_):
-        raise RuntimeError("wheel missing required kernel")
+        raise RuntimeError("wheel missing SM80 kernel")
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
@@ -375,7 +378,7 @@ def test_sm8x_failed_fa3_probe_reports_all_backends(monkeypatch):
     runner = _backend_validation_runner("auto")
     with pytest.raises(RuntimeError, match="No runnable paged-QKV") as exc:
         runner.verify_config()
-    assert "wheel missing required kernel" in str(exc.value)
+    assert "wheel missing SM80 kernel" in str(exc.value)
     assert "fa4:" in str(exc.value)
     assert "flashinfer:" in str(exc.value)
 

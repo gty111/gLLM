@@ -82,7 +82,9 @@ def prepare_chunk_indices(
             for c in range(n_chunks):
                 rows.append((seq_id, c))
         if not rows:
-            out = torch.empty((0, 2), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+            out = torch.empty(
+                (0, 2), dtype=cu_seqlens.dtype, device=cu_seqlens.device
+            )
         else:
             out_cpu = torch.tensor(
                 rows,

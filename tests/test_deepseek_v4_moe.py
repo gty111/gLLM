@@ -66,7 +66,7 @@ def _load_mxfp4_experts(module, w13, w2):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_deepseek_v4_shared_expert_uses_native_fp8_order():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native block FP8 backend is unsupported on this device")
+        pytest.skip("native block FP8 path requires Blackwell")
     pytest.importorskip("deep_gemm")
     from deep_gemm.utils import per_token_cast_to_fp8
 
@@ -100,7 +100,7 @@ def test_deepseek_v4_shared_expert_uses_native_fp8_order():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_deepseek_v4_moe_combines_native_routes_and_shared_branch():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native FP8-by-FP4 backend is unsupported on this device")
+        pytest.skip("native FP8-by-FP4 path requires Blackwell")
     pytest.importorskip("deep_gemm")
 
     torch.manual_seed(29)

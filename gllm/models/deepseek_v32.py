@@ -739,7 +739,7 @@ class DeepseekV32MLAAttention(DeepseekV2MLAAttention):
             # the sparse decode kernel. MLAAttention routes by cache dtype:
             # FP8-packed cache -> FlashMLA sparse ``fwd_kvcache_mla``; bf16 cache
             # -> FA4 with the top-k physical slots as gather indices
-            # (the selected sparse kernel requires packed FP8 KV). Either way
+            # (paged bf16 sparse is rejected by FlashMLA on SM90). Either way
             # sparse decode runs regardless of cache precision.
             if meta.num_decodes > 0:
                 decode_topk = self._select_topk_decode_fp8(
@@ -822,7 +822,7 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         # parallel paged index cache in the MemoryManager (see Segment).
         self.index_head_dim = config.index_head_dim
         # MLA rope head dim, needed to size the native FP8 MLA latent cache
-        # (the selected DSA sparse kernel requires the FP8-packed layout).
+        # (DSA sparse decode on SM90 requires the FP8-packed layout).
         self.qk_rope_head_dim = config.qk_rope_head_dim
 
         # Optional MTP (Multi-Token Prediction) head for speculative decoding.

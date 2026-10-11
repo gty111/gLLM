@@ -12,8 +12,9 @@ followers (column ``k`` = ranks ``{k, tp_size+k, 2*tp_size+k, ...}``).
 The motivation is the same as the overlap path's: the old design
 had rank 0 as the sole scheduler and pushed a delta payload to every
 TP follower over zmq each iteration. That broadcast was the dominant
-source of inter-rank skew in decode and required wire bookkeeping
-on every iteration. Moving the scheduler onto each column driver
+source of inter-rank skew in TP=4 decode (~1.7 ms / iter on H100),
+and even after the delta refactor still ate 50-200 us of wire
+bookkeeping per iter. Moving the scheduler onto each column driver
 keeps determinism (FIFO IDAllocator + identical broadcast input)
 and removes both costs from the critical path.
 

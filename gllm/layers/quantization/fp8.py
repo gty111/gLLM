@@ -33,16 +33,20 @@ def _sgl_group_quant_fp8():
 def deepgemm_available() -> bool:
     """Whether the DeepGEMM block-FP8 GEMM backend can be used on this device.
 
-    Availability is resolved once on the first FP8 linear call during warmup,
-    before CUDA-graph capture. A tiny self-test GEMM ensures that a
+    DeepGEMM ships hand-tuned Hopper (SM90+) FP8 kernels that are markedly
+    faster than the Triton ``_w8a8_block_fp8_matmul`` fallback. Availability is
+    resolved once, lazily (on the first FP8 linear call, i.e. during warmup,
+    never during CUDA-graph capture), and includes a tiny self-test GEMM so a
     broken JIT toolchain degrades gracefully to Triton instead of crashing on
     the first real matmul.
     """
     if not torch.cuda.is_available():
         return False
-    # This integration passes raw FP32 block scales. Restrict dispatch to the
-    # device API that accepts them: other variants use packed UE8M0 scales.
-    # A failed device assertion poisons the CUDA context and cannot fall back.
+    # This W8A8 block-scale integration targets DeepGEMM's Hopper API.  The
+    # Blackwell package aliases ``fp8_gemm_nt`` to its FP8/FP4 implementation,
+    # whose UE8M0 scale contract is different from the raw FP32 block scales
+    # passed below.  A failed device assertion cannot be recovered by the
+    # Python fallback, because it poisons the CUDA context.
     if torch.cuda.get_device_capability() != (9, 0):
         return False
     try:
@@ -70,12 +74,17 @@ def deepgemm_available() -> bool:
 
 @functools.lru_cache(maxsize=1)
 def deepgemm_packed_available() -> bool:
-    """Whether DeepGEMM's packed-UE8M0 block-FP8 GEMM can be used.
+    """Whether DeepGEMM's Blackwell packed-UE8M0 block-FP8 GEMM can be used.
 
-    The ``gemm_1d1d`` kernel requires per-row scales for both operands, packed
-    four to an int32 in a TMA-aligned mn-major layout. Pre-pack weight scales
-    once to avoid repacking the checkpoint's raw FP32 blocks on every call.
-    Activation scales are packed by DeepGEMM's quantization kernel.
+    On SM100/SM120 ``fp8_gemm_nt`` dispatches to the FP8/FP4 ``gemm_1d1d``
+    kernel, which wants *per-row* scales for both operands, packed four to an
+    int32 in a TMA-aligned mn-major layout. Handed the checkpoint's raw
+    ``(N/128, K/128)`` FP32 block scales it still runs, but re-lays them out on
+    every call -- measured at a flat ~15 us regardless of shape, which is most
+    of the kernel time at decode sizes. Pre-packing the weight scales once and
+    packing the activation scales with DeepGEMM's own kernel makes the same
+    GEMM 2.2-2.6x faster than the Triton fallback (measured on GB200, TP=4
+    DeepSeek-V4 shapes, M=1..32).
 
     Packing rounds scales to UE8M0, so this path is only taken for
     ``scale_fmt="ue8m0"`` checkpoints, whose weights are already quantized that
@@ -139,7 +148,7 @@ def w8a8_block_fp8_matmul_deepgemm_packed(
     Bs_packed: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Block-FP8 ``C = A @ B^T`` via DeepGEMM's packed-UE8M0 kernel."""
+    """Block-FP8 ``C = A @ B^T`` via DeepGEMM's Blackwell packed-UE8M0 kernel."""
     import deep_gemm
 
     assert output_dtype == torch.bfloat16, "DeepGEMM only outputs bfloat16"
@@ -178,9 +187,9 @@ def _log_deepgemm_enabled_once(packed: bool = False) -> None:
         logger.info(
             "DeepGEMM FP8 GEMM backend enabled "
             + (
-                "(packed-UE8M0 1d1d kernels)."
+                "(Blackwell packed-UE8M0 1d1d kernels)."
                 if packed
-                else "(FP32 block-scale kernels)."
+                else "(Hopper block-scale kernels)."
             )
         )
 
@@ -213,11 +222,12 @@ def _flashinfer_blockscale_gemm():
 
 @functools.lru_cache(maxsize=1)
 def flashinfer_swapab_available() -> bool:
-    """Whether FlashInfer's swapAB FP8 block-scale GEMM can be used.
+    """Whether FlashInfer's Hopper swapAB FP8 block-scale GEMM can be used.
 
     ``fp8_blockscale_gemm_sm90`` takes a *BF16* activation and fuses the
-    per-token FP8 quantization with a swapAB GEMM. It is JIT-compiled on first
-    use (needs ninja + nvcc + CUDA_HOME), so availability
+    per-token FP8 quantization with a swapAB GEMM that is ~2x faster than
+    DeepGEMM's 1d2d kernel for skinny-M (decode) shapes. It is Hopper-only and
+    JIT-compiled on first use (needs ninja + nvcc + CUDA_HOME), so availability
     is resolved once, lazily, with a self-test that degrades gracefully to the
     DeepGEMM/Triton path when the JIT toolchain is missing.
     """
@@ -374,7 +384,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     block_size: list[int],
     output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Block-wise FP8 matmul via DeepGEMM (``C = A @ B^T``).
+    """Block-wise FP8 matmul via DeepGEMM's Hopper kernels (``C = A @ B^T``).
 
     Drop-in replacement for :func:`w8a8_block_fp8_matmul` with identical
     inputs: ``A`` (M, K) fp8 activations with per-token-group row-major scales

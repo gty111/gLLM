@@ -158,7 +158,7 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
             "MLA latent KV cache precision for DeepSeek Sparse Attention "
             "(V3.2). 'bf16' (default) stores a full-precision latent cache and "
             "runs dense decode (exact for prompts <= index_topk). 'fp8' stores "
-            "the FlashMLA FP8-packed cache for sparse decode over long "
+            "the FlashMLA FP8-packed cache to drive SM90 sparse decode for long "
             "context. No effect on non-DSA models."
         ),
     )

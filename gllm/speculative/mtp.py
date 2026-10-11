@@ -1512,10 +1512,11 @@ class MtpMixin:
     # ``torch.empty`` and its pages are recycled between requests, so any
     # position the head never wrote returns a previous tenant's KV -- a state
     # validity bug, not merely a weak draft.  Every target forward therefore
-    # replays the head over the tokens it just consumed, rewriting accepted
-    # draft entries from the target's hidden states.
+    # replays the head over the tokens it just consumed (vLLM's drafter "first
+    # pass"), which also rewrites the entries of accepted draft tokens from the
+    # target's hidden states instead of the draft chain's own.
     #
-    # The entry at position ``p`` is the pair
+    # Entry convention (EAGLE / vLLM): the entry at position ``p`` is the pair
     # ``(target_hidden[p], embed(token[p+1]))`` and its output predicts
     # ``token[p+2]``.  The head therefore consumes the token stream shifted
     # left by one, and a draft step for a context of length ``ctx`` writes at
@@ -2113,8 +2114,8 @@ class MtpMixin:
                     [row[1:] for row in rows], positions=[row[0] for row in rows],
                 )
 
-        # Target verification returns the post-final-norm hidden states used
-        # to condition the MTP head.
+        # Target verification returns post-final-norm hidden states, matching
+        # vLLM and sglang's MTP conditioning contract.
         # Rejection mode: the target dist ``p`` at each of the 1+kk verify
         # positions, in the SAME transformed space as the draft dist ``q``
         # (temperature + top-k/top-p renorm) -- that equality is what makes the
