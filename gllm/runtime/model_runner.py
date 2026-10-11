@@ -654,6 +654,7 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
                 else 0
             ),
         )
+        self.memory_manager.requires_mrope_buffer = getattr(self.model, "requires_mrope_buffer", False)
         self.input_data = InputData(
             max_running_seqs=self.max_running_seqs,
             max_seq_length=self.model_max_length,
@@ -692,7 +693,7 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
             (self.max_num_batched_tokens, self.hidden_size), device=device
         )
         self.output_hidden_states = torch.zeros(
-            (self.max_num_batched_tokens, self.hidden_size), device=device
+            (self.max_num_batched_tokens, getattr(self.model, "output_hidden_size", self.hidden_size)), device=device
         )
         self.output_residual = torch.zeros(
             (self.max_num_batched_tokens, self.hidden_size), device=device
@@ -734,6 +735,7 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
             self.mtp_enabled
             and not is_dp_attn()
             and not self.disable_cuda_graph
+            and getattr(self.model, "supports_mtp_verify_cuda_graph", True)
             # Works for MLA (DeepSeek fp8 decode-sparse kernel) and non-MLA
             # (Qwen3.5 GDN): the verify forward reads only static input buffers
             # (incl. the 2D SSM block table + num_accepted static buffers filled
@@ -762,7 +764,7 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
         piecewise_model_supported = any(
             getattr(module, "supports_piecewise_cuda_graph", False)
             for module in self.model.modules()
-        )
+        ) and getattr(self.model, "supports_piecewise_cuda_graph", True)
         self._piecewise_cuda_graph_on = (
             piecewise_requested
             and piecewise_model_supported
@@ -902,7 +904,7 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
         self._mtp_staging = MtpStagingBuffers(
             capacity=mixed_cap,
             max_tokens=self.max_num_batched_tokens,
-            hidden_size=self.hidden_size,
+            hidden_size=self.output_hidden_states.shape[-1],
             hidden_dtype=self.output_hidden_states.dtype,
             device=mixed_device,
         )
@@ -1273,6 +1275,8 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
             # so the captured global ``dp_size * bucket`` MoE batch matches.
             num_real_tokens = self.input_data.pad_for_cuda_graph(dp_padded_size)
             self.size_to_graph[dp_padded_size].replay()
+            if self.input_data.use_ssm_cache:
+                self.input_data.mark_ssm_snapshot_writes_enqueued()
             num_cal_tokens = num_real_tokens
         elif is_dp_attn():
             # DP+EP eager path (prefill / mixed, or bucket miss): plain forward.
@@ -1291,6 +1295,8 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
                 # replay the pre-captured graph.
                 num_real_tokens = self.input_data.pad_for_cuda_graph(padded_size)
                 self.size_to_graph[padded_size].replay()
+                if self.input_data.use_ssm_cache:
+                    self.input_data.mark_ssm_snapshot_writes_enqueued()
                 # After replay, use only the real-token slice for logits.
                 num_cal_tokens = num_real_tokens
             else:
@@ -1639,6 +1645,8 @@ class OverlapModelRunner(ModelRunner):
             # the captured global ``dp_size * bucket`` MoE batch matches.
             num_cal_tokens = self.input_data.pad_for_cuda_graph(dp_padded_size)
             self.size_to_graph[dp_padded_size].replay()
+            if self.input_data.use_ssm_cache:
+                self.input_data.mark_ssm_snapshot_writes_enqueued()
         elif is_dp_attn():
             # DP+EP eager path (prefill / mixed / bucket miss): the driver
             # already made the per-group decision, so never fall into the
@@ -1652,6 +1660,8 @@ class OverlapModelRunner(ModelRunner):
             if padded_size is not None and padded_size in self.size_to_graph:
                 num_cal_tokens = self.input_data.pad_for_cuda_graph(padded_size)
                 self.size_to_graph[padded_size].replay()
+                if self.input_data.use_ssm_cache:
+                    self.input_data.mark_ssm_snapshot_writes_enqueued()
             else:
                 if not self._run_generic_piecewise_forward(num_cal_tokens):
                     self.forward()

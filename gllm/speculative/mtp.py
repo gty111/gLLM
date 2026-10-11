@@ -876,7 +876,7 @@ class MtpMixin:
             return
         dev = torch.cuda.current_device()
         B = max(self.capture_sizes)
-        H = self.hidden_size
+        H = self.output_hidden_states.shape[-1]
         dt = self.output_hidden_states.dtype
         self._d_tok = torch.zeros(B, dtype=torch.int64, device=dev)
         self._d_hidden = torch.zeros((B, H), dtype=dt, device=dev)
@@ -1828,22 +1828,19 @@ class MtpMixin:
                     >= seq.prompt_len
                 ]
                 if completed:
-                    nc = len(completed)
-                    completed_gpu = self._mtp_staging.mixed_new_idx[:nc]
-                    new_state_context_lens = self._mtp_staging.mixed_new_ctx[:nc]
-                    idx_host = self._mtp_staging.mixed_new_idx_host[:nc]
-                    ctx_host = self._mtp_staging.mixed_new_ctx_host[:nc]
-                    self._mtp_staging.mixed_new_idx_host_np[:nc] = completed
                     new_state_seq_ids = tuple(
                         extra_prefill_seqs[i].seq_id for i in completed
                     )
-                    self._mtp_staging.mixed_new_ctx_host_np[:nc] = [
+                    completed_contexts = [
                         extra_prefill_seqs[i].computed_token_num
                         + extra_prefill_seqs[i].to_compute_token_num
                         for i in completed
                     ]
-                    completed_gpu.copy_(idx_host, non_blocking=True)
-                    new_state_context_lens.copy_(ctx_host, non_blocking=True)
+                    completed_gpu, new_state_context_lens = (
+                        self._mtp_staging.stage_completed_prefills(
+                            completed, completed_contexts
+                        )
+                    )
                     new_state_tokens = prefill_tokens_gpu.index_select(
                         0, completed_gpu
                     )

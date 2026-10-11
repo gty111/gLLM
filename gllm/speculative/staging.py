@@ -32,6 +32,13 @@ class MtpStagingBuffers:
         self.mixed_new_ctx_host = _pinned_i64(capacity)
         self.mixed_new_idx_host_np = self.mixed_new_idx_host.numpy()
         self.mixed_new_ctx_host_np = self.mixed_new_ctx_host.numpy()
+        self._mixed_host_slots = [
+            (self.mixed_new_idx_host, self.mixed_new_ctx_host),
+            (_pinned_i64(capacity), _pinned_i64(capacity)),
+        ]
+        self._mixed_copy_done = [torch.cuda.Event(), torch.cuda.Event()]
+        self._mixed_copy_pending = [False, False]
+        self._mixed_host_next = 0
         self.mixed_new_idx = torch.empty(capacity, dtype=torch.int64, device=device)
         self.mixed_new_ctx = torch.empty_like(self.mixed_new_idx)
 
@@ -52,6 +59,13 @@ class MtpStagingBuffers:
         self.kv_val_host_np = self.kv_val_host.numpy()
         self.kv_gidx_host_np = self.kv_gidx_host.numpy()
         self.kv_gsrc_host_np = self.kv_gsrc_host.numpy()
+        self._patch_host_slots = [
+            (self.kv_idx_host, self.kv_val_host, self.kv_gidx_host, self.kv_gsrc_host),
+            tuple(_pinned_i64(capacity) for _ in range(4)),
+        ]
+        self._patch_copy_done = [torch.cuda.Event(), torch.cuda.Event()]
+        self._patch_copy_pending = [False, False]
+        self._patch_host_next = 0
         self.kv_idx_gpu = torch.empty(capacity, dtype=torch.int64, device=device)
         self.kv_val_gpu = torch.empty_like(self.kv_idx_gpu)
         self.kv_gidx_gpu = torch.empty_like(self.kv_idx_gpu)
@@ -65,6 +79,27 @@ class MtpStagingBuffers:
         self.install_ctx_host = _pinned_i64(capacity)
         self.install_ctx_host_np = self.install_ctx_host.numpy()
 
+    def stage_completed_prefills(self, indices, context_lens):
+        """Publish new relay rows without overwriting an in-flight H2D source."""
+        n = len(indices)
+        if n != len(context_lens) or n > self.capacity:
+            raise ValueError((n, len(context_lens), self.capacity))
+        slot = self._mixed_host_next
+        self._mixed_host_next = 1 - slot
+        if self._mixed_copy_pending[slot]:
+            self._mixed_copy_done[slot].synchronize()
+        self.mixed_new_idx_host, self.mixed_new_ctx_host = self._mixed_host_slots[slot]
+        self.mixed_new_idx_host_np = self.mixed_new_idx_host.numpy()
+        self.mixed_new_ctx_host_np = self.mixed_new_ctx_host.numpy()
+        self.mixed_new_idx_host_np[:n] = indices
+        self.mixed_new_ctx_host_np[:n] = context_lens
+        idx, ctx = self.mixed_new_idx[:n], self.mixed_new_ctx[:n]
+        idx.copy_(self.mixed_new_idx_host[:n], non_blocking=True)
+        ctx.copy_(self.mixed_new_ctx_host[:n], non_blocking=True)
+        self._mixed_copy_done[slot].record(torch.cuda.current_stream(idx.device))
+        self._mixed_copy_pending[slot] = True
+        return idx, ctx
+
     def patch_shifted_tokens(
         self,
         shifted: torch.Tensor,
@@ -73,6 +108,18 @@ class MtpStagingBuffers:
         gpu_pairs,
     ) -> None:
         """Patch row-boundary tokens without a pageable host transfer."""
+        if not host_pairs and not (gpu_pairs and gpu_src is not None):
+            return
+        slot = self._patch_host_next
+        self._patch_host_next = 1 - slot
+        if self._patch_copy_pending[slot]:
+            self._patch_copy_done[slot].synchronize()
+        (self.kv_idx_host, self.kv_val_host,
+         self.kv_gidx_host, self.kv_gsrc_host) = self._patch_host_slots[slot]
+        self.kv_idx_host_np = self.kv_idx_host.numpy()
+        self.kv_val_host_np = self.kv_val_host.numpy()
+        self.kv_gidx_host_np = self.kv_gidx_host.numpy()
+        self.kv_gsrc_host_np = self.kv_gsrc_host.numpy()
         if host_pairs:
             n = len(host_pairs)
             self.kv_idx_host_np[:n] = [pair[0] for pair in host_pairs]
@@ -94,3 +141,5 @@ class MtpStagingBuffers:
             shifted.index_copy_(
                 0, gidx, gpu_src.to(torch.int64).index_select(0, gsrc)
             )
+        self._patch_copy_done[slot].record(torch.cuda.current_stream(shifted.device))
+        self._patch_copy_pending[slot] = True

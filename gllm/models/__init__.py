@@ -37,6 +37,7 @@ from gllm.models.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 from gllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from gllm.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from gllm.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from gllm.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 
 MODEL_ARCH_REGISTRY: Dict[str, Tuple[type, Dict[str, bool]]] = {
     "LlamaForCausalLM": (LlamaForCausalLM, {}),
@@ -55,6 +56,7 @@ MODEL_ARCH_REGISTRY: Dict[str, Tuple[type, Dict[str, bool]]] = {
     "Qwen3VLMoeForConditionalGeneration": (Qwen3VLMoeForConditionalGeneration, {"mm": True}),
     "Qwen3_5ForConditionalGeneration": (Qwen3_5ForConditionalGeneration, {"mm": True, "hybrid": True}),
     "Qwen3_5MoeForConditionalGeneration": (Qwen3_5MoeForConditionalGeneration, {"mm": True, "hybrid": True}),
+    "Qwen4ExpForConditionalGeneration": (Qwen4ExpForConditionalGeneration, {"mm": True, "hybrid": True}),
     "KimiK25ForConditionalGeneration": (
         KimiK25ForConditionalGeneration,
         {"mla": True, "mm": True, "normalize_kimi_quant": True},

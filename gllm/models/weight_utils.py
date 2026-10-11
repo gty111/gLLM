@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Callable, Optional
 
+import torch
+
 from gllm.distributed.parallel_state import (
     get_tp_rank,
     get_tp_size,
@@ -484,3 +486,142 @@ def load_w2_stacked_natural(
 
     iter_experts(num_experts, _one, pool)
 
+
+
+class ShardedEmbeddingLookup:
+    """Checkpoint row slices and optional TP-sharded resident GPU lookup.
+
+    The CPU lookup is a reference path. ``load_parallel`` copies only local
+    rows in bounded chunks and preserves FP8 storage plus its global scale.
+    Handles are local to this object: do not share it across threads.
+    """
+
+    def __init__(self, path, tensor_keys):
+        import json
+        from pathlib import Path
+
+        from safetensors import safe_open
+
+        tensor_keys = list(tensor_keys)
+        if not tensor_keys:
+            raise ValueError("Embedding checkpoint parts must not be empty")
+        self._handles = {}
+        self._slices = []
+        self._ends = []
+        path = Path(path)
+        index = json.loads((path / "model.safetensors.index.json").read_text())[
+            "weight_map"
+        ]
+        end = 0
+        for key in tensor_keys:
+            filename = str(path / index[key])
+            if filename not in self._handles:
+                self._handles[filename] = safe_open(
+                    filename, framework="pt", device="cpu"
+                )
+            view = self._handles[filename].get_slice(key)
+            if view.get_dtype() not in {"BF16", "F8_E4M3"}:
+                raise ValueError("Embedding lookup supports BF16 and globally scaled FP8 tables")
+            source_dtype = torch.bfloat16 if view.get_dtype() == "BF16" else torch.float8_e4m3fn
+            if self._slices and source_dtype != self.source_dtype:
+                raise ValueError("Embedding checkpoint parts must have the same dtype")
+            self.source_dtype = source_dtype
+            shape = view.get_shape()
+            if len(shape) != 2 or (self._slices and shape[1] != self.head_dim):
+                raise ValueError("Inconsistent embedding checkpoint shape")
+            self.head_dim = shape[1]
+            end += shape[0]
+            self._ends.append(end)
+            self._slices.append(view)
+        self.num_rows = end
+        self.scale = None
+        if self.source_dtype == torch.float8_e4m3fn:
+            scale_key = tensor_keys[0].rsplit(".shard_", 1)[0] + ".weight_scale"
+            if scale_key not in index:
+                raise ValueError("FP8 embedding checkpoint is missing its global scale")
+            with safe_open(str(path / index[scale_key]), framework="pt", device="cpu") as handle:
+                self.scale = handle.get_tensor(scale_key)
+            if self.scale.numel() != 1 or not torch.isfinite(self.scale).all() or (self.scale <= 0).any():
+                raise ValueError("Invalid FP8 embedding global scale")
+
+    def __call__(self, ids, *, device=None, dtype=None):
+        import bisect
+
+        import torch
+
+        if ids.dtype != torch.long:
+            raise ValueError("Embedding lookup IDs must be int64")
+        original_shape = ids.shape
+        unique, inverse = torch.unique(ids.cpu().reshape(-1), return_inverse=True)
+        if unique.numel() and (unique[0] < 0 or unique[-1] >= self.num_rows):
+            raise ValueError("Embedding lookup ID is outside the checkpoint table")
+        rows = torch.empty(unique.numel(), self.head_dim, dtype=torch.bfloat16)
+        for output_row, row in enumerate(unique.tolist()):
+            shard = bisect.bisect_right(self._ends, row)
+            start = self._ends[shard - 1] if shard else 0
+            rows[output_row] = self._slices[shard][row - start : row - start + 1][0]
+        if self.scale is not None:
+            rows = rows * self.scale.to(rows.dtype)
+        output = rows[inverse].reshape(*original_shape, self.head_dim)
+        return output.to(
+            device=ids.device if device is None else device,
+            dtype=torch.bfloat16 if dtype is None else dtype,
+        )
+
+    def close(self):
+        self._slices.clear()
+        self._handles.clear()
+
+    def load_parallel(self, *, device="cuda"):
+        """Materialize only this TP rank's rows, preserving the source dtype."""
+        from gllm.distributed.parallel_state import get_tp_rank, get_tp_size
+
+        size, rank = get_tp_size(), get_tp_rank()
+        rows = (self.num_rows + size - 1) // size
+        start, end = rank * rows, min((rank + 1) * rows, self.num_rows)
+        weight = torch.zeros(rows, self.head_dim, device=device, dtype=self.source_dtype)
+        shard_start = 0
+        for view, shard_end in zip(self._slices, self._ends):
+            lo, hi = max(start, shard_start), min(end, shard_end)
+            # Bound host staging memory even for the 320-million-row PLE table.
+            for chunk in range(lo, hi, 65536):
+                chunk_end = min(chunk + 65536, hi)
+                weight[chunk - start : chunk_end - start].copy_(
+                    view[chunk - shard_start : chunk_end - shard_start]
+                )
+            shard_start = shard_end
+        scale = None if self.scale is None else self.scale.to(device)
+        return ParallelEmbeddingLookup(weight, start, end, size, scale)
+
+
+class ParallelEmbeddingLookup(torch.nn.Module):
+    """Graph-safe row-sharded lookup with a single TP reduction."""
+
+    def __init__(self, weight, start, end, tp_size, scale=None):
+        super().__init__()
+        self.register_buffer("weight", weight, persistent=False)
+        self.register_buffer("scale", scale, persistent=False)
+        self.start, self.end, self.tp_size = start, end, tp_size
+
+    def close(self):
+        self.weight = None
+        self.scale = None
+
+    def forward(self, ids, *, device=None, dtype=None):
+        from gllm.distributed.parallel_state import tensor_model_parallel_all_reduce
+
+        valid = (ids >= self.start) & (ids < self.end)
+        local = torch.where(valid, ids - self.start, 0).reshape(-1)
+        # Byte gathering also works when PyTorch lacks float8 index_select.
+        weight = self.weight
+        if weight.dtype == torch.float8_e4m3fn:
+            output = weight.view(torch.uint8).index_select(0, local).view(weight.dtype)
+        else:
+            output = weight.index_select(0, local)
+        output = output.to(dtype=dtype or torch.bfloat16).reshape(*ids.shape, weight.shape[1])
+        if self.scale is not None:
+            output = output * self.scale.to(output.dtype)
+        output = output * valid.unsqueeze(-1)
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output

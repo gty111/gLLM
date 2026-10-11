@@ -106,9 +106,16 @@ class Sampler:
             logits.div_(input_data.temperature.unsqueeze(1))
 
         probs = torch.softmax(logits, dim=-1)
+        greedy_mask = None
+        top_p = input_data.top_p
+        if flags["has_greedy"]:
+            greedy_mask = input_data.top_k == 1
+            top_p = torch.where(greedy_mask, 1.0, top_p)
         next_tokens = _fused_top_k_top_p_sample(
-            probs, input_data.top_k, input_data.top_p
+            probs, input_data.top_k, top_p
         )
+        if greedy_mask is not None:
+            next_tokens = torch.where(greedy_mask, logits.argmax(dim=-1), next_tokens)
         if active is not None:
             self._structured.record(active, next_tokens)
         if return_logprobs:
@@ -155,7 +162,8 @@ class Sampler:
     def _get_sampling_flags(input_data: InputData) -> dict[str, bool]:
         seqs = input_data.seqs
         return {
-            "is_all_greedy": all(seq.top_k == 1 for seq in seqs),
+            "is_all_greedy": all(seq.temperature == 0 or seq.top_k == 1 for seq in seqs),
+            "has_greedy": any(seq.temperature == 0 or seq.top_k == 1 for seq in seqs),
             "need_repetition_penalty": getattr(
                 input_data, "needs_repetition_penalty", False
             ),

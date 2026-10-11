@@ -2,8 +2,8 @@ import argparse
 import inspect
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 import gllm.runtime.model_runner as model_runner_module
 from gllm.engine.llm import LLM
@@ -355,7 +355,11 @@ def test_sm8x_selects_and_probes_fa3(monkeypatch, capability, requested):
     monkeypatch.setattr(model_runner_module, "create_qkv_attention_backend", create)
     runner = _backend_validation_runner(requested)
     runner.verify_config()
-    assert runner.attention_backend == runner.model_loader.config.attention_backend == "fa3"
+    assert (
+        runner.attention_backend
+        == runner.model_loader.config.attention_backend
+        == "fa3"
+    )
     assert runner._validated_qkv_attention_backend is backend
     assert attempts == [16]
 
@@ -366,11 +370,100 @@ def test_sm8x_failed_fa3_probe_reports_all_backends(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (8, 0))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    monkeypatch.setattr(model_runner_module, "create_qkv_attention_backend",
-                        lambda *_: SimpleNamespace(smoke_test=fail))
+    monkeypatch.setattr(
+        model_runner_module,
+        "create_qkv_attention_backend",
+        lambda *_: SimpleNamespace(smoke_test=fail),
+    )
     runner = _backend_validation_runner("auto")
     with pytest.raises(RuntimeError, match="No runnable paged-QKV") as exc:
         runner.verify_config()
     assert "wheel missing SM80 kernel" in str(exc.value)
     assert "fa4:" in str(exc.value)
     assert "flashinfer:" in str(exc.value)
+
+
+def test_mixed_width_boundaries_share_buffers_per_shape():
+    class Capture:
+        def add_eager(self, fn, *, capture_result=None):
+            return capture_result
+
+    inputs, outputs = [], []
+    runtime = PiecewiseRuntime(
+        bucket=8,
+        num_tokens=3,
+        workspace_tokens=8,
+        break_input_buffers=inputs,
+        break_buffers=outputs,
+    )
+    runtime.capture = Capture()
+    seen = {}
+    for i, width in enumerate([16, 4, 4, 16, 16, 4, 4, 16]):
+        x = torch.ones(8, width)
+        result = runtime.dynamic_tensor(lambda value: value, x)
+        key = (width, i % 2)
+        if key in seen:
+            assert result.data_ptr() == seen[key]
+        seen[key] = result.data_ptr()
+    assert len(inputs) == 2
+    assert len(outputs) == 4
+
+
+def test_dynamic_core_bridges_distinct_inputs_and_changed_output_shape():
+    class Capture:
+        def add_eager(self, fn, *, capture_result=None):
+            self.eager = fn
+            return capture_result
+
+    runtime = PiecewiseRuntime(bucket=8, num_tokens=3, workspace_tokens=8)
+    runtime.capture = Capture()
+    x = torch.arange(32, dtype=torch.float32).view(8, 4)
+    a, b = torch.full((8, 2), 2.0), torch.full((8, 2), 7.0)
+    output = runtime.dynamic_tensor(
+        lambda value, gate_a, gate_b: value[:, :2] + gate_a * gate_b,
+        x,
+        inputs=(a, b),
+        output_shape=(2,),
+    )
+    expected = x[:3, :2] + 14
+    x.zero_()
+    a.zero_()
+    b.zero_()
+    runtime.capture.eager()
+    torch.testing.assert_close(output[:3], expected)
+    assert output.shape == (8, 2)
+    assert output[3:].count_nonzero() == 0
+    assert len({buffer.data_ptr() for buffer in runtime.break_input_buffers}) == 3
+
+
+def test_dynamic_core_writes_persistent_output_across_ragged_replays():
+    class Capture:
+        def add_eager(self, fn, *, capture_result=None):
+            self.eager = fn
+            return capture_result
+
+    runtime = PiecewiseRuntime(bucket=8, num_tokens=3, workspace_tokens=8)
+    runtime.capture = Capture()
+    calls = []
+
+    def write(out, value):
+        calls.append(out.data_ptr())
+        torch.add(value[:, :2], 5, out=out)
+        return out
+
+    def allocating_path(value):
+        raise AssertionError("persistent output must use out_fn")
+
+    result = runtime.dynamic_tensor(
+        allocating_path,
+        torch.ones(8, 4),
+        output_shape=(2,),
+        out_fn=write,
+    )
+    for rows in [3, 7, 1]:
+        runtime.num_tokens = rows
+        runtime.break_input_buffers[0].fill_(rows)
+        runtime.capture.eager()
+        torch.testing.assert_close(result[:rows], torch.full((rows, 2), rows + 5.0))
+        assert result[rows:].count_nonzero() == 0
+    assert calls == [result.data_ptr()] * 3

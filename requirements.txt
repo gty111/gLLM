@@ -1,7 +1,7 @@
 pydantic >= 2.11.7
 numpy
 tqdm
-transformers >= 5.11.0
+transformers >= 5.19.0
 tiktoken >= 0.13.0 # Kimi K2.x tokenizer
 fastapi[standard] >= 0.115.0
 openai >= 2.53.0

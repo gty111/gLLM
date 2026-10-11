@@ -116,6 +116,13 @@ class MtpAsyncBatchState:
             max_batch_size, dtype=torch.int64, device="cpu", pin_memory=True
         )
         self._remap_idx_host_np = self._remap_idx_host.numpy()
+        self._remap_host_slots = [
+            self._remap_idx_host,
+            torch.empty_like(self._remap_idx_host, pin_memory=True),
+        ]
+        self._remap_copy_done = [torch.cuda.Event(), torch.cuda.Event()]
+        self._remap_copy_pending = [False, False]
+        self._remap_host_next = 0
         self._remap_idx_device = torch.empty(
             max_batch_size, dtype=torch.int64, device=device
         )
@@ -212,10 +219,20 @@ class MtpAsyncBatchState:
 
         old_row = {seq_id: i for i, seq_id in enumerate(self.seq_ids)}
         n = len(ids)
+        # A successor remap may be submitted while the predecessor's index
+        # H2D is still queued. Preserve the pinned source until that copy ends.
+        slot = self._remap_host_next
+        self._remap_host_next = 1 - slot
+        if self._remap_copy_pending[slot]:
+            self._remap_copy_done[slot].synchronize()
+        self._remap_idx_host = self._remap_host_slots[slot]
+        self._remap_idx_host_np = self._remap_idx_host.numpy()
         self._remap_idx_host_np[:n] = [old_row[seq_id] for seq_id in ids]
         self._remap_idx_device[:n].copy_(
             self._remap_idx_host[:n], non_blocking=True
         )
+        self._remap_copy_done[slot].record(torch.cuda.current_stream(self.device))
+        self._remap_copy_pending[slot] = True
         idx = self._remap_idx_device[:n]
         torch.index_select(
             self.context_lens,

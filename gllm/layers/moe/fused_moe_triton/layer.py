@@ -225,6 +225,31 @@ class Fp8MoEMethod(FusedMoEMethod):
         # scales to powers of two, matching the reference numerics.
         self.use_ue8m0 = self.quant_config.get("scale_fmt") == "ue8m0"
 
+    def process_weights_after_loading(self, layer):
+        if self._weights_processed:
+            return
+        from gllm.layers.moe.flashinfer_trtllm import (
+            convert_fp8_moe_weights,
+            fp8_moe_support_reason,
+        )
+
+        reason = fp8_moe_support_reason(layer, self.weight_block_size, self.use_ue8m0)
+        if reason is not None:
+            self._weights_processed = True
+            return
+        w13, w2, s13, s2 = convert_fp8_moe_weights(
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.w13_weight_scale_inv.data,
+            layer.w2_weight_scale_inv.data,
+        )
+        layer.w13_weight.data = w13
+        layer.w2_weight.data = w2
+        layer.w13_weight_scale_inv.data = s13
+        layer.w2_weight_scale_inv.data = s2
+        self.backend = "flashinfer_trtllm_fp8"
+        self._weights_processed = True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -289,6 +314,12 @@ class Fp8MoEMethod(FusedMoEMethod):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        self.process_weights_after_loading(layer)
+        if self.backend == "flashinfer_trtllm_fp8":
+            from gllm.layers.moe.flashinfer_trtllm import trtllm_fp8_moe
+
+            return trtllm_fp8_moe(layer, x, router_logits)
+
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -557,6 +588,7 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        self.params_dtype = params_dtype
         self.tp_size = get_tp_size()
         self.ep_size = get_ep_size()
         self.ep_rank = get_ep_rank()

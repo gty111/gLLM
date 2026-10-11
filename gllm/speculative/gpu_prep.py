@@ -152,6 +152,21 @@ class MtpGpuPrep:
         self._h_bt = torch.zeros((max_bs, max(bt_width, 1)), dtype=torch.int32, device="cpu", pin_memory=True)
         self._h_bt_np = self._h_bt.numpy()
 
+        # The overlap worker launches N+1 before collecting N. Pinned H2D
+        # sources must remain immutable until their copies finish, even when
+        # the Python launch has returned. Alternate slots and guard reuse by
+        # an event recorded immediately after staging, rather than waiting for
+        # the entire model forward.
+        self._host_slots = [
+            (self._h_meta, self._h_pt_packed, self._h_bt),
+            tuple(
+                torch.zeros_like(t, pin_memory=True)
+                for t in (self._h_meta, self._h_pt_packed, self._h_bt)
+            ),
+        ]
+        self._host_copy_done = [torch.cuda.Event(), torch.cuda.Event()]
+        self._host_copy_pending = [False, False]
+
         # --- persistent device mirrors ---
         self._d_meta = torch.zeros((max_bs, META_W), dtype=torch.int64, device=device)
         self._d_pt = torch.zeros((max_bs, max_blocks), dtype=torch.int32, device=device)
@@ -218,6 +233,14 @@ class MtpGpuPrep:
         self.nd = nd
         self.bucket = bucket
 
+        slot = epoch % len(self._host_slots)
+        if self._host_copy_pending[slot]:
+            self._host_copy_done[slot].synchronize()
+        self._h_meta, self._h_pt_packed, self._h_bt = self._host_slots[slot]
+        self._h_meta_np = self._h_meta.numpy()
+        self._h_pt_packed_np = self._h_pt_packed.numpy()
+        self._h_bt_np = self._h_bt.numpy()
+
         meta = self._h_meta_np
         meta[:nd, META_CTX] = ctx_lens
         meta[:nd, META_X1] = x1
@@ -281,6 +304,9 @@ class MtpGpuPrep:
         self._d_pt[:bucket, :cols].copy_(d_pt)
         if self.bt_width:
             self._d_bt[:bucket].copy_(self._h_bt[:bucket], non_blocking=True)
+
+        self._host_copy_done[slot].record(torch.cuda.current_stream(self.device))
+        self._host_copy_pending[slot] = True
 
         # A chained overlap-MTP step is launched before the predecessor's CPU
         # completion is finalized.  In that case the host values above are

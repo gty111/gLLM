@@ -34,7 +34,9 @@ from .weight_loader import (
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
-        quant_config = getattr(config, "quantization_config", None)
+        quant_config = getattr(config, "moe_quantization_config", None)
+        if quant_config is None:
+            quant_config = getattr(config, "quantization_config", None)
         self.tp_size = get_tp_size()
 
         if self.tp_size > config.num_experts:
