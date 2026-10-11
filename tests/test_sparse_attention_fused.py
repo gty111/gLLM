@@ -2,12 +2,21 @@
 
 import pytest
 import torch
+from torch.nn import functional as F
 
-from gllm.layers.attention.paged_sparse import _paged_gqa, paged_sparse_attention
+from gllm.layers.attention.paged_sparse import (
+    _paged_gqa,
+    paged_sparse_attention,
+    select_paged_query,
+    update_compressed_index,
+)
+from gllm.layers.attention.qsa import apply_indexer_rope, indexer_rotary_cache
+from gllm.layers.layernorm import GemmaRMSNorm
+from gllm.layers.ops.qsa import prepare_qsa
+from gllm.layers.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize("context", [16, 64, 256, 1024, 4096])
 @torch.inference_mode()
 def test_allocated_page_bound_preserves_visible_candidates(context):
@@ -67,6 +76,7 @@ def reference(q, k, v, table, selected, requests):
     return torch.stack(outputs)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize(
     "rows,heads,kv_heads,dim,width",
     [
@@ -110,6 +120,7 @@ def test_sparse_gqa_tensor_core_and_splitk(rows, heads, kv_heads, dim, width):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @torch.inference_mode()
 def test_ragged_prefill_rows_reuse_the_compiled_kernel():
     k = torch.randn((16, 16, 1, 64), device="cuda", dtype=torch.bfloat16)
@@ -130,6 +141,7 @@ def test_ragged_prefill_rows_reuse_the_compiled_kernel():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize("rows", [1, 32])
 @torch.inference_mode()
 def test_tensorcore_index_scores_and_fused_expansion(rows):
@@ -203,6 +215,7 @@ def test_tensorcore_index_scores_and_fused_expansion(rows):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize("rows", [1, 32])
 @torch.inference_mode()
 def test_ragged_topk_graph_growing_context_and_ties(rows, monkeypatch):
@@ -261,3 +274,248 @@ def test_ragged_topk_graph_growing_context_and_ties(rows, monkeypatch):
     q.normal_()
     graph.replay()
     torch.testing.assert_close(captured, select(), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@torch.inference_mode()
+def test_preprocess_widens_large_cache_page_offsets():
+    pages, stride = 32770, 65536
+    elements = (pages - 1) * stride + 16 * 768
+    if torch.cuda.mem_get_info()[0] < elements * 2 + (1 << 30):
+        pytest.skip("Requires approximately 4 GB of free GPU memory")
+    storage = torch.empty(elements, device="cuda", dtype=torch.bfloat16)
+    keys = storage.as_strided((pages, 16, 1, 64), (stride, 768, 64, 1))
+    values = storage.as_strided((pages, 16, 1, 64), (stride, 768, 64, 1), 128)
+    cache = storage.as_strided((pages, 16, 384), (stride, 768, 1), 256)
+    rope = RotaryEmbedding(64, 32, 128, 10000, True)
+    qkv = torch.randn(1, 384, device="cuda", dtype=torch.bfloat16)
+    index = torch.randn(1, 256, device="cuda", dtype=qkv.dtype)
+    norm = torch.zeros(64, device="cuda", dtype=qkv.dtype)
+    inorm = torch.zeros(128, device="cuda", dtype=qkv.dtype)
+    slot = torch.tensor([(pages - 1) * 16], device="cuda", dtype=torch.int32)
+    position = torch.tensor([37], device="cuda", dtype=torch.int64)
+    bounds = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    prepare_qsa(
+        qkv,
+        index,
+        norm,
+        norm,
+        inorm,
+        position,
+        norm,
+        slot,
+        bounds,
+        keys,
+        values,
+        cache,
+        rope.cos_sin_cache,
+        heads=2,
+        kv_heads=1,
+        index_heads=1,
+        head_dim=64,
+        index_dim=128,
+        rotary_dim=32,
+        eps=1e-6,
+        page_size=16,
+    )
+    torch.testing.assert_close(values[-1, 0, 0], qkv[0, -64:], atol=0, rtol=0)
+    torch.testing.assert_close(cache[-1, 0, :128], index[0, 128:], atol=0, rtol=0)
+    expected = torch.nn.functional.pad(rope.cos_sin_cache[37].to(qkv.dtype), (0, 96))
+    torch.testing.assert_close(cache[-1, 0, 256:], expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize(
+    "rows,mode", [(1, "text"), (32, "section"), (128, "interleaved"), (128, "text")]
+)
+@torch.inference_mode()
+def test_fused_qsa_norm_rope_paged_publication_and_replay(rows, mode):
+    torch.manual_seed(71)
+    heads, kv_heads, dim, index_heads, idim, rot = 6, 1, 256, 4, 128, 64
+    dtype = torch.bfloat16
+    rope = (
+        RotaryEmbedding(dim, rot, 2048, 10000, True)
+        if mode == "text"
+        else MRotaryEmbedding(
+            dim, rot, 512, 10000, True, [16, 8, 8], mode == "interleaved"
+        )
+    )
+    if mode == "interleaved":
+        axes = rope.interleaved_axis[: rot // 2]
+    else:
+        axes = torch.tensor(
+            [0] * 16 + [1] * 8 + [2] * 8, device="cuda", dtype=torch.int32
+        )
+    norms = [GemmaRMSNorm(d, 1e-6).to(dtype) for d in (dim, dim, idim)]
+    for norm in norms:
+        norm.weight.normal_(std=0.2)
+    qkv = torch.randn(
+        rows, (heads * 2 + kv_heads * 2) * dim, device="cuda", dtype=dtype
+    )
+    index = torch.randn(rows, (index_heads + 1) * idim, device="cuda", dtype=dtype)
+    positions = torch.arange(rows, device="cuda", dtype=torch.int64) + 37
+    if mode != "text":
+        positions = torch.stack((positions, positions + 19, positions + 43))
+    slots = torch.randperm(256, device="cuda")[:rows]
+    bounds = torch.tensor(
+        [0, rows] if rows == 1 else [0, 3, rows], device="cuda", dtype=torch.int32
+    )
+    keys = torch.zeros(16, 16, kv_heads, dim, device="cuda", dtype=dtype)
+    values = torch.zeros_like(keys)
+    cache = torch.zeros(16, 16, 384, device="cuda", dtype=dtype)
+
+    def fused():
+        return prepare_qsa(
+            qkv,
+            index,
+            *(n.weight for n in norms),
+            positions,
+            axes,
+            slots,
+            bounds,
+            keys,
+            values,
+            cache,
+            rope.cos_sin_cache,
+            heads=heads,
+            kv_heads=kv_heads,
+            index_heads=index_heads,
+            head_dim=dim,
+            index_dim=idim,
+            rotary_dim=rot,
+            eps=1e-6,
+            page_size=16,
+        )
+
+    def check(actual):
+        qg, k, v = qkv.split([heads * 2 * dim, kv_heads * dim, kv_heads * dim], -1)
+        q = qg.reshape(rows, heads, dim * 2)[..., :dim]
+        q = norms[0](q).reshape(rows, -1)
+        k = norms[1](k.reshape(rows, kv_heads, dim)).reshape(rows, -1)
+        q, k = rope(positions, q, k)
+        iq, raw = index.split([index_heads * idim, idim], -1)
+        iq = apply_indexer_rope(
+            norms[2](iq.reshape(rows, index_heads, idim)), positions, rope
+        )
+        entry = F.pad(
+            torch.cat(
+                (
+                    raw,
+                    torch.zeros_like(raw),
+                    indexer_rotary_cache(positions, rope).to(dtype),
+                ),
+                -1,
+            ),
+            (0, 64),
+        )
+        pages, offsets = slots // 16, slots % 16
+        torch.testing.assert_close(
+            actual[0], q.reshape(rows, heads, dim), atol=0.016, rtol=0.01
+        )
+        torch.testing.assert_close(actual[1], iq, atol=0.016, rtol=0.01)
+        torch.testing.assert_close(
+            keys[pages, offsets], k.reshape(rows, kv_heads, dim), atol=0.016, rtol=0.01
+        )
+        torch.testing.assert_close(
+            values[pages, offsets], v.reshape(rows, kv_heads, dim), atol=0, rtol=0
+        )
+        torch.testing.assert_close(cache[pages, offsets], entry, atol=0, rtol=0)
+        torch.testing.assert_close(
+            actual[2].long(),
+            torch.bucketize(torch.arange(rows, device="cuda"), bounds[1:], right=True),
+        )
+        untouched = torch.ones(256, device="cuda", dtype=torch.bool)
+        untouched[slots] = False
+        assert not keys.flatten(0, 1)[untouched].count_nonzero()
+        assert not cache.flatten(0, 1)[untouched].count_nonzero()
+
+    for _ in range(3):
+        actual = fused()
+    check(actual)
+    if rows == 32:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = fused()
+        qkv.normal_()
+        index.normal_()
+        positions.add_(11)
+        slots.copy_(slots.roll(1))
+        bounds[1] = 9
+        graph.replay()
+        check(actual)
+
+
+@torch.inference_mode()
+def test_paged_qsa_addresses_beyond_signed_int32_elements():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    # One sparse-strided allocation exercises all kernels without initializing
+    # the arena. The page ID and stride individually fit int32; their product
+    # does not, matching the actual serving arena's layout.
+    stride = 65536
+    pages = 32770
+    elements = (pages - 1) * stride + 16 * 512
+    if torch.cuda.mem_get_info()[0] < elements * 2 + (1 << 30):
+        pytest.skip("Requires approximately 4 GB of free GPU memory")
+    storage = torch.empty(elements, device="cuda", dtype=torch.bfloat16)
+    index = storage.as_strided((pages, 16, 384), (stride, 384, 1))
+    page = pages - 1
+    table = torch.tensor([[page]], device="cuda", dtype=torch.int32)
+    index[page, :2].zero_()
+    index[page, :2, :128] = 1
+    index[page, :2, 256:272] = 1  # Identity rotary cosine, zero sine.
+    positions = torch.tensor([0, 1], device="cuda", dtype=torch.int64)
+    requests = torch.zeros(2, device="cuda", dtype=torch.int64)
+    norm = torch.zeros(128, device="cuda", dtype=torch.bfloat16)
+    update_compressed_index(
+        index,
+        table,
+        positions,
+        requests,
+        norm,
+        page_size=16,
+        ratio=2,
+        rotary_dim=32,
+        eps=1e-6,
+    )
+    torch.testing.assert_close(index[page, 0, 128:256], torch.ones_like(norm))
+    selected = select_paged_query(
+        torch.ones((1, 1, 128), device="cuda", dtype=torch.bfloat16),
+        index,
+        table,
+        positions[1:],
+        requests[:1],
+        max_context=4,
+        page_size=16,
+        ratio=2,
+        budget=2,
+    )
+    assert sorted(selected[0][selected[0] >= 0].tolist()) == [0, 1]
+
+    keys = storage.as_strided((pages, 16, 1, 64), (stride, 512, 64, 1))
+    values = storage.as_strided(
+        (pages, 16, 1, 64), (stride, 512, 64, 1), storage_offset=256
+    )
+    keys[page, :2].zero_()
+    values[page, 0].fill_(1)
+    values[page, 1].fill_(3)
+    query = torch.zeros((1, 2, 64), device="cuda", dtype=torch.bfloat16)
+    output = paged_sparse_attention(
+        query, keys, values, table, selected, requests[:1], page_size=16, scale=0.125
+    )
+    torch.testing.assert_close(output, torch.full_like(query, 2))
+
+    # Snapshot metadata also carries int32 slots into the same large arena.
+    from gllm.layers.ops.state_snapshot import copy_slot_snapshots
+
+    states = storage.as_strided((pages, 16), (stride, 1))
+    expected = torch.arange(16, device="cuda", dtype=torch.bfloat16)
+    states[0].copy_(expected)
+    sources = torch.tensor([0], device="cuda", dtype=torch.int32)
+    targets = torch.tensor([page], device="cuda", dtype=torch.int32)
+    copy_slot_snapshots(states, sources, targets)
+    torch.testing.assert_close(states[page], expected)
+    targets.fill_(1)
+    sources.fill_(page)
+    copy_slot_snapshots(states, sources, targets)
+    torch.testing.assert_close(states[1], expected)

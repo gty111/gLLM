@@ -152,7 +152,7 @@ logits. MTP tests compare logits and accepted states numerically rather than
 requiring whole generated paragraphs to be identical across modes.
 
 ```bash
-python -m pytest tests/test_qwen4_exp*.py tests/test_parallel_embedding_lookup.py tests/test_sampler_zero_temperature.py -q
+python -m pytest tests/test_qwen4_exp*.py tests/test_output_budget.py -q
 
 GLLM_FLASH_NEXT_CHECKPOINT=/path/to/bf16/snapshot python -m pytest tests/test_qwen4_exp.py -q
 

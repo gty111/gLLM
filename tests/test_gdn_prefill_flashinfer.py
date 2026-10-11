@@ -5,16 +5,18 @@ import torch
 
 from gllm.layers.ops.fla import chunk_gated_delta_rule
 from gllm.layers.ops.fla.fused_gdn_gating import fused_gdn_gating
+from gllm.layers.ops.fla.index import prepare_chunk_indices, prepare_chunk_offsets
 from gllm.layers.ops.fla.l2norm import l2norm_fwd
 from gllm.layers.ops.fla.prefill import (
     PrefillInputWorkspace,
     flashinfer_prefill,
     supports_flashinfer_prefill,
 )
+from gllm.models.qwen3_5 import _partition_query_start_loc
+from gllm.runtime.input_data import InputData
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("tokens,hk,hv", [(1, 4, 12), (65, 4, 12), (257, 8, 8)])
 @torch.inference_mode()
@@ -69,6 +71,7 @@ def test_fused_prefill_inputs_strided_and_graph(dtype, tokens, hk, hv):
     check(captured)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @pytest.mark.parametrize("lens", [[65, 129], [1, 255], [128, 128]])
 @pytest.mark.parametrize("fused_inputs", [False, True])
 @torch.inference_mode()
@@ -163,6 +166,7 @@ def test_indexed_prefill_numerics_and_dynamic_graph(lens, fused_inputs):
     torch.testing.assert_close(state, graph_state, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 @torch.inference_mode()
 def test_indexed_prefill_state_offsets_exceed_int32():
     if not supports_flashinfer_prefill(128, 128):
@@ -202,3 +206,41 @@ def test_indexed_prefill_state_offsets_exceed_int32():
     actual = flashinfer_prefill(q, k, v, g, beta, state, slots, boundaries, 128**-0.5)
     torch.testing.assert_close(actual, expected.squeeze(0), atol=0.003, rtol=0.03)
     torch.testing.assert_close(state[slots], final, atol=0.003, rtol=0.03)
+
+
+def test_forward_metadata_reuses_partition_and_expires_with_new_batch():
+    data = InputData.__new__(InputData)
+    data.query_start_loc = torch.tensor([0, 1, 66, 196], dtype=torch.int32)
+    data.query_start_loc_cpu = data.query_start_loc.clone()
+    boundaries = data.get_query_start_loc()
+    assert data.get_query_start_loc() is boundaries
+    suffix = _partition_query_start_loc(boundaries, data.query_start_loc_cpu, 1)
+    assert _partition_query_start_loc(boundaries, data.query_start_loc_cpu, 1) is suffix
+    indices = prepare_chunk_indices(suffix, 64)
+    offsets = prepare_chunk_offsets(suffix, 64)
+    assert prepare_chunk_indices(suffix, 64) is indices
+    assert prepare_chunk_offsets(suffix, 64) is offsets
+    torch.testing.assert_close(
+        indices,
+        torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1], [1, 2]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(offsets, torch.tensor([0, 2, 5], dtype=torch.int32))
+    data.query_start_loc.copy_(torch.tensor([0, 1, 2, 3]))
+    data.query_start_loc_cpu = data.query_start_loc.clone()
+    fresh = data.get_query_start_loc()
+    assert fresh is not boundaries
+    suffix = _partition_query_start_loc(fresh, data.query_start_loc_cpu, 1)
+    torch.testing.assert_close(
+        prepare_chunk_offsets(suffix, 64), torch.tensor([0, 1, 2], dtype=torch.int32)
+    )
+
+
+def test_unmanaged_mutable_boundaries_do_not_use_forward_cache():
+    boundaries = torch.tensor([0, 65], dtype=torch.int32)
+    torch.testing.assert_close(
+        prepare_chunk_offsets(boundaries, 64), torch.tensor([0, 2], dtype=torch.int32)
+    )
+    boundaries[1] = 1
+    torch.testing.assert_close(
+        prepare_chunk_offsets(boundaries, 64), torch.tensor([0, 1], dtype=torch.int32)
+    )
