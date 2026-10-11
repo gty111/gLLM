@@ -7,7 +7,7 @@
 /// - Scalar/packed type aliases (`fp16_t`, `bf16_t`, `fp8_e4m3_t`, ...).
 /// - `SGL_DEVICE` macro (forced-inline device function qualifier).
 /// - `kWarpThreads` constant (32).
-/// - PDL (Programmatic Dependent Launch) helpers for Hopper (sm_90+).
+/// - PDL (Programmatic Dependent Launch) helpers when the device supports them.
 /// - Typed `load_as` / `store_as` for void-pointer access.
 /// - `pointer::offset` for safe void-pointer arithmetic.
 /// - `host::LaunchKernel` - kernel launcher with optional PDL.
@@ -128,8 +128,7 @@ static_assert(
 #endif
 
 // Maximum vector size in bytes supported by current architecture.
-// Pre-Blackwell / AMD: 128-bit (16 bytes)
-// Blackwell or greater: 256-bit (32 bytes)
+// Vector width is selected from the compile-time device capability.
 inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 : 16;
 
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
@@ -144,7 +143,7 @@ inline constexpr auto kFullMask = 0xffffffffffffffffULL;
 /**
  * \brief PDL (Programmatic Dependent Launch): wait for the primary kernel.
  *
- * On Hopper (sm_90+), inserts a `griddepcontrol.wait` instruction to
+ * When supported, inserts a `griddepcontrol.wait` instruction to
  * synchronize with a preceding kernel in the same stream. On older
  * architectures or ROCm this is a no-op.
  */
@@ -160,7 +159,7 @@ SGL_DEVICE void PDLWaitPrimary() {
 /**
  * \brief PDL: trigger dependent (secondary) kernel launch.
  *
- * On Hopper (sm_90+), inserts a `griddepcontrol.launch_dependents`
+ * When supported, inserts a `griddepcontrol.launch_dependents`
  * instruction. On older architectures or ROCm this is a no-op.
  */
 template <bool kUsePDL>

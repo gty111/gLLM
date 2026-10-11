@@ -148,6 +148,10 @@ class SSMCacheConfig:
     # ``ssm_layer_ids`` is the subset that should hit the SSM cache. Both are
     # populated by the model file at construction time.
     ssm_layer_ids: List[int] = field(default_factory=list)
+    # Additional histories share the request slot and prefix snapshot lifecycle.
+    # Shapes exclude the slot axis; dtype follows the convolution state.
+    auxiliary_shapes: Dict[str, tuple] = field(default_factory=dict)
+    auxiliary_dtypes: Dict[str, torch.dtype] = field(default_factory=dict)
 
     def conv_state_shape_per_slot(self):
         return (self.conv_dim, self.conv_kernel - 1)
@@ -559,6 +563,9 @@ class SSMSegment(RecurrentStateSegment):
         # entry stride required by CUDA Graph replay.
         self.conv_state = state_cache.tensor("conv_state").movedim(1, 0)
         self.temporal_state = state_cache.tensor("temporal_state").movedim(1, 0)
+        self.auxiliary_states = {
+            name: state_cache.tensor(name) for name in cfg.auxiliary_shapes
+        }
         if self.conv_state.shape != (cfg.num_layers, self.num_blocks, *conv_shape):
             raise ValueError(self.conv_state.shape)
         if self.temporal_state.shape != (
@@ -586,6 +593,8 @@ class SSMSegment(RecurrentStateSegment):
         def _zero():
             self.conv_state[:, block].zero_()
             self.temporal_state[:, block].zero_()
+            for state in getattr(self, "auxiliary_states", {}).values():
+                state[block].zero_()
 
         if self.restore_stream is not None:
             with torch.cuda.stream(self.restore_stream):
@@ -668,6 +677,8 @@ class SSMSegment(RecurrentStateSegment):
             # in one op per state (2 launches) instead of ``2 * num_layers``.
             dst_conv[:, dst_slot].copy_(src_conv[:, src_slot])
             dst_temp[:, dst_slot].copy_(src_temp[:, src_slot])
+            for state in getattr(self, "auxiliary_states", {}).values():
+                state[dst_slot].copy_(state[src_slot])
 
         # Pin the copies to ``restore_stream`` when set (overlap scheduling) so
         # a restore that reads a snapshot written by the in-flight forward is
@@ -718,6 +729,8 @@ class SSMSegment(RecurrentStateSegment):
         self.temporal_state.index_copy_(
             1, dst, self.temporal_state.index_select(1, src)
         )
+        for state in getattr(self, "auxiliary_states", {}).values():
+            state.index_copy_(0, dst, state.index_select(0, src))
 
 
 class Segment:
@@ -756,8 +769,8 @@ class Segment:
         self.index_head_dim = index_head_dim
         # DeepSeek Sparse Attention: the MLA latent cache is stored in FlashMLA's
         # FP8 packed layout (656 bytes/token) only when ``mla_cache_fp8`` is
-        # explicitly enabled -- that layout is what the SM90 *sparse* decode
-        # kernel reads (bf16 sparse decode is Blackwell-only). Default is a plain
+        # explicitly enabled, using the sparse decode kernel's packed layout.
+        # Default is a plain
         # bf16 latent cache + dense decode, which is exact for prompts <=
         # index_topk. Every non-DSA model keeps its bf16 latent cache unchanged.
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
@@ -968,7 +981,7 @@ class MemoryManager:
         self.qk_rope_head_dim = qk_rope_head_dim
         # Whether the MLA latent cache is stored natively in FP8 (DSA). Default
         # is bf16 (full precision, dense decode); FP8-packed is opt-in and only
-        # needed to drive FlashMLA's *sparse* decode kernel on SM90 for long
+        # needed by the selected FlashMLA sparse decode kernel for long
         # context (> index_topk). DSA on bf16 runs dense decode, which is exact
         # for prompts <= index_topk (the sparse top-k would select every key).
         self.mla_cache_fp8 = use_mla and index_head_dim > 0 and mla_cache_fp8
@@ -1299,22 +1312,27 @@ class MemoryManager:
         cfg = self.ssm_cache_config
         if cfg is None:
             raise RuntimeError("cannot register SSM cache without its config")
-        return CacheLayout(
-            name,
-            (
-                CacheTensorLayout(
-                    "conv_state",
-                    cfg.conv_state_dtype,
-                    (cfg.num_layers, *cfg.conv_state_shape_per_slot()),
-                ),
-                CacheTensorLayout(
-                    "temporal_state",
-                    cfg.dtype,
-                    (cfg.num_layers, *cfg.temporal_state_shape_per_slot()),
-                ),
+        tensors = [
+            CacheTensorLayout(
+                "conv_state",
+                cfg.conv_state_dtype,
+                (cfg.num_layers, *cfg.conv_state_shape_per_slot()),
             ),
-            prefer_high=True,
-        )
+            CacheTensorLayout(
+                "temporal_state",
+                cfg.dtype,
+                (cfg.num_layers, *cfg.temporal_state_shape_per_slot()),
+            ),
+        ]
+        for auxiliary_name, shape in cfg.auxiliary_shapes.items():
+            if auxiliary_name in {"conv_state", "temporal_state"}:
+                raise ValueError("Auxiliary state name collides with SSM state")
+            if not shape or any(dim <= 0 for dim in shape):
+                raise ValueError("Auxiliary state dimensions must be positive")
+            tensors.append(
+                CacheTensorLayout(auxiliary_name, cfg.auxiliary_dtypes.get(auxiliary_name, cfg.conv_state_dtype), shape)
+            )
+        return CacheLayout(name, tuple(tensors), prefer_high=True)
 
     def _dsv4_state_cache_layout(self) -> CacheLayout:
         cfg = self.dsv4_state_cache_config

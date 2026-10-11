@@ -876,7 +876,7 @@ class MtpMixin:
             return
         dev = torch.cuda.current_device()
         B = max(self.capture_sizes)
-        H = self.hidden_size
+        H = self.output_hidden_states.shape[-1]
         dt = self.output_hidden_states.dtype
         self._d_tok = torch.zeros(B, dtype=torch.int64, device=dev)
         self._d_hidden = torch.zeros((B, H), dtype=dt, device=dev)
@@ -1512,11 +1512,10 @@ class MtpMixin:
     # ``torch.empty`` and its pages are recycled between requests, so any
     # position the head never wrote returns a previous tenant's KV -- a state
     # validity bug, not merely a weak draft.  Every target forward therefore
-    # replays the head over the tokens it just consumed (vLLM's drafter "first
-    # pass"), which also rewrites the entries of accepted draft tokens from the
-    # target's hidden states instead of the draft chain's own.
+    # replays the head over the tokens it just consumed, rewriting accepted
+    # draft entries from the target's hidden states.
     #
-    # Entry convention (EAGLE / vLLM): the entry at position ``p`` is the pair
+    # The entry at position ``p`` is the pair
     # ``(target_hidden[p], embed(token[p+1]))`` and its output predicts
     # ``token[p+2]``.  The head therefore consumes the token stream shifted
     # left by one, and a draft step for a context of length ``ctx`` writes at
@@ -1828,22 +1827,19 @@ class MtpMixin:
                     >= seq.prompt_len
                 ]
                 if completed:
-                    nc = len(completed)
-                    completed_gpu = self._mtp_staging.mixed_new_idx[:nc]
-                    new_state_context_lens = self._mtp_staging.mixed_new_ctx[:nc]
-                    idx_host = self._mtp_staging.mixed_new_idx_host[:nc]
-                    ctx_host = self._mtp_staging.mixed_new_ctx_host[:nc]
-                    self._mtp_staging.mixed_new_idx_host_np[:nc] = completed
                     new_state_seq_ids = tuple(
                         extra_prefill_seqs[i].seq_id for i in completed
                     )
-                    self._mtp_staging.mixed_new_ctx_host_np[:nc] = [
+                    completed_contexts = [
                         extra_prefill_seqs[i].computed_token_num
                         + extra_prefill_seqs[i].to_compute_token_num
                         for i in completed
                     ]
-                    completed_gpu.copy_(idx_host, non_blocking=True)
-                    new_state_context_lens.copy_(ctx_host, non_blocking=True)
+                    completed_gpu, new_state_context_lens = (
+                        self._mtp_staging.stage_completed_prefills(
+                            completed, completed_contexts
+                        )
+                    )
                     new_state_tokens = prefill_tokens_gpu.index_select(
                         0, completed_gpu
                     )
@@ -2117,8 +2113,8 @@ class MtpMixin:
                     [row[1:] for row in rows], positions=[row[0] for row in rows],
                 )
 
-        # Target verification returns post-final-norm hidden states, matching
-        # vLLM and sglang's MTP conditioning contract.
+        # Target verification returns the post-final-norm hidden states used
+        # to condition the MTP head.
         # Rejection mode: the target dist ``p`` at each of the 1+kk verify
         # positions, in the SAME transformed space as the draft dist ``q``
         # (temperature + top-k/top-p renorm) -- that equality is what makes the

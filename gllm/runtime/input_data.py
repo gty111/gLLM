@@ -63,6 +63,7 @@ class InputData:
         self.use_ssm_cache = memory_manager.use_ssm_cache
         self.memory_manager: MemoryManager = memory_manager
         self.use_buffer = use_buffer
+        self.requires_mrope_buffer = getattr(memory_manager, "requires_mrope_buffer", False)
         # One canonical description of the current forward's batch geometry.
         # CPU input builders, MTP GPU prep and attention backends all consume
         # this plan instead of independently inferring decode/verify/prefill
@@ -180,7 +181,9 @@ class InputData:
         )
         self.top_k = async_tensor_h2d(
             [
-                seq.top_k if seq.top_k != -1 else self.memory_manager.vocab_size
+                1 if seq.temperature == 0 else (
+                    seq.top_k if seq.top_k != -1 else self.memory_manager.vocab_size
+                )
                 for seq in self.seqs
             ],
             torch.int32,
@@ -384,11 +387,13 @@ class InputData:
             self.ssm_num_accepted_cpu = None
 
     def copy_to_input_buffer(self):
+        self._query_start_loc_view = None
         assert self.use_buffer
         self._materialize_ssm_snapshot_targets()
         self.tokens[: self.tokens_cpu.shape[0]].copy_(
             self.tokens_cpu, non_blocking=True
         )
+        self.positions[: self.positions_cpu.shape[0]].copy_(self.positions_cpu, non_blocking=True)
         if (
             hasattr(self, "mrope_positions_cpu")
             and self.mrope_positions_cpu is not None
@@ -396,10 +401,8 @@ class InputData:
             self.mrope_positions[:, : self.mrope_positions_cpu.shape[1]].copy_(
                 self.mrope_positions_cpu, non_blocking=True
             )
-        else:
-            self.positions[: self.positions_cpu.shape[0]].copy_(
-                self.positions_cpu, non_blocking=True
-            )
+        elif getattr(self, "requires_mrope_buffer", False):
+            self.mrope_positions[:, : self.positions_cpu.shape[0]].copy_(self.positions_cpu.expand(3, -1), non_blocking=True)
         self.slot_mapping[: self.slot_mapping_cpu.shape[0]].copy_(
             self.slot_mapping_cpu, non_blocking=True
         )
@@ -540,6 +543,7 @@ class InputData:
         accessor still returns the right view. Cached per (num_rows, qlen); no
         per-step alloc.
         """
+        self._query_start_loc_view = None
         if plan.materialization is not MetadataMaterialization.GPU_UNIFORM:
             raise ValueError("GPU shape projection requires a uniform GPU plan")
         num_rows = plan.batch_size
@@ -757,6 +761,31 @@ class InputData:
     def get_tokens(self):
         return self.tokens[: self.tokens_cpu.shape[0]]
 
+    def get_ngram_context(self, length: int, eos_token_id: int):
+        """Predecessor tokens for each packed request, using frozen positions.
+
+        Scheduler counters may have advanced during overlap; the materialized
+        CPU logical positions identify the exact prefix for this forward.
+        Returned histories are oldest-to-newest and left-padded with EOS.
+        """
+        if length <= 0:
+            raise ValueError("Ngram context length must be positive")
+        boundaries = self.query_start_loc_cpu.tolist()
+        context = []
+        for row, start in enumerate(boundaries[:-1]):
+            if start == boundaries[row + 1]:
+                context.append([eos_token_id] * length)
+                continue
+            position = int(self.positions_cpu[start])
+            previous = self.seqs[row].token_ids[max(0, position - length) : position]
+            if len(previous) != min(length, position):
+                raise ValueError(
+                    "Request token history does not cover the ngram prefix"
+                )
+            context.append([eos_token_id] * (length - len(previous)) + previous)
+        return torch.tensor(context, dtype=torch.long, device=self.tokens.device)
+
+
     def _cal_position(self, seqs: List[GenerationSequence]):
         # Position ids are just consecutive integers per seq, so we write
         # them straight into a pinned tensor via its numpy view instead of
@@ -822,6 +851,9 @@ class InputData:
         return max(query_lens), out
 
     def get_query_start_loc(self):
+        cached = getattr(self, "_query_start_loc_view", None)
+        if cached is not None and cached._cpu_view is self.query_start_loc_cpu:
+            return cached
         view = self.query_start_loc[: self.query_start_loc_cpu.shape[0]]
         # Attach a pinned-CPU mirror so downstream kernels (e.g. fla's
         # ``prepare_chunk_indices``) can do the integer index math on the host
@@ -829,6 +861,10 @@ class InputData:
         # tensor by 0 steps because they were filled in the same prepare-input
         # phase from the same source values.
         view._cpu_view = self.query_start_loc_cpu
+        # Immutable for this forward only; copy_to_input_buffer invalidates it.
+        view._fla_metadata = {}
+        view._partitions = {}
+        self._query_start_loc_view = view
         return view
 
     def get_recurrent_state_slot_per_seq(self):

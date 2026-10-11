@@ -49,7 +49,7 @@ def test_support_reason_rejects_unsupported_routes(monkeypatch, override, reason
 def test_support_reason_falls_back_outside_sm100(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
-    assert "SM100" in bf16_moe_support_reason(make_layer())
+    assert "unsupported on this device" in bf16_moe_support_reason(make_layer())
 
 
 def test_block_layout_preserves_storage_size():

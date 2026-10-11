@@ -448,6 +448,8 @@ class ModelLoader:
                 index[key] = (shard_path, key)
             self._start_prefetch(shard for shard, _ in index.values())
             self.weights = LazySafetensors(index)
+            if hasattr(self, "config"):
+                self.config.checkpoint_path = path
             return True
 
         weights_path = sorted(glob.glob(f"{path}/*.safetensors"))

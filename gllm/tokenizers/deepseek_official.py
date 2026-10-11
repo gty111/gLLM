@@ -60,8 +60,7 @@ def _flatten_content(content):
 
     The bundled DeepSeek encoders join a message's rendered parts with
     ``"\n\n".join(...)`` and therefore require ``content`` to be a string.
-    Modern clients (the OpenAI SDK, vLLM's benchmark client, anything sending
-    multi-part input) send ``[{"type": "text", "text": ...}, ...]`` instead,
+    Clients that use multi-part input send ``[{"type": "text", "text": ...}, ...]`` instead,
     which reaches the encoder as a list and dies with a bare
     ``TypeError: sequence item 0: expected str instance, list found``.
     Flatten text parts here; a non-text part (image/audio) is not something a

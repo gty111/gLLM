@@ -2,12 +2,6 @@
 
 Plugs in front of NCCL's RING_LL kernel for the (TP, small-message) regime
 where the collective is bound by per-launch overhead rather than bandwidth.
-Profile of Qwen3-0.6B (hidden=1024) TP=2 showed ~6.5 us per NCCL AR for
-~64 KB messages plus a ~3.5 us host-side launch -- a two-shot P2P kernel
-hits ~3 us end-to-end on NVLink-connected H100s. With 28 layers x 2 ARs
-per forward this compounds to a real chunk of forward time
-(~35 % of GPU time in the baseline profile).
-
 The kernel itself lives in sgl-kernel (``torch.ops.sgl_kernel.all_reduce``).
 This module is the Python orchestration: cudaMalloc + cudaIpcGetMemHandle
 the shared metadata/staging buffers, exchange those handles across TP

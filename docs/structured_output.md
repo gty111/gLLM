@@ -151,34 +151,13 @@ constrained, but these additional strict-shape requirements are not imposed.
 
 ### Overlap ordering
 
-The upstream implementations provide useful ordering principles, not drop-in
-schedulers for gLLM:
-
-- vLLM separates model execution from sampling. Its engine can dispatch the
-  current forward, consume a previous result to advance grammar state, then
-  dispatch deferred sampling with the updated mask. See
-  [the engine batch queue](https://github.com/vllm-project/vllm/blob/main/vllm/v1/engine/core.py)
-  (`step_with_batch_queue`) and the async scheduler's
-  `pending_structured_output_tokens` flag.
-- SGLang's ordinary overlap loop also defers grammar-dependent sampling until
-  the preceding result is processed. See
-  [the scheduler](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/scheduler.py)
-  (`launch_batch_sample_if_needed`) and
-  [the worker](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/tp_worker.py)
-  (`delay_sample_func`). Its
-  [PP loop](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/scheduler_pp_mixin.py)
-  has separate microbatch/output-exchange ordering; the ordinary overlap loop
-  is not evidence that the same implementation works unchanged with PP.
-
 gLLM exposes the grammar-ready boundary between forward and sampling through
 the existing runner and sampler. Only authoritative sampled tokens advance a
 request's matcher. Independent PP microbatches retain the existing in-flight
 depth. Greedy structured MTP uses the same deferred completion queue and GPU
 relay as ordinary greedy MTP. Grammar still needs authoritative accepted tokens,
 but waits at the post-forward, pre-sampling boundary instead of draining the
-speculative pipeline. This
-integration does not replace the existing scheduler with an upstream scheduler
-or copy a second speculative-execution framework.
+speculative pipeline.
 
 ## Tests
 

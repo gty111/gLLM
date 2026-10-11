@@ -63,12 +63,18 @@ def _cache_put(cache, key, value):
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
+    metadata = getattr(cu_seqlens, "_fla_metadata", None)
+    local_key = ("indices", chunk_size)
+    if metadata is not None and local_key in metadata:
+        return metadata[local_key]
     cpu = _cpu_mirror(cu_seqlens)
     if cpu is not None:
         lens = (cpu[1:] - cpu[:-1]).tolist()
         key = (tuple(lens), chunk_size, cu_seqlens.dtype, str(cu_seqlens.device))
         cached = _cache_get(_INDICES_CACHE, key, cu_seqlens.device)
         if cached is not None:
+            if metadata is not None:
+                metadata[local_key] = cached
             return cached
         rows = []
         for seq_id, n in enumerate(lens):
@@ -76,9 +82,7 @@ def prepare_chunk_indices(
             for c in range(n_chunks):
                 rows.append((seq_id, c))
         if not rows:
-            out = torch.empty(
-                (0, 2), dtype=cu_seqlens.dtype, device=cu_seqlens.device
-            )
+            out = torch.empty((0, 2), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
         else:
             out_cpu = torch.tensor(
                 rows,
@@ -86,9 +90,14 @@ def prepare_chunk_indices(
                 device="cpu",
                 pin_memory=cu_seqlens.is_cuda,
             )
-            out = out_cpu.to(cu_seqlens.device, non_blocking=True) \
-                if cu_seqlens.is_cuda else out_cpu
+            out = (
+                out_cpu.to(cu_seqlens.device, non_blocking=True)
+                if cu_seqlens.is_cuda
+                else out_cpu
+            )
         _cache_put(_INDICES_CACHE, key, out)
+        if metadata is not None:
+            metadata[local_key] = out
         return out
 
     indices = torch.cat(
@@ -103,12 +112,18 @@ def prepare_chunk_indices(
 def prepare_chunk_offsets(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
+    metadata = getattr(cu_seqlens, "_fla_metadata", None)
+    local_key = ("offsets", chunk_size)
+    if metadata is not None and local_key in metadata:
+        return metadata[local_key]
     cpu = _cpu_mirror(cu_seqlens)
     if cpu is not None:
         lens = (cpu[1:] - cpu[:-1]).tolist()
         key = (tuple(lens), chunk_size, cu_seqlens.dtype, str(cu_seqlens.device))
         cached = _cache_get(_OFFSETS_CACHE, key, cu_seqlens.device)
         if cached is not None:
+            if metadata is not None:
+                metadata[local_key] = cached
             return cached
         n_chunks = [(n + chunk_size - 1) // chunk_size for n in lens]
         offsets = [0]
@@ -122,9 +137,14 @@ def prepare_chunk_offsets(
             device="cpu",
             pin_memory=cu_seqlens.is_cuda,
         )
-        out = out_cpu.to(cu_seqlens.device, non_blocking=True) \
-            if cu_seqlens.is_cuda else out_cpu
+        out = (
+            out_cpu.to(cu_seqlens.device, non_blocking=True)
+            if cu_seqlens.is_cuda
+            else out_cpu
+        )
         _cache_put(_OFFSETS_CACHE, key, out)
+        if metadata is not None:
+            metadata[local_key] = out
         return out
 
     return torch.cat(

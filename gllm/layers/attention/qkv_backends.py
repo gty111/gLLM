@@ -142,10 +142,9 @@ class FA4AttentionBackend(QKVAttentionBackend):
 
 
 class FA3AttentionBackend(QKVAttentionBackend):
-    """SGL kernel's FlashAttention-3 implementation for SM80/SM89/SM90.
+    """SGL kernel's FlashAttention-3 backend.
 
-    Unlike the TRT-LLM/XQA path, this supports Ampere and Ada. Metadata
-    references the runtime's static buffers directly, including during graph
+    Metadata references the runtime's static buffers directly, including during graph
     replay; no CPU planning or sequence-length readback is needed.
     """
 

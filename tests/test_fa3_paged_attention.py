@@ -1,4 +1,4 @@
-"""Run on an SM80/SM89/SM90 GPU with the installed SGL kernel wheel."""
+"""Test paged attention when the installed SGL kernel backend is supported."""
 
 from types import SimpleNamespace
 
@@ -10,7 +10,7 @@ from gllm.layers.ops.flash_attn_compat import flash_attn_varlen_func
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (8, 9),
-    reason="SGL kernel FlashAttention-3 needs an SM8x or SM90 GPU",
+    reason="SGL kernel FlashAttention-3 is unsupported on this device",
 )
 
 

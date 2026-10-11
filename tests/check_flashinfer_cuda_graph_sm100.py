@@ -1,4 +1,4 @@
-"""SM100 FlashInfer paged-attention CUDA Graph correctness probe.
+"""FlashInfer paged-attention CUDA Graph correctness probe.
 
 Run directly with the gLLM environment.  It checks graph replay after changing
 Q/K/V, sequence lengths, query offsets, and page tables, and compares against a

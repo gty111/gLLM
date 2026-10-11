@@ -7,7 +7,7 @@ from gllm.layers.moe.mxfp4_experts import NativeMXFP4Experts, deepgemm_mxfp4_moe
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp4_moe_matches_explicit_reference_loop():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native FP8-by-FP4 DeepGEMM requires Blackwell")
+        pytest.skip("native FP8-by-FP4 DeepGEMM is unsupported on this device")
 
     pytest.importorskip("deep_gemm")
     from deep_gemm.utils import (
@@ -90,7 +90,7 @@ def test_mxfp4_moe_matches_explicit_reference_loop():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_native_mxfp4_experts_module_keeps_checkpoint_packing():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native FP8-by-FP4 DeepGEMM requires Blackwell")
+        pytest.skip("native FP8-by-FP4 DeepGEMM is unsupported on this device")
     pytest.importorskip("deep_gemm")
     from deep_gemm.utils import per_token_cast_to_fp4
 
@@ -167,7 +167,7 @@ def test_flashinfer_mxfp4_experts_cuda_graph_replays_changed_routing():
     of crashing the online worker on its first request.
     """
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("FlashInfer MXFP4 MoE requires Blackwell")
+        pytest.skip("FlashInfer MXFP4 MoE is unsupported on this device")
     pytest.importorskip("deep_gemm")
     pytest.importorskip("flashinfer.fused_moe")
     from deep_gemm.utils import per_token_cast_to_fp4

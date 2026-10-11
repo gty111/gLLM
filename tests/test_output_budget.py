@@ -48,6 +48,19 @@ def test_engine_top_k_sampling_defaults(requested, configured, expected):
     assert flags["is_all_greedy"] == (expected == 1)
 
 
+def test_engine_zero_temperature_overrides_model_sampling_defaults():
+    from gllm.layers.sampler import Sampler
+
+    engine = make_engine()
+    engine.generation_config.temperature = 1.0
+    engine.generation_config.top_k = 20
+    engine.generation_config.top_p = 0.95
+    seq = engine.allocate_seq([1, 2], temperature=0)
+    assert seq.temperature == 0
+    assert seq.top_k == 1
+    assert Sampler._get_sampling_flags(SimpleNamespace(seqs=[seq]))["is_all_greedy"]
+
+
 @pytest.mark.parametrize("overrides,expected", [
     ({}, (1.0, 0.95)),
     ({"temperature": 0.7, "top_p": 0.8}, (0.7, 0.8)),

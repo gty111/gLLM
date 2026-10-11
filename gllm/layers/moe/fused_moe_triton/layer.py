@@ -99,16 +99,12 @@ class FusedMoEMethod(torch.nn.Module):
         # shared across layers instead of retaining one maximum-token workspace
         # per layer. Standalone callers without a runner-owned registry keep
         # the historical per-layer cache.
-        workspace_cache = getattr(
-            runtime, "workspaces", self._piecewise_workspaces
-        )
+        workspace_cache = getattr(runtime, "workspaces", self._piecewise_workspaces)
         workspace = workspace_cache.get(key)
         if workspace is None:
             workspace_input = x
             if x.shape[0] != workspace_tokens:
-                workspace_input = x.new_empty(
-                    (workspace_tokens, x.shape[-1])
-                )
+                workspace_input = x.new_empty((workspace_tokens, x.shape[-1]))
             config_dtype = get_config_dtype_str(
                 dtype=x.dtype,
                 use_fp8_w8a8=use_fp8_w8a8,
@@ -198,9 +194,7 @@ class FusedMoEMethod(torch.nn.Module):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        workspace = self._piecewise_workspace(
-            layer, x, top_k, global_num_experts
-        )
+        workspace = self._piecewise_workspace(layer, x, top_k, global_num_experts)
         with use_fused_moe_workspace(workspace):
             return fused_experts(
                 hidden_states=x,
@@ -224,6 +218,31 @@ class Fp8MoEMethod(FusedMoEMethod):
         # ``scale_fmt="ue8m0"`` (DeepSeek-V3.2) rounds FP8 activation group
         # scales to powers of two, matching the reference numerics.
         self.use_ue8m0 = self.quant_config.get("scale_fmt") == "ue8m0"
+
+    def process_weights_after_loading(self, layer):
+        if self._weights_processed:
+            return
+        from gllm.layers.moe.flashinfer_trtllm import (
+            convert_fp8_moe_weights,
+            fp8_moe_support_reason,
+        )
+
+        reason = fp8_moe_support_reason(layer, self.weight_block_size, self.use_ue8m0)
+        if reason is not None:
+            self._weights_processed = True
+            return
+        w13, w2, s13, s2 = convert_fp8_moe_weights(
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.w13_weight_scale_inv.data,
+            layer.w2_weight_scale_inv.data,
+        )
+        layer.w13_weight.data = w13
+        layer.w2_weight.data = w2
+        layer.w13_weight_scale_inv.data = s13
+        layer.w2_weight_scale_inv.data = s2
+        self.backend = "flashinfer_trtllm_fp8"
+        self._weights_processed = True
 
     def create_weights(
         self,
@@ -289,6 +308,12 @@ class Fp8MoEMethod(FusedMoEMethod):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        self.process_weights_after_loading(layer)
+        if self.backend == "flashinfer_trtllm_fp8":
+            from gllm.layers.moe.flashinfer_trtllm import trtllm_fp8_moe
+
+            return trtllm_fp8_moe(layer, x, router_logits)
+
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -474,7 +499,9 @@ class Int4FlashInferMoEMethod(FusedMoEMethod):
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if activation != "silu":
-            raise ValueError(f"int4_moe only supports silu activation, got {activation}")
+            raise ValueError(
+                f"int4_moe only supports silu activation, got {activation}"
+            )
         if apply_router_weight_on_input:
             raise ValueError(
                 "FlashInfer MXINT4 MoE does not support applying router "
@@ -486,9 +513,7 @@ class Int4FlashInferMoEMethod(FusedMoEMethod):
             global_num_experts = layer.w13_weight_packed.shape[0]
         local_expert_offset = 0
         if expert_map is not None:
-            local_expert_offset = layer.ep_rank * (
-                global_num_experts // layer.ep_size
-            )
+            local_expert_offset = layer.ep_rank * (global_num_experts // layer.ep_size)
 
         return ops.flashinfer_mxint4_moe(
             hidden_states=x,
@@ -557,6 +582,7 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        self.params_dtype = params_dtype
         self.tp_size = get_tp_size()
         self.ep_size = get_ep_size()
         self.ep_rank = get_ep_rank()
@@ -724,9 +750,7 @@ def determine_expert_map(
     local_num_experts = global_num_experts // ep_size
 
     # Create a tensor of size num_experts filled with -1
-    expert_map = torch.full(
-        (global_num_experts,), -1, dtype=torch.int32, device="cuda"
-    )
+    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32, device="cuda")
     # Create a expert map for the local experts
     if ep_rank < (ep_size - 1):
         # Each non-last rank gets local_num_experts experts.

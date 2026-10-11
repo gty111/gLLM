@@ -639,16 +639,16 @@ Removed during cleanup: `gllm/spec_decode/mtp_proposer.py` (superseded by the
 An MTP step prepares **two** batches (the draft chain's batch×1 and the verify
 batch's uniform `1+k`) on top of whatever the scheduler already prepared. Doing
 that with `InputData.cal_input` meant rebuilding every per-token array in Python
-per phase per step. Measured on Qwen3.5-0.8B (1×H200, 64 concurrent greedy
-decodes, with host-side phase profiling): **4.3 ms of the 12.4 ms step was
-host-side prep**.
+per phase per step.
 
-`MtpGpuPrep` replaces it with the vLLM-model-runner-V2 pattern:
+`MtpGpuPrep` uses persistent sequence metadata and device-side input builders:
 
 * per-*sequence* facts (context length, mrope delta, `x1`, page table, SSM block
   table) live in persistent **pinned** staging buffers and cross to the device in
   three small H2D copies, staged **once per step** (draft + verify share it,
   memoized on `(epoch, bucket)`);
+* alternating host slots retain each H2D source until its copy-completion
+  event finishes, including when a successor is launched before collection;
 * every per-*token* array is derived by vectorized CUDA ops written straight into
   the static buffers the captured graphs read -- the verify token ids come from
   the draft chain's GPU tensor and never round-trip through the host;
@@ -718,11 +718,9 @@ could continue past the stop token). It now ships `committed[:kept]`.
 
 ### 10.13 Sparse (top-k) `p` / `q` for rejection sampling
 
-With the per-seq loop gone, what remained was the *distribution transform*
-itself. Measured at this vocab (248k) on H200: `softmax -> top_k_renorm ->
-top_p_renorm` costs **1.5 ms for 64 rows** and **3.1 ms for 256 rows**, and the
-sampling step pays it `k` times in the draft chain (once per draft step, 64 rows)
-plus once in the accept (`nd·(1+k)` = 256 rows) — ~7 ms of the 17 ms step.
+The dense distribution transform scales with the vocabulary size. The draft
+chain applies `softmax -> top_k_renorm -> top_p_renorm` once per candidate,
+and acceptance applies it to `nd·(1+k)` target rows.
 
 But when a request restricts `top_k`, the transformed distribution has **at most
 `top_k` nonzero entries**, so carrying it as a dense `[rows, vocab]` tensor is
@@ -802,7 +800,7 @@ Still open, in profile order: `fused_recurrent_gdn_spec_fwd_kernel` (the
 `1+k` full recurrent-state checkpoints, ~17% of GPU time and the reason MTP
 trails plain decode on a 0.8B model — the bytes per checkpoint are now halved by
 the engine-wide `mamba_ssm_cache_dtype` knob, which stores the recurrent state in
-the activation dtype by default like vLLM does, but the *count* of checkpoints is
+the activation dtype by default, but the *count* of checkpoints is
 inherent to verifying `1+k` tokens); the sparse `topk` (16 radix passes/step —
 `_sparse_kpad_capture` is a fixed 128 even when a request asks for `top_k=20`, so
 per-bucket `k_pad` capture would cut it); and ~178 eager launches/step of prep +
@@ -819,8 +817,7 @@ in python, doing `index_select` + `index_copy_` + a single-token
 per MTP step** (72 conv kernels, 72 `index_copy`, 150 index, 86 gather) — more
 than half of every op in the step.
 
-`causal_conv1d_update` already supports the whole thing in one launch (vLLM's
-spec-decode path): `x` as `[nseq, dim, 1+k]` plus `intermediate_conv_window`,
+`causal_conv1d_update` supports the whole query in one launch: `x` as `[nseq, dim, 1+k]` plus `intermediate_conv_window`,
 which records the post-window after **every** token. Two details make it fit
 gLLM's block-table layout:
 
@@ -904,13 +901,13 @@ numbers below are `out=1024`, 3 repetitions each, spread ~1%:
 
 Acceptance is healthy throughout (mean 1.98 of 3 at k=2, 2.17 of 4 at k=3), so
 this is not a draft-quality problem — it is GPU saturation. A 0.8B model
-saturates an H200 at a *very* small batch, so the profitable window here is
+reaches device saturation at a small batch in this experiment, so the profitable window is
 `conc <= 4`; it widens with model size (a larger target forward amortizes the
 1-layer draft head better), which is exactly why the crossover cannot be a
 constant in the code.
 
-Hence `--mtp-max-batch N` (vLLM's speculative `disable_by_batch_size` analogue): speculate only while the decode batch is at
-most `N` sequences.
+`--mtp-max-batch N` enables speculation only while the decode batch contains
+at most `N` sequences.
 
 It is a *scheduling* decision, not a second code path: a declined step takes the
 plain decode path that already exists as MTP's bootstrap path. Three details:

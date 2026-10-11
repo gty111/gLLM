@@ -24,9 +24,8 @@ class PiecewiseCapture:
         # All piecewise graphs may use one pool when replay is serialized on
         # one stream and no graph-owned tensor is live across a segment. The
         # runner enforces the latter by copying every eager input, passthrough,
-        # and final output into persistent external buffers. This is the same
-        # lifetime rule used by vLLM's global CUDA graph pool: alternative
-        # bucket graphs may then reuse scratch addresses without retaining the
+        # and final output into persistent external buffers. Alternative
+        # bucket graphs may reuse scratch addresses without retaining the
         # sum of every bucket's peak activation footprint.
         self.graph_pool = graph_pool if graph_pool is not None else []
         self.segments: list[Callable[[], object]] = []
@@ -146,49 +145,66 @@ class PiecewiseRuntime:
 
     def dynamic_tensor(
         self,
-        fn: Callable[[torch.Tensor], torch.Tensor],
+        fn: Callable[..., torch.Tensor],
         x,
         *passthrough: torch.Tensor,
+        inputs: tuple[torch.Tensor, ...] = (),
+        output_shape: Optional[tuple[int, ...]] = None,
+        out_fn: Optional[Callable[..., torch.Tensor]] = None,
     ):
-        """Execute a dynamic layer and bridge every live cross-boundary tensor."""
+        """Bridge a dynamic core's inputs, output, and live residuals.
+
+        Additional inputs use separate persistent slots even when their shapes
+        match. ``output_shape`` declares the output dimensions after tokens.
+        ``out_fn(out, *inputs)`` may write directly into the persistent output.
+        """
         if self.warmup:
             # Warm only the graph-resident regions without advancing KV/GDN.
-            output = torch.zeros_like(x)
+            output = (
+                x.new_zeros((x.shape[0], *output_shape))
+                if output_shape is not None
+                else torch.zeros_like(x)
+            )
             return (output, *passthrough) if passthrough else output
         if self.capture is None:
-            output = fn(x[: self.num_tokens])
+            output = fn(
+                x[: self.num_tokens], *(value[: self.num_tokens] for value in inputs)
+            )
             return (output, *passthrough) if passthrough else output
 
         break_index = self._break_index
         self._break_index += 1
-        expected_shape = (self.workspace_tokens, *x.shape[1:])
-        if self.break_input_buffers:
-            input_buffer = self.break_input_buffers[0]
-            if (
-                input_buffer.shape != expected_shape
-                or input_buffer.dtype != x.dtype
-                or input_buffer.device != x.device
-            ):
-                raise RuntimeError(
-                    "piecewise eager-input signature changed across buckets: "
-                    f"break={break_index}, expected={expected_shape}/{x.dtype}/"
-                    f"{x.device}, actual={tuple(input_buffer.shape)}/"
-                    f"{input_buffer.dtype}/{input_buffer.device}"
-                )
-        else:
-            input_buffer = torch.zeros(
-                expected_shape,
-                dtype=x.dtype,
-                device=x.device,
+
+        def bridge_input(value, slot):
+            shape = (self.workspace_tokens, *value.shape[1:])
+            buffer = next(
+                (
+                    buffer
+                    for buffer in self.break_input_buffers
+                    if buffer.shape == shape
+                    and buffer.dtype == value.dtype
+                    and buffer.device == value.device
+                    and getattr(buffer, "_piecewise_input_slot", 0) == slot
+                ),
+                None,
             )
-            self.break_input_buffers.append(input_buffer)
-        boundary_input = input_buffer[: self.bucket]
+            if buffer is None:
+                buffer = value.new_zeros(shape)
+                buffer._piecewise_input_slot = slot
+                self.break_input_buffers.append(buffer)
+            bridged = buffer[: self.bucket]
+            bridged.copy_(value)
+            return bridged
+
+        boundary_input = bridge_input(x, 0)
+        boundary_inputs = tuple(
+            bridge_input(value, index + 1) for index, value in enumerate(inputs)
+        )
         # Make the graph publish its boundary into one persistent address.
         # The eager callable then no longer retains the graph-owned ``x``
         # tensor. Segments sharing this bucket's CUDA graph pool can therefore
         # recycle internal activations instead of keeping one live output per
         # layer and token bucket.
-        boundary_input.copy_(x)
 
         bridged_passthrough = []
         for index, value in enumerate(passthrough):
@@ -224,42 +240,49 @@ class PiecewiseRuntime:
             bridged_passthrough.append(bridged)
 
         # Adjacent boundaries use different buffers; boundary i+2 may safely
-        # reuse boundary i's storage because graph i+1 and its eager call are
+        # reuse boundary i's storage of the same shape because graph i+1 and its eager call are
         # ordered on the same replay stream. This bounds persistent eager
-        # activations at two max-token buffers regardless of layer count.
+        # activations at two max-token buffers per shape, regardless of layer count.
         buffer_slot = break_index % 2
-        if buffer_slot < len(self.break_buffers):
-            output_buffer = self.break_buffers[buffer_slot]
-            if (
-                output_buffer.shape != expected_shape
-                or output_buffer.dtype != x.dtype
-                or output_buffer.device != x.device
-            ):
-                raise RuntimeError(
-                    "piecewise eager-break signature changed across buckets: "
-                    f"break={break_index}, expected={expected_shape}/{x.dtype}/"
-                    f"{x.device}, actual={tuple(output_buffer.shape)}/"
-                    f"{output_buffer.dtype}/{output_buffer.device}"
-                )
-        else:
-            output_buffer = torch.zeros(
-                (self.workspace_tokens, *x.shape[1:]),
-                dtype=x.dtype,
-                device=x.device,
-            )
+        expected_shape = (
+            self.workspace_tokens,
+            *(x.shape[1:] if output_shape is None else output_shape),
+        )
+        output_buffer = next(
+            (
+                buffer
+                for buffer in self.break_buffers
+                if buffer.shape == expected_shape
+                and buffer.dtype == x.dtype
+                and buffer.device == x.device
+                and buffer._piecewise_buffer_slot == buffer_slot
+            ),
+            None,
+        )
+        if output_buffer is None:
+            output_buffer = torch.zeros(expected_shape, dtype=x.dtype, device=x.device)
+            output_buffer._piecewise_buffer_slot = buffer_slot
             self.break_buffers.append(output_buffer)
         output = output_buffer[: self.bucket]
 
         def eager_call():
             n = self.num_tokens
-            value = fn(boundary_input[:n])
+            args = (boundary_input[:n], *(value[:n] for value in boundary_inputs))
+            value = fn(*args) if out_fn is None else out_fn(output[:n], *args)
             if value.shape != output[:n].shape:
                 raise RuntimeError(
-                    "piecewise eager boundary must preserve hidden shape: "
+                    "piecewise eager boundary output signature changed: "
                     f"input={tuple(boundary_input[:n].shape)}, "
                     f"output={tuple(value.shape)}"
                 )
-            output[:n].copy_(value)
+            if out_fn is None:
+                output[:n].copy_(value)
+            elif (
+                value.data_ptr() != output.data_ptr()
+                or value.stride() != output[:n].stride()
+                or value.dtype != output.dtype
+            ):
+                raise RuntimeError("piecewise out_fn must return its output buffer")
             if n < self.bucket:
                 output[n:].zero_()
             return output
@@ -277,13 +300,18 @@ def piecewise_dynamic_tensor(
     fn: Callable[[torch.Tensor], torch.Tensor],
     x,
     *passthrough: torch.Tensor,
+    inputs: tuple[torch.Tensor, ...] = (),
+    output_shape: Optional[tuple[int, ...]] = None,
+    out_fn: Optional[Callable[..., torch.Tensor]] = None,
 ):
     """Layer-side hook; eager outside a piecewise capture."""
     runtime = PiecewiseRuntime.current()
     if runtime is None:
-        output = fn(x)
+        output = fn(x, *inputs)
         return (output, *passthrough) if passthrough else output
-    return runtime.dynamic_tensor(fn, x, *passthrough)
+    return runtime.dynamic_tensor(
+        fn, x, *passthrough, inputs=inputs, output_shape=output_shape, out_fn=out_fn
+    )
 
 
 @dataclass
@@ -350,18 +378,14 @@ class PiecewiseGraphRunner:
         while max_capture_size > interval_start:
             interval_end = min(max_capture_size, interval_start * 2)
             step = interval_start // 4
-            sizes.extend(
-                range(interval_start + step, interval_end + 1, step)
-            )
+            sizes.extend(range(interval_start + step, interval_end + 1, step))
             if sizes[-1] != interval_end:
                 sizes.append(interval_end)
             interval_start *= 2
         return sorted(set(sizes))
 
     def bucket_for(self, num_tokens: int) -> Optional[int]:
-        return next(
-            (size for size in self.capture_sizes if size >= num_tokens), None
-        )
+        return next((size for size in self.capture_sizes if size >= num_tokens), None)
 
     def can_run(self, num_tokens: int) -> bool:
         return self.bucket_for(num_tokens) is not None

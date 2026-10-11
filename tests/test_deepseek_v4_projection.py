@@ -42,7 +42,7 @@ def _load_fp8(linear, weight):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_deepseek_v4_attention_projection_shapes_and_roundtrip():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native block FP8 path requires Blackwell")
+        pytest.skip("native block FP8 backend is unsupported on this device")
     pytest.importorskip("deep_gemm")
 
     torch.manual_seed(37)
@@ -88,7 +88,7 @@ def test_deepseek_v4_attention_projection_shapes_and_roundtrip():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_grouped_wo_a_does_not_mix_output_groups():
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native block FP8 path requires Blackwell")
+        pytest.skip("native block FP8 backend is unsupported on this device")
     pytest.importorskip("deep_gemm")
 
     config = _config()
@@ -120,7 +120,7 @@ def test_grouped_wo_a_reuses_group_views():
     redone every decode step -- measurable, but never an error.
     """
     if torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("native block FP8 path requires Blackwell")
+        pytest.skip("native block FP8 backend is unsupported on this device")
     config = _config()
     projections = DeepseekV4AttentionProjections(config).cuda()
     # Real UE8M0 scales: DeepGEMM's packer asserts (device-side, so it does not

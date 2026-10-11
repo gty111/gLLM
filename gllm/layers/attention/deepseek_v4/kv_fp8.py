@@ -15,8 +15,7 @@ from those values either recovers it exactly (when the group maximum exceeds
 half the E4M3 range) or halves it, in which case every code doubles -- exactly,
 since doubling only changes the exponent -- and the product is unchanged.
 
-Layout, matching vLLM's ``fp8_ds_mla`` so a future native-packed kernel can
-read it directly (584 bytes per token per layer):
+The packed ``fp8_ds_mla`` layout uses 584 bytes per token per layer:
 
     [0    : 448)  NoPE, E4M3 codes
     [448  : 576)  RoPE, BF16 verbatim (never quantized -- it is positional)

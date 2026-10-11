@@ -65,8 +65,8 @@ The scorer is shared with prefill via `_topk_slots` (see §4).
 
 ## 3. Accuracy bugs found during bring-up
 
-V3.2 initially scored ~73 on MMLU-Pro vs vLLM's ~78. Three independent bugs, only
-one DSA-specific:
+Three independent accuracy bugs were found during bring-up; only one was
+DSA-specific:
 
 ### 3.1 MoE double-sigmoid (primary, affects all DeepSeek-V3 models)
 
@@ -118,8 +118,7 @@ block-table width); the real per-seq length is applied via a GPU mask
 memory tiling this required.
 
 **MMLU-Pro trajectory**: 72.86 (baseline) → 77.79 (§3.1–3.3 fixed, bf16 cache) →
-78.64 (+ prefill DSA); vLLM reference 78.29. FP8 KV cache: 77.36 (expected FP8
-quality trade-off).
+78.64 (+ prefill DSA). FP8 KV cache: 77.36 (expected FP8 quality trade-off).
 
 ---
 
@@ -183,8 +182,8 @@ Two shape/memory pitfalls, both from the `[rows, max_L, dim]` key gather:
    prefill batch size.
 
 Head padding: `flash_mla_sparse_fwd` requires the query head count to be a
-multiple of 64 (SM90) / 128 (SM100+). Under TP the per-rank head count is smaller
-(128/8 = 16), so zero-pad the head axis and trim the output (matches SGLang).
+multiple of 64 or 128, depending on the selected kernel. Under TP the per-rank
+head count is smaller (128/8 = 16), so zero-pad the head axis and trim the output.
 
 ---
 
@@ -233,52 +232,25 @@ full-width allocation ever dominates.
 - **FP8 dequant unit test**: `dequant_mla_fp8_slots` matches the full-cache
   dequant on referenced slots to 0.0 abs diff.
 
-### 7.1 gLLM vs vLLM alignment (RULER 4096, full FP8 indexer scoring)
+### 7.1 FP8 indexer validation
 
-Head-to-head against vLLM 0.22 (same DeepSeek-V3.2, tp8, EP, max-len 8192,
-enforce-eager), all runs `num_per_task=20`, concurrency 16:
+RULER 4096 runs use `num_per_task=20` and concurrency 16:
 
-| engine / config                     | RULER 4096         |
-| ------------------------------------ | ------------------ |
-| vLLM (fp8 indexer + UE8M0)           | 96.54 / 96.15 (two runs) |
-| gLLM fp32 scoring                    | 96.15              |
-| gLLM full-fp8 + UE8M0 (Hadamard off) | 95.38 (248/260)    |
-| gLLM full-fp8 + UE8M0 (Hadamard on)  | 94.23 / 95.77 (two runs) |
-| gLLM full-fp8, no UE8M0              | 93.85              |
+| Scoring configuration | RULER 4096 |
+| --- | --- |
+| FP32 | 96.15% |
+| FP8 with UE8M0 | 95.38% (248/260) |
+| FP8 without UE8M0 | 93.85% |
 
-Findings from the alignment deep-dive:
+UE8M0 scales use `exp2(ceil(log2(scale)))`. The scale format must be applied
+consistently to queries and cached keys; a no-op scaling flag changes the
+scoring contract. The historical Hadamard transform was removed because it
+reduced variable-tracking accuracy.
 
-- **Run-to-run nondeterminism dominates the "~1pt gap".** Same server, same
-  greedy config, two runs differ by up to ~1.5pt — all variance in the fuzzy
-  generative tasks (`qa`, `cwe`, `vt`); the exact-match tasks (niah, fwe) are
-  100% on every run and both engines. vLLM itself varies 96.54↔96.15. The cause
-  is batch-composition-dependent floating-point reduction order flipping greedy
-  argmax at tie-break points.
-- **Q and K FP8 quant are bit-exact with vLLM.** vLLM's indexer hard-sets
-  `scale_fmt="ue8m0"` and quantizes q via `per_token_group_quant_fp8(use_ue8m0=True)`
-  and k via `indexer_k_quant_and_cache(scale_fmt="ue8m0")`. Running both engines'
-  kernels on identical input: q scale identical (0.250000), **k fp8 bytes 100.00%
-  identical (25600/25600, zero off-by-1 ulp)**. UE8M0 formula
-  `exp2(ceil(log2(scale)))` is character-identical on both sides.
-- **UE8M0 matters, and gLLM matches vLLM's use of it.** Enabling UE8M0 lifted
-  gLLM full-fp8 from 93.85 → 95.38. (A `sgl_kernel==0.3.21` build was found to have
-  a no-op `scale_ue8m0` flag — that is a build bug, not the reference semantics.)
-- **The historical Hadamard experiment was net-negative and has been removed.**
-  gLLM tested a transform on q/k before fp8 quant; vLLM does not use it.
-  Per-question diffing showed the only task systematically lost was `vt` (variable
-  tracking): 15/20 with Hadamard vs 19/20 without, matching vLLM's 20/20. Logprob
-  analysis: Hadamard flattens the output distribution at the answer's opening
-  greedy tie-break, so the model takes a different narrative path and drops a
-  variable from the long answer. Removing it recovered all 5 lost `vt` questions
-  and moved logprobs toward vLLM (identical top-3 at the first generated token,
-  Δlp≈0.008). See §9.
-- **chat template is identical**: the model ships a standalone `chat_template.jinja`
-  (not in `tokenizer_config.json`); both engines load it and render token-identical
-  `input_ids`, so the prompt is not a variable.
-- **Single-request determinism**: gLLM in steady state is bit-deterministic across
-  repeated single requests (logprob spread 0.0); vLLM is NOT (spread up to ~1.08,
-  token sequence diverges by pos 13) — so per-token logprob equality between the
-  two is not achievable regardless, but the distributions align.
+Batch composition can change floating-point reduction order and flip greedy
+argmax near ties. Generative tasks can therefore vary between runs, while
+exact-match retrieval tasks remain stable. The model's standalone
+`chat_template.jinja` supplies the prompt format.
 
 RULER eval client: `benchmarks/evaluate_ruler.py` (buckets 4096/8192/16384).
 
@@ -302,8 +274,8 @@ DSA (decode + prefill) is always on for V3.2; it is a no-op for prompts ≤
 ## 9. FP8 indexer scoring (always on)
 
 The indexer always scores through the FP8 path. It is 10-50× faster at long
-context and was verified against the fp32 selector and vLLM's quantization
-layout (§7.1). There is no runtime environment-variable switch.
+context and was verified against the FP32 selector and the UE8M0 scale
+contract (§7.1). There is no runtime environment-variable switch.
 
 - **prefill** (`_select_topk_prefill_fp8`): reads the fp32 index-K cache, applies
   e4m3 + per-token quantization directly to q and k, then scores with
@@ -322,8 +294,8 @@ Key correctness rules (both learned the hard way):
   pointer, not `.to(uint8)` (which truncates the fp8 value to an integer).
 
 **Accuracy (RULER 4096, retrieval):** fp32 96.15% · current full-fp8 + UE8M0
-95.38% (248/260) · full-fp8 without UE8M0 93.85%. vLLM reference 96.15–96.54%.
-UE8M0 is required for alignment. See §7.1 for the full comparison.
+95.38% (248/260) · full-fp8 without UE8M0 93.85%.
+UE8M0 is required by the quantization contract. See §7.1 for validation details.
 
 ## 10. Known limitations / follow-ups
 

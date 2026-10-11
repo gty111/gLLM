@@ -128,10 +128,16 @@ def _partition_query_start_loc(
     rebuild identical chunk metadata. Attach the equivalently rebased CPU
     boundaries to the derived tensor so the metadata paths avoid that sync.
     """
+    partitions = getattr(query_start_loc, "_partitions", None)
+    if partitions is not None and row_start in partitions:
+        return partitions[row_start]
     partition = query_start_loc[row_start:] - query_start_loc[row_start]
     if query_start_loc_cpu is not None:
         cpu_partition = query_start_loc_cpu[row_start:]
         partition._cpu_view = cpu_partition - cpu_partition[0]
+    if partitions is not None:
+        partition._fla_metadata = {}
+        partitions[row_start] = partition
     return partition
 
 
@@ -299,6 +305,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             norm_before_gate=True,
         )
 
+        from gllm.layers.ops.fla.prefill import (
+            PrefillInputWorkspace,
+            supports_flashinfer_prefill,
+        )
+
+        self._use_flashinfer_prefill = supports_flashinfer_prefill(
+            self.head_k_dim, self.head_v_dim
+        )
+        self._prefill_input_workspace = PrefillInputWorkspace()
+
         self.out_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
@@ -360,6 +376,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         indices, avoiding a synchronizing ``nonzero`` and repeated index/cast
         kernels for identical metadata in every layer.
         """
+        if getattr(input_data, "max_query_len", 0) == 1:
+            from gllm.layers.ops.state_snapshot import copy_slot_snapshots
+
+            sources = input_data.get_recurrent_state_slot_per_seq()[row_start:]
+            targets = input_data.get_ssm_snapshot_write_slot_per_seq()[row_start:]
+            copy_slot_snapshots(conv_state_working, sources, targets)
+            copy_slot_snapshots(ssm_state_working, sources, targets)
+            input_data.mark_ssm_snapshot_writes_enqueued()
+            return
         copy_indices = input_data.get_ssm_snapshot_copy_indices(row_start)
         if copy_indices is None:
             return
@@ -371,12 +396,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # ``ssm_state_working`` are ``seg.conv_state[ssm_layer_id]`` /
         # ``seg.temporal_state[ssm_layer_id]``). ``src_idx`` (live rolling entry)
         # and ``dst_idx`` (cached entry) have distinct live ownership -> no alias.
-        conv_state_working.index_copy_(
-            0, dst_idx, conv_state_working.index_select(0, src_idx)
-        )
-        ssm_state_working.index_copy_(
-            0, dst_idx, ssm_state_working.index_select(0, src_idx)
-        )
+        from gllm.layers.ops.state_snapshot import copy_slot_snapshots
+
+        copy_slot_snapshots(conv_state_working, src_idx, dst_idx)
+        copy_slot_snapshots(ssm_state_working, src_idx, dst_idx)
         # CPU metadata for overlap batches is speculative. Make the snapshot
         # visible to prefix lookup only after the actual device copies have
         # been enqueued. The worker cannot schedule the next batch until this
@@ -523,6 +546,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         has_initial_state: torch.Tensor,
         query_start_loc: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
+        *,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run ordinary ragged prefill for one contiguous request partition."""
         seq_len = mixed_qkv.shape[0]
@@ -551,6 +576,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         kd = kd.view(1, seq_len, self.tp_num_k_heads, self.head_k_dim)
         vd = vd.view(1, seq_len, self.tp_num_v_heads, self.head_v_dim)
 
+        if self._use_flashinfer_prefill and qd.dtype in (torch.bfloat16, torch.float16):
+            from gllm.layers.ops.fla.prefill import flashinfer_prefill
+
+            return flashinfer_prefill(
+                qd,
+                kd,
+                vd,
+                None,
+                None,
+                ssm_state,
+                cache_indices,
+                query_start_loc,
+                self._scale,
+                out=out,
+                gate_inputs=(a, b, self.A_log, self.dt_bias),
+                workspace=self._prefill_input_workspace,
+            ).reshape(seq_len, self.tp_num_v_heads, self.head_v_dim)
         g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
             q=qd,
@@ -569,9 +611,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ssm_state[cache_indices] = last_recurrent_state.to(
                 ssm_state.dtype, copy=False
             )
-        return core_attn_out.reshape(
+        core_attn_out = core_attn_out.reshape(
             seq_len, self.tp_num_v_heads, self.head_v_dim
         )
+        if out is not None:
+            out.copy_(core_attn_out)
+            return out
+        return core_attn_out
 
     def _forward_decode_rows(
         self,
@@ -583,6 +629,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_weights: torch.Tensor,
         conv_bias,
         cache_indices: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the exact one-token decode path for a contiguous row prefix.
 
@@ -601,10 +649,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             conv_state_indices=cache_indices,
         )
         batch_size = mixed_qkv.shape[0]
-        out = torch.empty(
-            (batch_size, 1, self.tp_num_v_heads, self.head_v_dim),
-            dtype=mixed_qkv.dtype,
-            device=mixed_qkv.device,
+        out = (
+            out.view(batch_size, 1, self.tp_num_v_heads, self.head_v_dim)
+            if out is not None
+            else torch.empty(
+                (batch_size, 1, self.tp_num_v_heads, self.head_v_dim),
+                dtype=mixed_qkv.dtype,
+                device=mixed_qkv.device,
+            )
         )
         core_attn_out, _ = fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv,
@@ -622,29 +674,42 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             batch_size, self.tp_num_v_heads, self.head_v_dim
         ), mixed_qkv
 
-
-    def forward(self, input_data: InputData, hidden_states: torch.Tensor):
-        # Profile-run path (no allocated cache). Cheap, prevents crashes
-        # during ``MemoryManager.profile``.
-        if not hasattr(input_data.memory_manager, "ssm_segment") or \
-                input_data.memory_manager.ssm_segment is None:
-            return torch.zeros_like(hidden_states)
-
+    def _project(self, hidden_states):
         qkvz = self.in_proj_qkvz(hidden_states)
         ba = self.in_proj_ba(hidden_states)
-        q, k, v, z, b, a = self._split_qkvzba(qkvz, ba)
-
-        seq_len = hidden_states.shape[0]
-        # ``in_proj_qkvz`` already lays out Q, K and V as one adjacent prefix.
-        # Keep that strided view instead of materializing the same bytes with a
-        # per-layer ``cat``.  All causal-conv paths consume explicit strides
-        # and produce their own contiguous output, so the trailing Z columns
-        # in the projection's physical row stride are harmless.
+        _, _, _, z, b, a = self._split_qkvzba(qkvz, ba)
         qkv_width = (
             2 * (self.key_dim // get_tp_size())
             + self.value_dim // get_tp_size()
         )
-        mixed_qkv = qkvz[:, :qkv_width]
+        return qkvz[:, :qkv_width], a, b, z
+
+    def forward(self, input_data: InputData, hidden_states: torch.Tensor):
+        if getattr(input_data.memory_manager, "ssm_segment", None) is None:
+            return torch.zeros_like(hidden_states)
+        mixed_qkv, a, b, z = self._project(hidden_states)
+        core = self._forward_core(input_data, mixed_qkv, a, b)
+        return self._finish(core, z)
+
+    def forward_piecewise(self, input_data, hidden_states, *passthrough):
+        mixed_qkv, a, b, z = self._project(hidden_states)
+        core, *bridged = piecewise_dynamic_tensor(
+            lambda qkv, gate_a, gate_b: self._forward_core(
+                input_data, qkv, gate_a, gate_b
+            ),
+            mixed_qkv,
+            *passthrough,
+            z,
+            inputs=(a, b),
+            output_shape=(self.tp_num_v_heads, self.head_v_dim),
+            out_fn=lambda out, qkv, gate_a, gate_b: self._forward_core(
+                input_data, qkv, gate_a, gate_b, out=out
+            ),
+        )
+        return self._finish(core, bridged[-1]), *bridged[:-1]
+
+    def _forward_core(self, input_data, mixed_qkv, a, b, *, out=None):
+        seq_len = mixed_qkv.shape[0]
         conv_state, ssm_state = self._ssm_state_tensors(input_data)
         cache_indices = input_data.get_recurrent_state_slot_per_seq()
         has_initial_state = input_data.get_has_initial_state_per_seq()
@@ -684,6 +749,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 conv_bias,
                 cache_indices[:num_mtp_rows],
             )
+            if out is not None:
+                out[:num_mtp_tokens].copy_(core_mtp)
             if num_mtp_tokens < seq_len:
                 prefill_qsl = _partition_query_start_loc(
                     query_start_loc,
@@ -705,8 +772,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     has_initial_state[num_mtp_rows:],
                     prefill_qsl,
                     seq_lens_cpu,
+                    out=out[num_mtp_tokens:] if out is not None else None,
                 )
-                core_attn_out = torch.cat((core_mtp, core_prefill), dim=0)
+                core_attn_out = (
+                    out
+                    if out is not None
+                    else torch.cat((core_mtp, core_prefill), dim=0)
+                )
                 self._maybe_snapshot_state(
                     input_data,
                     conv_state,
@@ -714,7 +786,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     row_start=num_mtp_rows,
                 )
             else:
-                core_attn_out = core_mtp
+                core_attn_out = out if out is not None else core_mtp
         elif (
             int(getattr(input_data, "num_decodes", 0)) > 0
             and int(getattr(input_data, "num_prefills", 0)) > 0
@@ -735,6 +807,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 conv_weights,
                 conv_bias,
                 cache_indices[:num_decode_rows],
+                out=out[:num_decode_tokens] if out is not None else None,
             )
             prefill_qsl = _partition_query_start_loc(
                 query_start_loc,
@@ -756,8 +829,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 has_initial_state[num_decode_rows:],
                 prefill_qsl,
                 seq_lens_cpu,
+                out=out[num_decode_tokens:] if out is not None else None,
             )
-            core_attn_out = torch.cat((core_decode, core_prefill), dim=0)
+            core_attn_out = (
+                out
+                if out is not None
+                else torch.cat((core_decode, core_prefill), dim=0)
+            )
             self._maybe_snapshot_state(
                 input_data,
                 conv_state,
@@ -778,6 +856,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 conv_weights,
                 conv_bias,
                 cache_indices,
+                out=out,
             )
         else:
             # Prefill: causal_conv1d over the packed varlen sequence, then
@@ -795,6 +874,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 has_initial_state,
                 query_start_loc,
                 getattr(input_data, "seq_lens_cpu", None),
+                out=out,
             )
             # Persist the just-computed state into a snapshot arena
             # entry for seqs whose chunk ended on an eligible page boundary.
@@ -805,6 +885,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # don't pay anything beyond a cheap mask check.
             self._maybe_snapshot_state(input_data, conv_state, ssm_state)
 
+        return core_attn_out
+
+    def _finish(self, core_attn_out, z):
         z_shape = z.shape
         if core_attn_out.shape != z.shape:
             pad = torch.zeros_like(z)
@@ -1125,6 +1208,9 @@ class Qwen3_5Model(nn.Module):
                 )
                 kv_counter += 1
         self.layers = nn.ModuleList(layers)
+        from gllm.layers.ops.fla.prefill import share_prefill_input_workspace
+
+        share_prefill_input_workspace(self.layers)
         # Whether the last layer handed its mlp output on un-reduced; the tail
         # (final norm, or the PP hand-off) has to account for it.
         self._fuse_tail = link_fused_reduces(self.layers)
@@ -1170,9 +1256,7 @@ class Qwen3_5Model(nn.Module):
             if self._fuse_tail:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             return hidden_states, residual
-        # The MTP head consumes this POST-norm output, matching vLLM
-        # (``target_hidden_states = hidden_states``) and sglang
-        # (``spec_info.hidden_states``); the pre-norm residual is not it.
+        # The MTP head consumes the post-norm output.
         hidden_states, _ = maybe_fused_norm(
             hidden_states, residual, self.norm, self._fuse_tail
         )

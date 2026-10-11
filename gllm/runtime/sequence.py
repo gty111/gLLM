@@ -73,7 +73,9 @@ class GenerationSequence:
         self.cur_length = self.prompt_len
         self.temperature = temperature
         self.top_p = top_p
-        self.top_k = top_k
+        # Normalize once so ordinary and speculative sampling agree: zero
+        # temperature requests are greedy regardless of model sampling defaults.
+        self.top_k = 1 if temperature == 0 else top_k
         self.repetition_penalty = repetition_penalty
         # Per-token logprobs (OpenAI ``logprobs``). ``logprobs_enabled`` turns
         # the (gated) log_softmax + top-k on for this seq; ``num_top_logprobs``

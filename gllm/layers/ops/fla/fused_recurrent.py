@@ -811,9 +811,8 @@ def fused_recurrent_gdn_spec(
         SOFTPLUS_THRESHOLD=20.0,
         INPLACE_FINAL_STATE=True,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        # Keep the four-warp reduction tree used by ordinary decode. A one-warp
-        # launch is faster in isolation on GB200 but changes recurrent FP32
-        # rounding, which can compound over a long generation.
+        # Keep ordinary decode's four-warp reduction tree: changing it alters
+        # recurrent FP32 rounding, which can compound over a long generation.
         num_warps=4,
         num_stages=3,
     )

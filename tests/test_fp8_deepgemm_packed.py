@@ -1,6 +1,6 @@
-"""DeepGEMM's Blackwell packed-UE8M0 block-FP8 path.
+"""DeepGEMM's packed-UE8M0 block-FP8 path.
 
-On SM100 ``fp8_gemm_nt`` runs the ``gemm_1d1d`` kernel, which needs per-row
+The packed ``fp8_gemm_nt`` path uses ``gemm_1d1d``, which needs per-row
 scales packed four to an int32. These tests pin the two things that would
 otherwise fail silently: that the packed path agrees numerically with the
 Triton fallback, and that the derived weight scales are built once rather than

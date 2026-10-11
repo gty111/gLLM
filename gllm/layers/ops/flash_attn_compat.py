@@ -113,7 +113,7 @@ def flash_attn_varlen_func(
             q.shape[-1] != value_dim
             and torch.cuda.get_device_capability(q.device)[0] == 8
         ):
-            # Ampere/Ada kernels require equal QK/V dimensions. Zero padding
+            # This kernel requires equal QK/V dimensions. Zero padding
             # preserves attention scores, using the original softmax scale.
             head_dim = max(q.shape[-1], value_dim)
             q = torch.nn.functional.pad(q, (0, head_dim - q.shape[-1]))
@@ -190,7 +190,7 @@ def flash_attn_varlen_func(
         )
     else:
         # FlashInfer FA2 uses tiled head dimensions. An irregular vision width
-        # such as Qwen3-VL's 72 compiles but produces incorrect results on SM80.
+        # such as Qwen3-VL's 72 can compile while producing incorrect results.
         # Pad to a supported multiple of 64, preserving the original QK scale.
         value_dim = v.shape[-1]
         qk_dim = ((q.shape[-1] + 63) // 64) * 64

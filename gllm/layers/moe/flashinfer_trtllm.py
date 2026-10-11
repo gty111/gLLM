@@ -4,9 +4,111 @@ from typing import Optional
 
 import torch
 
-
 _EPILOGUE_TILE_M = 128
 _BLOCK_K = 128
+
+
+def fp8_moe_support_reason(layer, block_shape, use_ue8m0=False):
+    """Conservative dispatch for FP32-scaled 128x128 FP8 SwiGLU experts."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        return "TRT-LLM FP8 MoE is unsupported on this device"
+    try:
+        from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+    except (ImportError, AttributeError) as exc:
+        return f"FlashInfer TRT-LLM FP8 MoE is unavailable: {exc}"
+    if not callable(trtllm_fp8_block_scale_moe):
+        return "TRT-LLM FP8 MoE entrypoint is not callable"
+    if getattr(layer, "params_dtype", torch.bfloat16) != torch.bfloat16:
+        return "requires BF16 hidden states"
+    if tuple(block_shape) != (128, 128) or use_ue8m0:
+        return "requires 128x128 blocks with FP32 scales"
+    if any(w.dtype != torch.float8_e4m3fn for w in (layer.w13_weight, layer.w2_weight)):
+        return "requires E4M3 expert weights"
+    if any(
+        s.dtype != torch.float32
+        for s in (layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+    ):
+        return "requires FP32 expert scales"
+    if not (0 < layer.global_num_experts <= 512 and layer.global_num_experts % 4 == 0):
+        return "requires up to 512 experts, divisible by four"
+    if not 0 < layer.top_k <= 32 and layer.top_k < layer.global_num_experts:
+        return "unsupported routing top-k"
+    if layer.activation != "silu" or layer.apply_router_weight_on_input:
+        return "requires output-weighted SwiGLU"
+    if layer.scoring_func != "softmax" or not layer.renormalize:
+        return "requires renormalized softmax routing"
+    if layer.use_grouped_topk or layer.e_score_correction_bias is not None:
+        return "grouped or biased routing is unsupported by this dispatch"
+    if layer.w13_weight.shape[-1] % 128 or layer.intermediate_size_per_partition % 128:
+        return "expert dimensions must be aligned to 128"
+    return None
+
+
+def convert_fp8_moe_weights(w13, w2, w13_scale, w2_scale):
+    """Swap gate/up and shuffle to BlockMajorK without rounding FP32 scales.
+
+    Source reference: vLLM's prepare_fp8_moe_layer_for_fi (Apache-2.0).
+    The batched gather avoids a per-expert launch during model loading.
+    """
+    from flashinfer.utils import get_shuffle_matrix_a_row_indices
+
+    def convert(weight, swap=False):
+        experts, rows, columns = weight.shape
+        indices = get_shuffle_matrix_a_row_indices(weight[0].view(torch.uint8), 64).to(
+            weight.device
+        )
+        if swap:
+            indices = (indices + rows // 2) % rows
+        blocked = weight.view(torch.uint8).view(experts, rows, columns // 128, 128)
+        return (
+            blocked.permute(0, 2, 1, 3)[:, :, indices, :]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+        )
+
+    half = w13_scale.shape[1] // 2
+    scales = torch.cat((w13_scale[:, half:], w13_scale[:, :half]), dim=1)
+    return convert(w13, True), convert(w2), scales, w2_scale
+
+
+def trtllm_fp8_moe(layer, hidden_states, router_logits):
+    from flashinfer import RoutingMethodType
+    from flashinfer.fused_moe import (
+        Fp8QuantizationType,
+        WeightLayout,
+        trtllm_fp8_block_scale_moe,
+    )
+
+    from gllm.layers.quantization.fp8 import per_token_group_quant_fp8
+
+    quantized, scales = per_token_group_quant_fp8(
+        hidden_states, 128, column_major_scales=True
+    )
+    output = torch.empty_like(hidden_states)
+    result = trtllm_fp8_block_scale_moe(
+        routing_logits=router_logits,
+        routing_bias=None,
+        hidden_states=quantized,
+        hidden_states_scale=scales.t(),
+        gemm1_weights=layer.w13_weight,
+        gemm1_weights_scale=layer.w13_weight_scale_inv,
+        gemm2_weights=layer.w2_weight,
+        gemm2_weights_scale=layer.w2_weight_scale_inv,
+        num_experts=layer.global_num_experts,
+        top_k=layer.top_k,
+        n_group=0,
+        topk_group=0,
+        intermediate_size=layer.intermediate_size_per_partition,
+        local_expert_offset=layer.ep_rank * layer.local_num_experts,
+        local_num_experts=layer.local_num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.RenormalizeNaive,
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.BlockMajorK,
+        fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+        output=output,
+    )
+    return result[0] if isinstance(result, (tuple, list)) else result
 
 
 def bf16_moe_support_reason(layer: torch.nn.Module) -> Optional[str]:
@@ -14,7 +116,7 @@ def bf16_moe_support_reason(layer: torch.nn.Module) -> Optional[str]:
     if not torch.cuda.is_available():
         return "CUDA is unavailable"
     if torch.cuda.get_device_capability()[0] != 10:
-        return "TRT-LLM BF16 MoE requires an SM100-family GPU"
+        return "TRT-LLM BF16 MoE is unsupported on this device"
     try:
         from flashinfer.fused_moe import trtllm_bf16_moe
     except (ImportError, AttributeError) as exc:
@@ -82,9 +184,11 @@ def convert_bf16_moe_weights(
         row_indices: torch.Tensor,
     ) -> None:
         rows = expert.shape[0]
-        source = expert.view(torch.uint8).view(
-            rows, output.shape[0], _BLOCK_K
-        ).permute(1, 0, 2)
+        source = (
+            expert.view(torch.uint8)
+            .view(rows, output.shape[0], _BLOCK_K)
+            .permute(1, 0, 2)
+        )
         torch.index_select(
             source,
             1,
