@@ -761,31 +761,6 @@ class InputData:
     def get_tokens(self):
         return self.tokens[: self.tokens_cpu.shape[0]]
 
-    def get_ngram_context(self, length: int, eos_token_id: int):
-        """Predecessor tokens for each packed request, using frozen positions.
-
-        Scheduler counters may have advanced during overlap; the materialized
-        CPU logical positions identify the exact prefix for this forward.
-        Returned histories are oldest-to-newest and left-padded with EOS.
-        """
-        if length <= 0:
-            raise ValueError("Ngram context length must be positive")
-        boundaries = self.query_start_loc_cpu.tolist()
-        context = []
-        for row, start in enumerate(boundaries[:-1]):
-            if start == boundaries[row + 1]:
-                context.append([eos_token_id] * length)
-                continue
-            position = int(self.positions_cpu[start])
-            previous = self.seqs[row].token_ids[max(0, position - length) : position]
-            if len(previous) != min(length, position):
-                raise ValueError(
-                    "Request token history does not cover the ngram prefix"
-                )
-            context.append([eos_token_id] * (length - len(previous)) + previous)
-        return torch.tensor(context, dtype=torch.long, device=self.tokens.device)
-
-
     def _cal_position(self, seqs: List[GenerationSequence]):
         # Position ids are just consecutive integers per seq, so we write
         # them straight into a pinned tensor via its numpy view instead of

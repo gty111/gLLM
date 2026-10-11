@@ -1,5 +1,6 @@
 """TRTLLM FP8 MoE: expert-parallel routing, numerics and graph replay."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -8,9 +9,35 @@ import torch
 from gllm.layers.moe.flashinfer_trtllm import fp8_moe_support_reason
 from gllm.layers.moe.fused_moe_triton.layer import Fp8MoEMethod
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+@pytest.mark.parametrize(
+    "top_k,experts,supported",
+    [(1, 8, True), (7, 8, True), (0, 8, False), (8, 8, False),
+     (9, 8, False), (33, 32, False), (32, 512, True), (33, 512, False)],
+)
+def test_fp8_moe_dispatch_checks_routing_bounds(monkeypatch, top_k, experts, supported):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setitem(
+        sys.modules, "flashinfer.fused_moe",
+        SimpleNamespace(trtllm_fp8_block_scale_moe=lambda **kwargs: None),
+    )
+    weight = torch.zeros(1, 256, 128, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(1, 2, 1)
+    layer = SimpleNamespace(
+        w13_weight=weight, w2_weight=weight,
+        w13_weight_scale_inv=scale, w2_weight_scale_inv=scale,
+        global_num_experts=experts, top_k=top_k,
+        params_dtype=torch.bfloat16, activation="silu",
+        apply_router_weight_on_input=False, scoring_func="softmax",
+        renormalize=True, use_grouped_topk=False,
+        e_score_correction_bias=None, intermediate_size_per_partition=128,
+    )
+    reason = fp8_moe_support_reason(layer, [128, 128])
+    assert reason == (None if supported else "unsupported routing top-k")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "rows,experts,local,hidden,intermediate",
     [(1, 8, 4, 256, 256), (32, 512, 128, 2560, 640), (128, 512, 128, 2560, 640)],

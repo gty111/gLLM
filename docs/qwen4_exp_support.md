@@ -140,7 +140,8 @@ Kernel tests cover FP64 projection references, low-norm inputs, strided tensors,
 workspace growth, offsets above 2^31 elements, deterministic top-k ties and
 snapshot copies. Delayed-stream tests exercise staging reuse, cohort
 reorder/compaction, prefill relay admission and boundary patches. The latest
-staging/kernel validation passed 153 tests.
+CUDA-enabled validation passed 254 tests; one optional full-checkpoint test
+was skipped. Routing bounds and decoders without PLE layers are covered too.
 
 The latest 1400-question MMLU-Pro regression used concurrency 32, greedy
 decoding, no thinking and a 1024-token output cap. MTP k=3 scored 1091/1400

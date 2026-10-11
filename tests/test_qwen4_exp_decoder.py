@@ -2,7 +2,6 @@
 
 import json
 from copy import deepcopy
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -248,15 +247,6 @@ def test_native_config_preserves_nested_fields(tmp_path):
     assert config.text_config.dtype == torch.bfloat16
 
 
-def test_ngram_context_uses_materialized_positions_after_scheduler_advance():
-    data = InputData.__new__(InputData)
-    data.tokens = torch.tensor([7, 8])
-    data.positions_cpu = torch.tensor([3, 4])
-    data.query_start_loc_cpu = torch.tensor([0, 2])
-    data.seqs = [SimpleNamespace(token_ids=[1, 2, 3, 7, 8], computed_token_num=5)]
-    assert data.get_ngram_context(2, 31).tolist() == [[2, 3]]
-
-
 def test_auxiliary_state_snapshot_restore_commit_and_free(tiny_model):
     model, _ = tiny_model
     manager, _ = make_inputs(model)
@@ -277,6 +267,7 @@ def test_auxiliary_state_snapshot_restore_commit_and_free(tiny_model):
     assert not state[snapshot].any()
 
 
+@pytest.mark.parametrize("tiny_model", [{}, {"ple_layer_ids": []}], indirect=True)
 def test_decoder_full_chunked_prefill_and_decode_logits_match(tiny_model):
     model, _ = tiny_model
     tokens = [2, 5, 7, 11, 13, 31, 17, 19, 23, 29, 3, 9, 12, 15, 21, 22, 24]

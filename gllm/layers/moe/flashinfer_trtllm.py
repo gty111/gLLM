@@ -32,7 +32,7 @@ def fp8_moe_support_reason(layer, block_shape, use_ue8m0=False):
         return "requires FP32 expert scales"
     if not (0 < layer.global_num_experts <= 512 and layer.global_num_experts % 4 == 0):
         return "requires up to 512 experts, divisible by four"
-    if not 0 < layer.top_k <= 32 and layer.top_k < layer.global_num_experts:
+    if not (0 < layer.top_k <= 32 and layer.top_k < layer.global_num_experts):
         return "unsupported routing top-k"
     if layer.activation != "silu" or layer.apply_router_weight_on_input:
         return "requires output-weighted SwiGLU"

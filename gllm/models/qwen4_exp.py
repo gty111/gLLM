@@ -541,6 +541,8 @@ class Qwen4ExpModel(nn.Module):
         return hidden
 
     def _finish_states(self, input_data, streams):
+        if not self.parsed.ple_layer_ids:
+            return streams
         segment = input_data.memory_manager.ssm_segment
         slots, context = _ple_context(input_data, self.parsed)
         # Snapshot all PLE histories alongside the GDN states. Their slot is
