@@ -6,14 +6,19 @@ import torch
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 from gllm.runtime.cache_arena import CacheArena
 from gllm.runtime.memory_manager import (
+    DSparkKVCacheConfig,
+    DSparkRequestCache,
     DeepseekV4KVCacheConfig,
     DeepseekV4StateCacheConfig,
     DeepseekV4StateSegment,
     MemoryManager,
+    PrefixSegment,
     SSMSegment,
     SSMCacheConfig,
     Segment,
 )
+
+from gllm.runtime.sequence import GenerationSequence
 
 
 def _arena_for(layout, slots=12):
@@ -50,6 +55,285 @@ def test_explicit_kv_segment_uses_registered_cache_only():
     assert torch.all(cache.tensor("key")[page, 1] == 2)
     assert torch.all(cache.tensor("value")[page, 1] == 3)
     segment.free(page)
+
+
+def test_dspark_kv_layout_uses_draft_geometry():
+    cfg = DSparkKVCacheConfig(num_layers=5, kv_head_num=8, kv_head_dim=128)
+    manager = MemoryManager(
+        0.9, 16, torch.float32, 16, 4, 256, 32,
+        dspark_kv_cache_config=cfg,
+    )
+    layout = manager._dspark_kv_cache_layout()
+
+    assert layout.name == "dspark_kv_cache"
+    assert tuple(bank.name for bank in layout.tensors) == ("key", "value")
+    assert all(bank.shape == (5, 16, 8, 128) for bank in layout.tensors)
+    assert all(bank.dtype == torch.bfloat16 for bank in layout.tensors)
+    assert layout.entry_bytes == 2 * 5 * 16 * 8 * 128 * 2
+
+
+def test_dspark_segment_shares_arena_without_aliasing_live_target_pages():
+    cfg = DSparkKVCacheConfig(num_layers=2, kv_head_num=2, kv_head_dim=8)
+    manager = MemoryManager(
+        0.9, 1, torch.bfloat16, 4, 1, 8, 32,
+        dspark_kv_cache_config=cfg,
+    )
+    target_layout = manager._kv_cache_layout()
+    arena, target_cache = _arena_for(target_layout, slots=24)
+    target = Segment(1, 4, 1, 8, False, target_cache)
+    draft_cache = arena.register_cache(manager._dspark_kv_cache_layout())
+    draft = Segment(2, 4, 2, 8, False, draft_cache)
+
+    target_page = target.allocate()
+    draft_page = draft.allocate()
+    assert target_page is not None and draft_page is not None
+    target.k_cache[0][target_page].fill_(11)
+    target.v_cache[0][target_page].fill_(13)
+    for layer in range(2):
+        draft.k_cache[layer][draft_page].fill_(layer + 2)
+        draft.v_cache[layer][draft_page].fill_(layer + 5)
+        assert draft.k_cache[layer].untyped_storage().data_ptr() == (
+            arena.backing.untyped_storage().data_ptr()
+        )
+        assert torch.all(draft_cache.tensor("key")[draft_page, layer] == layer + 2)
+        assert torch.all(draft_cache.tensor("value")[draft_page, layer] == layer + 5)
+    assert torch.all(target.k_cache[0][target_page] == 11)
+    assert torch.all(target.v_cache[0][target_page] == 13)
+    assert draft.k_cache[0].stride(0) == (
+        draft_cache.cache_type.pages_per_slot * arena.physical_page_bytes // 2
+    )
+    assert draft.k_cache[0].stride(0) > draft.k_cache[0][0].numel()
+    draft.free(draft_page)
+    target.free(target_page)
+    assert target.get_num_free_pages() == 24
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("enabled", [False, True])
+def test_memory_manager_registers_dspark_cache_only_when_configured(monkeypatch, enabled):
+    cfg = DSparkKVCacheConfig(num_layers=2, kv_head_num=2, kv_head_dim=8)
+    manager = MemoryManager(
+        1.0, 1, torch.bfloat16, 4, 1, 8, 32,
+        dspark_kv_cache_config=cfg if enabled else None,
+    )
+    budget = 24 * manager._kv_cache_layout().entry_bytes
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (budget, budget))
+    manager.init()
+
+    assert manager.cache_arena.backing.numel() == budget
+    assert manager.segment.get_num_free_pages() == 24
+    if not enabled:
+        assert manager.dspark_segment is None
+        assert manager.cache_arena.allocator.cache_type_names == ("kv_cache",)
+        return
+    draft = manager.dspark_segment
+    cache = manager.cache_arena.cache("dspark_kv_cache")
+    assert draft.k_cache[0].shape == (cache.num_slots, 4, 2, 8)
+    assert draft.k_cache[0].untyped_storage().data_ptr() == (
+        manager.cache_arena.backing.untyped_storage().data_ptr()
+    )
+    assert not cache.cache_type.live_slots
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_history_attention_reads_arena_stride():
+    torch.manual_seed(0)
+    cfg = DSparkKVCacheConfig(num_layers=5, kv_head_num=8, kv_head_dim=128)
+    manager = MemoryManager(
+        0.9, 1, torch.bfloat16, 16, 1, 128, 32,
+        dspark_kv_cache_config=cfg,
+    )
+    target_layout = manager._kv_cache_layout()
+    draft_layout = manager._dspark_kv_cache_layout()
+    physical_pages = 4 * (
+        (draft_layout.entry_bytes + target_layout.entry_bytes - 1)
+        // target_layout.entry_bytes
+    )
+    arena = CacheArena(
+        torch.empty(
+            physical_pages * target_layout.entry_bytes,
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        physical_page_bytes=target_layout.entry_bytes,
+    )
+    cache = arena.register_cache(draft_layout)
+    draft = Segment(5, 16, 8, 128, False, cache)
+    pages = arena.allocator.allocate(cache.name, 3)
+    assert pages is not None
+    # Reverse two allocated slots to exercise the logical page table.
+    page_ids = [pages[2], pages[0]]
+    key, value = draft.k_cache[2], draft.v_cache[2]
+    for page in page_ids:
+        key[page].normal_()
+        value[page].normal_()
+    q = torch.randn(7, 32, 128, device="cuda", dtype=torch.bfloat16)
+    block_table = torch.tensor(
+        [page_ids] * 7, device="cuda", dtype=torch.int32
+    )
+    seq_lens = torch.full((7,), 21, device="cuda", dtype=torch.int32)
+    output = torch.empty_like(q)
+    lse = torch.empty(7, 32, device="cuda", dtype=torch.float32)
+    logits = torch.empty(7, 32, 4, 129, device="cuda", dtype=torch.float32)
+    decode_attention_fwd(
+        q, key, value, output, lse, block_table, seq_lens, logits,
+        4, 128**-0.5, 16,
+    )
+
+    # A short dense oracle is test-only; serving reads the strided pages directly.
+    history_k = key[page_ids].reshape(-1, 8, 128)[:21].repeat_interleave(4, dim=1)
+    history_v = value[page_ids].reshape(-1, 8, 128)[:21].repeat_interleave(4, dim=1)
+    scores = torch.einsum("qhd,shd->qhs", q.float(), history_k.float()) * 128**-0.5
+    expected = torch.einsum(
+        "qhs,shd->qhd", scores.softmax(-1), history_v.float()
+    )
+    torch.testing.assert_close(output.float(), expected, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(lse, scores.logsumexp(-1), atol=0.02, rtol=0.02)
+    arena.allocator.free(cache.name, pages)
+
+
+def _dspark_request_manager(pages=24):
+    cfg = DSparkKVCacheConfig(num_layers=2, kv_head_num=2, kv_head_dim=8)
+    state = SSMCacheConfig(
+        num_layers=1, conv_dim=8, conv_kernel=2,
+        num_v_heads=1, head_v_dim=4, head_k_dim=4,
+    )
+    mm = MemoryManager(
+        0.9, 1, torch.bfloat16, 4, 1, 8, 32,
+        dspark_kv_cache_config=cfg, ssm_cache_config=state,
+    )
+    arena, target = _arena_for(mm._kv_cache_layout(), slots=pages)
+    mm.cache_arena = arena
+    mm.segment = Segment(1, 4, 1, 8, False, target)
+    mm.dspark_segment = Segment(
+        2, 4, 2, 8, False, arena.register_cache(mm._dspark_kv_cache_layout())
+    )
+    mm.ssm_segment = SSMSegment(
+        state,
+        state_cache=arena.register_cache(mm._ssm_cache_layout("ssm_state")),
+        snapshot_cache=arena.register_cache(mm._ssm_cache_layout("ssm_snapshot")),
+    )
+    return mm
+
+
+def _dspark_sequence(seq_id=1):
+    return GenerationSequence(seq_id, [1], [], output_len=32)
+
+
+def test_dspark_reservation_separates_capacity_from_valid_context_and_resets():
+    mm = _dspark_request_manager()
+    seq, cache = _dspark_sequence(), DSparkRequestCache()
+    allocator = mm.cache_arena.allocator
+    owners = list(allocator._owners)
+    assert mm.reserve_dspark_pages(seq, cache, target_length=4, draft_length=4)
+    assert len(seq.page_table) == len(cache.page_table) == 1
+    assert cache.context_length == 0
+    for layer in range(2):
+        mm.dspark_segment.k_cache[layer][cache.page_table[0]].fill_(layer + 1)
+        mm.dspark_segment.v_cache[layer][cache.page_table[0]].fill_(layer + 2)
+    mm.commit_dspark_context(cache, 3)
+    assert mm.reserve_dspark_pages(seq, cache, target_length=5, draft_length=5)
+    assert len(seq.page_table) == len(cache.page_table) == 2
+    assert cache.context_length == 3
+    reserved = list(allocator._owners)
+    assert mm.reserve_dspark_pages(seq, cache, target_length=5, draft_length=5)
+    assert allocator._owners == reserved
+    with pytest.raises(ValueError):
+        mm.commit_dspark_context(cache, 9)
+    with pytest.raises(ValueError):
+        mm.commit_dspark_context(cache, 2)
+    assert cache.context_length == 3
+    mm.free_dspark_cache(seq, cache)
+    assert not seq.page_table and not cache.page_table
+    assert cache.context_length == 0 and seq.recurrent_state_slot is None
+    assert allocator._owners == owners
+    mm.free_dspark_cache(seq, cache)
+    assert mm.reserve_dspark_pages(seq, cache, target_length=4, draft_length=4)
+    assert cache.context_length == 0
+    mm.free_dspark_cache(seq, cache)
+    assert allocator._owners == owners
+
+
+def test_dspark_requests_have_independent_pages_and_valid_lengths():
+    mm = _dspark_request_manager()
+    seq1, seq2 = _dspark_sequence(1), _dspark_sequence(2)
+    first, second = DSparkRequestCache(), DSparkRequestCache()
+    assert mm.reserve_dspark_pages(seq1, first, target_length=4, draft_length=4)
+    assert mm.reserve_dspark_pages(seq2, second, target_length=4, draft_length=4)
+    assert set(first.page_table).isdisjoint(second.page_table)
+    mm.commit_dspark_context(first, 3)
+    assert second.context_length == 0
+    mm.free_dspark_cache(seq1, first)
+    assert len(second.page_table) == 1 and seq2.recurrent_state_slot is not None
+    mm.free_dspark_cache(seq2, second)
+
+
+@pytest.mark.parametrize("failure,existing", [
+    ("ssm_state", False),
+    ("dspark_kv_cache", False),
+    ("kv_cache", False),
+    ("dspark_kv_cache", True),
+    ("kv_cache", True),
+])
+def test_dspark_failed_reservation_preserves_existing_ownership(
+    monkeypatch, failure, existing
+):
+    mm = _dspark_request_manager()
+    seq, cache = _dspark_sequence(), DSparkRequestCache()
+    if existing:
+        assert mm.reserve_dspark_pages(seq, cache, target_length=4, draft_length=4)
+        mm.commit_dspark_context(cache, 3)
+    allocator = mm.cache_arena.allocator
+    owners = list(allocator._owners)
+    target, draft = list(seq.page_table), list(cache.page_table)
+    state = seq.recurrent_state_slot
+    original = allocator.allocate
+
+    def fail_one_type(name, count=1, **kwargs):
+        if name == failure and count:
+            return None
+        return original(name, count, **kwargs)
+
+    monkeypatch.setattr(allocator, "allocate", fail_one_type)
+    assert not mm.reserve_dspark_pages(seq, cache, target_length=8, draft_length=8)
+    assert allocator._owners == owners
+    assert seq.page_table == target and cache.page_table == draft
+    assert cache.context_length == (3 if existing else 0)
+    assert seq.recurrent_state_slot == state
+
+
+def test_dspark_real_exhaustion_rolls_back_state_and_draft_claims():
+    mm = _dspark_request_manager(pages=9)
+    seq, cache = _dspark_sequence(), DSparkRequestCache()
+    allocator = mm.cache_arena.allocator
+    owners = list(allocator._owners)
+    # After dummy and working state, one four-page draft slot fits, but four
+    # target pages do not. Each type alone appears to have enough capacity.
+    assert not mm.reserve_dspark_pages(seq, cache, target_length=16, draft_length=4)
+    assert allocator._owners == owners
+    assert not seq.page_table and not cache.page_table
+    assert seq.recurrent_state_slot is None
+
+
+def test_dspark_cannot_reserve_below_valid_context():
+    mm = _dspark_request_manager()
+    seq, cache = _dspark_sequence(), DSparkRequestCache()
+    assert mm.reserve_dspark_pages(seq, cache, target_length=4, draft_length=4)
+    mm.commit_dspark_context(cache, 3)
+    owners = list(mm.cache_arena.allocator._owners)
+    with pytest.raises(ValueError):
+        mm.reserve_dspark_pages(seq, cache, target_length=4, draft_length=2)
+    assert mm.cache_arena.allocator._owners == owners
+    mm.free_dspark_cache(seq, cache)
+
+
+def test_dspark_rejects_prefix_cache_before_allocating_arena():
+    mm = MemoryManager(
+        0.9, 1, torch.bfloat16, 4, 1, 8, 32,
+        dspark_kv_cache_config=DSparkKVCacheConfig(2, 2, 8),
+    )
+    with pytest.raises(ValueError, match="does not support prefix caching"):
+        mm.init(segment_cls=PrefixSegment)
 
 
 def test_mla_and_index_banks_share_one_registered_page_lifetime():
