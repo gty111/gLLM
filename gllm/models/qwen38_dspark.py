@@ -7,16 +7,15 @@ Its checkpoint keys are already the names its module tree exposes: there is no
 ``model.`` prefix and no ``mtp.N.`` remap to undo, which is why
 :meth:`Qwen38DSparkMapping.checkpoint_key` is the identity.
 
-Three things differ from the DeepSeek-V4 drafter and are easy to get subtly
-wrong:
+Three details of this drafter are easy to get subtly wrong:
 
 * **The draft block is dual-source.**  ``q`` comes from the noisy block alone
   while ``k``/``v`` come from ``cat([target context, noisy block])``, so a
   fused ``qkv_proj`` cannot express it and the projections stay separate.
-* **``block_size`` is counted differently.**  The checkpoint's ``block_size``
-  is the width of the noisy block the verifier consumes (anchor + proposals);
-  the shared contract's counts proposals only.  The two differ by one, and
-  :class:`Qwen38DSpark` reconciles them.
+* **``block_size`` counts proposals.**  Each noisy row predicts one next
+  token, including the row whose input is the anchor.  The shared contract
+  uses the same proposal count; verification consumes the anchor plus those
+  proposals, so its width is one larger than the noisy block.
 * **The context cache is stateful.**  :meth:`Qwen38DSpark.forward_draft`
   appends this step's accepted context K/V to :class:`Qwen38DSparkCache` in
   place, so a draft loop keeps one cache and never re-projects the prefix.
@@ -369,11 +368,9 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        # The checkpoint's ``block_size`` counts the width the verifier
-        # consumes (anchor + proposals); the contract counts proposals.  The
-        # heads below read ``block_size`` rows starting at the anchor's own
-        # position, so one of them is the anchor and only the rest are drafted.
-        self.block_size = config.block_size - 1
+        # Every noisy row predicts one proposal, including the anchor row.
+        # The verifier also consumes the anchor id, so its width is one larger.
+        self.block_size = config.block_size
         self.noise_width = config.block_size
         self.mask_token_id = config.mask_token_id
 
@@ -515,9 +512,9 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         """LM head + Markov correction + confidence, per draft position."""
         if self._lm_head[0] is None:
             raise ValueError("Qwen38DSpark.forward_head needs the target LM head")
-        # Row 0 sits at the anchor's own position and predicts nothing; the
-        # reference drops it (``draft_hidden[:, -block_size + 1:]``).
-        proposal_hidden = hidden_states[:, 1:, :]
+        # The anchor input row predicts the first proposal; retain every row.
+        # The anchor id itself is prepended separately in output_ids below.
+        proposal_hidden = hidden_states
         # ``forward_draft`` already applied ``self.norm``; the reference hands
         # that same tensor straight to the target LM head.
         logits = self._lm_head[0](proposal_hidden)

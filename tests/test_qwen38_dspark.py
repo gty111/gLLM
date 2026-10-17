@@ -248,6 +248,112 @@ def test_markov_rule_wins_over_the_catch_all():
     assert markov_index < catch_all_index
 
 
+# --- proposal row alignment: deterministic head-only checks -----------------
+
+
+def _head_stub(block_size):
+    """Exercise the real head without constructing CUDA-only backbone layers."""
+    from types import SimpleNamespace
+
+    lm_head = torch.nn.Linear(2, 8, bias=False, device="cpu", dtype=torch.float32)
+    markov_w1 = torch.nn.Embedding(8, 1, device="cpu", dtype=torch.float32)
+    markov_w2 = torch.nn.Linear(1, 8, bias=False, device="cpu", dtype=torch.float32)
+    confidence = torch.nn.Linear(3, 1, device="cpu", dtype=torch.float32)
+    with torch.no_grad():
+        for module in (lm_head, markov_w1, markov_w2, confidence):
+            module.weight.zero_()
+        confidence.bias.zero_()
+    return SimpleNamespace(
+        block_size=block_size,
+        _lm_head=[lm_head],
+        markov_head=SimpleNamespace(markov_w1=markov_w1, markov_w2=markov_w2),
+        confidence_head=SimpleNamespace(proj=confidence),
+    )
+
+
+@pytest.mark.parametrize("block_size", [1, 5, 7])
+def test_forward_head_preserves_every_noise_row(block_size):
+    """Distinct row values expose a dropped first row or shifted logits."""
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+
+    model = _head_stub(block_size)
+    with torch.no_grad():
+        model._lm_head[0].weight[:2].copy_(torch.eye(2))
+        model.confidence_head.proj.weight[0, 0] = 1
+
+    rows = torch.arange(1, block_size + 1, dtype=torch.float32)
+    hidden = torch.stack((rows, rows + 10), dim=-1).unsqueeze(0)
+    anchor = torch.tensor([4])
+    ids, logits, confidence = Qwen38DSpark.forward_head(model, hidden, anchor)
+
+    expected_logits = torch.zeros(1, block_size, 8)
+    expected_logits[0, :, :2] = hidden[0]
+    torch.testing.assert_close(logits, expected_logits, rtol=0, atol=0)
+    torch.testing.assert_close(confidence, rows.unsqueeze(0), rtol=0, atol=0)
+    assert ids.tolist() == [[4] + [1] * block_size]
+
+
+def test_forward_head_aligns_markov_and_confidence_with_previous_tokens():
+    """A hand-computed alternating chain pins each proposal's conditioning."""
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+
+    model = _head_stub(7)
+    with torch.no_grad():
+        # Token 0 contributes [-2, 2]; token 1 contributes [3, -3].
+        # With zero base logits, greedy proposals alternate 1, 0, 1, ...
+        model.markov_head.markov_w1.weight[:2, 0] = torch.tensor([-2., 3.])
+        model.markov_head.markov_w2.weight[:2, 0] = torch.tensor([1., -1.])
+        # Raw confidence = 2 * hidden[0] + previous-token embedding + 5.
+        model.confidence_head.proj.weight[0] = torch.tensor([2., 0., 1.])
+        model.confidence_head.proj.bias.fill_(5)
+
+    rows = torch.arange(1, 8, dtype=torch.float32)
+    hidden = torch.stack((rows, rows * 10), dim=-1).unsqueeze(0)
+    ids, logits, confidence = Qwen38DSpark.forward_head(
+        model, hidden, torch.tensor([0])
+    )
+
+    expected_logits = torch.zeros(1, 7, 8)
+    expected_logits[0, :, :2] = torch.tensor([
+        [-2., 2.], [3., -3.], [-2., 2.], [3., -3.],
+        [-2., 2.], [3., -3.], [-2., 2.],
+    ])
+    assert ids.tolist() == [[0, 1, 0, 1, 0, 1, 0, 1]]
+    torch.testing.assert_close(logits, expected_logits, rtol=0, atol=0)
+    torch.testing.assert_close(
+        confidence, torch.tensor([[5., 12., 9., 16., 13., 20., 17.]]),
+        rtol=0, atol=0,
+    )
+
+
+def test_forward_head_conditions_on_sampled_token_instead_of_argmax():
+    """The next bias must follow the callback's token, even if it is not greedy."""
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+
+    model = _head_stub(5)
+    with torch.no_grad():
+        model.markov_head.markov_w1.weight[0, 0] = -2
+        model.markov_head.markov_w1.weight[2, 0] = 7
+        model.markov_head.markov_w2.weight[:2, 0] = torch.tensor([1., -1.])
+        model.confidence_head.proj.weight[0, 2] = 1
+
+    ids, logits, confidence = Qwen38DSpark.forward_head(
+        model, torch.zeros(1, 5, 2), torch.tensor([0]),
+        sample=lambda step_logits: torch.full_like(step_logits.argmax(dim=-1), 2),
+    )
+
+    # Greedy would choose token 1 first, but the callback always chooses 2.
+    expected_logits = torch.zeros(1, 5, 8)
+    expected_logits[0, :, :2] = torch.tensor([
+        [-2., 2.], [7., -7.], [7., -7.], [7., -7.], [7., -7.],
+    ])
+    assert ids.tolist() == [[0, 2, 2, 2, 2, 2]]
+    torch.testing.assert_close(logits, expected_logits, rtol=0, atol=0)
+    torch.testing.assert_close(
+        confidence, torch.tensor([[-2., 7., 7., 7., 7.]]), rtol=0, atol=0
+    )
+
+
 # --- GPU forward path -------------------------------------------------------
 
 
@@ -302,6 +408,17 @@ def _rows(config, context_len):
         1, context_len, config.target_hidden_size,
         device="cuda", dtype=torch.bfloat16,
     )
+
+
+@pytest.mark.parametrize("block_size", [1, 5, 7])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_model_proposal_width_matches_checkpoint(block_size):
+    """Checkpoint block_size counts proposals; the anchor is one extra output id."""
+    from dataclasses import replace
+
+    model = _build_model(replace(_tensor_config(), block_size=block_size))
+    assert model.noise_width == block_size
+    assert model.block_size == block_size
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -518,15 +635,14 @@ def test_forward_draft_and_head_run_end_to_end():
 
     Shapes carry the meaning here -- ``forward_head`` must emit
     ``block_size + 1`` ids (anchor first) over ``block_size`` proposal
-    positions, and that width has to come out of a ``block_size + 1``-row
-    noisy block.
+    positions, using every row of the ``block_size``-row noisy block.
     """
     config = _tensor_config()
     torch.manual_seed(7)
     model = _build_model(config)
 
-    # The checkpoint counts the verifier width; the contract counts proposals.
-    assert model.block_size == config.block_size - 1
+    # The checkpoint and contract count proposals; verification adds the anchor.
+    assert model.block_size == config.block_size
     assert model.noise_width == config.block_size
 
     batch, prompt_len = 1, 6
@@ -551,8 +667,8 @@ def test_forward_draft_and_head_run_end_to_end():
     assert (draft_ids[0, 1:] == config.mask_token_id).all()
 
     ids, logits, confidence = model.forward_head(hidden, anchor)
-    assert ids.shape == (batch, model.block_size + 1)
-    assert logits.shape == (batch, model.block_size, config.vocab_size)
-    assert confidence.shape == (batch, model.block_size)
+    assert ids.shape == (batch, config.block_size + 1)
+    assert logits.shape == (batch, config.block_size, config.vocab_size)
+    assert confidence.shape == (batch, config.block_size)
     assert ids[0, 0].item() == 3
     assert not torch.isnan(hidden).any()
