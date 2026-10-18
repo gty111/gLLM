@@ -4,6 +4,7 @@ import sys
 from typing import List
 
 from setuptools import find_packages, setup
+from setuptools_rust import Binding, RustExtension
 
 ROOT_DIR = os.path.dirname(__file__)
 
@@ -57,4 +58,16 @@ setup(
             "layers/quantization/csrc/marlin/include/sgl_kernel/*",
         ],
     },
+    rust_extensions=[
+        RustExtension(
+            "gllm._cache_arena",
+            path="rust/cache_arena/Cargo.toml",
+            binding=Binding.PyO3,
+            features=["pyo3/extension-module"],
+            py_limited_api=True,
+            debug=False,
+        ),
+    ],
+    zip_safe=False,
+    options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
-from gllm.runtime.cache_arena import CacheArena
+from gllm.runtime.cache_arena import CacheArena, select_physical_page_bytes
 from gllm.runtime.memory_manager import (
     DSparkKVCacheConfig,
     DSparkRequestCache,
@@ -116,11 +116,17 @@ def test_memory_manager_registers_dspark_cache_only_when_configured(monkeypatch,
         1.0, 1, torch.bfloat16, 4, 1, 8, 32,
         dspark_kv_cache_config=cfg if enabled else None,
     )
-    budget = 24 * manager._kv_cache_layout().entry_bytes
+    layouts = manager._cache_layouts()
+    grain = select_physical_page_bytes(layouts.values())
+    kv_bytes = layouts["kv_cache"].entry_bytes
+    kv_stride = ((kv_bytes + grain - 1) // grain) * grain
+    budget = 24 * kv_stride
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (budget, budget))
     manager.init()
 
     assert manager.cache_arena.backing.numel() == budget
+    assert manager.cache_arena.physical_page_bytes == grain
+    assert manager.cache_arena.allocator.cache_type_names == tuple(layouts)
     assert manager.segment.get_num_free_pages() == 24
     if not enabled:
         assert manager.dspark_segment is None
@@ -133,6 +139,58 @@ def test_memory_manager_registers_dspark_cache_only_when_configured(monkeypatch,
         manager.cache_arena.backing.untyped_storage().data_ptr()
     )
     assert not cache.cache_type.live_slots
+
+
+def test_dspark_layout_participates_in_physical_grain_selection():
+    manager = MemoryManager(
+        1.0, 16, torch.bfloat16, 16, 4, 256, 32,
+        dspark_kv_cache_config=DSparkKVCacheConfig(5, 8, 128),
+    )
+    layouts = manager._cache_layouts()
+    assert tuple(layouts) == ("kv_cache", "dspark_kv_cache")
+    assert layouts["kv_cache"].entry_bytes == 1048576
+    assert layouts["dspark_kv_cache"].entry_bytes == 327680
+    assert select_physical_page_bytes(layouts.values()) == 65536
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_init_uses_exact_target_and_draft_slot_strides(monkeypatch):
+    manager = MemoryManager(
+        1.0, 16, torch.bfloat16, 16, 4, 256, 32,
+        dspark_kv_cache_config=DSparkKVCacheConfig(5, 8, 128),
+    )
+    budget = 24 * 1048576
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (budget, budget))
+    manager.init(reserve_dummy_page=True)
+    arena = manager.cache_arena
+    target = arena.cache("kv_cache")
+    draft = arena.cache("dspark_kv_cache")
+    assert arena.physical_page_bytes == 65536
+    assert target.cache_type.pages_per_slot == 16
+    assert draft.cache_type.pages_per_slot == 5
+    assert target.slot_bytes == 1048576
+    assert draft.slot_bytes == 327680
+    assert target.num_slots == 24
+    assert draft.num_slots == budget // 327680
+    assert manager.segment.k_cache[0].stride(0) * 2 == target.slot_bytes
+    assert manager.dspark_segment.k_cache[0].stride(0) * 2 == draft.slot_bytes
+    target_page = manager.segment.allocate()
+    draft_page = manager.dspark_segment.allocate()
+    for layer in range(16):
+        manager.segment.k_cache[layer][target_page].fill_(11)
+        manager.segment.v_cache[layer][target_page].fill_(13)
+    for layer in range(5):
+        manager.dspark_segment.k_cache[layer][draft_page].fill_(17)
+        manager.dspark_segment.v_cache[layer][draft_page].fill_(19)
+    assert torch.all(target.tensor("key")[target_page] == 11)
+    assert torch.all(target.tensor("value")[target_page] == 13)
+    assert torch.all(draft.tensor("key")[draft_page] == 17)
+    assert torch.all(draft.tensor("value")[draft_page] == 19)
+    assert arena.allocator.num_used_physical_pages == 16 + 16 + 5
+    manager.dspark_segment.free(draft_page)
+    manager.segment.free(target_page)
+    assert arena.allocator.num_used_physical_pages == 16
+    assert manager.segment.get_num_free_pages() == 23
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

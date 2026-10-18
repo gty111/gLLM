@@ -12,6 +12,7 @@ from gllm.runtime.cache_arena import (
     CacheLayout,
     CacheTensorLayout,
     RegisteredCache,
+    select_physical_page_bytes,
 )
 from gllm.runtime.sequence import GenerationSequence
 from gllm.utils import async_tensor_h2d, get_dtype_bytes
@@ -1080,26 +1081,37 @@ class MemoryManager:
         """Allocate one arena and register every persistent model cache."""
         if self.dspark_kv_cache_config is not None and issubclass(segment_cls, PrefixSegment):
             raise ValueError("DSpark cache does not support prefix caching")
-        kv_layout = self._kv_cache_layout()
+        layouts = self._cache_layouts()
+        physical_page_bytes = select_physical_page_bytes(layouts.values())
+        kv_layout = layouts["kv_cache"]
         free_mem, _ = torch.cuda.mem_get_info()
         kv_page_bytes = kv_layout.entry_bytes
+        kv_slot_bytes = (
+            (kv_page_bytes + physical_page_bytes - 1) // physical_page_bytes
+            * physical_page_bytes
+        )
         arena_budget = int(free_mem * self.gpu_memory_util)
-        num_physical_pages = arena_budget // kv_page_bytes
+        # PP ranks may have different layouts and accounting grains. Their
+        # shared request page tables still require equal logical KV capacity.
+        num_kv_slots = arena_budget // kv_slot_bytes
         if dist.is_initialized():
             gathered = [None for _ in range(dist.get_world_size())]
-            dist.all_gather_object(gathered, num_physical_pages)
-            num_physical_pages = min(gathered)
-        if num_physical_pages <= 0:
+            dist.all_gather_object(gathered, num_kv_slots)
+            num_kv_slots = min(gathered)
+        if num_kv_slots <= 0:
             raise RuntimeError("not enough GPU memory for one cache arena page")
 
         device = torch.device("cuda", torch.cuda.current_device())
         backing = torch.empty(
-            num_physical_pages * kv_page_bytes,
+            num_kv_slots * kv_slot_bytes,
             dtype=torch.uint8,
             device=device,
         )
-        arena = CacheArena(backing, physical_page_bytes=kv_page_bytes)
-        kv_cache = arena.register_cache(kv_layout)
+        arena = CacheArena(backing, physical_page_bytes=physical_page_bytes)
+        # The same immutable layouts drive grain selection and registration.
+        # New persistent groups must be declared in _cache_layouts as well.
+        caches = {name: arena.register_cache(layout) for name, layout in layouts.items()}
+        kv_cache = caches["kv_cache"]
         self.cache_arena = arena
         self.num_pages = kv_cache.num_slots
         self.segment = segment_cls(
@@ -1117,7 +1129,7 @@ class MemoryManager:
 
         if self.dspark_kv_cache_config is not None:
             cfg = self.dspark_kv_cache_config
-            draft_cache = arena.register_cache(self._dspark_kv_cache_layout())
+            draft_cache = caches["dspark_kv_cache"]
             # Separate logical slot IDs and geometry, shared physical ownership.
             self.dspark_segment = Segment(
                 cfg.num_layers,
@@ -1130,16 +1142,14 @@ class MemoryManager:
 
         if self.ssm_cache_config is not None:
             cfg = self.ssm_cache_config
-            state_cache = arena.register_cache(self._ssm_cache_layout("ssm_state"))
-            snapshot_cache = arena.register_cache(
-                self._ssm_cache_layout("ssm_snapshot")
-            )
+            state_cache = caches["ssm_state"]
+            snapshot_cache = caches["ssm_snapshot"]
             per_seq_blocks = 1 + self.mtp_k
             # Slot 0 is the graph-padding state and is never allocatable. This
             # checks viability only; it does not reserve a separate SSM pool.
             usable_ssm_slots = max(0, state_cache.num_slots - 1)
             if usable_ssm_slots < per_seq_blocks:
-                need = (per_seq_blocks + 1) * state_cache.entry_bytes
+                need = (per_seq_blocks + 1) * state_cache.slot_bytes
                 raise RuntimeError(
                     f"cache arena needs >= {need / (1 << 30):.1f} GB to run "
                     f"one request with MTP k={self.mtp_k}, but its total budget "
@@ -1155,10 +1165,10 @@ class MemoryManager:
             usable_ssm_slots = None
 
         if self.dsv4_state_cache_config is not None:
-            state_cache = arena.register_cache(self._dsv4_state_cache_layout())
+            state_cache = caches["dsv4_state"]
             usable_dsv4_slots = max(0, state_cache.num_slots - 1)
             if usable_dsv4_slots < 1:
-                need = 2 * state_cache.entry_bytes
+                need = 2 * state_cache.slot_bytes
                 raise RuntimeError(
                     f"cache arena needs >= {need / (1 << 30):.1f} GB to run "
                     "one DeepSeek-V4 request, but its total budget is "
@@ -1179,11 +1189,11 @@ class MemoryManager:
             "Cache arena: %.2f GB, physical page %.2f KB; registered caches: "
             "%s; KV=%d pages (%d tokens/page, %.2f KB/token)",
             backing.numel() / (1 << 30),
-            kv_page_bytes / 1024,
+            physical_page_bytes / 1024,
             cache_names,
             self.num_pages,
             self.page_size,
-            kv_page_bytes / (1024 * self.page_size),
+            kv_slot_bytes / (1024 * self.page_size),
         )
         if usable_ssm_slots is not None:
             logger.info(
@@ -1233,9 +1243,9 @@ class MemoryManager:
         try:
             kv_pages = self.get_num_free_pages()
             if self.dspark_segment is not None:
-                # Both types borrow the same physical pages. Claim draft first
-                # (larger aligned extents), then target, as request reservation
-                # does. Probe without leaving any temporary ownership behind.
+                # Both types borrow the same physical pages. Claim draft first,
+                # then target, matching request reservation. Probe without
+                # leaving any temporary ownership behind.
                 target_type = self.segment.id_allocator.cache_type
                 draft_type = self.dspark_segment.id_allocator.cache_type
                 low, high = 0, min(kv_pages, self.dspark_segment.get_num_free_pages())
@@ -1275,6 +1285,20 @@ class MemoryManager:
                 f"to <= {max_length}, or raise --gpu-memory-util or --tp."
             )
         return max_length
+
+    def _cache_layouts(self) -> Dict[str, CacheLayout]:
+        """Declare all arena groups before choosing a physical page size."""
+        layouts = [self._kv_cache_layout()]
+        if self.dspark_kv_cache_config is not None:
+            layouts.append(self._dspark_kv_cache_layout())
+        if self.ssm_cache_config is not None:
+            layouts.extend((
+                self._ssm_cache_layout("ssm_state"),
+                self._ssm_cache_layout("ssm_snapshot"),
+            ))
+        if self.dsv4_state_cache_config is not None:
+            layouts.append(self._dsv4_state_cache_layout())
+        return {layout.name: layout for layout in layouts}
 
     def _kv_cache_layout(self) -> CacheLayout:
         """Describe all tensor banks that share one attention-cache page id."""
@@ -2413,13 +2437,14 @@ class PrefixSegment(Segment):
         # ordinary free space and must be consumed before valid cached pages.
         arena = self.id_allocator.arena.allocator
         name = self.id_allocator.cache_type
-        retained = arena.cache_type(name).retained_slots
         cached, invalidated = [], []
         for page in reversed(page_nums):
             page_hash = self.page2hash[page]
             if page_hash and self.hash2page.get(page_hash) == page:
                 cached.append(page)
-            elif page in retained:
+            else:
+                # discard_cached ignores slots without retention. Avoid
+                # materializing a full native retained-slot snapshot here.
                 invalidated.append(page)
         if invalidated:
             arena.discard_cached(name, invalidated)
