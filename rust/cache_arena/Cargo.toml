@@ -1,0 +1,16 @@
+[package]
+name = "gllm-cache-arena"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+
+[lib]
+name = "_cache_arena"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29.3", features = ["abi3-py39"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
