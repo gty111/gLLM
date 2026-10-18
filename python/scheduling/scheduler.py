@@ -584,7 +584,7 @@ class Scheduler:
         """Pick a batch from the queues; return the live GenerationSequence objects.
 
         The worker snapshots whatever state the followers actually need into a
-        :class:`SchedulePayload` (``gllm/scheduling/distributed.py``) at send
+        :class:`SchedulePayload` (``python/scheduling/distributed.py``) at send
         time, so the seqs need no copy / token_ids stripping for pickling
         safety. The rank-0 consumers (``prepare_input``, the deferred-output
         processing in :class:`OverlapScheduler`) want the live objects anyway.

@@ -49,7 +49,7 @@ global_rank = pp_rank · S + dp_rank · tp_size + tp_rank,     S = dp_size · tp
 ```
 
 `S` is the **stage size** (ranks per pipeline stage). Group construction lives in
-`gllm/distributed/parallel_state.py::init_dp_ep`. Four group families are formed (every rank calls
+`python/distributed/parallel_state.py::init_dp_ep`. Four group families are formed (every rank calls
 `dist.new_group` the same number of times in the same order, so the NCCL groups line
 up across ranks):
 
@@ -115,7 +115,7 @@ Key accessors in `parallel_state.py`: `is_dp_attn()` (`_DP_SIZE > 1`), `get_dp_s
   `next_tokens`/`free_ids`) and keyed by `seq_id`, so ordering across replicas is
   irrelevant; the engine drains *all* queued packages each tick.
 
-Server flag: `--dp N` (see `gllm/entrypoints/api_server.py`). World size is
+Server flag: `--dp N` (see `python/entrypoints/api_server.py`). World size is
 `pp·dp·tp`; with `--enable-ep` the experts shard across `EP = dp·tp` per stage.
 
 ---
@@ -128,7 +128,7 @@ work and others may be idle. But the MoE runs collectives over the DP/EP group, 
 single unconditional all-gather every iteration (`Worker._schedule_forward_dp`):
 
 ```python
-# gllm/workers/worker.py
+# python/workers/worker.py
 real_counts, decode_flags = dp_all_gather_meta(real_ntok, is_decode)  # over _DP_GROUP
 if sum(real_counts) == 0:
     return                      # every replica idle → all skip in unison
@@ -156,7 +156,7 @@ see the determinism fixes in §7.
 
 ## 5. MoE forward under DP + EP
 
-`DeepseekV2MOE._forward_dp_ep` (in `gllm/models/deepseek_v2.py`) implements the
+`DeepseekV2MOE._forward_dp_ep` (in `python/models/deepseek_v2.py`) implements the
 gather → shard → reduce → slice dance. Per MoE layer:
 
 ```python
@@ -230,7 +230,7 @@ reset was **discarded** — never sent to any worker, so its `AsyncStream` never
 finished and the HTTP request hung. The DP path (`_send_ipc_package_dp`) has a wider
 window (per-seq zmq sends before the reset), which is why DP+EP tripped it most often.
 
-**Fix** (`gllm/engine/llm.py`, `gllm/engine/async_llm.py`): guard the intake queues
+**Fix** (`python/engine/llm.py`, `python/engine/async_llm.py`): guard the intake queues
 with `self._pending_lock` and **atomically snapshot-and-clear** them:
 
 ```python

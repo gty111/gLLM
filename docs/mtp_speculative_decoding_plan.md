@@ -128,7 +128,7 @@ Hard assumptions to relax (all in the **decode** path):
 
 ## 4. Component plan
 
-### 4.1 Model layer — `gllm/models/deepseek_mtp.py` (new)
+### 4.1 Model layer — `python/models/deepseek_mtp.py` (new)
 
 A thin module reusing existing V2/V3.2 building blocks:
 
@@ -162,7 +162,7 @@ Notes:
   needed. The head is only *built* when spec decoding is enabled, so today's
   "MTP weights silently skipped" behavior is preserved when it's off.
 
-### 4.2 Proposer — `gllm/spec_decode/mtp_proposer.py` (new)
+### 4.2 Proposer — `python/spec_decode/mtp_proposer.py` (new)
 
 Owns the **draft loop** (runs inside the worker, after the target forward):
 
@@ -191,7 +191,7 @@ Each draft step:
 * for DSA: honor `index_share_for_mtp_iteration` (reuse last full layer's top-k)
   in stage 2; in stage 1 just recompute the indexer (correct, slightly slower).
 
-### 4.3 Verifier + rejection sampler — `gllm/layers/sampler.py` (extend)
+### 4.3 Verifier + rejection sampler — `python/layers/sampler.py` (extend)
 
 Add `verify_draft_tokens(target_logits, draft_tokens, draft_probs=None)`.
 
@@ -213,7 +213,7 @@ accept/reject scan directly. Keep it separate from `forward_gpu`.
   proposer (store them in the chain loop).
 * Returns per-seq `num_accepted ∈ [1, k+1]` and the committed token ids.
 
-### 4.4 Scheduler + sequence state — `gllm/scheduling/scheduler.py`, `gllm/runtime/sequence.py`
+### 4.4 Scheduler + sequence state — `python/scheduling/scheduler.py`, `python/runtime/sequence.py`
 
 * When spec is on, for each decode seq **pre-allocate `k` extra KV slots** (so the
   draft chain has somewhere to write): `to_compute_token_num` becomes `1+k` on the
@@ -231,7 +231,7 @@ accept/reject scan directly. Keep it separate from `forward_gpu`.
   * finish / logprob / stream handling as today, but possibly emitting multiple
     tokens per step.
 
-### 4.5 Memory manager — `gllm/runtime/memory_manager.py` (extend)
+### 4.5 Memory manager — `python/runtime/memory_manager.py` (extend)
 
 Verified API: a sequence's page list is `seq.page_table` (list of page ids); pages
 are freed via `segment.free(page_num)` → `IDAllocator.free` (a FIFO free-list).
@@ -621,20 +621,20 @@ was removed. Fused C=1 speedup ~2.09×.
 
 ### 10.9 Key files (as-built)
 
-* `gllm/models/deepseek_mtp.py` — `DeepseekMTP` head (layer-61 nextn block).
-* `gllm/speculative/mtp.py` — `_mtp_decode` (draft→verify→accept), `_draft_chain_*`,
+* `python/models/deepseek_mtp.py` — `DeepseekMTP` head (layer-61 nextn block).
+* `python/speculative/mtp.py` — `_mtp_decode` (draft→verify→accept), `_draft_chain_*`,
   `_capture_{draft,verify}_graphs`, `_gumbel_argmax`, `_mtp_probs_static`,
-  `_record_mtp_metrics` (`MtpMixin`, mixed into `gllm/runtime/model_runner.py`).
-* `gllm/layers/attention/mla.py` — `_forward_verify_sparse` (fp8 verify kernel).
-* `gllm/runtime/input_data.py` — `is_mtp_verify` metadata + verify prefill-with-context path.
-* `gllm/workers/overlap.py` — `_run_mtp_sync`, all-rank sampling in `run_batch_async`.
-* `gllm/workers/worker.py` — hard-exit (`os._exit`) crash/shutdown handlers (avoids NCCL
+  `_record_mtp_metrics` (`MtpMixin`, mixed into `python/runtime/model_runner.py`).
+* `python/layers/attention/mla.py` — `_forward_verify_sparse` (fp8 verify kernel).
+* `python/runtime/input_data.py` — `is_mtp_verify` metadata + verify prefill-with-context path.
+* `python/workers/overlap.py` — `_run_mtp_sync`, all-rank sampling in `run_batch_async`.
+* `python/workers/worker.py` — hard-exit (`os._exit`) crash/shutdown handlers (avoids NCCL
   destroy deadlock), MTP token-list broadcast skip.
 
-Removed during cleanup: `gllm/spec_decode/mtp_proposer.py` (superseded by the
+Removed during cleanup: `python/spec_decode/mtp_proposer.py` (superseded by the
 `_draft_chain_*` methods) and its `spec_decode/` package.
 
-### 10.10 GPU-native input prep (`gllm/speculative/gpu_prep.py`)
+### 10.10 GPU-native input prep (`python/speculative/gpu_prep.py`)
 
 An MTP step prepares **two** batches (the draft chain's batch×1 and the verify
 batch's uniform `1+k`) on top of whatever the scheduler already prepared. Doing

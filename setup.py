@@ -47,7 +47,8 @@ setup(
     description="A high-throughput and memory-efficient inference and serving engine for LLMs",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    packages=find_packages(exclude=("benchmarks", "csrc", "docs", "examples", "tests*")),
+    packages=["gllm", *(f"gllm.{package}" for package in find_packages(where="python"))],
+    package_dir={"gllm": "python"},
     python_requires=">=3.9",
     install_requires=get_requirements(),
     package_data={

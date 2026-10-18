@@ -197,6 +197,30 @@ def run_suite(url, full=True, constraints=True):
                 structured_trials=structured_trials)
 
 
+def checkout_import_root(source, output):
+    """Expose the selected source to both the server and spawned workers."""
+    package = Path(source).resolve() / "python"
+    if not (package / "__init__.py").is_file():
+        return str(Path(source).resolve())
+    # PYTHONPATH selects a checkout for this comparison harness, independently
+    # of any editable install. Keep the shim outside the source tree so old
+    # and new layouts can be compared in the same interpreter environment.
+    root = Path(output).resolve() / "import-root"
+    shim = root / "gllm"
+    shim.mkdir(parents=True, exist_ok=True)
+    (shim / "__init__.py").write_text(
+        "from importlib.util import spec_from_file_location as _source_spec\n"
+        "import sys as _sys\n"
+        f"__spec__ = _source_spec(__name__, {str(package / '__init__.py')!r}, "
+        f"submodule_search_locations=[{str(package)!r}])\n"
+        "__file__ = __spec__.origin\n"
+        "__path__ = __spec__.submodule_search_locations\n"
+        "__loader__ = __spec__.loader\n"
+        "__loader__.exec_module(_sys.modules[__name__])\n"
+    )
+    return str(root)
+
+
 def main():
     assert os.environ.get("SLURM_JOB_ID"), "GPU tests must run under Slurm"
     parser = argparse.ArgumentParser()
@@ -220,7 +244,8 @@ def main():
             command.append("--overlap-scheduling")
         print(mode, command, flush=True)
         with (out / f"{mode}.server.log").open("w") as log:
-            pythonpath = source + os.pathsep + os.environ.get("STRUCTURED_DEBUG_DIR", "")
+            import_root = checkout_import_root(source, out / mode)
+            pythonpath = import_root + os.pathsep + os.environ.get("STRUCTURED_DEBUG_DIR", "")
             process = subprocess.Popen(command, cwd=source, env=dict(os.environ, PYTHONPATH=pythonpath),
                                        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             try:

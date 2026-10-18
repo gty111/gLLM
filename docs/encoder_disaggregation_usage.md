@@ -242,7 +242,7 @@ the two-plane design and is not gated by `GLLM_DISAGG_OVERLAP`.
 ### 6.1 Encoder pipeline and segment-streamed video
 
 The encoder serves items through a cross-request pipeline
-(`gllm/engine/encoder_pipeline.py`): a planning pool computes each item's grid,
+(`python/engine/encoder_pipeline.py`): a planning pool computes each item's grid,
 token count and hash; decode workers decode and preprocess *segments* (a whole
 image, or one time slice of a video) from a shared priority queue (FCFS by
 arrival, then segment order); a GPU thread runs the ViT; the main thread posts
