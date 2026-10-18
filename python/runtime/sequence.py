@@ -153,18 +153,17 @@ class GenerationSequence:
         # falls back to ``token_ids`` (text-only path).
         self.hash_token_ids: Optional[List[int]] = None
         # Incrementally extended page-aligned prefix hash chain used by the
-        # prefix cache. ``_page_hashes[i]`` is the chained hash of the first
-        # ``(i+1)*page_size`` token ids; ``_canary_cache`` is the first few
+        # prefix cache. Native ``_page_hashes`` stores the chain at complete
+        # page boundaries; ``_canary_cache`` is the first few
         # token ids used as a hash-collision guard. Building these lazily
         # turns long-prefill lookups from O(prefix_len) per page into
         # O(page_size) per page (see ``PrefixSegment``). The hash source
         # (``hash_token_ids`` vs ``token_ids``) is captured at first build;
-        # ``_hash_source_ref`` lets the helper auto-invalidate if a VL
+        # the native source reference lets the helper auto-invalidate if a VL
         # request swaps in a fresh ``hash_token_ids`` after the cache was
         # populated.
-        self._page_hashes: Optional[List[int]] = None
+        self._page_hashes = None  # Lazily created native PrefixHashes.
         self._canary_cache: Optional[tuple] = None
-        self._hash_source_ref: Optional[int] = None
 
     def __len__(self):
         return len(self.token_ids)

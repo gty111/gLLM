@@ -255,7 +255,7 @@ def test_batch_lookup_canary_mismatch_does_not_pin_page(prefix_manager, populate
     seq = GenerationSequence(1, list(range(64)), [], output_len=16)
     populate(manager.segment, seq)
     manager.segment.free_many(seq.page_table)
-    manager.segment.page2canary[seq.page_table[1]] = (-1,)
+    manager.segment._prefix.set_canary(seq.page_table[1], [-1])
     continuation = GenerationSequence(2, seq.token_ids + [99], [], output_len=16)
     manager.pre_allocate_computed_page([continuation])
     assert continuation.page_table == seq.page_table[:1]
@@ -301,8 +301,9 @@ def test_batch_lookup_pins_all_pages_before_restoring_filled_snapshot(
     for page, slot, filled in zip(
         seq.page_table[2:], snapshots, [True, last_snapshot_filled]
     ):
-        seg.page2ssm_snapshot[page] = slot
-        seg.page2ssm_snapshot_valid[page] = filled
+        seg._prefix.set_snapshot(page, slot)
+        if filled:
+            seg.publish_ssm_snapshot(page, slot)
     seg.free_many(seq.page_table)
     copies = []
     manager.ssm_segment = SimpleNamespace(copy_state=lambda *args: copies.append(args))
@@ -351,9 +352,8 @@ def test_snapshot_is_kept_until_its_cached_kv_page_is_actually_reused(prefix_man
     page = seq.page_table[0]
     released = []
     seg.ssm_segment = SimpleNamespace(free_snapshot=released.append)
-    seg.page2ssm_snapshot[page] = 7
-    seg.page2ssm_snapshot_valid[page] = True
-    seg._ssm_snapshot_lru[page] = None
+    seg._prefix.set_snapshot(page, 7)
+    seg.publish_ssm_snapshot(page, 7)
     seg.free_many(seq.page_table)
     assert released == []
     assert [seg.allocate(), seg.allocate()] == [1, 2]

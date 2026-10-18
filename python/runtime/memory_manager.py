@@ -1,4 +1,4 @@
-from collections import OrderedDict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from logger import logger
 
+from gllm._cache_arena import PrefixCore, PrefixHashes
 from gllm.distributed.parallel_state import get_pp_size
 from gllm.runtime.cache_arena import (
     CacheArena,
@@ -1864,10 +1865,6 @@ class MemoryManager:
         return self.get_num_free_pages() / self.num_pages
 
 
-# 64-bit nonzero seed for the chained prefix hash. Mixing a constant in
-# at chain start prevents the empty-prefix case from collapsing to 0
-# (which is the sentinel ``page2hash`` uses for "no hash registered").
-_PREFIX_HASH_SEED = 0x9E3779B97F4A7C15
 _PREFIX_CANARY_LEN = 8
 
 
@@ -1892,11 +1889,10 @@ def _maybe_invalidate_seq_hash_cache(seq: GenerationSequence, src: List[int]) ->
     safety net for the edge case where the MM pipeline rewrites
     ``hash_token_ids`` after some pages have already been hashed.
     """
-    ref = seq._hash_source_ref
-    if ref is None or ref != id(src):
-        seq._page_hashes = []
+    hashes = seq._page_hashes
+    if hashes is None or not hashes.matches_source(src):
+        seq._page_hashes = PrefixHashes(src)
         seq._canary_cache = None
-        seq._hash_source_ref = id(src)
 
 
 def _ensure_page_hash(seq: GenerationSequence, page_size: int, page_idx: int) -> int:
@@ -1906,7 +1902,7 @@ def _ensure_page_hash(seq: GenerationSequence, page_size: int, page_idx: int) ->
     ids in this page, so extending the chain by one page costs O(page_size)
     instead of O(prefix_len). The chained hash is reproducible across
     requests: any two seqs sharing identical first ``k*page_size`` tokens
-    produce identical ``_page_hashes[k-1]``.
+    produce identical native hash chains.
     """
     src = _hash_source(seq)
     _maybe_invalidate_seq_hash_cache(seq, src)
@@ -1914,17 +1910,10 @@ def _ensure_page_hash(seq: GenerationSequence, page_size: int, page_idx: int) ->
 
 
 def _page_hash_from_source(
-    src: List[int], cache: List[int], page_size: int, page_idx: int
+    src: List[int], cache: PrefixHashes, page_size: int, page_idx: int
 ) -> int:
     """Extend the hash chain after the caller has validated its source."""
-    if page_idx < len(cache):
-        return cache[page_idx]
-    while len(cache) <= page_idx:
-        i = len(cache)
-        prev = cache[i - 1] if i > 0 else _PREFIX_HASH_SEED
-        page_tokens = tuple(src[i * page_size : (i + 1) * page_size])
-        cache.append(hash((prev, page_tokens)))
-    return cache[page_idx]
+    return cache.page_hash(src, page_size, page_idx)
 
 
 def _ensure_canary(seq: GenerationSequence) -> tuple:
@@ -2189,11 +2178,7 @@ class PrefixMemoryManager(MemoryManager):
         """Return the snapshot slot for ``page_num`` only if it was actually
         *written* (filled), else ``None``. A reserved-but-unfilled slot holds
         zeros and must never be restored onto a non-empty prefix."""
-        if not self.segment.page2ssm_snapshot_valid[page_num]:
-            return None
-        if page_num in self.segment._ssm_snapshot_lru:
-            self.segment._ssm_snapshot_lru.move_to_end(page_num)
-        return self.segment.page2ssm_snapshot[page_num]
+        return self.segment._prefix.valid_snapshot(page_num)
 
     def get_cache_hit_rate(self):
         if self.num_allocated_pages == 0:
@@ -2241,113 +2226,63 @@ class PrefixSegment(Segment):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.hash2page: Dict[int, int] = {}
-        self.page_ref_num = [0 for _ in range(self.num_pages)]
-        self.page2hash: List[int] = [0 for _ in range(self.num_pages)]
-        # Canary stored per physical page; tuples are kept short
-        # (``_PREFIX_CANARY_LEN``) to avoid blowing up memory at large num_pages.
-        self.page2canary: List[Optional[tuple]] = [None for _ in range(self.num_pages)]
-        # SSM snapshot slot id per physical page; ``None`` if no snapshot
-        # was captured (e.g. when the SSM cache is disabled or the boundary
-        # never had a chance to snapshot during prefill).
-        self.page2ssm_snapshot: List[Optional[int]] = [
-            None for _ in range(self.num_pages)
-        ]
-        # Whether the snapshot slot actually holds a *written* recurrent state.
-        # A slot only ever gets written for the boundary a prefill chunk *ends*
-        # on (see ``InputData._cal_ssm_metadata``); this flag separates
-        # "reserved" from "filled" so the restore path never grafts a zeroed
-        # state (== h_0) onto a non-empty prefix.
-        self.page2ssm_snapshot_valid: List[bool] = [
-            False for _ in range(self.num_pages)
-        ]
-        self._ssm_snapshot_lru: "OrderedDict[int, None]" = OrderedDict()
-        self._ssm_snapshot_pins: Dict[int, int] = {}
+        self._prefix = PrefixCore(self.num_pages)
+
+    # Read-only diagnostic snapshots. Ownership lives exclusively in Rust.
+    hash2page = property(lambda self: self._prefix.index())
+    page_ref_num = property(lambda self: self._prefix.refs())
+    page2hash = property(lambda self: self._prefix.hashes())
+    page2canary = property(lambda self: self._prefix.canaries())
+    page2ssm_snapshot = property(lambda self: self._prefix.snapshots())
+    page2ssm_snapshot_valid = property(lambda self: self._prefix.validity())
+    _ssm_snapshot_lru = property(lambda self: dict.fromkeys(self._prefix.lru()))
+    _ssm_snapshot_pins = property(lambda self: self._prefix.pins())
+
+    # An indexed native view for PP payloads; no full-capacity table copy.
+    snapshot_slots = property(lambda self: self._prefix)
+
+    def mirror_ssm_snapshot_slots(self, pages, slots) -> None:
+        self._prefix.mirror_snapshots(pages, slots)
 
     def evict_arena_slot(self, page_num: int) -> None:
-        """Invalidate an unpinned KV entry before another arena type reuses it."""
-        if self.page_ref_num[page_num] != 0:
-            raise RuntimeError(
-                f"arena attempted to evict pinned KV page {page_num} "
-                f"(refs={self.page_ref_num[page_num]})"
-            )
-        page_hash = self.page2hash[page_num]
-        if page_hash and self.hash2page.get(page_hash) == page_num:
-            del self.hash2page[page_hash]
+        self._prefix.assert_evictable(page_num)
         self._release_snapshot_for(page_num)
-        self.page2hash[page_num] = 0
-        self.page2canary[page_num] = None
-        self.page2ssm_snapshot[page_num] = None
-        self.page2ssm_snapshot_valid[page_num] = False
+        self._prefix.evict(page_num)
 
     def reclaim_one_ssm_snapshot(self) -> bool:
-        """Release the oldest published, unpinned snapshot under pressure."""
-        while self._ssm_snapshot_lru:
-            page_num, _ = self._ssm_snapshot_lru.popitem(last=False)
-            if self.page2ssm_snapshot[page_num] is None:
-                continue
-            self._release_snapshot_for(page_num)
-            return True
-        return False
+        page = self._prefix.oldest_snapshot()
+        if page is None:
+            return False
+        self._release_snapshot_for(page)
+        return True
 
     def num_reclaimable_ssm_snapshots(self) -> int:
-        return len(self._ssm_snapshot_lru)
+        return self._prefix.reclaimable()
 
     def pin_ssm_snapshot(self, page_num: int) -> None:
-        self._ssm_snapshot_lru.pop(page_num, None)
-        self._ssm_snapshot_pins[page_num] = self._ssm_snapshot_pins.get(page_num, 0) + 1
+        self._prefix.pin(page_num)
 
     def unpin_ssm_snapshot(self, page_num: int) -> None:
-        count = self._ssm_snapshot_pins[page_num] - 1
-        if count:
-            self._ssm_snapshot_pins[page_num] = count
-        else:
-            del self._ssm_snapshot_pins[page_num]
-            if self.page2ssm_snapshot_valid[page_num]:
-                self._ssm_snapshot_lru[page_num] = None
+        self._prefix.unpin(page_num)
 
     def publish_ssm_snapshot(self, page_num: int, slot: int) -> None:
-        """Make a written snapshot reusable after its copies are enqueued."""
-        if self.page2ssm_snapshot[page_num] != slot:
-            return
-        self.page2ssm_snapshot_valid[page_num] = True
-        if page_num not in self._ssm_snapshot_pins:
-            self._ssm_snapshot_lru[page_num] = None
-            self._ssm_snapshot_lru.move_to_end(page_num)
+        self._prefix.publish(page_num, slot)
 
     def update(self, seq: GenerationSequence, n_tokens: int, page_num: int) -> None:
         """Register a hash for ``page_num`` after its KV was filled in decode."""
         page_idx = n_tokens // self.page_size - 1
         page_hash = _ensure_page_hash(seq, self.page_size, page_idx)
-        if page_hash not in self.hash2page:
-            self.page2hash[page_num] = page_hash
-            self.hash2page[page_hash] = page_num
-            self.page2canary[page_num] = _ensure_canary(seq)
+        self._prefix.register(page_num, page_hash, _ensure_canary(seq), False)
 
     def retain_computed_prefix(self, seq: GenerationSequence) -> List[int]:
-        """Find and pin the contiguous cached prefix in one arena transaction.
-
-        Hashing stays lazy: a miss stops the scan instead of hashing the rest
-        of a potentially long prompt. No allocator mutation occurs during the
-        scan; all hit pages are pinned before snapshot restoration can allocate
-        working state or reclaim any cached contents.
-        """
+        """Scan lazily in Rust, then pin all hits before any arena reuse."""
         src = _hash_source(seq)
         _maybe_invalidate_seq_hash_cache(seq, src)
-        canary = _ensure_canary(seq)
-        hashes = seq._page_hashes
-        pages = []
-        for i in range(len(seq) // self.page_size):
-            page_hash = _page_hash_from_source(src, hashes, self.page_size, i)
-            page = self.hash2page.get(page_hash)
-            if page is None or self.page2canary[page] != canary:
-                break
-            pages.append(page)
-        if pages:
-            self.id_allocator.retain_many(pages)
-            for page in pages:
-                self.page_ref_num[page] += 1
-        return pages
+        return self.id_allocator.arena.allocator.retain_prefix(
+            self.id_allocator.cache_type, self._prefix,
+            src, seq._page_hashes, self.page_size,
+            len(seq) // self.page_size, _ensure_canary(seq),
+        )
 
     def has_computed(self, seq: GenerationSequence, n_tokens: int) -> Optional[int]:
         """Look up a cached page. Returns the page id or ``None`` on miss.
@@ -2357,16 +2292,11 @@ class PrefixSegment(Segment):
         """
         page_idx = n_tokens // self.page_size - 1
         page_hash = _ensure_page_hash(seq, self.page_size, page_idx)
-        page_num = self.hash2page.get(page_hash)
+        page_num = self._prefix.lookup(page_hash, _ensure_canary(seq))
         if page_num is None:
             return None
-        if self.page2canary[page_num] != _ensure_canary(seq):
-            # Hash collision; treat as miss and let the caller allocate a
-            # fresh page. We deliberately do not evict the cached page here
-            # because the *other* prefix is the legitimate owner.
-            return None
         self.id_allocator.allocate(page_num)
-        self.page_ref_num[page_num] += 1
+        self._prefix.retain([page_num])
         return page_num
 
     def allocate(
@@ -2391,79 +2321,22 @@ class PrefixSegment(Segment):
             key_canary = _ensure_canary(seq)
 
         page_num = self.id_allocator.allocate()
-        # Re-mint: drop any prior hash entries that pointed at this physical
-        # page when it was last cached.
-        if self.page2hash[page_num] != 0 and self.page2hash[page_num] in self.hash2page:
-            del self.hash2page[self.page2hash[page_num]]
-        # Drop stale SSM snapshot for the previous tenant of this page.
+        # The arena callback invalidates the old tenant before returning.
         self._release_snapshot_for(page_num)
-
+        self._prefix.evict(page_num)
         if page_hash is not None:
-            self.page2hash[page_num] = page_hash
-            self.hash2page[page_hash] = page_num
-            self.page2canary[page_num] = key_canary
-            # NO state block is reserved here. Reservation is lazy and coarse --
-            # see ``reserve_ssm_snapshot`` and ``ssm_snapshot_stride``.
-            self.page2ssm_snapshot[page_num] = None
-            self.page2ssm_snapshot_valid[page_num] = False
-        else:
-            self.page2hash[page_num] = 0
-            self.page2canary[page_num] = None
-            self.page2ssm_snapshot[page_num] = None
-            self.page2ssm_snapshot_valid[page_num] = False
-
-        self.page_ref_num[page_num] += 1
+            self._prefix.register(page_num, page_hash, key_canary, True)
+        self._prefix.retain([page_num])
         return page_num
 
     def free(self, page_num: int) -> None:
-        assert self.page_ref_num[page_num] > 0
-        self.page_ref_num[page_num] -= 1
-        if self.page_ref_num[page_num] == 0:
-            # NOTE: keep ``page2ssm_snapshot[page_num]`` alive even though
-            # no one is pinning the page anymore. The cached KV survives
-            # the ref-count hitting zero (its ``hash2page`` entry stays
-            # registered until the page is re-minted for a *different*
-            # prompt by :meth:`allocate`). The SSM snapshot must follow
-            # the same lifetime — otherwise serial reuse of a cached
-            # prompt would always lose the snapshot half of the hit and
-            # ``_restore_ssm_working_state`` would drop the KV half too.
-            self._mark_cached_pages([page_num])
-            self.id_allocator.free(page_num)
-
-    def _mark_cached_pages(self, page_nums) -> None:
-        # A released prefix is still reusable. Keep its beginning longest:
-        # losing the first page would make every subsequent page unreachable
-        # to the contiguous-prefix lookup. Partial/unregistered pages remain
-        # ordinary free space and must be consumed before valid cached pages.
-        arena = self.id_allocator.arena.allocator
-        name = self.id_allocator.cache_type
-        cached, invalidated = [], []
-        for page in reversed(page_nums):
-            page_hash = self.page2hash[page]
-            if page_hash and self.hash2page.get(page_hash) == page:
-                cached.append(page)
-            else:
-                # discard_cached ignores slots without retention. Avoid
-                # materializing a full native retained-slot snapshot here.
-                invalidated.append(page)
-        if invalidated:
-            arena.discard_cached(name, invalidated)
-        if cached:
-            arena.mark_cached(name, cached)
+        self.free_many([page_num])
 
     def free_many(self, page_nums) -> None:
-        """Drop a request's KV references and batch-release newly unpinned pages."""
-        released = []
-        for value in page_nums:
-            page_num = int(value)
-            assert self.page_ref_num[page_num] > 0
-            self.page_ref_num[page_num] -= 1
-            if self.page_ref_num[page_num] == 0:
-                released.append(page_num)
-        if not released:
-            return
-        self._mark_cached_pages(released)
-        self.id_allocator.free_many(released)
+        """Drop references and classify retention order in one native batch."""
+        self.id_allocator.arena.allocator.release_prefix(
+            self.id_allocator.cache_type, self._prefix, page_nums,
+        )
 
     def reserve_ssm_snapshot(self, page_num: int, n_tokens: int) -> Optional[int]:
         """Lazily borrow a cached-state entry for ``page_num``, or ``None``.
@@ -2483,22 +2356,17 @@ class PrefixSegment(Segment):
             return None
         if n_tokens <= 0 or n_tokens % (self.ssm_snapshot_stride * self.page_size):
             return None
-        if self.page2hash[page_num] == 0:
+        if not self._prefix.cacheable(page_num):
             return None
-        slot = self.page2ssm_snapshot[page_num]
+        slot = self._prefix.prepare_snapshot(page_num)
         if slot is not None:
-            # The batch will write this entry again. Protect it from another
-            # row's reservation until all copy targets have been enqueued.
-            self._ssm_snapshot_lru.pop(page_num, None)
-            self.page2ssm_snapshot_valid[page_num] = False
             return slot
         slot = self.ssm_segment.allocate_snapshot()
         while slot is None and self.reclaim_one_ssm_snapshot():
             slot = self.ssm_segment.allocate_snapshot()
         if slot is None:
             return None
-        self.page2ssm_snapshot[page_num] = slot
-        self.page2ssm_snapshot_valid[page_num] = False
+        self._prefix.set_snapshot(page_num, slot)
         # Pending writes are owned but not reclaimable. Publication adds the
         # entry to the LRU; a later row cannot steal this batch's write target.
         return slot
@@ -2506,11 +2374,9 @@ class PrefixSegment(Segment):
     def _release_snapshot_for(self, page_num: int) -> None:
         if self.ssm_segment is None:
             return
-        snap_slot = self.page2ssm_snapshot[page_num]
+        snap_slot = self._prefix.snapshot(page_num)
         if snap_slot is not None:
-            if page_num in self._ssm_snapshot_pins:
-                raise RuntimeError(f"cannot release pinned SSM snapshot for page {page_num}")
+            self._prefix.can_release_snapshot(page_num)
+            # Enqueue tensor reset before making the extent available for reuse.
             self.ssm_segment.free_snapshot(snap_slot)
-            self.page2ssm_snapshot[page_num] = None
-            self._ssm_snapshot_lru.pop(page_num, None)
-        self.page2ssm_snapshot_valid[page_num] = False
+        self._prefix.set_snapshot(page_num, None)

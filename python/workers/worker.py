@@ -469,22 +469,17 @@ class Worker(TorchProfilerMixin):
     def _mirror_ssm_snapshot_slots(self, payload) -> None:
         """Replicate the driver's page->snapshot-slot map on this PP follower.
 
-        No-op unless the model is hybrid *and* prefix caching is on (the segment
-        then exposes ``page2ssm_snapshot``). We only mirror the slot *assignment*
-        (needed by ``_cal_ssm_metadata`` to choose write targets); the follower
-        never reads ``page2ssm_snapshot_valid`` (its restores are shipped, not
-        computed), so that table is left untouched.
+        No-op unless the segment supports prefix snapshots. Mirror native slot
+        assignments for ``_cal_ssm_metadata`` write targets. The follower does
+        not infer snapshot validity; restore decisions arrive from the driver.
         """
         seg = getattr(self.model_runner.memory_manager, "segment", None)
-        page2snap = getattr(seg, "page2ssm_snapshot", None)
-        if page2snap is None:
+        mirror = getattr(seg, "mirror_ssm_snapshot_slots", None)
+        if mirror is None:
             return
         for upd in payload.updates:
-            slots = upd.new_page_snap_slots
-            if not slots:
-                continue
-            for page_num, snap in zip(upd.new_page_ids, slots):
-                page2snap[page_num] = snap if snap >= 0 else None
+            if upd.new_page_snap_slots:
+                mirror(upd.new_page_ids, upd.new_page_snap_slots)
 
     def _apply_ssm_restores(self, seqs) -> None:
         """Replay driver prefix-cache-hit restores on this stage's GDN arena view.
@@ -739,7 +734,7 @@ class Worker(TorchProfilerMixin):
         mm = self.model_runner.memory_manager
         if getattr(mm, "ssm_segment", None) is not None and get_pp_size() > 1:
             seg = getattr(mm, "segment", None)
-            ssm_page2snap = getattr(seg, "page2ssm_snapshot", None)
+            ssm_page2snap = getattr(seg, "snapshot_slots", None)
             ssm_restores = mm.consume_pending_ssm_restores()
         return self.payload_builder.build(
             scheduled_seqs=schedule_seqs,

@@ -2,9 +2,11 @@
 
 The arena uses one Rust allocator for ordinary and prefix-retained cache slots.
 Rust owns physical occupancy, group slot indexes, retention ages and allocation
-priority. Existing Python prefix lookup and eviction callbacks retain their
-policy; they do not maintain a second arena ownership map. The extension only
-handles CPU metadata and does not access tensors or synchronize CUDA.
+priority. Rust also owns the prefix hash index, per-request incremental hash
+chains, KV reference counts, snapshot slot assignments, publication flags,
+restore pins and snapshot LRU. Python only coordinates tensor resets/copies
+and invokes the allocator; it does not maintain shadow ownership tables. The
+extension handles CPU metadata and does not access tensors or synchronize CUDA.
 
 Before any prefix is retained, an ordered bitset selects free slots. The first
 `mark_cached` call switches the same allocator to age-aware heaps. Uncached
@@ -85,3 +87,47 @@ than physical page count: different PP-local layouts can choose different
 physical grains. Allocation is rounded down to a whole number of target slots,
 so the backing allocation stays within each rank's budget. This is startup-only
 CPU layout arithmetic; it adds no device synchronization to request processing.
+
+## Prefix cache metadata
+
+`PrefixCore` and `PrefixHashes` are part of the required `_cache_arena`
+extension. Prefix scans stay lazy: only complete pages through the first miss
+are hashed. Hash keys retain Python's integer tuple-hash semantics and the
+first-eight-token canary, including multimodal content-derived IDs. A native
+hash chain holds its source list and invalidates on source replacement; it
+supports independent deep copies and pickling for scheduler/request transport.
+As before, already-hashed token boundaries must remain unchanged; decode may
+append committed tokens beyond those boundaries.
+
+Lookup and arena retain execute in one native operation. All hit pages are
+pinned before Python may allocate recurrent working state or reclaim snapshots.
+Release validates the whole reference batch first, then updates references,
+retention ages and physical ownership without sending intermediate page lists
+back through Python. The existing policy remains: use clean slots first, then
+older cached requests, preserving the beginning of each prefix longest.
+
+Snapshot publication and restore pins are separate from KV references. Pending
+writes never enter the reclaimable LRU; only the assigned slot can be published.
+Nested pins protect restore sources, and their final unpin returns published
+snapshots to the newest end. An intrusive native list provides constant-time
+LRU updates without stale heap entries. Python enqueues the tensor reset before
+releasing the arena extent; Rust borrows end before callbacks can reenter cache
+metadata. PP followers mirror slot assignments in a validated native batch.
+PP payload generation reads slots by index without copying the entire table.
+
+Prefix properties such as `page_ref_num`, `hash2page`, `page2ssm_snapshot` and
+`_ssm_snapshot_lru` are diagnostic snapshots, just like the arena properties.
+Mutating returned containers does not change ownership. Runtime code uses
+explicit native operations; there is no Python metadata backend or switch.
+
+```sh
+pytest -q tests/test_native_prefix_cache.py tests/test_prefix_cache_reuse.py \
+  tests/test_ssm_snapshot_replacement.py tests/test_ssm_snapshot_publication.py \
+  tests/test_cache_capacity.py tests/test_worker_nonoverlap.py
+python benchmarks/benchmark_prefix_cache_metadata.py --tokens 32768 144000
+```
+
+The benchmark uses CPU backing tensors and full-prefix hits. Fresh-request
+lookup includes hash generation; cached-hash lookup excludes it. Both include
+arena retain, and release includes retention policy and physical ownership
+updates. These are metadata measurements, not TTFT or model throughput.
