@@ -22,7 +22,7 @@ from gllm.entrypoints import cli_args
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="gLLM LM Server (encoder-disaggregated)")
-    # --- Model / engine: shared with api_server (gllm/entrypoints/cli_args.py) ---
+    # --- Model / engine: shared with api_server (python/entrypoints/cli_args.py) ---
     cli_args.add_frontend_args(p)
     cli_args.add_engine_args(
         p,

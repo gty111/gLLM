@@ -86,7 +86,7 @@ def mhc_pre(
 
     if _fused_mhc_usable(x, hc_fn):
         # Three launches instead of ~10, and the mix projection avoids cuBLAS'
-        # SIMT fp32 SGEMM -- see gllm/layers/ops/deepseek_v4/mhc.py.
+        # SIMT fp32 SGEMM -- see python/layers/ops/deepseek_v4/mhc.py.
         from gllm.layers.ops.deepseek_v4 import (
             hc_split_sinkhorn_fused,
             mhc_mix_and_sumsq,

@@ -5,7 +5,7 @@ from gllm.layers.layernorm import GemmaRMSNorm
 
 # BF16 keeps 8 mantissa bits, so one ulp is 2**-8 relative. The norm's own
 # FP32 reduction order is not required to match ``torch.mean``'s any more (see
-# ``gllm/layers/ops/gemma_rmsnorm.py``), which moves the variance estimate by
+# ``python/layers/ops/gemma_rmsnorm.py``), which moves the variance estimate by
 # well under an ulp and the output by at most a couple. The previous
 # ``atol=4e-3, rtol=0`` encoded the old bitwise guarantee -- it left room for
 # exactly one ulp at magnitude 1 and none at all above it.

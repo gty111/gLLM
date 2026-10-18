@@ -847,7 +847,7 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
                 f"<= {self._mtp_max_batch} seqs; larger batches take a plain "
                 f"decode step."
             )
-        # GPU-native MTP input prep (see ``gllm/speculative/gpu_prep.py``). It replaces
+        # GPU-native MTP input prep (see ``python/speculative/gpu_prep.py``). It replaces
         # the per-step Python rebuild of the
         # draft / verify input arrays with persistent pinned staging + a few
         # vectorized CUDA ops writing straight into the static graph buffers.

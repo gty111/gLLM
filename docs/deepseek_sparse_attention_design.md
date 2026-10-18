@@ -21,8 +21,8 @@ with `quantization_config.scale_fmt="ue8m0"`.
 
 V3.2's config and weights are a strict superset of V3 — identical MLA
 projections, MoE block, YaRN RoPE, FP8 block-quant — so everything except
-attention is inherited from `gllm/models/deepseek_v2.py`. The additions live in
-`gllm/models/deepseek_v32.py`:
+attention is inherited from `python/models/deepseek_v2.py`. The additions live in
+`python/models/deepseek_v32.py`:
 
 - **`DeepseekV32Indexer`**: a lightweight side path
   (`self_attn.indexer.{wq_b, wk, k_norm, weights_proj}`). Per token it computes a
@@ -70,7 +70,7 @@ one DSA-specific:
 
 ### 3.1 MoE double-sigmoid (primary, affects all DeepSeek-V3 models)
 
-`gllm/layers/moe/topk.py::fused_grouped_topk` pre-computed `scores =
+`python/layers/moe/topk.py::fused_grouped_topk` pre-computed `scores =
 gating.sigmoid()` and fed **that** to `sgl_kernel.moe_fused_gate`, which applies
 sigmoid **internally** — i.e. `sigmoid(sigmoid(logits))`. Because sigmoid is
 monotonic the ranking is mostly preserved (so it degraded a few points rather
@@ -93,7 +93,7 @@ un-aligned path. Confirmed against the reference `inference/kernel.py::act_quant
 (`round_scale=True`) and HF `deep_gemm.per_token_cast_to_fp8(use_ue8m0=True)`.
 
 **Fix**: a `round_scale` constexpr in the Triton per-token-group quant kernels
-(`gllm/layers/quantization/fp8.py`), enabled **from config**
+(`python/layers/quantization/fp8.py`), enabled **from config**
 (`quantization_config.scale_fmt == "ue8m0"`) — threaded through the dense linear
 path (`fp8LinearMethod`, bypassing the sgl/flashinfer fast paths which don't
 round) **and** the MoE experts (`_fp8_quantize` via `Fp8MoEMethod`). DeepGEMM's
@@ -194,7 +194,7 @@ The V3.2 FP8-packed MLA cache uses a 656-byte/token layout (512 fp8 nope + 4×fp
 per-tile scales + 64 bf16 rope). `flash_mla_sparse_fwd` needs a bf16 latent buffer
 its physical-slot indices can address, so the cache is dequantized first.
 
-`dequant_mla_fp8_slots` (`gllm/layers/ops/cache_kernels.py`): dequantizes **only
+`dequant_mla_fp8_slots` (`python/layers/ops/cache_kernels.py`): dequantizes **only
 the physical slots the top-k actually references** (`torch.unique(topk_indices)`,
 ≥0) into a **full-width, physical-slot-indexed** bf16 buffer. Unreferenced rows
 are never written (the kernel never reads them), so absolute slots index the

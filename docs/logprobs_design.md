@@ -94,7 +94,7 @@ rank that holds the gathered full-vocab logits.
 
 ### 3.1 Generation logprobs
 
-`Sampler.compute_logprobs` (`gllm/layers/sampler.py`) returns, on GPU:
+`Sampler.compute_logprobs` (`python/layers/sampler.py`) returns, on GPU:
 
 - `sampled` `[B]` — the logprob of the chosen token (always reported), and
 - `top_vals` / `top_ids` `[B, k]` — the top-`k` alternatives.
@@ -184,7 +184,7 @@ Key carriers:
 - **`IPCPackage.logprobs`** (list) and **`IPCPackage.prompt_logprobs`** (dict
   keyed by seq_id) — empty on the common no-logprobs path, so they add nothing to
   the pickled payload.
-- **`StreamOutput`** (`gllm/utils/__init__.py`) — wraps `text`, `logprob`,
+- **`StreamOutput`** (`python/utils/__init__.py`) — wraps `text`, `logprob`,
   `prompt_logprobs` so the async stream carries structured data, not a bare str.
 
 `Scheduler._attach_prompt_logprobs` emits a seq's completed
@@ -321,16 +321,16 @@ curl -s localhost:8200/v1/chat/completions -H 'Content-Type: application/json' -
 
 | File | Role |
 |------|------|
-| `gllm/entrypoints/protocol.py` | request/response schema fields |
-| `gllm/entrypoints/api_server.py` | parse + clamp request params |
-| `gllm/entrypoints/serving_chat.py`, `serving_completions.py` | build OpenAI logprob objects |
-| `gllm/layers/sampler.py` | `compute_logprobs` on GPU |
-| `gllm/runtime/model_runner.py` | `_build_logprob_rows`, `_compute_prompt_logprobs`, overlap staging |
-| `gllm/models/*.py` | `logits_from_hidden` (LM-head projection) |
-| `gllm/scheduling/scheduler.py` | queue logprobs with tokens, `_attach_prompt_logprobs` |
-| `gllm/distributed/comm.py` | `IPCPackage.logprobs` / `prompt_logprobs`, token socket tuple |
-| `gllm/workers/worker.py`, `workers/overlap.py` | carry logprobs alongside tokens (incl. PP>1) |
-| `gllm/scheduling/distributed.py` | `SeqRegister` / `FollowerSeq` logprob flags (PP>1) |
-| `gllm/runtime/sequence.py` | per-seq logprob flags + `prompt_logprobs_data` |
-| `gllm/engine/llm.py`, `engine/async_llm.py` | decode ids → entries, plumb params |
-| `gllm/utils/__init__.py` | `StreamOutput` |
+| `python/entrypoints/protocol.py` | request/response schema fields |
+| `python/entrypoints/api_server.py` | parse + clamp request params |
+| `python/entrypoints/serving_chat.py`, `serving_completions.py` | build OpenAI logprob objects |
+| `python/layers/sampler.py` | `compute_logprobs` on GPU |
+| `python/runtime/model_runner.py` | `_build_logprob_rows`, `_compute_prompt_logprobs`, overlap staging |
+| `python/models/*.py` | `logits_from_hidden` (LM-head projection) |
+| `python/scheduling/scheduler.py` | queue logprobs with tokens, `_attach_prompt_logprobs` |
+| `python/distributed/comm.py` | `IPCPackage.logprobs` / `prompt_logprobs`, token socket tuple |
+| `python/workers/worker.py`, `workers/overlap.py` | carry logprobs alongside tokens (incl. PP>1) |
+| `python/scheduling/distributed.py` | `SeqRegister` / `FollowerSeq` logprob flags (PP>1) |
+| `python/runtime/sequence.py` | per-seq logprob flags + `prompt_logprobs_data` |
+| `python/engine/llm.py`, `engine/async_llm.py` | decode ids → entries, plumb params |
+| `python/utils/__init__.py` | `StreamOutput` |

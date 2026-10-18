@@ -535,7 +535,7 @@ class InputData:
         """Declare that the GPU buffers were filled without the CPU builders.
 
         ``MtpGpuPrep`` writes the device buffers directly (see
-        ``gllm/speculative/gpu_prep.py``), so the ``*_cpu`` staging tensors this class
+        ``python/speculative/gpu_prep.py``), so the ``*_cpu`` staging tensors this class
         normally derives its *shapes* from are never built. The ``get_*``
         accessors slice by those shapes, so point them at cached, correctly
         shaped placeholders: the values are not read by the captured graph (it
