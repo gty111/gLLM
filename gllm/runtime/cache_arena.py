@@ -13,7 +13,9 @@ unpinned metadata when another type claims overlapping bytes.
 """
 
 import heapq
+import os
 from dataclasses import dataclass, field
+from math import gcd, lcm
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -89,6 +91,28 @@ class CacheLayout:
         return _align_up(offsets[last.name] + last.nbytes, alignment)
 
 
+def select_physical_page_bytes(
+    layouts: Iterable[CacheLayout], *, min_page_bytes: int = 1024
+) -> int:
+    """Choose one fixed accounting grain before allocating the arena.
+
+    Use the GCD of logical entry sizes when it meets the metadata-budget
+    floor. Below the floor, registration rounds each entry up to whole
+    physical pages; the logical tensor shape and packed bank offsets remain
+    unchanged. Include scalar alignment so every slot has valid typed views.
+    """
+    layouts = tuple(layouts)
+    if not layouts or min_page_bytes <= 0:
+        raise ValueError("cache layouts and a positive minimum page size are required")
+    alignment = lcm(16, *(
+        get_dtype_bytes(tensor.dtype)
+        for layout in layouts for tensor in layout.tensors
+    ))
+    common = gcd(*(layout.entry_bytes for layout in layouts))
+    floor = _align_up(min_page_bytes, alignment)
+    return common if common >= floor else floor
+
+
 @dataclass
 class ArenaCacheType:
     """One logical cache layout registered in a :class:`CacheArena`."""
@@ -100,6 +124,10 @@ class ArenaCacheType:
     prefer_high: bool = False
     free_slots: Set[int] = field(default_factory=set)
     free_heap: List[Tuple[int, int]] = field(default_factory=list)
+    # Before the first retained prefix, each queued slot has the same age.
+    # A cross-type claim leaves its heap entry usable on release: do not push
+    # a duplicate. None switches to the age/version-aware lazy heap behavior.
+    _clean_heap_slots: Optional[Set[int]] = field(default_factory=set)
     live_slots: Set[int] = field(default_factory=set)
     # Number of physical pages in each logical slot currently owned by any
     # cache type. Maintaining this incrementally makes the allocator's hot
@@ -127,6 +155,10 @@ class ArenaCacheType:
     def refresh_free(self, slot: int) -> None:
         if slot not in self.free_slots:
             return
+        if self._clean_heap_slots is not None:
+            if slot in self._clean_heap_slots:
+                return
+            self._clean_heap_slots.add(slot)
         heapq.heappush(
             self.free_heap, (self.cached_priority[slot], self.heap_key(slot))
         )
@@ -137,14 +169,39 @@ class ArenaCacheType:
                 (self.cached_priority[s], self.heap_key(s)) for s in self.free_slots
             ]
             heapq.heapify(self.free_heap)
+            if self._clean_heap_slots is not None:
+                self._clean_heap_slots = set(self.free_slots)
 
     def discard_free(self, slot: int) -> None:
         self.free_slots.discard(slot)
+
+    def add_clean_free_range(self, start: int, end: int) -> None:
+        """Publish a newly freed range before any cache ages exist."""
+        slots = range(start, end)
+        self.free_slots.update(slots)
+        assert self._clean_heap_slots is not None
+        pending = [s for s in slots if s not in self._clean_heap_slots]
+        self._clean_heap_slots.update(pending)
+        count = len(pending)
+        if not count:
+            return
+        if len(self.free_heap) + count > 4 * self.num_slots + 64:
+            self.free_heap = [(0, self.heap_key(s)) for s in self.free_slots]
+            heapq.heapify(self.free_heap)
+            self._clean_heap_slots = set(self.free_slots)
+        elif count > max(64, len(self.free_heap) // 8):
+            self.free_heap.extend((0, self.heap_key(s)) for s in pending)
+            heapq.heapify(self.free_heap)
+        else:
+            for slot in pending:
+                heapq.heappush(self.free_heap, (0, self.heap_key(slot)))
 
     def take_free(self) -> Optional[int]:
         while self.free_heap:
             priority, key = heapq.heappop(self.free_heap)
             slot = -key if self.prefer_high else key
+            if self._clean_heap_slots is not None:
+                self._clean_heap_slots.discard(slot)
             if slot in self.free_slots and priority == self.cached_priority[slot]:
                 self.free_slots.remove(slot)
                 return slot
@@ -192,15 +249,21 @@ class CacheArenaAllocator:
             occupied_pages=[0] * (self.num_physical_pages // pages),
             cached_priority=[0] * (self.num_physical_pages // pages),
         )
+        if self._cache_clock:
+            cache_type._clean_heap_slots = None
         self._types[name] = cache_type
         # Types are normally registered before the first claim. Populate from
         # the owner map as a correctness-preserving fallback for dynamically
         # registered cache shapes.
         for slot in range(cache_type.num_slots):
             start, end = self._extent(cache_type, slot)
-            occupied = sum(owner is not None for owner in self._owners[start:end])
+            occupied = (
+                sum(owner is not None for owner in self._owners[start:end])
+                if self._used_physical_pages else 0
+            )
             cache_type.occupied_pages[slot] = occupied
-            cache_type.cached_priority[slot] = max(self._cached_pages[start:end])
+            if self._cache_clock:
+                cache_type.cached_priority[slot] = max(self._cached_pages[start:end])
             if occupied == 0:
                 cache_type.add_free(slot)
         return cache_type
@@ -242,6 +305,11 @@ class CacheArenaAllocator:
             if slot not in cache_type.live_slots:
                 raise RuntimeError(f"cannot cache unowned {name} slot {slot}")
             extents.append((start, end))
+        if extents and not self._cache_clock:
+            # Cached ages can now change while an old entry is still queued.
+            # Disable clean-entry reuse before publishing the first age.
+            for registered in self._types.values():
+                registered._clean_heap_slots = None
         for start, end in extents:
             self._cache_clock += 1
             self._cached_pages[start:end] = [self._cache_clock] * (end - start)
@@ -331,7 +399,11 @@ class CacheArenaAllocator:
         if delta not in (-1, 1):
             raise ValueError(delta)
         for cache_type in self._types.values():
-            for slot in self._overlapping_slots(cache_type, start, end):
+            overlapping = self._overlapping_slots(cache_type, start, end)
+            if not self._cache_clock and len(overlapping) > 4:
+                self._update_clean_candidates(cache_type, start, end, delta, overlapping)
+                continue
+            for slot in overlapping:
                 slot_start, slot_end = self._extent(cache_type, slot)
                 overlap = min(end, slot_end) - max(start, slot_start)
                 occupied = cache_type.occupied_pages[slot] + delta * overlap
@@ -342,14 +414,61 @@ class CacheArenaAllocator:
                     )
                 cache_type.occupied_pages[slot] = occupied
                 if occupied == 0:
-                    cache_type.cached_priority[slot] = (
-                        self._cached_pages[slot_start]
-                        if cache_type.pages_per_slot == 1
-                        else max(self._cached_pages[slot_start:slot_end])
-                    )
+                    # Until the first retained prefix, all ages are zero.
+                    # In particular a large recurrent slot needs no scan of
+                    # thousands of physical pages just to rediscover that.
+                    if not self._cache_clock:
+                        priority = 0
+                    elif cache_type.pages_per_slot == 1:
+                        priority = self._cached_pages[slot_start]
+                    else:
+                        priority = max(self._cached_pages[slot_start:slot_end])
+                    cache_type.cached_priority[slot] = priority
                     cache_type.add_free(slot)
                 else:
                     cache_type.discard_free(slot)
+
+    def _update_clean_candidates(
+        self, cache_type: ArenaCacheType, start: int, end: int,
+        delta: int, overlapping: range,
+    ) -> None:
+        """Bulk-update fully covered slots; only two boundary slots can be partial.
+
+        A claimed range was entirely free and a released range entirely owned.
+        Hence every fully covered typed slot transitions between zero and full
+        occupancy, even when the two cache types have different slot grids.
+        Prefix-cache priorities use the scalar path instead.
+        """
+        span = cache_type.pages_per_slot
+        first = min(overlapping.stop, (start + span - 1) // span)
+        stop = max(first, min(overlapping.stop, end // span))
+        if first < stop:
+            previous = cache_type.occupied_pages[first:stop]
+            expected = 0 if delta == 1 else span
+            if min(previous) != expected or max(previous) != expected:
+                raise RuntimeError(
+                    f"arena occupancy index is inconsistent for {cache_type.name}"
+                )
+            cache_type.occupied_pages[first:stop] = [span - expected] * (stop - first)
+            if delta == 1:
+                cache_type.free_slots.difference_update(range(first, stop))
+            else:
+                cache_type.add_clean_free_range(first, stop)
+        for slot in dict.fromkeys((overlapping.start, overlapping.stop - 1)):
+            if first <= slot < stop:
+                continue
+            slot_start = slot * span
+            overlap = min(end, slot_start + span) - max(start, slot_start)
+            occupied = cache_type.occupied_pages[slot] + delta * overlap
+            if not 0 <= occupied <= span:
+                raise RuntimeError(
+                    f"arena occupancy index is inconsistent for {cache_type.name} slot {slot}"
+                )
+            cache_type.occupied_pages[slot] = occupied
+            if occupied == 0:
+                cache_type.add_free(slot)
+            else:
+                cache_type.discard_free(slot)
 
     def _claim(self, cache_type: ArenaCacheType, slot: int) -> None:
         self._claim_many(cache_type, [slot])
@@ -441,13 +560,14 @@ class CacheArenaAllocator:
             return []
 
         if slot is not None:
-            start, end = self._extent(cache_type, int(slot))
-            owners = set(self._owners[start:end])
-            if owners == {(name, int(slot))}:
+            self._extent(cache_type, int(slot))
+            # Claims own whole aligned slots. The live-slot set and occupancy
+            # index already encode exact ownership, including cross-type overlap.
+            if int(slot) in cache_type.live_slots:
                 if retain:
                     return [int(slot)]
                 raise RuntimeError(f"{name} slot {slot} is already live")
-            if owners != {None}:
+            if cache_type.occupied_pages[int(slot)] != 0:
                 return None
             cache_type.discard_free(int(slot))
             selected = [int(slot)]
@@ -515,8 +635,11 @@ class CacheArenaAllocator:
         extents = []
         for slot in slot_list:
             start, end = self._extent(cache_type, slot)
-            expected = (name, slot)
-            if any(owner != expected for owner in self._owners[start:end]):
+            # A live logical slot owns its entire extent. Other types cannot
+            # claim any part until it is released; validate the full cohort
+            # before changing ownership, without rescanning physical pages.
+            if (slot not in cache_type.live_slots
+                    or cache_type.occupied_pages[slot] != cache_type.pages_per_slot):
                 raise RuntimeError(f"{name} slot {slot} is not live")
             extents.append((start, end, slot))
 
@@ -524,10 +647,8 @@ class CacheArenaAllocator:
         # MTP block tables are allocated as neighboring arena entries; updating
         # every overlapping cache grid once for the combined range avoids
         # repeating the generic candidate walk for each checkpoint column.
-        for start, end, slot in extents:
-            self._owners[start:end] = [None] * (end - start)
+        for _, _, slot in extents:
             cache_type.live_slots.remove(slot)
-            self._used_physical_pages -= end - start
         merged = []
         for start, end, _ in sorted(extents):
             if merged and start == merged[-1][1]:
@@ -535,6 +656,13 @@ class CacheArenaAllocator:
             else:
                 merged.append((start, end))
         for start, end in merged:
+            # Bound temporary slice storage for fine-grained arenas: a long
+            # request can span millions of physical pages. Still batch the
+            # candidate-grid update over the full coalesced range below.
+            for offset in range(start, end, 65536):
+                stop = min(offset + 65536, end)
+                self._owners[offset:stop] = [None] * (stop - offset)
+            self._used_physical_pages -= end - start
             self._update_candidates(start, end, -1)
 
     def is_free(self, name: str, slot: int) -> bool:
@@ -613,6 +741,11 @@ class RegisteredCache:
     @property
     def entry_bytes(self) -> int:
         return self.layout.entry_bytes
+
+    @property
+    def slot_bytes(self) -> int:
+        """Physical slot stride, including any page-grain padding."""
+        return self.cache_type.pages_per_slot * self.arena.physical_page_bytes
 
     def tensor(self, name: str) -> torch.Tensor:
         try:
@@ -775,3 +908,19 @@ class ArenaSlotAllocator:
 
     def get_num_free_ids(self):
         return self.arena.allocator.num_available_slots(self.cache_type)
+
+
+# Keep a reference backend for differential tests and source-only development.
+# Prefix and ordinary caches select the same native ownership implementation.
+PythonCacheArenaAllocator = CacheArenaAllocator
+_arena_backend = os.environ.get("GLLM_CACHE_ARENA_BACKEND", "auto")
+if _arena_backend not in ("auto", "python", "rust"):
+    raise ValueError("GLLM_CACHE_ARENA_BACKEND must be auto, python or rust")
+if _arena_backend != "python":
+    try:
+        from gllm.runtime.native_cache_arena import NativeCacheArenaAllocator
+    except ModuleNotFoundError as _exc:
+        if _arena_backend == "rust" or _exc.name != "gllm._cache_arena":
+            raise
+    else:
+        CacheArenaAllocator = NativeCacheArenaAllocator

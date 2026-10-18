@@ -1,3 +1,5 @@
+recursive-include rust/cache_arena *.toml *.lock *.rs
 include requirements.txt
 include LICENSE
 include README.md
+prune rust/cache_arena/target
