@@ -613,7 +613,10 @@ def test_mirror_ssm_snapshot_slots_noop_without_segment():
 
 def test_mirror_ssm_snapshot_slots_applies_driver_assignments():
     page2snap = {10: 1}
-    seg = SimpleNamespace(page2ssm_snapshot=page2snap)
+    def mirror(pages, slots):
+        page2snap.update((page, slot if slot >= 0 else None) for page, slot in zip(pages, slots))
+
+    seg = SimpleNamespace(mirror_ssm_snapshot_slots=mirror)
     worker = make_worker(
         model_runner=SimpleNamespace(memory_manager=SimpleNamespace(segment=seg))
     )

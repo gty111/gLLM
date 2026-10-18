@@ -172,6 +172,30 @@ class NativeCacheArenaAllocator:
         self._call(self._core.free, group.index, self._slots(slots))
         self._emit_changes(-1)
 
+    def retain_prefix(self, name, prefix, src, hashes, page_size, count, canary):
+        """Scan and pin cached pages before invoking any eviction callback."""
+        group = self.cache_type(name)
+        result = self._call(
+            prefix.retain_scanned, self._core, group.index,
+            src, hashes, page_size, count, canary,
+        )
+        if result:
+            self._emit_changes(1)
+            notifications = self._core.invalidate_claimed(
+                group.index, [g.evictor is not None for g in self._groups], True,
+            )
+            for index, slot in notifications:
+                callback = self._groups[index].evictor
+                if callback is not None:
+                    callback(slot)
+        return result
+
+    def release_prefix(self, name, prefix, slots):
+        """Drop references, mark retention and free extents in one native call."""
+        group = self.cache_type(name)
+        self._call(prefix.release_arena, self._core, group.index, self._slots(slots))
+        self._emit_changes(-1)
+
     def mark_cached(self, name, slots):
         self._call(self._core.mark_cached, self.cache_type(name).index, self._slots(slots))
 

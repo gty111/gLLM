@@ -1,4 +1,5 @@
-//! CPU-only aligned cache ownership. No tensor/device operations or unsafe code.
+mod prefix;
+// CPU-only aligned cache ownership. No tensor/device operations or unsafe code.
 use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use std::cmp::Reverse;
@@ -443,6 +444,14 @@ impl ArenaCore {
         self.refresh_ages(ranges);
         Ok(())
     }
+    fn invalidate_claimed(
+        &mut self,
+        id: usize,
+        callbacks: Vec<bool>,
+        preserve: bool,
+    ) -> PyResult<Vec<(usize, usize)>> {
+        self.invalidate(id, self.claimed.clone(), callbacks, preserve)
+    }
     // Determine stale views while the new owner is already pinned. Python
     // invokes policy callbacks after this method returns (no Rust borrow held).
     fn invalidate(
@@ -558,5 +567,7 @@ impl ArenaCore {
 #[pymodule]
 fn _cache_arena(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ArenaCore>()?;
+    m.add_class::<prefix::PrefixCore>()?;
+    m.add_class::<prefix::PrefixHashes>()?;
     Ok(())
 }
