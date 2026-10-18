@@ -58,22 +58,16 @@ setup(
             "layers/quantization/csrc/marlin/include/sgl_kernel/*",
         ],
     },
-    rust_extensions=(
-        [] if os.environ.get("GLLM_BUILD_RUST") == "0" else [
-            RustExtension(
-                "gllm._cache_arena",
-                path="rust/cache_arena/Cargo.toml",
-                binding=Binding.PyO3,
-                features=["pyo3/extension-module"],
-                py_limited_api=True,
-                debug=False,
-            ),
-        ]
-    ),
+    rust_extensions=[
+        RustExtension(
+            "gllm._cache_arena",
+            path="rust/cache_arena/Cargo.toml",
+            binding=Binding.PyO3,
+            features=["pyo3/extension-module"],
+            py_limited_api=True,
+            debug=False,
+        ),
+    ],
     zip_safe=False,
-    options=(
-        {} if os.environ.get("GLLM_BUILD_RUST") == "0" else {
-            "bdist_wheel": {"py_limited_api": "cp39"},
-        }
-    ),
+    options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )

@@ -25,8 +25,8 @@ PyO3 extension in release mode. Source distributions include the Cargo sources
 and lockfile. Wheels carry the Python 3.9+ stable ABI extension.
 
 For an existing environment with build isolation disabled, install
-`setuptools-rust>=1.10,<2` first. A source-only development installation is
-available with `GLLM_BUILD_RUST=0 pip install -e . --no-deps`.
+`setuptools-rust>=1.10,<2` first. Rust and the compiled extension are required;
+there is no Python allocator fallback.
 
 On hosts that need a mirror, configure the toolchain before installing gLLM:
 
@@ -47,19 +47,18 @@ registry = "sparse+https://rsproxy.cn/index/"
 
 The mirror is a host setting and is not hardcoded into the package build.
 
-## Backend selection and checks
+## Checks
 
-`GLLM_CACHE_ARENA_BACKEND=auto` (the default) selects Rust when the extension is
-installed, otherwise the Python reference. `rust` requires the extension and
-fails immediately if it is missing. `python` selects the reference for
-comparison. Import or ABI errors in an installed extension are not hidden by an
-automatic fallback. Set the variable before importing gLLM or starting workers.
+The arena always uses the Rust extension. Import fails immediately when the
+extension is missing or incompatible; there is no backend selection setting.
+The Python adapter exposes batch operations and policy callbacks without
+maintaining a second ownership map.
 
 ```sh
-GLLM_CACHE_ARENA_BACKEND=rust pytest -q \
+pytest -q \
   tests/test_cache_arena.py tests/test_native_cache_arena.py \
   tests/test_memory_manager_arena.py tests/test_cache_capacity.py \
-  tests/test_prefix_cache_reuse.py
+  tests/test_prefix_cache_reuse.py tests/test_cache_arena_granularity.py
 ```
 
 Native cache-type properties such as `free_slots`, `live_slots` and
