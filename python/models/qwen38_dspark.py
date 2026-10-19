@@ -27,7 +27,7 @@ that trained this checkpoint.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 from torch import nn
@@ -58,6 +58,10 @@ from gllm.models.weight_loader import (
     run_weight_loader,
 )
 from gllm.models.weight_utils import get_tensor_from_dict
+
+
+if TYPE_CHECKING:
+    from gllm.runtime.memory_manager import DSparkRequestCache, Segment
 
 
 @dataclass(frozen=True)
@@ -187,6 +191,17 @@ class Qwen38DSparkCache:
         return self.keys[0].shape[-2]
 
 
+@dataclass
+class Qwen38DSparkPagedCache:
+    """A view of one request's arena storage; allocation stays with the runtime."""
+
+    segment: Segment
+    state: DSparkRequestCache
+
+    def context_length(self) -> int:
+        return self.state.context_length
+
+
 class Qwen38DSparkMarkovHead(nn.Module):
     """Low-rank previous-token logit bias (SpecForge ``VanillaMarkovHead``).
 
@@ -289,6 +304,9 @@ class Qwen38DSparkAttention(nn.Module):
         cached_v: torch.Tensor,
         noise_positions: torch.Tensor,
         rotary_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor | None = None,
+        context_length: int = 0,
     ) -> torch.Tensor:
         """Attend the noisy block against the history plus itself.
 
@@ -309,17 +327,77 @@ class Qwen38DSparkAttention(nn.Module):
         k_noise, v_noise = self._project_kv(hidden_states)
         k_noise = _rotate(k_noise, rotary_cache, noise_positions)
 
-        k = torch.cat([cached_k, k_noise], dim=2)
-        v = torch.cat([cached_v, v_noise], dim=2)
-        k = _repeat_kv(k, self.num_key_value_groups)
-        v = _repeat_kv(v, self.num_key_value_groups)
-        # No mask: the reference offline path passes ``attention_mask=None``
-        # with ``is_causal=False``, so the block sees everything.
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, scale=self.scaling
-        )
+        if page_table is not None:
+            out = self._paged_attention(
+                q, k_noise, v_noise, cached_k, cached_v, page_table, context_length
+            )
+        else:
+            k = torch.cat([cached_k, k_noise], dim=2)
+            v = torch.cat([cached_v, v_noise], dim=2)
+            k = _repeat_kv(k, self.num_key_value_groups)
+            v = _repeat_kv(v, self.num_key_value_groups)
+            # The dense validation path also sees all history and noise.
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, scale=self.scaling
+            )
         out = out.transpose(1, 2).reshape(batch, query_len, -1)
         return self.o_proj(out)
+
+    def _paged_attention(
+        self,
+        q: torch.Tensor,
+        k_noise: torch.Tensor,
+        v_noise: torch.Tensor,
+        cached_k: torch.Tensor,
+        cached_v: torch.Tensor,
+        page_table: torch.Tensor,
+        context_length: int,
+    ) -> torch.Tensor:
+        """Merge noncausal paged history and dense noise for one request.
+
+        Both sources share Q, scale and natural-log LSE. Only the small noise
+        matrices are expanded for GQA; historical K/V stays in the arena.
+        """
+        noise_k = _repeat_kv(k_noise, self.num_key_value_groups)
+        noise_v = _repeat_kv(v_noise, self.num_key_value_groups)
+        scores = torch.matmul(q.float(), noise_k.float().transpose(-1, -2))
+        scores = scores * self.scaling
+        noise_output = torch.matmul(scores.softmax(-1), noise_v.float()).to(q.dtype)
+        if context_length == 0:
+            # The paged reducer has no valid split for an empty history.
+            return noise_output
+
+        from gllm.layers.ops.merge_attn_states import merge_attn_states
+        from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
+
+        query = q[0].transpose(0, 1).contiguous()
+        query_len = query.shape[0]
+        history_output = torch.empty_like(query)
+        history_lse = torch.empty(
+            query_len, self.num_heads, device=q.device, dtype=torch.float32
+        )
+        # Each noisy row is an independent query over the same request history.
+        block_table = page_table.expand(query_len, -1).contiguous()
+        seq_lens = torch.full(
+            (query_len,), context_length, device=q.device, dtype=torch.int32
+        )
+        num_splits = 4
+        scratch = torch.empty(
+            query_len, self.num_heads, num_splits, self.head_dim + 1,
+            device=q.device, dtype=torch.float32,
+        )
+        decode_attention_fwd(
+            query, cached_k, cached_v, history_output, history_lse,
+            block_table, seq_lens, scratch, num_splits, self.scaling,
+            cached_k.shape[1],
+        )
+        noise_lse = scores.logsumexp(-1)[0].transpose(0, 1).contiguous()
+        suffix_output = noise_output[0].transpose(0, 1).contiguous()
+        merged = torch.empty_like(history_output)
+        merge_attn_states(
+            merged, history_output, history_lse, suffix_output, noise_lse
+        )
+        return merged.transpose(0, 1).unsqueeze(0)
 
 
 class Qwen38DSparkDecoderLayer(nn.Module):
@@ -341,6 +419,9 @@ class Qwen38DSparkDecoderLayer(nn.Module):
         cached_v: torch.Tensor,
         noise_positions: torch.Tensor,
         rotary_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor | None = None,
+        context_length: int = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(
@@ -349,6 +430,8 @@ class Qwen38DSparkDecoderLayer(nn.Module):
             cached_v,
             noise_positions,
             rotary_cache,
+            page_table=page_table,
+            context_length=context_length,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
@@ -431,13 +514,113 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
             values.append(v)
         return Qwen38DSparkCache(keys=keys, values=values)
 
+    @torch.no_grad()
+    def prefill_paged(
+        self,
+        main_hidden: torch.Tensor,
+        *,
+        segment: Segment,
+        cache: DSparkRequestCache,
+    ) -> Qwen38DSparkPagedCache:
+        """Seed or append a prompt chunk in storage reserved by the caller."""
+        self.append_paged_context(
+            main_hidden, start_pos=cache.context_length + main_hidden.shape[1],
+            segment=segment, cache=cache,
+        )
+        return Qwen38DSparkPagedCache(segment=segment, state=cache)
+
+    @torch.no_grad()
+    def append_paged_context(
+        self,
+        main_hidden: torch.Tensor,
+        *,
+        start_pos: int,
+        segment: Segment,
+        cache: DSparkRequestCache,
+    ) -> None:
+        """Append accepted context to an already-reserved draft segment.
+
+        This single-request BF16/TP=1 path uses the same position convention as
+        forward_draft: start_pos is the exclusive context end (the anchor
+        position), and the suffix starts at cache.context_length. Logical slot
+        IDs address the segment's strided views; they are not physical page IDs.
+
+        Only new rows are projected. Publish the valid length after all layer
+        writes are enqueued, preserving commit_dspark_context's invariant.
+        A layer failure leaves the old valid prefix unchanged; an unpublished
+        suffix may be overwritten on retry. The caller serializes access on
+        one CUDA stream (or supplies synchronization), and must not retry a
+        fatal asynchronous device error as though it were a Python exception.
+        """
+        if (
+            main_hidden.ndim != 3
+            or main_hidden.shape[0] != 1
+            or main_hidden.shape[2] != self.config.target_hidden_size
+        ):
+            raise ValueError("paged context requires [1, S, target_hidden_size]")
+        if _tp_size() != 1:
+            raise ValueError("paged DSpark context currently requires TP=1")
+        geometry = (segment.num_layers, segment.kv_head_num, segment.kv_head_dim)
+        expected = (
+            len(self.layers), self.config.num_key_value_heads, self.config.head_dim
+        )
+        if geometry != expected:
+            raise ValueError((geometry, expected))
+        key_cache = segment.k_cache[0]
+        if (
+            main_hidden.dtype != torch.bfloat16
+            or key_cache.dtype != main_hidden.dtype
+            or key_cache.device != main_hidden.device
+        ):
+            raise ValueError("paged context and cache must share a BF16 device")
+        length = main_hidden.shape[1]
+        if start_pos - length != cache.context_length:
+            raise ValueError((start_pos, length, cache.context_length))
+        if start_pos > len(cache.page_table) * segment.page_size:
+            raise ValueError("draft context exceeds reserved page capacity")
+        if start_pos > self.rotary_emb.cos_sin_cache.shape[0]:
+            raise ValueError("draft context exceeds the rotary position range")
+        if length == 0:
+            return
+
+        from gllm.layers.ops.cache_kernels import reshape_and_cache_flash
+
+        context = self._project_context(main_hidden)
+        positions = torch.arange(
+            cache.context_length, start_pos, device=main_hidden.device
+        )
+        first_page = cache.context_length // segment.page_size
+        end_page = (start_pos + segment.page_size - 1) // segment.page_size
+        page_ids = torch.tensor(
+            cache.page_table[first_page:end_page],
+            dtype=torch.long,
+            device=main_hidden.device,
+        )
+        slot_mapping = (
+            page_ids[positions // segment.page_size - first_page] * segment.page_size
+            + positions % segment.page_size
+        )
+        for index, layer in enumerate(self.layers):
+            key, value = layer.self_attn.prefill_context(
+                context, positions, self.rotary_emb.cos_sin_cache
+            )
+            # The writer requires packed head/dim axes. Copy only the new
+            # suffix, never the existing history. "auto" ignores scale tensors.
+            key = key[0].transpose(0, 1).contiguous()
+            value = value[0].transpose(0, 1).contiguous()
+            reshape_and_cache_flash(
+                key, value, segment.k_cache[index], segment.v_cache[index],
+                slot_mapping, "auto", key, value,
+            )
+        cache.context_length = start_pos
+
     def forward_draft(
         self,
         main_hidden: torch.Tensor,
         input_ids: torch.Tensor,
         *,
         start_pos: int,
-        caches: Qwen38DSparkCache,
+        caches: Qwen38DSparkCache | Qwen38DSparkPagedCache,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the noisy block and return ``(hidden, draft_ids)``.
 
@@ -451,8 +634,9 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         ``[start_pos - len(main_hidden), start_pos)``.  The caller therefore
         has to satisfy ``start_pos - len(main_hidden) == caches.context_length()``
         -- passing anything else silently overlaps or skips positions.
-        Documentation only: this method states the convention, it does not
-        enforce it.
+        The paged path checks this convention and the noise position range
+        before appending. Once appended, context remains valid even if later
+        noise computation fails. The dense path retains its existing API.
 
         Only context is appended.  The noisy block is attended against the
         history and then dropped, which is the net effect of SpecForge's
@@ -470,9 +654,27 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         signature when the protocol is next revised, at which point the noisy
         block becomes a caller-supplied input instead.
         """
-        context = self._project_context(main_hidden)
-        noise = self._embed_noise(input_ids)
         anchor = _anchor_ids(input_ids)
+        page_table = None
+        if isinstance(caches, Qwen38DSparkPagedCache):
+            if anchor.numel() != 1:
+                raise ValueError("paged draft requires a single anchor")
+            if start_pos + self.noise_width > self.rotary_emb.cos_sin_cache.shape[0]:
+                raise ValueError("draft noise exceeds the rotary position range")
+            self.append_paged_context(
+                main_hidden, start_pos=start_pos,
+                segment=caches.segment, cache=caches.state,
+            )
+            num_pages = (
+                start_pos + caches.segment.page_size - 1
+            ) // caches.segment.page_size
+            page_table = torch.tensor(
+                [caches.state.page_table[:num_pages]],
+                device=main_hidden.device, dtype=torch.int32,
+            )
+        else:
+            context = self._project_context(main_hidden)
+        noise = self._embed_noise(input_ids)
         draft_ids = anchor.new_full(
             (anchor.shape[0], self.noise_width), self.mask_token_id
         )
@@ -481,7 +683,7 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         # The block sits *after* the context it was given: the new rows occupy
         # ``[start_pos - len(context), start_pos)`` and the noisy rows follow.
         context_positions = torch.arange(
-            start_pos - context.shape[1], start_pos, device=noise.device
+            start_pos - main_hidden.shape[1], start_pos, device=noise.device
         )
         noise_positions = torch.arange(
             start_pos, start_pos + self.noise_width, device=noise.device
@@ -490,15 +692,20 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
 
         hidden = noise
         for index, layer in enumerate(self.layers):
-            new_k, new_v = layer.self_attn.prefill_context(
-                context, context_positions, rotary_cache
-            )
-            cached_k = torch.cat([caches.keys[index], new_k], dim=2)
-            cached_v = torch.cat([caches.values[index], new_v], dim=2)
-            caches.keys[index] = cached_k
-            caches.values[index] = cached_v
+            if page_table is not None:
+                cached_k = caches.segment.k_cache[index]
+                cached_v = caches.segment.v_cache[index]
+            else:
+                new_k, new_v = layer.self_attn.prefill_context(
+                    context, context_positions, rotary_cache
+                )
+                cached_k = torch.cat([caches.keys[index], new_k], dim=2)
+                cached_v = torch.cat([caches.values[index], new_v], dim=2)
+                caches.keys[index] = cached_k
+                caches.values[index] = cached_v
             hidden = layer(
-                hidden, cached_k, cached_v, noise_positions, rotary_cache
+                hidden, cached_k, cached_v, noise_positions, rotary_cache,
+                page_table=page_table, context_length=start_pos,
             )
         return self.norm(hidden), draft_ids
 
@@ -751,6 +958,7 @@ def _h_markov_vocab_shard(ctx: LoadContext, key: str, param: Any) -> None:
 __all__ = [
     "Qwen38DSpark",
     "Qwen38DSparkCache",
+    "Qwen38DSparkPagedCache",
     "Qwen38DSparkConfig",
     "Qwen38DSparkMapping",
 ]

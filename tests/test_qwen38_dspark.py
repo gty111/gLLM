@@ -672,3 +672,331 @@ def test_forward_draft_and_head_run_end_to_end():
     assert confidence.shape == (batch, config.block_size)
     assert ids[0, 0].item() == 3
     assert not torch.isnan(hidden).any()
+
+
+def _paged_context_storage(config, page_size):
+    from gllm.runtime.cache_arena import CacheArena, select_physical_page_bytes
+    from gllm.runtime.memory_manager import (
+        DSparkKVCacheConfig, DSparkRequestCache, MemoryManager, Segment,
+    )
+
+    manager = MemoryManager(
+        1.0, 1, torch.bfloat16, page_size, 1, config.head_dim, config.vocab_size,
+        dspark_kv_cache_config=DSparkKVCacheConfig(
+            config.num_hidden_layers, config.num_key_value_heads, config.head_dim
+        ),
+    )
+    layouts = manager._cache_layouts()
+    grain = select_physical_page_bytes(layouts.values())
+    slot_bytes = max(
+        ((layout.entry_bytes + grain - 1) // grain) * grain
+        for layout in layouts.values()
+    )
+    arena = CacheArena(
+        torch.zeros(12 * slot_bytes, device="cuda", dtype=torch.uint8),
+        physical_page_bytes=grain,
+    )
+    target = arena.register_cache(layouts["kv_cache"])
+    target_page = arena.allocator.allocate(target.name)[0]
+    target.tensor("key")[target_page].fill_(11)
+    target.tensor("value")[target_page].fill_(13)
+    draft = arena.register_cache(layouts["dspark_kv_cache"])
+    slots = arena.allocator.allocate(draft.name, 4)
+    assert slots is not None
+    for slot in slots:
+        draft.tensor("key")[slot].fill_(31)
+        draft.tensor("value")[slot].fill_(37)
+    segment = Segment(
+        config.num_hidden_layers, page_size, config.num_key_value_heads,
+        config.head_dim, False, draft,
+    )
+    # Keep one allocated slot outside the request, and reverse the first pages.
+    cache = DSparkRequestCache(page_table=[slots[2], slots[0], slots[3]])
+    return segment, cache, arena
+
+
+def _read_paged_context(segment, cache, length):
+    # Test-only gather in logical token order, independent of physical grain.
+    blocks = [cache.page_table[t // segment.page_size] for t in range(length)]
+    offsets = [t % segment.page_size for t in range(length)]
+    return (
+        [key[blocks, offsets].transpose(0, 1).unsqueeze(0) for key in segment.k_cache],
+        [value[blocks, offsets].transpose(0, 1).unsqueeze(0) for value in segment.v_cache],
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("page_size", [3, 4])
+def test_paged_context_append_matches_dense_and_preserves_other_rows(
+    monkeypatch, page_size
+):
+    torch.manual_seed(41)
+    config = _tensor_config()
+    model = _build_model(config)
+    segment, cache, arena = _paged_context_storage(config, page_size)
+    first, suffix = _rows(config, 5), _rows(config, 4)
+    projected_lengths = []
+    project = model._project_context
+
+    def record(rows):
+        projected_lengths.append(rows.shape[1])
+        return project(rows)
+
+    monkeypatch.setattr(model, "_project_context", record)
+    model.append_paged_context(first, start_pos=5, segment=segment, cache=cache)
+    target = arena.cache("kv_cache")
+    target_page = next(iter(target.cache_type.live_slots))
+    assert torch.all(target.tensor("key")[target_page] == 11)
+    assert torch.all(target.tensor("value")[target_page] == 13)
+    draft = arena.cache("dspark_kv_cache")
+    spare = next(iter(draft.cache_type.live_slots - set(cache.page_table)))
+    assert torch.all(draft.tensor("key")[spare] == 31)
+    assert torch.all(draft.tensor("value")[spare] == 37)
+    before_keys = [key.clone() for key in segment.k_cache]
+    before_values = [value.clone() for value in segment.v_cache]
+    model.append_paged_context(suffix, start_pos=9, segment=segment, cache=cache)
+    assert projected_lengths == [5, 4]
+    assert cache.context_length == 9
+    monkeypatch.setattr(model, "_project_context", project)
+
+    anchor = torch.tensor([5], device="cuda")
+    reference = model.prefill(torch.cat([first, suffix], dim=1), anchor)
+    keys, values = _read_paged_context(segment, cache, 9)
+    for got, want in zip(keys + values, reference.keys + reference.values):
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+    # All locations except the second append's suffix must be bitwise unchanged,
+    # including the old valid prefix, another draft slot and the target bytes.
+    keep = torch.ones(segment.num_pages, page_size, device="cuda", dtype=torch.bool)
+    for position in range(5, 9):
+        keep[cache.page_table[position // page_size], position % page_size] = False
+    for got, before in zip(segment.k_cache + segment.v_cache, before_keys + before_values):
+        assert torch.equal(got[keep], before[keep])
+    assert segment.k_cache[0].stride(0) > segment.k_cache[0][0].numel()
+    assert arena.allocator.num_used_physical_pages > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("invalid", [
+    "gap", "overlap", "capacity", "batch", "width", "dtype", "geometry", "rope", "tp",
+])
+def test_paged_context_rejects_invalid_input_before_writing(monkeypatch, invalid):
+    import gllm.models.qwen38_dspark as adapter
+
+    config = _tensor_config()
+    model = _build_model(config)
+    segment, cache, arena = _paged_context_storage(config, 4)
+    model.append_paged_context(
+        _rows(config, 2), start_pos=2, segment=segment, cache=cache
+    )
+    rows, end = _rows(config, 2), 4
+    if invalid == "gap":
+        end = 5
+    elif invalid == "overlap":
+        end = 3
+    elif invalid == "capacity":
+        cache.page_table = cache.page_table[:1]
+        rows, end = _rows(config, 3), 5
+    elif invalid == "batch":
+        rows = rows.repeat(2, 1, 1)
+    elif invalid == "width":
+        rows = rows[..., :-1]
+    elif invalid == "dtype":
+        rows = rows.float()
+    elif invalid == "geometry":
+        segment.kv_head_dim += 1
+    elif invalid == "rope":
+        monkeypatch.setattr(
+            model.rotary_emb, "cos_sin_cache", model.rotary_emb.cos_sin_cache[:3]
+        )
+    elif invalid == "tp":
+        monkeypatch.setattr(adapter, "_tp_size", lambda: 2)
+    before = arena.backing.clone()
+
+    def unexpected_projection(rows):
+        raise AssertionError("invalid input must fail before context projection")
+
+    monkeypatch.setattr(model, "_project_context", unexpected_projection)
+    with pytest.raises(ValueError):
+        model.append_paged_context(rows, start_pos=end, segment=segment, cache=cache)
+    assert cache.context_length == 2
+    assert torch.equal(arena.backing, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_paged_context_layer_failure_keeps_valid_prefix_and_can_retry(monkeypatch):
+    torch.manual_seed(43)
+    config = _tensor_config()
+    model = _build_model(config)
+    segment, cache, _ = _paged_context_storage(config, 4)
+    prefix, suffix = _rows(config, 2), _rows(config, 3)
+    model.append_paged_context(prefix, start_pos=2, segment=segment, cache=cache)
+    keys, values = _read_paged_context(segment, cache, 2)
+    keys, values = [key.clone() for key in keys], [value.clone() for value in values]
+    attention = model.layers[1].self_attn
+    original = attention.prefill_context
+
+    def fail_layer(*args):
+        raise RuntimeError("injected context projection failure")
+
+    monkeypatch.setattr(attention, "prefill_context", fail_layer)
+    with pytest.raises(RuntimeError, match="injected context projection failure"):
+        model.append_paged_context(suffix, start_pos=5, segment=segment, cache=cache)
+    assert cache.context_length == 2
+    got_keys, got_values = _read_paged_context(segment, cache, 2)
+    for got, before in zip(got_keys + got_values, keys + values):
+        assert torch.equal(got, before)
+    monkeypatch.setattr(attention, "prefill_context", original)
+    model.append_paged_context(suffix, start_pos=5, segment=segment, cache=cache)
+    assert cache.context_length == 5
+    reference = model.prefill(
+        torch.cat([prefix, suffix], dim=1), torch.tensor([5], device="cuda")
+    )
+    got_keys, got_values = _read_paged_context(segment, cache, 5)
+    for got, want in zip(got_keys + got_values, reference.keys + reference.values):
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_paged_context_empty_suffix_is_noop(monkeypatch):
+    config = _tensor_config()
+    model = _build_model(config)
+    segment, cache, arena = _paged_context_storage(config, 4)
+    model.append_paged_context(
+        _rows(config, 2), start_pos=2, segment=segment, cache=cache
+    )
+    before = arena.backing.clone()
+
+    def unexpected_projection(rows):
+        raise AssertionError("empty context must not be projected")
+
+    monkeypatch.setattr(model, "_project_context", unexpected_projection)
+    model.append_paged_context(
+        _rows(config, 0), start_pos=2, segment=segment, cache=cache
+    )
+    assert cache.context_length == 2
+    assert torch.equal(arena.backing, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("context_length", [0, 3, 17])
+def test_paged_dual_source_attention_matches_dense_oracle(context_length):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from gllm.models.qwen38_dspark import Qwen38DSparkAttention
+
+    torch.manual_seed(47)
+    config = replace(
+        _tensor_config(), num_hidden_layers=1, num_attention_heads=32,
+        num_key_value_heads=8, head_dim=128, block_size=7,
+    )
+    segment, cache, arena = _paged_context_storage(config, 16)
+    key, value = segment.k_cache[0], segment.v_cache[0]
+    for page in cache.page_table:
+        key[page].fill_(float("nan"))
+        value[page].fill_(float("nan"))
+    history_k = torch.randn(context_length, 8, 128, device="cuda", dtype=torch.bfloat16)
+    history_v = torch.randn_like(history_k)
+    if context_length:
+        blocks = [cache.page_table[t // 16] for t in range(context_length)]
+        offsets = [t % 16 for t in range(context_length)]
+        key[blocks, offsets] = history_k
+        value[blocks, offsets] = history_v
+    q = torch.randn(1, 32, 7, 128, device="cuda", dtype=torch.bfloat16)
+    noise_k = torch.randn(1, 8, 7, 128, device="cuda", dtype=torch.bfloat16)
+    noise_v = torch.randn_like(noise_k)
+    table = torch.tensor(
+        [cache.page_table[:(context_length + 15) // 16]],
+        device="cuda", dtype=torch.int32,
+    )
+    attention = SimpleNamespace(
+        num_heads=32, num_key_value_groups=4, head_dim=128, scaling=128**-0.5
+    )
+    before = arena.backing.clone()
+    got = Qwen38DSparkAttention._paged_attention(
+        attention, q, noise_k, noise_v, key, value, table, context_length
+    )
+    # Concatenation is the test oracle only; poison rows beyond valid history
+    # expose accidental reads of reserved capacity or a wrong logical page.
+    dense_k = torch.cat(
+        [history_k.transpose(0, 1).unsqueeze(0), noise_k], dim=2
+    ).repeat_interleave(4, dim=1)
+    dense_v = torch.cat(
+        [history_v.transpose(0, 1).unsqueeze(0), noise_v], dim=2
+    ).repeat_interleave(4, dim=1)
+    scores = torch.matmul(q.float(), dense_k.float().transpose(-1, -2)) * 128**-0.5
+    expected = torch.matmul(scores.softmax(-1), dense_v.float())
+    torch.testing.assert_close(got.float(), expected, rtol=2e-2, atol=2e-2)
+    assert torch.isfinite(got).all()
+    assert torch.equal(arena.backing, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise():
+    from dataclasses import replace
+
+    torch.manual_seed(53)
+    config = replace(_tensor_config(), block_size=7)
+    model = _build_model(config)
+    # Centered, bounded synthetic weights give a meaningful numerical comparison
+    # rather than nearly identical large positive attention scores.
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.ndim >= 2:
+                parameter.normal_(0, 0.02)
+    segment, state, arena = _paged_context_storage(config, 4)
+    prompt = _rows(config, 5)
+    anchor = torch.tensor([5], device="cuda")
+    dense = model.prefill(prompt, anchor)
+    paged = model.prefill_paged(prompt, segment=segment, cache=state)
+    assert paged.state is state and paged.segment is segment
+    position = 5
+    for added in (1, 2):
+        context = _rows(config, added)
+        position += added
+        expected, dense_ids = model.forward_draft(
+            context, anchor, start_pos=position, caches=dense
+        )
+        got, paged_ids = model.forward_draft(
+            context, anchor, start_pos=position, caches=paged
+        )
+        torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
+        assert torch.equal(paged_ids, dense_ids)
+        assert got.shape == (1, 7, config.hidden_size)
+        assert paged.context_length() == dense.context_length() == position
+        keys, values = _read_paged_context(segment, state, position)
+        for actual, reference in zip(keys + values, dense.keys + dense.values):
+            torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
+    # Recomputing noise with no new accepted context must not change any arena
+    # byte, including reserved suffix rows, target storage and other draft slots.
+    before = arena.backing.clone()
+    repeated, repeated_ids = model.forward_draft(
+        _rows(config, 0), anchor, start_pos=position, caches=paged
+    )
+    torch.testing.assert_close(repeated, got, rtol=0, atol=0)
+    assert torch.equal(repeated_ids, paged_ids)
+    assert torch.equal(arena.backing, before)
+    assert state.context_length == position
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("invalid", ["anchor_batch", "noise_range"])
+def test_paged_draft_rejects_invalid_noise_before_context_append(monkeypatch, invalid):
+    config = _tensor_config()
+    model = _build_model(config)
+    segment, state, arena = _paged_context_storage(config, 4)
+    paged = model.prefill_paged(_rows(config, 5), segment=segment, cache=state)
+    anchor = torch.tensor([5], device="cuda")
+    if invalid == "anchor_batch":
+        anchor = anchor.repeat(2)
+    else:
+        monkeypatch.setattr(
+            model.rotary_emb, "cos_sin_cache", model.rotary_emb.cos_sin_cache[:10]
+        )
+    before = arena.backing.clone()
+    with pytest.raises(ValueError):
+        model.forward_draft(
+            _rows(config, 1), anchor, start_pos=6, caches=paged
+        )
+    assert state.context_length == 5
+    assert torch.equal(arena.backing, before)
