@@ -135,6 +135,82 @@ class DSparkRequestCache:
 
     page_table: List[int] = field(default_factory=list)
     context_length: int = 0
+    _device_page_table: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _page_table_staging: Optional[torch.Tensor] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _num_uploaded_pages: int = field(default=0, init=False, repr=False, compare=False)
+    _page_table_copy_done: Optional[torch.cuda.Event] = field(
+        default=None, init=False, repr=False, compare=False
+    )
+    _pending_page_table_staging: List[Tuple[torch.cuda.Event, torch.Tensor]] = field(
+        default_factory=list, init=False, repr=False, compare=False
+    )
+
+    def get_device_page_table(self, device: torch.device) -> torch.Tensor:
+        """Return a request-owned CUDA int32 table with shape [1, pages].
+
+        The host table is append-only until reset. Updates and consumers must
+        use the same CUDA stream, or the caller must supply synchronization.
+        The uploaded count means enqueued, not device-complete: stream order
+        makes those entries visible before the consuming kernels execute.
+        """
+        count = len(self.page_table)
+        if count < self._num_uploaded_pages:
+            raise ValueError("reset the draft cache before replacing its pages")
+        table = self._device_page_table
+        if table is None or count > table.numel():
+            capacity = max(count, 1 if table is None else 2 * table.numel())
+            grown = torch.empty(capacity, device=device, dtype=torch.int32)
+            staging = torch.empty(
+                capacity, device="cpu", dtype=torch.int32, pin_memory=True
+            )
+            if self._num_uploaded_pages:
+                grown[:self._num_uploaded_pages].copy_(
+                    table[:self._num_uploaded_pages], non_blocking=True
+                )
+            # Only capacity growth retires a staging allocation. Its last
+            # event covers every earlier copy from it on the consuming stream.
+            self._pending_page_table_staging = [
+                (event, buffer)
+                for event, buffer in self._pending_page_table_staging
+                if not event.query()
+            ]
+            if (
+                self._page_table_copy_done is not None
+                and not self._page_table_copy_done.query()
+            ):
+                self._pending_page_table_staging.append(
+                    (self._page_table_copy_done, self._page_table_staging)
+                )
+            self._device_page_table = table = grown
+            self._page_table_staging = staging
+            self._page_table_copy_done = torch.cuda.Event()
+
+        if count > self._num_uploaded_pages:
+            begin = self._num_uploaded_pages
+            # Never overwrite an earlier staging range: a previous H2D copy
+            # may still be reading it. Only newly allocated IDs cross to CUDA.
+            staging = self._page_table_staging[begin:count]
+            staging.copy_(torch.tensor(
+                self.page_table[begin:count], device="cpu", dtype=torch.int32
+            ))
+            table[begin:count].copy_(staging, non_blocking=True)
+            self._page_table_copy_done.record(torch.cuda.current_stream(device))
+            self._num_uploaded_pages = count
+        return table[:count].unsqueeze(0)
+
+    def reset(self) -> None:
+        """Clear metadata after freeing slots and finishing GPU users/copies."""
+        self.page_table.clear()
+        self.context_length = 0
+        self._device_page_table = None
+        self._page_table_staging = None
+        self._num_uploaded_pages = 0
+        self._page_table_copy_done = None
+        self._pending_page_table_staging.clear()
 
 
 @dataclass
@@ -1640,8 +1716,7 @@ class MemoryManager:
         target-only free. Clearing both tables makes repeated cleanup safe.
         """
         self.dspark_segment.free_many(cache.page_table)
-        cache.page_table.clear()
-        cache.context_length = 0
+        cache.reset()
         self.free(seq)
         seq.page_table.clear()
 

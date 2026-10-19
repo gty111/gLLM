@@ -376,8 +376,9 @@ class Qwen38DSparkAttention(nn.Module):
         history_lse = torch.empty(
             query_len, self.num_heads, device=q.device, dtype=torch.float32
         )
-        # Each noisy row is an independent query over the same request history.
-        block_table = page_table.expand(query_len, -1).contiguous()
+        # The kernel honors the row stride, including zero: every noise
+        # query reads the same request-owned table without a per-layer copy.
+        block_table = page_table.expand(query_len, -1)
         seq_lens = torch.full(
             (query_len,), context_length, device=q.device, dtype=torch.int32
         )
@@ -589,15 +590,9 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         positions = torch.arange(
             cache.context_length, start_pos, device=main_hidden.device
         )
-        first_page = cache.context_length // segment.page_size
-        end_page = (start_pos + segment.page_size - 1) // segment.page_size
-        page_ids = torch.tensor(
-            cache.page_table[first_page:end_page],
-            dtype=torch.long,
-            device=main_hidden.device,
-        )
+        page_table = cache.get_device_page_table(main_hidden.device)[0]
         slot_mapping = (
-            page_ids[positions // segment.page_size - first_page] * segment.page_size
+            page_table[positions // segment.page_size].long() * segment.page_size
             + positions % segment.page_size
         )
         for index, layer in enumerate(self.layers):
@@ -668,10 +663,9 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
             num_pages = (
                 start_pos + caches.segment.page_size - 1
             ) // caches.segment.page_size
-            page_table = torch.tensor(
-                [caches.state.page_table[:num_pages]],
-                device=main_hidden.device, dtype=torch.int32,
-            )
+            page_table = caches.state.get_device_page_table(
+                main_hidden.device
+            )[:, :num_pages]
         else:
             context = self._project_context(main_hidden)
         noise = self._embed_noise(input_ids)

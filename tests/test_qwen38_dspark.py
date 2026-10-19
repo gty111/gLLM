@@ -397,6 +397,11 @@ def _build_model(config):
     try:
         embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        # These stand in for loaded target weights. Their constructors use
+        # torch.empty, and the draft holds them outside model.parameters().
+        with torch.no_grad():
+            embed.weight.normal_(0, 0.02)
+            lm_head.weight.normal_(0, 0.02)
         return Qwen38DSpark(config, embed=embed, lm_head=lm_head)
     finally:
         torch.set_default_dtype(previous_dtype)
@@ -879,7 +884,8 @@ def test_paged_context_empty_suffix_is_noop(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("context_length", [0, 3, 17])
-def test_paged_dual_source_attention_matches_dense_oracle(context_length):
+@pytest.mark.parametrize("kv_heads", [8, 32])
+def test_paged_dual_source_attention_matches_dense_oracle(context_length, kv_heads):
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -888,14 +894,14 @@ def test_paged_dual_source_attention_matches_dense_oracle(context_length):
     torch.manual_seed(47)
     config = replace(
         _tensor_config(), num_hidden_layers=1, num_attention_heads=32,
-        num_key_value_heads=8, head_dim=128, block_size=7,
+        num_key_value_heads=kv_heads, head_dim=128, block_size=7,
     )
     segment, cache, arena = _paged_context_storage(config, 16)
     key, value = segment.k_cache[0], segment.v_cache[0]
     for page in cache.page_table:
         key[page].fill_(float("nan"))
         value[page].fill_(float("nan"))
-    history_k = torch.randn(context_length, 8, 128, device="cuda", dtype=torch.bfloat16)
+    history_k = torch.randn(context_length, kv_heads, 128, device="cuda", dtype=torch.bfloat16)
     history_v = torch.randn_like(history_k)
     if context_length:
         blocks = [cache.page_table[t // 16] for t in range(context_length)]
@@ -903,14 +909,11 @@ def test_paged_dual_source_attention_matches_dense_oracle(context_length):
         key[blocks, offsets] = history_k
         value[blocks, offsets] = history_v
     q = torch.randn(1, 32, 7, 128, device="cuda", dtype=torch.bfloat16)
-    noise_k = torch.randn(1, 8, 7, 128, device="cuda", dtype=torch.bfloat16)
+    noise_k = torch.randn(1, kv_heads, 7, 128, device="cuda", dtype=torch.bfloat16)
     noise_v = torch.randn_like(noise_k)
-    table = torch.tensor(
-        [cache.page_table[:(context_length + 15) // 16]],
-        device="cuda", dtype=torch.int32,
-    )
+    table = cache.get_device_page_table(q.device)[:, :(context_length + 15) // 16]
     attention = SimpleNamespace(
-        num_heads=32, num_key_value_groups=4, head_dim=128, scaling=128**-0.5
+        num_heads=32, num_key_value_groups=32 // kv_heads, head_dim=128, scaling=128**-0.5
     )
     before = arena.backing.clone()
     got = Qwen38DSparkAttention._paged_attention(
@@ -920,10 +923,10 @@ def test_paged_dual_source_attention_matches_dense_oracle(context_length):
     # expose accidental reads of reserved capacity or a wrong logical page.
     dense_k = torch.cat(
         [history_k.transpose(0, 1).unsqueeze(0), noise_k], dim=2
-    ).repeat_interleave(4, dim=1)
+    ).repeat_interleave(32 // kv_heads, dim=1)
     dense_v = torch.cat(
         [history_v.transpose(0, 1).unsqueeze(0), noise_v], dim=2
-    ).repeat_interleave(4, dim=1)
+    ).repeat_interleave(32 // kv_heads, dim=1)
     scores = torch.matmul(q.float(), dense_k.float().transpose(-1, -2)) * 128**-0.5
     expected = torch.matmul(scores.softmax(-1), dense_v.float())
     torch.testing.assert_close(got.float(), expected, rtol=2e-2, atol=2e-2)
@@ -932,12 +935,31 @@ def test_paged_dual_source_attention_matches_dense_oracle(context_length):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise():
+@pytest.mark.parametrize("poison_vocab_storage", [False, True])
+def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise(
+    monkeypatch, poison_vocab_storage
+):
     from dataclasses import replace
+
+    if poison_vocab_storage:
+        from gllm.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+        create_weights = VocabParallelEmbedding.create_weights
+
+        def dirty_vocab_weights(module, *args, **kwargs):
+            create_weights(module, *args, **kwargs)
+            # Model a reused torch.empty allocation containing NaNs. The
+            # synthetic fixture must initialize its borrowed target weights.
+            with torch.no_grad():
+                module.weight.fill_(float("nan"))
+
+        monkeypatch.setattr(VocabParallelEmbedding, "create_weights", dirty_vocab_weights)
 
     torch.manual_seed(53)
     config = replace(_tensor_config(), block_size=7)
     model = _build_model(config)
+    assert torch.isfinite(model._embed[0].weight).all()
+    assert torch.isfinite(model._lm_head[0].weight).all()
     # Centered, bounded synthetic weights give a meaningful numerical comparison
     # rather than nearly identical large positive attention scores.
     with torch.no_grad():
@@ -945,21 +967,47 @@ def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise():
             if parameter.ndim >= 2:
                 parameter.normal_(0, 0.02)
     segment, state, arena = _paged_context_storage(config, 4)
+    # The caller owns this reserved slot, but exposes it to the request only
+    # when the growing context needs a third page.
+    next_page = state.page_table.pop()
     prompt = _rows(config, 5)
     anchor = torch.tensor([5], device="cuda")
     dense = model.prefill(prompt, anchor)
     paged = model.prefill_paged(prompt, segment=segment, cache=state)
     assert paged.state is state and paged.segment is segment
+    tensor = torch.tensor
+
+    def reject_pageable_upload(data, *args, **kwargs):
+        device = kwargs.get("device")
+        if device is not None and torch.device(device).type == "cuda" and isinstance(data, list):
+            raise AssertionError("draft must reuse the request GPU page table")
+        return tensor(data, *args, **kwargs)
+
+    from gllm.layers.ops import triton_decode_attention
+    decode = triton_decode_attention.decode_attention_fwd
+
+    def check_shared_table(*args, **kwargs):
+        block_table = args[5]
+        assert block_table.data_ptr() == state._device_page_table.data_ptr()
+        assert block_table.stride(0) == 0
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", reject_pageable_upload)
+    monkeypatch.setattr(triton_decode_attention, "decode_attention_fwd", check_shared_table)
     position = 5
-    for added in (1, 2):
+    for added in (1, 2, 1):
         context = _rows(config, added)
         position += added
+        if position > len(state.page_table) * segment.page_size:
+            state.page_table.append(next_page)
         expected, dense_ids = model.forward_draft(
             context, anchor, start_pos=position, caches=dense
         )
         got, paged_ids = model.forward_draft(
             context, anchor, start_pos=position, caches=paged
         )
+        assert torch.isfinite(expected).all(), "dense reference produced nonfinite hidden"
+        assert torch.isfinite(got).all(), "paged draft produced nonfinite hidden"
         torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
         assert torch.equal(paged_ids, dense_ids)
         assert got.shape == (1, 7, config.hidden_size)

@@ -312,6 +312,125 @@ def test_dspark_reservation_separates_capacity_from_valid_context_and_resets():
     assert allocator._owners == owners
 
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_gpu_page_table_reuses_storage_and_uploads_only_new_ids(monkeypatch):
+    cache = DSparkRequestCache()
+    device = torch.device("cuda", torch.cuda.current_device())
+    copies = []
+    copy = torch.Tensor.copy_
+
+    def track_copy(destination, source, *args, **kwargs):
+        if destination.is_cuda:
+            copies.append((
+                source.device.type, source.numel(),
+                source.is_pinned() if not source.is_cuda else False,
+                kwargs.get("non_blocking", False),
+            ))
+        return copy(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", track_copy)
+    assert cache.get_device_page_table(device).shape == (1, 0)
+    cache.get_device_page_table(device)
+    assert copies == []
+    cache.page_table.extend([7, 2, 9])
+    first = cache.get_device_page_table(device)
+    staging = cache._page_table_staging
+    assert first.dtype == torch.int32 and first.tolist() == [[7, 2, 9]]
+    assert cache.get_device_page_table(device).data_ptr() == first.data_ptr()
+    assert cache._page_table_staging is staging
+    assert copies == [("cpu", 3, True, True)]
+
+    cache.page_table.append(4)
+    grown = cache.get_device_page_table(device)
+    assert grown.data_ptr() != first.data_ptr()
+    assert first.tolist() == [[7, 2, 9]]
+    assert grown.tolist() == [[7, 2, 9, 4]]
+    cache.page_table.append(6)
+    assert cache.get_device_page_table(device).data_ptr() == grown.data_ptr()
+    assert cache.get_device_page_table(device).tolist() == [[7, 2, 9, 4, 6]]
+    assert [entry for entry in copies if entry[0] == "cpu"] == [
+        ("cpu", 3, True, True), ("cpu", 1, True, True), ("cpu", 1, True, True),
+    ]
+    assert [entry for entry in copies if entry[0] == "cuda"] == [
+        ("cuda", 3, False, True),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_gpu_page_table_keeps_inflight_staging_immutable(monkeypatch):
+    # Hold completion reporting pending so lifetime checks do not depend on
+    # whether a tiny transfer happens to finish before the next Python call.
+    real_event = torch.cuda.Event
+    events = []
+
+    class PendingEvent:
+        def __init__(self):
+            self.event = real_event()
+            self.completed = False
+            events.append(self)
+
+        def record(self, stream):
+            self.event.record(stream)
+
+        def query(self):
+            return self.completed and self.event.query()
+
+    monkeypatch.setattr(torch.cuda, "Event", PendingEvent)
+    cache = DSparkRequestCache(page_table=[7, 2])
+    device = torch.device("cuda", torch.cuda.current_device())
+    first = cache.get_device_page_table(device)
+    old_staging = cache._page_table_staging
+    cache.page_table.append(9)
+    second = cache.get_device_page_table(device)
+    active_staging = cache._page_table_staging
+    assert any(buffer is old_staging for _, buffer in cache._pending_page_table_staging)
+    assert old_staging.tolist() == [7, 2]
+    assert active_staging[2].item() == 9
+
+    cache.page_table.append(4)
+    third = cache.get_device_page_table(device)
+    assert cache._page_table_staging is active_staging
+    assert old_staging.tolist() == [7, 2]
+    assert active_staging[2:4].tolist() == [9, 4]
+    assert first.tolist() == [[7, 2]]
+    assert second.tolist() == [[7, 2, 9]]
+    assert third.tolist() == [[7, 2, 9, 4]]
+    torch.cuda.current_stream(device).synchronize()
+    for event in events:
+        event.completed = True
+    cache.page_table.append(6)
+    assert cache.get_device_page_table(device).tolist() == [[7, 2, 9, 4, 6]]
+    assert not cache._pending_page_table_staging
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_gpu_page_table_resets_before_request_reuse():
+    mm = _dspark_request_manager()
+    seq, cache = _dspark_sequence(), DSparkRequestCache()
+    device = torch.device("cuda", torch.cuda.current_device())
+    assert mm.reserve_dspark_pages(seq, cache, target_length=4, draft_length=4)
+    old = cache.get_device_page_table(device)
+    assert old.tolist() == [cache.page_table]
+    mm.commit_dspark_context(cache, 3)
+    # Poison the old mirror so this also catches reuse with the same page
+    # count/IDs, which a length-only refresh would incorrectly skip.
+    old.fill_(-1)
+    torch.cuda.current_stream(device).synchronize()
+    mm.free_dspark_cache(seq, cache)
+    assert cache.page_table == [] and cache.context_length == 0
+    assert cache._device_page_table is None
+    assert cache._page_table_staging is None and cache._num_uploaded_pages == 0
+    assert cache._page_table_copy_done is None
+    assert cache._pending_page_table_staging == []
+    mm.free_dspark_cache(seq, cache)
+    assert mm.reserve_dspark_pages(seq, cache, target_length=4, draft_length=4)
+    restored = cache.get_device_page_table(device)
+    assert restored.data_ptr() != old.data_ptr()
+    assert restored.tolist() == [cache.page_table]
+    assert cache.context_length == 0
+    mm.free_dspark_cache(seq, cache)
+
 def test_dspark_requests_have_independent_pages_and_valid_lengths():
     mm = _dspark_request_manager()
     seq1, seq2 = _dspark_sequence(1), _dspark_sequence(2)
