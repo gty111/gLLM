@@ -49,7 +49,9 @@ import torch
 from torch import nn
 
 from gllm.distributed.parallel_state import (
+    get_dp_size,
     get_pp_layers,
+    get_pp_size,
     get_tp_rank,
     get_tp_size,
     is_first_pp_rank,
@@ -1234,12 +1236,96 @@ class Qwen3_5Model(nn.Module):
         residual: Optional[torch.Tensor] = None,
         deepstack_input_embeds=None,
     ):
+        return self._forward(
+            input_data, hidden_states, residual, deepstack_input_embeds
+        )
+
+    @torch.no_grad()
+    def forward_with_hidden_taps(
+        self,
+        input_data: InputData,
+        hidden_states: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+        *,
+        target_layer_ids: Tuple[int, ...],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return final hidden and owned [1, tokens, taps * hidden] features.
+
+        Layer IDs are zero-based decoder-block indices, in checkpoint order.
+        Each feature is the complete post-block residual stream, before the
+        next layer's input norm (and before the final norm for the last block).
+        Unlike the final hidden, these features are not post-norm outputs.
+
+        This inference-only entry point supports one pure-text request with
+        TP=PP=DP=1. It does not select accepted rows or advance draft history.
+        """
+        if (get_tp_size(), get_pp_size(), get_dp_size()) != (1, 1, 1):
+            raise ValueError("Qwen3.5 hidden taps require TP=PP=DP=1")
+        if len(input_data.seqs) != 1 or input_data.seqs[0].mm_contents is not None:
+            raise ValueError("Qwen3.5 hidden taps require one pure-text request")
+        layer_ids = tuple(target_layer_ids)
+        if (
+            not layer_ids
+            or any(
+                not isinstance(i, int) or not self.start_layer <= i < self.end_layer
+                for i in layer_ids
+            )
+            or len(set(layer_ids)) != len(layer_ids)
+        ):
+            raise ValueError("target_layer_ids must be nonempty, unique block indices")
+
+        rows = input_data.get_tokens().shape[0]
+        shape = (rows, self.config.hidden_size)
+        if rows == 0:
+            raise ValueError("Qwen3.5 hidden taps require nonempty input")
+        source = self.embed_tokens.weight
+        for value in (hidden_states, residual):
+            if value is not None and (
+                value.shape != shape
+                or value.dtype != source.dtype
+                or value.device != source.device
+            ):
+                raise ValueError(
+                    "hidden input must match target token rows, width, dtype and device"
+                )
+        return self._forward(
+            input_data, hidden_states, residual, hidden_tap_layers=layer_ids
+        )
+
+    def _forward(
+        self,
+        input_data: InputData,
+        hidden_states: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
+        deepstack_input_embeds=None,
+        *,
+        hidden_tap_layers: Optional[Tuple[int, ...]] = None,
+    ):
         if is_first_pp_rank() and hidden_states is None:
             hidden_states = self.embed_tokens(input_data.get_tokens())
+
+        taps = None
+        tap_columns = None
+        if hidden_tap_layers is not None:
+            width = self.config.hidden_size
+            taps = hidden_states.new_empty(
+                (hidden_states.shape[0], len(hidden_tap_layers) * width)
+            )
+            tap_columns = {
+                layer_id: slice(index * width, (index + 1) * width)
+                for index, layer_id in enumerate(hidden_tap_layers)
+            }
 
         for local_idx, layer in enumerate(self.layers):
             global_idx = local_idx + self.start_layer
             hidden_states, residual = layer(input_data, hidden_states, residual)
+            if tap_columns is not None and global_idx in tap_columns:
+                # The layer returns an MLP branch plus its residual. Save the
+                # complete stream now: the next fused norm mutates both inputs.
+                # Writing into owned storage leaves the model's pair unchanged.
+                torch.add(
+                    hidden_states, residual, out=taps[:, tap_columns[global_idx]]
+                )
             if (
                 deepstack_input_embeds is not None
                 and f"deepstack_input_embeds_{global_idx}" in deepstack_input_embeds
@@ -1262,6 +1348,8 @@ class Qwen3_5Model(nn.Module):
         hidden_states, _ = maybe_fused_norm(
             hidden_states, residual, self.norm, self._fuse_tail
         )
+        if taps is not None:
+            return hidden_states, taps.unsqueeze(0)
         return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1661,6 +1749,15 @@ class Qwen3_5ForCausalLM(StandardCausalLMMixin, nn.Module):
     def forward(self, input_data: InputData, hidden_states=None, residual=None):
         return self.model(input_data, hidden_states, residual)
 
+    def forward_with_hidden_taps(
+        self, input_data: InputData, hidden_states=None, residual=None,
+        *, target_layer_ids: Tuple[int, ...],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Expose the text backbone's opt-in, caller-owned hidden features."""
+        return self.model.forward_with_hidden_taps(
+            input_data, hidden_states, residual, target_layer_ids=target_layer_ids
+        )
+
     # ----- weight loading --------------------------------------------------
 
     # Sub-keys of a GDN block filled en bloc by ``_load_gdn_layer_weights``
@@ -1773,6 +1870,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.ssm_cache_config = self.language_model.ssm_cache_config
         self.num_kv_layers = self.language_model.num_kv_layers
         self.num_ssm_layers = self.language_model.num_ssm_layers
+
+    def forward_with_hidden_taps(
+        self, input_data: InputData, hidden_states=None, residual=None,
+        *, target_layer_ids: Tuple[int, ...],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Collect pure-text taps through the actual conditional wrapper."""
+        if self.language_model is None:
+            raise ValueError("hidden taps require a language model")
+        return self.language_model.forward_with_hidden_taps(
+            input_data, hidden_states, residual, target_layer_ids=target_layer_ids
+        )
 
     @property
     def mtp(self):
