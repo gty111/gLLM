@@ -1048,3 +1048,389 @@ def test_paged_draft_rejects_invalid_noise_before_context_append(monkeypatch, in
         )
     assert state.context_length == 5
     assert torch.equal(arena.backing, before)
+
+
+
+def _target_tap_fixture():
+    """CPU control-flow oracle with split residuals and destructive final norm."""
+    from types import SimpleNamespace
+
+    from gllm.models.qwen3_5 import (
+        Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration, Qwen3_5Model,
+    )
+
+    class SplitLayer(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+            self.calls = 0
+
+        def forward(self, data, hidden, residual):
+            self.calls += 1
+            if residual is None:
+                residual = hidden.clone()
+            else:
+                residual.add_(hidden)
+            return torch.full_like(hidden, (self.index + 1) / 32), residual
+
+    class DestructiveNorm(torch.nn.Module):
+        def forward(self, hidden, residual):
+            residual.add_(hidden)
+            hidden.copy_(residual * 3)
+            return hidden, residual
+
+    model = Qwen3_5Model.__new__(Qwen3_5Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=4)
+    model.start_layer, model.end_layer = 0, 64
+    model.embed_tokens = torch.nn.Embedding(32, 4)
+    with torch.no_grad():
+        model.embed_tokens.weight.copy_(torch.arange(128).view(32, 4))
+    model.layers = torch.nn.ModuleList(SplitLayer(index) for index in range(64))
+    model.norm = DestructiveNorm()
+    model._fuse_tail = False
+
+    text_model = Qwen3_5ForCausalLM.__new__(Qwen3_5ForCausalLM)
+    torch.nn.Module.__init__(text_model)
+    text_model.model = model
+    wrapper = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.language_model = text_model
+    tokens = torch.tensor([2, 5, 7])
+    data = SimpleNamespace(
+        seqs=[SimpleNamespace(mm_contents=None)], get_tokens=lambda: tokens,
+    )
+    return wrapper, model, data
+
+
+@pytest.mark.parametrize("layer_ids", [(5, 19, 33, 47, 61), (61, 5, 47)])
+@torch.no_grad()
+def test_target_taps_preserve_block_indices_order_and_owned_storage(layer_ids):
+    wrapper, model, data = _target_tap_fixture()
+    embedded = model.embed_tokens(data.get_tokens()).clone()
+    expected = torch.cat([
+        embedded + (layer_id + 1) * (layer_id + 2) / 64
+        for layer_id in layer_ids
+    ], dim=-1).unsqueeze(0)
+
+    normal = model(data)
+    final_hidden, taps = wrapper.forward_with_hidden_taps(
+        data, target_layer_ids=layer_ids
+    )
+    torch.testing.assert_close(final_hidden, normal, rtol=0, atol=0)
+    torch.testing.assert_close(final_hidden, (embedded + 65) * 3, rtol=0, atol=0)
+    torch.testing.assert_close(taps, expected, rtol=0, atol=0)
+    assert taps.shape == (1, 3, len(layer_ids) * 4)
+
+    saved = taps.clone()
+    next_hidden, next_taps = wrapper.forward_with_hidden_taps(
+        data, embedded + 1, target_layer_ids=layer_ids
+    )
+    assert next_taps.data_ptr() != taps.data_ptr()
+    torch.testing.assert_close(next_taps, expected + 1, rtol=0, atol=0)
+    torch.testing.assert_close(next_hidden, final_hidden + 3, rtol=0, atol=0)
+    torch.testing.assert_close(taps, saved, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_target_normal_forward_does_not_allocate_tap_storage(monkeypatch):
+    _, model, data = _target_tap_fixture()
+
+    def fail_allocation(*args, **kwargs):
+        raise AssertionError("ordinary target forward must not allocate taps")
+
+    monkeypatch.setattr(torch.Tensor, "new_empty", fail_allocation)
+    result = model(data)
+    expected = (model.embed_tokens(data.get_tokens()) + 65) * 3
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("layer_ids", [(), (5, 5), (-1,), (64,), (5.5,)])
+def test_target_taps_reject_invalid_layers_before_forward(layer_ids):
+    wrapper, model, data = _target_tap_fixture()
+    with pytest.raises(ValueError, match="target_layer_ids"):
+        wrapper.forward_with_hidden_taps(data, target_layer_ids=layer_ids)
+    assert all(layer.calls == 0 for layer in model.layers)
+
+
+@pytest.mark.parametrize("dimension", ["tp", "pp", "dp"])
+def test_target_taps_reject_unsupported_parallelism_before_forward(monkeypatch, dimension):
+    from gllm.models import qwen3_5
+
+    wrapper, model, data = _target_tap_fixture()
+    monkeypatch.setattr(qwen3_5, f"get_{dimension}_size", lambda: 2)
+    with pytest.raises(ValueError, match="TP=PP=DP=1"):
+        wrapper.forward_with_hidden_taps(data, target_layer_ids=(5,))
+    assert all(layer.calls == 0 for layer in model.layers)
+
+
+@pytest.mark.parametrize("invalid", ["batch", "multimodal", "empty", "hidden", "residual"])
+def test_target_taps_reject_invalid_input_before_forward(invalid):
+    wrapper, model, data = _target_tap_fixture()
+    kwargs = {}
+    if invalid == "batch":
+        data.seqs *= 2
+    elif invalid == "multimodal":
+        data.seqs[0].mm_contents = object()
+    elif invalid == "empty":
+        data.get_tokens = lambda: torch.empty(0, dtype=torch.long)
+    else:
+        kwargs["hidden_states" if invalid == "hidden" else "residual"] = torch.zeros(4, 4)
+    with pytest.raises(ValueError):
+        wrapper.forward_with_hidden_taps(data, target_layer_ids=(5,), **kwargs)
+    assert all(layer.calls == 0 for layer in model.layers)
+
+
+def _hybrid_target_fixture():
+    """Real tiny hybrid target and independent request-owned arena states."""
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import (
+        Qwen3_5ForCausalLM as ReferenceCausalLM,
+    )
+
+    from gllm.models.qwen3_5 import Qwen3_5ForCausalLM
+    from gllm.runtime.cache_arena import CacheArena, select_physical_page_bytes
+    from gllm.runtime.input_data import InputData
+    from gllm.runtime.memory_manager import MemoryManager, Segment, SSMSegment
+    from gllm.runtime.sequence import GenerationSequence
+
+    torch.manual_seed(71)
+    config = Qwen3_5TextConfig(
+        vocab_size=128, hidden_size=128, intermediate_size=256,
+        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2,
+        # Quarter-width RoPE is 16-wide, satisfying the FlashInfer alignment.
+        head_dim=64, max_position_embeddings=64,
+        linear_num_key_heads=2, linear_num_value_heads=4,
+        linear_key_head_dim=32, linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+        layer_types=["linear_attention", "full_attention", "linear_attention"],
+    )
+    config._attn_implementation = "eager"
+    config.attn_output_gate = True
+    config.mtp_enabled = False
+    config.mamba_ssm_cache_dtype = "float32"
+    reference = ReferenceCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        model = Qwen3_5ForCausalLM(config).eval()
+        model.load_weights(reference.state_dict())
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+    class DensePrefillBackend:
+        # Test-only causal attention over the tiny request's valid history.
+        # Actual projections, RoPE, arena writes, GDN and residual norms run.
+        def forward(self, q, key, value, metadata, scale):
+            pages, length = metadata
+            k = key[pages].reshape(-1, key.shape[-2], key.shape[-1])[:length]
+            v = value[pages].reshape(-1, value.shape[-2], value.shape[-1])[:length]
+            # A continuation chunk starts after the existing KV prefix.
+            mask = None
+            if q.shape[0] != length:
+                query_positions = torch.arange(
+                    length - q.shape[0], length, device=q.device
+                )
+                mask = torch.arange(length, device=q.device)[None, :] <= query_positions[:, None]
+            output = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(0, 1).unsqueeze(0),
+                k.transpose(0, 1).unsqueeze(0),
+                v.transpose(0, 1).unsqueeze(0),
+                attn_mask=mask, is_causal=mask is None, scale=scale, enable_gqa=True,
+            )
+            return output[0].transpose(0, 1).contiguous()
+
+    def make_input(tokens):
+        manager = MemoryManager(
+            1.0, model.num_kv_layers, torch.bfloat16, 16,
+            model.num_kv_heads, model.head_dim, config.vocab_size,
+            ssm_cache_config=model.ssm_cache_config,
+        )
+        # Match init_arena's unquantized KV writer metadata.
+        manager.kv_cache_dtype = "auto"
+        manager.k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+        manager.v_scale = manager.k_scale
+        layouts = manager._cache_layouts()
+        grain = select_physical_page_bytes(layouts.values())
+        pages = 16 * sum((layout.entry_bytes + grain - 1) // grain for layout in layouts.values())
+        arena = CacheArena(
+            torch.zeros(pages * grain, device="cuda", dtype=torch.uint8),
+            physical_page_bytes=grain,
+        )
+        manager.cache_arena = arena
+        manager.segment = Segment(
+            model.num_kv_layers, 16, model.num_kv_heads, model.head_dim, False,
+            arena.register_cache(layouts["kv_cache"]),
+        )
+        manager.ssm_segment = SSMSegment(
+            model.ssm_cache_config,
+            state_cache=arena.register_cache(layouts["ssm_state"]),
+            snapshot_cache=arena.register_cache(layouts["ssm_snapshot"]),
+        )
+        seq = GenerationSequence(1, list(tokens), [], output_len=8, temperature=0)
+        seq.page_table = [
+            manager.segment.allocate() for _ in range((len(tokens) + 15) // 16)
+        ]
+        assert manager.allocate_recurrent_slot(seq)
+        seq.to_compute_token_num = len(tokens)
+        data = InputData(True, manager, max_seq_length=64, max_running_seqs=1)
+        data.cal_and_set_input([seq])
+        data.forward_metadata_plan.attention_metadata = (seq.page_table, len(tokens))
+        return data, manager, seq
+
+    for layer in model.model.layers:
+        if layer.self_attn is not None:
+            layer.self_attn.attn.set_backend(DensePrefillBackend())
+    return model, reference, make_input
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_target_taps_match_hf_hybrid_residual_stream():
+    model, reference, make_input = _hybrid_target_fixture()
+    ordinary, ordinary_manager, ordinary_seq = make_input((1, 2, 3, 4))
+    collected, collected_manager, collected_seq = make_input((1, 2, 3, 4))
+    # Independent initial cache/state is essential: a prior forward advances GDN.
+    normal = model(ordinary)
+    final_hidden, taps = model.forward_with_hidden_taps(
+        collected, target_layer_ids=(1, 0)
+    )
+    output = reference(
+        torch.tensor([[1, 2, 3, 4]], device="cuda"),
+        use_cache=False, output_hidden_states=True, return_dict=True,
+    )
+    expected_taps = torch.cat(
+        [output.hidden_states[2], output.hidden_states[1]], dim=-1
+    )
+    assert torch.isfinite(taps).all() and torch.isfinite(final_hidden).all()
+    # BF16 fused residual+norm and the unfused reference round differently.
+    torch.testing.assert_close(taps, expected_taps, atol=2e-3, rtol=1e-2)
+    # Preserve the target's existing final-norm numerics exactly. Its fused
+    # BF16 path already differs from the unfused HF final output at baseline;
+    # selected pre-norm block features are the independent oracle above.
+    torch.testing.assert_close(final_hidden, normal, atol=0, rtol=0)
+    for name in ("k_cache", "v_cache"):
+        for actual, expected in zip(
+            getattr(collected_manager.segment, name), getattr(ordinary_manager.segment, name)
+        ):
+            torch.testing.assert_close(
+                actual[collected_seq.page_table], expected[ordinary_seq.page_table],
+                atol=0, rtol=0,
+            )
+    for name in ("conv_state", "temporal_state"):
+        torch.testing.assert_close(
+            getattr(collected_manager.ssm_segment, name)[:, collected_seq.recurrent_state_slot],
+            getattr(ordinary_manager.ssm_segment, name)[:, ordinary_seq.recurrent_state_slot],
+            atol=0, rtol=0,
+        )
+    collected_manager.free(collected_seq)
+    ordinary_manager.free(ordinary_seq)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_target_taps_stream_chunks_into_paged_draft_and_select_accepted_prefix():
+    from dataclasses import replace
+
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+
+    model, reference, make_input = _hybrid_target_fixture()
+    tokens = (1, 2, 3, 4, 5, 6)
+    ordinary, ordinary_manager, ordinary_seq = make_input(tokens)
+    collected, collected_manager, collected_seq = make_input(tokens)
+    output = reference(
+        torch.tensor([tokens], device="cuda"),
+        use_cache=False, output_hidden_states=True, return_dict=True,
+    )
+    expected_taps = torch.cat(
+        [output.hidden_states[2], output.hidden_states[1]], dim=-1
+    )
+    config = replace(
+        _tensor_config(), hidden_size=128, intermediate_size=256,
+        target_layer_ids=(1, 0), block_size=7,
+    )
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        draft = Qwen38DSpark(
+            config, embed=model.model.embed_tokens, lm_head=model.lm_head
+        ).eval()
+        for parameter in draft.parameters():
+            if parameter.ndim >= 2:
+                parameter.normal_(0, 0.02)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    assert draft._embed[0] is model.model.embed_tokens
+    assert draft._lm_head[0] is model.lm_head
+
+    segment, state, arena = _paged_context_storage(config, 4)
+    chunks, snapshots = [], []
+    anchor = torch.tensor([7], device="cuda")
+    start = 0
+    for end in (2, 3, 6):
+        for data, seq in ((ordinary, ordinary_seq), (collected, collected_seq)):
+            seq.to_compute_token_num = end - start
+            data.cal_and_set_input([seq])
+            data.forward_metadata_plan.attention_metadata = (seq.page_table, end)
+        normal = model(ordinary)
+        final_hidden, taps = model.forward_with_hidden_taps(
+            collected, target_layer_ids=config.target_layer_ids
+        )
+        assert taps.shape == (1, end - start, config.target_hidden_size)
+        torch.testing.assert_close(
+            taps, expected_taps[:, start:end], atol=2e-3, rtol=1e-2
+        )
+        torch.testing.assert_close(final_hidden, normal, atol=0, rtol=0)
+        for old, saved in zip(chunks, snapshots):
+            torch.testing.assert_close(old, saved, atol=0, rtol=0)
+        chunks.append(taps)
+        snapshots.append(taps.clone())
+        # Consume only this chunk; no full-prompt raw feature buffer is needed.
+        paged = draft.prefill_paged(taps, segment=segment, cache=state)
+        dense = draft.prefill(torch.cat(chunks, dim=1), anchor)
+        assert paged.context_length() == dense.context_length() == end
+        keys, values = _read_paged_context(segment, state, end)
+        for got, want in zip(keys + values, dense.keys + dense.values):
+            torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+        ordinary_seq.computed_token_num = collected_seq.computed_token_num = end
+        start = end
+
+    # The dense path's norm requires a nonempty suffix. Build the same
+    # six-row history as five cached rows plus the final collected row.
+    features = torch.cat(chunks, dim=1)
+    dense = draft.prefill(features[:, :5], anchor)
+    before = arena.backing.clone()
+    expected, dense_ids = draft.forward_draft(
+        features[:, 5:], anchor, start_pos=6, caches=dense
+    )
+    got, paged_ids = draft.forward_draft(
+        features[:, :0], anchor, start_pos=6, caches=paged
+    )
+    assert torch.isfinite(got).all() and torch.isfinite(expected).all()
+    torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
+    assert torch.equal(paged_ids, dense_ids)
+    assert torch.equal(arena.backing, before)
+
+    # Simulate a caller selecting an accepted prefix from already-computed
+    # target rows. This does not implement verifier decisions or GDN rollback.
+    accepted = features[:, :3].clone()
+    prefix_segment, prefix_state, _ = _paged_context_storage(config, 4)
+    prefix_keys = [key.clone() for key in prefix_segment.k_cache]
+    prefix_values = [value.clone() for value in prefix_segment.v_cache]
+    draft.prefill_paged(accepted, segment=prefix_segment, cache=prefix_state)
+    dense_prefix = draft.prefill(accepted, anchor)
+    assert prefix_state.context_length == 3
+    keys, values = _read_paged_context(prefix_segment, prefix_state, 3)
+    for got, want in zip(keys + values, dense_prefix.keys + dense_prefix.values):
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+    keep = torch.ones(
+        prefix_segment.num_pages, prefix_segment.page_size,
+        device="cuda", dtype=torch.bool,
+    )
+    keep[prefix_state.page_table[0], :3] = False
+    for got, before in zip(
+        prefix_segment.k_cache + prefix_segment.v_cache, prefix_keys + prefix_values
+    ):
+        assert torch.equal(got[keep], before[keep])
+    collected_manager.free(collected_seq)
+    ordinary_manager.free(ordinary_seq)
