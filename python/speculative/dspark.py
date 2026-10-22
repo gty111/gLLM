@@ -96,8 +96,13 @@ def _validate_verify_input(target, data, block_size, layer_ids):
         raise ValueError("DSpark verify needs eight distinct GDN slots and rolling column zero")
     start = seq.computed_token_num
     end = start + 8
-    # Page reservation is rounded up; it cannot extend the model context.
-    if end > text.max_model_len:
+    # The runner publishes the resolved serving bound on the text config.
+    # Reserved pages and the checkpoint window may both be larger.
+    context_limit = text.max_model_len
+    serving_limit = getattr(text.config, "model_max_length", None)
+    if serving_limit is not None:
+        context_limit = min(context_limit, serving_limit)
+    if end > context_limit:
         raise ValueError("target verify exceeds the model context window")
     if len(seq.page_table) * kv.page_size < end:
         raise ValueError("target KV capacity does not cover the verify window")

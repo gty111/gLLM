@@ -2117,13 +2117,17 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
 
 
 
-def test_dspark_verify_rejects_window_beyond_model_limit_before_forward():
+@pytest.mark.parametrize("checkpoint_limit,serving_limit", [(20, None), (64, 20), (20, 64)])
+def test_dspark_verify_rejects_window_beyond_context_limit_before_forward(
+    checkpoint_limit, serving_limit
+):
     from gllm.speculative.dspark import verify_dspark_target
 
     target, data, _ = _verify_contract_fixture()
-    # The request owns two 16-token pages, but the target permits only 20
-    # positions. Capacity alone would allow [13, 21) to reach the model.
-    target.max_model_len = 20
+    # Two reserved 16-token pages cover [13, 21), but either the checkpoint
+    # or the resolved serving limit permits only 20 positions.
+    target.max_model_len = checkpoint_limit
+    target.config.model_max_length = serving_limit
     manager = data.memory_manager
     banks = manager.segment.k_cache + manager.segment.v_cache + [
         manager.ssm_segment.conv_state, manager.ssm_segment.temporal_state,
@@ -2136,11 +2140,15 @@ def test_dspark_verify_rejects_window_beyond_model_limit_before_forward():
         assert torch.equal(bank, saved)
 
 
-def test_dspark_verify_allows_window_ending_at_model_limit():
+@pytest.mark.parametrize("checkpoint_limit,serving_limit", [(21, None), (64, 21), (21, 64)])
+def test_dspark_verify_allows_window_ending_at_context_limit(
+    checkpoint_limit, serving_limit
+):
     from gllm.speculative.dspark import verify_dspark_target
 
     target, data, _ = _verify_contract_fixture()
-    target.max_model_len = 21
+    target.max_model_len = checkpoint_limit
+    target.config.model_max_length = serving_limit
     result = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
     assert target.calls == target.head_calls == 1
     assert result.accepted_drafts == 2
