@@ -120,11 +120,18 @@ def _validate_verify_input(target, data, block_size, layer_ids):
     gpu_table = data.get_ssm_block_table_2d()
     if gpu_table is None or gpu_table.shape != (1, 8):
         raise ValueError("eight-column GDN device table was not materialized")
+    positions = data.get_position()
+    expected_positions = list(range(start, end))
+    # Conditional text-only requests carry three identical MRoPE axes. Check
+    # every axis without replacing the model's original position buffer.
+    if positions is not None and positions.shape == (3, 8):
+        positions = positions.flatten()
+        expected_positions *= 3
     # A single bounded read catches stale GPU mirrors after column promotion.
     # Historical KV pages remain the InputData materializer's responsibility.
     checks = [
         (tokens, cpu_tokens),
-        (data.get_position(), list(range(start, end))),
+        (positions, expected_positions),
         (data.get_seq_lens(), [end]),
         (data.get_query_start_loc(), [0, 8]),
         (data.get_slot_mapping(), slots),
