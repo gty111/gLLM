@@ -1664,8 +1664,11 @@ def _verify_contract_fixture(accepted=2):
                 predictions[accepted] = (predictions[accepted] + 1) % 32
             self.logits[torch.arange(8), predictions] = 10
 
-        def forward_with_hidden_taps(self, data, *, target_layer_ids):
+        def forward_with_hidden_taps(
+            self, data, hidden_states=None, residual=None, *, target_layer_ids,
+        ):
             assert target_layer_ids == (1, 0)
+            assert hidden_states is None and residual is None
             self.calls += 1
             return self.hidden, self.taps
 
@@ -1706,12 +1709,45 @@ def test_dspark_verify_selects_longest_prefix_and_owns_results(accepted):
     assert result.accepted_hidden.untyped_storage().nbytes() == expected_taps.numel() * 2
 
 
+@pytest.mark.parametrize("mrope", [False, True], ids=["1d", "mrope"])
+@torch.no_grad()
+def test_dspark_verify_accepts_conditional_wrapper_text_positions(mrope):
+    from gllm.layers.rotary_embedding import MRotaryEmbedding
+    from gllm.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+    from gllm.runtime.input_data import InputData
+    from gllm.speculative.dspark import verify_dspark_target
+
+    target, data, buffers = _verify_contract_fixture()
+    data.positions_cpu = data.positions = buffers["position"]
+    data.mrope_positions_cpu = None
+    if mrope:
+        # The conditional runner uses three identical axes even for text.
+        positions = MRotaryEmbedding.get_next_input_positions(0, 13, 21)
+        data.mrope_positions_cpu = data.mrope_positions = torch.tensor(positions)
+    data.get_position = lambda: InputData.get_position(data)
+    before = data.get_position().clone()
+
+    wrapper = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.language_model = target
+    result = verify_dspark_target(wrapper, data, block_size=7, target_layer_ids=(1, 0))
+
+    assert target.calls == target.head_calls == 1
+    assert result.accepted_drafts == 2
+    torch.testing.assert_close(result.committed_ids, buffers["tokens"][:3].unsqueeze(0))
+    torch.testing.assert_close(result.accepted_hidden, target.taps[:, :3], atol=0, rtol=0)
+    assert data.get_position().shape == before.shape
+    assert torch.equal(data.get_position(), before)
+
+
 @pytest.mark.parametrize("invalid", [
     "activation", "key", "value", "conv", "temporal_bf16", "temporal_fp16", "draft_key",
     "sampling", "penalty", "structured", "logprobs", "prompt_logprobs", "prefill",
     "verify_flag", "capacity", "duplicate_state", "rolling_slot", "resume",
     "stale_state_table", "position", "slot_mapping", "seq_lens", "snapshot",
     "vocab", "metadata_missing", "metadata_buffers", "width",
+    "mrope_t", "mrope_h", "mrope_w", "position_matrix",
+    "position_two_axes", "position_short_mrope",
 ])
 def test_dspark_verify_rejects_before_forward_without_cache_changes(invalid):
     from dataclasses import replace
@@ -1761,6 +1797,16 @@ def test_dspark_verify_rejects_before_forward_without_cache_changes(invalid):
         buffers["ssm_block_table_2d"] = buffers["ssm_block_table_2d"].roll(1, dims=1)
     elif invalid in ("position", "slot_mapping", "seq_lens"):
         buffers[invalid][0] += 1
+    elif invalid in ("mrope_t", "mrope_h", "mrope_w"):
+        buffers["position"] = buffers["position"].repeat(3, 1)
+        axis = ("mrope_t", "mrope_h", "mrope_w").index(invalid)
+        buffers["position"][axis, 0] += 1
+    elif invalid == "position_matrix":
+        buffers["position"] = buffers["position"].unsqueeze(0)
+    elif invalid == "position_two_axes":
+        buffers["position"] = buffers["position"].repeat(2, 1)
+    elif invalid == "position_short_mrope":
+        buffers["position"] = buffers["position"].repeat(3, 1)[:, :-1]
     elif invalid == "snapshot":
         buffers["ssm_snapshot_write_slot_per_seq"][0] = 1
     elif invalid == "vocab":
