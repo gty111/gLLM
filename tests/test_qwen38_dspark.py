@@ -2198,3 +2198,274 @@ def test_dspark_verify_allows_window_ending_at_context_limit(
     result = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
     assert target.calls == target.head_calls == 1
     assert result.accepted_drafts == 2
+
+
+def _dspark_loader_target(config, *, embed=None, head=None):
+    """Target shell for loader ownership checks; it does not execute a target."""
+    from types import SimpleNamespace
+    from gllm.models.qwen3_5 import Qwen3_5ForCausalLM
+
+    target = Qwen3_5ForCausalLM.__new__(Qwen3_5ForCausalLM)
+    torch.nn.Module.__init__(target)
+    target.config = SimpleNamespace(hidden_size=config.hidden_size, vocab_size=config.vocab_size)
+    target.max_model_len = config.max_position_embeddings
+    target.model = SimpleNamespace(
+        start_layer=0, end_layer=3,
+        embed_tokens=embed if embed is not None else torch.nn.Embedding(
+            config.vocab_size, config.hidden_size, dtype=torch.bfloat16
+        ),
+    )
+    target.lm_head = head if head is not None else torch.nn.Linear(
+        config.hidden_size, config.vocab_size, bias=False, dtype=torch.bfloat16
+    )
+    target.ssm_cache_config = SimpleNamespace(
+        dtype=torch.float32, conv_state_dtype=torch.bfloat16
+    )
+    target.mtp = None
+    return target
+
+
+@pytest.mark.parametrize("field,value", [
+    ("block_size", 6), ("hidden_size", 65), ("vocab_size", 129),
+    ("mask_token_id", 128), ("target_layer_ids", [0, 0]),
+    ("target_layer_ids", [0, 3]),
+])
+def test_dspark_loader_rejects_incompatible_checkpoint_before_cuda(tmp_path, field, value):
+    from dataclasses import asdict, replace
+    import json
+    from gllm.runtime.model_loader import load_dspark_draft
+
+    config = replace(_tensor_config(), block_size=7)
+    target = _dspark_loader_target(config)
+    raw = asdict(config)
+    raw[field] = value
+    (tmp_path / "config.json").write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ValueError, match="incompatible width, vocabulary or target taps"):
+        load_dspark_draft(str(tmp_path), target, model_max_length=32)
+
+
+@pytest.mark.parametrize("length", [8, 65])
+def test_dspark_loader_rejects_context_before_allocating_draft(tmp_path, length):
+    from dataclasses import asdict, replace
+    import json
+    from gllm.runtime.model_loader import load_dspark_draft
+
+    config = replace(_tensor_config(), block_size=7)
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
+    with pytest.raises(ValueError, match="context windows"):
+        load_dspark_draft(str(tmp_path), _dspark_loader_target(config), length)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_loader_reads_indexed_checkpoint_and_borrows_target_weights(tmp_path):
+    from dataclasses import asdict, replace
+    import json
+    from safetensors.torch import save_file
+    from gllm.runtime.model_loader import load_dspark_draft
+
+    config = replace(_tensor_config(), block_size=7)
+    source = _build_model(config)
+    weights = _build_synthetic_checkpoint(source, config)
+    save_file(weights, tmp_path / "model.safetensors")
+    # An index must select the intended set even beside an alternate shard.
+    save_file({"fc.weight": torch.zeros_like(weights["fc.weight"])}, tmp_path / "alternate.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "model.safetensors" for key in weights}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
+    target = _dspark_loader_target(
+        config, embed=source._embed[0], head=source._lm_head[0]
+    )
+    embed_before = target.model.embed_tokens.weight.clone()
+    head_before = target.lm_head.weight.clone()
+    previous_dtype = torch.get_default_dtype()
+    loaded = load_dspark_draft(str(tmp_path), target, model_max_length=32)
+
+    _assert_loaded_checkpoint(loaded, weights)
+    assert torch.get_default_dtype() == previous_dtype
+    assert loaded._embed[0] is target.model.embed_tokens
+    assert loaded._lm_head[0] is target.lm_head
+    assert torch.equal(target.model.embed_tokens.weight, embed_before)
+    assert torch.equal(target.lm_head.weight, head_before)
+    assert all(p.dtype == torch.bfloat16 and p.device.type == "cuda" for p in loaded.parameters())
+    assert not any("embed" in name or "lm_head" in name for name, _ in loaded.named_parameters())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_loader_rejects_bf16_temporal_state_before_loading(tmp_path):
+    from dataclasses import asdict, replace
+    import json
+    from gllm.runtime.model_loader import load_dspark_draft
+
+    config = replace(_tensor_config(), block_size=7)
+    source = _build_model(config)
+    target = _dspark_loader_target(config, embed=source._embed[0], head=source._lm_head[0])
+    target.ssm_cache_config.dtype = torch.bfloat16
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
+    with pytest.raises(ValueError, match="FP32 temporal"):
+        load_dspark_draft(str(tmp_path), target, model_max_length=32)
+
+
+def _dspark_runtime_fixture():
+    """Real MRoPE target/draft pair, before allocating their shared arena."""
+    from dataclasses import replace
+
+    from gllm.layers.attention.qkv_backends import (
+        bind_qkv_attention_backend, create_qkv_attention_backend, find_qkv_attention_layers,
+    )
+    from gllm.models.qwen3_5 import Qwen3_5ForConditionalGeneration
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+    from gllm.runtime.input_data import InputData
+    from gllm.runtime.memory_manager import DSparkKVCacheConfig, MemoryManager
+    from gllm.runtime.model_runner import ModelRunner
+
+    text, _, make_input = _hybrid_target_fixture(mtp_k=7)
+    # The tiny text fixture defaults to ordinary RoPE. A conditional wrapper
+    # carrying three-axis positions needs the real MRoPE path, with sections
+    # sized to this fixture's rotary dimension rather than the 27B geometry.
+    from gllm.layers.rotary_embedding import MRotaryEmbedding
+
+    for layer in text.model.layers:
+        if layer.self_attn is not None:
+            rope = layer.self_attn.rotary_emb
+            half = rope.rotary_dim // 2
+            layer.self_attn.rotary_emb = MRotaryEmbedding(
+                head_size=rope.head_size, rotary_dim=rope.rotary_dim,
+                max_position_embeddings=text.max_model_len, base=rope.base,
+                is_neox_style=True, mrope_interleaved=True,
+                mrope_section=[(half + 2) // 3, (half + 1) // 3, half // 3],
+            )
+    target = Qwen3_5ForConditionalGeneration.__new__(Qwen3_5ForConditionalGeneration)
+    torch.nn.Module.__init__(target)
+    target.language_model = text
+    config = replace(
+        _tensor_config(), hidden_size=128, intermediate_size=256,
+        target_layer_ids=(1, 0), block_size=7,
+    )
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        draft = Qwen38DSpark(
+            config, embed=text.model.embed_tokens, lm_head=text.lm_head
+        ).eval()
+        for param in draft.parameters():
+            if param.ndim >= 2:
+                param.normal_(0, 0.02)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    manager = MemoryManager(
+        1.0, text.num_kv_layers, torch.bfloat16, 16, text.num_kv_heads, text.head_dim,
+        text.config.vocab_size, max_running_seqs=1, ssm_cache_config=text.ssm_cache_config,
+        mtp_k=7, dspark_kv_cache_config=DSparkKVCacheConfig(
+            len(draft.layers), config.num_key_value_heads, config.head_dim,
+        ),
+    )
+    manager.requires_mrope_buffer = True
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.maxd, runner.maxp, runner.minp, runner.iterp = 1, 8, 1, 1
+    runner.init_new_token_ratio = runner.min_new_token_ratio = 0.1
+    runner.model, runner.dspark, runner.dspark_enabled = target, draft, True
+    runner.model_max_length, runner.max_num_batched_tokens = 32, 32
+    runner.memory_manager, runner.uses_mrope = manager, True
+    runner.page_size = manager.page_size
+    runner.input_data = InputData(
+        use_buffer=True, memory_manager=manager, max_seq_length=32, max_running_seqs=1
+    )
+    backend = create_qkv_attention_backend("fa3", 32, 1)
+    bind_qkv_attention_backend(find_qkv_attention_layers(target), backend)
+    runner.qkv_attention_backend = backend
+
+    return runner, make_input
+
+
+def _init_dspark_runtime_test_arena(runner):
+    from gllm.runtime.cache_arena import CacheArena, select_physical_page_bytes
+    from gllm.runtime.memory_manager import Segment, SSMSegment
+
+    text, draft, manager = runner.model.language_model, runner.dspark, runner.memory_manager
+    config = draft.config
+    # A small real arena avoids consuming the rest of the GPU in a unit test.
+    layouts = manager._cache_layouts()
+    grain = select_physical_page_bytes(layouts.values())
+    pages = 24 * sum((layout.entry_bytes + grain - 1) // grain for layout in layouts.values())
+    arena = CacheArena(
+        torch.zeros(pages * grain, device="cuda", dtype=torch.uint8),
+        physical_page_bytes=grain,
+    )
+    caches = {name: arena.register_cache(layout) for name, layout in layouts.items()}
+    manager.cache_arena = arena
+    manager.segment = Segment(
+        text.num_kv_layers, 16, text.num_kv_heads, text.head_dim, False, caches["kv_cache"]
+    )
+    manager.dspark_segment = Segment(
+        len(draft.layers), 16, config.num_key_value_heads, config.head_dim, False,
+        caches["dspark_kv_cache"],
+    )
+    manager.ssm_segment = SSMSegment(
+        text.ssm_cache_config, state_cache=caches["ssm_state"],
+        snapshot_cache=caches["ssm_snapshot"],
+    )
+    manager.kv_cache_dtype = "auto"
+    manager.k_scale = manager.v_scale = torch.tensor(1.0, device="cuda")
+    return arena
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("chunk_size", [16, 32])
+@torch.no_grad()
+def test_dspark_startup_profiles_max_chunk_and_eight_row_verify_in_shared_arena(chunk_size):
+    runner, _ = _dspark_runtime_fixture()
+    runner.max_num_batched_tokens = chunk_size
+    # Pre-arena: actual maximum prompt/tap/projection shapes and both heads.
+    runner.profile_run()
+    assert runner.dspark_profile["prefill_tokens"] == chunk_size
+    assert runner.dspark_profile["projected_tokens"] == chunk_size
+    assert runner.dspark_profile["noise_rows"] == 7
+    assert runner.dspark_profile["target_logits_rows"] == 8
+    assert runner.dspark_profile["paged_workspace_allowance_bytes"] > 0
+
+    arena = _init_dspark_runtime_test_arena(runner)
+    owned_before = arena.allocator.num_used_physical_pages
+    runner._profile_dspark_paged_verify()
+    assert runner.dspark_profile["verify_tokens"] == 8
+    assert runner.dspark_profile["paged_prefill_tokens"] == chunk_size
+    # One case fits the verify after the maximum chunk; the other must
+    # release that probe and create a shorter context without leaking slots.
+    context_size = min(chunk_size, runner.model_max_length - 8)
+    assert runner.dspark_profile["verify_context_tokens"] == context_size
+    assert runner.input_data.forward_metadata_plan.query_lens == (8,)
+    assert runner.input_data.get_position().shape == (3, 8)
+    assert not runner.input_data.get_position().is_contiguous()
+    assert arena.allocator.num_used_physical_pages == owned_before
+    assert runner.input_data.seqs[0].ssm_block_table is None
+    assert runner.input_data.seqs[0].page_table == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_loader_failure_closes_weights_and_restores_default_dtype(tmp_path, monkeypatch):
+    from dataclasses import asdict, replace
+    import json
+    from safetensors.torch import save_file
+    from gllm.runtime import model_loader as module
+
+    config = replace(_tensor_config(), block_size=7)
+    source = _build_model(config)
+    target = _dspark_loader_target(config, embed=source._embed[0], head=source._lm_head[0])
+    weights = _build_synthetic_checkpoint(source, config)
+    del weights["fc.weight"]
+    save_file(weights, tmp_path / "model.safetensors")
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
+    closed = []
+    original_close = module.LazySafetensors.close
+
+    def close(mapping):
+        original_close(mapping)
+        closed.append(True)
+
+    monkeypatch.setattr(module.LazySafetensors, "close", close)
+    previous_dtype = torch.get_default_dtype()
+    with pytest.raises(KeyError):
+        module.load_dspark_draft(str(tmp_path), target, model_max_length=32)
+    assert closed == [True]
+    assert torch.get_default_dtype() == previous_dtype

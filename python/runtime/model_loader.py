@@ -151,6 +151,101 @@ class LazySafetensors:
         self._pool.close()
 
 
+def _safetensors_index(path: str) -> Dict[str, Tuple[str, str]]:
+    """Read only the indexed shard set, or reject ambiguous unindexed keys."""
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as stream:
+            weight_map = json.load(stream).get("weight_map", {})
+        if not weight_map:
+            raise ValueError(f"Safetensors index {index_path} has no non-empty weight_map")
+        index = {}
+        for key, shard_name in weight_map.items():
+            shard_path = os.path.join(path, shard_name)
+            if not os.path.isfile(shard_path):
+                raise FileNotFoundError(
+                    f"Safetensors index maps {key!r} to missing shard {shard_path!r}"
+                )
+            index[key] = (shard_path, key)
+        return index
+
+    index = {}
+    for weight_path in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+        with safe_open(weight_path, framework="pt", device="cpu") as stream:
+            for key in stream.keys():
+                if key in index:
+                    previous = index[key][0]
+                    raise ValueError(
+                        f"Duplicate tensor key {key!r} in unindexed safetensors files "
+                        f"{previous!r} and {weight_path!r}; add a "
+                        "model.safetensors.index.json to select the intended shard set"
+                    )
+                index[key] = (weight_path, key)
+    return index
+
+
+@torch.no_grad()
+def load_dspark_draft(path: str, target, model_max_length: int):
+    """Load a local standalone drafter, borrowing the target's vocabulary.
+
+    Target FP8 weights are independent of activation/cache precision. Only the
+    BF16 embedding/head and FP32 temporal/BF16 conv configuration are required
+    here; no second tokenizer, embedding, or LM head is constructed.
+    """
+    from gllm.distributed.parallel_state import get_dp_size, get_pp_size, get_tp_size
+    from gllm.models.qwen3_5 import Qwen3_5ForCausalLM
+    from gllm.models.qwen38_dspark import Qwen38DSpark, Qwen38DSparkConfig
+
+    if (get_tp_size(), get_pp_size(), get_dp_size()) != (1, 1, 1):
+        raise ValueError("DSpark requires TP=PP=DP=1")
+    text = getattr(target, "language_model", target)
+    if not isinstance(text, Qwen3_5ForCausalLM) or getattr(text, "mtp", None) is not None:
+        raise ValueError("DSpark requires a Qwen3.5 text target without an MTP head")
+    with open(os.path.join(path, "config.json"), encoding="utf-8") as stream:
+        config = Qwen38DSparkConfig.from_dict(json.load(stream))
+    backbone = text.model
+    layer_ids = config.target_layer_ids
+    if (
+        config.block_size != 7 or config.hidden_size != text.config.hidden_size
+        or config.vocab_size != text.config.vocab_size
+        or not 0 <= config.mask_token_id < config.vocab_size
+        or not layer_ids or len(set(layer_ids)) != len(layer_ids)
+        or any(not backbone.start_layer <= i < backbone.end_layer for i in layer_ids)
+    ):
+        raise ValueError("DSpark checkpoint has incompatible width, vocabulary or target taps")
+    if not 9 <= model_max_length <= min(text.max_model_len, config.max_position_embeddings):
+        raise ValueError("DSpark serving length must fit the target and draft context windows")
+    embed, head = backbone.embed_tokens, text.lm_head
+    if (
+        embed.weight.shape != (config.vocab_size, config.hidden_size)
+        or head.weight.shape != embed.weight.shape
+        or embed.weight.dtype != torch.bfloat16 or head.weight.dtype != torch.bfloat16
+        or embed.weight.device.type != "cuda" or head.weight.device != embed.weight.device
+    ):
+        raise ValueError("DSpark requires compatible BF16 target embedding/head on CUDA")
+    state = text.ssm_cache_config
+    if state.dtype != torch.float32 or state.conv_state_dtype != torch.bfloat16:
+        raise ValueError("DSpark requires FP32 temporal and BF16 conv state")
+    index = _safetensors_index(path)
+    if not index:
+        raise FileNotFoundError("DSpark directory contains no safetensors weights")
+    weights = LazySafetensors(index)
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        draft = Qwen38DSpark(config, embed=embed, lm_head=head).eval()
+        if model_max_length > draft.rotary_emb.cos_sin_cache.shape[0]:
+            raise ValueError("DSpark serving length exceeds the draft RoPE cache")
+        draft.load_weights(weights)
+        if any(p.dtype != torch.bfloat16 or p.device != embed.weight.device
+               for p in draft.parameters()):
+            raise ValueError("DSpark parameters must share the target BF16 device")
+        return draft
+    finally:
+        weights.close()
+        torch.set_default_dtype(previous_dtype)
+
+
 def _is_quantized_param(param: torch.Tensor) -> bool:
     """True for the per-tensor weight of a FP8 / INT8 quantized linear.
 
@@ -424,64 +519,14 @@ class ModelLoader:
         _prefetch_shards(list(shard_paths), rank=rank, world_size=world)
 
     def load_safetensors(self, path):
-        index_path = os.path.join(path, "model.safetensors.index.json")
-        if os.path.isfile(index_path):
-            # A directory may contain stale or alternate shard sets alongside
-            # the one selected by Hugging Face's index.  Scanning every
-            # ``*.safetensors`` file silently mixes those models because the
-            # same parameter names occur in both sets. The index is the
-            # authoritative parameter-to-shard mapping, so load only its files.
-            with open(index_path, encoding="utf-8") as f:
-                weight_map = json.load(f).get("weight_map", {})
-            if not weight_map:
-                raise ValueError(
-                    f"Safetensors index {index_path} has no non-empty weight_map"
-                )
-            index: Dict[str, Tuple[str, str]] = {}
-            for key, shard_name in weight_map.items():
-                shard_path = os.path.join(path, shard_name)
-                if not os.path.isfile(shard_path):
-                    raise FileNotFoundError(
-                        f"Safetensors index maps {key!r} to missing shard "
-                        f"{shard_path!r}"
-                    )
-                index[key] = (shard_path, key)
-            self._start_prefetch(shard for shard, _ in index.values())
-            self.weights = LazySafetensors(index)
-            if hasattr(self, "config"):
-                self.config.checkpoint_path = path
-            return True
-
-        weights_path = sorted(glob.glob(f"{path}/*.safetensors"))
-        if not weights_path:
-            return False
-        # Build only a key -> (shard, key) index from the shard headers; tensors
-        # are read lazily on demand (see LazySafetensors). This avoids loading
-        # the entire checkpoint into CPU memory before the GPU copy starts.
-        #
-        # NB: we intentionally index *all* keys, including routed experts not
-        # owned by this EP rank. The pull-based weight loader
-        # (load_fused_w13_per_expert / load_w2_per_expert) checks expert
-        # ownership via resolve_ep_expert_idx *before* calling
-        # get_tensor_from_dict, so non-local experts are never lazily
-        # materialized -- indexing them costs only a dict entry, not any disk I/O.
-        index: Dict[str, Tuple[str, str]] = {}
-        for weight_path in weights_path:
-            with safe_open(weight_path, framework="pt", device="cpu") as f:
-                for k in f.keys():
-                    if k in index:
-                        previous = index[k][0]
-                        raise ValueError(
-                            f"Duplicate tensor key {k!r} in unindexed "
-                            f"safetensors files {previous!r} and "
-                            f"{weight_path!r}; add a model.safetensors.index.json "
-                            "to select the intended shard set"
-                        )
-                    index[k] = (weight_path, k)
+        index = _safetensors_index(path)
         if not index:
             return False
         self._start_prefetch(shard for shard, _ in index.values())
         self.weights = LazySafetensors(index)
+        if os.path.isfile(os.path.join(path, "model.safetensors.index.json")):
+            if hasattr(self, "config"):
+                self.config.checkpoint_path = path
         return True
 
     def load_bin(self, path):
