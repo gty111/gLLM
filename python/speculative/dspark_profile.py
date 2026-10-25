@@ -20,11 +20,15 @@ def profile_dspark_prefill(
     """Include taps, projection/noise and both heads before sizing the arena.
 
     Dense K/V is temporary profiling storage only. A nonempty one-row
-    suffix avoids the validation path's unsupported zero-row RMSNorm.
+    suffix avoids the validation path's unsupported zero-row RMSNorm. The
+    startup chunk must contain at least eight rows to also probe all target
+    verify logits; this minimum does not restrict real request prompt lengths.
     Paged attention uses four FP32 split accumulators; the explicit extra
     allowance also covers its merge/noise tensors. The real paged path is
     exercised separately after arena allocation.
     """
+    if input_data.tokens_cpu.shape[0] < 8:
+        raise ValueError("DSpark startup profiling requires a prefill chunk of at least 8 tokens")
     torch.cuda.reset_peak_memory_stats()
     hidden, taps = target.forward_with_hidden_taps(
         input_data, target_layer_ids=draft.config.target_layer_ids
@@ -79,6 +83,9 @@ def profile_dspark_paged_verify(
     In particular, do not attempt event waits or cache recovery after a
     potentially fatal CUDA error. Cleanup below runs only after success.
     """
+    if max_prompt_tokens < 8:
+        raise ValueError("DSpark startup profiling requires a prefill chunk of at least 8 tokens")
+
     from gllm.speculative.dspark import verify_dspark_target
 
     manager = input_data.memory_manager

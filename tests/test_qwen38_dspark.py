@@ -2412,13 +2412,21 @@ def _init_dspark_runtime_test_arena(runner):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("chunk_size", [16, 32])
+@pytest.mark.parametrize("chunk_size,context_limit", [(8, 9), (8, 32), (16, 32), (32, 32)])
 @torch.no_grad()
-def test_dspark_startup_profiles_max_chunk_and_eight_row_verify_in_shared_arena(chunk_size):
+def test_dspark_startup_profiles_max_chunk_and_eight_row_verify_in_shared_arena(
+    chunk_size, context_limit
+):
     from gllm.speculative.dspark_profile import profile_dspark_paged_verify
 
     runner, _ = _dspark_runtime_fixture()
     runner.max_num_batched_tokens = chunk_size
+    runner.model_max_length = context_limit
+    runner.model.language_model.config.model_max_length = context_limit
+    if context_limit == 9:
+        # The minimum valid context leaves one row for dense history in the
+        # pre-arena probe and one cached row before the eight-row verify.
+        runner.dspark.rotary_emb.cos_sin_cache = runner.dspark.rotary_emb.cos_sin_cache[:9]
     # Pre-arena: actual maximum prompt/tap/projection shapes and both heads.
     runner.profile_run()
     assert runner.dspark_profile["prefill_tokens"] == chunk_size
@@ -2438,7 +2446,7 @@ def test_dspark_startup_profiles_max_chunk_and_eight_row_verify_in_shared_arena(
     assert runner.dspark_profile["paged_prefill_tokens"] == chunk_size
     # One case fits the verify after the maximum chunk; the other must
     # release that probe and create a shorter context without leaking slots.
-    context_size = min(chunk_size, runner.model_max_length - 8)
+    context_size = min(chunk_size, context_limit - 8)
     assert runner.dspark_profile["verify_context_tokens"] == context_size
     assert runner.input_data.forward_metadata_plan.query_lens == (8,)
     assert runner.input_data.get_position().shape == (3, 8)
@@ -2475,3 +2483,38 @@ def test_dspark_loader_failure_closes_weights_and_restores_default_dtype(tmp_pat
         module.load_dspark_draft(str(tmp_path), target, model_max_length=32)
     assert closed == [True]
     assert torch.get_default_dtype() == previous_dtype
+
+
+@pytest.mark.parametrize("chunk_size", [1, 7])
+@pytest.mark.parametrize("phase", ["prefill", "paged_verify"])
+def test_dspark_startup_rejects_short_chunks_before_cuda(monkeypatch, chunk_size, phase):
+    from types import SimpleNamespace
+
+    from gllm.speculative.dspark_profile import (
+        profile_dspark_paged_verify, profile_dspark_prefill,
+    )
+
+    def unexpected_work(*args, **kwargs):
+        pytest.fail("A short startup chunk must be rejected before CUDA or model work")
+
+    for name in ("reset_peak_memory_stats", "memory_allocated", "synchronize"):
+        monkeypatch.setattr(torch.cuda, name, unexpected_work)
+    data = SimpleNamespace(
+        tokens_cpu=torch.empty(chunk_size, dtype=torch.long, device="cpu"),
+        memory_manager=SimpleNamespace(reserve_dspark_pages=unexpected_work),
+    )
+    target = SimpleNamespace(forward_with_hidden_taps=unexpected_work)
+    draft = SimpleNamespace(
+        _project_context=unexpected_work, prefill=unexpected_work,
+        prefill_paged=unexpected_work, forward_draft=unexpected_work,
+        forward_head=unexpected_work,
+    )
+    with pytest.raises(ValueError, match="at least 8 tokens"):
+        if phase == "prefill":
+            profile_dspark_prefill(target, draft, data)
+        else:
+            profile_dspark_paged_verify(
+                target, draft, data, max_prompt_tokens=chunk_size,
+                model_max_length=32, uses_mrope=False,
+                prepare_attention=unexpected_work,
+            )
