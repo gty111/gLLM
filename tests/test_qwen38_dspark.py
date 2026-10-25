@@ -2518,3 +2518,58 @@ def test_dspark_startup_rejects_short_chunks_before_cuda(monkeypatch, chunk_size
                 model_max_length=32, uses_mrope=False,
                 prepare_attention=unexpected_work,
             )
+
+
+def test_dspark_startup_releases_outputs_before_shorter_prefill(monkeypatch):
+    """CPU lifetime oracle; this does not measure CUDA memory peaks."""
+    from types import SimpleNamespace
+    import weakref
+
+    from gllm.speculative.dspark_profile import profile_dspark_paged_verify
+
+    class ShorterProbeReached(Exception):
+        pass
+
+    previous_outputs, freed = [], []
+
+    class Target:
+        calls = 0
+
+        def forward_with_hidden_taps(self, data, *, target_layer_ids):
+            self.calls += 1
+            length = data.seqs[0].to_compute_token_num
+            if self.calls == 2:
+                assert length == 24 and freed == [32]
+                assert all(reference() is None for reference in previous_outputs)
+                raise ShorterProbeReached
+            assert length == 32
+            hidden = torch.empty(length, 4, device="cpu")
+            taps = torch.empty(1, length, 8, device="cpu")
+            previous_outputs.extend([weakref.ref(hidden), weakref.ref(taps)])
+            return hidden, taps
+
+    def release(seq, cache):
+        freed.append(seq.computed_token_num)
+        cache.reset()
+
+    manager = SimpleNamespace(
+        dspark_segment=object(),
+        reserve_dspark_pages=lambda *args, **kwargs: True,
+        free_dspark_cache=release,
+    )
+    data = SimpleNamespace(memory_manager=manager)
+    data.cal_and_set_input = lambda seqs: setattr(data, "seqs", seqs)
+    draft = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=(0,)),
+        prefill_paged=lambda *args, **kwargs: object(),
+    )
+    for name in ("memory_allocated", "max_memory_allocated"):
+        monkeypatch.setattr(torch.cuda, name, lambda: 0)
+    for name in ("reset_peak_memory_stats", "synchronize"):
+        monkeypatch.setattr(torch.cuda, name, lambda: None)
+
+    with pytest.raises(ShorterProbeReached):
+        profile_dspark_paged_verify(
+            Target(), draft, data, max_prompt_tokens=32, model_max_length=32,
+            uses_mrope=False, prepare_attention=lambda _: None,
+        )

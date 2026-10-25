@@ -130,6 +130,9 @@ def profile_dspark_paged_verify(
     if length + 8 > model_max_length:
         manager.free_dspark_cache(seq, cache)
         torch.cuda.synchronize()
+        # Assignment evaluates the next prefill before replacing these names.
+        # Drop the completed probe outputs first to avoid overlapping peaks.
+        del hidden, taps, paged
         length = model_max_length - 8
         seq, cache, hidden, taps, paged = prefill(length)
     if not manager.reserve_dspark_pages(
