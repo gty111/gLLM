@@ -61,11 +61,14 @@ from gllm.runtime.config import EngineConfig
 from gllm.runtime.cuda_graph import CudaGraphMixin
 from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.runtime.input_data import InputData
-from gllm.runtime.memory_manager import DSparkRequestCache, MemoryManager, PrefixMemoryManager
+from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.runtime.model_loader import ModelLoader, propagate_serving_config
 from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.async_state import MtpAsyncBatchState
+from gllm.speculative.dspark_profile import (
+    profile_dspark_paged_verify, profile_dspark_prefill,
+)
 from gllm.speculative.gpu_prep import MtpGpuPrep
 from gllm.speculative.mtp import MtpMixin, MtpQDist, MtpVerifyResult
 from gllm.speculative.staging import MtpStagingBuffers
@@ -1039,7 +1042,9 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
         with stream_ctx:
             self._prepare_attention_metadata(self.input_data)
             if getattr(self, "dspark_enabled", False):
-                self._profile_dspark_prefill()
+                self.dspark_profile = profile_dspark_prefill(
+                    self.model, self.dspark, self.input_data
+                )
             elif is_first_pp_rank():
                 self.model(self.input_data)
             else:
@@ -1056,140 +1061,15 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
         else:
             torch.cuda.synchronize()
 
-    def _profile_dspark_prefill(self):
-        """Include taps, projection/noise and both heads before sizing the arena.
-
-        Dense K/V is temporary profiling storage only. A nonempty one-row
-        suffix avoids the validation path's unsupported zero-row RMSNorm.
-        Paged attention uses four FP32 split accumulators; the explicit extra
-        allowance also covers its merge/noise tensors. The real paged path is
-        exercised separately after arena allocation.
-        """
-        torch.cuda.reset_peak_memory_stats()
-        hidden, taps = self.model.forward_with_hidden_taps(
-            self.input_data, target_layer_ids=self.dspark.config.target_layer_ids
-        )
-        # Keep the full-chunk projection alive to account for the largest
-        # actual append shape, even if RoPE bounds shorten the noise probe.
-        projected = self.dspark._project_context(taps)
-        anchor = self.input_data.get_tokens()[:1]
-        rows = min(taps.shape[1], self.dspark.rotary_emb.cos_sin_cache.shape[0] - 7)
-        cache = self.dspark.prefill(taps[:, :rows - 1], anchor)
-        heads, dim = self.dspark.config.num_attention_heads, self.dspark.config.head_dim
-        workspace = torch.empty(
-            (7, heads, 4 * (dim + 1) + 8 * dim + 4 * 7 + 4),
-            dtype=torch.float32, device=taps.device,
-        )
-        draft_hidden, _ = self.dspark.forward_draft(
-            taps[:, rows - 1:rows], anchor, start_pos=rows, caches=cache
-        )
-        draft_output = self.dspark.forward_head(draft_hidden, anchor)
-        target_logits = self.model.logits_from_hidden(hidden[-8:])
-        self.dspark_profile = {
-            "prefill_tokens": taps.shape[1],
-            "projected_tokens": projected.shape[1],
-            "noise_rows": draft_output[0].shape[1] - 1,
-            "target_logits_rows": target_logits.shape[0],
-            "prefill_peak_bytes": torch.cuda.max_memory_allocated(),
-            "paged_workspace_allowance_bytes": workspace.numel() * workspace.element_size(),
-        }
-        logger.info(
-            "DSpark pre-arena profile: prompt=%d, noise=7, target_logits=8, "
-            "peak_allocated=%.2f MiB, paged_allowance=%.2f MiB",
-            taps.shape[1], self.dspark_profile["prefill_peak_bytes"] / (1 << 20),
-            self.dspark_profile["paged_workspace_allowance_bytes"] / (1 << 20),
-        )
-
-    @torch.inference_mode()
     def _profile_dspark_paged_verify(self):
-        """Probe an actual eight-row target verify with both caches in one arena.
-
-        Startup failures propagate to the worker's existing failure path.
-        In particular, do not attempt event waits or cache recovery after a
-        potentially fatal CUDA error. Cleanup below runs only after success.
-        """
-        from gllm.speculative.dspark import verify_dspark_target
-
-        def prefill(length):
-            seq = GenerationSequence(
-                -1, [0] * length, [], output_len=8, temperature=0, top_k=1,
-            )
-            cache = DSparkRequestCache()
-            if not self.memory_manager.reserve_dspark_pages(
-                seq, cache, target_length=length, draft_length=length
-            ):
-                raise RuntimeError("DSpark startup probe cannot reserve target/draft/GDN storage")
-            seq.to_compute_token_num = length
-            self.input_data.cal_and_set_input([seq])
-            if self.uses_mrope:
-                self.input_data.set_mrope_position(
-                    torch.arange(length, device="cpu").repeat(3, 1)
-                )
-            self._prepare_attention_metadata(self.input_data)
-            hidden, taps = self.model.forward_with_hidden_taps(
-                self.input_data, target_layer_ids=self.dspark.config.target_layer_ids
-            )
-            paged = self.dspark.prefill_paged(
-                taps, segment=self.memory_manager.dspark_segment, cache=cache
-            )
-            seq.computed_token_num = length
-            return seq, cache, hidden, taps, paged
-
-        # Profile the maximum chunk even when it leaves no eight-row suffix.
-        # A second, shorter request then probes the full verify shape.
-        before = torch.cuda.memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
-        length = self.max_num_batched_tokens
-        seq, cache, hidden, taps, paged = prefill(length)
-        torch.cuda.synchronize()
-        self.dspark_profile.update(
-            paged_prefill_tokens=length,
-            paged_prefill_peak_extra_bytes=torch.cuda.max_memory_allocated() - before,
+        """Run the DSpark post-arena probe after shared cache initialization."""
+        profile = profile_dspark_paged_verify(
+            self.model, self.dspark, self.input_data,
+            max_prompt_tokens=self.max_num_batched_tokens,
+            model_max_length=self.model_max_length, uses_mrope=self.uses_mrope,
+            prepare_attention=self._prepare_attention_metadata,
         )
-        if length + 8 > self.model_max_length:
-            self.memory_manager.free_dspark_cache(seq, cache)
-            torch.cuda.synchronize()
-            length = self.model_max_length - 8
-            seq, cache, hidden, taps, paged = prefill(length)
-        if not self.memory_manager.reserve_dspark_pages(
-            seq, cache, target_length=length + 8, draft_length=length + 8
-        ):
-            raise RuntimeError("DSpark startup probe cannot reserve the full verify window")
-        anchor = self.model.logits_from_hidden(hidden[-1:]).argmax(-1)
-        seq.computed_token_num = length
-        before = torch.cuda.memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
-        draft_hidden, _ = self.dspark.forward_draft(
-            taps[:, :0], anchor, start_pos=length, caches=paged
-        )
-        proposed, _, _ = self.dspark.forward_head(draft_hidden, anchor)
-        seq.to_compute_tokens = proposed[0].cpu().tolist()
-        seq.to_compute_token_num = 8
-        seq._mtp_verify = True
-        self.input_data.cal_and_set_input([seq])
-        if self.uses_mrope:
-            self.input_data.set_mrope_position(
-                torch.arange(length, length + 8, device="cpu").repeat(3, 1)
-            )
-        self._prepare_attention_metadata(self.input_data)
-        verify_dspark_target(
-            self.model, self.input_data, block_size=7,
-            target_layer_ids=self.dspark.config.target_layer_ids,
-        )
-        torch.cuda.synchronize()
-        self.dspark_profile.update(
-            verify_tokens=8, verify_context_tokens=length,
-            verify_peak_extra_bytes=torch.cuda.max_memory_allocated() - before,
-        )
-        self.memory_manager.free_dspark_cache(seq, cache)
-        torch.cuda.synchronize()
-        logger.info(
-            "DSpark post-arena profile: prompt=%d (peak_extra=%.2f MiB), "
-            "context=%d, verify=8 (peak_extra=%.2f MiB); temporary request released",
-            self.dspark_profile["paged_prefill_tokens"],
-            self.dspark_profile["paged_prefill_peak_extra_bytes"] / (1 << 20),
-            length, self.dspark_profile["verify_peak_extra_bytes"] / (1 << 20),
-        )
+        self.dspark_profile.update(profile)
 
     @torch.inference_mode()
     def forward(self):

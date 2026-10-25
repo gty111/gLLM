@@ -2415,6 +2415,8 @@ def _init_dspark_runtime_test_arena(runner):
 @pytest.mark.parametrize("chunk_size", [16, 32])
 @torch.no_grad()
 def test_dspark_startup_profiles_max_chunk_and_eight_row_verify_in_shared_arena(chunk_size):
+    from gllm.speculative.dspark_profile import profile_dspark_paged_verify
+
     runner, _ = _dspark_runtime_fixture()
     runner.max_num_batched_tokens = chunk_size
     # Pre-arena: actual maximum prompt/tap/projection shapes and both heads.
@@ -2427,7 +2429,11 @@ def test_dspark_startup_profiles_max_chunk_and_eight_row_verify_in_shared_arena(
 
     arena = _init_dspark_runtime_test_arena(runner)
     owned_before = arena.allocator.num_used_physical_pages
-    runner._profile_dspark_paged_verify()
+    runner.dspark_profile.update(profile_dspark_paged_verify(
+        runner.model, runner.dspark, runner.input_data,
+        max_prompt_tokens=chunk_size, model_max_length=runner.model_max_length,
+        uses_mrope=runner.uses_mrope, prepare_attention=runner._prepare_attention_metadata,
+    ))
     assert runner.dspark_profile["verify_tokens"] == 8
     assert runner.dspark_profile["paged_prefill_tokens"] == chunk_size
     # One case fits the verify after the maximum chunk; the other must

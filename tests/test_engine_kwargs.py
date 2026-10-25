@@ -95,6 +95,7 @@ def test_dspark_startup_cuda_failure_reaches_worker_exit_path_without_cleanup(mo
         _prepare_attention_metadata=lambda data: None,
         model=SimpleNamespace(forward_with_hidden_taps=fail_forward),
     )
+    runner.input_data.memory_manager = runner.memory_manager
     monkeypatch.setattr(torch.cuda, "synchronize", unsafe_cleanup)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
