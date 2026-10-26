@@ -1262,6 +1262,7 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
             and self.mtp_speculate_batch(self.input_data.num_decodes)
             and self.check_decode_batch()
             and self.mtp_sampling_compatible(self.input_data.seqs)
+            and self.mtp_context_compatible(self.input_data.seqs)
         ):
             seqs = self.input_data.seqs[: self.input_data.num_decodes]
             if seqs:
@@ -1380,10 +1381,12 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
                 and self.input_data.num_prefills == 0
                 and self.input_data.num_decodes > 0
                 and (not self.mtp_speculate_batch(self.input_data.num_decodes)
-                     or not self.mtp_sampling_compatible(seqs))
+                     or not self.mtp_sampling_compatible(seqs)
+                     or not self.mtp_context_compatible(seqs))
             ):
-                # Constraints require plain sampling, or this batch is too large
-                # to profit from speculation. Its one sampled token is final.
+                # Constraints require plain sampling, the verify window does
+                # not fit, or the batch is too large to profit from speculation.
+                # Its one sampled token is final.
                 # The relay it leaves behind is stale (see ``_mtp_drop_relay``).
                 self._mtp_drop_relay()
             elif (

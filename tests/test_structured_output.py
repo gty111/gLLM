@@ -409,7 +409,9 @@ def test_mixed_structured_prefill_selects_async_mtp_plan(top_k):
 
     worker = OverlapWorker.__new__(OverlapWorker)
     worker._dp = False
-    worker.model_runner = SimpleNamespace(mtp_enabled=True, mtp_begin_iter=bool)
+    worker.model_runner = SimpleNamespace(
+        mtp_enabled=True, mtp_begin_iter=lambda n, **kwargs: bool(n),
+    )
     decode, prefill = seq(seq_id=1), seq(seq_id=2)
     decode.structured_output = None
     decode.computed_token_num = 1

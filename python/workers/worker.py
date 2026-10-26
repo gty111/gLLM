@@ -921,7 +921,8 @@ class Worker(TorchProfilerMixin):
         # previous decode iteration for the adaptive gate.
         _pure_decode = bool(schedule_seqs) and schedule_seqs[-1].computed_prompt
         self.model_runner.mtp_begin_iter(
-            len(schedule_seqs) if _pure_decode else None
+            len(schedule_seqs) if _pure_decode else None,
+            seqs=schedule_seqs if _pure_decode else None,
         )
         # See ``ModelRunner.mtp_prep_eligible``: an MTP step throws
         # this prep's per-token arrays away, so skip building them. The predicate

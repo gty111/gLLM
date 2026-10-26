@@ -9,6 +9,35 @@ from gllm.layers.ops.state_snapshot import copy_slot_snapshots
 from gllm.speculative.async_state import MtpAsyncBatchState
 from gllm.speculative.gpu_prep import META_CTX, META_X1, MtpGpuPrep
 from gllm.speculative.staging import MtpStagingBuffers
+from gllm.speculative.mtp import MtpMixin
+from gllm.runtime.sequence import GenerationSequence
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_production_context_boundary_stages_only_fitting_mtp_window():
+    runner = MtpMixin()
+    runner._mtp_k = 3
+    runner.model_max_length = 240000
+    seq = GenerationSequence(1, [10] * 239996, [], output_len=64)
+    seq.raw_prompt_len = 239990
+    prep = MtpGpuPrep(
+        max_bs=1, max_blocks=15000, bt_width=0, page_size=16,
+        uses_mrope=False, device=torch.device("cuda"),
+    )
+    assert runner.mtp_context_compatible([seq])
+    reserved_length = len(seq) + 1 + runner._mtp_k
+    seq.page_table = list(range((reserved_length + 15) // 16))
+    prep.push_meta(
+        [seq], 1, epoch=1, ctx_lens=[len(seq)], x1=[10], dummy_page=0,
+    )
+    torch.cuda.synchronize()
+    assert prep.pt_cols == 15000
+    assert prep._d_pt[0, -1].item() == 14999
+    seq.append(10)
+    # This would reserve 15001 pages and crash the fixed-width copy. The
+    # planner must now leave MTP before touching page or GPU metadata buffers.
+    assert (len(seq) + 4 + 15) // 16 == 15001
+    assert not runner.mtp_context_compatible([seq])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

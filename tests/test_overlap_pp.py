@@ -124,6 +124,8 @@ class _DeferredSeq:
         self.computed_token_num = 4
         self.to_compute_token_num = 1
         self.prompt_len = 4
+        self.raw_prompt_len = 4
+        self.output_len = 64
         self.token_ids = [1, 2, 3, 4, 5]
         self._overlap_freed = False
 
@@ -133,6 +135,9 @@ class _DeferredSeq:
 
     def append(self, token):
         self.token_ids.append(token)
+
+    def __len__(self):
+        return len(self.token_ids)
 
 
 def test_pp_overlap_rotates_completed_microbatch_to_decode_tail():
