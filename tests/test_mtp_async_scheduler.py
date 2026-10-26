@@ -7,6 +7,7 @@ from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.workers.overlap import OverlapWorker
 from gllm.scheduling.scheduler import OverlapScheduler
 from gllm.runtime.sequence import GenerationSequence
+from gllm.speculative.mtp import MtpMixin
 
 
 class _Runner:
@@ -278,7 +279,7 @@ def test_overlap_worker_builds_one_mtp_plan_for_pure_and_mixed_batches(top_k):
     decisions = []
     worker.model_runner = SimpleNamespace(
         mtp_enabled=True,
-        mtp_begin_iter=lambda n: decisions.append(n) or bool(n),
+        mtp_begin_iter=lambda n, **kwargs: decisions.append(n) or bool(n),
     )
 
     pure_seqs = [_decode_seq(31), _decode_seq(32)]
@@ -352,3 +353,135 @@ def test_plain_decode_transition_publishes_mtp_relay_before_input_refresh():
     worker.run_pp0()
 
     assert calls == ["drain", "publish", "refresh", "build"]
+
+
+def _boundary_runner(limit=32):
+    runner = MtpMixin()
+    runner.mtp_enabled = True
+    runner._mtp_k = 3
+    runner._mtp_max_batch = 0
+    runner._mtp_spec_decision = None
+    runner.max_num_batched_tokens = 8192
+    runner.model_max_length = limit
+    runner._mtp_relay = {}
+    return runner
+
+
+@pytest.mark.parametrize("limit,length,output_len,expected", [
+    (32, 28, 64, True),
+    (32, 29, 64, False),
+    (33, 29, 64, True),
+    (33, 30, 64, False),
+    (240000, 239996, 240000, True),
+    (240000, 239997, 240000, False),
+    (64, 28, 30, True),  # Two prompt tokens plus thirty output tokens.
+    (64, 29, 30, False),
+])
+def test_mtp_window_respects_context_and_output_budget(limit, length, output_len, expected):
+    runner = _boundary_runner(limit)
+    seq = _decode_seq(output_len=output_len)
+    seq.token_ids = [10] * length
+    assert runner.mtp_begin_iter(1, seqs=[seq]) is expected
+    # Input prep and execution must agree with the iteration decision.
+    assert runner.mtp_speculate_batch(1) is expected
+    assert runner.mtp_prep_eligible([seq]) is expected
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_overlap_plan_declines_entire_cohort_when_one_window_does_not_fit(mixed):
+    worker = OverlapWorker.__new__(OverlapWorker)
+    worker._dp = False
+    worker.model_runner = _boundary_runner()
+    safe, tail = _decode_seq(51, 64), _decode_seq(52, 64)
+    safe.token_ids = [10] * 20
+    tail.token_ids = [10] * 29
+    seqs = [safe, tail]
+    if mixed:
+        seqs.append(GenerationSequence(53, [10] * 8, [], output_len=8))
+    worker._prefetched_input = SimpleNamespace(
+        seqs=seqs, num_decodes=2, num_prefills=int(mixed),
+    )
+    assert not worker._plan_mtp_batch().speculate
+    assert not worker.model_runner.mtp_prep_eligible([safe, tail])
+
+
+@pytest.mark.parametrize("accepted", [1, 4])
+def test_context_boundary_drains_optimistic_mtp_before_replanning(accepted):
+    scheduler = _scheduler()
+    seq = _decode_seq(61, output_len=64)
+    seq.token_ids = [10] * 25
+    seq.computed_token_num = 24
+    scheduler.batch_running.append([seq])
+    deferred = scheduler.process_mtp_output_deferred(decode_rows=1, width=4)
+    assert len(seq) == 29  # The pending result may accept fewer than four.
+    worker = OverlapWorker.__new__(OverlapWorker)
+    worker._dp = False
+    worker.model_runner = _boundary_runner()
+    worker._mtp_pending = deque([deferred])
+    worker._prefetched_input = SimpleNamespace(
+        seqs=[seq], num_decodes=1, num_prefills=0,
+    )
+    calls = []
+    worker.check_abort_seqs = lambda: None
+    worker.recv_ipc_package = lambda: None
+    worker._polls_frontend = lambda: False
+    worker._publish_mtp_relay_only = lambda: False
+    worker._refresh_prefetched_input = lambda: calls.append("refresh")
+
+    def drain():
+        calls.append("drain")
+        scheduler.process_mtp_output_finalize(
+            worker._mtp_pending.popleft(), [[20] * accepted],
+        )
+
+    class PlainDecodeReached(Exception):
+        pass
+
+    def launch_plain(*args, **kwargs):
+        assert calls == ["drain", "refresh"]
+        assert not seq._mtp_async_pending and -1 not in seq.token_ids
+        assert len(seq) == 25 + accepted
+        raise PlainDecodeReached
+
+    worker._drain_mtp_pending = drain
+    worker._run_mtp = lambda plan: calls.append("mtp")
+    worker._launch_batch = launch_plain
+    if accepted == 1:
+        worker.run_pp0()
+        assert calls == ["drain", "refresh", "mtp"]
+        assert worker.model_runner.mtp_context_compatible([seq])
+    else:
+        with pytest.raises(PlainDecodeReached):
+            worker.run_pp0()
+
+
+def test_plain_overlap_launch_invalidates_only_its_rows_relay():
+    worker = OverlapWorker.__new__(OverlapWorker)
+    worker.model_runner = _boundary_runner()
+    worker.model_runner._mtp_relay = {71: object(), 72: object()}
+
+    class PreparationReached(Exception):
+        pass
+
+    def prepare(data):
+        assert set(worker.model_runner._mtp_relay) == {72}
+        raise PreparationReached
+
+    worker.model_runner.prepare_input_cpu = prepare
+    with pytest.raises(PreparationReached):
+        worker._launch_batch(SimpleNamespace(seqs=[_decode_seq(71)]))
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_last_plain_overlap_token_is_finalized_without_scheduling_successor(pp_size):
+    scheduler = _scheduler()
+    scheduler.pp_size = pp_size
+    seq = _decode_seq(81, output_len=2)
+    scheduler.batch_running.append([seq])
+    deferred = scheduler.process_output_deferred([5])
+    assert len(seq) - seq.raw_prompt_len == seq.output_len
+    assert list(scheduler.seqs_to_decode) == []
+    package = scheduler.process_output_finalize(deferred, [20])
+    assert package.next_tokens == [20]
+    assert package.free_ids == [81]
+    assert seq.token_ids == [10, 11, 12, 20]

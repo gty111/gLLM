@@ -1028,6 +1028,11 @@ class OverlapScheduler(Scheduler):
                 placeholder_pos = len(seq.token_ids)
                 seq.append(placeholder)
                 deferred_seqs.append((idx, seq, placeholder_pos))
+                # This pending token already exhausts the known output budget.
+                # Finalize must still publish it, but no successor may consume
+                # it and advance beyond the request/context limit meanwhile.
+                if len(seq) - seq.raw_prompt_len >= seq.output_len:
+                    continue
                 if self.pp_size > 1:
                     # Fill the PP pipeline with independent microbatches before
                     # revisiting this batch. Pushing an in-flight batch back to

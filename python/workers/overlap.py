@@ -271,6 +271,10 @@ class OverlapWorker(Worker):
             self._prefetched_input = self._make_scheduled_input(schedule_seqs)
 
     def _launch_batch(self, input_data: InputData, dp_padded_size=None):
+        # Ordinary decode invalidates the bonus/hidden from the last verify.
+        # Other rows may re-enter MTP after a context-limited row retires.
+        if self.model_runner.mtp_enabled:
+            self.model_runner._mtp_drop_relay(input_data.seqs)
         # Pipelined input prep:
         #   * ``prepare_input_cpu`` is pure CPU work and overlaps with the
         #     previous batch's GPU forward.
@@ -574,7 +578,7 @@ class OverlapWorker(Worker):
         """Classify the prefetched tick and cache one speculation decision."""
         decode = self._mtp_decode_prefix(self._prefetched_input)
         speculate = self.model_runner.mtp_begin_iter(
-            len(decode) if decode else None
+            len(decode) if decode else None, seqs=decode,
         )
         if not speculate:
             return _MtpBatchPlan()

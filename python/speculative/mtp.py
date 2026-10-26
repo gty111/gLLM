@@ -104,15 +104,33 @@ class MtpMixin:
         self._mtp_spec_decision = (num_decodes, dec)
         return dec
 
-    def mtp_begin_iter(self, num_decodes: Optional[int]) -> bool:
+    def mtp_context_compatible(self, seqs) -> bool:
+        """Fit the whole verify window, including optimistic overlap tokens.
+
+        CPU placeholders bound the in-flight accepted length from above, so
+        this check needs no device read. Declining speculation lets the worker
+        drain that completion before preparing ordinary one-token decode.
+        """
+        width = 1 + self._mtp_k
+        return all(
+            len(seq) + width
+            <= min(self.model_max_length, seq.raw_prompt_len + seq.output_len)
+            for seq in seqs
+        )
+
+    def mtp_begin_iter(self, num_decodes: Optional[int], *, seqs=None) -> bool:
         """Open an iteration: decide once whether it speculates, and cache it.
 
-        ``num_decodes=None`` marks a prefill / mixed / idle iteration, which never
-        speculates. Called by both worker loops before any prep, so every later
-        gate site reads the same decision.
+        ``num_decodes=None`` marks an iteration without an eligible decode
+        partition. When supplied, ``seqs`` also bounds the fixed verify window
+        by context and output limits. Both worker loops call this before prep,
+        so every later gate site reads the same decision.
         """
         if not num_decodes or not self.mtp_enabled:
             self._mtp_spec_decision = None
+            return False
+        if seqs is not None and not self.mtp_context_compatible(seqs):
+            self._mtp_spec_decision = (num_decodes, False)
             return False
         return self._mtp_decide(num_decodes)
 
@@ -177,6 +195,8 @@ class MtpMixin:
             return False  # prefill / mixed batch
         if not self.mtp_speculate_batch(len(seqs)):
             return False  # batch too large to profit from speculation
+        if not self.mtp_context_compatible(seqs):
+            return False  # fixed-width verify would overrun a request limit
         return True
 
     def prepare_input_mtp(self, seqs: List[GenerationSequence]) -> None:
