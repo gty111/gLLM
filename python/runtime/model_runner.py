@@ -66,6 +66,9 @@ from gllm.runtime.model_loader import ModelLoader, propagate_serving_config
 from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.async_state import MtpAsyncBatchState
+from gllm.speculative.dspark_profile import (
+    profile_dspark_paged_verify, profile_dspark_prefill,
+)
 from gllm.speculative.gpu_prep import MtpGpuPrep
 from gllm.speculative.mtp import MtpMixin, MtpQDist, MtpVerifyResult
 from gllm.speculative.staging import MtpStagingBuffers
@@ -1038,7 +1041,11 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
         stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullcontext()
         with stream_ctx:
             self._prepare_attention_metadata(self.input_data)
-            if is_first_pp_rank():
+            if getattr(self, "dspark_enabled", False):
+                self.dspark_profile = profile_dspark_prefill(
+                    self.model, self.dspark, self.input_data
+                )
+            elif is_first_pp_rank():
                 self.model(self.input_data)
             else:
                 self.model(
@@ -1053,6 +1060,16 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
             stream.synchronize()
         else:
             torch.cuda.synchronize()
+
+    def _profile_dspark_paged_verify(self):
+        """Run the DSpark post-arena probe after shared cache initialization."""
+        profile = profile_dspark_paged_verify(
+            self.model, self.dspark, self.input_data,
+            max_prompt_tokens=self.max_num_batched_tokens,
+            model_max_length=self.model_max_length, uses_mrope=self.uses_mrope,
+            prepare_attention=self._prepare_attention_metadata,
+        )
+        self.dspark_profile.update(profile)
 
     @torch.inference_mode()
     def forward(self):
