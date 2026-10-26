@@ -2363,6 +2363,8 @@ def _dspark_runtime_fixture():
     )
     manager.requires_mrope_buffer = True
     runner = ModelRunner.__new__(ModelRunner)
+    runner._dspark_requests = {}
+    runner._mtp_relay, runner.use_mm = {}, False
     runner.maxd, runner.maxp, runner.minp, runner.iterp = 1, 8, 1, 1
     runner.init_new_token_ratio = runner.min_new_token_ratio = 0.1
     runner.model, runner.dspark, runner.dspark_enabled = target, draft, True
@@ -2573,3 +2575,876 @@ def test_dspark_startup_releases_outputs_before_shorter_prefill(monkeypatch):
             Target(), draft, data, max_prompt_tokens=32, model_max_length=32,
             uses_mrope=False, prepare_attention=lambda _: None,
         )
+
+
+def _dspark_prompt_spy(monkeypatch, *, mrope=True):
+    """CPU controller oracle; no real attention, allocation or CUDA execution."""
+    from types import SimpleNamespace
+
+    from gllm.runtime import model_runner as module
+    from gllm.runtime.model_runner import ModelRunner
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.speculative.dspark import DSparkRequestState
+
+    class Event:
+        def __init__(self):
+            self.records = 0
+
+        def record(self, stream):
+            self.records += 1
+
+        def synchronize(self):
+            self.waited = True
+
+    monkeypatch.setattr(
+        module, "DSparkRequestState",
+        lambda *args: DSparkRequestState(*args, last_use=Event()),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+
+    class Data:
+        def cal_and_set_input(self, seqs):
+            self.seqs = seqs
+            seq = seqs[0]
+            start, end = seq.computed_token_num, seq.seq_len
+            tokens = seq[start:end] if seq.to_compute_tokens is None else seq.to_compute_tokens
+            assert len(tokens) == seq.to_compute_token_num
+            self.tokens = torch.tensor(tokens, dtype=torch.long)
+            self.positions = torch.arange(start, end)
+            self.prepared = False
+
+        def set_mrope_position(self, positions):
+            self.positions = positions
+
+    class Target:
+        def __init__(self):
+            self.calls = []
+            self.head_calls = 0
+            self.scratch = torch.empty(1, 64, 8)
+
+        def forward_with_hidden_taps(self, data, *, target_layer_ids):
+            assert data.prepared and target_layer_ids == (1, 0)
+            self.calls.append((data.tokens.tolist(), data.positions.clone()))
+            count = data.tokens.numel()
+            self.scratch[:, :count].copy_(data.tokens[None, :, None] + torch.arange(8))
+            hidden = data.tokens[:, None].expand(count, 4).float()
+            return hidden, self.scratch[:, :count]
+
+        def __call__(self, data):
+            assert data.prepared
+            self.calls.append((data.tokens.tolist(), data.positions.clone()))
+            return data.tokens[:, None].expand(data.tokens.numel(), 4).float()
+
+        def logits_from_hidden(self, hidden):
+            self.head_calls += 1
+            assert hidden.shape == (1, 4)
+            logits = torch.zeros(1, 32)
+            logits[0, (int(hidden[0, 0]) + 3) % 32] = 1
+            return logits
+
+    class Draft:
+        block_size = noise_width = 7
+        config = SimpleNamespace(vocab_size=32, target_layer_ids=(1, 0))
+        rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(64, 2))
+
+        def __init__(self):
+            self.chunks = []
+
+        def prefill_paged(self, taps, *, segment, cache):
+            self.chunks.append(taps.clone())
+            cache.context_length += taps.shape[1]
+            return SimpleNamespace(state=cache, segment=segment)
+
+    class Manager:
+        dspark_segment = object()
+        allow = True
+
+        def __init__(self):
+            self.freed, self.reservations, self.freed_tables = [], [], []
+
+        def free(self, seq):
+            self.freed.append(seq.seq_id)
+            self.freed_tables.append(list(seq.ssm_block_table or []))
+            seq.page_table.clear()
+            seq.ssm_block_table = None
+            seq.recurrent_state_slot = None
+
+        def free_dspark_cache(self, seq, cache):
+            cache.reset()
+            self.free(seq)
+
+        def reserve_dspark_pages(self, seq, cache, *, target_length, draft_length):
+            self.reservations.append((target_length, draft_length))
+            if not self.allow or target_length > getattr(self, "limit", 64):
+                return False
+            for table, length in ((seq.page_table, target_length), (cache.page_table, draft_length)):
+                while len(table) * 16 < length:
+                    table.append(len(table) + 1)
+            if seq.ssm_block_table is None:
+                seq.ssm_block_table = list(range(1, 9))
+                seq.recurrent_state_slot = 1
+            return True
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.dspark_enabled, runner.uses_mrope = True, mrope
+    runner.model_max_length, runner.max_num_batched_tokens = 64, 16
+    runner._dspark_requests = {}
+    runner._mtp_relay, runner.use_mm = {}, False
+    runner.model, runner.dspark = Target(), Draft()
+    runner.input_data, runner.memory_manager = Data(), Manager()
+    runner.page_size = 16
+    runner._prepare_attention_metadata = lambda data: setattr(data, "prepared", True)
+    seq = GenerationSequence(61, list(range(13)), [], output_len=16, temperature=0)
+    seq.to_compute_token_num = 4
+    return runner, seq
+
+
+@pytest.mark.parametrize("mrope", [False, True])
+def test_dspark_prompt_chunks_and_bootstrap_preserve_publication_and_pending(monkeypatch, mrope):
+    from gllm.speculative.dspark import commit_dspark_prompt_step
+
+    runner, seq = _dspark_prompt_spy(monkeypatch, mrope=mrope)
+    published = []
+    for count, end in ((4, 4), (5, 9), (4, 13)):
+        seq.to_compute_token_num = count
+        previous, history = seq.computed_token_num, list(seq.token_ids)
+        result = runner._step_dspark_prompt(seq)
+        state = runner._dspark_requests[seq.seq_id]
+        assert seq.computed_token_num == previous and seq.token_ids == history
+        assert state.cache.context_length == end and result.hidden is None
+        assert state.paged_cache.state is state.cache
+        assert runner.model.head_calls == (1 if end == 13 else 0)
+        positions = torch.arange(previous, end)
+        if mrope:
+            positions = positions.repeat(3, 1)
+        assert torch.equal(runner.model.calls[-1][1], positions)
+        with pytest.raises(ValueError, match="uncommitted"):
+            runner._step_dspark_prompt(seq)
+        tokens = commit_dspark_prompt_step(seq, state, result)
+        assert tokens == ([15] if end == 13 else [])
+        published.extend(tokens)
+        with pytest.raises(ValueError, match="already consumed"):
+            commit_dspark_prompt_step(seq, state, result)
+    assert published == [15]
+    assert seq.token_ids == list(range(13)) + [15]
+    assert state.phase == "bootstrap" and state.pending_hidden is None
+    assert len(runner.dspark.chunks) == 3
+
+    seq.to_compute_token_num = 1
+    result = runner._step_dspark_prompt(seq)
+    assert runner.model.calls[-1][0] == [15]
+    assert state.cache.context_length == seq.computed_token_num == 13
+    assert result.hidden.data_ptr() != runner.model.scratch.data_ptr()
+    assert commit_dspark_prompt_step(seq, state, result) == []
+    assert seq.token_ids == list(range(13)) + [15]
+    assert seq.computed_token_num == state.anchor_pos == len(seq) == 14
+    assert state.phase == "verify" and int(state.anchor.item()) == 18
+    assert state.cache.context_length + state.pending_hidden.shape[1] == 14
+    assert state.pending_hidden.shape == (1, 1, 8)
+    assert state.last_use.records == 4
+    pending = state.pending_hidden.clone()
+    runner.model.scratch.fill_(-123)
+    assert torch.equal(state.pending_hidden, pending)
+
+
+@pytest.mark.parametrize("stop", ["budget", "eos"])
+def test_dspark_prompt_first_token_can_finish_without_bootstrap(monkeypatch, stop):
+    from gllm.speculative.dspark import commit_dspark_prompt_step
+
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+    if stop == "budget":
+        seq.output_len = 1
+    else:
+        seq.finish_tokens = [15]
+    seq.to_compute_token_num = seq.prompt_len
+    result = runner._step_dspark_prompt(seq)
+    state = runner._dspark_requests[seq.seq_id]
+    assert commit_dspark_prompt_step(seq, state, result) == [15]
+    assert seq.is_finish and state.cache.context_length == 13
+    seq.to_compute_token_num = 1
+    with pytest.raises(ValueError):
+        runner._step_dspark_prompt(seq)
+    assert len(runner.model.calls) == 1 and state.pending_hidden is None
+
+
+@pytest.mark.parametrize("invalid", [
+    "sampling", "multimodal", "repetition", "structured", "logprobs",
+    "prompt_logprobs", "empty", "budget", "chunk", "override", "mtp", "rope", "token", "autocast",
+])
+def test_dspark_prompt_rejects_unsupported_input_before_reservation(monkeypatch, invalid):
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+    if invalid == "sampling":
+        seq.temperature, seq.top_k = 0.7, 2
+    elif invalid == "multimodal":
+        seq.mm_contents = object()
+    elif invalid == "repetition":
+        seq.repetition_penalty = 1.1
+    elif invalid == "structured":
+        seq.structured_output = object()
+    elif invalid == "logprobs":
+        seq.logprobs_enabled = True
+    elif invalid == "prompt_logprobs":
+        seq.prompt_logprobs_enabled = True
+    elif invalid == "empty":
+        seq.token_ids, seq.raw_prompt_len, seq.prompt_len = [], 0, 0
+    elif invalid == "budget":
+        seq.output_len = 52
+    elif invalid == "chunk":
+        seq.to_compute_token_num = 17
+    elif invalid == "override":
+        seq.to_compute_tokens = [3] * 4
+    elif invalid == "mtp":
+        seq._mtp_verify = True
+    elif invalid == "rope":
+        runner.dspark.rotary_emb = type(runner.dspark.rotary_emb)(cos_sin_cache=torch.empty(2, 2))
+    elif invalid == "autocast":
+        monkeypatch.setattr(torch, "is_autocast_enabled", lambda *args: True)
+    else:
+        seq.token_ids[0] = 99
+    with pytest.raises(ValueError):
+        runner._step_dspark_prompt(seq)
+    assert not runner._dspark_requests and not runner.model.calls
+    assert not seq.page_table and seq.recurrent_state_slot is None
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_dspark_prompt_failed_joint_reservation_preserves_progress(monkeypatch, existing):
+    from gllm.runtime.sequence import RequestCapacityError
+    from gllm.speculative.dspark import commit_dspark_prompt_step
+
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+    if existing:
+        result = runner._step_dspark_prompt(seq)
+        state = runner._dspark_requests[seq.seq_id]
+        commit_dspark_prompt_step(seq, state, result)
+    state = runner._dspark_requests.get(seq.seq_id)
+    before = (seq.computed_token_num, list(seq.token_ids), list(seq.page_table))
+    runner.memory_manager.allow = False
+    seq.to_compute_token_num = 4
+    with pytest.raises(RequestCapacityError):
+        runner._step_dspark_prompt(seq)
+    assert before == (seq.computed_token_num, seq.token_ids, seq.page_table)
+    assert len(runner.model.calls) == int(existing)
+    if existing:
+        assert state.cache.context_length == 4 and state.inflight is None
+    else:
+        assert not runner._dspark_requests
+
+
+@pytest.mark.parametrize("invalid", ["epoch", "position", "query", "foreign", "abort", "phase"])
+def test_dspark_prompt_commit_rejects_stale_result_without_progress(monkeypatch, invalid):
+    from dataclasses import replace
+    from gllm.speculative.dspark import commit_dspark_prompt_step
+
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+    result = runner._step_dspark_prompt(seq)
+    state = runner._dspark_requests[seq.seq_id]
+    if invalid == "epoch":
+        seq._cache_epoch += 1
+    elif invalid == "position":
+        seq.computed_token_num += 1
+    elif invalid == "query":
+        seq.to_compute_token_num -= 1
+    elif invalid == "foreign":
+        result = replace(result)
+    elif invalid == "abort":
+        seq.is_abort = True
+    else:
+        result.phase = "bootstrap"
+    before = (seq.computed_token_num, list(seq.token_ids), state.phase)
+    with pytest.raises(ValueError):
+        commit_dspark_prompt_step(seq, state, result)
+    assert before == (seq.computed_token_num, seq.token_ids, state.phase)
+    assert not result.consumed and state.cache.context_length == 4
+
+
+def test_dspark_prompt_partial_forward_failure_blocks_retry(monkeypatch):
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+
+    def fail_forward(*args, **kwargs):
+        raise RuntimeError("target forward failed")
+
+    monkeypatch.setattr(runner.model, "forward_with_hidden_taps", fail_forward)
+    with pytest.raises(RuntimeError, match="target forward failed"):
+        runner._step_dspark_prompt(seq)
+    state = runner._dspark_requests[seq.seq_id]
+    assert state.inflight is not None
+    assert seq.computed_token_num == state.cache.context_length == 0
+    with pytest.raises(ValueError, match="uncommitted"):
+        runner._step_dspark_prompt(seq)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+@pytest.mark.parametrize("chunks", [(1,), (23,), (1, 8, 7, 7), (8, 8, 7)])
+def test_dspark_prompt_runtime_matches_ordinary_prefill_and_bootstrap_in_shared_arena(chunks):
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.speculative.dspark import commit_dspark_prompt_step
+
+    runner, make_input = _dspark_runtime_fixture()
+    arena = _init_dspark_runtime_test_arena(runner)
+    owned_before = arena.allocator.num_used_physical_pages
+    prompt_len = sum(chunks)
+    prompt = list(range(1, prompt_len + 1))
+    seq = GenerationSequence(72, prompt.copy(), [], output_len=9, temperature=0)
+    oracle, oracle_manager, oracle_seq = make_input(prompt)
+    text = runner.model.language_model
+    captured = []
+    original_prefill = runner.dspark.prefill_paged
+
+    def capture(taps, **kwargs):
+        captured.append(taps.clone())
+        return original_prefill(taps, **kwargs)
+
+    runner.dspark.prefill_paged = capture
+    published = []
+    for count in chunks:
+        start = seq.computed_token_num
+        end = start + count
+        seq.to_compute_token_num = oracle_seq.to_compute_token_num = count
+        oracle.cal_and_set_input([oracle_seq])
+        oracle.set_mrope_position(torch.arange(start, end).repeat(3, 1))
+        oracle.forward_metadata_plan.prepare_attention(runner.qkv_attention_backend, oracle)
+        ordinary = text(oracle)
+        result = runner._step_dspark_prompt(seq)
+        state = runner._dspark_requests[seq.seq_id]
+        assert seq.computed_token_num == start
+        assert state.cache.context_length == end
+        tokens = commit_dspark_prompt_step(seq, state, result)
+        if end == len(prompt):
+            expected = int(text.logits_from_hidden(ordinary[-1:]).argmax(-1).item())
+            assert tokens == [expected]
+        else:
+            assert tokens == []
+        published.extend(tokens)
+        oracle_seq.computed_token_num = end
+
+    assert len(published) == 1 and seq.token_ids == prompt + published
+    oracle_seq.append(published[0])
+    seq.to_compute_token_num = oracle_seq.to_compute_token_num = 1
+    oracle.cal_and_set_input([oracle_seq])
+    oracle.set_mrope_position(torch.arange(prompt_len, prompt_len + 1).repeat(3, 1))
+    oracle.forward_metadata_plan.prepare_attention(runner.qkv_attention_backend, oracle)
+    ordinary = text(oracle)
+    expected_anchor = text.logits_from_hidden(ordinary[-1:]).argmax(-1)
+
+    result = runner._step_dspark_prompt(seq)
+    assert runner.input_data.get_position().shape == (3, 1)
+    assert not runner.input_data.get_position().is_contiguous()
+    assert commit_dspark_prompt_step(seq, state, result) == []
+    assert torch.equal(state.anchor, expected_anchor)
+    assert seq.token_ids == prompt + published
+    assert state.anchor_pos == seq.computed_token_num == len(seq) == prompt_len + 1
+    assert state.cache.context_length == prompt_len and state.pending_hidden.shape[1] == 1
+
+    # Only prompt rows are valid draft K/V; bootstrap stays in pending until
+    # the next draft. Compare the chunked writes with an independent dense view.
+    dense = runner.dspark.prefill(torch.cat(captured, dim=1), state.anchor)
+    keys, values = _read_paged_context(
+        runner.memory_manager.dspark_segment, state.cache, len(prompt)
+    )
+    for got, want in zip(keys + values, dense.keys + dense.values):
+        assert torch.isfinite(got).all() and torch.isfinite(want).all()
+        torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+    target_keys, target_values = _read_paged_context(
+        runner.memory_manager.segment, seq, prompt_len + 1
+    )
+    oracle_keys, oracle_values = _read_paged_context(
+        oracle_manager.segment, oracle_seq, prompt_len + 1
+    )
+    for got, want in zip(target_keys + target_values, oracle_keys + oracle_values):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    for name in ("conv_state", "temporal_state"):
+        actual = getattr(runner.memory_manager.ssm_segment, name)[:, seq.recurrent_state_slot]
+        expected = getattr(oracle_manager.ssm_segment, name)[:, oracle_seq.recurrent_state_slot]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    runner.free(seq)
+    oracle_manager.free(oracle_seq)
+    assert arena.allocator.num_used_physical_pages == owned_before
+
+
+@pytest.mark.parametrize("reuse", ["epoch", "other_request"])
+def test_dspark_prompt_request_record_rejects_reuse_before_release(monkeypatch, reuse):
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.speculative.dspark import commit_dspark_prompt_step
+
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+    result = runner._step_dspark_prompt(seq)
+    state = runner._dspark_requests[seq.seq_id]
+    commit_dspark_prompt_step(seq, state, result)
+    if reuse == "epoch":
+        seq._cache_epoch += 1
+    else:
+        seq = GenerationSequence(62, list(range(13)), [], output_len=16, temperature=0)
+    seq.to_compute_token_num = 4
+    with pytest.raises(ValueError):
+        runner._step_dspark_prompt(seq)
+    assert len(runner.model.calls) == 1
+    assert list(runner._dspark_requests.values()) == [state]
+    assert state.cache.context_length == 4 and state.inflight is None
+
+
+@pytest.mark.parametrize("invalid", ["query", "missing_first_token", "progress"])
+def test_dspark_prompt_bootstrap_rejects_invalid_window_before_forward(monkeypatch, invalid):
+    from gllm.speculative.dspark import commit_dspark_prompt_step
+
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+    seq.to_compute_token_num = seq.prompt_len
+    result = runner._step_dspark_prompt(seq)
+    state = runner._dspark_requests[seq.seq_id]
+    commit_dspark_prompt_step(seq, state, result)
+    seq.to_compute_token_num = 1
+    if invalid == "query":
+        seq.to_compute_token_num = 2
+    elif invalid == "missing_first_token":
+        seq.token_ids.pop()
+    else:
+        seq.computed_token_num += 1
+    with pytest.raises(ValueError):
+        runner._step_dspark_prompt(seq)
+    assert len(runner.model.calls) == 1 and state.cache.context_length == 13
+    assert state.pending_hidden is None and state.inflight is None
+
+
+def _dspark_execution_spy(monkeypatch, *, accepted=2):
+    """Direct runner oracle; no Worker/Scheduler or real CUDA execution."""
+    from gllm.runtime import model_runner as module
+    from gllm.speculative.dspark import DSparkVerifyResult, commit_dspark_prompt_step
+
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+    seq.output_len = 32
+    tables = []
+
+    def draft_forward(pending, anchor, *, start_pos, caches):
+        assert caches.state.context_length + pending.shape[1] == start_pos
+        caches.state.context_length = start_pos
+        return torch.zeros(1, 7, 4), None
+
+    def draft_head(hidden, anchor):
+        first = int(anchor.item())
+        return torch.tensor([[first] + [(first + i) % 32 for i in range(1, 8)]]), None, None
+
+    def verify(target, data, *, block_size, target_layer_ids):
+        request = data.seqs[0]
+        assert request._mtp_verify and request.to_compute_token_num == 8
+        assert len(request) == request.computed_token_num
+        assert block_size == 7 and target_layer_ids == (1, 0)
+        tables.append(list(request.ssm_block_table))
+        length = accepted + 1
+        return DSparkVerifyResult(
+            request.seq_id, request._cache_epoch, request.computed_token_num, accepted,
+            data.tokens[:length].unsqueeze(0).clone(),
+            torch.tensor([(int(data.tokens[length - 1]) + 1) % 32]),
+            torch.ones(1, length, 8),
+        )
+
+    runner.dspark.forward_draft, runner.dspark.forward_head = draft_forward, draft_head
+    monkeypatch.setattr(module, "verify_dspark_target", verify)
+    for count in (8, 5, 1):
+        seq.to_compute_token_num = count
+        result = runner._step_dspark_prompt(seq)
+        commit_dspark_prompt_step(seq, runner._dspark_requests[seq.seq_id], result)
+    return runner, seq, tables
+
+
+@pytest.mark.parametrize("accepted", [0, 2, 7])
+def test_dspark_execution_verify_commits_prefix_and_reuses_promoted_table(monkeypatch, accepted):
+    from gllm.speculative.dspark import commit_dspark_verify_step
+
+    runner, seq, tables = _dspark_execution_spy(monkeypatch, accepted=accepted)
+    state = runner._dspark_requests[seq.seq_id]
+    for _ in range(2):
+        start, anchor = seq.computed_token_num, int(state.anchor.item())
+        history, table = list(seq.token_ids), list(seq.ssm_block_table)
+        seq.to_compute_token_num = 8
+        result = runner._step_dspark_verify(seq)
+        assert seq.token_ids == history and seq.computed_token_num == start
+        assert result.ready and not result.consumed
+        assert seq.to_compute_tokens is None and not seq._mtp_verify
+        assert runner.input_data.positions.tolist() == [list(range(start, start + 8))] * 3
+        expected = [(anchor + i) % 32 for i in range(accepted + 1)]
+        assert commit_dspark_verify_step(seq, state, result) == expected
+        assert seq.token_ids == history + expected
+        assert seq.computed_token_num == len(seq) == start + accepted + 1
+        assert state.cache.context_length == start
+        assert state.pending_hidden.shape[1] == accepted + 1
+        assert state.anchor_pos == len(seq) and state.inflight is None
+        table[0], table[accepted] = table[accepted], table[0]
+        assert seq.ssm_block_table == table and seq.recurrent_state_slot == table[0]
+        assert result.consumed and result.verification.consumed
+        before = (list(seq.token_ids), seq.computed_token_num, list(seq.ssm_block_table))
+        with pytest.raises(ValueError, match="already consumed"):
+            commit_dspark_verify_step(seq, state, result)
+        assert before == (seq.token_ids, seq.computed_token_num, seq.ssm_block_table)
+    assert tables[1][0] == tables[0][accepted]
+
+
+@pytest.mark.parametrize("cutoff", ["eos", "budget"])
+def test_dspark_execution_verify_cutoff_promotes_only_retained_inputs(monkeypatch, cutoff):
+    from gllm.speculative.dspark import commit_dspark_verify_step
+
+    runner, seq, tables = _dspark_execution_spy(monkeypatch, accepted=7)
+    state = runner._dspark_requests[seq.seq_id]
+    seq.to_compute_token_num = 8
+    result = runner._step_dspark_verify(seq)
+    if cutoff == "eos":
+        seq.finish_tokens = [20]
+        expected = [18, 19, 20]
+    else:
+        seq.output_len = 3
+        expected = [18, 19]
+    assert commit_dspark_verify_step(seq, state, result) == expected
+    assert seq.computed_token_num == len(seq) == 14 + len(expected)
+    assert seq.recurrent_state_slot == tables[0][len(expected) - 1]
+    assert seq.is_finish and state.anchor is state.pending_hidden is None
+    event = state.last_use
+    runner.free(seq)
+    assert event.waited and not runner._dspark_requests
+    assert seq.page_table == [] and seq.ssm_block_table is None
+    assert state.cache.context_length == 0 and state.cache.page_table == []
+
+
+@pytest.mark.parametrize("phase", ["verify", "tail"])
+def test_dspark_execution_failed_reservation_preserves_pending_and_progress(monkeypatch, phase):
+    from gllm.runtime.sequence import RequestCapacityError
+
+    runner, seq, tables = _dspark_execution_spy(monkeypatch)
+    state = runner._dspark_requests[seq.seq_id]
+    state.phase = phase
+    seq.to_compute_token_num = 8 if phase == "verify" else 1
+    before = (list(seq.token_ids), seq.computed_token_num, list(seq.ssm_block_table))
+    pending, anchor = state.pending_hidden, state.anchor
+    reservations, calls = len(runner.memory_manager.reservations), len(runner.model.calls)
+    runner.memory_manager.allow = False
+    with pytest.raises(RequestCapacityError):
+        getattr(runner, "_step_dspark_" + phase)(seq)
+    assert before == (seq.token_ids, seq.computed_token_num, seq.ssm_block_table)
+    assert state.pending_hidden is pending and state.anchor is anchor
+    assert state.cache.context_length == 13 and state.inflight is None
+    assert len(runner.memory_manager.reservations) == reservations + 1
+    assert len(runner.model.calls) == calls and not tables
+
+
+@pytest.mark.parametrize("limit", ["budget", "rope"])
+def test_dspark_execution_rejects_short_verify_window_before_reservation(monkeypatch, limit):
+    runner, seq, tables = _dspark_execution_spy(monkeypatch)
+    state = runner._dspark_requests[seq.seq_id]
+    if limit == "budget":
+        seq.output_len = 8  # One token is already published, leaving seven.
+    else:
+        runner.dspark.rotary_emb.cos_sin_cache = torch.empty(20, 2)
+    seq.to_compute_token_num = 8
+    pending, anchor = state.pending_hidden, state.anchor
+    reservations = list(runner.memory_manager.reservations)
+    assert not runner._dspark_verify_fits(seq)
+    with pytest.raises(ValueError, match="verify window"):
+        runner._step_dspark_verify(seq)
+    assert runner.memory_manager.reservations == reservations and not tables
+    assert state.pending_hidden is pending and state.anchor is anchor
+    assert state.cache.context_length == 13 and state.inflight is None
+    assert seq.computed_token_num == len(seq) == 14
+
+
+@pytest.mark.parametrize("phase", ["verify", "tail"])
+@pytest.mark.parametrize("invalid", ["epoch", "query", "foreign"])
+def test_dspark_execution_commit_rejects_stale_result_without_mutation(monkeypatch, phase, invalid):
+    from dataclasses import replace
+    from gllm.speculative.dspark import commit_dspark_tail_step, commit_dspark_verify_step
+
+    runner, seq, _ = _dspark_execution_spy(monkeypatch)
+    state = runner._dspark_requests[seq.seq_id]
+    state.phase = phase
+    seq.to_compute_token_num = 8 if phase == "verify" else 1
+    result = getattr(runner, "_step_dspark_" + phase)(seq)
+    if invalid == "epoch":
+        seq._cache_epoch += 1
+    elif invalid == "query":
+        seq.to_compute_token_num += 1
+    else:
+        result = replace(result)
+    before = (list(seq.token_ids), seq.computed_token_num, list(seq.ssm_block_table))
+    commit = commit_dspark_verify_step if phase == "verify" else commit_dspark_tail_step
+    with pytest.raises(ValueError):
+        commit(seq, state, result)
+    assert before == (seq.token_ids, seq.computed_token_num, seq.ssm_block_table)
+    assert not result.consumed
+    if result.verification is not None:
+        assert not result.verification.consumed
+
+
+@pytest.mark.parametrize("boundary", ["budget", "rope", "context"])
+def test_dspark_execution_tail_consumes_relay_without_growing_draft(monkeypatch, boundary):
+    from gllm.speculative.dspark import commit_dspark_tail_step
+
+    runner, seq, tables = _dspark_execution_spy(monkeypatch)
+    seq.output_len = 4 if boundary != "rope" else 10
+    if boundary == "context":
+        runner.model_max_length = seq.raw_prompt_len + seq.output_len
+    elif boundary == "rope":
+        runner.dspark.rotary_emb.cos_sin_cache = torch.empty(20, 2)
+    state = runner._dspark_requests[seq.seq_id]
+    assert not runner._dspark_verify_fits(seq)
+    state.phase = "tail"
+    published = [15]
+    while not seq.is_finish:
+        start, anchor = seq.computed_token_num, int(state.anchor.item())
+        seq.to_compute_token_num = 1
+        result = runner._step_dspark_tail(seq)
+        assert runner.model.calls[-1][0] == [anchor]
+        assert runner.input_data.positions.tolist() == [[start]] * 3
+        assert runner.memory_manager.reservations[-1] == (start + 1, 13)
+        assert result.hidden is result.verification is None
+        published.extend(commit_dspark_tail_step(seq, state, result))
+        assert state.cache.context_length == 13
+    assert published == [(15 + 3 * i) % 32 for i in range(seq.output_len)]
+    assert seq.token_ids == list(range(13)) + published
+    assert seq.computed_token_num == len(seq) and not tables
+    assert state.anchor is state.pending_hidden is None
+    with pytest.raises(ValueError, match="already consumed"):
+        commit_dspark_tail_step(seq, state, result)
+    runner.free(seq)
+    assert not runner._dspark_requests
+
+
+@pytest.mark.parametrize("failure", ["request", "fatal", "event"])
+def test_dspark_execution_failed_verify_requires_a_new_completion_boundary(monkeypatch, failure):
+    from gllm.runtime import model_runner as module
+
+    runner, seq, _ = _dspark_execution_spy(monkeypatch)
+    state = runner._dspark_requests[seq.seq_id]
+    seq.to_compute_token_num = 8
+    history, progress = list(seq.token_ids), seq.computed_token_num
+    records = state.last_use.records
+
+    def fail(*args, **kwargs):
+        raise ValueError("request validation") if failure != "fatal" else RuntimeError("CUDA failure")
+
+    monkeypatch.setattr(module, "verify_dspark_target", fail)
+    with pytest.raises(ValueError if failure != "fatal" else RuntimeError):
+        runner._step_dspark_verify(seq)
+    assert seq.token_ids == history and seq.computed_token_num == progress
+    assert seq.to_compute_tokens is None and not seq._mtp_verify
+    assert state.cache.context_length == progress and state.pending_hidden is None
+    assert state.last_use.records == records and not state.inflight.ready
+    with pytest.raises(ValueError, match="uncommitted"):
+        runner._step_dspark_verify(seq)
+    with pytest.raises(RuntimeError, match="safe completion event"):
+        runner.free(seq)
+    assert not runner.memory_manager.freed
+    if failure == "fatal":
+        return
+    if failure == "event":
+        def fail_record(*args, **kwargs):
+            raise RuntimeError("CUDA event recording failed")
+        monkeypatch.setattr(state.last_use, "record", fail_record)
+        with pytest.raises(RuntimeError, match="event recording failed"):
+            runner.complete_dspark_failed_step(seq)
+        assert not state.inflight.ready and not runner.memory_manager.freed
+        return
+    runner.complete_dspark_failed_step(seq)
+    assert state.last_use.records == records + 1 and state.inflight.ready
+    runner.free(seq)
+    assert not runner._dspark_requests and state.last_use is None
+    assert state.anchor is state.pending_hidden is state.paged_cache is None
+
+
+def test_dspark_execution_free_clears_request_before_id_reuse(monkeypatch):
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.speculative.dspark import commit_dspark_prompt_step
+
+    runner, seq, _ = _dspark_execution_spy(monkeypatch)
+    old = runner._dspark_requests[seq.seq_id]
+    event = old.last_use
+    runner.free(seq)
+    assert event.waited and not old.cache.page_table
+    assert old.cache.context_length == 0 and not runner._dspark_requests
+    assert old.anchor is old.pending_hidden is old.paged_cache is old.last_use is None
+    reused = GenerationSequence(seq.seq_id, list(range(13)), [], output_len=16, temperature=0)
+    reused.to_compute_token_num = 4
+    result = runner._step_dspark_prompt(reused)
+    state = runner._dspark_requests[reused.seq_id]
+    assert state is not old and state.cache is not old.cache
+    assert state.anchor is state.pending_hidden is None
+    assert commit_dspark_prompt_step(reused, state, result) == []
+    assert state.cache.context_length == reused.computed_token_num == 4
+
+
+def test_dspark_execution_ordinary_free_preserves_default_path(monkeypatch):
+    runner, seq = _dspark_prompt_spy(monkeypatch)
+    runner.dspark_enabled = False
+    runner._mtp_relay[seq.seq_id] = object()
+    runner.free(seq)
+    assert runner.memory_manager.freed == [seq.seq_id]
+    assert not runner._mtp_relay and not runner._dspark_requests
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_dspark_execution_matches_greedy_with_controlled_and_real_draft():
+    from gllm.runtime.input_data import InputData
+    from gllm.runtime.sequence import GenerationSequence
+
+    from gllm.speculative.dspark import (
+        commit_dspark_prompt_step, commit_dspark_tail_step, commit_dspark_verify_step,
+    )
+
+    runner, make_input = _dspark_runtime_fixture()
+    runner.model_max_length = 64
+    runner.input_data = InputData(True, runner.memory_manager, max_seq_length=64, max_running_seqs=1)
+    arena = _init_dspark_runtime_test_arena(runner)
+    owned_before = arena.allocator.num_used_physical_pages
+    prompt = list(range(1, 14))
+    seq = GenerationSequence(101, prompt.copy(), [], output_len=51, temperature=0)
+    oracle, oracle_manager, oracle_seq = make_input(prompt)
+    oracle_seq.output_len = 51
+    text = runner.model.language_model
+    features = []
+    real_prefill = runner.dspark.prefill_paged
+
+    def capture_prompt(taps, **kwargs):
+        features.append(taps.clone())
+        return real_prefill(taps, **kwargs)
+
+    runner.dspark.prefill_paged = capture_prompt
+
+    def ordinary_step(token_ids):
+        start = oracle_seq.computed_token_num
+        oracle_seq.to_compute_tokens = list(token_ids)
+        oracle_seq.to_compute_token_num = len(token_ids)
+        oracle_manager.pre_allocate_page_for_lengths(
+            [oracle_seq], [start + len(token_ids)]
+        )
+        oracle.cal_and_set_input([oracle_seq])
+        oracle.set_mrope_position(torch.arange(start, start + len(token_ids)).repeat(3, 1))
+        oracle.forward_metadata_plan.prepare_attention(runner.qkv_attention_backend, oracle)
+        hidden = text(oracle)
+        oracle_seq.computed_token_num += len(token_ids)
+        return int(text.logits_from_hidden(hidden[-1:]).argmax(-1).item())
+
+    for chunk in (prompt[:8], prompt[8:]):
+        prediction = ordinary_step(chunk)
+        seq.to_compute_token_num = len(chunk)
+        record = runner._step_dspark_prompt(seq)
+        state = runner._dspark_requests[seq.seq_id]
+        published = commit_dspark_prompt_step(seq, state, record)
+        assert seq.computed_token_num == oracle_seq.computed_token_num
+    assert published == [prediction]
+    oracle_seq.append(prediction)
+    expected_anchor = ordinary_step([prediction])
+    seq.to_compute_token_num = 1
+    record = runner._step_dspark_prompt(seq)
+    assert commit_dspark_prompt_step(seq, state, record) == []
+    assert int(state.anchor.item()) == expected_anchor
+    assert seq.token_ids == oracle_seq.token_ids
+
+    real_head = runner.dspark.forward_head
+    for desired in (0, 0, 2, 7, None):
+        start = seq.computed_token_num
+        anchor = int(state.anchor.item())
+        expected_inputs, predictions, snapshots = [], [], []
+        for _ in range(8):
+            expected_inputs.append(anchor)
+            anchor = ordinary_step([anchor])
+            predictions.append(anchor)
+            slot = oracle_seq.recurrent_state_slot
+            snapshots.append((
+                oracle_manager.ssm_segment.conv_state[:, slot].clone(),
+                oracle_manager.ssm_segment.temporal_state[:, slot].clone(),
+            ))
+        proposals = []
+
+        def head(hidden, first):
+            ids, confidence, logits = real_head(hidden, first)
+            ids = ids.clone()
+            # Controlled boundaries still execute the real draft/head. The
+            # final round consumes its genuine proposals without substitution.
+            if desired is not None:
+                chosen = expected_inputs.copy()
+                if desired < 7:
+                    chosen[desired + 1] = (chosen[desired + 1] + 1) % runner.dspark.config.vocab_size
+                ids[0].copy_(torch.tensor(chosen, device=ids.device))
+            proposals[:] = ids[0].cpu().tolist()
+            return ids, confidence, logits
+
+        runner.dspark.forward_head = head
+        features.append(state.pending_hidden.clone())
+        history, table = list(seq.token_ids), list(seq.ssm_block_table)
+        seq.to_compute_token_num = 8
+        record = runner._step_dspark_verify(seq)
+        assert seq.token_ids == history and seq.computed_token_num == start
+        assert record.query_len == 8 and record.ready
+        assert seq.to_compute_tokens is None and not seq._mtp_verify
+        assert runner.input_data.forward_metadata_plan.query_lens == (8,)
+        accepted = 0
+        for got, want in zip(proposals[1:], expected_inputs[1:]):
+            if got != want:
+                break
+            accepted += 1
+        if desired is not None:
+            assert accepted == desired
+        count = accepted + 1
+        assert commit_dspark_verify_step(seq, state, record) == expected_inputs[:count]
+        assert record.verification.accepted_drafts == accepted
+        assert record.consumed and record.verification.consumed
+        assert seq.computed_token_num == start + count == len(seq)
+        assert state.cache.context_length == start
+        assert state.pending_hidden.shape[1] == count and state.anchor_pos == len(seq)
+        assert int(state.anchor.item()) == predictions[accepted]
+        assert seq.recurrent_state_slot == table[accepted] and seq.ssm_num_accepted == 1
+        for name, expected, tolerance in (
+            ("conv_state", snapshots[accepted][0], 2e-3),
+            ("temporal_state", snapshots[accepted][1], 2e-5),
+        ):
+            actual = getattr(runner.memory_manager.ssm_segment, name)[:, seq.recurrent_state_slot]
+            torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+        oracle_seq.computed_token_num = start + count
+        oracle_seq.token_ids.extend(expected_inputs[:count])
+        oracle_slot = oracle_seq.recurrent_state_slot
+        oracle_manager.ssm_segment.conv_state[:, oracle_slot].copy_(snapshots[accepted][0])
+        oracle_manager.ssm_segment.temporal_state[:, oracle_slot].copy_(snapshots[accepted][1])
+        assert seq.token_ids == oracle_seq.token_ids
+        actual_k, actual_v = _read_paged_context(runner.memory_manager.segment, seq, len(seq))
+        oracle_k, oracle_v = _read_paged_context(oracle_manager.segment, oracle_seq, len(seq))
+        for actual, expected in zip(actual_k + actual_v, oracle_k + oracle_v):
+            torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+        dense = runner.dspark.prefill(torch.cat(features, dim=1), state.anchor)
+        actual_k, actual_v = _read_paged_context(
+            runner.memory_manager.dspark_segment, state.cache, start
+        )
+        for actual, expected in zip(actual_k + actual_v, dense.keys + dense.values):
+            torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    # Finish through the ordinary one-token relay while keeping draft history
+    # fixed. The oracle uses its independent target cache at the same positions.
+    draft_length = state.cache.context_length
+    seq.output_len = len(seq) - seq.raw_prompt_len + 3
+    oracle_seq.output_len = seq.output_len
+    state.phase = "tail"
+    for _ in range(3):
+        anchor = int(state.anchor.item())
+        predicted = ordinary_step([anchor])
+        seq.to_compute_token_num = 1
+        record = runner._step_dspark_tail(seq)
+        assert commit_dspark_tail_step(seq, state, record) == [anchor]
+        oracle_seq.append(anchor)
+        assert seq.token_ids == oracle_seq.token_ids
+        assert seq.computed_token_num == oracle_seq.computed_token_num
+        assert state.cache.context_length == draft_length
+        if not seq.is_finish:
+            assert int(state.anchor.item()) == predicted
+        for name, tolerance in (("conv_state", 2e-3), ("temporal_state", 2e-5)):
+            actual = getattr(runner.memory_manager.ssm_segment, name)[:, seq.recurrent_state_slot]
+            expected = getattr(oracle_manager.ssm_segment, name)[:, oracle_seq.recurrent_state_slot]
+            torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+        actual_k, actual_v = _read_paged_context(runner.memory_manager.segment, seq, len(seq))
+        oracle_k, oracle_v = _read_paged_context(oracle_manager.segment, oracle_seq, len(seq))
+        for actual, expected in zip(actual_k + actual_v, oracle_k + oracle_v):
+            torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+    assert seq.is_finish and state.anchor is state.pending_hidden is None
+
+    runner.free(seq)
+    torch.cuda.synchronize()
+    oracle_manager.free(oracle_seq)
+    assert not runner._dspark_requests
+    assert arena.allocator.num_used_physical_pages == owned_before

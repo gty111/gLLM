@@ -1,7 +1,7 @@
-"""Synchronous single-request target verification for the Qwen3.8 drafter."""
+"""Synchronous single-request DSpark prompt steps and target verification."""
 
-from dataclasses import dataclass
-from typing import Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 from torch import nn
@@ -10,7 +10,121 @@ from gllm.distributed.parallel_state import get_dp_size, get_pp_size, get_tp_siz
 from gllm.layers.attention.qkv_backends import FlashInferPagedAttentionMetadata
 from gllm.runtime.forward_metadata import MetadataMaterialization
 from gllm.runtime.input_data import InputData
+from gllm.runtime.memory_manager import DSparkRequestCache
 from gllm.runtime.sequence import GenerationSequence
+
+if TYPE_CHECKING:
+    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache
+
+
+@dataclass
+class DSparkStepResult:
+    """Worker-local phase output, awaiting one scheduler commit.
+
+    Prefill retains only its final prediction, not the large prompt taps.
+    Bootstrap owns one input's taps and an unpublished next anchor.
+    """
+
+    seq_id: int
+    cache_epoch: int
+    start_pos: int
+    query_len: int
+    phase: str
+    next_anchor: Optional[torch.Tensor] = None
+    hidden: Optional[torch.Tensor] = None
+    consumed: bool = False
+    ready: bool = False  # GPU work submitted and covered by last_use; not GPU-complete.
+    verification: Optional["DSparkVerifyResult"] = None
+
+
+@dataclass
+class DSparkRequestState:
+    """Runner-owned tensors; never copied into a GenerationSequence.
+
+    Target length comes solely from seq.computed_token_num. After bootstrap,
+    pending_hidden covers [cache.context_length, target length) during verify, and anchor
+    is unpublished at anchor_pos == target length. An outstanding result also
+    blocks retry after a possibly partial forward failure.
+    """
+
+    seq_id: int
+    cache_epoch: int
+    cache: DSparkRequestCache = field(default_factory=DSparkRequestCache)
+    phase: str = "prefill"
+    paged_cache: Optional["Qwen38DSparkPagedCache"] = None
+    pending_hidden: Optional[torch.Tensor] = None
+    anchor: Optional[torch.Tensor] = None
+    anchor_pos: Optional[int] = None
+    last_use: Optional[torch.cuda.Event] = None
+    inflight: Optional[DSparkStepResult] = None
+
+
+def _validate_dspark_step_result(seq, state, result):
+    if result.consumed:
+        raise ValueError("DSpark step result was already consumed")
+    if (
+        not result.ready or state.inflight is not result or state.phase != result.phase
+        or seq.seq_id != state.seq_id or seq.seq_id != result.seq_id
+        or seq._cache_epoch != state.cache_epoch or seq._cache_epoch != result.cache_epoch
+        or seq.computed_token_num != result.start_pos
+        or seq.to_compute_token_num != result.query_len
+        or seq.is_abort or seq.is_finish
+    ):
+        raise ValueError("DSpark step does not match the live request, epoch or position")
+
+
+def commit_dspark_prompt_step(
+    seq: GenerationSequence,
+    state: DSparkRequestState,
+    result: DSparkStepResult,
+) -> list[int]:
+    """Scheduler-side commit; return only tokens newly published this step.
+
+    Intermediate prefill and bootstrap return no tokens. The final prompt
+    chunk publishes y0 once; bootstrap later consumes that already-published
+    input without appending it again. GPU work and draft append happen before
+    this call; only this commit advances the authoritative target length.
+    """
+    _validate_dspark_step_result(seq, state, result)
+    end = result.start_pos + result.query_len
+    if result.query_len <= 0:
+        raise ValueError("DSpark step must consume a nonempty input")
+    if result.phase == "prefill":
+        final = end == seq.prompt_len
+        if (
+            end > seq.prompt_len or len(seq) != seq.prompt_len
+            or state.cache.context_length != end
+            or (result.next_anchor is not None) != final
+        ):
+            raise ValueError("DSpark prefill result does not cover the next prompt chunk")
+        # Read the token before mutating host progress. A failed device read
+        # must not leave a partially committed request.
+        published = [int(result.next_anchor.item())] if final else []
+    elif result.phase == "bootstrap":
+        if (
+            result.query_len != 1 or result.start_pos != seq.prompt_len
+            or len(seq) != end or state.cache.context_length != result.start_pos
+            or result.next_anchor is None or result.hidden is None
+            or result.hidden.ndim != 3 or result.hidden.shape[:2] != (1, 1)
+        ):
+            raise ValueError("DSpark bootstrap must consume the published first token once")
+        published = []
+    else:
+        raise ValueError("DSpark prompt commit requires prefill or bootstrap")
+
+    seq.computed_token_num = end
+    seq.to_compute_token_num = 0
+    if result.phase == "prefill":
+        if published:
+            seq.append(published[0])
+            state.phase = "bootstrap"
+    else:
+        state.pending_hidden = result.hidden
+        state.anchor, state.anchor_pos = result.next_anchor, end
+        state.phase = "verify"
+    result.consumed = True
+    state.inflight = None
+    return published
 
 
 @dataclass
@@ -252,3 +366,78 @@ def commit_dspark_verify_state(
     seq.recurrent_state_slot = table[0]
     seq.ssm_num_accepted = 1
     result.consumed = True
+
+
+def commit_dspark_verify_step(
+    seq: GenerationSequence,
+    state: DSparkRequestState,
+    result: DSparkStepResult,
+) -> list[int]:
+    """Scheduler-side verify commit, including an EOS/output-budget cutoff.
+
+    Every published token was a verified target input. Promote the checkpoint
+    for the actual prefix before advancing target progress. The predicted next
+    anchor is retained only when continuing after the complete accepted prefix.
+    """
+    _validate_dspark_step_result(seq, state, result)
+    verified = result.verification
+    if (
+        result.phase != "verify" or result.query_len != 8 or verified is None
+        or len(seq) != result.start_pos or state.cache.context_length != result.start_pos
+        or state.pending_hidden is not None
+    ):
+        raise ValueError("DSpark verify commit needs an appended context and eight-row result")
+    tokens = verified.committed_ids[0].cpu().tolist()
+    remaining = seq.output_len - (len(seq) - seq.raw_prompt_len)
+    count = min(len(tokens), remaining)
+    if not seq.ignore_eos:
+        count = next(
+            (i + 1 for i, token in enumerate(tokens[:count]) if token in seq.finish_tokens),
+            count,
+        )
+    if count <= 0:
+        raise ValueError("DSpark verify commit has no remaining output budget")
+    # All device reads and validation precede the first state-table mutation.
+    commit_dspark_verify_state(seq, verified, committed_count=count)
+    seq.token_ids.extend(tokens[:count])
+    seq.computed_token_num += count
+    seq.to_compute_token_num = 0
+    if seq.is_finish:
+        state.pending_hidden = state.anchor = None
+        state.anchor_pos = None
+    else:
+        state.pending_hidden = verified.accepted_hidden
+        state.anchor = verified.next_anchor
+        state.anchor_pos = seq.computed_token_num
+    result.consumed = True
+    state.inflight = None
+    return tokens[:count]
+
+
+def commit_dspark_tail_step(
+    seq: GenerationSequence,
+    state: DSparkRequestState,
+    result: DSparkStepResult,
+) -> list[int]:
+    """Publish the consumed relay input once; retain only its next prediction.
+
+    Tail never appends draft context or promotes speculative GDN checkpoints:
+    the ordinary single-token target forward updates rolling column zero.
+    """
+    _validate_dspark_step_result(seq, state, result)
+    if (
+        result.phase != "tail" or result.query_len != 1
+        or len(seq) != result.start_pos or state.anchor_pos != result.start_pos
+        or state.anchor is None or result.next_anchor is None
+    ):
+        raise ValueError("DSpark tail commit needs one consumed unpublished anchor")
+    token = int(state.anchor.item())
+    seq.append(token)
+    seq.computed_token_num += 1
+    seq.to_compute_token_num = 0
+    state.pending_hidden = None
+    state.anchor = None if seq.is_finish else result.next_anchor
+    state.anchor_pos = None if seq.is_finish else seq.computed_token_num
+    result.consumed = True
+    state.inflight = None
+    return [token]
