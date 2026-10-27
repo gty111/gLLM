@@ -1656,7 +1656,8 @@ def _verify_contract_fixture(accepted=2):
                 embed_tokens=torch.nn.Embedding(32, 4, dtype=torch.bfloat16),
             )
             self.calls = self.head_calls = 0
-            self.hidden = torch.zeros(8, 4, dtype=torch.bfloat16)
+            # Tag rows so the controller head also supports one-row calls.
+            self.hidden = torch.arange(8, dtype=torch.bfloat16)[:, None].expand(-1, 4).clone()
             self.taps = torch.arange(64, dtype=torch.bfloat16).reshape(1, 8, 8)
             self.logits = torch.zeros(8, 32)
             predictions = buffers["tokens"][1:].tolist() + [27]
@@ -1674,8 +1675,8 @@ def _verify_contract_fixture(accepted=2):
 
         def logits_from_hidden(self, hidden):
             self.head_calls += 1
-            assert hidden.shape == (8, 4)
-            return self.logits
+            assert hidden.ndim == 2 and hidden.shape[1] == 4
+            return self.logits.index_select(0, hidden[:, 0].long())
 
         def compute_logits(self, *args):
             raise AssertionError("verify needs all target rows, not only the final row")
@@ -1694,7 +1695,7 @@ def test_dspark_verify_selects_longest_prefix_and_owns_results(accepted):
     expected_taps = target.taps[:, :accepted + 1].clone()
     expected_next = target.logits.argmax(-1)[accepted:accepted + 1].clone()
     result = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
-    assert target.calls == target.head_calls == 1
+    assert target.calls == 1 and target.head_calls == 8
     assert result.accepted_drafts == accepted
     assert (result.seq_id, result.cache_epoch, result.start_pos) == (41, 3, 13)
     assert result.consumed is False
@@ -1707,6 +1708,32 @@ def test_dspark_verify_selects_longest_prefix_and_owns_results(accepted):
     torch.testing.assert_close(result.accepted_hidden, expected_taps, atol=0, rtol=0)
     torch.testing.assert_close(result.next_anchor, expected_next, atol=0, rtol=0)
     assert result.accepted_hidden.untyped_storage().nbytes() == expected_taps.numel() * 2
+
+
+def test_dspark_verify_uses_ordinary_head_shape_for_batch_sensitive_logits(monkeypatch):
+    from gllm.speculative.dspark import verify_dspark_target
+
+    target, data, buffers = _verify_contract_fixture(accepted=7)
+    original_head = target.logits_from_hidden
+
+    def batch_sensitive_head(hidden):
+        logits = original_head(hidden).clone()
+        if hidden.shape[0] > 1:
+            # Model a near-tied choice changed only by the head GEMM shape.
+            logits[0].zero_()
+            logits[0, int(buffers["tokens"][1]) + 1] = 10
+        return logits
+
+    monkeypatch.setattr(target, "logits_from_hidden", batch_sensitive_head)
+    assert target.logits_from_hidden(target.hidden).argmax(-1)[0] != (
+        target.logits_from_hidden(target.hidden[:1]).argmax(-1)[0]
+    )
+    target.head_calls = 0
+    result = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
+    assert target.calls == 1 and target.head_calls == 8
+    assert result.accepted_drafts == 7
+    torch.testing.assert_close(result.committed_ids, buffers["tokens"].unsqueeze(0))
+    assert result.next_anchor.tolist() == [27]
 
 
 @pytest.mark.parametrize("mrope", [False, True], ids=["1d", "mrope"])
@@ -1732,7 +1759,7 @@ def test_dspark_verify_accepts_conditional_wrapper_text_positions(mrope):
     wrapper.language_model = target
     result = verify_dspark_target(wrapper, data, block_size=7, target_layer_ids=(1, 0))
 
-    assert target.calls == target.head_calls == 1
+    assert target.calls == 1 and target.head_calls == 8
     assert result.accepted_drafts == 2
     torch.testing.assert_close(result.committed_ids, buffers["tokens"][:3].unsqueeze(0))
     torch.testing.assert_close(result.accepted_hidden, target.taps[:, :3], atol=0, rtol=0)
@@ -2196,7 +2223,7 @@ def test_dspark_verify_allows_window_ending_at_context_limit(
     target.max_model_len = checkpoint_limit
     target.config.model_max_length = serving_limit
     result = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
-    assert target.calls == target.head_calls == 1
+    assert target.calls == 1 and target.head_calls == 8
     assert result.accepted_drafts == 2
 
 
@@ -2581,7 +2608,7 @@ def _dspark_prompt_spy(monkeypatch, *, mrope=True):
     """CPU controller oracle; no real attention, allocation or CUDA execution."""
     from types import SimpleNamespace
 
-    from gllm.runtime import model_runner as module
+    from gllm.speculative import dspark_execution as module
     from gllm.runtime.model_runner import ModelRunner
     from gllm.runtime.sequence import GenerationSequence
     from gllm.speculative.dspark import DSparkRequestState
@@ -3009,7 +3036,7 @@ def test_dspark_prompt_bootstrap_rejects_invalid_window_before_forward(monkeypat
 
 def _dspark_execution_spy(monkeypatch, *, accepted=2):
     """Direct runner oracle; no Worker/Scheduler or real CUDA execution."""
-    from gllm.runtime import model_runner as module
+    from gllm.speculative import dspark_execution as module
     from gllm.speculative.dspark import DSparkVerifyResult, commit_dspark_prompt_step
 
     runner, seq = _dspark_prompt_spy(monkeypatch)
@@ -3209,7 +3236,7 @@ def test_dspark_execution_tail_consumes_relay_without_growing_draft(monkeypatch,
 
 @pytest.mark.parametrize("failure", ["request", "fatal", "event"])
 def test_dspark_execution_failed_verify_requires_a_new_completion_boundary(monkeypatch, failure):
-    from gllm.runtime import model_runner as module
+    from gllm.speculative import dspark_execution as module
 
     runner, seq, _ = _dspark_execution_spy(monkeypatch)
     state = runner._dspark_requests[seq.seq_id]

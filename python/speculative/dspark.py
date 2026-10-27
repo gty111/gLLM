@@ -308,7 +308,13 @@ def verify_dspark_target(
     hidden, taps = target.forward_with_hidden_taps(
         input_data, target_layer_ids=layer_ids
     )
-    predictions = target.logits_from_hidden(hidden).argmax(dim=-1)
+    # Ordinary greedy scores one row. Batched BF16 GEMM can round near-tied
+    # logits differently even for the same hidden row, so retain that head
+    # shape here while keeping the target body as one eight-row forward.
+    predictions = torch.cat([
+        target.logits_from_hidden(hidden[i:i + 1]).argmax(dim=-1)
+        for i in range(hidden.shape[0])
+    ], dim=0)
     matches = predictions[:-1] == tokens[1:]
     accepted = int(matches.to(torch.int32).cumprod(dim=0).sum().item())
     length = 1 + accepted
