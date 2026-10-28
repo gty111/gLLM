@@ -61,8 +61,12 @@ from gllm.runtime.config import EngineConfig
 from gllm.runtime.cuda_graph import CudaGraphMixin
 from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.runtime.input_data import InputData
-from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
-from gllm.runtime.model_loader import ModelLoader, propagate_serving_config
+from gllm.runtime.memory_manager import (
+    DSparkKVCacheConfig, MemoryManager, PrefixMemoryManager,
+)
+from gllm.runtime.model_loader import (
+    ModelLoader, load_dspark_draft, propagate_serving_config,
+)
 from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.async_state import MtpAsyncBatchState
@@ -111,7 +115,7 @@ class ModelRunner(
 ):
     def __init__(self, config: EngineConfig):
         self.config = config
-        self.dspark_enabled = False
+        self.dspark_enabled = config.speculative_backend == "dspark"
         self.dspark = None
         self._dspark_requests: Dict[int, DSparkRequestState] = {}
 
@@ -261,20 +265,9 @@ class ModelRunner(
             or getattr(_text_cfg, "mtp_num_hidden_layers", 0)
             or 0
         )
-        if (
-            config.mtp_enabled is None
-            and self.model_loader.architecture == "DeepseekV4ForCausalLM"
-        ):
-            # V4's ``mtp.0/1/2`` are a joint noisy-block DSpark model with a
-            # Markov correction and confidence head. They are not compatible
-            # with gLLM's sequential one-token NextN protocol, so auto mode
-            # keeps the verified base model lean. Explicit ``--mtp-enabled on``
-            # still constructs the DSpark numerical/reference module.
-            resolved_mtp_enabled = False
-        else:
-            resolved_mtp_enabled = (
-                (_num_nextn >= 1) if config.mtp_enabled is None else bool(config.mtp_enabled)
-            )
+        resolved_mtp_enabled = config.resolve_mtp_enabled(
+            self.model_loader.architecture, _num_nextn
+        )
         self._mtp_k_cfg = config.mtp_k
         self._mtp_max_batch_cfg = config.mtp_max_batch
         self.model_loader.config.mtp_enabled = resolved_mtp_enabled
@@ -583,7 +576,18 @@ class ModelRunner(
 
     def init(self, mp_load_progress=None):
         self.verify_config()
+        if self.dspark_enabled and (
+            self.attention_backend != "fa3"
+            or self._validated_qkv_attention_backend.name != "fa3"
+        ):
+            # verify_config may fall back even for an explicit FA3 request.
+            # Other backends have not passed DSpark's GPU integration checks.
+            raise RuntimeError("DSpark requires the resolved and bound FA3 backend")
         self.model = self.model_loader.load_model(mp_load_progress)
+        if self.dspark_enabled:
+            self.dspark = load_dspark_draft(
+                self.config.dspark_model_path, self.model, self.model_max_length
+            )
         # Models may opt out of monolithic decode graphs while individual
         # components are still being made graph-safe.  Keep this capability on
         # the model rather than architecture-switching in the runner: new model
@@ -611,6 +615,8 @@ class ModelRunner(
         self.mtp_enabled = bool(
             self._mtp_k > 0 and getattr(self.model, "mtp", None) is not None
         )
+        if self.config.speculative_backend == "mtp" and not self.mtp_enabled:
+            raise ValueError("mtp requires a loaded compatible MTP head")
         # Hybrid models (Qwen3.5 GDN) advertise a ready-to-use SSM cache
         # config via ``model.ssm_cache_config``. ``num_layers`` for the KV
         # path must then be the count of *full-attention* layers only.
@@ -655,13 +661,20 @@ class ModelRunner(
             # Recurrent-state prefix-cache granularity (tokens). Rounded to
             # whole pages by ``PrefixMemoryManager.init``.
             ssm_snapshot_stride_tokens=self.ssm_snapshot_stride_tokens,
-            # MTP draft-chain length for hybrid GDN models: each running seq may
-            # claim 1+mtp_k working/checkpoint entries from the cache arena.
-            # 0 for non-MTP or non-hybrid.
+            # Extra GDN checkpoint entries beyond rolling state. DSpark uses
+            # the legacy capacity parameter without enabling an MTP head.
             mtp_k=(
-                self._mtp_k
-                if (ssm_cache_config is not None and self.mtp_enabled)
+                self.dspark.block_size if self.dspark_enabled
+                else self._mtp_k if (ssm_cache_config is not None and self.mtp_enabled)
                 else 0
+            ),
+            dspark_kv_cache_config=(
+                DSparkKVCacheConfig(
+                    num_layers=len(self.dspark.layers),
+                    kv_head_num=self.dspark.config.num_key_value_heads,
+                    kv_head_dim=self.dspark.config.head_dim,
+                )
+                if self.dspark_enabled else None
             ),
         )
         self.memory_manager.requires_mrope_buffer = getattr(self.model, "requires_mrope_buffer", False)
@@ -928,7 +941,11 @@ class ModelRunner(
         self.memory_manager.validate_model_max_length(
             self.model_max_length,
             mtp_lookahead=self._mtp_k if self.mtp_enabled else 0,
+            dspark_lookahead=self.dspark.block_size if self.dspark_enabled else 0,
         )
+
+        if self.dspark_enabled:
+            self._profile_dspark_paged_verify()
 
         if self._full_cuda_graph_on or self._piecewise_runner is not None:
             self.capture_graph()
@@ -942,6 +959,12 @@ class ModelRunner(
     def prepare_input(
         self, seqs: List[GenerationSequence] = None, input_data: InputData = None
     ):
+        if getattr(self, "dspark_enabled", False):
+            if input_data is not None or seqs is None or len(seqs) != 1:
+                raise ValueError("DSpark input preparation requires one live request")
+            # Per-phase dispatch reserves storage before building GPU metadata.
+            self.input_data.seqs = seqs
+            return
         if input_data is not None:
             self.input_data.set_input_from_prebuilt(input_data)
         else:
@@ -1257,6 +1280,16 @@ class ModelRunner(
 
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
+        if getattr(self, "dspark_enabled", False):
+            if dp_padded_size is not None or len(self.input_data.seqs) != 1:
+                raise ValueError("DSpark runtime requires one unpadded request")
+            seq = self.input_data.seqs[0]
+            state = self._dspark_requests.get(seq.seq_id)
+            if state is None or state.phase in ("prefill", "bootstrap"):
+                return self._step_dspark_prompt(seq)
+            if state.phase == "tail":
+                return self._step_dspark_tail(seq)
+            return self._step_dspark_verify(seq)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         # A mixed prefill+decode batch deliberately uses the ordinary forward
         # path below: speculative draft/verify is only legal for pure decode.

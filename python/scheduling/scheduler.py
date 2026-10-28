@@ -18,6 +18,9 @@ from gllm.distributed.parallel_state import (
 from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.runtime.model_runner import ModelRunner
 from gllm.runtime.sequence import GenerationSequence
+from gllm.speculative.dspark_runtime import (
+    process_dspark_output, reject_dspark_request, schedule_dspark,
+)
 
 
 @dataclass
@@ -238,6 +241,8 @@ class Scheduler:
         )
 
     def dispatch_schedule_method(self):
+        if getattr(self.model_runner, "dspark_enabled", False):
+            return self._schedule_dspark
         if self.schedule_method in ["split_pd", "chunked_prefill"]:
             return self.chunked_prefill
         elif self.schedule_method == "token_throttling":
@@ -327,6 +332,15 @@ class Scheduler:
             len(i) - i.computed_token_num for i in self.seqs_to_prefill
         )
 
+    def _reject_dspark_request(self, seq, message):
+        return reject_dspark_request(self, seq, message)
+
+    def _schedule_dspark(self):
+        return schedule_dspark(self)
+
+    def _process_dspark_output(self, seqs, result, ipc_package):
+        return process_dspark_output(self, seqs, result, ipc_package)
+
     def add_abort_ids(self, abort_ids):
         self.abort_ids.update(abort_ids)
 
@@ -371,6 +385,8 @@ class Scheduler:
         next_tokens, logprobs, prompt_logprobs = self.next_tokens_queue.popleft()
 
         ipc_package = IPCPackage([])
+        if getattr(self.model_runner, "dspark_enabled", False):
+            return self._process_dspark_output(schedule_seqs, next_tokens, ipc_package)
 
         for idx, seq in enumerate(schedule_seqs):
             seq.computed_token_num += seq.to_compute_token_num

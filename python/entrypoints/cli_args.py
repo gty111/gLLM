@@ -256,6 +256,18 @@ def add_scheduler_args(p: argparse.ArgumentParser) -> None:
 
 def add_mtp_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
+        "--speculative-backend",
+        choices=["none", "mtp", "dspark"],
+        default=None,
+        help="Explicit speculative backend; omission preserves --mtp-enabled policy.",
+    )
+    p.add_argument(
+        "--dspark-model-path",
+        type=str,
+        default=None,
+        help="Local standalone Qwen3.8 DSpark checkpoint directory.",
+    )
+    p.add_argument(
         "--mtp-enabled",
         type=str,
         default="auto",
