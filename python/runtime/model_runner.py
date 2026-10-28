@@ -66,6 +66,8 @@ from gllm.runtime.model_loader import ModelLoader, propagate_serving_config
 from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.async_state import MtpAsyncBatchState
+from gllm.speculative.dspark import DSparkRequestState, DSparkStepResult
+from gllm.speculative.dspark_execution import DSparkExecutionMixin
 from gllm.speculative.dspark_profile import (
     profile_dspark_paged_verify, profile_dspark_prefill,
 )
@@ -104,9 +106,14 @@ def apply_mm_processor_pixels(
         logger.info(f"Max pixels: {max_pixels}")
 
 
-class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin):
+class ModelRunner(
+    DSparkExecutionMixin, MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin,
+):
     def __init__(self, config: EngineConfig):
         self.config = config
+        self.dspark_enabled = False
+        self.dspark = None
+        self._dspark_requests: Dict[int, DSparkRequestState] = {}
 
         self.max_num_batched_tokens = (
             config.maxp
@@ -1236,6 +1243,18 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
             if c0 + n >= prompt_len:
                 self._last_prompt_logprobs[seq.seq_id] = seq.prompt_logprobs_data
 
+    def _step_dspark_prompt(self, seq: GenerationSequence) -> DSparkStepResult:
+        return self._execute_dspark_prompt(seq)
+
+    def _step_dspark_verify(self, seq: GenerationSequence) -> DSparkStepResult:
+        return self._execute_dspark_verify(seq)
+
+    def _step_dspark_tail(self, seq: GenerationSequence) -> DSparkStepResult:
+        return self._execute_dspark_tail(seq)
+
+    def complete_dspark_failed_step(self, seq: GenerationSequence) -> None:
+        self._complete_dspark_failed_step(seq)
+
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
@@ -1446,11 +1465,11 @@ class ModelRunner(MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin
         # when the request finishes instead of waiting for another MTP iteration
         # to replace the relay map (which may never happen when the batch ends).
         self._mtp_relay.pop(seq.seq_id, None)
-        self.memory_manager.free(seq)
+        if not self._free_dspark_request(seq):
+            self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq.seq_id, None)
             self._disagg_free(seq.seq_id)
-
     def free_follower_state(self, seq_id: int) -> None:
         """Drop per-seq cache on a TP/PP follower; does **not** touch pages.
 
