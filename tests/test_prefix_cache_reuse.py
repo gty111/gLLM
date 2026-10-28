@@ -409,3 +409,26 @@ def test_released_page_with_replaced_hash_mapping_becomes_uncached(prefix_manage
     seg.free_many(b.page_table)
     assert not arena.allocator.cache_type(cache.name).retained_slots
     assert seg.allocate() == a.page_table[0]
+
+
+@pytest.mark.parametrize("prompt_len", [15, 19, 32])
+def test_multimodal_decode_pages_are_reusable_without_image_collisions(prefix_manager, populate, prompt_len):
+    manager, arena, cache = prefix_manager(16)
+    seq = GenerationSequence(1, [7] * prompt_len, [], output_len=64)
+    seq.hash_token_ids = [900] * prompt_len
+    populate(manager.segment, seq)
+    # MTP appends several accepted tokens at once; the MM prompt view stays put.
+    seq.token_ids.extend(range(40))
+    while len(seq.page_table) < len(seq) // 16:
+        seq.page_table.append(manager.segment.allocate())
+    for boundary in range(16, len(seq) + 1, 16):
+        manager.register_decode_boundary(seq, boundary - 1)
+    manager.segment.free_many(seq.page_table)
+    continuation = GenerationSequence(2, seq.token_ids + [99], [], output_len=16)
+    continuation.hash_token_ids = [900] * prompt_len + list(range(40)) + [99]
+    manager.pre_allocate_computed_page([continuation])
+    assert continuation.computed_token_num == (len(seq) // 16) * 16
+    different_image = GenerationSequence(3, continuation.token_ids[:], [], output_len=16)
+    different_image.hash_token_ids = [901] * prompt_len + list(range(40)) + [99]
+    manager.pre_allocate_computed_page([different_image])
+    assert different_image.computed_token_num == 0

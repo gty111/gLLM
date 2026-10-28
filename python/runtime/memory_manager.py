@@ -1943,7 +1943,7 @@ class MemoryManager:
 _PREFIX_CANARY_LEN = 8
 
 
-def _hash_source(seq: GenerationSequence) -> List[int]:
+def _hash_source(seq: GenerationSequence, n_tokens: Optional[int] = None) -> List[int]:
     """Pick the token list used for prefix-cache hashing.
 
     ``hash_token_ids`` (set by the multimodal pipeline) wins over the raw
@@ -1951,7 +1951,21 @@ def _hash_source(seq: GenerationSequence) -> List[int]:
     placeholders but distinct images do not collide.
     """
     hi = getattr(seq, "hash_token_ids", None)
-    return hi if hi is not None else seq.token_ids
+    if hi is None:
+        return seq.token_ids
+    # The multimodal view initially contains only the content-hashed prompt.
+    # Decode mutates token_ids directly (including overlap placeholders), so
+    # extend lazily only through the finalized boundary requested by the caller.
+    # Preserve the image-derived prompt IDs and the native hash source identity.
+    end = len(seq.token_ids) if n_tokens is None else n_tokens
+    if len(hi) < end:
+        if len(hi) < seq.raw_prompt_len or end > len(seq.token_ids):
+            raise ValueError("Incomplete multimodal prefix hash source")
+        tail = seq.token_ids[len(hi):end]
+        if any(token < 0 for token in tail):
+            raise ValueError("Cannot hash unfinalized decode tokens")
+        hi.extend(tail)
+    return hi
 
 
 def _maybe_invalidate_seq_hash_cache(seq: GenerationSequence, src: List[int]) -> None:
@@ -1979,7 +1993,7 @@ def _ensure_page_hash(seq: GenerationSequence, page_size: int, page_idx: int) ->
     requests: any two seqs sharing identical first ``k*page_size`` tokens
     produce identical native hash chains.
     """
-    src = _hash_source(seq)
+    src = _hash_source(seq, (page_idx + 1) * page_size)
     _maybe_invalidate_seq_hash_cache(seq, src)
     return _page_hash_from_source(src, seq._page_hashes, page_size, page_idx)
 
@@ -2000,7 +2014,7 @@ def _ensure_canary(seq: GenerationSequence) -> tuple:
     single seq), but built without rebuilding the full prefix tuple each
     call.
     """
-    src = _hash_source(seq)
+    src = _hash_source(seq, 0)
     _maybe_invalidate_seq_hash_cache(seq, src)
     c = seq._canary_cache
     if c is None:
