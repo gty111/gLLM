@@ -226,3 +226,44 @@ def test_pp_payload_reads_native_snapshot_assignments_without_full_table_copy():
     appended = builder.build([seq], [], ssm_page2snap=core)
     assert appended.updates[0].new_page_ids == [15]
     assert appended.updates[0].new_page_snap_slots == [11]
+
+
+@pytest.mark.parametrize("prompt_len", [15, 16, 19, 31, 32])
+@pytest.mark.parametrize("width", [1, 4])
+def test_multimodal_decode_hash_extends_only_finalized_boundary(prompt_len, width):
+    seq = GenerationSequence(1, [7] * prompt_len, [], output_len=64)
+    seq.hash_token_ids = [900 + i for i in range(prompt_len)]
+    source = seq.hash_token_ids
+    expected = source[:]
+    for start in range(0, 40, width):
+        row = list(range(100 + start, 100 + start + width))
+        seq.token_ids.extend(row)
+        expected.extend(row)
+        # An overlapped successor may already have placeholders in token_ids.
+        seq.token_ids.extend([-1] * 4)
+        for page_idx in range(len(expected) // 16):
+            actual = _ensure_page_hash(seq, 16, page_idx)
+            assert actual == PrefixHashes(expected).page_hash(expected, 16, page_idx)
+        del seq.token_ids[-4:]
+        assert seq.hash_token_ids is source
+        assert source[:prompt_len] == expected[:prompt_len]
+        assert all(token >= 0 for token in source)
+    assert len(source) == (len(expected) // 16) * 16
+
+
+def test_multimodal_lookup_after_decode_extends_hash_source():
+    from gllm.runtime.memory_manager import _hash_source
+
+    seq = GenerationSequence(1, [7] * 19, [], output_len=64)
+    seq.hash_token_ids = [900] * 19
+    seq.token_ids.extend(range(40))
+    assert _hash_source(seq) == [900] * 19 + list(range(40))
+
+
+def test_multimodal_hash_rejects_placeholder_without_mutating_source():
+    seq = GenerationSequence(1, [7] * 15, [], output_len=64)
+    seq.hash_token_ids = [900] * 15
+    seq.token_ids.append(-1)
+    with pytest.raises(ValueError, match="unfinalized"):
+        _ensure_page_hash(seq, 16, 0)
+    assert seq.hash_token_ids == [900] * 15
