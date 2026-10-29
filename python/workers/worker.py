@@ -75,6 +75,7 @@ from gllm.scheduling.distributed import (
     SchedulePayload,
 )
 from gllm.scheduling.scheduler import Scheduler
+from gllm.speculative.dspark_runtime import schedule_forward_dspark
 
 
 # Used with AsyncLLM
@@ -899,6 +900,8 @@ class Worker(TorchProfilerMixin):
         send_pp_data(output, get_next_pp_rank())
 
     def schedule_forward(self):
+        if getattr(self.model_runner, "dspark_enabled", False):
+            return schedule_forward_dspark(self)
         if is_dp_attn():
             if get_pp_size() > 1:
                 self._schedule_forward_dp_pp()

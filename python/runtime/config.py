@@ -72,6 +72,9 @@ class EngineConfig:
     mm_processor_max_pixels: Optional[int] = None
     # Encoder disaggregation
     disagg_config: Optional[DisaggConfig] = None
+    # Explicit selection is opt-in; None preserves the legacy MTP policy.
+    speculative_backend: Optional[str] = None
+    dspark_model_path: Optional[str] = None
 
     def __post_init__(self):
         # Internal consistency lives here, next to the fields, so entrypoints
@@ -85,3 +88,44 @@ class EngineConfig:
         for name in ("pp_size", "tp_size", "dp_size"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
+
+        backend = self.speculative_backend
+        if backend not in (None, "none", "mtp", "dspark"):
+            raise ValueError(f"Invalid speculative_backend: {backend!r}")
+        if backend == "dspark":
+            if not self.dspark_model_path:
+                raise ValueError("DSpark requires a local dspark_model_path")
+        elif self.dspark_model_path is not None:
+            raise ValueError("dspark_model_path requires speculative_backend='dspark'")
+        if backend in ("none", "dspark") and self.mtp_enabled is True:
+            raise ValueError(f"{backend} conflicts with mtp_enabled=True")
+        if backend == "mtp" and self.mtp_enabled is False:
+            raise ValueError("mtp conflicts with mtp_enabled=False")
+        if backend == "dspark":
+            required = {
+                "tp_size": 1, "pp_size": 1, "dp_size": 1, "maxd": 1,
+                "overlap_scheduling": False, "enable_prefix_caching": False,
+                "disable_cuda_graph": True, "piecewise_cuda_graph": False,
+                "schedule_method": "chunked_prefill", "attention_backend": "fa3",
+                "load_format": "auto",
+            }
+            for name, value in required.items():
+                if getattr(self, name) != value:
+                    raise ValueError(f"DSpark requires {name}={value!r}")
+            if self.maxp < 8:
+                raise ValueError("DSpark requires maxp >= 8")
+            if self.disagg_config is not None or self.assigned_layers is not None:
+                raise ValueError("DSpark does not support disaggregation or assigned_layers")
+
+    def resolve_mtp_enabled(self, architecture: str, nextn_layers: int) -> bool:
+        """Resolve head construction without confusing GDN capacity with MTP."""
+        if self.speculative_backend in ("none", "dspark"):
+            return False
+        if self.speculative_backend == "mtp":
+            # V4's joint DSpark stages are not a sequential NextN head.
+            if architecture == "DeepseekV4ForCausalLM" or nextn_layers < 1 or self.mtp_k < 1:
+                raise ValueError("mtp requires a compatible MTP head and positive mtp_k")
+            return True
+        if self.mtp_enabled is None and architecture == "DeepseekV4ForCausalLM":
+            return False
+        return nextn_layers >= 1 if self.mtp_enabled is None else bool(self.mtp_enabled)
