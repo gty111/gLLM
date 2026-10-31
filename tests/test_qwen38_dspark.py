@@ -1164,12 +1164,15 @@ def test_target_taps_reject_unsupported_parallelism_before_forward(monkeypatch, 
     assert all(layer.calls == 0 for layer in model.layers)
 
 
-@pytest.mark.parametrize("invalid", ["batch", "multimodal", "empty", "hidden", "residual"])
+@pytest.mark.parametrize("invalid", ["empty_batch", "multimodal", "multimodal_second", "empty", "hidden", "residual"])
 def test_target_taps_reject_invalid_input_before_forward(invalid):
     wrapper, model, data = _target_tap_fixture()
     kwargs = {}
-    if invalid == "batch":
-        data.seqs *= 2
+    if invalid == "empty_batch":
+        data.seqs = []
+    elif invalid == "multimodal_second":
+        from types import SimpleNamespace
+        data.seqs.append(SimpleNamespace(mm_contents=object()))
     elif invalid == "multimodal":
         data.seqs[0].mm_contents = object()
     elif invalid == "empty":
@@ -1181,7 +1184,7 @@ def test_target_taps_reject_invalid_input_before_forward(invalid):
     assert all(layer.calls == 0 for layer in model.layers)
 
 
-def _hybrid_target_fixture(*, mtp_k=0):
+def _hybrid_target_fixture(*, mtp_k=0, arena_capacity=16):
     """Real tiny hybrid target and independent request-owned arena states."""
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -1252,7 +1255,7 @@ def _hybrid_target_fixture(*, mtp_k=0):
         manager.v_scale = manager.k_scale
         layouts = manager._cache_layouts()
         grain = select_physical_page_bytes(layouts.values())
-        pages = 16 * sum((layout.entry_bytes + grain - 1) // grain for layout in layouts.values())
+        pages = arena_capacity * sum((layout.entry_bytes + grain - 1) // grain for layout in layouts.values())
         arena = CacheArena(
             torch.zeros(pages * grain, device="cuda", dtype=torch.uint8),
             physical_page_bytes=grain,
@@ -2334,7 +2337,7 @@ def test_dspark_loader_rejects_bf16_temporal_state_before_loading(tmp_path):
         load_dspark_draft(str(tmp_path), target, model_max_length=32)
 
 
-def _dspark_runtime_fixture():
+def _dspark_runtime_fixture(*, batch=1, max_tokens=32):
     """Real MRoPE target/draft pair, before allocating their shared arena."""
     from dataclasses import replace
 
@@ -2383,7 +2386,7 @@ def _dspark_runtime_fixture():
         torch.set_default_dtype(previous_dtype)
     manager = MemoryManager(
         1.0, text.num_kv_layers, torch.bfloat16, 16, text.num_kv_heads, text.head_dim,
-        text.config.vocab_size, max_running_seqs=1, ssm_cache_config=text.ssm_cache_config,
+        text.config.vocab_size, max_running_seqs=batch, ssm_cache_config=text.ssm_cache_config,
         mtp_k=7, dspark_kv_cache_config=DSparkKVCacheConfig(
             len(draft.layers), config.num_key_value_heads, config.head_dim,
         ),
@@ -2392,23 +2395,24 @@ def _dspark_runtime_fixture():
     runner = ModelRunner.__new__(ModelRunner)
     runner._dspark_requests = {}
     runner._mtp_relay, runner.use_mm = {}, False
-    runner.maxd, runner.maxp, runner.minp, runner.iterp = 1, 8, 1, 1
+    runner.maxd, runner.maxp, runner.minp, runner.iterp = batch, min(max_tokens, 8 * batch), 1, 1
+    runner.max_running_seqs = batch
     runner.init_new_token_ratio = runner.min_new_token_ratio = 0.1
     runner.model, runner.dspark, runner.dspark_enabled = target, draft, True
-    runner.model_max_length, runner.max_num_batched_tokens = 32, 32
+    runner.model_max_length, runner.max_num_batched_tokens = 32, max_tokens
     runner.memory_manager, runner.uses_mrope = manager, True
     runner.page_size = manager.page_size
     runner.input_data = InputData(
-        use_buffer=True, memory_manager=manager, max_seq_length=32, max_running_seqs=1
+        use_buffer=True, memory_manager=manager, max_seq_length=max_tokens, max_running_seqs=batch
     )
-    backend = create_qkv_attention_backend("fa3", 32, 1)
+    backend = create_qkv_attention_backend("fa3", 32, batch)
     bind_qkv_attention_backend(find_qkv_attention_layers(target), backend)
     runner.qkv_attention_backend = backend
 
     return runner, make_input
 
 
-def _init_dspark_runtime_test_arena(runner):
+def _init_dspark_runtime_test_arena(runner, *, arena_capacity=24):
     from gllm.runtime.cache_arena import CacheArena, select_physical_page_bytes
     from gllm.runtime.memory_manager import Segment, SSMSegment
 
@@ -2417,7 +2421,7 @@ def _init_dspark_runtime_test_arena(runner):
     # A small real arena avoids consuming the rest of the GPU in a unit test.
     layouts = manager._cache_layouts()
     grain = select_physical_page_bytes(layouts.values())
-    pages = 24 * sum((layout.entry_bytes + grain - 1) // grain for layout in layouts.values())
+    pages = arena_capacity * sum((layout.entry_bytes + grain - 1) // grain for layout in layouts.values())
     arena = CacheArena(
         torch.zeros(pages * grain, device="cuda", dtype=torch.uint8),
         physical_page_bytes=grain,
@@ -4206,3 +4210,1886 @@ def test_dspark_tail_capacity_failure_is_terminal_before_forward(monkeypatch):
     assert len(runner.model.calls) == calls and seq.token_ids == history and not tables
     assert pending.shape[1] == 1 and anchor.numel() == 1
     assert not runner._dspark_requests
+
+
+
+@pytest.mark.parametrize("lengths", [(1, 3), (2, 1, 4, 3)])
+@torch.no_grad()
+def test_target_taps_packed_batch_preserves_request_rows_and_storage(lengths):
+    from types import SimpleNamespace
+
+    wrapper, model, data = _target_tap_fixture()
+    tokens = torch.arange(2, sum(lengths) + 2, dtype=torch.long)
+    data.get_tokens = lambda: tokens
+    data.seqs = [SimpleNamespace(mm_contents=None) for _ in lengths]
+    embedded = model.embed_tokens(tokens).clone()
+    hidden, taps = wrapper.forward_with_hidden_taps(data, target_layer_ids=(5, 19))
+    expected = torch.cat(
+        [embedded + (layer + 1) * (layer + 2) / 64 for layer in (5, 19)], dim=-1
+    ).unsqueeze(0)
+    assert all(layer.calls == 1 for layer in model.layers)
+    begin = 0
+    for length in lengths:
+        torch.testing.assert_close(
+            taps[:, begin:begin + length], expected[:, begin:begin + length], rtol=0, atol=0
+        )
+        begin += length
+    torch.testing.assert_close(hidden, (embedded + 65) * 3, rtol=0, atol=0)
+    saved = taps.clone()
+    wrapper.forward_with_hidden_taps(data, embedded + 1, target_layer_ids=(19, 5))
+    torch.testing.assert_close(taps, saved, rtol=0, atol=0)
+
+
+def test_paged_batch_rope_keeps_each_request_absolute_positions():
+    from gllm.models.qwen38_dspark import _rotate
+
+    torch.manual_seed(101)
+    queries = torch.randn(4, 2, 7, 16)
+    rotary = torch.randn(64, 16)
+    positions = torch.stack([torch.arange(start, start + 7) for start in (0, 3, 17, 31)])
+    got = _rotate(queries, rotary, positions)
+    expected = torch.cat([
+        _rotate(queries[index:index + 1], rotary, positions[index])
+        for index in range(4)
+    ])
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+def test_paged_batch_table_reuses_grows_reorders_and_rebinds_sources(monkeypatch):
+    from types import SimpleNamespace
+
+    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache, _Qwen38DSparkBatchTable
+
+    segment = SimpleNamespace(page_size=4, k_cache=[torch.empty(1)])
+    def view(pages):
+        state = SimpleNamespace(table=torch.tensor(pages, dtype=torch.int32))
+        state.get_device_page_table = lambda device: state.table.unsqueeze(0)
+        return Qwen38DSparkPagedCache(segment, state)
+
+    first, second = view([7, 2, 9]), view([4, 8])
+    metadata = _Qwen38DSparkBatchTable(7)
+    table = metadata.prepare([first, second], (5, 1))
+    pointer = table.data_ptr()
+    assert torch.equal(table[:7, :2], torch.tensor([[7, 2]], dtype=torch.int32).expand(7, -1))
+    assert torch.equal(table[7:, :1], torch.full((7, 1), 4, dtype=torch.int32))
+
+    with monkeypatch.context() as context:
+        def no_copy(*args, **kwargs):
+            raise AssertionError("unchanged page bindings must not be copied again")
+        context.setattr(torch.Tensor, "copy_", no_copy)
+        unchanged = metadata.prepare([first, second], (7, 2))
+    assert unchanged.data_ptr() == pointer
+
+    grown = metadata.prepare([first, second], (9, 2))
+    assert grown.shape == (14, 3)
+    assert metadata.table.shape == (14, 4)
+    assert torch.equal(grown[:7], torch.tensor([[7, 2, 9]], dtype=torch.int32).expand(7, -1))
+    rebound = metadata.prepare([second, first], (2, 9))
+    assert torch.equal(rebound[:7, :1], torch.full((7, 1), 4, dtype=torch.int32))
+    assert torch.equal(rebound[7:, :3], torch.tensor([[7, 2, 9]], dtype=torch.int32).expand(7, -1))
+
+    # Same request object and page count after reset must not retain old IDs.
+    first.state.table = torch.tensor([12, 13, 14], dtype=torch.int32)
+    reused = metadata.prepare([second, first], (2, 9))
+    assert torch.equal(reused[7:, :3], torch.tensor([[12, 13, 14]], dtype=torch.int32).expand(7, -1))
+    replacement = view([21, 22, 23])
+    replaced = metadata.prepare([second, replacement], (2, 9))
+    assert torch.equal(replaced[7:, :3], torch.tensor([[21, 22, 23]], dtype=torch.int32).expand(7, -1))
+    active_only = metadata.prepare([first, second], (0, 2))
+    assert active_only.shape == (7, 1)
+    assert torch.equal(active_only, torch.full((7, 1), 4, dtype=torch.int32))
+
+
+def _paged_batch_storage(config, page_size, batch):
+    from gllm.runtime.memory_manager import DSparkRequestCache
+
+    segment, first, arena = _paged_context_storage(config, page_size)
+    caches = [first]
+    if batch > 1:
+        draft = arena.cache("dspark_kv_cache")
+        slots = arena.allocator.allocate(draft.name, 2 * (batch - 1))
+        assert slots is not None
+        for slot in slots:
+            draft.tensor("key")[slot].fill_(31)
+            draft.tensor("value")[slot].fill_(37)
+        caches.extend(
+            DSparkRequestCache(page_table=[slots[index + 1], slots[index]])
+            for index in range(0, len(slots), 2)
+        )
+    return segment, caches, arena
+
+
+def _bounded_batch_draft(config):
+    model = _build_model(config)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if parameter.ndim >= 2:
+                parameter.normal_(0, 0.02)
+            elif name.endswith("bias"):
+                parameter.zero_()
+            else:
+                parameter.fill_(1)
+    return model
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@torch.no_grad()
+def test_paged_batch_draft_matches_independent_dense_histories(monkeypatch, batch):
+    from dataclasses import replace
+
+    torch.manual_seed(103)
+    config = replace(_tensor_config(), block_size=7)
+    model = _bounded_batch_draft(config)
+    segment, states, arena = _paged_batch_storage(config, 16, batch)
+    contexts = [_rows(config, length) for length in (2, 5, 9, 16)[:batch]]
+    anchors = torch.arange(3, 3 + batch, device="cuda")
+    projections = []
+    project = model._project_context
+    def record_projection(rows):
+        projections.append(rows.shape[1])
+        return project(rows)
+    monkeypatch.setattr(model, "_project_context", record_projection)
+    caches = model.prefill_paged_batched(contexts, segment=segment, caches=states)
+    assert projections == [sum(context.shape[1] for context in contexts)]
+
+    tensor = torch.tensor
+    def reject_pageable_table(data, *args, **kwargs):
+        device = kwargs.get("device")
+        if isinstance(data, list) and device is not None and torch.device(device).type == "cuda":
+            raise AssertionError("batched draft must not rebuild a pageable CPU-to-GPU table")
+        return tensor(data, *args, **kwargs)
+    monkeypatch.setattr(torch, "tensor", reject_pageable_table)
+
+    from gllm.layers.ops import triton_decode_attention
+    decode = triton_decode_attention.decode_attention_fwd
+    history_queries = []
+    def record_history(*args, **kwargs):
+        history_queries.append(args[0].shape[0])
+        return decode(*args, **kwargs)
+    monkeypatch.setattr(triton_decode_attention, "decode_attention_fwd", record_history)
+
+    for added in ((1, 2, 0, 3), (0, 1, 2, 0)):
+        suffixes = [_rows(config, size) for size in added[:batch]]
+        ends = [state.context_length + suffix.shape[1] for state, suffix in zip(states, suffixes)]
+        before = [key.clone() for key in segment.k_cache + segment.v_cache]
+        keep = torch.ones(segment.num_pages, 16, device="cuda", dtype=torch.bool)
+        for state, end in zip(states, ends):
+            for position in range(state.context_length, end):
+                keep[state.page_table[position // 16], position % 16] = False
+        seen = []
+        hooks = [layer.self_attn.q_proj.register_forward_pre_hook(
+            lambda module, args: seen.append(tuple(args[0].shape[:2]))
+        ) for layer in model.layers]
+        projections.clear()
+        history_queries.clear()
+        got, noisy_ids = model.forward_draft_batched(
+            suffixes, anchors, start_positions=ends, caches=caches
+        )
+        for hook in hooks:
+            hook.remove()
+        assert seen == [(batch, 7)] * len(model.layers)
+        assert history_queries == [batch * 7] * len(model.layers)
+        assert projections == ([sum(added[:batch])] if sum(added[:batch]) else [])
+        assert got.shape == (batch, 7, config.hidden_size)
+        assert torch.equal(noisy_ids[:, 0], anchors)
+        assert torch.all(noisy_ids[:, 1:] == config.mask_token_id)
+        for actual, old in zip(segment.k_cache + segment.v_cache, before):
+            assert torch.equal(actual[keep], old[keep])
+
+        for index in range(batch):
+            contexts[index] = torch.cat([contexts[index], suffixes[index]], dim=1)
+            # The old dense path rejects zero-row increments. Reconstruct the
+            # test oracle by reserving its last context row for a nonempty append.
+            dense = model.prefill(contexts[index][:, :-1], anchors[index:index + 1])
+            expected, _ = model.forward_draft(
+                contexts[index][:, -1:], anchors[index:index + 1],
+                start_pos=ends[index], caches=dense,
+            )
+            assert torch.isfinite(expected).all() and torch.isfinite(got[index]).all()
+            torch.testing.assert_close(got[index:index + 1], expected, rtol=2e-2, atol=2e-2)
+            keys, values = _read_paged_context(segment, states[index], ends[index])
+            for actual, want in zip(keys + values, dense.keys + dense.values):
+                torch.testing.assert_close(actual, want, rtol=2e-2, atol=2e-2)
+            assert states[index].context_length == ends[index]
+
+    before = arena.backing.clone()
+    repeated, ids = model.forward_draft_batched(
+        [_rows(config, 0) for _ in states], anchors, start_positions=ends, caches=caches
+    )
+    torch.testing.assert_close(repeated, got, rtol=0, atol=0)
+    assert torch.equal(ids, noisy_ids) and torch.equal(arena.backing, before)
+    proposed, logits, confidence = model.forward_head(repeated, anchors)
+    assert proposed.shape == (batch, 8) and torch.equal(proposed[:, 0], anchors)
+    assert torch.isfinite(logits).all() and torch.isfinite(confidence).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lengths", [(0, 0), (0, 3), (1, 17, 0, 9)])
+@torch.no_grad()
+def test_paged_batch_attention_skips_empty_history_and_never_crosses_requests(lengths):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from gllm.models.qwen38_dspark import Qwen38DSparkAttention, Qwen38DSparkPagedCache, _Qwen38DSparkBatchTable
+
+    torch.manual_seed(107)
+    config = replace(_tensor_config(), num_hidden_layers=1)
+    segment, states, arena = _paged_batch_storage(config, 16, len(lengths))
+    key, value = segment.k_cache[0], segment.v_cache[0]
+    for state in states:
+        for page in state.page_table:
+            key[page].fill_(float("nan"))
+            value[page].fill_(float("nan"))
+    histories = []
+    for index, (state, length) in enumerate(zip(states, lengths)):
+        k = torch.randn(length, 2, 16, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn_like(k) + index
+        for position in range(length):
+            key[state.page_table[position // 16], position % 16] = k[position]
+            value[state.page_table[position // 16], position % 16] = v[position]
+        histories.append((k.transpose(0, 1).unsqueeze(0), v.transpose(0, 1).unsqueeze(0)))
+    q = torch.randn(len(lengths), 4, 7, 16, device="cuda", dtype=torch.bfloat16)
+    noise_k = torch.randn(len(lengths), 2, 7, 16, device="cuda", dtype=torch.bfloat16)
+    noise_v = torch.randn_like(noise_k)
+    views = [Qwen38DSparkPagedCache(segment, state) for state in states]
+    table = _Qwen38DSparkBatchTable(7).prepare(views, lengths)
+    attention = SimpleNamespace(num_heads=4, num_key_value_groups=2, head_dim=16, scaling=16**-0.5)
+    before = arena.backing.clone()
+    got = Qwen38DSparkAttention._paged_attention(
+        attention, q, noise_k, noise_v, key, value, table, lengths
+    )
+    for index, (history_k, history_v) in enumerate(histories):
+        dense_k = torch.cat([history_k, noise_k[index:index + 1]], dim=2).repeat_interleave(2, dim=1)
+        dense_v = torch.cat([history_v, noise_v[index:index + 1]], dim=2).repeat_interleave(2, dim=1)
+        scores = q[index:index + 1].float() @ dense_k.float().transpose(-1, -2) * attention.scaling
+        expected = scores.softmax(-1) @ dense_v.float()
+        torch.testing.assert_close(got[index:index + 1].float(), expected, rtol=2e-2, atol=2e-2)
+    assert torch.isfinite(got).all() and torch.equal(arena.backing, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("invalid", [
+    "count", "duplicate_cache", "late_gap", "late_width", "late_dtype",
+    "anchor_count", "anchor_dtype", "noise_range",
+])
+@torch.no_grad()
+def test_paged_batch_draft_rejects_invalid_request_before_any_append(monkeypatch, invalid):
+    from dataclasses import replace
+
+    config = replace(_tensor_config(), block_size=7)
+    model = _bounded_batch_draft(config)
+    segment, states, arena = _paged_batch_storage(config, 16, 2)
+    caches = model.prefill_paged_batched(
+        [_rows(config, 2), _rows(config, 5)], segment=segment, caches=states
+    )
+    suffixes, ends = [_rows(config, 1), _rows(config, 1)], [3, 6]
+    anchors = torch.tensor([3, 4], device="cuda")
+    if invalid == "count":
+        ends.pop()
+    elif invalid == "duplicate_cache":
+        caches[1] = caches[0]
+    elif invalid == "late_gap":
+        ends[1] += 1
+    elif invalid == "late_width":
+        suffixes[1] = suffixes[1][..., :-1]
+    elif invalid == "late_dtype":
+        suffixes[1] = suffixes[1].float()
+    elif invalid == "anchor_count":
+        anchors = anchors[:1]
+    elif invalid == "anchor_dtype":
+        anchors = anchors.to(torch.int32)
+    else:
+        monkeypatch.setattr(model.rotary_emb, "cos_sin_cache", model.rotary_emb.cos_sin_cache[:12])
+    before = arena.backing.clone()
+    with pytest.raises(ValueError):
+        model.forward_draft_batched(suffixes, anchors, start_positions=ends, caches=caches)
+    assert [state.context_length for state in states] == [2, 5]
+    assert torch.equal(arena.backing, before)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_paged_batch_context_failure_does_not_publish_any_request_length(monkeypatch):
+    from dataclasses import replace
+
+    config = replace(_tensor_config(), block_size=7)
+    model = _bounded_batch_draft(config)
+    segment, states, arena = _paged_batch_storage(config, 16, 2)
+    model.prefill_paged_batched([_rows(config, 2), _rows(config, 5)], segment=segment, caches=states)
+    before = [key.clone() for key in segment.k_cache + segment.v_cache]
+    original = model.layers[1].self_attn.prefill_context
+    def fail(*args):
+        raise RuntimeError("injected batch context projection failure")
+    monkeypatch.setattr(model.layers[1].self_attn, "prefill_context", fail)
+    with pytest.raises(RuntimeError, match="batch context projection"):
+        model.prefill_paged_batched([_rows(config, 1), _rows(config, 2)], segment=segment, caches=states)
+    assert [state.context_length for state in states] == [2, 5]
+    for cache, length in zip(states, (2, 5)):
+        for tensor, old in zip(segment.k_cache + segment.v_cache, before):
+            for position in range(length):
+                page, offset = cache.page_table[position // 16], position % 16
+                assert torch.equal(tensor[page, offset], old[page, offset])
+    monkeypatch.setattr(model.layers[1].self_attn, "prefill_context", original)
+    model.prefill_paged_batched([_rows(config, 1), _rows(config, 2)], segment=segment, caches=states)
+    assert [state.context_length for state in states] == [3, 7]
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_paged_batch_single_request_preserves_existing_forward_exactly():
+    from dataclasses import replace
+
+    torch.manual_seed(109)
+    config = replace(_tensor_config(), block_size=7)
+    model = _bounded_batch_draft(config)
+    segment, state, _ = _paged_context_storage(config, 16)
+    batched_segment, batched_states, _ = _paged_batch_storage(config, 16, 1)
+    prefix, suffix = _rows(config, 3), _rows(config, 2)
+    anchor = torch.tensor([5], device="cuda")
+    single = model.prefill_paged(prefix, segment=segment, cache=state)
+    batched = model.prefill_paged_batched(
+        [prefix], segment=batched_segment, caches=batched_states
+    )
+    expected, expected_ids = model.forward_draft(suffix, anchor, start_pos=5, caches=single)
+    got, ids = model.forward_draft_batched([suffix], anchor, start_positions=[5], caches=batched)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    assert torch.equal(ids, expected_ids)
+    for actual, reference in zip(
+        sum(_read_paged_context(batched_segment, batched_states[0], 5), []),
+        sum(_read_paged_context(segment, state, 5), []),
+    ):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_paged_batch_empty_context_never_projects_or_writes(monkeypatch):
+    from dataclasses import replace
+
+    torch.manual_seed(113)
+    config = replace(_tensor_config(), block_size=7)
+    model = _bounded_batch_draft(config)
+    segment, states, arena = _paged_batch_storage(config, 16, 2)
+    def unexpected_projection(*args):
+        raise AssertionError("empty context must not reach RMSNorm")
+    monkeypatch.setattr(model, "_project_context", unexpected_projection)
+    before = arena.backing.clone()
+    caches = model.prefill_paged_batched(
+        [_rows(config, 0), _rows(config, 0)], segment=segment, caches=states
+    )
+    hidden, _ = model.forward_draft_batched(
+        [_rows(config, 0), _rows(config, 0)], torch.tensor([2, 3], device="cuda"),
+        start_positions=[0, 0], caches=caches,
+    )
+    assert torch.isfinite(hidden).all() and [state.context_length for state in states] == [0, 0]
+    assert torch.equal(arena.backing, before)
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch", [2, 4])
+@torch.no_grad()
+def test_target_taps_packed_batch_matches_independent_hybrid_states(batch):
+    from gllm.runtime.input_data import InputData
+    from gllm.runtime.sequence import GenerationSequence
+
+    model, _, make_input = _hybrid_target_fixture()
+    token_rows = [tuple(range(1 + index, 4 + 2 * index)) for index in range(batch)]
+    _, manager, first = make_input(token_rows[0])
+    seqs = [first]
+    for index, tokens in enumerate(token_rows[1:], start=2):
+        seq = GenerationSequence(index, list(tokens), [], output_len=8, temperature=0)
+        seq.page_table = [manager.segment.allocate()]
+        assert manager.allocate_recurrent_slot(seq)
+        seq.to_compute_token_num = len(tokens)
+        seqs.append(seq)
+
+    class IndependentCausalAttention:
+        # Test oracle only: real target projections/RoPE/GDN/taps remain batched.
+        def forward(self, q, key, value, metadata, scale):
+            groups = [metadata] if isinstance(metadata, tuple) else metadata
+            outputs, begin = [], 0
+            for pages, length in groups:
+                k = key[pages].reshape(-1, key.shape[-2], key.shape[-1])[:length]
+                v = value[pages].reshape(-1, value.shape[-2], value.shape[-1])[:length]
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    q[begin:begin + length].transpose(0, 1).unsqueeze(0),
+                    k.transpose(0, 1).unsqueeze(0), v.transpose(0, 1).unsqueeze(0),
+                    is_causal=True, scale=scale, enable_gqa=True,
+                )
+                outputs.append(output[0].transpose(0, 1))
+                begin += length
+            return torch.cat(outputs).contiguous()
+
+    for layer in model.model.layers:
+        if layer.self_attn is not None:
+            layer.self_attn.attn.set_backend(IndependentCausalAttention())
+    data = InputData(True, manager, max_seq_length=64, max_running_seqs=batch)
+    data.cal_and_set_input(seqs)
+    data.forward_metadata_plan.attention_metadata = [
+        (seq.page_table, len(tokens)) for seq, tokens in zip(seqs, token_rows)
+    ]
+    hidden, taps = model.forward_with_hidden_taps(data, target_layer_ids=(1, 0))
+    begin = 0
+    for seq, tokens in zip(seqs, token_rows):
+        reference_data, reference_manager, reference_seq = make_input(tokens)
+        expected_hidden, expected_taps = model.forward_with_hidden_taps(
+            reference_data, target_layer_ids=(1, 0)
+        )
+        length = len(tokens)
+        torch.testing.assert_close(
+            hidden[begin:begin + length], expected_hidden, rtol=2e-2, atol=2e-2
+        )
+        torch.testing.assert_close(
+            taps[:, begin:begin + length], expected_taps, rtol=1e-2, atol=2e-3
+        )
+        for actual_bank, expected_bank in zip(
+            manager.segment.k_cache + manager.segment.v_cache,
+            reference_manager.segment.k_cache + reference_manager.segment.v_cache,
+        ):
+            actual = actual_bank[seq.page_table].reshape(-1, *actual_bank.shape[-2:])[:length]
+            expected = expected_bank[reference_seq.page_table].reshape(
+                -1, *expected_bank.shape[-2:]
+            )[:length]
+            torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-3)
+        for name in ("conv_state", "temporal_state"):
+            torch.testing.assert_close(
+                getattr(manager.ssm_segment, name)[:, seq.recurrent_state_slot],
+                getattr(reference_manager.ssm_segment, name)[:, reference_seq.recurrent_state_slot],
+                rtol=1e-2, atol=2e-3,
+            )
+        reference_manager.free(reference_seq)
+        begin += length
+    assert torch.isfinite(hidden).all() and torch.isfinite(taps).all()
+    for seq in seqs:
+        manager.free(seq)
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_paged_batch_noise_failure_keeps_published_context_without_duplicate_append(monkeypatch):
+    from dataclasses import replace
+
+    config = replace(_tensor_config(), block_size=7)
+    model = _bounded_batch_draft(config)
+    segment, states, arena = _paged_batch_storage(config, 16, 2)
+    caches = model.prefill_paged_batched(
+        [_rows(config, 2), _rows(config, 5)], segment=segment, caches=states
+    )
+    original = model.layers[0].self_attn.forward
+    def fail_noise(*args, **kwargs):
+        raise RuntimeError("injected batch noise failure")
+    monkeypatch.setattr(model.layers[0].self_attn, "forward", fail_noise)
+    anchors = torch.tensor([3, 4], device="cuda")
+    with pytest.raises(RuntimeError, match="batch noise failure"):
+        model.forward_draft_batched(
+            [_rows(config, 1), _rows(config, 2)], anchors,
+            start_positions=[3, 7], caches=caches,
+        )
+    assert [state.context_length for state in states] == [3, 7]
+    before = arena.backing.clone()
+    monkeypatch.setattr(model.layers[0].self_attn, "forward", original)
+    hidden, _ = model.forward_draft_batched(
+        [_rows(config, 0), _rows(config, 0)], anchors,
+        start_positions=[3, 7], caches=caches,
+    )
+    assert torch.isfinite(hidden).all() and torch.equal(arena.backing, before)
+
+
+def _verify_batch_contract_fixture(accepted=(0, 7)):
+    """CPU controller oracle with disjoint, shuffled request storage."""
+    from gllm.layers.attention.qkv_backends import PagedAttentionMetadata
+    from gllm.runtime.forward_metadata import ForwardMetadataPlan, MetadataMaterialization
+    from gllm.runtime.sequence import GenerationSequence
+
+    target, data, buffers = _verify_contract_fixture()
+    batch, starts = len(accepted), (13, 21, 7, 31)
+    seqs, windows = [], []
+    for row in range(batch):
+        start = starts[row]
+        seq = GenerationSequence(41 + row, list(range(start)), [], output_len=64, temperature=0)
+        seq.computed_token_num, seq.to_compute_token_num = start, 8
+        seq.to_compute_tokens = [(2 + row * 3 + col) % 32 for col in range(8)]
+        seq._mtp_verify, seq._cache_epoch = True, 3 + row
+        seq.page_table = [row * 4 + offset for offset in (2, 0, 3, 1)]
+        seq.ssm_block_table = [row * 8 + slot for slot in (4, 1, 7, 3, 8, 2, 6, 5)]
+        seq.recurrent_state_slot = seq.ssm_block_table[0]
+        seqs.append(seq)
+        windows.extend(seq.to_compute_tokens)
+    buffers.update(
+        tokens=torch.tensor(windows),
+        position=torch.cat([torch.arange(start, start + 8) for start in starts[:batch]]),
+        seq_lens=torch.tensor([start + 8 for start in starts[:batch]], dtype=torch.int32),
+        query_start_loc=torch.arange(0, batch * 8 + 1, 8, dtype=torch.int32),
+        slot_mapping=torch.tensor([
+            seq.page_table[pos // 16] * 16 + pos % 16
+            for seq in seqs for pos in range(seq.computed_token_num, seq.computed_token_num + 8)
+        ]),
+        block_table=torch.tensor([seq.page_table for seq in seqs], dtype=torch.int32),
+        ssm_block_table_2d=torch.tensor([seq.ssm_block_table for seq in seqs], dtype=torch.int32),
+        ssm_num_accepted=torch.ones(batch, dtype=torch.int32),
+        recurrent_state_slot_per_seq=torch.tensor([seq.recurrent_state_slot for seq in seqs], dtype=torch.int32),
+        ssm_snapshot_write_slot_per_seq=torch.full((batch,), -1, dtype=torch.int32),
+    )
+    kv, state = data.memory_manager.segment, data.memory_manager.ssm_segment
+    kv.num_pages = batch * 4
+    kv.k_cache = [torch.full((kv.num_pages, 16, 2, 4), .25, dtype=torch.bfloat16)]
+    kv.v_cache = [torch.full((kv.num_pages, 16, 2, 4), -.5, dtype=torch.bfloat16)]
+    state.num_blocks = batch * 8 + 1
+    state.conv_state = torch.ones(2, state.num_blocks, 4, 3, dtype=torch.bfloat16)
+    state.temporal_state = torch.zeros(2, state.num_blocks, 2, 4, 4, dtype=torch.float32)
+    data.seqs, data.tokens_cpu = seqs, buffers["tokens"].clone()
+    data.num_mtp_verify_rows = batch
+    data.forward_metadata_plan = ForwardMetadataPlan(
+        MetadataMaterialization.CPU, (8,) * batch, 0, num_mtp_verify_rows=batch,
+        attention_metadata=PagedAttentionMetadata(
+            buffers["block_table"], buffers["seq_lens"], buffers["query_start_loc"], 8, batch
+        ),
+    )
+    target.hidden = torch.arange(batch * 8, dtype=torch.bfloat16)[:, None].expand(-1, 4).clone()
+    target.taps = torch.arange(batch * 64, dtype=torch.bfloat16).reshape(1, batch * 8, 8)
+    target.logits = torch.zeros(batch * 8, 32)
+    for row, count in enumerate(accepted):
+        predictions = seqs[row].to_compute_tokens[1:] + [27 - row]
+        if count < 7:
+            predictions[count] = (predictions[count] + 1) % 32
+        target.logits[torch.arange(row * 8, row * 8 + 8), predictions] = 10
+    return target, data, buffers
+
+
+@pytest.mark.parametrize("accepted", [(0,), (0, 7), (0, 2, 5, 7)])
+@torch.no_grad()
+def test_dspark_verify_batch_owns_each_request_prefix_and_preserves_head_shape(accepted, monkeypatch):
+    from gllm.speculative.dspark import verify_dspark_target_batched
+
+    target, data, buffers = _verify_batch_contract_fixture(accepted)
+    original_head = target.logits_from_hidden
+    def head(hidden):
+        # A wider head call would change these choices, as with near-tied BF16 logits.
+        logits = original_head(hidden).clone()
+        if hidden.shape[0] != 1:
+            logits.zero_()
+        return logits
+    monkeypatch.setattr(target, "logits_from_hidden", head)
+    ids, taps, next_ids = buffers["tokens"].clone(), target.taps.clone(), target.logits.argmax(-1)
+    results = verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
+    assert target.calls == 1 and target.head_calls == 8 * len(accepted)
+    assert [result.accepted_drafts for result in results] == list(accepted)
+    buffers["tokens"].zero_()
+    target.taps.fill_(-1)
+    target.logits.zero_()
+    for row, (result, seq, count) in enumerate(zip(results, data.seqs, accepted)):
+        begin, length = row * 8, count + 1
+        assert (result.seq_id, result.cache_epoch, result.start_pos) == (
+            seq.seq_id, seq._cache_epoch, seq.computed_token_num
+        )
+        assert not result.consumed
+        assert seq.to_compute_token_num == 8 and seq.recurrent_state_slot == seq.ssm_block_table[0]
+        torch.testing.assert_close(result.committed_ids, ids[begin:begin + length][None])
+        torch.testing.assert_close(result.accepted_hidden, taps[:, begin:begin + length])
+        assert result.next_anchor.tolist() == next_ids[begin + count:begin + count + 1].tolist()
+        assert result.accepted_hidden.untyped_storage().nbytes() == length * 8 * 2
+
+
+@pytest.mark.parametrize("mrope", [False, True])
+def test_dspark_verify_batch_accepts_packed_text_positions_and_single_api(mrope):
+    from gllm.speculative.dspark import verify_dspark_target, verify_dspark_target_batched
+
+    target, data, buffers = _verify_batch_contract_fixture((2,))
+    if mrope:
+        buffers["position"] = buffers["position"].repeat(3, 1)
+    before = buffers["position"].clone()
+    one = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
+    batched = verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))[0]
+    assert one.accepted_drafts == batched.accepted_drafts == 2
+    for field in ("committed_ids", "accepted_hidden", "next_anchor"):
+        assert torch.equal(getattr(one, field), getattr(batched, field))
+    assert torch.equal(buffers["position"], before)
+    target, data, buffers = _verify_batch_contract_fixture((2, 5))
+    if mrope:
+        buffers["position"] = buffers["position"].repeat(3, 1)
+    assert len(verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))) == 2
+    with pytest.raises(ValueError, match="exactly one"):
+        verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
+
+
+@pytest.mark.parametrize("invalid", [
+    "empty", "duplicate_request", "shared_gdn", "shared_kv", "sampling", "prefill",
+    "abort", "finished", "capacity", "context", "rolling", "state_mirror",
+    "position", "mrope", "slot_mapping", "seq_lens", "query_start_loc", "page_mirror",
+    "plan", "metadata_batch",
+])
+def test_dspark_verify_batch_rejects_invalid_later_request_before_any_forward(invalid):
+    from dataclasses import replace
+    from gllm.speculative.dspark import verify_dspark_target_batched
+
+    target, data, buffers = _verify_batch_contract_fixture()
+    first, seq = data.seqs
+    if invalid == "empty":
+        data.seqs = []
+    elif invalid == "duplicate_request":
+        seq.seq_id = first.seq_id
+    elif invalid == "shared_gdn":
+        seq.ssm_block_table[-1] = first.ssm_block_table[-1]
+        buffers["ssm_block_table_2d"][1] = torch.tensor(seq.ssm_block_table)
+    elif invalid == "shared_kv":
+        seq.page_table[1] = first.page_table[0]
+        buffers["block_table"][1] = torch.tensor(seq.page_table)
+        buffers["slot_mapping"][8:] = torch.tensor([
+            seq.page_table[pos // 16] * 16 + pos % 16
+            for pos in range(seq.computed_token_num, seq.computed_token_num + 8)
+        ])
+    elif invalid == "sampling":
+        seq.temperature, seq.top_k = 1, 10
+    elif invalid == "prefill":
+        seq.computed_token_num -= 1
+    elif invalid == "abort":
+        seq.is_abort = True
+    elif invalid == "finished":
+        seq.output_len = 0
+    elif invalid == "capacity":
+        seq.page_table = seq.page_table[:1]
+    elif invalid == "context":
+        target.config.model_max_length = seq.computed_token_num + 7
+    elif invalid == "rolling":
+        seq.recurrent_state_slot = seq.ssm_block_table[1]
+    elif invalid == "state_mirror":
+        buffers["ssm_block_table_2d"][1] = buffers["ssm_block_table_2d"][1].roll(1)
+    elif invalid == "position":
+        buffers["position"][8] += 1
+    elif invalid == "mrope":
+        buffers["position"] = buffers["position"].repeat(3, 1)
+        buffers["position"][2, 8] += 1
+    elif invalid == "slot_mapping":
+        buffers[invalid][8] += 1
+    elif invalid == "seq_lens":
+        buffers[invalid][1] += 1
+    elif invalid == "query_start_loc":
+        buffers[invalid][1] += 1
+    elif invalid == "page_mirror":
+        buffers["block_table"][1, 1] += 1
+    elif invalid == "plan":
+        data.forward_metadata_plan = replace(data.forward_metadata_plan, num_mtp_verify_rows=1)
+    elif invalid == "metadata_batch":
+        data.forward_metadata_plan.attention_metadata.batch_size = 1
+    manager = data.memory_manager
+    banks = manager.segment.k_cache + manager.segment.v_cache + [
+        manager.ssm_segment.conv_state, manager.ssm_segment.temporal_state,
+    ]
+    before = [bank.clone() for bank in banks]
+    tables = [list(request.ssm_block_table) for request in (first, seq)]
+    with pytest.raises(ValueError) as caught:
+        verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
+    if invalid == "shared_gdn":
+        assert "disjoint GDN" in str(caught.value)
+    elif invalid == "shared_kv":
+        assert "distinct writable KV" in str(caught.value)
+    assert target.calls == target.head_calls == 0
+    assert tables == [request.ssm_block_table for request in (first, seq)]
+    assert all(torch.equal(bank, saved) for bank, saved in zip(banks, before))
+
+
+def test_dspark_verify_batch_commits_eos_budget_and_independent_rolling_columns():
+    from gllm.speculative.dspark import (
+        DSparkRequestState, DSparkStepResult, commit_dspark_verify_step,
+        verify_dspark_target_batched,
+    )
+
+    target, data, _ = _verify_batch_contract_fixture((2, 7, 5, 0))
+    verified = verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
+    states, records = [], []
+    tables = [list(seq.ssm_block_table) for seq in data.seqs]
+    for seq, result in zip(data.seqs, verified):
+        # One generated input already precedes the unpublished anchor.
+        seq.raw_prompt_len = seq.prompt_len = seq.computed_token_num - 1
+        state = DSparkRequestState(seq.seq_id, seq._cache_epoch, phase="verify")
+        state.cache.context_length = seq.computed_token_num
+        record = DSparkStepResult(
+            seq.seq_id, seq._cache_epoch, seq.computed_token_num, 8,
+            "verify", ready=True, verification=result,
+        )
+        state.inflight = record
+        states.append(state)
+        records.append(record)
+    data.seqs[0].finish_tokens = [int(verified[0].committed_ids[0, 1])]
+    data.seqs[1].output_len = 4  # One existing output plus a three-input cutoff.
+    counts = (2, 3, 6, 1)
+    for index in (3, 1, 0, 2):
+        seq, state, record = data.seqs[index], states[index], records[index]
+        neighbors = [
+            (list(other.ssm_block_table), other.computed_token_num, list(other.token_ids))
+            for other in data.seqs
+        ]
+        expected = verified[index].committed_ids[0, :counts[index]].tolist()
+        assert commit_dspark_verify_step(seq, state, record) == expected
+        assert seq.recurrent_state_slot == tables[index][counts[index] - 1]
+        assert set(seq.ssm_block_table) == set(tables[index])
+        assert verified[index].consumed and record.consumed and state.inflight is None
+        assert seq.computed_token_num == verified[index].start_pos + counts[index]
+        for row, other in enumerate(data.seqs):
+            if row != index:
+                assert (other.ssm_block_table, other.computed_token_num, other.token_ids) == neighbors[row]
+        if index < 2:
+            assert seq.is_finish and state.pending_hidden is state.anchor is None
+        else:
+            assert state.pending_hidden is verified[index].accepted_hidden
+            assert state.anchor is verified[index].next_anchor
+        selected = list(seq.ssm_block_table)
+        with pytest.raises(ValueError, match="consumed"):
+            commit_dspark_verify_step(seq, state, record)
+        assert seq.ssm_block_table == selected
+
+
+def test_dspark_verify_batch_rejects_exchanged_and_stale_results_without_consuming():
+    from gllm.speculative.dspark import commit_dspark_verify_state, verify_dspark_target_batched
+
+    target, data, _ = _verify_batch_contract_fixture()
+    results = verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
+    tables = [list(seq.ssm_block_table) for seq in data.seqs]
+    for seq, wrong in zip(data.seqs, reversed(results)):
+        with pytest.raises(ValueError, match="request, epoch or position"):
+            commit_dspark_verify_state(seq, wrong, committed_count=1)
+    data.seqs[1]._cache_epoch += 1
+    with pytest.raises(ValueError, match="request, epoch or position"):
+        commit_dspark_verify_state(data.seqs[1], results[1], committed_count=8)
+    assert [seq.ssm_block_table for seq in data.seqs] == tables
+    assert all(not result.consumed for result in results)
+    # A failed commit for request 1 cannot block an otherwise valid request 0.
+    commit_dspark_verify_state(data.seqs[0], results[0], committed_count=1)
+    assert results[0].consumed and not results[1].consumed
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@torch.no_grad()
+def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, monkeypatch):
+    from copy import copy
+    from types import SimpleNamespace
+
+    from gllm.layers.ops.fla import fused_recurrent_gated_delta_rule_packed_decode
+    from gllm.models.qwen3_5 import Qwen3_5GatedDeltaNet
+
+    from gllm.layers.attention.qkv_backends import (
+        bind_qkv_attention_backend, create_qkv_attention_backend, find_qkv_attention_layers,
+    )
+    from gllm.runtime.input_data import InputData
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.speculative.dspark import commit_dspark_verify_state, verify_dspark_target_batched
+
+    model, _, make_input = _hybrid_target_fixture(mtp_k=7, arena_capacity=64)
+    backend = create_qkv_attention_backend("fa3", 64, batch)
+    bind_qkv_attention_backend(find_qkv_attention_layers(model), backend)
+    calls, forward = [], backend.forward
+    def record(q, key, value, metadata, scale):
+        calls.append((q.shape[0], metadata.batch_size, metadata.max_query_len))
+        return forward(q, key, value, metadata, scale)
+    monkeypatch.setattr(backend, "forward", record)
+    projected_gdn, projected_kv = {}, {}
+
+    for module in model.modules():
+        if isinstance(module, Qwen3_5GatedDeltaNet):
+            original_verify, original_conv = module._forward_mtp_verify, module._verify_conv
+
+            def capture_verify(input_data, mixed_qkv, a, b, conv_state, temporal_state, *args,
+                               _original=original_verify, _module=module):
+                if input_data.memory_manager is manager:
+                    rolling = input_data.get_recurrent_state_slot_per_seq().long()
+                    projected_gdn[_module.ssm_layer_id] = {
+                        "module": _module,
+                        "conv_initial": conv_state.index_select(0, rolling).clone(),
+                        "temporal_initial": temporal_state.index_select(0, rolling).clone(),
+                        "raw": mixed_qkv.reshape(batch, 8, -1).transpose(1, 2).clone(),
+                        "a": a.reshape(batch, 8, -1).clone(),
+                        "b": b.reshape(batch, 8, -1).clone(),
+                    }
+                return _original(
+                    input_data, mixed_qkv, a, b, conv_state, temporal_state, *args
+                )
+
+            def capture_conv(input_data, *args, _original=original_conv,
+                             _layer=module.ssm_layer_id):
+                output = _original(input_data, *args)
+                if input_data.memory_manager is manager:
+                    projected_gdn[_layer]["conv_output"] = output.clone()
+                return output
+
+            monkeypatch.setattr(module, "_forward_mtp_verify", capture_verify)
+            monkeypatch.setattr(module, "_verify_conv", capture_conv)
+    for decoder in model.model.layers:
+        if decoder.self_attn is not None:
+            attention = decoder.self_attn.attn
+            original_attention = attention.forward
+
+            def capture_kv(q, key, value, input_data, _original=original_attention,
+                           _attention=attention):
+                if input_data.memory_manager is manager:
+                    shape = (-1, _attention.num_key_value_heads, _attention.head_dim)
+                    projected_kv[_attention.layer_id] = (
+                        key.reshape(shape).clone(), value.reshape(shape).clone()
+                    )
+                return _original(q, key, value, input_data)
+
+            monkeypatch.setattr(attention, "forward", capture_kv)
+    prompts = [
+        tuple(range(1 + row, 1 + row + length))
+        for row, length in enumerate((5, 13, 21, 29)[:batch])
+    ]
+    _, manager, first = make_input(prompts[0])
+    seqs, oracles, anchors = [], [], []
+    for row, prompt in enumerate(prompts):
+        seq = first if row == 0 else GenerationSequence(
+            41 + row, list(prompt), [], output_len=64, temperature=0
+        )
+        seq.seq_id, seq._cache_epoch, seq.output_len = 41 + row, 3 + row, 64
+        while len(seq.page_table) < 4:
+            seq.page_table.append(manager.segment.allocate())
+        seq.page_table.reverse()
+        assert manager.allocate_recurrent_slot(seq)
+        table = seq.ssm_block_table
+        seq.ssm_block_table = [table[index] for index in (3, 0, 6, 2, 7, 1, 5, 4)]
+        seq.recurrent_state_slot = seq.ssm_block_table[0]
+        oracle, owner, reference = make_input(prompt)
+        reference.output_len = 64
+        while len(reference.page_table) < 4:
+            reference.page_table.append(owner.segment.allocate())
+        oracle.cal_and_set_input([reference])
+        oracle.forward_metadata_plan.prepare_attention(backend, oracle)
+        hidden = model(oracle)
+        anchors.append(int(model.logits_from_hidden(hidden[-1:]).argmax(-1).item()))
+        reference.computed_token_num = seq.computed_token_num = len(prompt)
+        seq.to_compute_token_num = 0
+        # Seed identical ordinary prefixes, isolating this test to batched
+        # verify/commit. Packed prefill has its own model tests above.
+        for actual, expected in zip(
+            manager.segment.k_cache + manager.segment.v_cache,
+            owner.segment.k_cache + owner.segment.v_cache,
+        ):
+            for page in range((len(prompt) + 15) // 16):
+                actual[seq.page_table[page]].copy_(expected[reference.page_table[page]])
+        for name in ("conv_state", "temporal_state"):
+            getattr(manager.ssm_segment, name)[:, seq.recurrent_state_slot].copy_(
+                getattr(owner.ssm_segment, name)[:, reference.recurrent_state_slot]
+            )
+        seqs.append(seq)
+        oracles.append((oracle, owner, reference))
+
+    spare = GenerationSequence(99, [1], [], output_len=64, temperature=0)
+    spare.page_table = [manager.segment.allocate()]
+    assert manager.allocate_recurrent_slot(spare)
+    for bank in manager.segment.k_cache + manager.segment.v_cache:
+        bank[spare.page_table[0]].fill_(.75)
+    for name in ("conv_state", "temporal_state"):
+        for slot in spare.ssm_block_table:
+            getattr(manager.ssm_segment, name)[:, slot].fill_(.5)
+    spare_kv = [bank[spare.page_table].clone() for bank in manager.segment.k_cache + manager.segment.v_cache]
+    spare_ssm = [getattr(manager.ssm_segment, name)[:, spare.ssm_block_table].clone()
+                 for name in ("conv_state", "temporal_state")]
+    data = InputData(True, manager, max_seq_length=64, max_running_seqs=batch)
+    previous = []
+    for round_index in range(2):
+        references = []
+        for row, (oracle, owner, reference) in enumerate(oracles):
+            inputs, predictions, features, checkpoints = [], [], [], []
+            token = anchors[row]
+            for _ in range(8):
+                inputs.append(token)
+                reference.to_compute_tokens, reference.to_compute_token_num = [token], 1
+                oracle.cal_and_set_input([reference])
+                oracle.forward_metadata_plan.prepare_attention(backend, oracle)
+                hidden, taps = model.forward_with_hidden_taps(oracle, target_layer_ids=(1, 0))
+                token = int(model.logits_from_hidden(hidden).argmax(-1).item())
+                predictions.append(token)
+                features.append(taps)
+                checkpoints.append(tuple(
+                    getattr(owner.ssm_segment, name)[:, reference.recurrent_state_slot].clone()
+                    for name in ("conv_state", "temporal_state")
+                ))
+                reference.computed_token_num += 1
+            wanted = (0, 2, 5, 7)[(row + round_index) % 4]
+            proposed = list(inputs)
+            if wanted < 7:
+                proposed[wanted + 1] = (proposed[wanted + 1] + 1) % model.config.vocab_size
+            seqs[row].to_compute_tokens, seqs[row].to_compute_token_num = proposed, 8
+            seqs[row]._mtp_verify = True
+            references.append((inputs, predictions, features, checkpoints, wanted))
+
+        # Membership is unchanged but packed row order changes on the next round.
+        order = list(range(batch)) if round_index == 0 else list(reversed(range(batch)))
+        data.cal_and_set_input([seqs[row] for row in order])
+        data.forward_metadata_plan.prepare_attention(backend, data)
+        # Every typed bank is a view over the same physical arena, including
+        # inactive slots that can alias another cache type's live bytes. Clone
+        # that backing once and recreate views; independent bank clones or
+        # whole typed-bank comparisons are invalid controls.
+        original_backing = manager.cache_arena.backing
+        assert original_backing.storage_offset() == 0
+        control_backing = original_backing.clone()
+        untouched = original_backing.clone()
+
+        def clone_view(tensor):
+            assert tensor.untyped_storage().data_ptr() == original_backing.untyped_storage().data_ptr()
+            return torch.as_strided(
+                control_backing.view(tensor.dtype), tensor.shape, tensor.stride(),
+                storage_offset=tensor.storage_offset(),
+            )
+
+        control = copy(data)
+        control.memory_manager = copy(manager)
+        control.memory_manager.segment = SimpleNamespace(
+            k_cache=[clone_view(bank) for bank in manager.segment.k_cache],
+            v_cache=[clone_view(bank) for bank in manager.segment.v_cache],
+        )
+        control.memory_manager.ssm_segment = SimpleNamespace(
+            conv_state=clone_view(manager.ssm_segment.conv_state),
+            temporal_state=clone_view(manager.ssm_segment.temporal_state),
+        )
+        model(control)
+        assert torch.equal(original_backing, untouched), "control wrote the primary arena"
+        del untouched
+        prefixes = {
+            seq.seq_id: [bank.clone() for bank in sum(
+                _read_paged_context(manager.segment, seq, seq.computed_token_num), []
+            )]
+            for seq in data.seqs
+        }
+        projected_gdn.clear()
+        projected_kv.clear()
+        calls.clear()
+        results = verify_dspark_target_batched(model, data, block_size=7, target_layer_ids=(1, 0))
+        assert calls == [(batch * 8, batch, 8)]
+        assert data.get_ssm_block_table_2d().cpu().tolist() == [seqs[row].ssm_block_table for row in order]
+        # Same target body and physical storage layout must give the same
+        # cache bytes with or without taps, including their shared aliases.
+        assert torch.equal(
+            manager.cache_arena.backing, control_backing
+        ), "target taps changed the packed target cache bytes"
+        assert len(projected_gdn) == model.num_ssm_layers
+        assert len(projected_kv) == model.num_kv_layers
+        for layer, captured in projected_gdn.items():
+            module = captured["module"]
+            source = torch.cat((captured["conv_initial"], captured["raw"]), dim=-1)
+            width = captured["conv_initial"].shape[-1]
+            initial = captured["temporal_initial"]
+            reference_state = initial.new_zeros((batch + 1, *initial.shape[1:]))
+            reference_state[1:].copy_(initial)
+            indices = torch.arange(1, batch + 1, dtype=torch.int32, device=initial.device)
+            output = captured["conv_output"].new_empty(
+                batch, 1, module.tp_num_v_heads, module.head_v_dim
+            )
+            for column in range(8):
+                # Conv checkpoints are raw shifted input windows. Check every
+                # column exactly against the bytes that entered this forward.
+                actual_conv = torch.stack([
+                    manager.ssm_segment.conv_state[layer, seq.ssm_block_table[column]]
+                    for seq in data.seqs
+                ])
+                torch.testing.assert_close(
+                    actual_conv, source[:, :, column + 1:column + 1 + width],
+                    atol=0, rtol=0, msg=f"conv layer {layer}, checkpoint {column}",
+                )
+                # Isolate recurrence/slot correctness from upstream BF16 GEMM
+                # shape differences by replaying the identical post-conv rows
+                # and gates through the ordinary one-token recurrent kernel.
+                fused_recurrent_gated_delta_rule_packed_decode(
+                    mixed_qkv=captured["conv_output"][:, column].contiguous(),
+                    a=captured["a"][:, column].contiguous(),
+                    b=captured["b"][:, column].contiguous(),
+                    A_log=module.A_log, dt_bias=module.dt_bias, scale=module._scale,
+                    initial_state=reference_state, out=output,
+                    ssm_state_indices=indices, use_qk_l2norm_in_kernel=True,
+                )
+                actual_temporal = torch.stack([
+                    manager.ssm_segment.temporal_state[layer, seq.ssm_block_table[column]]
+                    for seq in data.seqs
+                ])
+                torch.testing.assert_close(
+                    actual_temporal, reference_state[1:], atol=2e-5, rtol=2e-5,
+                    msg=f"temporal layer {layer}, checkpoint {column}",
+                )
+        for packed_row, seq in enumerate(data.seqs):
+            start, end = seq.computed_token_num, seq.computed_token_num + 8
+            stored = _read_paged_context(manager.segment, seq, end)
+            for layer, (key, value) in projected_kv.items():
+                for actual, projected in ((stored[0][layer], key), (stored[1][layer], value)):
+                    expected = projected[packed_row * 8:packed_row * 8 + 8]
+                    expected = expected.transpose(0, 1).unsqueeze(0)
+                    torch.testing.assert_close(actual[:, :, start:end], expected, atol=0, rtol=0)
+            for actual, expected in zip(sum(
+                _read_paged_context(manager.segment, seq, start), []
+            ), prefixes[seq.seq_id]):
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        physical = manager.cache_arena.backing.clone()
+        for packed_row in reversed(range(batch)):
+            row = order[packed_row]
+            seq, result = seqs[row], results[packed_row]
+            oracle, owner, reference = oracles[row]
+            inputs, predictions, features, checkpoints, wanted = references[row]
+            assert result.seq_id == seq.seq_id and result.accepted_drafts == wanted
+            assert result.committed_ids[0].tolist() == inputs[:wanted + 1]
+            assert result.next_anchor.tolist() == predictions[wanted:wanted + 1]
+            torch.testing.assert_close(
+                result.accepted_hidden, torch.cat(features[:wanted + 1], dim=1),
+                atol=2e-3, rtol=1e-2,
+            )
+            count = wanted + 1 if round_index == 0 else min(wanted + 1, row + 1)
+            selected = seq.ssm_block_table[count - 1]
+            commit_dspark_verify_state(seq, result, committed_count=count)
+            assert seq.recurrent_state_slot == selected and result.consumed
+            # Promotion is a CPU slot exchange: the physical checkpoint
+            # values were checked against their identical inputs above.
+            assert seq.ssm_block_table[0] == selected
+            seq.token_ids.extend(inputs[:count])
+            seq.computed_token_num += count
+            seq.to_compute_tokens, seq.to_compute_token_num, seq._mtp_verify = None, 0, False
+            reference.token_ids.extend(inputs[:count])
+            reference.computed_token_num = seq.computed_token_num
+            for name, state in zip(("conv_state", "temporal_state"), checkpoints[count - 1]):
+                getattr(owner.ssm_segment, name)[:, reference.recurrent_state_slot].copy_(state)
+            assert seq.token_ids == reference.token_ids
+            # A truncated last-round commit deliberately discards its old bonus.
+            anchors[row] = int(result.next_anchor.item()) if count == wanted + 1 else None
+        assert torch.equal(manager.cache_arena.backing, physical)
+        for old, ids, taps in previous:
+            assert torch.equal(old.committed_ids, ids) and torch.equal(old.accepted_hidden, taps)
+        previous.extend(
+            (result, result.committed_ids.clone(), result.accepted_hidden.clone())
+            for result in results
+        )
+        del control, control_backing
+        for bank, saved in zip(manager.segment.k_cache + manager.segment.v_cache, spare_kv):
+            assert torch.equal(bank[spare.page_table], saved)
+        for name, saved in zip(("conv_state", "temporal_state"), spare_ssm):
+            assert torch.equal(getattr(manager.ssm_segment, name)[:, spare.ssm_block_table], saved)
+    for seq in seqs + [spare]:
+        manager.free(seq)
+    for _, owner, reference in oracles:
+        owner.free(reference)
+
+
+
+def test_dspark_verify_batch_rejects_unrefreshed_device_tables_after_independent_commits():
+    from gllm.speculative.dspark import commit_dspark_verify_state, verify_dspark_target_batched
+
+    target, data, _ = _verify_batch_contract_fixture((2, 5))
+    results = verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
+    for seq, result in zip(data.seqs, results):
+        commit_dspark_verify_state(seq, result, committed_count=result.accepted_drafts + 1)
+    selected = [list(seq.ssm_block_table) for seq in data.seqs]
+    with pytest.raises(ValueError, match="metadata is stale"):
+        verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
+    assert target.calls == 1 and target.head_calls == 16
+    assert [seq.ssm_block_table for seq in data.seqs] == selected
+    assert all(result.consumed for result in results)
+
+
+def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True):
+    """CPU control oracle for real batching glue, without CUDA/model numerics."""
+    from types import SimpleNamespace
+
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.scheduling.scheduler import Scheduler
+    from gllm.speculative import dspark_execution as module
+    from gllm.speculative.dspark import DSparkVerifyResult
+    from gllm.workers.worker import Worker
+
+    runner, _ = _dspark_prompt_spy(monkeypatch, mrope=mrope)
+    runner.maxd = runner.max_running_seqs = batch
+    runner.maxp = runner.max_num_batched_tokens = batch * 8
+    runner.dspark.batch_calls = []
+    data, manager = runner.input_data, runner.memory_manager
+    def materialize(seqs):
+        data.seqs = list(seqs)
+        tokens, positions = [], []
+        for seq in seqs:
+            start, end = seq.computed_token_num, seq.seq_len
+            row = seq[start:end] if seq.to_compute_tokens is None else seq.to_compute_tokens
+            assert len(row) == seq.to_compute_token_num
+            tokens.extend(row)
+            positions.extend(range(start, end))
+        data.tokens = torch.tensor(tokens, dtype=torch.long)
+        data.positions = torch.tensor(positions, dtype=torch.long)
+        data.prepared = False
+    data.cal_and_set_input = materialize
+    next_page, next_state = 1, 1
+    def reserve(seq, cache, *, target_length, draft_length):
+        nonlocal next_page, next_state
+        manager.reservations.append((target_length, draft_length))
+        if not manager.allow or target_length > getattr(manager, "limit", 64):
+            return False
+        for table, length in ((seq.page_table, target_length), (cache.page_table, draft_length)):
+            while len(table) * 16 < length:
+                table.append(next_page)
+                next_page += 1
+        if seq.ssm_block_table is None:
+            seq.ssm_block_table = list(range(next_state, next_state + 8))
+            seq.recurrent_state_slot = next_state
+            next_state += 8
+        return True
+    manager.reserve_dspark_pages = reserve
+    def prefill_batch(chunks, *, segment, caches):
+        runner.dspark.batch_calls.append(("prefill", len(chunks)))
+        return [runner.dspark.prefill_paged(chunk, segment=segment, cache=cache)
+                for chunk, cache in zip(chunks, caches)]
+    def draft_batch(chunks, anchors, *, start_positions, caches):
+        runner.dspark.batch_calls.append(("verify", len(chunks)))
+        for chunk, start, cache in zip(chunks, start_positions, caches):
+            assert cache.state.context_length + chunk.shape[1] == start
+            cache.state.context_length = start
+        return torch.zeros(len(chunks), 7, 4), None
+    def draft_one(chunk, anchor, *, start_pos, caches):
+        return draft_batch([chunk], anchor, start_positions=[start_pos], caches=[caches])
+    def head(hidden, anchors):
+        anchors = anchors.reshape(-1)
+        return (anchors[:, None] + torch.arange(8)[None, :]) % 32, None, None
+    verify_tables = []
+    def verify_batch(target, current, **kwargs):
+        _, taps = target.forward_with_hidden_taps(current, target_layer_ids=(1, 0))
+        results = []
+        for row, seq in enumerate(current.seqs):
+            assert seq._mtp_verify and seq.to_compute_token_num == 8
+            verify_tables.append((seq.seq_id, list(seq.ssm_block_table)))
+            accepted = (0, 2, 5, 7)[(seq.seq_id - 61) % 4]
+            length, begin = accepted + 1, row * 8
+            ids = current.tokens[begin:begin + length][None].clone()
+            results.append(DSparkVerifyResult(
+                seq.seq_id, seq._cache_epoch, seq.computed_token_num, accepted,
+                ids, (ids[:, -1] + 1) % 32,
+                taps[:, begin:begin + length].clone(),
+            ))
+        return results
+    runner.dspark.prefill_paged_batched = prefill_batch
+    runner.dspark.forward_draft_batched, runner.dspark.forward_draft = draft_batch, draft_one
+    runner.dspark.forward_head = head
+    monkeypatch.setattr(module, "verify_dspark_target_batched", verify_batch)
+    monkeypatch.setattr(module, "verify_dspark_target",
+                        lambda *args, **kwargs: verify_batch(*args, **kwargs)[0])
+    scheduler = Scheduler(1, runner, "chunked_prefill")
+    scheduler.log = False
+    worker = Worker.__new__(Worker)
+    worker.model_runner, worker.scheduler = runner, scheduler
+    seqs = [
+        GenerationSequence(61 + row, list(range(1, 4 + 2 * row)), [],
+                           output_len=20, temperature=0)
+        for row in range(batch)
+    ]
+    scheduler.add_new_requests(seqs)
+    return worker, seqs, verify_tables
+
+
+@pytest.mark.parametrize("batch,mrope", [(2, False), (2, True), (4, True)])
+def test_dspark_runtime_batch_executes_prompt_bootstrap_and_verify(monkeypatch, batch, mrope):
+    worker, seqs, tables = _dspark_batch_worker_spy(monkeypatch, batch=batch, mrope=mrope)
+    runner, scheduler = worker.model_runner, worker.scheduler
+    original = [list(seq.token_ids) for seq in seqs]
+    worker.schedule_forward()
+    records = scheduler.next_tokens_queue[-1][0]
+    assert isinstance(records, list) and len(records) == batch
+    assert [seq.token_ids for seq in seqs] == original
+    assert len(runner.model.calls) == 1
+    assert runner.dspark.batch_calls == [("prefill", batch)]
+    events = [runner._dspark_requests[seq.seq_id].last_use for seq in seqs]
+    assert len({id(event) for event in events}) == batch
+    package = scheduler.process_output()
+    assert package.act_schedule_ids == [seq.seq_id for seq in seqs]
+    assert package.next_tokens == [[len(tokens) + 3] for tokens in original]
+    worker.schedule_forward()
+    bootstrap = scheduler.next_tokens_queue[-1][0]
+    assert all(record.hidden.shape == (1, 1, 8) for record in bootstrap)
+    assert all(record.hidden.data_ptr() != runner.model.scratch.data_ptr() for record in bootstrap)
+    assert not scheduler.process_output().next_tokens
+    starts = [seq.computed_token_num for seq in seqs]
+    before = [list(seq.ssm_block_table) for seq in seqs]
+    worker.schedule_forward()
+    records = scheduler.next_tokens_queue[-1][0]
+    assert runner.dspark.batch_calls[-1] == ("verify", batch)
+    assert all(record.ready and record.query_len == 8 for record in records)
+    assert all(seq.to_compute_tokens is None and not seq._mtp_verify for seq in seqs)
+    expected_positions = torch.cat([torch.arange(start, start + 8) for start in starts])
+    if mrope:
+        expected_positions = expected_positions.repeat(3, 1)
+    assert torch.equal(runner.input_data.positions, expected_positions)
+    assert len(runner.model.calls) == 3
+    package = scheduler.process_output()
+    for row, (seq, result) in enumerate(zip(seqs, records)):
+        state = runner._dspark_requests[seq.seq_id]
+        count = (0, 2, 5, 7)[row] + 1
+        assert package.next_tokens[row] == result.verification.committed_ids[0].tolist()
+        assert seq.computed_token_num == starts[row] + count
+        assert seq.recurrent_state_slot == before[row][count - 1]
+        assert state.cache.context_length == starts[row]
+        assert state.pending_hidden.shape[1] == count
+        assert state.anchor_pos == seq.computed_token_num
+        assert result.consumed and result.verification.consumed
+    assert len(tables) == batch and all(event.records == 3 for event in events)
+
+
+def test_dspark_runtime_batch_admits_prefill_before_existing_decode_finishes(monkeypatch):
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    scheduler, runner = worker.scheduler, worker.model_runner
+    second = scheduler.seqs_to_prefill.pop()
+    first = seqs[0]
+    for _ in range(2):
+        worker.schedule_forward()
+        scheduler.process_output()
+    assert runner._dspark_requests[first.seq_id].phase == "verify"
+    progress = first.computed_token_num
+    scheduler.add_new_requests([second])
+    worker.schedule_forward()
+    assert scheduler.batch_running[-1] == [second]
+    scheduler.process_output()
+    assert first.computed_token_num == progress and not first.is_finish
+    assert set(runner._dspark_requests) == {seq.seq_id for seq in seqs}
+    for _ in range(4):
+        worker.schedule_forward()
+        scheduler.process_output()
+        if ("verify", 2) in runner.dspark.batch_calls:
+            break
+    assert ("verify", 2) in runner.dspark.batch_calls
+
+
+@pytest.mark.parametrize("failure", ["cancel", "commit"])
+def test_dspark_runtime_batch_retires_one_owner_and_commits_peer(monkeypatch, failure):
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    scheduler, runner = worker.scheduler, worker.model_runner
+    for _ in range(2):
+        worker.schedule_forward()
+        scheduler.process_output()
+    worker.schedule_forward()
+    records = scheduler.next_tokens_queue[-1][0]
+    events = [runner._dspark_requests[seq.seq_id].last_use for seq in seqs]
+    if failure == "cancel":
+        scheduler.add_abort_ids([seqs[0].seq_id])
+    else:
+        records[0].start_pos += 1
+    package = scheduler.process_output()
+    assert package.free_ids == [seqs[0].seq_id]
+    assert package.act_schedule_ids == [seqs[1].seq_id]
+    assert records[1].consumed
+    assert set(runner._dspark_requests) == {seqs[1].seq_id}
+    assert events[0].waited and not getattr(events[1], "waited", False)
+    assert bool(package.request_errors) == (failure == "commit")
+    assert scheduler.check_abort_seqs() is None
+
+
+@pytest.mark.parametrize("failure", ["request", "fatal", "event"])
+def test_dspark_runtime_batch_failure_covers_affected_owners_without_retry(monkeypatch, failure):
+    from gllm.speculative import dspark_execution as module
+
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    scheduler, runner = worker.scheduler, worker.model_runner
+    for _ in range(2):
+        worker.schedule_forward()
+        scheduler.process_output()
+    states = [runner._dspark_requests[seq.seq_id] for seq in seqs]
+    history = [list(seq.token_ids) for seq in seqs]
+    if failure == "event":
+        def fail_record(*args):
+            raise RuntimeError("completion event failed")
+        states[0].last_use.record = fail_record
+    else:
+        def fail(*args, **kwargs):
+            assert all(state.pending_hidden is None for state in states)
+            assert all(state.cache.context_length == seq.computed_token_num
+                       for state, seq in zip(states, seqs))
+            if failure == "request":
+                raise ValueError("request validation after shared draft append")
+            raise RuntimeError("CUDA context failed")
+        monkeypatch.setattr(module, "verify_dspark_target_batched", fail)
+    if failure == "request":
+        worker.schedule_forward()
+        package = scheduler.check_abort_seqs()
+        assert set(package.free_ids) == {seq.seq_id for seq in seqs}
+        assert len(package.request_errors) == 2
+        assert not runner._dspark_requests and not scheduler.batch_running
+        assert len(runner.memory_manager.freed) == 2
+    else:
+        with pytest.raises(RuntimeError):
+            worker.schedule_forward()
+        assert not runner.memory_manager.freed and not scheduler._pending_request_errors
+        assert all(state.inflight is not None for state in states)
+    assert [seq.token_ids for seq in seqs] == history
+    assert all(seq.to_compute_tokens is None and not seq._mtp_verify for seq in seqs)
+
+
+@pytest.mark.parametrize("stop", ["budget", "eos"])
+def test_dspark_runtime_batch_tail_finishes_requests_independently(monkeypatch, stop):
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    scheduler, runner = worker.scheduler, worker.model_runner
+    for _ in range(2):
+        worker.schedule_forward()
+        scheduler.process_output()
+    states = [runner._dspark_requests[seq.seq_id] for seq in seqs]
+    anchors = [int(state.anchor.item()) for state in states]
+    draft_lengths = [state.cache.context_length for state in states]
+    seqs[0].output_len = 2 if stop == "budget" else 3
+    seqs[1].output_len = 3
+    if stop == "eos":
+        seqs[0].finish_tokens = [anchors[0]]
+    worker.schedule_forward()
+    records = scheduler.next_tokens_queue[-1][0]
+    assert all(record.phase == "tail" for record in records)
+    package = scheduler.process_output()
+    assert package.next_tokens == [[anchor] for anchor in anchors]
+    assert package.free_ids == [seqs[0].seq_id]
+    assert states[1].cache.context_length == draft_lengths[1]
+    worker.schedule_forward()
+    package = scheduler.process_output()
+    assert package.free_ids == [seqs[1].seq_id] and not runner._dspark_requests
+
+
+def test_dspark_runtime_batch_rejects_mixed_phases_before_model_or_reservation(monkeypatch):
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    worker.schedule_forward()
+    worker.scheduler.process_output()
+    runner = worker.model_runner
+    runner._dspark_requests[seqs[1].seq_id].phase = "verify"
+    for seq in seqs:
+        seq.to_compute_token_num = 1
+    calls, reservations = len(runner.model.calls), len(runner.memory_manager.reservations)
+    with pytest.raises(ValueError, match="homogeneous"):
+        runner._execute_dspark_batch(seqs)
+    assert len(runner.model.calls) == calls
+    assert len(runner.memory_manager.reservations) == reservations
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch", [2, 4])
+@torch.no_grad()
+def test_dspark_runtime_batch_profiles_maximum_prompt_and_full_verify_shape(batch):
+    runner, _ = _dspark_runtime_fixture(batch=batch)
+    runner.profile_run()
+    profile = runner.dspark_profile
+    assert profile["prefill_tokens"] == profile["projected_tokens"] == 32
+    assert profile["profile_batch_size"] == batch
+    assert profile["noise_rows"] == 7 * batch
+    assert profile["target_logits_rows"] == 8 * batch
+    arena = _init_dspark_runtime_test_arena(runner, arena_capacity=64)
+    before = arena.allocator.num_used_physical_pages
+    runner._profile_dspark_paged_verify()
+    assert profile["batch_prefill_tokens"] == 32
+    assert profile["verify_batch_size"] == batch and profile["verify_tokens"] == 8 * batch
+    assert profile["gdn_working_slots"] == 8 * batch
+    assert profile["batch_prefill_peak_extra_bytes"] >= 0
+    assert profile["batch_verify_peak_extra_bytes"] >= 0
+    assert runner.input_data.forward_metadata_plan.query_lens == (8,) * batch
+    assert all(not seq.page_table and seq.ssm_block_table is None for seq in runner.input_data.seqs)
+    assert arena.allocator.num_used_physical_pages == before
+    assert not runner._dspark_requests
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch", [2, 4])
+@torch.no_grad()
+def test_dspark_runtime_batch_small_models_drive_independent_requests_to_budgets(batch, monkeypatch):
+    """Real models/arena check runtime contracts; real checkpoints are a later gate."""
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.scheduling.scheduler import Scheduler
+    from gllm.workers.worker import Worker
+
+    runner, _ = _dspark_runtime_fixture(batch=batch)
+    arena = _init_dspark_runtime_test_arena(runner, arena_capacity=64)
+    before = arena.allocator.num_used_physical_pages
+    worker = Worker.__new__(Worker)
+    worker.model_runner = runner
+    scheduler = worker.scheduler = Scheduler(1, runner, "chunked_prefill")
+    scheduler.log = False
+    requests = [
+        GenerationSequence(71 + row, list(range(1, 4 + row * 2)), [],
+                           output_len=12 + row, temperature=0)
+        for row in range(batch)
+    ]
+    draft_calls, target_calls = [], []
+    original_draft = runner.dspark.forward_draft_batched
+    original_target = runner.model.forward_with_hidden_taps
+    def draft(chunks, anchors, **kwargs):
+        draft_calls.append(len(chunks))
+        return original_draft(chunks, anchors, **kwargs)
+    def target(data, **kwargs):
+        plan = data.forward_metadata_plan
+        target_calls.append((len(data.seqs), plan.query_lens, plan.num_mtp_verify_rows))
+        return original_target(data, **kwargs)
+    monkeypatch.setattr(runner.dspark, "forward_draft_batched", draft)
+    monkeypatch.setattr(runner.model, "forward_with_hidden_taps", target)
+    scheduler.add_new_requests(requests)
+    published = {seq.seq_id: [] for seq in requests}
+    freed = []
+    for _ in range(128):
+        history = {seq.seq_id: (list(seq.token_ids), seq.computed_token_num) for seq in requests}
+        worker.schedule_forward()
+        assert all((seq.token_ids, seq.computed_token_num) == history[seq.seq_id] for seq in requests)
+        assert scheduler.next_tokens_queue, "live requests made no scheduling progress"
+        result = scheduler.next_tokens_queue[-1][0]
+        records = [result] if not isinstance(result, list) else result
+        scheduled = scheduler.batch_running[-1]
+        assert len(records) == len(scheduled) <= batch
+        assert sum(record.query_len for record in records) <= runner.max_num_batched_tokens
+        events = [runner._dspark_requests[seq.seq_id].last_use for seq in scheduled]
+        assert len({id(event) for event in events}) == len(events)
+        package = scheduler.process_output()
+        assert not package.request_errors
+        for seq_id, tokens in zip(package.act_schedule_ids, package.next_tokens):
+            published[seq_id].extend(tokens)
+        freed.extend(package.free_ids)
+        assert len(runner._dspark_requests) <= batch
+        if len(freed) == batch:
+            break
+    assert sorted(freed) == sorted(seq.seq_id for seq in requests)
+    assert batch in draft_calls
+    assert (batch, (8,) * batch, batch) in target_calls
+    for seq in requests:
+        assert seq.is_finish and len(published[seq.seq_id]) == seq.output_len
+        assert published[seq.seq_id] == seq.token_ids[seq.raw_prompt_len:]
+        assert seq.computed_token_num == len(seq)
+    assert not runner._dspark_requests and not scheduler.batch_running
+    assert not scheduler.seqs_to_prefill and not scheduler.seqs_to_decode
+    assert arena.allocator.num_used_physical_pages == before
+
+
+@pytest.mark.parametrize("phase", ["prefill", "paged_verify"])
+def test_dspark_runtime_batch_profile_rejects_an_incomplete_token_budget_before_cuda(monkeypatch, phase):
+    from types import SimpleNamespace
+    from gllm.speculative.dspark_profile import profile_dspark_paged_verify, profile_dspark_prefill
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Invalid maximum batch geometry must fail before CUDA or model work")
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", unexpected)
+    data = SimpleNamespace(tokens_cpu=torch.empty(15, dtype=torch.long))
+    if phase == "prefill":
+        with pytest.raises(ValueError, match=r"8 \* maxd"):
+            profile_dspark_prefill(None, None, data, max_running_seqs=2)
+    else:
+        with pytest.raises(ValueError, match=r"8 \* maxd"):
+            profile_dspark_paged_verify(
+                None, None, data, max_prompt_tokens=15, model_max_length=32,
+                uses_mrope=False, prepare_attention=unexpected, max_running_seqs=2,
+            )
+
+
+def test_dspark_runtime_batch_rejects_one_invalid_arrival_and_dispatches_valid_peers(monkeypatch):
+    from gllm.runtime.sequence import GenerationSequence
+
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    scheduler, runner = worker.scheduler, worker.model_runner
+    seqs[0].temperature, seqs[0].top_k = 0.8, 10
+    third = GenerationSequence(63, [1, 2, 3, 4], [], output_len=12, temperature=0)
+    scheduler.add_new_requests([third])
+    worker.schedule_forward()
+    assert scheduler.batch_running[-1] == [seqs[1], third]
+    assert runner.dspark.batch_calls == [("prefill", 2)]
+    package = scheduler.process_output()
+    assert package.act_schedule_ids == [seqs[1].seq_id, third.seq_id]
+    errors = scheduler.check_abort_seqs()
+    assert errors.free_ids == [seqs[0].seq_id]
+    assert errors.request_errors[seqs[0].seq_id]
+    assert set(runner._dspark_requests) == {seqs[1].seq_id, third.seq_id}
+    assert scheduler.check_abort_seqs() is None
+
+
+def test_dspark_runtime_batch_cancelled_arrival_does_not_block_a_live_peer(monkeypatch):
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    seqs[0].is_abort = True
+    worker.schedule_forward()
+    package = worker.scheduler.process_output()
+    assert package.act_schedule_ids == [seqs[1].seq_id]
+    cleanup = worker.scheduler.check_abort_seqs()
+    assert cleanup.free_ids == [seqs[0].seq_id] and not cleanup.request_errors
+    assert set(worker.model_runner._dspark_requests) == {seqs[1].seq_id}
+
+
+def test_dspark_runtime_batch_completion_failure_precedes_every_owner_free(monkeypatch):
+    from gllm.speculative import dspark_execution as module
+
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    scheduler, runner = worker.scheduler, worker.model_runner
+    for _ in range(2):
+        worker.schedule_forward()
+        scheduler.process_output()
+    def fail_verify(*args, **kwargs):
+        raise ValueError("recoverable host validation after shared work")
+    def fail_event(*args):
+        raise RuntimeError("cannot establish completion")
+    monkeypatch.setattr(module, "verify_dspark_target_batched", fail_verify)
+    runner._dspark_requests[seqs[1].seq_id].last_use.record = fail_event
+    with pytest.raises(RuntimeError, match="completion"):
+        worker.schedule_forward()
+    assert not runner.memory_manager.freed
+    assert not scheduler._pending_request_errors
+    assert set(runner._dspark_requests) == {seq.seq_id for seq in seqs}
+
+
+def _dspark_lifecycle_frontend(seqs):
+    """Exercise the actual IPC consumer with separate frontend sequence objects."""
+    from gllm.engine.llm import LLM
+    from gllm.runtime.sequence import GenerationSequence
+
+    frontend = LLM.__new__(LLM)
+    frontend.running_maps, frontend.async_streams = {}, {}
+    mirrors, retired = {}, []
+    frontend.free_finish_ids = retired.extend
+    def register(seq):
+        assert seq.seq_id not in frontend.running_maps
+        mirror = GenerationSequence(
+            seq.seq_id, list(seq.token_ids), list(seq.finish_tokens),
+            output_len=seq.output_len, ignore_eos=seq.ignore_eos, temperature=0,
+        )
+        frontend.running_maps[seq.seq_id] = mirror
+        mirrors[id(seq)] = mirror
+    for seq in seqs:
+        register(seq)
+    return frontend, mirrors, retired, register
+
+
+@pytest.mark.parametrize("batch", [2, 4])
+def test_dspark_lifecycle_mixed_arrivals_lengths_and_frontend_budgets(monkeypatch, batch):
+    from gllm.runtime.sequence import GenerationSequence
+
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch, batch=batch)
+    runner, scheduler = worker.model_runner, worker.scheduler
+    for seq, budget in zip(seqs, (1, 2, 7, 9)):
+        seq.output_len = budget
+    frontend, mirrors, retired, register = _dspark_lifecycle_frontend(seqs)
+    late = GenerationSequence(
+        81, [(index % 19) + 1 for index in range(runner.max_num_batched_tokens + 1)],
+        [], output_len=9, temperature=0,
+    )
+    admitted = False
+    max_batch = 0
+    for _ in range(240):
+        worker.schedule_forward()
+        assert scheduler.next_tokens_queue
+        running = scheduler.batch_running[-1]
+        max_batch = max(max_batch, len(running))
+        package = scheduler.process_output()
+        assert not package.request_errors
+        frontend._apply_ipc_package(package)
+        assert all(mirrors[id(seq)].token_ids == seq.token_ids for seq in seqs)
+        if not admitted and seqs[0].seq_id in package.free_ids:
+            assert runner._dspark_requests, "all peers finished before late admission"
+            register(late)
+            scheduler.add_new_requests([late])
+            admitted = True
+        if admitted:
+            assert mirrors[id(late)].token_ids == late.token_ids
+        if admitted and not frontend.running_maps:
+            break
+    assert admitted and max_batch > 1
+    assert sorted(retired) == sorted(seq.seq_id for seq in seqs + [late])
+    for seq in seqs + [late]:
+        assert seq.is_finish and len(seq) - seq.raw_prompt_len == seq.output_len
+    assert not runner._dspark_requests and not scheduler.batch_running
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_dspark_lifecycle_verify_eos_selects_its_own_prefix_without_stopping_peers(monkeypatch, ignore_eos):
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch, batch=4)
+    runner, scheduler = worker.model_runner, worker.scheduler
+    for _ in range(2):
+        worker.schedule_forward()
+        scheduler.process_output()
+    worker.schedule_forward()
+    records = scheduler.next_tokens_queue[-1][0]
+    selected, seq = records[1].verification, seqs[1]
+    table = list(seq.ssm_block_table)
+    states = [runner._dspark_requests[request.seq_id] for request in seqs]
+    events = [state.last_use for state in states]
+    seq.finish_tokens = [int(selected.committed_ids[0, 1])]
+    seq.ignore_eos = ignore_eos
+    package = scheduler.process_output()
+    count = 3 if ignore_eos else 2
+    assert package.next_tokens[1] == selected.committed_ids[0, :count].tolist()
+    assert all(record.consumed for record in records)
+    if ignore_eos:
+        assert not package.free_ids and seq.recurrent_state_slot == table[2]
+        assert not getattr(events[1], "waited", False)
+    else:
+        assert package.free_ids == [seq.seq_id]
+        assert runner.memory_manager.freed_tables[-1][0] == table[1]
+        assert events[1].waited and states[1].pending_hidden is states[1].anchor is None
+    for row in (0, 2, 3):
+        assert seqs[row].seq_id in runner._dspark_requests
+        assert not getattr(events[row], "waited", False)
+        assert package.next_tokens[row] == records[row].verification.committed_ids[0].tolist()
+
+
+@pytest.mark.parametrize("moment", ["partial_prefill", "between_steps", "inflight_verify"])
+def test_dspark_lifecycle_cancel_and_same_id_reuse_preserve_peer_and_drop_old_result(monkeypatch, moment):
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.speculative.dspark import commit_dspark_verify_step
+
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    runner, scheduler = worker.model_runner, worker.scheduler
+    victim, peer = seqs
+    if moment == "partial_prefill":
+        victim.token_ids = list(range(1, 18))
+        victim.raw_prompt_len = victim.prompt_len = 17
+        scheduler.seqs_to_prefill.reverse()  # Peer finishes; victim retains a partial chunk.
+        steps = 1
+    else:
+        steps = 2
+    frontend, mirrors, retired, register = _dspark_lifecycle_frontend(seqs)
+    for _ in range(steps):
+        worker.schedule_forward()
+        frontend._apply_ipc_package(scheduler.process_output())
+    state = runner._dspark_requests[victim.seq_id]
+    old_cache, event = state.cache, state.last_use
+    old_cache._device_page_table = torch.tensor([99], dtype=torch.int32)
+    old_cache._num_uploaded_pages = 1
+    old_record = None
+    if moment == "inflight_verify":
+        worker.schedule_forward()
+        old_record = scheduler.next_tokens_queue[-1][0][0]
+    history = list(victim.token_ids)
+    scheduler.add_abort_ids([victim.seq_id])
+    package = scheduler.process_output() if old_record is not None else scheduler.check_abort_seqs()
+    frontend._apply_ipc_package(package)
+    assert package.free_ids == [victim.seq_id] and victim.token_ids == history
+    assert victim.seq_id not in package.act_schedule_ids
+    assert peer.seq_id in runner._dspark_requests and event.waited
+    assert old_cache._device_page_table is None and not old_cache.page_table
+    assert state.pending_hidden is state.anchor is state.inflight is state.paged_cache is None
+    assert scheduler.check_abort_seqs() is None
+    replacement = GenerationSequence(victim.seq_id, [2, 3, 4], [], output_len=1, temperature=0)
+    register(replacement)
+    scheduler.add_new_requests([replacement])
+    observed_new_state = False
+    for _ in range(100):
+        worker.schedule_forward()
+        assert scheduler.next_tokens_queue
+        new_state = runner._dspark_requests.get(replacement.seq_id)
+        if new_state is not None:
+            observed_new_state = True
+            assert new_state is not state and new_state.cache is not old_cache
+            assert new_state.cache._device_page_table is None
+            if old_record is not None:
+                before = (replacement.computed_token_num, list(replacement.ssm_block_table))
+                with pytest.raises(ValueError, match="live request"):
+                    commit_dspark_verify_step(replacement, new_state, old_record)
+                assert (replacement.computed_token_num, replacement.ssm_block_table) == before
+        frontend._apply_ipc_package(scheduler.process_output())
+        if not frontend.running_maps:
+            break
+    assert observed_new_state
+    assert retired.count(victim.seq_id) == 2 and retired.count(peer.seq_id) == 1
+    assert mirrors[id(victim)].token_ids == history
+    assert mirrors[id(peer)].token_ids == peer.token_ids
+    assert mirrors[id(replacement)].token_ids == replacement.token_ids
+    assert not runner._dspark_requests
+
+
+def test_dspark_lifecycle_async_error_finishes_only_its_stream_and_peers_complete(monkeypatch):
+    from gllm.engine import llm as engine
+    from gllm.runtime.sequence import GenerationSequence, RequestCapacityError
+
+    worker, seqs, _ = _dspark_batch_worker_spy(monkeypatch)
+    bad, peer = seqs
+    bad.temperature, bad.top_k = .8, 10
+    peer.output_len = 2
+    third = GenerationSequence(63, [1, 2, 3], [], output_len=3, temperature=0)
+    worker.scheduler.add_new_requests([third])
+    frontend, mirrors, retired, _ = _dspark_lifecycle_frontend(seqs + [third])
+    class Stream:
+        def __init__(self):
+            self.items, self.finishes = [], 0
+        def put(self, item):
+            self.items.append(item)
+        def finish(self):
+            self.finishes += 1
+    streams = {seq.seq_id: Stream() for seq in seqs + [third]}
+    frontend.async_streams = dict(streams)
+    frontend.model_runner = type("TokenizerOwner", (), {"tokenizer": object()})()
+    frontend._reasoning_controls = None
+    def decode(seq, tokenizer, tokens, controls):
+        seq.token_ids.extend(tokens)
+        return "", []
+    monkeypatch.setattr(engine, "decode_stream_delta", decode)
+    for _ in range(30):
+        worker.schedule_forward()
+        package = worker.scheduler.process_output()
+        if package is not None:
+            frontend._apply_ipc_package(package)
+        cleanup = worker.scheduler.check_abort_seqs()
+        if cleanup is not None:
+            frontend._apply_ipc_package(cleanup)
+        if not frontend.running_maps:
+            break
+    assert not frontend.running_maps and not worker.model_runner._dspark_requests
+    assert all(stream.finishes == 1 for stream in streams.values())
+    assert len(streams[bad.seq_id].items) == 1
+    assert isinstance(streams[bad.seq_id].items[0], RequestCapacityError)
+    assert sorted(retired) == sorted(seq.seq_id for seq in seqs + [third])
+    assert all(mirrors[id(seq)].token_ids == seq.token_ids for seq in (peer, third))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch", [2, 4])
+@pytest.mark.parametrize("action", ["cancel", "preempt"])
+@torch.no_grad()
+def test_dspark_lifecycle_shared_arena_cancel_preempt_rebind_and_frontend_progress(batch, action, monkeypatch):
+    """Small real models check cache lifecycle; real-checkpoint IDs are a later gate."""
+    from collections import Counter
+
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.scheduling.scheduler import Scheduler
+    from gllm.speculative.dspark import commit_dspark_verify_step
+    from gllm.workers.worker import Worker
+
+    runner, _ = _dspark_runtime_fixture(batch=batch)
+    manager = runner.memory_manager
+    arena = _init_dspark_runtime_test_arena(runner, arena_capacity=64)
+    before = arena.allocator.num_used_physical_pages
+    worker = Worker.__new__(Worker)
+    worker.model_runner = runner
+    scheduler = worker.scheduler = Scheduler(1, runner, "chunked_prefill")
+    scheduler.log = False
+    seqs = [
+        GenerationSequence(91 + row, list(range(1, row + 2)), [],
+                           output_len=28 - row, temperature=0)
+        for row in range(batch)
+    ]
+    frontend, mirrors, retired, register = _dspark_lifecycle_frontend(seqs)
+    scheduler.add_new_requests(seqs)
+    bindings = []
+    metadata = runner.dspark._paged_batch_table
+    original_prepare = metadata.prepare
+    def check_table(caches, lengths):
+        table = original_prepare(caches, lengths)
+        active = [(cache, length) for cache, length in zip(caches, lengths) if length]
+        for row, (cache, length) in enumerate(active):
+            pages = (length + cache.segment.page_size - 1) // cache.segment.page_size
+            # Test-only upload: production reads reusable request GPU tables.
+            expected = torch.tensor(
+                cache.state.page_table[:pages], dtype=torch.int32, device=table.device
+            ).expand(runner.dspark.noise_width, -1)
+            torch.testing.assert_close(
+                table[row * 7:(row + 1) * 7, :pages], expected, atol=0, rtol=0
+            )
+        bindings.append(tuple(cache.state for cache, _ in active))
+        return table
+    monkeypatch.setattr(metadata, "prepare", check_table)
+    original_draft = runner.dspark.forward_draft_batched
+    def finite_draft(*args, **kwargs):
+        hidden, ids = original_draft(*args, **kwargs)
+        assert torch.isfinite(hidden).all()
+        return hidden, ids
+    monkeypatch.setattr(runner.dspark, "forward_draft_batched", finite_draft)
+
+    for _ in range(2 if action == "cancel" else 3):
+        worker.schedule_forward()
+        frontend._apply_ipc_package(scheduler.process_output())
+    victim = max(scheduler.seqs_to_decode, key=lambda seq: len(seq.page_table))
+    old_state = runner._dspark_requests[victim.seq_id]
+    old_cache, old_event = old_state.cache, old_state.last_use
+    retired_pages = (list(victim.page_table), list(old_cache.page_table))
+    old_epoch, old_history = victim._cache_epoch, list(victim.token_ids)
+    raw_prompt_len = victim.raw_prompt_len
+    peers = [seq for seq in seqs if seq is not victim]
+    old_result = None
+    if action == "cancel":
+        worker.schedule_forward()
+        scheduled = scheduler.batch_running[-1]
+        records = scheduler.next_tokens_queue[-1][0]
+        assert len(scheduled) == batch and isinstance(records, list)
+        old_result = records[scheduled.index(victim)]
+        assert old_cache._device_page_table is not None
+    else:
+        assert old_cache._device_page_table is not None
+
+    # The inflight case also reads the eight rows just written by verify,
+    # which are speculative scratch, not committed history. No uncomputed
+    # reservation or inactive typed-bank region is treated as valid KV.
+    snapshots = []
+    def values(seq, target_length, draft_length, slots):
+        cache = runner._dspark_requests[seq.seq_id].cache
+        return (
+            sum(_read_paged_context(manager.segment, seq, target_length), [])
+            + sum(_read_paged_context(manager.dspark_segment, cache, draft_length), [])
+            + [manager.ssm_segment.conv_state[:, slots],
+               manager.ssm_segment.temporal_state[:, slots]]
+        )
+    for peer in peers:
+        state = runner._dspark_requests[peer.seq_id]
+        length = peer.computed_token_num + (8 if action == "cancel" else 0)
+        draft_length, slots = state.cache.context_length, list(peer.ssm_block_table)
+        snapshots.append((peer, length, draft_length, slots,
+                          [value.clone() for value in values(peer, length, draft_length, slots)]))
+    owned = arena.allocator.num_used_physical_pages
+    if action == "cancel":
+        scheduler.add_abort_ids([victim.seq_id])
+        package = scheduler.process_output()
+        assert package.free_ids == [victim.seq_id]
+        assert victim.seq_id not in package.act_schedule_ids
+        frontend._apply_ipc_package(package)
+        assert victim.token_ids == old_history and not old_result.consumed
+        replacement = GenerationSequence(victim.seq_id, [7, 8, 9, 10], [],
+                                         output_len=24, temperature=0)
+    else:
+        scheduler.check_preempt(manager.get_num_free_pages() + 1)
+        assert scheduler.num_preempt_seqs == 1
+        assert victim._cache_epoch == old_epoch + 1 and victim.computed_token_num == 0
+        assert victim.prompt_len == len(old_history) and victim.token_ids == old_history
+        assert victim.raw_prompt_len == raw_prompt_len
+        replacement = GenerationSequence(101, [7, 8, 9, 10], [],
+                                         output_len=5, temperature=0)
+    assert old_event.query()
+    assert arena.allocator.num_used_physical_pages < owned
+    assert old_cache._device_page_table is None and not old_cache.page_table
+    assert old_state.anchor is old_state.pending_hidden is old_state.inflight is old_state.paged_cache is None
+    assert victim.seq_id not in runner._dspark_requests
+    for peer, length, draft_length, slots, saved in snapshots:
+        for actual, expected in zip(values(peer, length, draft_length, slots), saved):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    held = []
+    for segment, pages in zip((manager.segment, manager.dspark_segment), retired_pages):
+        page = pages[0]
+        assert segment.id_allocator.is_free(page)
+        # Force the old request's page to be reused by a separate live test
+        # owner, independent of allocator age policy. Stale batch rows would
+        # now point into poisoned K/V; the replacement must get other pages.
+        assert segment.id_allocator.allocate(page) == page
+        for bank in segment.k_cache + segment.v_cache:
+            bank[page].fill_(float("nan"))
+        held.append((segment, page))
+    for peer, length, draft_length, slots, saved in snapshots:
+        for actual, expected in zip(values(peer, length, draft_length, slots), saved):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    register(replacement)
+    scheduler.add_new_requests([replacement])
+    observed_fresh = False
+    active_identity = victim if action == "preempt" else replacement
+    refreshed_cache = None
+    for _ in range(256):
+        worker.schedule_forward()
+        assert scheduler.next_tokens_queue, "remaining requests stopped progressing"
+        current = runner._dspark_requests.get(active_identity.seq_id)
+        if current is not None and current is not old_state and not observed_fresh:
+            observed_fresh = True
+            refreshed_cache = current.cache
+            assert current.cache is not old_cache and current.cache_epoch == active_identity._cache_epoch
+            assert retired_pages[0][0] not in active_identity.page_table
+            assert retired_pages[1][0] not in current.cache.page_table
+            if old_result is not None:
+                table = list(active_identity.ssm_block_table)
+                with pytest.raises(ValueError):
+                    commit_dspark_verify_step(active_identity, current, old_result)
+                assert active_identity.ssm_block_table == table
+        package = scheduler.process_output()
+        assert not package.request_errors
+        frontend._apply_ipc_package(package)
+        assert all(mirrors[id(seq)].token_ids == seq.token_ids for seq in seqs + [replacement])
+        if not frontend.running_maps:
+            break
+    assert observed_fresh and any(any(cache is refreshed_cache for cache in group) for group in bindings)
+    assert Counter(retired) == Counter(seq.seq_id for seq in seqs + [replacement])
+    continuing = seqs + [replacement] if action == "preempt" else peers + [replacement]
+    for seq in continuing:
+        assert seq.is_finish and len(seq) - seq.raw_prompt_len == seq.output_len
+    assert not runner._dspark_requests and not scheduler.batch_running
+    assert not scheduler.seqs_to_prefill and not scheduler.seqs_to_decode
+    for segment, page in held:
+        segment.free(page)
+    torch.cuda.synchronize()
+    assert arena.allocator.num_used_physical_pages == before

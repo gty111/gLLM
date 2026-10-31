@@ -1,10 +1,10 @@
-"""DSpark execution and validation for the synchronous single-request runner."""
+"""DSpark execution and validation for the synchronous runner."""
 
 import torch
 
 from gllm.runtime.sequence import GenerationSequence, RequestCapacityError
 from gllm.speculative.dspark import (
-    DSparkRequestState, DSparkStepResult, verify_dspark_target,
+    DSparkRequestState, DSparkStepResult, verify_dspark_target, verify_dspark_target_batched,
 )
 
 
@@ -39,8 +39,9 @@ class DSparkExecutionMixin:
     def _get_dspark_request(self, seq: GenerationSequence) -> DSparkRequestState:
         state = self._dspark_requests.get(seq.seq_id)
         if state is None:
-            if self._dspark_requests or seq.computed_token_num != 0:
-                raise ValueError("DSpark requires one active request starting at position zero")
+            capacity = getattr(self, "max_running_seqs", getattr(self, "maxd", 1))
+            if len(self._dspark_requests) >= capacity or seq.computed_token_num != 0:
+                raise ValueError("DSpark needs available request capacity and a position-zero start")
             state = DSparkRequestState(seq.seq_id, seq._cache_epoch)
         if (
             state.seq_id != seq.seq_id or state.cache_epoch != seq._cache_epoch
@@ -222,6 +223,156 @@ class DSparkExecutionMixin:
         state.last_use.record(torch.cuda.current_stream())
         result.ready = True
         return result
+
+    @torch.inference_mode()
+    def _execute_dspark_batch(self, seqs) -> list[DSparkStepResult]:
+        """Execute one homogeneous phase with independent request records.
+
+        Scheduling validates and reserves each owner before dispatch. All
+        members become inflight before shared GPU work; a partial batch
+        failure cannot be retried using any member's mutated rolling state.
+        """
+        capacity = getattr(self, "max_running_seqs", getattr(self, "maxd", 1))
+        if (
+            not 1 < len(seqs) <= capacity
+            or len({seq.seq_id for seq in seqs}) != len(seqs)
+            or sum(seq.to_compute_token_num for seq in seqs) > self.max_num_batched_tokens
+            or len(self._dspark_requests) + sum(
+                seq.seq_id not in self._dspark_requests for seq in seqs
+            ) > capacity
+        ):
+            raise ValueError("DSpark batch exceeds its request/token capacity or repeats an owner")
+        states = []
+        for seq in seqs:
+            self._validate_dspark_request(seq)
+            states.append(self._get_dspark_request(seq))
+        phase = states[0].phase
+        if phase not in ("prefill", "bootstrap", "verify", "tail") or any(
+            state.phase != phase for state in states
+        ):
+            raise ValueError("DSpark batches require one homogeneous phase")
+
+        starts = [seq.computed_token_num for seq in seqs]
+        counts = [seq.to_compute_token_num for seq in seqs]
+        ends = [start + count for start, count in zip(starts, counts)]
+        for seq, state, start, count, end in zip(seqs, states, starts, counts, ends):
+            if not 0 < count <= self.max_num_batched_tokens or end > self.model_max_length:
+                raise ValueError("DSpark batch input exceeds its target context/token limit")
+            if phase in ("prefill", "bootstrap"):
+                if (
+                    end > self.dspark.rotary_emb.cos_sin_cache.shape[0]
+                    or state.cache.context_length != start
+                    or any(not 0 <= token < self.dspark.config.vocab_size for token in seq[start:end])
+                ):
+                    raise ValueError("DSpark prompt batch has invalid context, position or token IDs")
+                if phase == "prefill":
+                    valid = start < end <= seq.prompt_len and len(seq) == seq.prompt_len
+                else:
+                    valid = count == 1 and start == seq.prompt_len and len(seq) == end
+                if not valid:
+                    raise ValueError("DSpark prompt batch does not cover contiguous phase inputs")
+            elif (
+                count != (8 if phase == "verify" else 1)
+                or len(seq) != start or state.anchor_pos != start or state.anchor is None
+                or state.anchor.numel() != 1
+            ):
+                raise ValueError("DSpark decode batch needs one unpublished anchor per request")
+            if phase == "verify" and (
+                state.paged_cache is None or state.pending_hidden is None
+                or state.pending_hidden.ndim != 3 or state.pending_hidden.shape[0] != 1
+                or not 1 <= state.pending_hidden.shape[1] <= 8
+                or state.cache.context_length + state.pending_hidden.shape[1] != start
+                or not self._dspark_verify_fits(seq)
+            ):
+                raise ValueError("DSpark verify batch needs contiguous pending taps and full windows")
+
+        for seq, state, end in zip(seqs, states, ends):
+            if not self._reserve_dspark_step(
+                seq, state, target_length=end,
+                draft_length=state.cache.context_length if phase == "tail" else end,
+            ):
+                raise RequestCapacityError("Insufficient cache capacity for the DSpark batch")
+        results = [
+            DSparkStepResult(seq.seq_id, seq._cache_epoch, start, count, phase)
+            for seq, start, count in zip(seqs, starts, counts)
+        ]
+        for state, result in zip(states, results):
+            state.inflight = result
+
+        old = [(seq.to_compute_tokens, seq.to_compute_token_num,
+                getattr(seq, "_mtp_verify", False)) for seq in seqs]
+        try:
+            if phase == "verify":
+                anchors = torch.cat([state.anchor.reshape(1) for state in states])
+                hidden, _ = self.dspark.forward_draft_batched(
+                    [state.pending_hidden for state in states], anchors,
+                    start_positions=starts, caches=[state.paged_cache for state in states],
+                )
+                for state in states:
+                    state.pending_hidden = None
+                proposed, _, _ = self.dspark.forward_head(hidden, anchors)
+                proposed_ids = proposed.cpu().tolist()
+                for seq, tokens in zip(seqs, proposed_ids):
+                    seq.to_compute_tokens, seq._mtp_verify = tokens, True
+            elif phase == "tail":
+                anchors = torch.cat([state.anchor.reshape(1) for state in states]).cpu().tolist()
+                for seq, token in zip(seqs, anchors):
+                    seq.to_compute_tokens = [token]
+
+            self.input_data.cal_and_set_input(seqs)
+            if self.uses_mrope:
+                positions = torch.cat([
+                    torch.arange(start, end, device="cpu") for start, end in zip(starts, ends)
+                ])
+                self.input_data.set_mrope_position(positions.repeat(3, 1))
+            self._prepare_attention_metadata(self.input_data)
+            if phase == "verify":
+                verified = verify_dspark_target_batched(
+                    self.model, self.input_data, block_size=self.dspark.block_size,
+                    target_layer_ids=self.dspark.config.target_layer_ids,
+                )
+                for result, verification in zip(results, verified):
+                    result.verification = verification
+            else:
+                if phase == "tail":
+                    hidden = self.model(self.input_data)
+                    taps = None
+                else:
+                    hidden, taps = self.model.forward_with_hidden_taps(
+                        self.input_data, target_layer_ids=self.dspark.config.target_layer_ids
+                    )
+                begin, chunks = 0, []
+                for seq, state, result, count, end in zip(seqs, states, results, counts, ends):
+                    if phase == "prefill":
+                        chunks.append(taps[:, begin:begin + count])
+                    elif phase == "bootstrap":
+                        result.hidden = taps[:, begin:begin + count].clone()
+                    if phase != "prefill" or end == seq.prompt_len:
+                        result.next_anchor = self.model.logits_from_hidden(
+                            hidden[begin + count - 1:begin + count]
+                        ).argmax(-1)
+                    begin += count
+                if phase == "prefill":
+                    caches = self.dspark.prefill_paged_batched(
+                        chunks, segment=self.memory_manager.dspark_segment,
+                        caches=[state.cache for state in states],
+                    )
+                    for state, cache in zip(states, caches):
+                        state.paged_cache = cache
+        finally:
+            # Restore only host overrides here. Unknown CUDA failures must
+            # propagate without event operations in this cleanup.
+            for seq, (tokens, count, verify) in zip(seqs, old):
+                seq.to_compute_tokens, seq.to_compute_token_num = tokens, count
+                seq._mtp_verify = verify
+        for state, result in zip(states, results):
+            # Events stay request-owned. Re-recording B's next use must never
+            # extend A's completion boundary after their shared batch.
+            if state.last_use is None:
+                state.last_use = torch.cuda.Event()
+            state.last_use.record(torch.cuda.current_stream())
+            result.ready = True
+        return results
 
     def _complete_dspark_failed_step(self, seq: GenerationSequence) -> None:
         """Cover partial work after a recoverable host validation/capacity error.

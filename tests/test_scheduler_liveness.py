@@ -383,3 +383,53 @@ def test_dspark_finalize_error_notifies_frontend_once(
     assert not scheduler._pending_request_errors
     assert scheduler.check_abort_seqs() is None
     assert scheduler._pending_follower_frees == [seq.seq_id]
+
+
+def test_dspark_scheduler_batch_skips_blocked_admission_and_runs_resident_decode(
+    prefix_manager, make_scheduler
+):
+    from types import SimpleNamespace
+
+    scheduler, calls = _dspark_scheduler_spy(prefix_manager, make_scheduler)
+    runner = scheduler.model_runner
+    runner.maxd, runner.max_num_batched_tokens = 2, 16
+    states = {}
+    active = []
+    for index in (101, 102):
+        seq = GenerationSequence(index, [1, 2, 3], [], output_len=16, temperature=0)
+        seq.computed_token_num = seq.prompt_len
+        active.append(seq)
+        states[index] = SimpleNamespace(phase="verify")
+    runner._dspark_requests = states
+    runner._get_dspark_request = lambda seq: states[seq.seq_id]
+    waiting = GenerationSequence(103, [1, 2], [], output_len=16, temperature=0)
+    scheduler.add_new_requests([waiting])
+    scheduler.seqs_to_decode.extend(active)
+    scheduler._dspark_prefer_prefill = True
+    assert scheduler.schedule_once() == active
+    assert sum(seq.to_compute_token_num for seq in active) == 16
+    assert list(scheduler.seqs_to_prefill) == [waiting]
+    assert calls == [(11, 11), (11, 11)]
+
+
+def test_dspark_scheduler_batch_groups_phases_and_defers_other_ready_owners(
+    prefix_manager, make_scheduler
+):
+    from types import SimpleNamespace
+
+    scheduler, calls = _dspark_scheduler_spy(prefix_manager, make_scheduler)
+    runner = scheduler.model_runner
+    runner.maxd, runner.max_num_batched_tokens = 3, 24
+    seqs = [GenerationSequence(index, [1, 2, 3], [], output_len=16, temperature=0)
+            for index in (111, 112, 113)]
+    for seq in seqs:
+        seq.computed_token_num = seq.prompt_len
+    states = {seq.seq_id: SimpleNamespace(phase=phase)
+              for seq, phase in zip(seqs, ("verify", "bootstrap", "verify"))}
+    runner._dspark_requests = states
+    runner._get_dspark_request = lambda seq: states[seq.seq_id]
+    scheduler.seqs_to_decode.extend(seqs)
+    assert scheduler.schedule_once() == [seqs[0], seqs[2]]
+    assert calls == [(11, 11), (11, 11)]
+    assert list(scheduler.seqs_to_decode) == [seqs[1]]
+    assert seqs[1].to_compute_token_num == 0
