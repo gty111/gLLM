@@ -202,6 +202,69 @@ class Qwen38DSparkPagedCache:
         return self.state.context_length
 
 
+@dataclass
+class _Qwen38DSparkBatchTable:
+    """Reusable GPU metadata, not ownership of requests or arena slots.
+
+    Each history request contributes noise_width equal table rows to the
+    existing decode kernel. Sources stay request-owned; stable bindings copy
+    only newly visible pages D2D. A changed binding/buffer refreshes its prefix.
+    Access is serialized on the consuming stream, as for DSparkRequestCache.
+    """
+
+    noise_width: int
+    table: torch.Tensor | None = None
+    sources: tuple = ()
+
+    def prepare(
+        self,
+        caches: list[Qwen38DSparkPagedCache],
+        lengths: tuple[int, ...],
+    ) -> torch.Tensor:
+        device = caches[0].segment.k_cache[0].device
+        current = []
+        for cache, length in zip(caches, lengths):
+            if length:
+                source = cache.state.get_device_page_table(device)
+                pages = (length + cache.segment.page_size - 1) // cache.segment.page_size
+                current.append((cache.state, source, pages))
+        if not current:
+            return torch.empty((0, 0), device=device, dtype=torch.int32)
+        rows = len(current) * self.noise_width
+        pages = max(record[2] for record in current)
+        grown = (
+            self.table is None or self.table.device != device
+            or self.table.shape[0] < rows or self.table.shape[1] < pages
+        )
+        if grown:
+            old = self.table
+            old_rows, old_pages = (0, 0) if old is None else old.shape
+            # Growing history must not also double the request capacity.
+            row_capacity = max(rows, 2 * old_rows) if rows > old_rows else old_rows
+            page_capacity = max(pages, 2 * old_pages) if pages > old_pages else old_pages
+            self.table = torch.empty(
+                (row_capacity, page_capacity), device=device, dtype=torch.int32,
+            )
+        for index, (state, source, count) in enumerate(current):
+            previous = self.sources[index] if index < len(self.sources) else None
+            unchanged = (
+                not grown and previous is not None and previous[0] is state
+                and previous[1].data_ptr() == source.data_ptr()
+                and previous[2] <= count
+            )
+            begin = previous[2] if unchanged else 0
+            if begin < count:
+                self.table[
+                    index * self.noise_width:(index + 1) * self.noise_width, begin:count
+                ].copy_(
+                    source[:, begin:count].expand(self.noise_width, -1), non_blocking=True
+                )
+        # Retain source buffers: reset/reuse cannot masquerade as the previous
+        # binding, and an enqueued D2D copy cannot lose its source allocation.
+        self.sources = tuple(current)
+        return self.table[:rows, :pages]
+
+
 class Qwen38DSparkMarkovHead(nn.Module):
     """Low-rank previous-token logit bias (SpecForge ``VanillaMarkovHead``).
 
@@ -306,7 +369,7 @@ class Qwen38DSparkAttention(nn.Module):
         rotary_cache: torch.Tensor,
         *,
         page_table: torch.Tensor | None = None,
-        context_length: int = 0,
+        context_length: int | tuple[int, ...] = 0,
     ) -> torch.Tensor:
         """Attend the noisy block against the history plus itself.
 
@@ -351,40 +414,50 @@ class Qwen38DSparkAttention(nn.Module):
         cached_k: torch.Tensor,
         cached_v: torch.Tensor,
         page_table: torch.Tensor,
-        context_length: int,
+        context_length: int | tuple[int, ...],
     ) -> torch.Tensor:
-        """Merge noncausal paged history and dense noise for one request.
+        """Merge paged history and noncausal noise without sharing histories.
 
-        Both sources share Q, scale and natural-log LSE. Only the small noise
-        matrices are expanded for GQA; historical K/V stays in the arena.
+        The single-request table keeps its zero row stride. A batched table
+        already has noise_width rows per nonempty request, in query order.
+        Empty histories use noise only and never enter the paged reducer.
         """
+        batch, _, query_len, _ = q.shape
+        lengths = (context_length,) if isinstance(context_length, int) else context_length
+        if len(lengths) != batch or any(length < 0 for length in lengths):
+            raise ValueError("paged attention needs one valid length per request")
+        active = [index for index, length in enumerate(lengths) if length]
         noise_k = _repeat_kv(k_noise, self.num_key_value_groups)
         noise_v = _repeat_kv(v_noise, self.num_key_value_groups)
         scores = torch.matmul(q.float(), noise_k.float().transpose(-1, -2))
         scores = scores * self.scaling
         noise_output = torch.matmul(scores.softmax(-1), noise_v.float()).to(q.dtype)
-        if context_length == 0:
-            # The paged reducer has no valid split for an empty history.
+        if not active:
             return noise_output
 
         from gllm.layers.ops.merge_attn_states import merge_attn_states
         from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 
-        query = q[0].transpose(0, 1).contiguous()
-        query_len = query.shape[0]
+        def pack_active(tensor):
+            if len(active) == batch:
+                return tensor.reshape(batch * query_len, *tensor.shape[2:]).contiguous()
+            return torch.cat([tensor[index] for index in active], dim=0).contiguous()
+
+        query = pack_active(q.transpose(1, 2))
         history_output = torch.empty_like(query)
         history_lse = torch.empty(
-            query_len, self.num_heads, device=q.device, dtype=torch.float32
+            query.shape[0], self.num_heads, device=q.device, dtype=torch.float32
         )
-        # The kernel honors the row stride, including zero: every noise
-        # query reads the same request-owned table without a per-layer copy.
-        block_table = page_table.expand(query_len, -1)
-        seq_lens = torch.full(
-            (query_len,), context_length, device=q.device, dtype=torch.int32
+        block_table = (
+            page_table.expand(query_len, -1) if isinstance(context_length, int) else page_table
         )
+        seq_lens = torch.cat([
+            torch.full((query_len,), lengths[index], device=q.device, dtype=torch.int32)
+            for index in active
+        ])
         num_splits = 4
         scratch = torch.empty(
-            query_len, self.num_heads, num_splits, self.head_dim + 1,
+            query.shape[0], self.num_heads, num_splits, self.head_dim + 1,
             device=q.device, dtype=torch.float32,
         )
         decode_attention_fwd(
@@ -392,13 +465,21 @@ class Qwen38DSparkAttention(nn.Module):
             block_table, seq_lens, scratch, num_splits, self.scaling,
             cached_k.shape[1],
         )
-        noise_lse = scores.logsumexp(-1)[0].transpose(0, 1).contiguous()
-        suffix_output = noise_output[0].transpose(0, 1).contiguous()
+        noise_lse = pack_active(scores.logsumexp(-1).transpose(1, 2))
+        suffix_output = pack_active(noise_output.transpose(1, 2))
         merged = torch.empty_like(history_output)
         merge_attn_states(
             merged, history_output, history_lse, suffix_output, noise_lse
         )
-        return merged.transpose(0, 1).unsqueeze(0)
+        merged = merged.view(
+            len(active), query_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        if len(active) == batch:
+            return merged
+        outputs = list(noise_output.unbind(0))
+        for index, request in enumerate(active):
+            outputs[request] = merged[index]
+        return torch.stack(outputs)
 
 
 class Qwen38DSparkDecoderLayer(nn.Module):
@@ -422,7 +503,7 @@ class Qwen38DSparkDecoderLayer(nn.Module):
         rotary_cache: torch.Tensor,
         *,
         page_table: torch.Tensor | None = None,
-        context_length: int = 0,
+        context_length: int | tuple[int, ...] = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(
@@ -479,6 +560,7 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
             config.hidden_size + config.markov_rank
         )
         self.rotary_emb = _build_rope(config)
+        self._paged_batch_table = _Qwen38DSparkBatchTable(self.noise_width)
 
     # -- internals ---------------------------------------------------------
 
@@ -553,34 +635,8 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         one CUDA stream (or supplies synchronization), and must not retry a
         fatal asynchronous device error as though it were a Python exception.
         """
-        if (
-            main_hidden.ndim != 3
-            or main_hidden.shape[0] != 1
-            or main_hidden.shape[2] != self.config.target_hidden_size
-        ):
-            raise ValueError("paged context requires [1, S, target_hidden_size]")
-        if _tp_size() != 1:
-            raise ValueError("paged DSpark context currently requires TP=1")
-        geometry = (segment.num_layers, segment.kv_head_num, segment.kv_head_dim)
-        expected = (
-            len(self.layers), self.config.num_key_value_heads, self.config.head_dim
-        )
-        if geometry != expected:
-            raise ValueError((geometry, expected))
-        key_cache = segment.k_cache[0]
-        if (
-            main_hidden.dtype != torch.bfloat16
-            or key_cache.dtype != main_hidden.dtype
-            or key_cache.device != main_hidden.device
-        ):
-            raise ValueError("paged context and cache must share a BF16 device")
+        self._validate_paged_context(main_hidden, start_pos, segment, cache)
         length = main_hidden.shape[1]
-        if start_pos - length != cache.context_length:
-            raise ValueError((start_pos, length, cache.context_length))
-        if start_pos > len(cache.page_table) * segment.page_size:
-            raise ValueError("draft context exceeds reserved page capacity")
-        if start_pos > self.rotary_emb.cos_sin_cache.shape[0]:
-            raise ValueError("draft context exceeds the rotary position range")
         if length == 0:
             return
 
@@ -608,6 +664,161 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
                 slot_mapping, "auto", key, value,
             )
         cache.context_length = start_pos
+
+    def _validate_paged_context(self, main_hidden, start_pos, segment, cache):
+        if (
+            main_hidden.ndim != 3
+            or main_hidden.shape[0] != 1
+            or main_hidden.shape[2] != self.config.target_hidden_size
+        ):
+            raise ValueError("paged context requires [1, S, target_hidden_size]")
+        if _tp_size() != 1:
+            raise ValueError("paged DSpark context currently requires TP=1")
+        geometry = (segment.num_layers, segment.kv_head_num, segment.kv_head_dim)
+        expected = (
+            len(self.layers), self.config.num_key_value_heads, self.config.head_dim
+        )
+        if geometry != expected:
+            raise ValueError((geometry, expected))
+        key_cache = segment.k_cache[0]
+        if (
+            main_hidden.dtype != torch.bfloat16
+            or key_cache.dtype != main_hidden.dtype
+            or key_cache.device != main_hidden.device
+        ):
+            raise ValueError("paged context and cache must share a BF16 device")
+        length = main_hidden.shape[1]
+        if type(start_pos) is not int or start_pos < 0:
+            raise ValueError("paged context position must be a nonnegative integer")
+        if start_pos - length != cache.context_length:
+            raise ValueError((start_pos, length, cache.context_length))
+        if start_pos > len(cache.page_table) * segment.page_size:
+            raise ValueError("draft context exceeds reserved page capacity")
+        if start_pos > self.rotary_emb.cos_sin_cache.shape[0]:
+            raise ValueError("draft context exceeds the rotary position range")
+
+    def _validate_paged_batch(self, main_hiddens, start_positions, caches):
+        if not caches or not len(main_hiddens) == len(start_positions) == len(caches):
+            raise ValueError("paged batch needs one context, position and cache per request")
+        if any(not isinstance(cache, Qwen38DSparkPagedCache) for cache in caches):
+            raise ValueError("paged batch requires request-owned paged cache views")
+        if len({id(cache.state) for cache in caches}) != len(caches):
+            raise ValueError("paged batch cannot repeat a request cache")
+        segment = caches[0].segment
+        if any(cache.segment is not segment for cache in caches):
+            raise ValueError("paged batch must use one shared draft segment")
+        for hidden, end, cache in zip(main_hiddens, start_positions, caches):
+            self._validate_paged_context(hidden, end, segment, cache.state)
+
+    def _append_paged_context_batched(self, main_hiddens, start_positions, caches):
+        """Write only the ragged new suffixes; publish all lengths last.
+
+        Validation is complete before any write. Only the newly accepted
+        context is packed, never the historical KV. A layer failure leaves all
+        old valid lengths intact; callers must not retry fatal CUDA errors.
+        """
+        nonempty = [
+            (hidden, end, cache) for hidden, end, cache in zip(
+                main_hiddens, start_positions, caches
+            ) if hidden.shape[1]
+        ]
+        if not nonempty:
+            return
+        from gllm.layers.ops.cache_kernels import reshape_and_cache_flash
+
+        segment = caches[0].segment
+        context = self._project_context(torch.cat([row[0] for row in nonempty], dim=1))
+        positions, slots = [], []
+        for hidden, end, cache in nonempty:
+            position = torch.arange(cache.state.context_length, end, device=hidden.device)
+            page_table = cache.state.get_device_page_table(hidden.device)[0]
+            positions.append(position)
+            slots.append(
+                page_table[position // segment.page_size].long() * segment.page_size
+                + position % segment.page_size
+            )
+        positions, slots = torch.cat(positions), torch.cat(slots)
+        for index, layer in enumerate(self.layers):
+            key, value = layer.self_attn.prefill_context(
+                context, positions, self.rotary_emb.cos_sin_cache
+            )
+            key = key[0].transpose(0, 1).contiguous()
+            value = value[0].transpose(0, 1).contiguous()
+            reshape_and_cache_flash(
+                key, value, segment.k_cache[index], segment.v_cache[index],
+                slots, "auto", key, value,
+            )
+        for end, cache in zip(start_positions, caches):
+            cache.state.context_length = end
+
+    @torch.no_grad()
+    def prefill_paged_batched(
+        self,
+        main_hiddens: list[torch.Tensor],
+        *,
+        segment: Segment,
+        caches: list[DSparkRequestCache],
+    ) -> list[Qwen38DSparkPagedCache]:
+        """Append independent prompt chunks with one packed context projection."""
+        if any(hidden.ndim != 3 for hidden in main_hiddens):
+            raise ValueError("paged context requires [1, S, target_hidden_size]")
+        views = [Qwen38DSparkPagedCache(segment, cache) for cache in caches]
+        ends = [
+            cache.context_length + hidden.shape[1] for hidden, cache in zip(main_hiddens, caches)
+        ]
+        self._validate_paged_batch(main_hiddens, ends, views)
+        self._append_paged_context_batched(main_hiddens, ends, views)
+        return views
+
+    @torch.no_grad()
+    def forward_draft_batched(
+        self,
+        main_hiddens: list[torch.Tensor],
+        input_ids: torch.Tensor,
+        *,
+        start_positions: list[int],
+        caches: list[Qwen38DSparkPagedCache],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run a real batch with ragged committed suffixes and private anchors.
+
+        Each context is [1, S_i, taps*H], ending at start_positions[i].
+        Returns [B, noise_width, H] and the noisy input IDs [B, noise_width].
+        The shared forward protocol's B=1/dense entry is unchanged. All
+        reservations and stream/completion ownership remain with the caller.
+        Context is published before noise; a later failure does not roll it
+        back. Callers must not replay an already appended suffix on failure.
+        """
+        self._validate_paged_batch(main_hiddens, start_positions, caches)
+        anchor = _anchor_ids(input_ids)
+        device = caches[0].segment.k_cache[0].device
+        if anchor.shape != (len(caches),) or anchor.device != device or anchor.dtype != torch.int64:
+            raise ValueError("paged batch needs one CUDA int64 anchor per request")
+        if any(
+            end + self.noise_width > self.rotary_emb.cos_sin_cache.shape[0]
+            for end in start_positions
+        ):
+            raise ValueError("draft noise exceeds the rotary position range")
+        if len(caches) == 1:
+            return self.forward_draft(
+                main_hiddens[0], input_ids, start_pos=start_positions[0], caches=caches[0]
+            )
+        self._append_paged_context_batched(main_hiddens, start_positions, caches)
+        lengths = tuple(start_positions)
+        page_table = self._paged_batch_table.prepare(caches, lengths)
+        noise_positions = torch.stack([
+            torch.arange(end, end + self.noise_width, device=device) for end in lengths
+        ])
+        hidden = self._embed_noise(input_ids)
+        draft_ids = anchor.new_full((len(caches), self.noise_width), self.mask_token_id)
+        draft_ids[:, 0] = anchor
+        segment = caches[0].segment
+        for index, layer in enumerate(self.layers):
+            hidden = layer(
+                hidden, segment.k_cache[index], segment.v_cache[index],
+                noise_positions, self.rotary_emb.cos_sin_cache,
+                page_table=page_table, context_length=lengths,
+            )
+        return self.norm(hidden), draft_ids
 
     def forward_draft(
         self,
@@ -801,7 +1012,7 @@ def _build_rope(config: Qwen38DSparkConfig) -> YaRNScalingRotaryEmbedding:
 def _cos_sin(
     cache: torch.Tensor, positions: torch.Tensor, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Index a rotary cache into ``(cos, sin)`` shaped ``[1, 1, S, D]``.
+    """Index shared [S] or request-specific [B, S] positions into cos/sin.
 
     gLLM's ``RotaryEmbedding`` applies RoPE through a fused op that takes one
     position tensor for *both* q and k.  The dual-source block cannot use it:
@@ -820,6 +1031,8 @@ def _cos_sin(
     # half is the same rotation, written the other way round.
     cos = torch.cat([cos_half, cos_half], dim=-1)
     sin = torch.cat([sin_half, sin_half], dim=-1)
+    if positions.ndim == 2:
+        return cos[:, None], sin[:, None]
     return cos[None, None], sin[None, None]
 
 
