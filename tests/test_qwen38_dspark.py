@@ -6093,3 +6093,129 @@ def test_dspark_lifecycle_shared_arena_cancel_preempt_rebind_and_frontend_progre
         segment.free(page)
     torch.cuda.synchronize()
     assert arena.allocator.num_used_physical_pages == before
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("batch", [2, 4])
+@torch.no_grad()
+def test_dspark_capacity_shared_arena_reservation_failure_recovers_requests(batch, monkeypatch):
+    """Allocator exhaustion itself must trigger retraction and frontend progress."""
+    from collections import Counter
+
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.scheduling.scheduler import Scheduler
+    from gllm.workers.worker import Worker
+
+    runner, _ = _dspark_runtime_fixture(batch=batch)
+    manager = runner.memory_manager
+    arena = _init_dspark_runtime_test_arena(runner, arena_capacity=64)
+    initial_pages = arena.allocator.num_used_physical_pages
+    worker = Worker.__new__(Worker)
+    worker.model_runner = runner
+    scheduler = worker.scheduler = Scheduler(1, runner, "chunked_prefill")
+    scheduler.log = False
+    seqs = [
+        GenerationSequence(301 + row, list(range(1, 4 + row)), [],
+                           output_len=20 - row, temperature=0)
+        for row in range(batch)
+    ]
+    frontend, mirrors, retired, _ = _dspark_lifecycle_frontend(seqs)
+    scheduler.add_new_requests(seqs)
+    for _ in range(2):
+        worker.schedule_forward()
+        frontend._apply_ipc_package(scheduler.process_output())
+    assert all(runner._dspark_requests[seq.seq_id].phase == "verify" for seq in seqs)
+    histories = {seq.seq_id: list(seq.token_ids) for seq in seqs}
+    raw_lengths = {seq.seq_id: seq.raw_prompt_len for seq in seqs}
+
+    # Hold otherwise idle arena capacity in a test owner. Existing requests
+    # have one target/draft page each; growing either cache must now fail.
+    # Retracting one real request returns both types plus its GDN slots,
+    # enough for a peer's two-page context and subsequent recomputation.
+    cache_type = manager.segment.id_allocator.cache_type
+    held = []
+    while True:
+        claim = arena.allocator.allocate(cache_type, 1)
+        if claim is None:
+            break
+        held.extend(claim)
+    assert held
+
+    failures, retracted = [], []
+    original_reserve = manager.reserve_dspark_pages
+
+    def observe_reserve(seq, cache, **kwargs):
+        reserved = original_reserve(seq, cache, **kwargs)
+        if not reserved:
+            failures.append(seq.seq_id)
+        return reserved
+    monkeypatch.setattr(manager, "reserve_dspark_pages", observe_reserve)
+    original_free = runner.free
+
+    def observe_free(seq):
+        state = runner._dspark_requests.get(seq.seq_id)
+        retracting = state is not None and not seq.is_finish and not seq.is_abort
+        if retracting:
+            event, epoch = state.last_use, seq._cache_epoch
+            history = list(seq.token_ids)
+            peers = []
+            for peer in seqs:
+                other = runner._dspark_requests.get(peer.seq_id)
+                if peer is not seq and other is not None:
+                    slots = list(peer.ssm_block_table)
+                    values = (
+                        sum(_read_paged_context(manager.segment, peer, peer.computed_token_num), [])
+                        + sum(_read_paged_context(manager.dspark_segment, other.cache,
+                                                  other.cache.context_length), [])
+                        + [manager.ssm_segment.conv_state[:, slots],
+                           manager.ssm_segment.temporal_state[:, slots]]
+                    )
+                    peers.append((peer, other, slots, [value.clone() for value in values]))
+        original_free(seq)
+        if retracting:
+            assert event.query() and seq._cache_epoch == epoch
+            assert not state.cache.page_table and state.cache._device_page_table is None
+            assert state.anchor is state.pending_hidden is state.inflight is None
+            assert seq.token_ids == history
+            for peer, other, slots, saved in peers:
+                values = (
+                    sum(_read_paged_context(manager.segment, peer, peer.computed_token_num), [])
+                    + sum(_read_paged_context(manager.dspark_segment, other.cache,
+                                              other.cache.context_length), [])
+                    + [manager.ssm_segment.conv_state[:, slots],
+                       manager.ssm_segment.temporal_state[:, slots]]
+                )
+                for actual, expected in zip(values, saved):
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            retracted.append(seq.seq_id)
+    monkeypatch.setattr(runner, "free", observe_free)
+
+    try:
+        for _ in range(512):
+            worker.schedule_forward()
+            package = scheduler.process_output()
+            if package is not None:
+                assert not package.request_errors
+                frontend._apply_ipc_package(package)
+            cleanup = scheduler.check_abort_seqs()
+            if cleanup is not None:
+                assert not cleanup.request_errors
+                frontend._apply_ipc_package(cleanup)
+            for seq in seqs:
+                assert mirrors[id(seq)].token_ids == seq.token_ids
+                assert seq.token_ids[:len(histories[seq.seq_id])] == histories[seq.seq_id]
+                assert seq.raw_prompt_len == raw_lengths[seq.seq_id]
+            if not frontend.running_maps:
+                break
+        assert failures and retracted and scheduler.num_preempt_seqs == len(retracted)
+        assert all(next(seq for seq in seqs if seq.seq_id == sid)._cache_epoch > 0
+                   for sid in retracted)
+        assert Counter(retired) == Counter(seq.seq_id for seq in seqs)
+        assert all(seq.is_finish and len(seq) - seq.raw_prompt_len == seq.output_len for seq in seqs)
+        assert not runner._dspark_requests and not scheduler.batch_running
+        assert not scheduler.seqs_to_prefill and not scheduler.seqs_to_decode
+    finally:
+        arena.allocator.free(cache_type, held)
+    torch.cuda.synchronize()
+    assert arena.allocator.num_used_physical_pages == initial_pages

@@ -16,6 +16,56 @@ def reject_dspark_request(scheduler, seq, message):
     scheduler._pending_request_errors[seq.seq_id] = message
 
 
+def _recover_dspark_capacity(scheduler, blocked):
+    """Retract one competing owner only when no queued phase can progress.
+
+    Retry the actual joint target/draft/GDN reservation on the next tick.
+    A KV-only free-page estimate cannot prove that the shared arena fits.
+    Keep new admissions out until the retained owner retires, so recomputing
+    a victim cannot immediately recreate the same pressure.
+    """
+    if not blocked or scheduler.batch_running:
+        return
+    runner = scheduler.model_runner
+    resident = [
+        item for item in blocked
+        if runner._dspark_requests.get(item[1].seq_id) is item[2]
+    ]
+    recovery = getattr(scheduler, "_dspark_recovery_owner", None)
+    queue, seq, state = next(
+        (item for item in resident if item[2] is recovery),
+        resident[0] if resident else blocked[0],
+    )
+    victims = [
+        (other_queue, other)
+        for other_queue in (scheduler.seqs_to_decode, scheduler.seqs_to_prefill)
+        for other in other_queue
+        if other.seq_id != seq.seq_id and other.seq_id in runner._dspark_requests
+        and other.seq_id not in scheduler.abort_ids and not other.is_abort
+    ]
+    if victims:
+        victim_queue, victim = max(
+            victims, key=lambda item: len(item[1].page_table) + len(
+                runner._dspark_requests[item[1].seq_id].cache.page_table
+            ),
+        )
+        # Runner.free waits for this owner's last GPU use before releasing
+        # either cache or GDN slots. Only then may preempt reset its epoch.
+        runner.free(victim)
+        victim_queue.remove(victim)
+        victim.preempt()
+        scheduler.seqs_to_prefill.append(victim)
+        scheduler.num_preempt_seqs += 1
+        scheduler._dspark_recovery_owner = state
+    elif not any(owner != seq.seq_id for owner in runner._dspark_requests):
+        # The reservation just failed without competing request owners.
+        # Retrying/recomputing the same exclusive demand cannot add capacity.
+        queue.remove(seq)
+        scheduler._reject_dspark_request(
+            seq, "Insufficient cache capacity for the DSpark phase even without concurrent owners"
+        )
+
+
 def schedule_dspark(scheduler):
     """Select a homogeneous phase, respecting admission and total token limits.
 
@@ -30,6 +80,10 @@ def schedule_dspark(scheduler):
         else (scheduler.seqs_to_decode, scheduler.seqs_to_prefill)
     )
     runner = scheduler.model_runner
+    recovery = getattr(scheduler, "_dspark_recovery_owner", None)
+    if recovery is not None and runner._dspark_requests.get(recovery.seq_id) is not recovery:
+        scheduler._dspark_recovery_owner = recovery = None
+    blocked = []
     for queue in queues:
         selected, phase = [], None
         budget = scheduler.max_num_batched_tokens
@@ -44,7 +98,9 @@ def schedule_dspark(scheduler):
                 if capacity == 1:
                     return []
                 continue
-            if seq.seq_id not in runner._dspark_requests and len(runner._dspark_requests) >= capacity:
+            if seq.seq_id not in runner._dspark_requests and (
+                len(runner._dspark_requests) >= capacity or recovery is not None
+            ):
                 queue.append(seq)
                 continue
             try:
@@ -80,7 +136,7 @@ def schedule_dspark(scheduler):
                 if capacity == 1:
                     return []
                 continue
-            reserved = False
+            reserved = rejected = False
             while True:
                 end = seq.computed_token_num + count
                 try:
@@ -96,17 +152,20 @@ def schedule_dspark(scheduler):
                         raise
                     runner.complete_dspark_failed_step(seq)
                     scheduler._reject_dspark_request(seq, str(exc))
+                    rejected = True
                     break
                 if reserved:
                     break
                 if state.phase != "prefill" or count == 1:
-                    scheduler._reject_dspark_request(
-                        seq, "Insufficient cache capacity for the DSpark phase"
-                    )
                     break
                 count = max(1, count // 2)
             if not reserved:
+                if not rejected:
+                    seq.to_compute_token_num = 0
+                    queue.append(seq)
+                    blocked.append((queue, seq, state))
                 if capacity == 1:
+                    _recover_dspark_capacity(scheduler, blocked)
                     return []
                 continue
             seq.to_compute_token_num = count
@@ -116,6 +175,7 @@ def schedule_dspark(scheduler):
         if selected:
             scheduler._dspark_prefer_prefill = queue is scheduler.seqs_to_decode
             return selected
+    _recover_dspark_capacity(scheduler, blocked)
     return []
 
 
