@@ -103,7 +103,7 @@ class EngineConfig:
             raise ValueError("mtp conflicts with mtp_enabled=False")
         if backend == "dspark":
             required = {
-                "tp_size": 1, "pp_size": 1, "dp_size": 1, "maxd": 1,
+                "tp_size": 1, "pp_size": 1, "dp_size": 1,
                 "overlap_scheduling": False, "enable_prefix_caching": False,
                 "disable_cuda_graph": True, "piecewise_cuda_graph": False,
                 "schedule_method": "chunked_prefill", "attention_backend": "fa3",
@@ -112,8 +112,10 @@ class EngineConfig:
             for name, value in required.items():
                 if getattr(self, name) != value:
                     raise ValueError(f"DSpark requires {name}={value!r}")
-            if self.maxp < 8:
-                raise ValueError("DSpark requires maxp >= 8")
+            if type(self.maxd) is not int or self.maxd < 1:
+                raise ValueError("DSpark requires maxd >= 1")
+            if self.maxp < 8 * self.maxd:
+                raise ValueError("DSpark requires maxp >= 8 * maxd")
             if self.disagg_config is not None or self.assigned_layers is not None:
                 raise ValueError("DSpark does not support disaggregation or assigned_layers")
 

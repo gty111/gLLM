@@ -397,6 +397,9 @@ class ModelRunner(
                     self.max_num_batched_tokens
                 )
 
+        if getattr(self, "dspark_enabled", False) and self.max_num_batched_tokens < 8 * self.max_running_seqs:
+            raise ValueError("DSpark effective token budget must cover 8 * maxd verify rows")
+
     def resolve_model_max_length(self, model_max_length):
         if model_max_length is None:
             if self.tokenizer.model_max_length != VERY_LARGE_INTEGER:
@@ -960,8 +963,11 @@ class ModelRunner(
         self, seqs: List[GenerationSequence] = None, input_data: InputData = None
     ):
         if getattr(self, "dspark_enabled", False):
-            if input_data is not None or seqs is None or len(seqs) != 1:
-                raise ValueError("DSpark input preparation requires one live request")
+            if (
+                input_data is not None or not seqs
+                or len(seqs) > getattr(self, "max_running_seqs", getattr(self, "maxd", 1))
+            ):
+                raise ValueError("DSpark input preparation requires a nonempty live batch within capacity")
             # Per-phase dispatch reserves storage before building GPU metadata.
             self.input_data.seqs = seqs
             return
@@ -1073,7 +1079,10 @@ class ModelRunner(
             self._prepare_attention_metadata(self.input_data)
             if getattr(self, "dspark_enabled", False):
                 self.dspark_profile = profile_dspark_prefill(
-                    self.model, self.dspark, self.input_data
+                    self.model, self.dspark, self.input_data,
+                    max_running_seqs=getattr(self, "max_running_seqs", getattr(self, "maxd", 1)),
+                    uses_mrope=self.uses_mrope,
+                    prepare_attention=self._prepare_attention_metadata,
                 )
             elif is_first_pp_rank():
                 self.model(self.input_data)
@@ -1098,6 +1107,7 @@ class ModelRunner(
             max_prompt_tokens=self.max_num_batched_tokens,
             model_max_length=self.model_max_length, uses_mrope=self.uses_mrope,
             prepare_attention=self._prepare_attention_metadata,
+            max_running_seqs=getattr(self, "max_running_seqs", getattr(self, "maxd", 1)),
         )
         self.dspark_profile.update(profile)
 
@@ -1281,8 +1291,10 @@ class ModelRunner(
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
         if getattr(self, "dspark_enabled", False):
-            if dp_padded_size is not None or len(self.input_data.seqs) != 1:
-                raise ValueError("DSpark runtime requires one unpadded request")
+            if dp_padded_size is not None or not self.input_data.seqs:
+                raise ValueError("DSpark runtime requires a nonempty unpadded batch")
+            if len(self.input_data.seqs) > 1:
+                return self._execute_dspark_batch(self.input_data.seqs)
             seq = self.input_data.seqs[0]
             state = self._dspark_requests.get(seq.seq_id)
             if state is None or state.phase in ("prefill", "bootstrap"):

@@ -1256,13 +1256,17 @@ class Qwen3_5Model(nn.Module):
         next layer's input norm (and before the final norm for the last block).
         Unlike the final hidden, these features are not post-norm outputs.
 
-        This inference-only entry point supports one pure-text request with
-        TP=PP=DP=1. It does not select accepted rows or advance draft history.
+        Pure-text requests are packed in InputData query order. The caller
+        splits the owned taps with the same query offsets; the leading one
+        dimension is retained for the draft context interface. TP=PP=DP=1;
+        this does not select accepted rows or advance any draft history.
         """
         if (get_tp_size(), get_pp_size(), get_dp_size()) != (1, 1, 1):
             raise ValueError("Qwen3.5 hidden taps require TP=PP=DP=1")
-        if len(input_data.seqs) != 1 or input_data.seqs[0].mm_contents is not None:
-            raise ValueError("Qwen3.5 hidden taps require one pure-text request")
+        if not input_data.seqs or any(
+            seq.mm_contents is not None for seq in input_data.seqs
+        ):
+            raise ValueError("Qwen3.5 hidden taps require pure-text requests")
         layer_ids = tuple(target_layer_ids)
         if (
             not layer_ids

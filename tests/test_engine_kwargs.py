@@ -120,7 +120,7 @@ def test_explicit_backend_resolves_head_construction(backend, enabled, layers, e
     ({"dspark_model_path": None}, "dspark_model_path"),
     ({"mtp_enabled": True}, "mtp_enabled"),
     ({"tp_size": 2}, "tp_size"), ({"pp_size": 2}, "pp_size"),
-    ({"dp_size": 2}, "dp_size"), ({"maxd": 2}, "maxd"),
+    ({"dp_size": 2}, "dp_size"), ({"maxd": 0}, "maxd"),
     ({"overlap_scheduling": True}, "overlap_scheduling"),
     ({"enable_prefix_caching": True}, "enable_prefix_caching"),
     ({"disable_cuda_graph": False}, "disable_cuda_graph"),
@@ -264,7 +264,7 @@ def test_dspark_request_dispatch_rejects_an_unprepared_batch():
     runner = ModelRunner.__new__(ModelRunner)
     runner.dspark_enabled = True
     runner.input_data = SimpleNamespace(seqs=[])
-    with pytest.raises(ValueError, match="one unpadded request"):
+    with pytest.raises(ValueError, match="unpadded batch"):
         runner.step_once()
 
 
@@ -293,6 +293,40 @@ def test_dspark_input_preparation_rejects_invalid_batches_before_materialization
         seqs.append(object())
     else:
         prebuilt = object()
-    with pytest.raises(ValueError, match="one live request"):
+    with pytest.raises(ValueError, match="live batch"):
         runner.prepare_input(seqs, input_data=prebuilt)
     assert runner.input_data.seqs is previous
+
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_dspark_config_accepts_a_full_verify_batch_token_budget(batch):
+    values = _dspark_engine_options()
+    values.update(maxd=batch, maxp=8 * batch)
+    config = EngineConfig(**values)
+    assert config.maxd == batch and config.maxp == 8 * batch
+    assert not config.resolve_mtp_enabled("Qwen3_5ForConditionalGeneration", 1)
+
+
+@pytest.mark.parametrize("batch,tokens", [(2, 15), (4, 31)])
+def test_dspark_config_rejects_a_partial_maximum_verify_window(batch, tokens):
+    values = _dspark_engine_options()
+    values.update(maxd=batch, maxp=tokens)
+    with pytest.raises(ValueError, match="maxp >= 8"):
+        EngineConfig(**values)
+
+
+def test_dspark_prepare_and_dispatch_delegates_a_supported_batch(monkeypatch):
+    from types import SimpleNamespace
+    from gllm.runtime.model_runner import ModelRunner
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.dspark_enabled, runner.max_running_seqs = True, 2
+    runner.input_data = SimpleNamespace(seqs=[])
+    seqs, delegated = [object(), object()], []
+    expected = object()
+    def execute(batch):
+        delegated.append(batch)
+        return expected
+    runner._execute_dspark_batch = execute
+    runner.prepare_input(seqs)
+    assert runner.step_once() is expected
+    assert delegated == [seqs]

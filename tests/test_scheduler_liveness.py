@@ -383,3 +383,285 @@ def test_dspark_finalize_error_notifies_frontend_once(
     assert not scheduler._pending_request_errors
     assert scheduler.check_abort_seqs() is None
     assert scheduler._pending_follower_frees == [seq.seq_id]
+
+
+def test_dspark_scheduler_batch_skips_blocked_admission_and_runs_resident_decode(
+    prefix_manager, make_scheduler
+):
+    from types import SimpleNamespace
+
+    scheduler, calls = _dspark_scheduler_spy(prefix_manager, make_scheduler)
+    runner = scheduler.model_runner
+    runner.maxd, runner.max_num_batched_tokens = 2, 16
+    states = {}
+    active = []
+    for index in (101, 102):
+        seq = GenerationSequence(index, [1, 2, 3], [], output_len=16, temperature=0)
+        seq.computed_token_num = seq.prompt_len
+        active.append(seq)
+        states[index] = SimpleNamespace(phase="verify")
+    runner._dspark_requests = states
+    runner._get_dspark_request = lambda seq: states[seq.seq_id]
+    waiting = GenerationSequence(103, [1, 2], [], output_len=16, temperature=0)
+    scheduler.add_new_requests([waiting])
+    scheduler.seqs_to_decode.extend(active)
+    scheduler._dspark_prefer_prefill = True
+    assert scheduler.schedule_once() == active
+    assert sum(seq.to_compute_token_num for seq in active) == 16
+    assert list(scheduler.seqs_to_prefill) == [waiting]
+    assert calls == [(11, 11), (11, 11)]
+
+
+def test_dspark_scheduler_batch_groups_phases_and_defers_other_ready_owners(
+    prefix_manager, make_scheduler
+):
+    from types import SimpleNamespace
+
+    scheduler, calls = _dspark_scheduler_spy(prefix_manager, make_scheduler)
+    runner = scheduler.model_runner
+    runner.maxd, runner.max_num_batched_tokens = 3, 24
+    seqs = [GenerationSequence(index, [1, 2, 3], [], output_len=16, temperature=0)
+            for index in (111, 112, 113)]
+    for seq in seqs:
+        seq.computed_token_num = seq.prompt_len
+    states = {seq.seq_id: SimpleNamespace(phase=phase)
+              for seq, phase in zip(seqs, ("verify", "bootstrap", "verify"))}
+    runner._dspark_requests = states
+    runner._get_dspark_request = lambda seq: states[seq.seq_id]
+    scheduler.seqs_to_decode.extend(seqs)
+    assert scheduler.schedule_once() == [seqs[0], seqs[2]]
+    assert calls == [(11, 11), (11, 11)]
+    assert list(scheduler.seqs_to_decode) == [seqs[1]]
+    assert seqs[1].to_compute_token_num == 0
+
+
+
+def _dspark_capacity_scheduler(batch=2):
+    """Real scheduler/request cleanup with CPU joint-reservation failure control."""
+    from types import MethodType, SimpleNamespace
+    from gllm.scheduling.scheduler import Scheduler
+    from gllm.speculative.dspark import DSparkRequestState
+    from gllm.speculative.dspark_execution import DSparkExecutionMixin
+
+    calls, freed = [], []
+    manager = SimpleNamespace()
+    runner = SimpleNamespace(
+        dspark_enabled=True, mtp_enabled=False, memory_manager=manager,
+        maxd=batch, max_running_seqs=batch, maxp=8 * batch,
+        max_num_batched_tokens=8 * batch, minp=1, iterp=1, page_size=16,
+        init_new_token_ratio=0.1, min_new_token_ratio=0.1,
+        _dspark_requests={}, can_reserve=lambda seq: True,
+    )
+    runner._validate_dspark_request = lambda seq: None
+    runner._get_dspark_request = MethodType(DSparkExecutionMixin._get_dspark_request, runner)
+    runner._reserve_dspark_step = MethodType(DSparkExecutionMixin._reserve_dspark_step, runner)
+    runner._dspark_verify_fits = lambda seq: True
+
+    def reserve(seq, cache, *, target_length, draft_length):
+        allowed = runner.can_reserve(seq)
+        calls.append((seq.seq_id, target_length, draft_length, allowed))
+        if not allowed:
+            return False
+        for table, length in ((seq.page_table, target_length), (cache.page_table, draft_length)):
+            while len(table) * 16 < length:
+                table.append(seq.seq_id * 16 + len(table))
+        if seq.ssm_block_table is None:
+            seq.ssm_block_table = list(range(seq.seq_id * 8, seq.seq_id * 8 + 8))
+            seq.recurrent_state_slot = seq.ssm_block_table[0]
+        return True
+
+    def release(seq):
+        freed.append(seq.seq_id)
+        seq.page_table.clear()
+        seq.ssm_block_table = None
+        seq.recurrent_state_slot = None
+
+    def release_owned(seq, cache):
+        cache.reset()
+        release(seq)
+
+    manager.reserve_dspark_pages = reserve
+    manager.free_dspark_cache = release_owned
+
+    def free(seq):
+        if not DSparkExecutionMixin._free_dspark_request(runner, seq):
+            release(seq)
+    runner.free = free
+    scheduler = Scheduler(1, runner, "chunked_prefill")
+    scheduler.log = False
+
+    class Event:
+        waited = False
+
+        def synchronize(self):
+            self.waited = True
+
+    def own(seq, phase="verify"):
+        # Prime an already computed owner; fresh public requests must start at zero.
+        state = DSparkRequestState(seq.seq_id, seq._cache_epoch, phase=phase)
+        assert runner._reserve_dspark_step(
+            seq, state, target_length=seq.computed_token_num,
+            draft_length=seq.computed_token_num,
+        )
+        state.cache.context_length = seq.computed_token_num
+        state.last_use = Event()
+        return state
+
+    return SimpleNamespace(scheduler=scheduler, runner=runner, own=own, calls=calls, freed=freed)
+
+
+def test_dspark_capacity_defers_new_admission_until_peer_retires():
+    from gllm.distributed.comm import IPCPackage
+
+    fixture = _dspark_capacity_scheduler()
+    scheduler, runner = fixture.scheduler, fixture.runner
+    peer = GenerationSequence(201, list(range(13)), [], output_len=32, temperature=0)
+    peer.computed_token_num = peer.prompt_len
+    fixture.own(peer)
+    waiting = GenerationSequence(202, [1, 2], [], output_len=4, temperature=0)
+    scheduler.seqs_to_decode.append(peer)
+    scheduler.add_new_requests([waiting])
+    runner.can_reserve = lambda seq: seq is peer or peer.seq_id not in runner._dspark_requests
+    assert scheduler.schedule_once() == [peer]
+    assert list(scheduler.seqs_to_prefill) == [waiting]
+    assert not scheduler._pending_request_errors and scheduler.num_preempt_seqs == 0
+    scheduler.batch_running.popleft()
+    scheduler._retire_seq(peer, IPCPackage([]))
+    assert scheduler.schedule_once() == [waiting]
+    assert not scheduler._pending_request_errors
+
+
+@pytest.mark.parametrize("phase", ["prefill", "verify"])
+def test_dspark_capacity_retracts_blocked_owners_and_keeps_readmissions_out(phase):
+    from gllm.distributed.comm import IPCPackage
+
+    fixture = _dspark_capacity_scheduler()
+    scheduler, runner = fixture.scheduler, fixture.runner
+    seqs = [
+        GenerationSequence(sid, list(range(32 if phase == "prefill" else 13)), [],
+                           output_len=32, temperature=0)
+        for sid in (211, 212)
+    ]
+    for seq in seqs:
+        seq.computed_token_num = 4 if phase == "prefill" else seq.prompt_len
+        fixture.own(seq, phase)
+    first, victim = seqs
+    old_state = runner._dspark_requests[victim.seq_id]
+    event, history, epoch = old_state.last_use, list(victim.token_ids), victim._cache_epoch
+    queue = scheduler.seqs_to_prefill if phase == "prefill" else scheduler.seqs_to_decode
+    queue.extend(seqs)
+    runner.can_reserve = lambda seq: len(runner._dspark_requests) < 2
+    assert scheduler.schedule_once() == []
+    assert scheduler.num_preempt_seqs == 1 and fixture.freed == [victim.seq_id]
+    assert event.waited and victim._cache_epoch == epoch + 1
+    assert victim.token_ids == history and victim.computed_token_num == 0
+    assert old_state.cache.context_length == 0 and not old_state.cache.page_table
+    assert scheduler.check_abort_seqs() is None
+    assert not scheduler._pending_follower_frees
+    assert scheduler.schedule_once() == [first]
+    assert victim.seq_id not in runner._dspark_requests
+    assert not scheduler._pending_request_errors
+    scheduler.batch_running.popleft()
+    scheduler._retire_seq(first, IPCPackage([]))
+    assert scheduler.schedule_once() == [victim]
+    assert runner._dspark_requests[victim.seq_id] is not old_state
+    assert runner._dspark_requests[victim.seq_id].cache_epoch == epoch + 1
+    assert scheduler._dspark_recovery_owner is None
+
+
+def test_dspark_capacity_preserves_a_selected_batch_and_its_waiting_peer():
+    fixture = _dspark_capacity_scheduler()
+    scheduler, runner = fixture.scheduler, fixture.runner
+    seqs = [GenerationSequence(sid, list(range(13)), [], output_len=32, temperature=0)
+            for sid in (221, 222)]
+    for seq in seqs:
+        seq.computed_token_num = seq.prompt_len
+        fixture.own(seq)
+    scheduler.seqs_to_decode.extend(seqs)
+    runner.can_reserve = lambda seq: seq is seqs[0]
+    assert scheduler.schedule_once() == [seqs[0]]
+    assert list(scheduler.seqs_to_decode) == [seqs[1]]
+    assert not fixture.freed and not scheduler._pending_request_errors
+    assert scheduler.num_preempt_seqs == 0
+
+
+def test_dspark_capacity_retries_joint_demand_after_more_than_one_retraction():
+    fixture = _dspark_capacity_scheduler(batch=3)
+    scheduler, runner = fixture.scheduler, fixture.runner
+    seqs = [GenerationSequence(sid, list(range(13)), [], output_len=32, temperature=0)
+            for sid in (231, 232, 233)]
+    for seq in seqs:
+        seq.computed_token_num = seq.prompt_len
+        fixture.own(seq)
+    scheduler.seqs_to_decode.extend(seqs)
+    runner.can_reserve = lambda seq: len(runner._dspark_requests) == 1
+    assert scheduler.schedule_once() == []
+    assert scheduler.schedule_once() == []
+    assert scheduler.num_preempt_seqs == 2
+    assert scheduler.schedule_once() == [seqs[0]]
+    assert len(scheduler.seqs_to_prefill) == 2
+    assert not scheduler._pending_request_errors
+    assert not scheduler._pending_follower_frees
+
+
+def test_dspark_capacity_reports_exclusive_failure_once_and_runs_next_request():
+    fixture = _dspark_capacity_scheduler()
+    scheduler, runner = fixture.scheduler, fixture.runner
+    owner = GenerationSequence(241, list(range(13)), [], output_len=32, temperature=0)
+    owner.computed_token_num = owner.prompt_len
+    state = fixture.own(owner)
+    event = state.last_use
+    waiting = GenerationSequence(242, [1], [], output_len=1, temperature=0)
+    scheduler.seqs_to_decode.append(owner)
+    scheduler.add_new_requests([waiting])
+    scheduler._dspark_recovery_owner = state
+    runner.can_reserve = lambda seq: seq is waiting
+    assert scheduler.schedule_once() == []
+    package = scheduler.check_abort_seqs()
+    assert package.free_ids == [owner.seq_id]
+    assert "without concurrent owners" in package.request_errors[owner.seq_id]
+    assert scheduler.check_abort_seqs() is None
+    assert fixture.freed == [owner.seq_id] and event.waited
+    assert scheduler.schedule_once() == [waiting]
+
+
+def test_dspark_capacity_completion_failure_propagates_before_queue_reset():
+    from types import SimpleNamespace
+
+    fixture = _dspark_capacity_scheduler()
+    scheduler, runner = fixture.scheduler, fixture.runner
+    seqs = [GenerationSequence(sid, list(range(13)), [], output_len=32, temperature=0)
+            for sid in (251, 252)]
+    for seq in seqs:
+        seq.computed_token_num = seq.prompt_len
+        fixture.own(seq)
+    scheduler.seqs_to_decode.extend(seqs)
+    runner.can_reserve = lambda seq: False
+
+    def fail():
+        raise RuntimeError("completion failed")
+    runner._dspark_requests[seqs[1].seq_id].last_use = SimpleNamespace(synchronize=fail)
+    with pytest.raises(RuntimeError, match="completion failed"):
+        scheduler.schedule_once()
+    assert not fixture.freed and scheduler.num_preempt_seqs == 0
+    assert set(runner._dspark_requests) == {seq.seq_id for seq in seqs}
+    assert list(scheduler.seqs_to_decode) == seqs
+    assert not scheduler._pending_request_errors
+
+
+def test_dspark_capacity_aborted_recovery_owner_does_not_block_admission():
+    fixture = _dspark_capacity_scheduler()
+    scheduler, runner = fixture.scheduler, fixture.runner
+    seqs = [GenerationSequence(sid, list(range(13)), [], output_len=32, temperature=0)
+            for sid in (261, 262)]
+    for seq in seqs:
+        seq.computed_token_num = seq.prompt_len
+        fixture.own(seq)
+    scheduler.seqs_to_decode.extend(seqs)
+    runner.can_reserve = lambda seq: len(runner._dspark_requests) < 2
+    assert scheduler.schedule_once() == []
+    scheduler.add_abort_ids([seqs[0].seq_id])
+    package = scheduler.check_abort_seqs()
+    assert package.free_ids == [seqs[0].seq_id] and not package.request_errors
+    assert scheduler.schedule_once() == [seqs[1]]
+    assert scheduler._dspark_recovery_owner is None

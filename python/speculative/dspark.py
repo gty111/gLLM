@@ -1,4 +1,4 @@
-"""Synchronous single-request DSpark prompt steps and target verification."""
+"""Synchronous DSpark prompt steps and request-owned target verification."""
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -149,16 +149,20 @@ class DSparkVerifyResult:
 def _validate_verify_input(target, data, block_size, layer_ids):
     if (get_tp_size(), get_pp_size(), get_dp_size()) != (1, 1, 1):
         raise ValueError("DSpark verify requires TP=PP=DP=1")
-    if block_size != 7 or len(data.seqs) != 1:
-        raise ValueError("DSpark verify requires one request and seven proposals")
-    seq = data.seqs[0]
-    if (
+    seqs = data.seqs
+    batch = len(seqs)
+    if block_size != 7 or not batch:
+        raise ValueError("DSpark verify requires a nonempty batch and seven proposals")
+    if len({seq.seq_id for seq in seqs}) != batch:
+        raise ValueError("DSpark verify requires distinct request IDs")
+    if any(
         seq.mm_contents is not None or not seq.computed_prompt
-        or seq.computed_token_num <= 0
+        or seq.computed_token_num <= 0 or seq.is_abort or seq.is_finish
         or (seq.temperature != 0 and seq.top_k != 1)
         or seq.repetition_penalty != 1
         or seq.structured_output is not None
         or seq.logprobs_enabled or seq.prompt_logprobs_enabled
+        for seq in seqs
     ):
         raise ValueError("DSpark verify requires a pure-text greedy decode request")
     text = getattr(target, "language_model", target)
@@ -175,19 +179,23 @@ def _validate_verify_input(target, data, block_size, layer_ids):
     if (
         plan is None or plan.materialization != MetadataMaterialization.CPU
         or not plan.device_buffers_ready or plan.gpu_patch_rows
-        or plan.query_lens != (8,) or plan.num_decodes != 0
-        or plan.num_mtp_verify_rows != 1 or plan.attention_metadata is None
-        or not getattr(seq, "_mtp_verify", False)
-        or not data.is_mtp_verify or data.num_mtp_verify_rows != 1
-        or data.num_decodes != 0 or seq.to_compute_token_num != 8
+        or plan.query_lens != (8,) * batch or plan.num_decodes != 0
+        or plan.num_mtp_verify_rows != batch or plan.attention_metadata is None
+        or any(
+            not getattr(seq, "_mtp_verify", False) or seq.to_compute_token_num != 8
+            for seq in seqs
+        )
+        or not data.is_mtp_verify or data.num_mtp_verify_rows != batch
+        or data.num_decodes != 0
     ):
         raise ValueError("DSpark verify needs prepared eight-row CPU verify metadata")
 
     manager = data.memory_manager
     kv, state = manager.segment, manager.ssm_segment
     tokens = data.get_tokens()
-    if tokens.shape != (8,) or tokens.dtype != torch.int64 or kv is None or state is None:
-        raise ValueError("DSpark verify needs eight tokens and target KV/GDN storage")
+    rows = batch * 8
+    if tokens.shape != (rows,) or tokens.dtype != torch.int64 or kv is None or state is None:
+        raise ValueError("DSpark verify needs eight tokens per request and target KV/GDN storage")
     if torch.is_autocast_enabled(tokens.device.type):
         raise ValueError("DSpark verify does not support autocast")
     banks = [backbone.embed_tokens.weight, *kv.k_cache, *kv.v_cache, state.conv_state]
@@ -201,59 +209,78 @@ def _validate_verify_input(target, data, block_size, layer_ids):
     if state.temporal_state.dtype != torch.float32 or state.temporal_state.device != tokens.device:
         raise ValueError("DSpark verify requires FP32 temporal state")
 
-    table = seq.ssm_block_table
-    if (
-        table is None or len(table) != 8 or len(set(table)) != 8
-        or any(not 0 < slot < state.num_blocks for slot in table)
-        or seq.recurrent_state_slot != table[0] or seq.ssm_num_accepted != 1
-    ):
-        raise ValueError("DSpark verify needs eight distinct GDN slots and rolling column zero")
-    start = seq.computed_token_num
-    end = start + 8
-    # The runner publishes the resolved serving bound on the text config.
-    # Reserved pages and the checkpoint window may both be larger.
+    gpu_table = data.get_ssm_block_table_2d()
+    if gpu_table is None or gpu_table.shape != (batch, 8):
+        raise ValueError("eight-column GDN device table was not materialized")
+    block_table = data.get_block_table()
+    if block_table is None or block_table.ndim != 2 or block_table.shape[0] != batch:
+        raise ValueError("target device page table does not describe the verify batch")
     context_limit = text.max_model_len
     serving_limit = getattr(text.config, "model_max_length", None)
     if serving_limit is not None:
         context_limit = min(context_limit, serving_limit)
-    if end > context_limit:
-        raise ValueError("target verify exceeds the model context window")
-    if len(seq.page_table) * kv.page_size < end:
-        raise ValueError("target KV capacity does not cover the verify window")
-    first_page, last_page = start // kv.page_size, (end - 1) // kv.page_size
-    pages = seq.page_table[first_page:last_page + 1]
-    if any(not 0 <= page < kv.num_pages for page in pages):
-        raise ValueError("invalid target page in the verify window")
+    positions, ends, slots, tables, rolling, page_checks = [], [], [], [], [], []
+    used_states, used_write_pages = set(), set()
+    for row, seq in enumerate(seqs):
+        table = seq.ssm_block_table
+        if (
+            table is None or len(table) != 8 or len(set(table)) != 8
+            or any(type(slot) is not int or not 0 < slot < state.num_blocks for slot in table)
+            or seq.recurrent_state_slot != table[0] or seq.ssm_num_accepted != 1
+        ):
+            raise ValueError("DSpark verify needs eight distinct GDN slots and rolling column zero")
+        if used_states.intersection(table):
+            raise ValueError("DSpark verify requests must own disjoint GDN slots")
+        used_states.update(table)
+        start, end = seq.computed_token_num, seq.computed_token_num + 8
+        # The runner publishes the resolved serving bound on the text config.
+        # Reserved pages and the checkpoint window may both be larger.
+        if end > context_limit:
+            raise ValueError("target verify exceeds the model context window")
+        if len(seq.page_table) * kv.page_size < end:
+            raise ValueError("target KV capacity does not cover the verify window")
+        first_page, last_page = start // kv.page_size, (end - 1) // kv.page_size
+        pages = seq.page_table[first_page:last_page + 1]
+        if any(not 0 <= page < kv.num_pages for page in pages):
+            raise ValueError("invalid target page in the verify window")
+        # Prefix sharing is disabled for DSpark. Concurrent verify windows
+        # must never write the same physical page, even at different offsets.
+        if len(set(pages)) != len(pages) or used_write_pages.intersection(pages):
+            raise ValueError("DSpark verify requests must own distinct writable KV pages")
+        used_write_pages.update(pages)
+        if block_table.shape[1] <= last_page:
+            raise ValueError("target device page table does not cover the verify window")
+        page_checks.append((block_table[row, first_page:last_page + 1], pages))
+        positions.extend(range(start, end))
+        ends.append(end)
+        slots.extend(
+            seq.page_table[pos // kv.page_size] * kv.page_size + pos % kv.page_size
+            for pos in range(start, end)
+        )
+        tables.extend(table)
+        rolling.append(table[0])
     cpu_tokens = data.tokens_cpu.tolist()
-    if len(cpu_tokens) != 8 or any(not 0 <= token < text.config.vocab_size for token in cpu_tokens):
+    if len(cpu_tokens) != rows or any(not 0 <= token < text.config.vocab_size for token in cpu_tokens):
         raise ValueError("verify token IDs are outside the target vocabulary")
-    slots = [
-        seq.page_table[pos // kv.page_size] * kv.page_size + pos % kv.page_size
-        for pos in range(start, end)
-    ]
-    gpu_table = data.get_ssm_block_table_2d()
-    if gpu_table is None or gpu_table.shape != (1, 8):
-        raise ValueError("eight-column GDN device table was not materialized")
-    positions = data.get_position()
-    expected_positions = list(range(start, end))
+    position_buffer = data.get_position()
     # Conditional text-only requests carry three identical MRoPE axes. Check
     # every axis without replacing the model's original position buffer.
-    if positions is not None and positions.shape == (3, 8):
-        positions = positions.flatten()
-        expected_positions *= 3
-    # A single bounded read catches stale GPU mirrors after column promotion.
-    # Historical KV pages remain the InputData materializer's responsibility.
+    if position_buffer is not None and position_buffer.shape == (3, rows):
+        position_buffer = position_buffer.flatten()
+        positions *= 3
+    # One bounded read validates all requests before target forward. Historical
+    # KV pages remain the InputData materializer's responsibility.
     checks = [
         (tokens, cpu_tokens),
-        (positions, expected_positions),
-        (data.get_seq_lens(), [end]),
-        (data.get_query_start_loc(), [0, 8]),
+        (position_buffer, positions),
+        (data.get_seq_lens(), ends),
+        (data.get_query_start_loc(), list(range(0, rows + 1, 8))),
         (data.get_slot_mapping(), slots),
-        (data.get_block_table()[0, first_page:last_page + 1], pages),
-        (gpu_table.flatten(), table),
-        (data.get_ssm_num_accepted(), [1]),
-        (data.get_recurrent_state_slot_per_seq(), [table[0]]),
-        (data.get_ssm_snapshot_write_slot_per_seq(), [-1]),
+        *page_checks,
+        (gpu_table.flatten(), tables),
+        (data.get_ssm_num_accepted(), [1] * batch),
+        (data.get_recurrent_state_slot_per_seq(), rolling),
+        (data.get_ssm_snapshot_write_slot_per_seq(), [-1] * batch),
     ]
     actual, expected = [], []
     for tensor, values in checks:
@@ -269,18 +296,18 @@ def _validate_verify_input(target, data, block_size, layer_ids):
         raise ValueError("verify device metadata is stale or inconsistent with the request")
     metadata = plan.attention_metadata
     if (
-        metadata.max_query_len != 8 or metadata.batch_size != 1
-        or metadata.block_table.data_ptr() != data.get_block_table().data_ptr()
+        metadata.max_query_len != 8 or metadata.batch_size != batch
+        or metadata.block_table.data_ptr() != block_table.data_ptr()
         or metadata.seq_lens.data_ptr() != data.get_seq_lens().data_ptr()
         or metadata.query_start_loc.data_ptr() != data.get_query_start_loc().data_ptr()
     ):
         raise ValueError("attention metadata does not describe the verify buffers")
     if isinstance(metadata, FlashInferPagedAttentionMetadata) and (
-        metadata.fast_path_rows != 1 or metadata.fast_path_tokens != 8
+        metadata.fast_path_rows != batch or metadata.fast_path_tokens != rows
         or metadata.fast_q_len_per_req != 8 or metadata.context_max_query_len != 0
     ):
         raise ValueError("FlashInfer metadata must use the eight-token verify partition")
-    return seq, tokens
+    return seqs, tokens
 
 
 @torch.no_grad()
@@ -291,40 +318,60 @@ def verify_dspark_target(
     block_size: int,
     target_layer_ids: Tuple[int, ...],
 ) -> DSparkVerifyResult:
-    """Verify [anchor, d1..d7] against the target's causal next-token logits.
+    """Verify one [anchor, d1..d7] window; retain the single-result API."""
+    if len(input_data.seqs) != 1:
+        raise ValueError("DSpark single-request verify requires exactly one request")
+    return verify_dspark_target_batched(
+        target, input_data, block_size=block_size, target_layer_ids=target_layer_ids
+    )[0]
 
-    The caller prepares/reserves a single greedy request on the consuming
-    stream. Activation/KV/conv are BF16; temporal state is FP32. This eager
-    path reads bounded device metadata and the accepted count on the host.
 
-    Target forward writes KV and GDN checkpoints, including column zero.
-    It cannot be retried after a partial failure without restoring/recomputing
-    the request. This call neither promotes a checkpoint nor publishes tokens
-    or advances request/draft lengths. Consume/commit the result before another
-    target forward, then materialize fresh metadata for the next call.
+@torch.no_grad()
+def verify_dspark_target_batched(
+    target: nn.Module,
+    input_data: InputData,
+    *,
+    block_size: int,
+    target_layer_ids: Tuple[int, ...],
+) -> list[DSparkVerifyResult]:
+    """Verify one packed [anchor, d1..d7] window for each request.
+
+    The caller prepares/reserves all requests on the consuming stream, with
+    BF16 activation/KV/conv and FP32 temporal state. Each consecutive eight
+    rows belongs to the corresponding input_data.seqs entry, including taps.
+
+    Target forward writes independent KV/GDN checkpoints, including column
+    zero. A partial failure is not retryable without restoring/recomputing
+    affected requests. No state is promoted or token published here. Consume
+    each owned result separately, then prepare fresh metadata; EOS/budget
+    cutoffs must select that request's actual committed checkpoint column.
     """
     layer_ids = tuple(target_layer_ids)
-    seq, tokens = _validate_verify_input(target, input_data, block_size, layer_ids)
+    seqs, tokens = _validate_verify_input(target, input_data, block_size, layer_ids)
     hidden, taps = target.forward_with_hidden_taps(
         input_data, target_layer_ids=layer_ids
     )
     # Ordinary greedy scores one row. Batched BF16 GEMM can round near-tied
     # logits differently even for the same hidden row, so retain that head
-    # shape here while keeping the target body as one eight-row forward.
+    # shape while executing the target body once for the whole packed batch.
     predictions = torch.cat([
         target.logits_from_hidden(hidden[i:i + 1]).argmax(dim=-1)
         for i in range(hidden.shape[0])
-    ], dim=0)
-    matches = predictions[:-1] == tokens[1:]
-    accepted = int(matches.to(torch.int32).cumprod(dim=0).sum().item())
-    length = 1 + accepted
-    return DSparkVerifyResult(
-        seq_id=seq.seq_id, cache_epoch=seq._cache_epoch,
-        start_pos=seq.computed_token_num, accepted_drafts=accepted,
-        committed_ids=tokens[:length].unsqueeze(0).clone(),
-        next_anchor=predictions[accepted:accepted + 1].clone(),
-        accepted_hidden=taps[:, :length].clone(),
-    )
+    ], dim=0).reshape(len(seqs), 8)
+    windows = tokens.reshape(len(seqs), 8)
+    matches = predictions[:, :-1] == windows[:, 1:]
+    accepted = matches.to(torch.int32).cumprod(dim=1).sum(dim=1).cpu().tolist()
+    results = []
+    for row, (seq, count) in enumerate(zip(seqs, accepted)):
+        length, begin = 1 + count, row * 8
+        results.append(DSparkVerifyResult(
+            seq_id=seq.seq_id, cache_epoch=seq._cache_epoch,
+            start_pos=seq.computed_token_num, accepted_drafts=count,
+            committed_ids=windows[row:row + 1, :length].clone(),
+            next_anchor=predictions[row, count:count + 1].clone(),
+            accepted_hidden=taps[:, begin:begin + length].clone(),
+        ))
+    return results
 
 
 def commit_dspark_verify_state(
