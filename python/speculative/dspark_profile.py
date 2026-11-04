@@ -58,11 +58,12 @@ def profile_dspark_prefill(
     )
     draft_output = draft.forward_head(draft_hidden, anchor)
     target_logits = target.logits_from_hidden(hidden[-8:])
+    target_predictions = target_logits.argmax(dim=-1)
     profile = {
         "prefill_tokens": taps.shape[1],
         "projected_tokens": projected.shape[1],
         "noise_rows": draft_output[0].shape[1] - 1,
-        "target_logits_rows": target_logits.shape[0],
+        "target_logits_rows": target_predictions.shape[0],
         "prefill_peak_bytes": torch.cuda.max_memory_allocated(),
         "paged_workspace_allowance_bytes": workspace.numel() * workspace.element_size(),
     }
@@ -70,7 +71,7 @@ def profile_dspark_prefill(
         # Release the completed maximum-chunk outputs before probing the
         # distinct B x 8/B x 7 shape. Cached allocator memory still covers
         # the prior peak when MemoryManager sizes the arena from free memory.
-        del hidden, taps, projected, cache, workspace, draft_hidden, draft_output, target_logits
+        del hidden, taps, projected, cache, workspace, draft_hidden, draft_output, target_logits, target_predictions
         seqs = [
             GenerationSequence(-2 - row, [0] * 8, [], output_len=8, temperature=0)
             for row in range(max_running_seqs)
@@ -103,11 +104,13 @@ def profile_dspark_prefill(
             features[:, rows - 1:rows], anchors, start_pos=rows, caches=cache
         )
         draft_output = draft.forward_head(draft_hidden, anchors)
-        for row in range(max_running_seqs * 8):
-            target.logits_from_hidden(hidden[row:row + 1]).argmax(-1)
+        # Match the verifier's packed logits allocation before arena sizing;
+        # probing one row at a time would underestimate the peak for B * 8.
+        target_logits = target.logits_from_hidden(hidden)
+        target_predictions = target_logits.argmax(dim=-1)
         profile.update(
             profile_batch_size=max_running_seqs, noise_rows=max_running_seqs * 7,
-            target_logits_rows=max_running_seqs * 8,
+            target_logits_rows=target_predictions.shape[0],
             prefill_peak_bytes=max(profile["prefill_peak_bytes"], torch.cuda.max_memory_allocated()),
             paged_workspace_allowance_bytes=workspace.numel() * workspace.element_size(),
         )

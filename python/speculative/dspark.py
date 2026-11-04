@@ -351,13 +351,10 @@ def verify_dspark_target_batched(
     hidden, taps = target.forward_with_hidden_taps(
         input_data, target_layer_ids=layer_ids
     )
-    # Ordinary greedy scores one row. Batched BF16 GEMM can round near-tied
-    # logits differently even for the same hidden row, so retain that head
-    # shape while executing the target body once for the whole packed batch.
-    predictions = torch.cat([
-        target.logits_from_hidden(hidden[i:i + 1]).argmax(dim=-1)
-        for i in range(hidden.shape[0])
-    ], dim=0).reshape(len(seqs), 8)
+    # Keep the request-major eight-row layout through one packed projection.
+    # BF16 GEMM rounding may differ from one-row greedy; batch invariance is
+    # not required, but each request must consume its own packed predictions.
+    predictions = target.logits_from_hidden(hidden).argmax(dim=-1).reshape(len(seqs), 8)
     windows = tokens.reshape(len(seqs), 8)
     matches = predictions[:, :-1] == windows[:, 1:]
     accepted = matches.to(torch.int32).cumprod(dim=1).sum(dim=1).cpu().tolist()

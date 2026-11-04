@@ -1659,7 +1659,7 @@ def _verify_contract_fixture(accepted=2):
                 embed_tokens=torch.nn.Embedding(32, 4, dtype=torch.bfloat16),
             )
             self.calls = self.head_calls = 0
-            # Tag rows so the controller head also supports one-row calls.
+            # Tag rows to preserve packed request/position identity in the head.
             self.hidden = torch.arange(8, dtype=torch.bfloat16)[:, None].expand(-1, 4).clone()
             self.taps = torch.arange(64, dtype=torch.bfloat16).reshape(1, 8, 8)
             self.logits = torch.zeros(8, 32)
@@ -1698,7 +1698,7 @@ def test_dspark_verify_selects_longest_prefix_and_owns_results(accepted):
     expected_taps = target.taps[:, :accepted + 1].clone()
     expected_next = target.logits.argmax(-1)[accepted:accepted + 1].clone()
     result = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
-    assert target.calls == 1 and target.head_calls == 8
+    assert target.calls == 1 and target.head_calls == 1
     assert result.accepted_drafts == accepted
     assert (result.seq_id, result.cache_epoch, result.start_pos) == (41, 3, 13)
     assert result.consumed is False
@@ -1713,30 +1713,46 @@ def test_dspark_verify_selects_longest_prefix_and_owns_results(accepted):
     assert result.accepted_hidden.untyped_storage().nbytes() == expected_taps.numel() * 2
 
 
-def test_dspark_verify_uses_ordinary_head_shape_for_batch_sensitive_logits(monkeypatch):
-    from gllm.speculative.dspark import verify_dspark_target
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_dspark_verify_uses_packed_choices_for_batch_sensitive_logits(monkeypatch, batch):
+    from gllm.speculative.dspark import verify_dspark_target_batched
 
-    target, data, buffers = _verify_contract_fixture(accepted=7)
+    target, data, buffers = _verify_batch_contract_fixture((7,) * batch)
     original_head = target.logits_from_hidden
+    head_rows = []
+    counts = (0, 2, 5, 7)[:batch]
+    expected_anchors = []
+    for row, count in enumerate(counts):
+        if count == 7:
+            expected_anchors.append(27 - row)
+        else:
+            expected_anchors.append((data.seqs[row].to_compute_tokens[count + 1] + 1) % 32)
 
     def batch_sensitive_head(hidden):
+        head_rows.append(hidden.shape[0])
         logits = original_head(hidden).clone()
-        if hidden.shape[0] > 1:
-            # Model a near-tied choice changed only by the head GEMM shape.
-            logits[0].zero_()
-            logits[0, int(buffers["tokens"][1]) + 1] = 10
+        if hidden.shape[0] == batch * 8:
+            # Simulate shape-dependent choices. Verification must consume the
+            # packed head, including a different cutoff in each request.
+            for row, count in enumerate(counts):
+                if count < 7:
+                    index = row * 8 + count
+                    logits[index].zero_()
+                    logits[index, expected_anchors[row]] = 10
         return logits
 
     monkeypatch.setattr(target, "logits_from_hidden", batch_sensitive_head)
-    assert target.logits_from_hidden(target.hidden).argmax(-1)[0] != (
-        target.logits_from_hidden(target.hidden[:1]).argmax(-1)[0]
-    )
-    target.head_calls = 0
-    result = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
-    assert target.calls == 1 and target.head_calls == 8
-    assert result.accepted_drafts == 7
-    torch.testing.assert_close(result.committed_ids, buffers["tokens"].unsqueeze(0))
-    assert result.next_anchor.tolist() == [27]
+    results = verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
+    assert target.calls == target.head_calls == 1
+    assert head_rows == [batch * 8]
+    assert [result.accepted_drafts for result in results] == list(counts)
+    for row, (result, count, anchor) in enumerate(zip(results, counts, expected_anchors)):
+        assert result.committed_ids.tolist() == [data.seqs[row].to_compute_tokens[:count + 1]]
+        assert result.next_anchor.tolist() == [anchor]
+        torch.testing.assert_close(
+            result.accepted_hidden, target.taps[:, row * 8:row * 8 + count + 1],
+            atol=0, rtol=0,
+        )
 
 
 @pytest.mark.parametrize("mrope", [False, True], ids=["1d", "mrope"])
@@ -1762,7 +1778,7 @@ def test_dspark_verify_accepts_conditional_wrapper_text_positions(mrope):
     wrapper.language_model = target
     result = verify_dspark_target(wrapper, data, block_size=7, target_layer_ids=(1, 0))
 
-    assert target.calls == 1 and target.head_calls == 8
+    assert target.calls == 1 and target.head_calls == 1
     assert result.accepted_drafts == 2
     torch.testing.assert_close(result.committed_ids, buffers["tokens"][:3].unsqueeze(0))
     torch.testing.assert_close(result.accepted_hidden, target.taps[:, :3], atol=0, rtol=0)
@@ -2226,7 +2242,7 @@ def test_dspark_verify_allows_window_ending_at_context_limit(
     target.max_model_len = checkpoint_limit
     target.config.model_max_length = serving_limit
     result = verify_dspark_target(target, data, block_size=7, target_layer_ids=(1, 0))
-    assert target.calls == 1 and target.head_calls == 8
+    assert target.calls == 1 and target.head_calls == 1
     assert result.accepted_drafts == 2
 
 
@@ -4760,23 +4776,23 @@ def _verify_batch_contract_fixture(accepted=(0, 7)):
     return target, data, buffers
 
 
-@pytest.mark.parametrize("accepted", [(0,), (0, 7), (0, 2, 5, 7)])
+@pytest.mark.parametrize("accepted", [
+    (0,), (7,), (0, 7), (1, 6), (0, 2, 5, 7), (1, 3, 4, 6),
+])
 @torch.no_grad()
-def test_dspark_verify_batch_owns_each_request_prefix_and_preserves_head_shape(accepted, monkeypatch):
+def test_dspark_verify_batch_owns_each_request_prefix_with_one_packed_head(accepted, monkeypatch):
     from gllm.speculative.dspark import verify_dspark_target_batched
 
     target, data, buffers = _verify_batch_contract_fixture(accepted)
     original_head = target.logits_from_hidden
     def head(hidden):
-        # A wider head call would change these choices, as with near-tied BF16 logits.
-        logits = original_head(hidden).clone()
-        if hidden.shape[0] != 1:
-            logits.zero_()
-        return logits
+        assert hidden.shape == (8 * len(accepted), 4)
+        assert torch.equal(hidden, target.hidden)
+        return original_head(hidden)
     monkeypatch.setattr(target, "logits_from_hidden", head)
     ids, taps, next_ids = buffers["tokens"].clone(), target.taps.clone(), target.logits.argmax(-1)
     results = verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
-    assert target.calls == 1 and target.head_calls == 8 * len(accepted)
+    assert target.calls == 1 and target.head_calls == 1
     assert [result.accepted_drafts for result in results] == list(accepted)
     buffers["tokens"].zero_()
     target.taps.fill_(-1)
@@ -5281,7 +5297,7 @@ def test_dspark_verify_batch_rejects_unrefreshed_device_tables_after_independent
     selected = [list(seq.ssm_block_table) for seq in data.seqs]
     with pytest.raises(ValueError, match="metadata is stale"):
         verify_dspark_target_batched(target, data, block_size=7, target_layer_ids=(1, 0))
-    assert target.calls == 1 and target.head_calls == 16
+    assert target.calls == 1 and target.head_calls == 1
     assert [seq.ssm_block_table for seq in data.seqs] == selected
     assert all(result.consumed for result in results)
 
@@ -5556,12 +5572,81 @@ def test_dspark_runtime_batch_rejects_mixed_phases_before_model_or_reservation(m
     assert len(runner.memory_manager.reservations) == reservations
 
 
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_dspark_prefill_profile_includes_packed_head_and_argmax(monkeypatch, batch):
+    """CPU allocation-shape oracle, not a measurement of GPU memory usage."""
+    from types import SimpleNamespace
+
+    from gllm.speculative.dspark_profile import profile_dspark_prefill
+
+    head_rows, argmax_rows, measured_rows = [], [], []
+    data = SimpleNamespace(tokens_cpu=torch.zeros(32, dtype=torch.long), page_size=16)
+
+    def set_input(seqs):
+        data.tokens_cpu = torch.zeros(sum(seq.to_compute_token_num for seq in seqs), dtype=torch.long)
+    data.cal_and_set_input = set_input
+    data.get_tokens = lambda: data.tokens_cpu
+
+    def forward(data, *, target_layer_ids):
+        assert target_layer_ids == (0,)
+        rows = data.tokens_cpu.numel()
+        return torch.zeros(rows, 4), torch.zeros(1, rows, 4)
+
+    class Logits:
+        def __init__(self, rows):
+            self.shape = (rows, 32)
+
+        def argmax(self, dim):
+            assert dim == -1
+            argmax_rows.append(self.shape[0])
+            return torch.zeros(self.shape[0], dtype=torch.long)
+
+    def head(hidden):
+        head_rows.append(hidden.shape[0])
+        return Logits(hidden.shape[0])
+
+    def measure():
+        # The peak read must follow both the projection and reduction for
+        # the current geometry, not merely count a total number of rows.
+        assert head_rows == argmax_rows
+        measured_rows.append(head_rows[-1])
+        return 100 * head_rows[-1]
+
+    target = SimpleNamespace(forward_with_hidden_taps=forward, logits_from_hidden=head)
+    draft = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=(0,), num_attention_heads=1, head_dim=4),
+        rotary_emb=SimpleNamespace(cos_sin_cache=torch.empty(64, 2)),
+        _project_context=lambda taps: taps,
+        prefill=lambda *args: None,
+        forward_draft=lambda *args, **kwargs: (None, None),
+        forward_head=lambda _, anchors: (torch.zeros(anchors.numel(), 8), None, None),
+    )
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", measure)
+    profile = profile_dspark_prefill(
+        target, draft, data, max_running_seqs=batch,
+        prepare_attention=lambda _: None,
+    )
+    expected = [8] if batch == 1 else [8, batch * 8]
+    assert head_rows == argmax_rows == measured_rows == expected
+    assert profile["target_logits_rows"] == batch * 8
+    assert profile["prefill_peak_bytes"] == 100 * batch * 8
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("batch", [2, 4])
 @torch.no_grad()
-def test_dspark_runtime_batch_profiles_maximum_prompt_and_full_verify_shape(batch):
+def test_dspark_runtime_batch_profiles_maximum_prompt_and_full_verify_shape(batch, monkeypatch):
     runner, _ = _dspark_runtime_fixture(batch=batch)
+    head_rows, original_head = [], runner.model.logits_from_hidden
+    def head(hidden):
+        head_rows.append(hidden.shape[0])
+        return original_head(hidden)
+    monkeypatch.setattr(runner.model, "logits_from_hidden", head)
     runner.profile_run()
+    # Arena sizing must include the full packed logits tensor, not B * 8
+    # independent one-row allocations that only report the same row total.
+    assert head_rows == [8, batch * 8]
     profile = runner.dspark_profile
     assert profile["prefill_tokens"] == profile["projected_tokens"] == 32
     assert profile["profile_batch_size"] == batch
@@ -5569,7 +5654,9 @@ def test_dspark_runtime_batch_profiles_maximum_prompt_and_full_verify_shape(batc
     assert profile["target_logits_rows"] == 8 * batch
     arena = _init_dspark_runtime_test_arena(runner, arena_capacity=64)
     before = arena.allocator.num_used_physical_pages
+    head_rows.clear()
     runner._profile_dspark_paged_verify()
+    assert head_rows[-1] == batch * 8
     assert profile["batch_prefill_tokens"] == 32
     assert profile["verify_batch_size"] == batch and profile["verify_tokens"] == 8 * batch
     assert profile["gdn_working_slots"] == 8 * batch
