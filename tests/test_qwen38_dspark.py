@@ -2649,7 +2649,12 @@ def _dspark_prompt_spy(monkeypatch, *, mrope=True):
     )
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
 
+    from gllm.runtime.input_data import InputData
+
     class Data:
+        prepare_dspark_draft_metadata = InputData.prepare_dspark_draft_metadata
+        release_dspark_draft_metadata = InputData.release_dspark_draft_metadata
+
         def cal_and_set_input(self, seqs):
             self.seqs = seqs
             seq = seqs[0]
@@ -4271,10 +4276,38 @@ def test_paged_batch_rope_keeps_each_request_absolute_positions():
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
 
+
+def _draft_runtime_context():
+    from gllm.runtime.input_data import InputData
+
+    return InputData.__new__(InputData)
+
+
+def _prepare_draft_metadata(data, caches, lengths, epochs=None):
+    from gllm.runtime.forward_metadata import DSparkDraftMetadataPlan
+
+    for cache, length in zip(caches, lengths):
+        cache.state.context_length = length
+    plan = DSparkDraftMetadataPlan(tuple(lengths), 7, tuple(epochs or [0] * len(caches)))
+    return plan.materialize(
+        data, [cache.state for cache in caches], page_size=caches[0].segment.page_size,
+        device=caches[0].segment.k_cache[0].device,
+    )
+
+
+def _forward_draft_in_runtime(model, chunks, anchors, *, start_positions, caches, input_data=None):
+    from gllm.speculative.dspark_execution import forward_dspark_draft_batch
+
+    return forward_dspark_draft_batch(
+        model, input_data if input_data is not None else _draft_runtime_context(),
+        chunks, anchors, start_positions=start_positions, caches=caches,
+        cache_epochs=[0] * len(caches),
+    )
+
 def test_paged_batch_table_reuses_grows_reorders_and_rebinds_sources(monkeypatch):
     from types import SimpleNamespace
 
-    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache, _Qwen38DSparkBatchTable
+    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache
 
     segment = SimpleNamespace(page_size=4, k_cache=[torch.empty(1)])
     def view(pages):
@@ -4283,8 +4316,11 @@ def test_paged_batch_table_reuses_grows_reorders_and_rebinds_sources(monkeypatch
         return Qwen38DSparkPagedCache(segment, state)
 
     first, second = view([7, 2, 9]), view([4, 8])
-    metadata = _Qwen38DSparkBatchTable(7)
-    table = metadata.prepare([first, second], (5, 1))
+    input_data = _draft_runtime_context()
+    def prepare(caches, lengths):
+        return _prepare_draft_metadata(input_data, caches, lengths).page_table
+    table = prepare([first, second], (5, 1))
+    metadata = input_data.dspark_draft_buffers
     pointer = table.data_ptr()
     assert torch.equal(table[:7, :2], torch.tensor([[7, 2]], dtype=torch.int32).expand(7, -1))
     assert torch.equal(table[7:, :1], torch.full((7, 1), 4, dtype=torch.int32))
@@ -4293,25 +4329,25 @@ def test_paged_batch_table_reuses_grows_reorders_and_rebinds_sources(monkeypatch
         def no_copy(*args, **kwargs):
             raise AssertionError("unchanged page bindings must not be copied again")
         context.setattr(torch.Tensor, "copy_", no_copy)
-        unchanged = metadata.prepare([first, second], (7, 2))
+        unchanged = prepare([first, second], (7, 2))
     assert unchanged.data_ptr() == pointer
 
-    grown = metadata.prepare([first, second], (9, 2))
+    grown = prepare([first, second], (9, 2))
     assert grown.shape == (14, 3)
     assert metadata.table.shape == (14, 4)
     assert torch.equal(grown[:7], torch.tensor([[7, 2, 9]], dtype=torch.int32).expand(7, -1))
-    rebound = metadata.prepare([second, first], (2, 9))
+    rebound = prepare([second, first], (2, 9))
     assert torch.equal(rebound[:7, :1], torch.full((7, 1), 4, dtype=torch.int32))
     assert torch.equal(rebound[7:, :3], torch.tensor([[7, 2, 9]], dtype=torch.int32).expand(7, -1))
 
     # Same request object and page count after reset must not retain old IDs.
     first.state.table = torch.tensor([12, 13, 14], dtype=torch.int32)
-    reused = metadata.prepare([second, first], (2, 9))
+    reused = prepare([second, first], (2, 9))
     assert torch.equal(reused[7:, :3], torch.tensor([[12, 13, 14]], dtype=torch.int32).expand(7, -1))
     replacement = view([21, 22, 23])
-    replaced = metadata.prepare([second, replacement], (2, 9))
+    replaced = prepare([second, replacement], (2, 9))
     assert torch.equal(replaced[7:, :3], torch.tensor([[21, 22, 23]], dtype=torch.int32).expand(7, -1))
-    active_only = metadata.prepare([first, second], (0, 2))
+    active_only = prepare([first, second], (0, 2))
     assert active_only.shape == (7, 1)
     assert torch.equal(active_only, torch.full((7, 1), 4, dtype=torch.int32))
 
@@ -4399,7 +4435,8 @@ def test_paged_batch_draft_matches_independent_dense_histories(monkeypatch, batc
         ) for layer in model.layers]
         projections.clear()
         history_queries.clear()
-        got, noisy_ids = model.forward_draft_batched(
+        got, noisy_ids = _forward_draft_in_runtime(
+            model,
             suffixes, anchors, start_positions=ends, caches=caches
         )
         for hook in hooks:
@@ -4430,7 +4467,8 @@ def test_paged_batch_draft_matches_independent_dense_histories(monkeypatch, batc
             assert states[index].context_length == ends[index]
 
     before = arena.backing.clone()
-    repeated, ids = model.forward_draft_batched(
+    repeated, ids = _forward_draft_in_runtime(
+        model,
         [_rows(config, 0) for _ in states], anchors, start_positions=ends, caches=caches
     )
     torch.testing.assert_close(repeated, got, rtol=0, atol=0)
@@ -4447,7 +4485,7 @@ def test_paged_batch_attention_skips_empty_history_and_never_crosses_requests(le
     from dataclasses import replace
     from types import SimpleNamespace
 
-    from gllm.models.qwen38_dspark import Qwen38DSparkAttention, Qwen38DSparkPagedCache, _Qwen38DSparkBatchTable
+    from gllm.models.qwen38_dspark import Qwen38DSparkAttention, Qwen38DSparkPagedCache
 
     torch.manual_seed(107)
     config = replace(_tensor_config(), num_hidden_layers=1)
@@ -4469,7 +4507,7 @@ def test_paged_batch_attention_skips_empty_history_and_never_crosses_requests(le
     noise_k = torch.randn(len(lengths), 2, 7, 16, device="cuda", dtype=torch.bfloat16)
     noise_v = torch.randn_like(noise_k)
     views = [Qwen38DSparkPagedCache(segment, state) for state in states]
-    table = _Qwen38DSparkBatchTable(7).prepare(views, lengths)
+    table = _prepare_draft_metadata(_draft_runtime_context(), views, lengths).page_table
     attention = SimpleNamespace(num_heads=4, num_key_value_groups=2, head_dim=16, scaling=16**-0.5)
     before = arena.backing.clone()
     got = Qwen38DSparkAttention._paged_attention(
@@ -4519,7 +4557,7 @@ def test_paged_batch_draft_rejects_invalid_request_before_any_append(monkeypatch
         monkeypatch.setattr(model.rotary_emb, "cos_sin_cache", model.rotary_emb.cos_sin_cache[:12])
     before = arena.backing.clone()
     with pytest.raises(ValueError):
-        model.forward_draft_batched(suffixes, anchors, start_positions=ends, caches=caches)
+        _forward_draft_in_runtime(model, suffixes, anchors, start_positions=ends, caches=caches)
     assert [state.context_length for state in states] == [2, 5]
     assert torch.equal(arena.backing, before)
 
@@ -4569,7 +4607,7 @@ def test_paged_batch_single_request_preserves_existing_forward_exactly():
         [prefix], segment=batched_segment, caches=batched_states
     )
     expected, expected_ids = model.forward_draft(suffix, anchor, start_pos=5, caches=single)
-    got, ids = model.forward_draft_batched([suffix], anchor, start_positions=[5], caches=batched)
+    got, ids = _forward_draft_in_runtime(model, [suffix], anchor, start_positions=[5], caches=batched)
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
     assert torch.equal(ids, expected_ids)
     for actual, reference in zip(
@@ -4595,7 +4633,8 @@ def test_paged_batch_empty_context_never_projects_or_writes(monkeypatch):
     caches = model.prefill_paged_batched(
         [_rows(config, 0), _rows(config, 0)], segment=segment, caches=states
     )
-    hidden, _ = model.forward_draft_batched(
+    hidden, _ = _forward_draft_in_runtime(
+        model,
         [_rows(config, 0), _rows(config, 0)], torch.tensor([2, 3], device="cuda"),
         start_positions=[0, 0], caches=caches,
     )
@@ -4701,14 +4740,16 @@ def test_paged_batch_noise_failure_keeps_published_context_without_duplicate_app
     monkeypatch.setattr(model.layers[0].self_attn, "forward", fail_noise)
     anchors = torch.tensor([3, 4], device="cuda")
     with pytest.raises(RuntimeError, match="batch noise failure"):
-        model.forward_draft_batched(
+        _forward_draft_in_runtime(
+            model,
             [_rows(config, 1), _rows(config, 2)], anchors,
             start_positions=[3, 7], caches=caches,
         )
     assert [state.context_length for state in states] == [3, 7]
     before = arena.backing.clone()
     monkeypatch.setattr(model.layers[0].self_attn, "forward", original)
-    hidden, _ = model.forward_draft_batched(
+    hidden, _ = _forward_draft_in_runtime(
+        model,
         [_rows(config, 0), _rows(config, 0)], anchors,
         start_positions=[3, 7], caches=caches,
     )
@@ -5317,6 +5358,8 @@ def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True):
     runner.maxp = runner.max_num_batched_tokens = batch * 8
     runner.dspark.batch_calls = []
     data, manager = runner.input_data, runner.memory_manager
+    manager.dspark_segment = SimpleNamespace(page_size=16, k_cache=[torch.empty(1)])
+
     def materialize(seqs):
         data.seqs = list(seqs)
         tokens, positions = [], []
@@ -5344,13 +5387,25 @@ def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True):
             seq.ssm_block_table = list(range(next_state, next_state + 8))
             seq.recurrent_state_slot = next_state
             next_state += 8
+        # Controller-only source tables; production uses request-owned CUDA tables.
+        cache.get_device_page_table = lambda device: torch.tensor(
+            cache.page_table, dtype=torch.int32, device=device
+        ).unsqueeze(0)
         return True
     manager.reserve_dspark_pages = reserve
     def prefill_batch(chunks, *, segment, caches):
         runner.dspark.batch_calls.append(("prefill", len(chunks)))
         return [runner.dspark.prefill_paged(chunk, segment=segment, cache=cache)
                 for chunk, cache in zip(chunks, caches)]
-    def draft_batch(chunks, anchors, *, start_positions, caches):
+    def validate_batch(chunks, anchors, *, start_positions, caches):
+        assert len(chunks) == len(caches) == len(start_positions)
+        for chunk, start, cache in zip(chunks, start_positions, caches):
+            assert cache.state.context_length + chunk.shape[1] == start
+    runner.dspark.validate_draft_batch = validate_batch
+    def draft_batch(chunks, anchors, *, start_positions, caches, metadata=None):
+        if len(caches) > 1:
+            assert metadata is not None and metadata.plan.context_lens == tuple(start_positions)
+            assert all(chunk.shape[1] == 0 for chunk in chunks)
         runner.dspark.batch_calls.append(("verify", len(chunks)))
         for chunk, start, cache in zip(chunks, start_positions, caches):
             assert cache.state.context_length + chunk.shape[1] == start
@@ -5666,6 +5721,8 @@ def test_dspark_runtime_batch_profiles_maximum_prompt_and_full_verify_shape(batc
     assert all(not seq.page_table and seq.ssm_block_table is None for seq in runner.input_data.seqs)
     assert arena.allocator.num_used_physical_pages == before
     assert not runner._dspark_requests
+    assert runner.input_data.dspark_draft_metadata is None
+    assert all(record is None for record in runner.input_data.dspark_draft_buffers.sources)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -6040,21 +6097,24 @@ def test_dspark_lifecycle_shared_arena_cancel_preempt_rebind_and_frontend_progre
     frontend, mirrors, retired, register = _dspark_lifecycle_frontend(seqs)
     scheduler.add_new_requests(seqs)
     bindings = []
-    metadata = runner.dspark._paged_batch_table
+    from gllm.runtime.input_data import DSparkDraftMetadataBuffers
+
+    metadata = runner.input_data.dspark_draft_buffers = DSparkDraftMetadataBuffers()
     original_prepare = metadata.prepare
-    def check_table(caches, lengths):
-        table = original_prepare(caches, lengths)
+    def check_table(caches, plan, **kwargs):
+        table = original_prepare(caches, plan, **kwargs)
+        lengths = plan.context_lens
         active = [(cache, length) for cache, length in zip(caches, lengths) if length]
         for row, (cache, length) in enumerate(active):
-            pages = (length + cache.segment.page_size - 1) // cache.segment.page_size
+            pages = (length + runner.page_size - 1) // runner.page_size
             # Test-only upload: production reads reusable request GPU tables.
             expected = torch.tensor(
-                cache.state.page_table[:pages], dtype=torch.int32, device=table.device
+                cache.page_table[:pages], dtype=torch.int32, device=table.device
             ).expand(runner.dspark.noise_width, -1)
             torch.testing.assert_close(
                 table[row * 7:(row + 1) * 7, :pages], expected, atol=0, rtol=0
             )
-        bindings.append(tuple(cache.state for cache, _ in active))
+        bindings.append(tuple(cache for cache, _ in active))
         return table
     monkeypatch.setattr(metadata, "prepare", check_table)
     original_draft = runner.dspark.forward_draft_batched
@@ -6084,6 +6144,10 @@ def test_dspark_lifecycle_shared_arena_cancel_preempt_rebind_and_frontend_progre
         assert old_cache._device_page_table is not None
     else:
         assert old_cache._device_page_table is not None
+
+    prepared_metadata = runner.input_data.dspark_draft_metadata
+    assert prepared_metadata is not None and prepared_metadata.valid
+    assert any(cache is old_cache for cache in prepared_metadata.request_caches)
 
     # The inflight case also reads the eight rows just written by verify,
     # which are speculative scratch, not committed history. No uncomputed
@@ -6126,6 +6190,11 @@ def test_dspark_lifecycle_shared_arena_cancel_preempt_rebind_and_frontend_progre
     assert old_cache._device_page_table is None and not old_cache.page_table
     assert old_state.anchor is old_state.pending_hidden is old_state.inflight is old_state.paged_cache is None
     assert victim.seq_id not in runner._dspark_requests
+    assert not prepared_metadata.valid and runner.input_data.dspark_draft_metadata is None
+    assert all(record is None or record[0] is not old_cache for record in metadata.sources)
+    for peer in peers:
+        peer_cache = runner._dspark_requests[peer.seq_id].cache
+        assert any(record is not None and record[0] is peer_cache for record in metadata.sources)
     for peer, length, draft_length, slots, saved in snapshots:
         for actual, expected in zip(values(peer, length, draft_length, slots), saved):
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -6306,3 +6375,240 @@ def test_dspark_capacity_shared_arena_reservation_failure_recovers_requests(batc
         arena.allocator.free(cache_type, held)
     torch.cuda.synchronize()
     assert arena.allocator.num_used_physical_pages == initial_pages
+
+
+def test_dspark_runtime_metadata_contexts_epochs_and_retired_views():
+    from types import SimpleNamespace
+
+    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache
+
+    segment = SimpleNamespace(page_size=4, k_cache=[torch.empty(1)])
+    state = SimpleNamespace(context_length=1, table=torch.tensor([[5]], dtype=torch.int32))
+    state.get_device_page_table = lambda device: state.table
+    views = [Qwen38DSparkPagedCache(segment, state)]
+    first, second = _draft_runtime_context(), _draft_runtime_context()
+    target_plan = object()
+    first.forward_metadata_plan = target_plan
+    original = _prepare_draft_metadata(first, views, (1,), epochs=(3,))
+    independent = _prepare_draft_metadata(second, views, (1,), epochs=(3,))
+    assert original.page_table.data_ptr() != independent.page_table.data_ptr()
+    assert first.forward_metadata_plan is target_plan
+
+    # Reuse the same source allocation at a new request epoch. The old view
+    # becomes invalid and the effective table must refresh, not just its shape.
+    state.table.fill_(17)
+    updated = _prepare_draft_metadata(first, views, (1,), epochs=(4,))
+    assert not original.valid and updated.valid and independent.valid
+    assert updated.page_table.data_ptr() == original.page_table.data_ptr()
+    assert torch.equal(updated.page_table, torch.full((7, 1), 17, dtype=torch.int32))
+    first.release_dspark_draft_metadata(state)
+    assert not updated.valid and first.dspark_draft_metadata is None
+    assert all(record is None for record in first.dspark_draft_buffers.sources)
+    assert independent.valid  # Another execution context owns its own view.
+
+
+def test_dspark_runtime_metadata_empty_history_clears_request_bindings():
+    from types import SimpleNamespace
+
+    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache
+
+    segment = SimpleNamespace(page_size=4, k_cache=[torch.empty(1)])
+    state = SimpleNamespace(context_length=1)
+    source = torch.tensor([[9]], dtype=torch.int32)
+    state.get_device_page_table = lambda device: source
+    views, data = [Qwen38DSparkPagedCache(segment, state)], _draft_runtime_context()
+    previous = _prepare_draft_metadata(data, views, (1,))
+    allocated = data.dspark_draft_buffers.table.data_ptr()
+    empty = _prepare_draft_metadata(data, views, (0,))
+    assert not previous.valid and empty.page_table.shape == (0, 0)
+    assert data.dspark_draft_buffers.sources == ()
+    assert data.dspark_draft_buffers.table.data_ptr() == allocated
+
+
+@pytest.mark.parametrize("invalid", ["epochs", "length", "duplicate"])
+def test_dspark_runtime_metadata_rejects_invalid_binding_geometry(invalid):
+    from types import SimpleNamespace
+
+    from gllm.runtime.forward_metadata import DSparkDraftMetadataPlan
+
+    data = _draft_runtime_context()
+    state = SimpleNamespace(context_length=2)
+    def no_read(device):
+        raise AssertionError("invalid geometry must fail before device table reads")
+    state.get_device_page_table = no_read
+    if invalid == "epochs":
+        with pytest.raises(ValueError, match="geometry"):
+            DSparkDraftMetadataPlan((2,), 7, ())
+        return
+    caches = [state, state] if invalid == "duplicate" else [state]
+    lengths = (2, 2) if invalid == "duplicate" else (3,)
+    plan = DSparkDraftMetadataPlan(lengths, 7, (0,) * len(caches))
+    with pytest.raises(ValueError, match="distinct|valid context"):
+        plan.materialize(data, caches, page_size=4, device=torch.device("cpu"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_dspark_runtime_metadata_rejects_stream_change_before_context_append():
+    from dataclasses import replace
+
+    config = replace(_tensor_config(), block_size=7)
+    model = _bounded_batch_draft(config)
+    segment, states, arena = _paged_batch_storage(config, 16, 2)
+    caches = model.prefill_paged_batched(
+        [_rows(config, 2), _rows(config, 3)], segment=segment, caches=states
+    )
+    data, anchors = _draft_runtime_context(), torch.tensor([2, 3], device="cuda")
+    _forward_draft_in_runtime(
+        model, [_rows(config, 0), _rows(config, 0)], anchors,
+        start_positions=[2, 3], caches=caches, input_data=data,
+    )
+    torch.cuda.synchronize()
+    before = arena.backing.clone()
+    with torch.cuda.stream(torch.cuda.Stream()):
+        with pytest.raises(ValueError, match="consuming stream"):
+            _forward_draft_in_runtime(
+                model, [_rows(config, 1), _rows(config, 1)], anchors,
+                start_positions=[3, 4], caches=caches, input_data=data,
+            )
+    torch.cuda.synchronize()
+    assert [state.context_length for state in states] == [2, 3]
+    assert torch.equal(arena.backing, before)
+    assert not hasattr(model, "_paged_batch_table")
+
+
+def test_dspark_runtime_metadata_only_copies_new_pages_without_reallocating(monkeypatch):
+    from types import SimpleNamespace
+
+    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache
+
+    segment = SimpleNamespace(page_size=4, k_cache=[torch.empty(1)])
+    state = SimpleNamespace(table=torch.tensor([[7, 2, 9, 15]], dtype=torch.int32))
+    state.get_device_page_table = lambda device: state.table
+    views, data = [Qwen38DSparkPagedCache(segment, state)], _draft_runtime_context()
+    _prepare_draft_metadata(data, views, (5,))
+    grown = _prepare_draft_metadata(data, views, (9,))
+    pointer = grown.page_table.data_ptr()
+    prefix = grown.page_table.clone()
+    assert data.dspark_draft_buffers.table.shape == (7, 4)
+
+    copies, copy = [], torch.Tensor.copy_
+    def record_copy(destination, source, *args, **kwargs):
+        copies.append((tuple(destination.shape), tuple(source.shape)))
+        return copy(destination, source, *args, **kwargs)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(torch.Tensor, "copy_", record_copy)
+        appended = _prepare_draft_metadata(data, views, (13,))
+    assert appended.page_table.data_ptr() == pointer
+    assert copies == [((7, 1), (7, 1))]
+    assert torch.equal(appended.page_table[:, :3], prefix)
+    assert torch.equal(appended.page_table[:, 3], torch.full((7,), 15, dtype=torch.int32))
+
+
+def test_dspark_runtime_metadata_release_preserves_peer_and_drops_retired_source(monkeypatch):
+    from types import SimpleNamespace
+    import weakref
+
+    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache
+
+    segment = SimpleNamespace(page_size=4, k_cache=[torch.empty(1)])
+    def view(ids):
+        state = SimpleNamespace(table=torch.tensor([ids], dtype=torch.int32))
+        state.get_device_page_table = lambda device: state.table
+        return Qwen38DSparkPagedCache(segment, state)
+    peer, victim = view([2, 3]), view([7, 8])
+    data = _draft_runtime_context()
+    previous = _prepare_draft_metadata(data, [peer, victim], (5, 5))
+    peer_rows = previous.page_table[:7].clone()
+    retired_source = weakref.ref(victim.state.table)
+    victim.state.table = torch.tensor([[17, 18]], dtype=torch.int32)
+    assert retired_source() is not None  # The active binding retains its source.
+    data.release_dspark_draft_metadata(victim.state)
+    assert retired_source() is None
+    assert not previous.valid and data.dspark_draft_metadata is None
+    assert data.dspark_draft_buffers.sources[0][0] is peer.state
+    assert data.dspark_draft_buffers.sources[1] is None
+
+    copies, copy = [], torch.Tensor.copy_
+    def record_copy(destination, source, *args, **kwargs):
+        copies.append(tuple(destination.shape))
+        return copy(destination, source, *args, **kwargs)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(torch.Tensor, "copy_", record_copy)
+        rebound = _prepare_draft_metadata(data, [peer, victim], (5, 5), epochs=(0, 1))
+    assert copies == [(7, 2)]
+    assert torch.equal(rebound.page_table[:7], peer_rows)
+    assert torch.equal(rebound.page_table[7:], torch.tensor([[17, 18]], dtype=torch.int32).expand(7, -1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_dspark_runtime_metadata_queued_snapshots_survive_growth_and_rebinding():
+    from types import SimpleNamespace
+
+    from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache
+
+    data, snapshots, expected, pointers = _draft_runtime_context(), [], [], []
+    stream, done = torch.cuda.Stream(), torch.cuda.Event()
+    with torch.cuda.stream(stream):
+        segment = SimpleNamespace(page_size=4, k_cache=[torch.empty(0, device="cuda")])
+        for page_ids in (
+            [[11], [12]],
+            [[21, 22, 23], [24, 25, 26], [27, 28, 29], [30, 31, 32]],
+            [[41, 42], [43, 44]],
+        ):
+            views = []
+            for ids in page_ids:
+                state = SimpleNamespace(table=torch.tensor([ids], dtype=torch.int32, device="cuda"))
+                state.get_device_page_table = lambda device, owner=state: owner.table
+                views.append(Qwen38DSparkPagedCache(segment, state))
+            lengths = tuple((len(ids) - 1) * 4 + 1 for ids in page_ids)
+            metadata = _prepare_draft_metadata(data, views, lengths)
+            pointers.append(metadata.page_table.data_ptr())
+            # These reads precede the next overwrite/growth on the same stream.
+            snapshots.append(metadata.page_table.clone())
+            expected.append([ids for ids in page_ids for _ in range(7)])
+            del metadata, views, state
+        done.record(stream)
+    # No host wait separates the three materializations or their queued reads.
+    done.synchronize()
+    assert pointers[0] != pointers[1] == pointers[2]
+    for actual, ids in zip(snapshots, expected):
+        assert torch.equal(actual.cpu(), torch.tensor(ids, dtype=torch.int32))
+    owners = data.dspark_draft_metadata.request_caches
+    for owner in owners:
+        data.release_dspark_draft_metadata(owner)
+    assert data.dspark_draft_metadata is None
+    assert all(record is None for record in data.dspark_draft_buffers.sources)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("invalid", ["retired", "exchanged"])
+@torch.no_grad()
+def test_dspark_runtime_metadata_model_rejects_old_or_exchanged_views(monkeypatch, invalid):
+    from dataclasses import replace
+
+    config = replace(_tensor_config(), block_size=7)
+    model = _bounded_batch_draft(config)
+    segment, states, arena = _paged_batch_storage(config, 16, 2)
+    views = model.prefill_paged_batched(
+        [_rows(config, 2), _rows(config, 3)], segment=segment, caches=states
+    )
+    data, lengths = _draft_runtime_context(), (2, 3)
+    metadata = _prepare_draft_metadata(data, views, lengths)
+    if invalid == "retired":
+        _prepare_draft_metadata(data, views, lengths)
+        assert not metadata.valid
+    else:
+        views, lengths = list(reversed(views)), tuple(reversed(lengths))
+    def no_noise(*args):
+        raise AssertionError("invalid metadata must fail before noise projection")
+    monkeypatch.setattr(model, "_embed_noise", no_noise)
+    before = arena.backing.clone()
+    with pytest.raises(ValueError, match="runtime metadata"):
+        model.forward_draft_batched(
+            [_rows(config, 0), _rows(config, 0)], torch.tensor([2, 3], device="cuda"),
+            start_positions=list(lengths), caches=views, metadata=metadata,
+        )
+    assert [state.context_length for state in states] == [2, 3]
+    assert torch.equal(arena.backing, before)

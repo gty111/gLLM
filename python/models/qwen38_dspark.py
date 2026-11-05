@@ -62,6 +62,7 @@ from gllm.models.weight_utils import get_tensor_from_dict
 
 if TYPE_CHECKING:
     from gllm.runtime.memory_manager import DSparkRequestCache, Segment
+    from gllm.runtime.forward_metadata import DSparkDraftMetadata
 
 
 @dataclass(frozen=True)
@@ -200,69 +201,6 @@ class Qwen38DSparkPagedCache:
 
     def context_length(self) -> int:
         return self.state.context_length
-
-
-@dataclass
-class _Qwen38DSparkBatchTable:
-    """Reusable GPU metadata, not ownership of requests or arena slots.
-
-    Each history request contributes noise_width equal table rows to the
-    existing decode kernel. Sources stay request-owned; stable bindings copy
-    only newly visible pages D2D. A changed binding/buffer refreshes its prefix.
-    Access is serialized on the consuming stream, as for DSparkRequestCache.
-    """
-
-    noise_width: int
-    table: torch.Tensor | None = None
-    sources: tuple = ()
-
-    def prepare(
-        self,
-        caches: list[Qwen38DSparkPagedCache],
-        lengths: tuple[int, ...],
-    ) -> torch.Tensor:
-        device = caches[0].segment.k_cache[0].device
-        current = []
-        for cache, length in zip(caches, lengths):
-            if length:
-                source = cache.state.get_device_page_table(device)
-                pages = (length + cache.segment.page_size - 1) // cache.segment.page_size
-                current.append((cache.state, source, pages))
-        if not current:
-            return torch.empty((0, 0), device=device, dtype=torch.int32)
-        rows = len(current) * self.noise_width
-        pages = max(record[2] for record in current)
-        grown = (
-            self.table is None or self.table.device != device
-            or self.table.shape[0] < rows or self.table.shape[1] < pages
-        )
-        if grown:
-            old = self.table
-            old_rows, old_pages = (0, 0) if old is None else old.shape
-            # Growing history must not also double the request capacity.
-            row_capacity = max(rows, 2 * old_rows) if rows > old_rows else old_rows
-            page_capacity = max(pages, 2 * old_pages) if pages > old_pages else old_pages
-            self.table = torch.empty(
-                (row_capacity, page_capacity), device=device, dtype=torch.int32,
-            )
-        for index, (state, source, count) in enumerate(current):
-            previous = self.sources[index] if index < len(self.sources) else None
-            unchanged = (
-                not grown and previous is not None and previous[0] is state
-                and previous[1].data_ptr() == source.data_ptr()
-                and previous[2] <= count
-            )
-            begin = previous[2] if unchanged else 0
-            if begin < count:
-                self.table[
-                    index * self.noise_width:(index + 1) * self.noise_width, begin:count
-                ].copy_(
-                    source[:, begin:count].expand(self.noise_width, -1), non_blocking=True
-                )
-        # Retain source buffers: reset/reuse cannot masquerade as the previous
-        # binding, and an enqueued D2D copy cannot lose its source allocation.
-        self.sources = tuple(current)
-        return self.table[:rows, :pages]
 
 
 class Qwen38DSparkMarkovHead(nn.Module):
@@ -560,7 +498,6 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
             config.hidden_size + config.markov_rank
         )
         self.rotary_emb = _build_rope(config)
-        self._paged_batch_table = _Qwen38DSparkBatchTable(self.noise_width)
 
     # -- internals ---------------------------------------------------------
 
@@ -770,24 +707,8 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         self._append_paged_context_batched(main_hiddens, ends, views)
         return views
 
-    @torch.no_grad()
-    def forward_draft_batched(
-        self,
-        main_hiddens: list[torch.Tensor],
-        input_ids: torch.Tensor,
-        *,
-        start_positions: list[int],
-        caches: list[Qwen38DSparkPagedCache],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run a real batch with ragged committed suffixes and private anchors.
-
-        Each context is [1, S_i, taps*H], ending at start_positions[i].
-        Returns [B, noise_width, H] and the noisy input IDs [B, noise_width].
-        The shared forward protocol's B=1/dense entry is unchanged. All
-        reservations and stream/completion ownership remain with the caller.
-        Context is published before noise; a later failure does not roll it
-        back. Callers must not replay an already appended suffix on failure.
-        """
+    def validate_draft_batch(self, main_hiddens, input_ids, *, start_positions, caches):
+        """Validate every member before the execution context appends any K/V."""
         self._validate_paged_batch(main_hiddens, start_positions, caches)
         anchor = _anchor_ids(input_ids)
         device = caches[0].segment.k_cache[0].device
@@ -798,13 +719,54 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
             for end in start_positions
         ):
             raise ValueError("draft noise exceeds the rotary position range")
+
+    @torch.no_grad()
+    def forward_draft_batched(
+        self,
+        main_hiddens: list[torch.Tensor],
+        input_ids: torch.Tensor,
+        *,
+        start_positions: list[int],
+        caches: list[Qwen38DSparkPagedCache],
+        metadata: DSparkDraftMetadata | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run a real batch with ragged committed suffixes and private anchors.
+
+        For B>1 context is already appended; each input is [1, 0, taps*H].
+        The runtime supplies the history page table for this execution.
+        Returns [B, noise_width, H] and the noisy input IDs [B, noise_width].
+        The shared forward protocol's B=1/dense entry is unchanged. All
+        reservations and stream/completion ownership remain with the caller.
+        Context is published before noise; a later failure does not roll it
+        back. Callers must not replay an already appended suffix on failure.
+        """
+        self.validate_draft_batch(
+            main_hiddens, input_ids, start_positions=start_positions, caches=caches
+        )
+        anchor = _anchor_ids(input_ids)
+        device = caches[0].segment.k_cache[0].device
         if len(caches) == 1:
             return self.forward_draft(
                 main_hiddens[0], input_ids, start_pos=start_positions[0], caches=caches[0]
             )
-        self._append_paged_context_batched(main_hiddens, start_positions, caches)
         lengths = tuple(start_positions)
-        page_table = self._paged_batch_table.prepare(caches, lengths)
+        if (
+            any(hidden.shape[1] for hidden in main_hiddens)
+            or metadata is None or not metadata.valid or metadata.plan.context_lens != lengths
+            or metadata.plan.noise_width != self.noise_width
+            or len(metadata.request_caches) != len(caches)
+            or any(owner is not cache.state for owner, cache in zip(metadata.request_caches, caches))
+        ):
+            raise ValueError("batched draft needs runtime metadata for already appended context")
+        page_table = metadata.page_table
+        expected_rows = sum(length > 0 for length in lengths) * self.noise_width
+        page_size = caches[0].segment.page_size
+        expected_pages = max((length + page_size - 1) // page_size for length in lengths)
+        if (
+            page_table.device != device or page_table.dtype != torch.int32
+            or page_table.shape != (expected_rows, expected_pages)
+        ):
+            raise ValueError("batched draft metadata has invalid page-table geometry")
         noise_positions = torch.stack([
             torch.arange(end, end + self.noise_width, device=device) for end in lengths
         ])

@@ -8,6 +8,7 @@ from logger import logger
 from gllm.runtime.input_data import InputData
 from gllm.runtime.memory_manager import DSparkRequestCache
 from gllm.runtime.sequence import GenerationSequence
+from gllm.speculative.dspark_execution import forward_dspark_draft_batch
 
 if TYPE_CHECKING:
     from gllm.models.qwen38_dspark import Qwen38DSpark
@@ -289,8 +290,9 @@ def profile_dspark_paged_verify(
                 raise RuntimeError("DSpark batch profile cannot reserve all verify windows")
         before = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
-        draft_hidden, _ = draft.forward_draft_batched(
-            empty, anchors, start_positions=lengths, caches=paged
+        draft_hidden, _ = forward_dspark_draft_batch(
+            draft, input_data, empty, anchors, start_positions=lengths, caches=paged,
+            cache_epochs=[request._cache_epoch for request in seqs],
         )
         proposed, _, _ = draft.forward_head(draft_hidden, anchors)
         proposed_ids = proposed.cpu().tolist()
@@ -317,6 +319,7 @@ def profile_dspark_paged_verify(
             profile["verify_peak_extra_bytes"], profile["batch_verify_peak_extra_bytes"]
         )
         for request, state in zip(seqs, caches):
+            input_data.release_dspark_draft_metadata(state)
             manager.free_dspark_cache(request, state)
         torch.cuda.synchronize()
         profile["probe_final_physical_pages"] = manager.cache_arena.allocator.num_used_physical_pages
