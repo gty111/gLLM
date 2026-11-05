@@ -2,10 +2,50 @@
 
 import torch
 
+from gllm.runtime.forward_metadata import DSparkDraftMetadataPlan
 from gllm.runtime.sequence import GenerationSequence, RequestCapacityError
 from gllm.speculative.dspark import (
     DSparkRequestState, DSparkStepResult, verify_dspark_target, verify_dspark_target_batched,
 )
+
+
+@torch.inference_mode()
+def forward_dspark_draft_batch(
+    draft, input_data, main_hiddens, input_ids, *, start_positions, caches, cache_epochs,
+):
+    """Append once, materialize execution metadata, then run noncausal noise.
+
+    This helper is shared by live execution and the post-arena memory probe.
+    The single-request path retains its existing projection/kernel shapes.
+    """
+    draft.validate_draft_batch(
+        main_hiddens, input_ids, start_positions=start_positions, caches=caches
+    )
+    if len(caches) == 1:
+        return draft.forward_draft_batched(
+            main_hiddens, input_ids, start_positions=start_positions, caches=caches
+        )
+    device = caches[0].segment.k_cache[0].device
+    buffers = getattr(input_data, "dspark_draft_buffers", None)
+    if buffers is not None:
+        buffers.check_stream(device)
+    plan = DSparkDraftMetadataPlan(
+        tuple(start_positions), draft.noise_width, tuple(cache_epochs)
+    )
+    # Validate epoch/geometry counts before any context writes.
+    if len(plan.context_lens) != len(caches):
+        raise ValueError("DSpark metadata needs one binding per request")
+    draft.prefill_paged_batched(
+        main_hiddens, segment=caches[0].segment, caches=[cache.state for cache in caches]
+    )
+    metadata = plan.materialize(
+        input_data, [cache.state for cache in caches],
+        page_size=caches[0].segment.page_size, device=device,
+    )
+    empty = [hidden[:, :0] for hidden in main_hiddens]
+    return draft.forward_draft_batched(
+        empty, input_ids, start_positions=start_positions, caches=caches, metadata=metadata
+    )
 
 
 class DSparkExecutionMixin:
@@ -304,9 +344,11 @@ class DSparkExecutionMixin:
         try:
             if phase == "verify":
                 anchors = torch.cat([state.anchor.reshape(1) for state in states])
-                hidden, _ = self.dspark.forward_draft_batched(
+                hidden, _ = forward_dspark_draft_batch(
+                    self.dspark, self.input_data,
                     [state.pending_hidden for state in states], anchors,
                     start_positions=starts, caches=[state.paged_cache for state in states],
+                    cache_epochs=[state.cache_epoch for state in states],
                 )
                 for state in states:
                     state.pending_hidden = None
@@ -410,6 +452,7 @@ class DSparkExecutionMixin:
             raise RuntimeError("DSpark forward failed before a safe completion event")
         if state.last_use is not None:
             state.last_use.synchronize()
+        self.input_data.release_dspark_draft_metadata(state.cache)
         self.memory_manager.free_dspark_cache(seq, state.cache)
         # Drop the runner-owned tensor and relay references. Independently
         # owned step outputs live until their callers release them. A

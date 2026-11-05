@@ -263,3 +263,44 @@ class ForwardMetadataPlan:
         else:
             self.attention_metadata = backend.prepare_metadata(input_data, self)
         return self.attention_metadata
+
+
+@dataclass(frozen=True)
+class DSparkDraftMetadataPlan:
+    """Host geometry for noncausal noise, separate from target attention.
+
+    Each nonempty history contributes noise_width identical page-table rows.
+    Epochs describe execution bindings, not ownership of arena pages.
+    """
+
+    context_lens: Tuple[int, ...]
+    noise_width: int
+    cache_epochs: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.context_lens or self.noise_width <= 0
+            or len(self.context_lens) != len(self.cache_epochs)
+            or any(n < 0 for n in self.context_lens)
+        ):
+            raise ValueError("invalid DSpark draft metadata geometry")
+
+    @property
+    def query_lens(self) -> Tuple[int, ...]:
+        return (self.noise_width,) * len(self.context_lens)
+
+    def materialize(self, input_data, caches, *, page_size, device):
+        """Install draft metadata without replacing the target forward plan."""
+        return input_data.prepare_dspark_draft_metadata(
+            self, caches, page_size=page_size, device=device
+        )
+
+
+@dataclass
+class DSparkDraftMetadata:
+    """One execution-owned view; valid until the next materialization."""
+
+    plan: DSparkDraftMetadataPlan
+    page_table: Any
+    request_caches: Tuple[Any, ...]
+    valid: bool = True

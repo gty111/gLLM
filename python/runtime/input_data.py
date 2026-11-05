@@ -8,6 +8,7 @@ import torch
 from gllm.distributed.parallel_state import get_pp_size
 from gllm.runtime.forward_metadata import (
     ForwardMetadataPlan,
+    DSparkDraftMetadata,
     MetadataMaterialization,
 )
 from gllm.runtime.memory_manager import MemoryManager
@@ -41,7 +42,123 @@ class PrebuiltCpuMetadataMaterializer:
         input_data._copy_prebuilt_cpu_metadata(self.source)
 
 
+@dataclass
+class DSparkDraftMetadataBuffers:
+    """Execution-context GPU metadata, not ownership of requests or arena slots.
+
+    Each history request contributes noise_width equal table rows to the
+    existing decode kernel. Sources stay request-owned; stable bindings copy
+    only newly visible pages D2D. A changed binding/buffer refreshes its prefix.
+    Access is serialized on the consuming stream, as for DSparkRequestCache.
+    """
+
+    table: torch.Tensor | None = None
+    sources: tuple = ()
+    stream: object = None
+
+    def check_stream(self, device):
+        """This context supports serialized use on one consuming CUDA stream."""
+        if device.type == "cuda":
+            stream = torch.cuda.current_stream(device)
+            if self.stream is not None and self.stream != stream:
+                raise ValueError("DSpark draft metadata requires its consuming stream")
+            self.stream = stream
+
+    def prepare(self, caches, plan, *, page_size, device):
+        self.check_stream(device)
+        lengths, noise_width = plan.context_lens, plan.noise_width
+        if len(caches) != len(lengths) or len({id(cache) for cache in caches}) != len(caches):
+            raise ValueError("DSpark metadata needs distinct request caches")
+        if any(cache.context_length != length for cache, length in zip(caches, lengths)):
+            raise ValueError("DSpark metadata must use appended valid context lengths")
+        current = []
+        for cache, length, epoch in zip(caches, lengths, plan.cache_epochs):
+            if length:
+                source = cache.get_device_page_table(device)
+                pages = (length + page_size - 1) // page_size
+                if source.dtype != torch.int32 or source.ndim != 2 or source.shape[0] != 1 or source.shape[1] < pages:
+                    raise ValueError("invalid DSpark request device page table")
+                if source.device != device:
+                    raise ValueError("DSpark page tables must share their consuming device")
+                current.append((cache, source, pages, epoch, noise_width))
+        if not current:
+            for record in self.sources:
+                if record is not None and record[1].device.type == "cuda":
+                    record[1].record_stream(self.stream)
+            self.sources = ()
+            return torch.empty((0, 0), device=device, dtype=torch.int32)
+        rows = len(current) * noise_width
+        pages = max(record[2] for record in current)
+        grown = (
+            self.table is None or self.table.device != device
+            or self.table.shape[0] < rows or self.table.shape[1] < pages
+        )
+        if grown:
+            old = self.table
+            if old is not None and old.device.type == "cuda":
+                old.record_stream(self.stream)
+            old_rows, old_pages = (0, 0) if old is None else old.shape
+            # Growing history must not also double the request capacity.
+            row_capacity = max(rows, 2 * old_rows) if rows > old_rows else old_rows
+            page_capacity = max(pages, 2 * old_pages) if pages > old_pages else old_pages
+            self.table = torch.empty(
+                (row_capacity, page_capacity), device=device, dtype=torch.int32,
+            )
+        for index, (state, source, count, epoch, width) in enumerate(current):
+            previous = self.sources[index] if index < len(self.sources) else None
+            unchanged = (
+                not grown and previous is not None and previous[0] is state
+                and previous[1].data_ptr() == source.data_ptr()
+                and previous[2] <= count and previous[3] == epoch
+                and previous[4] == width
+            )
+            begin = previous[2] if unchanged else 0
+            if begin < count:
+                self.table[
+                    index * noise_width:(index + 1) * noise_width, begin:count
+                ].copy_(
+                    source[:, begin:count].expand(noise_width, -1), non_blocking=True
+                )
+        # Retain source buffers: reset/reuse cannot masquerade as the previous
+        # binding, and an enqueued D2D copy cannot lose its source allocation.
+        for record in self.sources:
+            if record is not None and record[1].device.type == "cuda":
+                record[1].record_stream(self.stream)
+        self.sources = tuple(current)
+        return self.table[:rows, :pages]
+
+    def release(self, cache):
+        """Caller has waited for this request's last GPU use before release."""
+        self.sources = tuple(
+            None if record is not None and record[0] is cache else record
+            for record in self.sources
+        )
+
+
 class InputData:
+    def prepare_dspark_draft_metadata(self, plan, caches, *, page_size, device):
+        buffers = getattr(self, "dspark_draft_buffers", None)
+        if buffers is None:
+            buffers = self.dspark_draft_buffers = DSparkDraftMetadataBuffers()
+        previous = getattr(self, "dspark_draft_metadata", None)
+        if previous is not None:
+            previous.valid = False
+        self.dspark_draft_metadata = None
+        table = buffers.prepare(caches, plan, page_size=page_size, device=device)
+        metadata = DSparkDraftMetadata(plan, table, tuple(caches))
+        self.dspark_draft_metadata = metadata
+        return metadata
+
+    def release_dspark_draft_metadata(self, cache):
+        """Invalidate bindings only after the request completion boundary."""
+        buffers = getattr(self, "dspark_draft_buffers", None)
+        if buffers is not None:
+            buffers.release(cache)
+        metadata = getattr(self, "dspark_draft_metadata", None)
+        if metadata is not None and any(owner is cache for owner in metadata.request_caches):
+            metadata.valid = False
+            self.dspark_draft_metadata = None
+
     def __init__(
         self,
         use_buffer: bool,

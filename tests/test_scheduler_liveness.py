@@ -439,6 +439,7 @@ def test_dspark_scheduler_batch_groups_phases_and_defers_other_ready_owners(
 def _dspark_capacity_scheduler(batch=2):
     """Real scheduler/request cleanup with CPU joint-reservation failure control."""
     from types import MethodType, SimpleNamespace
+    from gllm.runtime.input_data import InputData
     from gllm.scheduling.scheduler import Scheduler
     from gllm.speculative.dspark import DSparkRequestState
     from gllm.speculative.dspark_execution import DSparkExecutionMixin
@@ -447,6 +448,7 @@ def _dspark_capacity_scheduler(batch=2):
     manager = SimpleNamespace()
     runner = SimpleNamespace(
         dspark_enabled=True, mtp_enabled=False, memory_manager=manager,
+        input_data=InputData.__new__(InputData),
         maxd=batch, max_running_seqs=batch, maxp=8 * batch,
         max_num_batched_tokens=8 * batch, minp=1, iterp=1, page_size=16,
         init_new_token_ratio=0.1, min_new_token_ratio=0.1,
