@@ -6612,3 +6612,29 @@ def test_dspark_runtime_metadata_model_rejects_old_or_exchanged_views(monkeypatc
         )
     assert [state.context_length for state in states] == [2, 3]
     assert torch.equal(arena.backing, before)
+
+
+@pytest.mark.parametrize("phase,rows", [("bootstrap", 1), ("verify", 8), ("tail", 1)])
+def test_dspark_backend_reserves_phase_rows_without_mtp(phase, rows):
+    from gllm.speculative.backend import select_speculative_backend
+
+    backend = select_speculative_backend(dspark_enabled=True, mtp_enabled=False)
+    assert backend.reservation_width(None, 4, phase=phase) == rows
+
+
+@pytest.mark.parametrize("phase", ["prefill", "unknown", None])
+def test_dspark_backend_requires_decode_phase_for_fixed_width(phase):
+    from gllm.speculative.backend import select_speculative_backend
+
+    backend = select_speculative_backend(dspark_enabled=True, mtp_enabled=False)
+    with pytest.raises(ValueError, match="known decode phase"):
+        backend.reservation_width(None, 4, phase=phase)
+
+
+def test_dspark_backend_keeps_phase_scheduler():
+    from types import SimpleNamespace
+    from gllm.speculative.backend import select_speculative_backend
+
+    phase_schedule = object()
+    backend = select_speculative_backend(dspark_enabled=True, mtp_enabled=False)
+    assert backend.schedule_method(SimpleNamespace(_schedule_dspark=phase_schedule)) is phase_schedule

@@ -127,7 +127,9 @@ def schedule_dspark(scheduler):
                     scheduler.maxp, budget,
                 )
             else:
-                count = 8 if state.phase == "verify" else 1
+                count = scheduler.speculative_backend.reservation_width(
+                    runner, len(selected) + 1, phase=state.phase,
+                )
             if count > budget:
                 queue.append(seq)
                 continue

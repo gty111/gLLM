@@ -20,7 +20,13 @@ def setup_pending(monkeypatch, prefix_manager, make_scheduler):
         seq.raw_prompt_len = seq.prompt_len = length - 1
         seq.computed_token_num = length - 1
         seq.to_compute_token_num = 1
-        seq.page_table = [mm.segment.allocate(seq, n) for n in (16, 32)]
+        # Keep both pages reserved, but only hash complete, computed pages.
+        # Short histories still have an unfinished trailing page.
+        seq.page_table = [
+            mm.segment.allocate(seq, end)
+            if end <= seq.computed_token_num else mm.segment.allocate()
+            for end in (16, 32)
+        ]
         s.batch_running.append([seq])
         w = OverlapWorker.__new__(OverlapWorker)
         w.scheduler, w.model_runner = s, s.model_runner
@@ -96,6 +102,12 @@ def test_mtp_compaction_recalculates_demand_and_avoids_preemption(setup_pending,
     if lookahead:
         s.model_runner.mtp_k = 3
         s.model_runner.model = SimpleNamespace(mtp=object())
+        # The fixture installs its simulated MTP head after construction.
+        from gllm.speculative.backend import select_speculative_backend
+        s.model_runner.mtp_enabled = True
+        s.speculative_backend = select_speculative_backend(
+            dspark_enabled=False, mtp_enabled=True,
+        )
     # Optimistic history plus lookahead needs a third page; actual history fits.
     assert len(seq) + lookahead == 33
     assert s.schedule_decode_batch(1) == [seq]

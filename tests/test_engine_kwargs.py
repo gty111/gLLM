@@ -330,3 +330,20 @@ def test_dspark_prepare_and_dispatch_delegates_a_supported_batch(monkeypatch):
     runner.prepare_input(seqs)
     assert runner.step_once() is expected
     assert delegated == [seqs]
+
+
+@pytest.mark.parametrize("dspark,mtp,name,overlap,graph", [
+    (False, False, "none", True, True),
+    (False, True, "mtp", True, True),
+    (True, False, "dspark", False, False),
+])
+def test_effective_speculative_backend_selection(dspark, mtp, name, overlap, graph):
+    from gllm.speculative.backend import select_speculative_backend
+
+    backend = select_speculative_backend(dspark_enabled=dspark, mtp_enabled=mtp)
+    assert backend.name == name
+    assert backend.capabilities.overlap is overlap
+    assert backend.capabilities.cuda_graph is graph
+    # Selection carries no model, request registry or execution-context state.
+    assert not vars(backend)
+    assert backend is select_speculative_backend(dspark_enabled=dspark, mtp_enabled=mtp)

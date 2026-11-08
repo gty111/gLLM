@@ -76,6 +76,7 @@ from gllm.speculative.dspark_profile import (
     profile_dspark_paged_verify, profile_dspark_prefill,
 )
 from gllm.speculative.gpu_prep import MtpGpuPrep
+from gllm.speculative.backend import select_speculative_backend
 from gllm.speculative.mtp import MtpMixin, MtpQDist, MtpVerifyResult
 from gllm.speculative.staging import MtpStagingBuffers
 from gllm.tokenizers.mixin import TokenizerMixin
@@ -591,22 +592,6 @@ class ModelRunner(
             self.dspark = load_dspark_draft(
                 self.config.dspark_model_path, self.model, self.model_max_length
             )
-        # Models may opt out of monolithic decode graphs while individual
-        # components are still being made graph-safe.  Keep this capability on
-        # the model rather than architecture-switching in the runner: new model
-        # adapters get the common graph path by default, and an adapter can
-        # remove the opt-out once capture *and real-data replay* are verified.
-        # ``--disable-cuda-graph`` remains the user-facing global override.
-        self._full_cuda_graph_on = bool(
-            not self.disable_cuda_graph
-            and getattr(self.model, "supports_full_cuda_graph", True)
-        )
-        if not self.disable_cuda_graph and not self._full_cuda_graph_on:
-            logger.warning(
-                "%s does not yet support decode FULL CUDA graph replay; "
-                "FULL graphs are disabled (piecewise graphs remain available).",
-                type(self.model).__name__,
-            )
         # MTP speculative decoding: number of draft tokens per step (k). Active
         # only when the model built an MTP head (mtp_enabled + nextn layers).
         self._mtp_k = (
@@ -620,6 +605,26 @@ class ModelRunner(
         )
         if self.config.speculative_backend == "mtp" and not self.mtp_enabled:
             raise ValueError("mtp requires a loaded compatible MTP head")
+        self.speculative_backend = select_speculative_backend(
+            dspark_enabled=self.dspark_enabled, mtp_enabled=self.mtp_enabled,
+        )
+        # Models may opt out of monolithic decode graphs while individual
+        # components are still being made graph-safe.  Keep this capability on
+        # the model rather than architecture-switching in the runner: new model
+        # adapters get the common graph path by default, and an adapter can
+        # remove the opt-out once capture *and real-data replay* are verified.
+        # ``--disable-cuda-graph`` remains the user-facing global override.
+        self._full_cuda_graph_on = bool(
+            self.speculative_backend.capabilities.cuda_graph
+            and not self.disable_cuda_graph
+            and getattr(self.model, "supports_full_cuda_graph", True)
+        )
+        if not self.disable_cuda_graph and not self._full_cuda_graph_on:
+            logger.warning(
+                "%s does not yet support decode FULL CUDA graph replay; "
+                "FULL graphs are disabled (piecewise graphs remain available).",
+                type(self.model).__name__,
+            )
         # Hybrid models (Qwen3.5 GDN) advertise a ready-to-use SSM cache
         # config via ``model.ssm_cache_config``. ``num_layers`` for the KV
         # path must then be the count of *full-attention* layers only.
@@ -733,7 +738,8 @@ class ModelRunner(
         # ``_draft_input`` are lazily built in ``_init_draft_graph_state`` after
         # the model + memory manager exist.
         self._mtp_draft_graph = (
-            self.mtp_enabled
+            self.speculative_backend.capabilities.cuda_graph
+            and self.mtp_enabled
             and not is_dp_attn()
             and not self.disable_cuda_graph
             # Works for both MLA (DeepSeek) and non-MLA (Qwen3.5 GDN): the draft
@@ -758,7 +764,8 @@ class ModelRunner(
         # overhead (~250ms, ~constant vs batch size), so graphing it is the main
         # speedup lever. Requires the fp8 decode-sparse verify kernel (graph-safe).
         self._mtp_verify_graph = (
-            self.mtp_enabled
+            self.speculative_backend.capabilities.cuda_graph
+            and self.mtp_enabled
             and not is_dp_attn()
             and not self.disable_cuda_graph
             and getattr(self.model, "supports_mtp_verify_cuda_graph", True)
