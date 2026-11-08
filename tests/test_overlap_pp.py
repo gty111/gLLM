@@ -207,3 +207,55 @@ def test_retire_helper_returns_batches_in_launch_order(monkeypatch):
     worker._wait_q.put(None)
     t.join(timeout=5)
     assert [b.buf_idx for b in got] == [b.buf_idx for b in sent]
+
+@pytest.mark.parametrize("keep_peer", [False, True])
+def test_cancel_refresh_preserves_unsent_pp_deltas(monkeypatch, keep_peer):
+    from collections import deque
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.scheduling.distributed import DriverPayloadBuilder, FollowerSeqStore
+
+    monkeypatch.setattr(overlap_worker, "get_pp_size", lambda: 2)
+    victim = GenerationSequence(1, [1] * 32, [99], output_len=8)
+    peer = GenerationSequence(2, [2] * 31 + [-7], [99], output_len=8)
+    for seq in (victim, peer):
+        seq.raw_prompt_len = seq.prompt_len = seq.computed_token_num = 31
+        seq.to_compute_token_num = 1
+        seq.page_table = [seq.seq_id * 2, seq.seq_id * 2 + 1]
+    seqs = [victim, peer] if keep_peer else [victim]
+    scheduler = OverlapScheduler.__new__(OverlapScheduler)
+    scheduler.batch_running = deque([seqs])
+    scheduler._pending_follower_frees = [victim.seq_id]
+    worker = overlap_worker.OverlapWorker.__new__(overlap_worker.OverlapWorker)
+    worker.scheduler = scheduler
+    worker.payload_builder = DriverPayloadBuilder()
+    worker._prefetched_input = SimpleNamespace(seqs=seqs)
+    worker._prefetched_payload = worker.payload_builder.build(seqs, frees=[77])
+    original_updates = worker._prefetched_payload.updates
+    sent = []
+    worker.comm = SimpleNamespace(send_schedule_payload=sent.append)
+    worker._make_scheduled_input = lambda rows: SimpleNamespace(seqs=rows)
+    victim._overlap_freed = True
+    peer.token_ids[-1] = 40
+
+    worker._refresh_prefetched_input()
+
+    payload = worker._prefetched_payload if keep_peer else sent[0]
+    store = FollowerSeqStore()
+    mirrors = store.apply_payload(payload)
+    assert payload.frees == [77, victim.seq_id]
+    assert store.get(victim.seq_id) is None
+    assert victim.seq_id not in worker.payload_builder._known
+    assert not scheduler._pending_follower_frees
+    if keep_peer:
+        assert [seq.seq_id for seq in mirrors] == [peer.seq_id]
+        assert mirrors[0].page_table == peer.page_table
+        assert mirrors[0].to_compute_tokens == [40]
+        assert payload.updates[0].new_page_ids == original_updates[1].new_page_ids
+        assert [reg.seq_id for reg in payload.registers] == [peer.seq_id]
+        assert list(scheduler.batch_running) == [[peer]]
+        assert not sent
+    else:
+        assert not mirrors and not payload.updates and not payload.registers
+        assert not scheduler.batch_running
+        assert worker._prefetched_input is None
+        assert worker._prefetched_payload is None
