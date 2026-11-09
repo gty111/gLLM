@@ -213,10 +213,44 @@ class OverlapWorker(Worker):
         # once and the correct re-prefill boundary.
         return self._publish_mtp_relay_only() or changed
 
-    # ``recv_ipc_package`` / ``check_abort_seqs`` / ``_translate_control_cmd``
-    # are inherited unchanged from :class:`Worker`. The new column-driver
-    # base class already runs them on every PP=0 TP rank with the zmq
-    # input fan-out, which is exactly what overlap mode needs.
+    def check_abort_seqs(self):
+        """Settle cancelled owners before freeing or rebuilding a prefetched batch."""
+        abort_ids = self.scheduler.abort_ids
+        if not abort_ids:
+            return Worker.check_abort_seqs(self)
+
+        owners = {seq.seq_id: seq for seq in self._pending_frees}
+        if self._prefetched_input is not None:
+            owners.update((seq.seq_id, seq) for seq in self._prefetched_input.seqs)
+        for batch in self._gpu_pending:
+            owners.update((seq.seq_id, seq) for seq in batch.input_data.seqs)
+        for batch in self._mtp_pending:
+            owners.update((seq.seq_id, seq) for seq in batch.seqs)
+            owners.update((seq.seq_id, seq) for seq in batch.release_after)
+
+        settle = bool(abort_ids.intersection(owners))
+        if settle:
+            # Queue-only sweeps miss owners already selected for the next tick.
+            # Finalize every launched reader before exposing those owners to the
+            # ordinary cancellation/free path. Normal ticks never drain here.
+            self._drain_pending()
+            self._drain_mtp_pending()
+            for sid, seq in owners.items():
+                if sid not in abort_ids:
+                    continue
+                if getattr(seq, "_overlap_freed", False):
+                    # EOS/budget may have retired this owner during the drain.
+                    abort_ids.discard(sid)
+                    continue
+                queue = (self.scheduler.seqs_to_decode if seq.computed_prompt
+                         else self.scheduler.seqs_to_prefill)
+                if seq not in queue:
+                    queue.append(seq)
+
+        Worker.check_abort_seqs(self)
+        if settle:
+            self._refresh_prefetched_input()
+
 
     def _make_scheduled_input(self, seqs) -> InputData:
         """Build either a regular CPU view or minimal fused-MTP bookkeeping."""
@@ -529,14 +563,40 @@ class OverlapWorker(Worker):
         return kept
 
     def _refresh_prefetched_input(self) -> None:
-        """Rebuild a batch scheduled against now-compacted MTP placeholders."""
+        """Rebuild prefetched inputs after completion or cancellation."""
         if self._prefetched_input is None:
             return
         seqs = self._filter_prefetched_freed(self._prefetched_input.seqs)
-        if not seqs:
-            self._prefetched_input = None
-            return
-        self._prefetched_input = self._make_scheduled_input(seqs)
+        self._prefetched_input = self._make_scheduled_input(seqs) if seqs else None
+        if get_pp_size() > 1:
+            # The builder has already consumed the unsent registration/page
+            # deltas. Preserve them while removing retired rows and replacing
+            # token placeholders materialized by the drain.
+            payload = self._prefetched_payload
+            by_id = {seq.seq_id: seq for seq in seqs}
+            frees = payload.frees + self.scheduler.consume_pending_follower_frees()
+            for sid in frees:
+                self.payload_builder.forget(sid)
+            payload = dataclasses.replace(
+                payload,
+                registers=[reg for reg in payload.registers if reg.seq_id in by_id],
+                updates=[
+                    dataclasses.replace(
+                        update,
+                        computed_token_num=by_id[update.seq_id].computed_token_num,
+                        to_compute_token_num=by_id[update.seq_id].to_compute_token_num,
+                        to_compute_tokens=list(by_id[update.seq_id][
+                            by_id[update.seq_id].computed_token_num:
+                            by_id[update.seq_id].seq_len
+                        ]),
+                    )
+                    for update in payload.updates if update.seq_id in by_id
+                ],
+                frees=frees,
+            )
+            self._prefetched_payload = payload if seqs else None
+            if not seqs and not payload.is_empty():
+                self.comm.send_schedule_payload(payload)
 
     def _publish_mtp_relay_only(self) -> bool:
         """Publish relay-only x1 tokens required by ordinary decode."""
@@ -837,10 +897,10 @@ class OverlapWorker(Worker):
         or baked at capture time for graphs), so they never race the in-flight
         batch.
         """
-        self.check_abort_seqs()
         # ``recv_ipc_package`` also drives the disagg coordinator (TP0) and
         # applies its fanned-out ADMIT / EMB_READY events on every column.
         self.recv_ipc_package()
+        self.check_abort_seqs()
 
         # Bootstrap on the first iter, otherwise this is a no-op
         # (the previous iter's tail already built next-iter's input).

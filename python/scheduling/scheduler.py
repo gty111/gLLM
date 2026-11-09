@@ -521,12 +521,13 @@ class Scheduler:
                 break
             id = seq.seq_id
             if id in self.abort_ids:
-                ipc_package.free_ids.append(id)
+                # A worker must settle any in-flight readers before calling
+                # this sweep. Latch retirement so prefetched rows are dropped.
                 # See ``process_output``: followers need their own free
                 # notification so they can drop the FollowerSeq mirror.
-                self._pending_follower_frees.append(id)
-                self.model_runner.free(seq)
                 seqs.remove(seq)
+                if not getattr(seq, "_overlap_freed", False):
+                    self._retire_seq(seq, ipc_package)
                 self.abort_ids.remove(id)
 
     def check_abort_seqs(self):
