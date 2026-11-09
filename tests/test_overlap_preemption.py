@@ -20,12 +20,19 @@ def setup_pending(monkeypatch, prefix_manager, make_scheduler):
         seq.raw_prompt_len = seq.prompt_len = length - 1
         seq.computed_token_num = length - 1
         seq.to_compute_token_num = 1
-        seq.page_table = [mm.segment.allocate(seq, n) for n in (16, 32)]
+        # Keep both pages reserved, hashing only complete computed pages.
+        seq.page_table = [
+            mm.segment.allocate(seq, end)
+            if end <= seq.computed_token_num else mm.segment.allocate()
+            for end in (16, 32)
+        ]
         s.batch_running.append([seq])
         w = OverlapWorker.__new__(OverlapWorker)
         w.scheduler, w.model_runner = s, s.model_runner
         w._gpu_pending, w._mtp_pending = deque(), deque()
         w._pending_frees = []
+        w._prefetched_input = None
+        w._prefetched_payload = None
         w._async_retire = False
         w._polls_frontend = lambda: True
         emitted, events = [], []
@@ -213,3 +220,196 @@ def test_completion_during_barrier_retries_stale_prefill_reserve(setup_pending, 
     else:
         assert first == [newcomer]
     assert not s._pending_request_errors
+
+def _prefetch_cancel_owner(scheduler, worker):
+    """Leave the owner outside waiting queues, as a real prefetch does."""
+    seqs = list(scheduler.seqs_to_decode)
+    scheduler.seqs_to_decode.clear()
+    if seqs:
+        scheduler.batch_running.append(seqs)
+        worker._prefetched_input = SimpleNamespace(seqs=seqs)
+    worker._make_scheduled_input = lambda rows: SimpleNamespace(seqs=rows)
+
+
+@pytest.mark.parametrize("mtp", [False, True])
+@pytest.mark.parametrize("prefetched", [False, True])
+def test_abort_settles_readers_before_retiring_owner(setup_pending, mtp, prefetched):
+    s, seq, w, events, emitted = setup_pending(mtp=mtp)
+    if prefetched:
+        _prefetch_cancel_owner(s, w)
+    s.add_abort_ids([seq.seq_id, seq.seq_id])
+    w.check_abort_seqs()
+    assert events == ["settled", "free"]
+    assert s.freed == [seq.seq_id]
+    assert seq._overlap_freed
+    assert not s.abort_ids and not s.seqs_to_decode and not s.batch_running
+    assert not w._gpu_pending and not w._mtp_pending
+    assert w._prefetched_input is None
+    assert [sid for package in emitted for sid in package.free_ids] == [seq.seq_id]
+    assert emitted[-1].act_schedule_ids == []
+    assert s._pending_follower_frees == [seq.seq_id]
+    w.check_abort_seqs()
+    assert s.freed == [seq.seq_id]
+
+
+@pytest.mark.parametrize("mtp", [False, True])
+@pytest.mark.parametrize("finish", ["eos", "budget"])
+def test_abort_drain_handles_natural_retirement_once(setup_pending, mtp, finish):
+    s, seq, w, events, emitted = setup_pending(
+        mtp=mtp, result=(99 if finish == "eos" else 40,)
+    )
+    if finish == "budget":
+        seq.output_len = 2
+    _prefetch_cancel_owner(s, w)
+    s.add_abort_ids([seq.seq_id])
+    w.check_abort_seqs()
+    assert events == ["settled", "free"]
+    assert s.freed == [seq.seq_id]
+    assert not s.abort_ids and not s.batch_running
+    assert w._prefetched_input is None
+    assert [sid for package in emitted for sid in package.free_ids] == [seq.seq_id]
+
+
+def test_abort_waits_for_successor_before_free(setup_pending):
+    s, seq, w, events, emitted = setup_pending(result=(99,))
+    _prefetch_cancel_owner(s, w)
+    w._gpu_pending.append(_PendingBatch(
+        copy_done=SimpleNamespace(synchronize=lambda: events.append("successor")),
+        batch_size=1, buf_idx=0, future_slot_ids=[8], deferred=None,
+        input_data=SimpleNamespace(seqs=[seq]), is_dummy=False, lp_k=None,
+    ))
+    s.add_abort_ids([seq.seq_id])
+    w.check_abort_seqs()
+    assert events == ["settled", "successor", "free"]
+    assert s.freed == [seq.seq_id]
+    assert [sid for package in emitted for sid in package.free_ids] == [seq.seq_id]
+
+
+def test_no_abort_preserves_inflight_overlap(setup_pending):
+    s, _, w, events, emitted = setup_pending(mtp=True)
+    w.check_abort_seqs()
+    assert w._mtp_pending and not events and not emitted
+    assert not s.freed
+
+
+def test_queue_only_abort_does_not_drain_peer(setup_pending):
+    s, _, w, events, emitted = setup_pending(mtp=True)
+    newcomer = GenerationSequence(2, [11] * 8, [99], output_len=4)
+    s.add_new_requests([newcomer])
+    original_free = s.model_runner.free
+    s.model_runner.free = lambda seq: (
+        s.memory_manager.free(seq) if seq is newcomer else original_free(seq)
+    )
+    s.add_abort_ids([newcomer.seq_id])
+    w.check_abort_seqs()
+    assert not events and w._mtp_pending
+    assert not s.seqs_to_prefill and newcomer._overlap_freed
+    assert not s.abort_ids and emitted[-1].free_ids == [newcomer.seq_id]
+
+
+def test_prefetched_abort_preserves_peer_and_next_admission(setup_pending):
+    s, victim, w, _, emitted = setup_pending(mtp=True)
+    peer = GenerationSequence(2, [11] * 32, [99], output_len=4)
+    peer.raw_prompt_len = peer.prompt_len = peer.computed_token_num = 31
+    peer.to_compute_token_num = 1
+    s.seqs_to_decode.append(peer)
+    _prefetch_cancel_owner(s, w)
+    arrival = GenerationSequence(3, [12] * 8, [99], output_len=1)
+    s.add_new_requests([arrival])
+    # Exercise a duplicate queue reference as well as the prefetched owner.
+    s.seqs_to_decode.append(victim)
+    s.add_abort_ids([victim.seq_id])
+    w.check_abort_seqs()
+    assert s.freed == [victim.seq_id]
+    assert w._prefetched_input.seqs == [peer]
+    assert list(s.batch_running) == [[peer]]
+    assert list(s.seqs_to_prefill) == [arrival]
+    assert not s.abort_ids and not getattr(peer, "_overlap_freed", False)
+    # The surviving batch can retire and the next queued prompt is scheduled.
+    s.add_next_tokens([99])
+    package = s.process_output()
+    assert package.free_ids == [peer.seq_id]
+    assert s.schedule_once() == [arrival]
+    assert emitted[-1].free_ids == [victim.seq_id]
+
+
+def test_received_abort_is_handled_before_next_launch(setup_pending):
+    s, seq, w, _, _ = setup_pending(mtp=True)
+    _prefetch_cancel_owner(s, w)
+    w.recv_ipc_package = lambda: s.add_abort_ids([seq.seq_id])
+    def stop_before_launch():
+        assert s.freed == [seq.seq_id]
+        assert not s.abort_ids and not s.batch_running
+        raise RuntimeError("cancelled before launch")
+    w._build_prefetched_input = stop_before_launch
+    with pytest.raises(RuntimeError, match="cancelled before launch"):
+        w.run_pp0()
+
+def test_abort_does_not_materialize_cancelled_mtp_relay(setup_pending):
+    s, seq, w, events, emitted = setup_pending(mtp=True)
+    seq.token_ids = [10] * 32
+    seq.raw_prompt_len = seq.prompt_len = 32
+    seq.computed_token_num = 31
+    seq.to_compute_token_num = 1
+    s.seqs_to_decode.clear()
+    s.batch_running.append([seq])
+    w._mtp_pending[0].deferred = s.process_mtp_output_deferred(0, 4)
+    s.model_runner.take_mtp_relay_token = lambda sid: pytest.fail(
+        "cancelled relay was published"
+    )
+    _prefetch_cancel_owner(s, w)
+    s.add_abort_ids([seq.seq_id])
+    w.check_abort_seqs()
+    assert events == ["settled", "free"]
+    assert seq.token_ids == [10] * 32
+    assert not s.abort_ids and s.freed == [seq.seq_id]
+    assert len(emitted) == 1 and emitted[0].free_ids == [seq.seq_id]
+    assert not emitted[0].act_schedule_ids
+
+
+def test_abort_prefetched_owner_without_inflight_work(prefix_manager, make_scheduler):
+    mm, arena, _ = prefix_manager(pages=4)
+    s = make_scheduler(mm)
+    s.__class__ = OverlapScheduler
+    seq = GenerationSequence(1, [10] * 16, [99], output_len=4)
+    seq.raw_prompt_len = seq.prompt_len = seq.computed_token_num = 15
+    seq.to_compute_token_num = 1
+    seq.page_table = [mm.segment.allocate()]
+    scheduled = [seq]
+    s.batch_running.append(scheduled)
+    w = OverlapWorker.__new__(OverlapWorker)
+    w.scheduler, w.model_runner = s, s.model_runner
+    w._gpu_pending, w._mtp_pending = deque(), deque()
+    w._pending_frees = []
+    w._prefetched_payload = None
+    w._prefetched_input = SimpleNamespace(seqs=scheduled)
+    w._polls_frontend = lambda: True
+    emitted = []
+    w.comm = SimpleNamespace(send_output=emitted.append)
+    w._make_scheduled_input = lambda rows: SimpleNamespace(seqs=rows)
+    assert w._prefetched_input.seqs is s.batch_running[-1]
+    s.add_abort_ids([seq.seq_id])
+    w.check_abort_seqs()
+    assert not w._prefetched_input and not s.batch_running
+    assert s.freed == [seq.seq_id] and not s.abort_ids
+    assert emitted[0].free_ids == [seq.seq_id]
+    assert arena.allocator.num_used_physical_pages == 0
+
+def test_abort_settles_partial_prefill_before_free(setup_pending):
+    s, seq, w, events, emitted = setup_pending()
+    seq.token_ids = [10] * 64
+    seq.raw_prompt_len = seq.prompt_len = 64
+    w._gpu_pending[0].deferred = []
+    s.seqs_to_decode.clear()
+    s.seqs_to_prefill.append(seq)
+    scheduled = [seq]
+    s.batch_running.append(scheduled)
+    w._prefetched_input = SimpleNamespace(seqs=scheduled)
+    w._make_scheduled_input = lambda rows: SimpleNamespace(seqs=rows)
+    assert w._prefetched_input.seqs is s.batch_running[-1]
+    s.add_abort_ids([seq.seq_id])
+    w.check_abort_seqs()
+    assert events == ["settled", "free"]
+    assert not s.abort_ids and not s.seqs_to_prefill and not s.batch_running
+    assert w._prefetched_input is None
+    assert len(emitted) == 1 and emitted[0].free_ids == [seq.seq_id]
