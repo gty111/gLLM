@@ -18,6 +18,7 @@ from gllm.distributed.parallel_state import (
 from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.runtime.model_runner import ModelRunner
 from gllm.runtime.sequence import GenerationSequence
+from gllm.speculative.backend import select_speculative_backend
 from gllm.speculative.dspark_runtime import (
     process_dspark_output, reject_dspark_request, schedule_dspark,
 )
@@ -66,6 +67,10 @@ class Scheduler:
         self.model_runner: ModelRunner = model_runner
         self.memory_manager: MemoryManager = model_runner.memory_manager
         self.schedule_method = schedule_method
+        self.speculative_backend = select_speculative_backend(
+            dspark_enabled=getattr(model_runner, "dspark_enabled", False),
+            mtp_enabled=getattr(model_runner, "mtp_enabled", False),
+        )
 
         # --- Adaptive KV-cache admission control (SGLang-style) ---
         # We no longer hold back a *static* page reserve (the old ``kvthresh``).
@@ -241,14 +246,7 @@ class Scheduler:
         )
 
     def dispatch_schedule_method(self):
-        if getattr(self.model_runner, "dspark_enabled", False):
-            return self._schedule_dspark
-        if self.schedule_method in ["split_pd", "chunked_prefill"]:
-            return self.chunked_prefill
-        elif self.schedule_method == "token_throttling":
-            return self.token_throttling
-        else:
-            assert 0
+        return self.speculative_backend.schedule_method(self)
 
     def get_num_free_pages(self):
         return self.memory_manager.get_num_free_pages()
@@ -653,37 +651,11 @@ class Scheduler:
         return decode_token_budget
 
     def _decode_tokens_per_seq(self, num_decode_seqs, mtp_eligible=True):
-        """Return the target-forward token cost of one decode request.
-
-        gLLM drafts and verifies MTP tokens inside ``ModelRunner.step_once``.
-        The scheduler therefore has to reserve the verify query (``1+k``)
-        before the runner expands a decode batch; otherwise a legal B-row
-        decode batch can become a ``B*(1+k)`` forward larger than the shared
-        ``max_num_batched_tokens`` buffers.
-        """
-        if not mtp_eligible or num_decode_seqs <= 0:
-            return 1
-        # ModelRunner currently disables MTP under DP-attention until the
-        # bootstrap/draft/verify forward cadence is coordinated across every
-        # replica. Keep scheduling ordinary one-token decode batches there.
-        if is_dp_attn():
-            return 1
-        k = int(getattr(self.model_runner, "mtp_k", 0) or 0)
-        if k <= 0 or getattr(self.model_runner.model, "mtp", None) is None:
-            return 1
-        # ``mtp_max_batch`` is a performance gate: batches above it execute the
-        # ordinary one-token decode path and must keep their one-token cost.
-        max_mtp_batch = int(
-            getattr(self.model_runner, "mtp_max_batch", 0) or 0
+        """Reserve target inputs before the runner decides whether to speculate."""
+        return self.speculative_backend.reservation_width(
+            self.model_runner, num_decode_seqs,
+            eligible=mtp_eligible, dp_attention=is_dp_attn(),
         )
-        if max_mtp_batch > 0 and num_decode_seqs > max_mtp_batch:
-            return 1
-        qlen = 1 + k
-        # If even one verify query cannot fit globally, MTP is capacity-gated
-        # off by ModelRunner and the scheduler must keep making plain progress.
-        if qlen > self.max_num_batched_tokens:
-            return 1
-        return qlen
 
     def schedule_prefill_batch(
         self, prefill_token_budget, max_seqs=None, reserve_pages=0,

@@ -103,6 +103,12 @@ def test_mtp_compaction_recalculates_demand_and_avoids_preemption(setup_pending,
     if lookahead:
         s.model_runner.mtp_k = 3
         s.model_runner.model = SimpleNamespace(mtp=object())
+        # The fixture installs its simulated MTP head after construction.
+        from gllm.speculative.backend import select_speculative_backend
+        s.model_runner.mtp_enabled = True
+        s.speculative_backend = select_speculative_backend(
+            dspark_enabled=False, mtp_enabled=True,
+        )
     # Optimistic history plus lookahead needs a third page; actual history fits.
     assert len(seq) + lookahead == 33
     assert s.schedule_decode_batch(1) == [seq]

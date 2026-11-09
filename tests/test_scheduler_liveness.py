@@ -667,3 +667,91 @@ def test_dspark_capacity_aborted_recovery_owner_does_not_block_admission():
     assert package.free_ids == [seqs[0].seq_id] and not package.request_errors
     assert scheduler.schedule_once() == [seqs[1]]
     assert scheduler._dspark_recovery_owner is None
+
+
+@pytest.mark.parametrize("k,head,gate,budget,batch,eligible,dp,expected", [
+    (3, True, 0, 8, 2, True, False, 4),
+    (3, True, 0, 7, 2, True, False, 4),  # Reserve before shrinking the cohort.
+    (3, True, 0, 4, 1, True, False, 4),
+    (3, True, 0, 3, 1, True, False, 1),
+    (3, True, 2, 8, 2, True, False, 4),
+    (3, True, 2, 8, 3, True, False, 1),
+    (3, True, 0, 8, 2, False, False, 1),
+    (3, True, 0, 8, 2, True, True, 1),
+    (3, True, 0, 8, 0, True, False, 1),
+    (0, True, 0, 8, 2, True, False, 1),
+    (3, False, 0, 8, 2, True, False, 1),
+])
+def test_speculative_scheduler_reservation_width(
+    monkeypatch, k, head, gate, budget, batch, eligible, dp, expected,
+):
+    from types import SimpleNamespace
+    from gllm.scheduling.scheduler import Scheduler
+    from gllm.speculative.backend import select_speculative_backend
+
+    runner = SimpleNamespace(
+        mtp_k=k, mtp_max_batch=gate, max_num_batched_tokens=budget,
+        model=SimpleNamespace(mtp=object() if head else None),
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.model_runner = runner
+    scheduler.speculative_backend = select_speculative_backend(
+        dspark_enabled=False, mtp_enabled=True,
+    )
+    monkeypatch.setattr("gllm.scheduling.scheduler.is_dp_attn", lambda: dp)
+    assert scheduler._decode_tokens_per_seq(batch, mtp_eligible=eligible) == expected
+
+
+@pytest.mark.parametrize("mtp,method", [
+    (False, "chunked_prefill"), (False, "split_pd"), (False, "token_throttling"),
+    (True, "chunked_prefill"), (True, "split_pd"), (True, "token_throttling"),
+])
+def test_speculative_backend_preserves_target_schedule_method(mtp, method):
+    from types import SimpleNamespace
+    from gllm.speculative.backend import select_speculative_backend
+
+    chunked, throttled = object(), object()
+    scheduler = SimpleNamespace(
+        schedule_method=method, chunked_prefill=chunked, token_throttling=throttled,
+    )
+    backend = select_speculative_backend(dspark_enabled=False, mtp_enabled=mtp)
+    assert backend.schedule_method(scheduler) is (
+        throttled if method == "token_throttling" else chunked
+    )
+
+
+def test_speculative_reservation_can_exceed_actual_mtp_execution(monkeypatch):
+    from types import SimpleNamespace
+    from gllm.speculative.backend import select_speculative_backend
+    from gllm.speculative.mtp import MtpMixin
+
+    runner = SimpleNamespace(
+        mtp_k=3, _mtp_k=3, mtp_max_batch=0, _mtp_max_batch=0,
+        max_num_batched_tokens=7, model=SimpleNamespace(mtp=object()),
+    )
+    backend = select_speculative_backend(dspark_enabled=False, mtp_enabled=True)
+    assert backend.reservation_width(runner, 2) == 4
+    monkeypatch.setattr("gllm.speculative.mtp.is_dp_attn", lambda: False)
+    assert MtpMixin._mtp_decide(runner, 2) is False
+    assert runner._mtp_spec_decision == (2, False)
+
+
+def test_speculative_budget_shrinks_mtp_cohort_before_forward(
+    prefix_manager, make_seq, make_scheduler,
+):
+    from types import SimpleNamespace
+    from gllm.speculative.backend import select_speculative_backend
+
+    manager, _, _ = prefix_manager(pages=4)
+    scheduler = make_scheduler(manager)
+    runner = scheduler.model_runner
+    runner.mtp_enabled, runner.mtp_k, runner.mtp_max_batch = True, 3, 0
+    runner.model = SimpleNamespace(mtp=object())
+    runner.max_num_batched_tokens = 7
+    scheduler.speculative_backend = select_speculative_backend(
+        dspark_enabled=False, mtp_enabled=True,
+    )
+    first, second = make_seq(21, 10), make_seq(22, 10)
+    scheduler.seqs_to_decode.extend([first, second])
+    assert scheduler.schedule_decode_batch(2, token_budget=7) == [first]
+    assert list(scheduler.seqs_to_decode) == [second]
