@@ -3134,7 +3134,7 @@ def test_dspark_execution_verify_commits_prefix_and_reuses_promoted_table(monkey
     assert tables[1][0] == tables[0][accepted]
 
 
-@pytest.mark.parametrize("cutoff", ["eos", "budget"])
+@pytest.mark.parametrize("cutoff", ["eos", "budget", "ignore_eos"])
 def test_dspark_execution_verify_cutoff_promotes_only_retained_inputs(monkeypatch, cutoff):
     from gllm.speculative.dspark import commit_dspark_verify_step
 
@@ -3143,11 +3143,17 @@ def test_dspark_execution_verify_cutoff_promotes_only_retained_inputs(monkeypatc
     seq.to_compute_token_num = 8
     result = runner._step_dspark_verify(seq)
     if cutoff == "eos":
-        seq.finish_tokens = [20]
+        seq.finish_tokens = [20, 22]
         expected = [18, 19, 20]
-    else:
+    elif cutoff == "budget":
+        seq.finish_tokens = [20]  # EOS is beyond the retained output budget.
         seq.output_len = 3
         expected = [18, 19]
+    else:
+        seq.finish_tokens = [18, 20]
+        seq.ignore_eos = True
+        seq.output_len = 9  # One published token plus all eight verified inputs.
+        expected = list(range(18, 26))
     assert commit_dspark_verify_step(seq, state, result) == expected
     assert seq.computed_token_num == len(seq) == 14 + len(expected)
     assert seq.recurrent_state_slot == tables[0][len(expected) - 1]
@@ -3157,6 +3163,33 @@ def test_dspark_execution_verify_cutoff_promotes_only_retained_inputs(monkeypatc
     assert event.waited and not runner._dspark_requests
     assert seq.page_table == [] and seq.ssm_block_table is None
     assert state.cache.context_length == 0 and state.cache.page_table == []
+
+
+def test_dspark_execution_verify_rejects_exhausted_budget_without_commit(monkeypatch):
+    from gllm.speculative.dspark import commit_dspark_verify_step
+
+    runner, seq, _ = _dspark_execution_spy(monkeypatch, accepted=7)
+    state = runner._dspark_requests[seq.seq_id]
+    seq.to_compute_token_num = 8
+    result = runner._step_dspark_verify(seq)
+    # Unlike an already launched MTP successor, DSpark must not turn an
+    # exhausted output budget into an extra committed input.
+    seq.output_len = len(seq) - seq.raw_prompt_len
+    before = (
+        list(seq.token_ids), seq.computed_token_num, list(seq.ssm_block_table),
+        seq.recurrent_state_slot, state.cache.context_length,
+    )
+    anchor = state.anchor
+
+    with pytest.raises(ValueError, match="live request"):
+        commit_dspark_verify_step(seq, state, result)
+
+    assert before == (
+        seq.token_ids, seq.computed_token_num, seq.ssm_block_table,
+        seq.recurrent_state_slot, state.cache.context_length,
+    )
+    assert state.inflight is result and state.anchor is anchor
+    assert not result.consumed and not result.verification.consumed
 
 
 @pytest.mark.parametrize("phase", ["verify", "tail"])

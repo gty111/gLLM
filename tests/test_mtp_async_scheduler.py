@@ -8,6 +8,7 @@ from gllm.workers.overlap import OverlapWorker
 from gllm.scheduling.scheduler import OverlapScheduler
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.mtp import MtpMixin
+from gllm.speculative.output import append_output_row, output_prefix_length
 
 
 class _Runner:
@@ -48,6 +49,166 @@ def _decode_seq(seq_id=1, output_len=32):
     seq.computed_token_num = 2
     seq.to_compute_token_num = 1
     return seq
+
+
+@pytest.mark.parametrize("tokens,remaining,finish_tokens,ignore_eos,expected", [
+    ([20, 99, 98, 21], 4, [99, 98], False, 2),
+    ([20, 99, 98, 21], 3, [99, 98], True, 3),
+    ([20, 21, 99], 2, [99], False, 2),
+    ([99, 20], 2, [99], False, 1),
+    ([20, 99], 1, [99], False, 1),
+    ([20, 21], 8, [], False, 2),
+    ([], 5, [99], False, 0),
+    ([99], 0, [99], False, 0),
+    ([20, 99], -1, [99], False, 0),
+], ids=[
+    "first-of-multiple-eos", "ignore-eos", "eos-after-budget", "first-token-eos",
+    "one-token-budget", "short-row", "empty-row", "zero-budget", "negative-budget",
+])
+def test_output_prefix_length_limits_visible_tokens(
+    tokens, remaining, finish_tokens, ignore_eos, expected
+):
+    before = list(tokens), list(finish_tokens)
+    assert output_prefix_length(
+        tokens, remaining_tokens=remaining,
+        finish_tokens=finish_tokens, ignore_eos=ignore_eos,
+    ) == expected
+    assert (tokens, finish_tokens) == before
+
+
+@pytest.mark.parametrize("payload,output_len,ignore_eos,expected", [
+    (20, 2, False, [20]),
+    (99, 32, False, [99]),
+    ([20, 99, 21], 32, False, [20, 99]),
+    ([20, 21, 22], 2, False, [20]),
+    ([20, 99, 21], 4, True, [20, 99, 21]),
+    ([20, 21], 32, False, [20, 21]),
+    ([20, 21], 1, False, [20]),
+], ids=[
+    "ordinary", "scalar-eos", "mtp-eos", "mtp-budget", "ignore-eos",
+    "full-prefix", "already-completed-budget",
+])
+def test_sync_output_keeps_prefix_and_cache_progress(
+    payload, output_len, ignore_eos, expected
+):
+    scheduler = _scheduler()
+    allocations = []
+    scheduler.model_runner.memory_manager = SimpleNamespace(
+        pre_allocate_page=lambda seqs: allocations.append([s.seq_id for s in seqs])
+    )
+    scheduler.next_tokens_queue = deque()
+    seq = _decode_seq(output_len=output_len)
+    seq.ignore_eos = ignore_eos
+    scheduler.batch_running.append([seq])
+    scheduler.add_next_tokens([payload])
+
+    package = scheduler.process_output()
+
+    assert seq.token_ids == [10, 11, 12] + expected
+    assert seq.computed_token_num == 3 + max(len(expected) - 1, 0)
+    assert package.act_schedule_ids == [seq.seq_id]
+    assert package.next_tokens == [expected if isinstance(payload, list) else payload]
+    assert package.logprobs == [None]
+    assert scheduler.model_runner.hash_positions == [
+        (seq.seq_id, pos) for pos in range(3, 3 + len(expected))
+    ]
+    assert allocations == ([[seq.seq_id]] if len(expected) > 1 else [])
+    retired = [seq.seq_id] if seq.is_finish else []
+    assert package.free_ids == scheduler.model_runner.freed == retired
+    assert list(scheduler.seqs_to_decode) == ([] if retired else [seq])
+
+
+def test_mtp_finalize_keeps_one_already_completed_token_after_budget():
+    scheduler = _scheduler()
+    seq = _decode_seq(output_len=1)
+    scheduler.batch_running.append([seq])
+    deferred = scheduler.process_mtp_output_deferred(decode_rows=1, width=4)
+
+    package = scheduler.process_mtp_output_finalize(deferred, [[20, 99, 21]])
+
+    assert seq.token_ids == [10, 11, 12, 20]
+    assert seq.computed_token_num == 3
+    assert package.next_tokens == [[20]] and package.free_ids == [seq.seq_id]
+    assert scheduler.model_runner.freed == [seq.seq_id]
+    assert not seq._mtp_async_pending and not scheduler.seqs_to_decode
+
+
+@pytest.mark.parametrize("tokens", [20, [20, 21]])
+def test_output_row_preserves_shape_and_sends_local_prompt_once(tokens):
+    from gllm.distributed.comm import IPCPackage
+
+    seq = _decode_seq()
+    seq.prompt_logprobs_enabled = True
+    seq.prompt_logprobs_data = [None, (11, -0.1, [], [])]
+    before = list(seq.token_ids), seq.computed_token_num, seq._cache_epoch
+    package = IPCPackage([])
+    append_output_row(package, seq, tokens, logprobs=(-0.2, [], []))
+    assert package.act_schedule_ids == [seq.seq_id]
+    assert package.next_tokens == [tokens]
+    assert package.logprobs == [(-0.2, [], [])]
+    assert package.prompt_logprobs == {seq.seq_id: seq.prompt_logprobs_data}
+    assert seq._prompt_logprobs_sent
+
+    second = IPCPackage([])
+    append_output_row(second, seq, tokens)
+    assert not second.prompt_logprobs and second.logprobs == [None]
+    assert before == (seq.token_ids, seq.computed_token_num, seq._cache_epoch)
+
+
+@pytest.mark.parametrize("value", [None, [(11, -0.5, [], [])]])
+def test_output_row_preserves_explicit_follower_prompt_entry(value):
+    from gllm.distributed.comm import IPCPackage
+
+    seq = _decode_seq()
+    seq.prompt_logprobs_enabled = True
+    seq.prompt_logprobs_data = [(11, -0.1, [], [])]
+    package = IPCPackage([])
+    append_output_row(package, seq, [20], prompt_logprobs={seq.seq_id: value})
+    assert package.prompt_logprobs == {seq.seq_id: value}
+    assert not seq._prompt_logprobs_sent
+
+
+def test_sync_output_rows_keep_batch_logprobs_and_prompt_sources_aligned():
+    scheduler = _scheduler()
+    scheduler.model_runner.memory_manager = SimpleNamespace(pre_allocate_page=lambda seqs: None)
+    scheduler.next_tokens_queue = deque()
+    first, second = _decode_seq(1), _decode_seq(2)
+    for seq in (first, second):
+        seq.prompt_logprobs_enabled = True
+        seq.prompt_logprobs_data = [None, (11, -0.1, [], [])]
+    first.logprobs_enabled = True
+    scheduler.batch_running.append([first, second])
+    row = (-0.2, [20], [-0.2])
+    scheduler.add_next_tokens([[20, 21], 30], [row, row], {second.seq_id: None})
+
+    package = scheduler.process_output()
+
+    assert package.act_schedule_ids == [1, 2]
+    assert package.next_tokens == [[20, 21], 30]
+    assert package.logprobs == [row, None]
+    assert package.prompt_logprobs == {1: first.prompt_logprobs_data, 2: None}
+    assert first._prompt_logprobs_sent and not second._prompt_logprobs_sent
+    assert first.token_ids[-2:] == [20, 21] and second.token_ids[-1] == 30
+
+
+def test_overlap_output_row_keeps_logprobs_and_delays_physical_free():
+    scheduler = _scheduler()
+    seq = _decode_seq(output_len=2)
+    seq.logprobs_enabled = seq.prompt_logprobs_enabled = True
+    seq.num_top_logprobs = 1
+    seq.prompt_logprobs_data = [None, (11, -0.1, [], [])]
+    scheduler.batch_running.append([seq])
+    deferred = scheduler.process_output_deferred([7])
+    protected = []
+    package = scheduler.process_output_finalize(
+        deferred, [20], [(-0.1, [20, 21], [-0.1, -0.2])], defer_frees=protected
+    )
+    assert package.next_tokens == [20]
+    assert package.logprobs == [(-0.1, [20], [-0.1])]
+    assert package.prompt_logprobs == {seq.seq_id: seq.prompt_logprobs_data}
+    assert package.free_ids == [seq.seq_id] and protected == [seq]
+    assert not scheduler.model_runner.freed
+    assert seq.token_ids == [10, 11, 12, 20] and seq.computed_token_num == 3
 
 
 def test_mtp_deferred_compacts_rejected_tail():

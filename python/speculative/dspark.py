@@ -12,6 +12,7 @@ from gllm.runtime.forward_metadata import MetadataMaterialization
 from gllm.runtime.input_data import InputData
 from gllm.runtime.memory_manager import DSparkRequestCache
 from gllm.runtime.sequence import GenerationSequence
+from gllm.speculative.output import output_prefix_length
 
 if TYPE_CHECKING:
     from gllm.models.qwen38_dspark import Qwen38DSparkPagedCache
@@ -439,12 +440,10 @@ def commit_dspark_verify_step(
         raise ValueError("DSpark verify commit needs an appended context and eight-row result")
     tokens = verified.committed_ids[0].cpu().tolist()
     remaining = seq.output_len - (len(seq) - seq.raw_prompt_len)
-    count = min(len(tokens), remaining)
-    if not seq.ignore_eos:
-        count = next(
-            (i + 1 for i, token in enumerate(tokens[:count]) if token in seq.finish_tokens),
-            count,
-        )
+    count = output_prefix_length(
+        tokens, remaining_tokens=remaining,
+        finish_tokens=seq.finish_tokens, ignore_eos=seq.ignore_eos,
+    )
     if count <= 0:
         raise ValueError("DSpark verify commit has no remaining output budget")
     # All device reads and validation precede the first state-table mutation.
