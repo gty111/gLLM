@@ -22,6 +22,7 @@ from gllm.speculative.backend import select_speculative_backend
 from gllm.speculative.dspark_runtime import (
     process_dspark_output, reject_dspark_request, schedule_dspark,
 )
+from gllm.speculative.output import append_output_row, output_prefix_length
 
 
 @dataclass
@@ -355,22 +356,6 @@ class Scheduler:
         # ``process_output`` can attach them in batch order.
         self.next_tokens_queue.append((next_tokens, logprobs, prompt_logprobs))
 
-    @staticmethod
-    def _attach_prompt_logprobs(ipc_package, seq):
-        """Emit a seq's completed prompt-logprobs exactly once.
-
-        Called on the step the prompt finishes prefill (its first output
-        token). ``prompt_logprobs_data`` is fully populated by then, so we hand
-        it to the frontend keyed by seq_id and latch ``_prompt_logprobs_sent``
-        so later decode steps don't resend it.
-        """
-        if (
-            getattr(seq, "prompt_logprobs_enabled", False)
-            and not seq._prompt_logprobs_sent
-            and seq.prompt_logprobs_data is not None
-        ):
-            ipc_package.prompt_logprobs[seq.seq_id] = seq.prompt_logprobs_data
-            seq._prompt_logprobs_sent = True
 
     def set_log(self, log):
         self.log = log
@@ -389,33 +374,25 @@ class Scheduler:
         for idx, seq in enumerate(schedule_seqs):
             seq.computed_token_num += seq.to_compute_token_num
             if seq.computed_prompt:
-                ipc_package.act_schedule_ids.append(seq.seq_id)
                 tok = next_tokens[idx]
-                if logprobs is not None and seq.logprobs_enabled:
-                    ipc_package.logprobs.append(logprobs[idx])
-                else:
-                    ipc_package.logprobs.append(None)
-                if prompt_logprobs and seq.seq_id in prompt_logprobs:
-                    # PP>1: prompt logprobs computed on the follower and shipped
-                    # over the token socket; attach the received list directly.
-                    ipc_package.prompt_logprobs[seq.seq_id] = prompt_logprobs[
-                        seq.seq_id
-                    ]
-                else:
-                    # PP=1: attach from the local seq's accumulated data.
-                    self._attach_prompt_logprobs(ipc_package, seq)
+                row_logprobs = (
+                    logprobs[idx] if logprobs is not None and seq.logprobs_enabled else None
+                )
                 # MTP relay: ``tok`` is ``[x1] + accepted_drafts``. Every element
                 # was a verify input, so its KV/GDN state is already valid; the
                 # target bonus stays in the runner relay and becomes the next
                 # verify's x1. For the ordinary path ``tok`` is one uncached token.
                 committed = tok if isinstance(tok, list) else [tok]
-                kept = 0
-                for t in committed:
+                # Preserve the old append-then-stop rule for a completed step,
+                # including its first token when the budget is already spent.
+                remaining = max(1, seq.output_len - (len(seq) - seq.raw_prompt_len))
+                kept = output_prefix_length(
+                    committed, remaining_tokens=remaining,
+                    finish_tokens=seq.finish_tokens, ignore_eos=seq.ignore_eos,
+                )
+                for t in committed[:kept]:
                     seq.append(t)
-                    kept += 1
                     self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
-                    if seq.is_finish:
-                        break
                 # Cached beyond the base decode's +1: the accepted drafts. In
                 # MTP, the +1 accounts for x1 even though it arrived from the
                 # runner relay rather than the scheduler token list.
@@ -423,14 +400,15 @@ class Scheduler:
                 if extra > 0:
                     seq.computed_token_num += extra
                     self.model_runner.memory_manager.pre_allocate_page([seq])
-                # Ship only the tokens we actually kept. The loop above stops at
-                # ``is_finish``, so ``kept`` is where EOS / max_tokens landed;
+                # Ship only the tokens we actually kept. The shared prefix
+                # count places ``kept`` at the EOS / max_tokens boundary;
                 # sending the untruncated ``committed`` made the frontend append
                 # the whole speculative burst to its own copy of the sequence
                 # (``LLM._apply_ipc_package``), overshooting ``max_tokens`` by up
                 # to ``k`` tokens and emitting text past the stop token.
-                ipc_package.next_tokens.append(
-                    committed[:kept] if isinstance(tok, list) else tok
+                append_output_row(
+                    ipc_package, seq, committed[:kept] if isinstance(tok, list) else tok,
+                    logprobs=row_logprobs, prompt_logprobs=prompt_logprobs,
                 )
             if seq.is_finish:
                 self._retire_seq(seq, ipc_package)
@@ -1152,12 +1130,10 @@ class OverlapScheduler(Scheduler):
             remaining = max(
                 1, seq.output_len - (len(seq) - seq.raw_prompt_len)
             )
-            kept = min(len(row), remaining)
-            if not seq.ignore_eos:
-                for idx, token in enumerate(row[:kept]):
-                    if int(token) in seq.finish_tokens:
-                        kept = idx + 1
-                        break
+            kept = output_prefix_length(
+                row, remaining_tokens=remaining,
+                finish_tokens=seq.finish_tokens, ignore_eos=seq.ignore_eos,
+            )
             committed_tokens = [int(token) for token in row[:kept]]
             append_start = len(seq.token_ids)
             seq.token_ids.extend(committed_tokens)
@@ -1174,10 +1150,7 @@ class OverlapScheduler(Scheduler):
                 self.model_runner.register_decode_page_hash(seq, n_tokens - 1)
 
             if seq.computed_prompt:
-                ipc_package.act_schedule_ids.append(seq.seq_id)
-                ipc_package.next_tokens.append(committed_tokens)
-                ipc_package.logprobs.append(None)
-                self._attach_prompt_logprobs(ipc_package, seq)
+                append_output_row(ipc_package, seq, committed_tokens)
 
             if seq.is_finish:
                 self._retire_seq(seq, ipc_package, defer_frees)
@@ -1216,10 +1189,7 @@ class OverlapScheduler(Scheduler):
             seq.append(token)
             self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
 
-            ipc_package.act_schedule_ids.append(seq.seq_id)
-            ipc_package.next_tokens.append([token])
-            ipc_package.logprobs.append(None)
-            self._attach_prompt_logprobs(ipc_package, seq)
+            append_output_row(ipc_package, seq, [token])
 
             if seq.is_finish:
                 self._retire_seq(seq, ipc_package)
@@ -1262,17 +1232,12 @@ class OverlapScheduler(Scheduler):
             self.model_runner.register_decode_page_hash(seq, placeholder_pos)
 
             if seq.computed_prompt:
-                ipc_package.act_schedule_ids.append(seq.seq_id)
-                ipc_package.next_tokens.append(real_token)
+                row_logprobs = None
                 if logprobs is not None and seq.logprobs_enabled:
                     sampled, top_ids, top_vals = logprobs[batch_idx]
                     k = seq.num_top_logprobs
-                    ipc_package.logprobs.append(
-                        (sampled, top_ids[:k], top_vals[:k])
-                    )
-                else:
-                    ipc_package.logprobs.append(None)
-                self._attach_prompt_logprobs(ipc_package, seq)
+                    row_logprobs = (sampled, top_ids[:k], top_vals[:k])
+                append_output_row(ipc_package, seq, real_token, logprobs=row_logprobs)
 
             is_eos = not seq.ignore_eos and real_token in seq.finish_tokens
             generated_len = placeholder_pos + 1 - seq.raw_prompt_len

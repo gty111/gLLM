@@ -2,6 +2,8 @@
 
 import torch
 
+from gllm.speculative.output import append_output_row
+
 from gllm.runtime.sequence import RequestCapacityError
 from gllm.speculative.dspark import (
     DSparkStepResult, commit_dspark_prompt_step, commit_dspark_tail_step,
@@ -213,9 +215,7 @@ def process_dspark_output(scheduler, seqs, result, ipc_package):
             ipc_package.request_errors[seq.seq_id] = scheduler._pending_request_errors.pop(seq.seq_id)
             continue
         if published:
-            ipc_package.act_schedule_ids.append(seq.seq_id)
-            ipc_package.next_tokens.append(published)
-            ipc_package.logprobs.append(None)
+            append_output_row(ipc_package, seq, published)
         if seq.is_finish:
             scheduler._retire_seq(seq, ipc_package)
         else:
