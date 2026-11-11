@@ -100,8 +100,9 @@ class DSparkExecutionMixin:
 
     def _dspark_verify_fits(self, seq):
         remaining = seq.output_len - (len(seq) - seq.raw_prompt_len)
+        width = self.dspark.block_size + 1
         return (
-            remaining >= 8 and seq.computed_token_num + 8 <= self.model_max_length
+            remaining >= width and seq.computed_token_num + width <= self.model_max_length
             and seq.computed_token_num + self.dspark.noise_width
             <= self.dspark.rotary_emb.cos_sin_cache.shape[0]
         )
@@ -174,27 +175,28 @@ class DSparkExecutionMixin:
 
     @torch.inference_mode()
     def _execute_dspark_verify(self, seq: GenerationSequence) -> DSparkStepResult:
-        """Append the previous committed suffix once, then verify eight inputs."""
+        """Append the previous committed suffix once, then verify the configured anchor/candidate window."""
         self._validate_dspark_request(seq)
         state = self._get_dspark_request(seq)
+        width = self.dspark.block_size + 1
         start = seq.computed_token_num
         pending = state.pending_hidden
         if (
-            state.phase != "verify" or seq.to_compute_token_num != 8
+            state.phase != "verify" or seq.to_compute_token_num != width
             or len(seq) != start or state.anchor_pos != start or state.anchor is None
             or state.paged_cache is None or pending is None
             or pending.ndim != 3 or pending.shape[0] != 1
-            or not 1 <= pending.shape[1] <= 8
+            or not 1 <= pending.shape[1] <= width
             or state.cache.context_length + pending.shape[1] != start
         ):
             raise ValueError("DSpark verify needs contiguous pending taps and an unpublished anchor")
         if not self._dspark_verify_fits(seq):
             raise ValueError("DSpark verify window does not fit; use the single-token tail")
         if not self._reserve_dspark_step(
-            seq, state, target_length=start + 8, draft_length=start + 8
+            seq, state, target_length=start + width, draft_length=start + width
         ):
             raise RequestCapacityError("Insufficient cache capacity for the DSpark verify window")
-        result = DSparkStepResult(seq.seq_id, seq._cache_epoch, start, 8, "verify")
+        result = DSparkStepResult(seq.seq_id, seq._cache_epoch, start, width, "verify")
         state.inflight = result
         draft_hidden, _ = self.dspark.forward_draft(
             pending, state.anchor, start_pos=start, caches=state.paged_cache
@@ -205,11 +207,11 @@ class DSparkExecutionMixin:
         old_verify = getattr(seq, "_mtp_verify", False)
         try:
             seq.to_compute_tokens = proposed[0].cpu().tolist()
-            seq.to_compute_token_num, seq._mtp_verify = 8, True
+            seq.to_compute_token_num, seq._mtp_verify = width, True
             self.input_data.cal_and_set_input([seq])
             if self.uses_mrope:
                 self.input_data.set_mrope_position(
-                    torch.arange(start, start + 8, device="cpu").repeat(3, 1)
+                    torch.arange(start, start + width, device="cpu").repeat(3, 1)
                 )
             self._prepare_attention_metadata(self.input_data)
             result.verification = verify_dspark_target(
@@ -272,6 +274,7 @@ class DSparkExecutionMixin:
         members become inflight before shared GPU work; a partial batch
         failure cannot be retried using any member's mutated rolling state.
         """
+        width = self.dspark.block_size + 1
         capacity = getattr(self, "max_running_seqs", getattr(self, "maxd", 1))
         if (
             not 1 < len(seqs) <= capacity
@@ -312,7 +315,7 @@ class DSparkExecutionMixin:
                 if not valid:
                     raise ValueError("DSpark prompt batch does not cover contiguous phase inputs")
             elif (
-                count != (8 if phase == "verify" else 1)
+                count != (width if phase == "verify" else 1)
                 or len(seq) != start or state.anchor_pos != start or state.anchor is None
                 or state.anchor.numel() != 1
             ):
@@ -320,7 +323,7 @@ class DSparkExecutionMixin:
             if phase == "verify" and (
                 state.paged_cache is None or state.pending_hidden is None
                 or state.pending_hidden.ndim != 3 or state.pending_hidden.shape[0] != 1
-                or not 1 <= state.pending_hidden.shape[1] <= 8
+                or not 1 <= state.pending_hidden.shape[1] <= width
                 or state.cache.context_length + state.pending_hidden.shape[1] != start
                 or not self._dspark_verify_fits(seq)
             ):

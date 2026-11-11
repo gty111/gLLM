@@ -59,7 +59,10 @@ class DSparkBackend(TargetBackend):
     def reservation_width(self, runner, num_decodes, *, phase=None, eligible=True, dp_attention=False):
         """Prefill uses its ragged chunk length; these are fixed decode phases."""
         if phase == "verify":
-            return 8
+            k = runner.dspark.block_size
+            if type(k) is not int or k < 1:
+                raise ValueError("DSpark verify requires a positive runtime proposal count")
+            return k + 1
         if phase in ("bootstrap", "tail"):
             return 1
         raise ValueError("DSpark decode reservation requires a known decode phase")

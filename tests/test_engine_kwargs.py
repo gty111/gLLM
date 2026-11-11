@@ -236,7 +236,7 @@ def test_dspark_startup_cuda_failure_reaches_worker_exit_path_without_cleanup(mo
 
     runner = SimpleNamespace(
         max_num_batched_tokens=16, model_max_length=32, uses_mrope=False,
-        dspark=SimpleNamespace(config=SimpleNamespace(target_layer_ids=(0, 1))),
+        dspark=SimpleNamespace(block_size=7, noise_width=7, config=SimpleNamespace(target_layer_ids=(0, 1))),
         input_data=SimpleNamespace(cal_and_set_input=lambda seqs: None),
         memory_manager=SimpleNamespace(
             reserve_dspark_pages=lambda *args, **kwargs: True,
@@ -347,3 +347,132 @@ def test_effective_speculative_backend_selection(dspark, mtp, name, overlap, gra
     # Selection carries no model, request registry or execution-context state.
     assert not vars(backend)
     assert backend is select_speculative_backend(dspark_enabled=dspark, mtp_enabled=mtp)
+
+
+
+@pytest.mark.parametrize("builder", [api_server.build_arg_parser, lm_server.build_arg_parser])
+def test_runtime_width_cli_forwards_common_proposal_count(builder):
+    args = _parse(builder, [
+        "server", "--model-path", "/tmp/target", "--speculative-backend", "mtp",
+        "--speculative-num-draft-tokens", "2", "--mtp-k", "5",
+    ])
+    values = cli_args.engine_kwargs(args)
+    assert values["speculative_num_draft_tokens"] == 2 and values["mtp_k"] == 5
+    config = EngineConfig(model_path="/tmp/target", **{
+        key: value for key, value in values.items() if key != "model_path"
+    })
+    assert config.resolve_num_draft_tokens("mtp") == 2
+
+
+def test_runtime_width_llm_forwards_common_count_before_worker_construction(monkeypatch):
+    from gllm.engine import llm as module
+
+    captured = {}
+
+    class CapturedConfig(Exception):
+        pass
+
+    def capture(**kwargs):
+        captured.update(kwargs)
+        raise CapturedConfig
+
+    monkeypatch.setattr(module, "init_logger", lambda: None)
+    monkeypatch.setattr(module, "EngineConfig", capture)
+    with pytest.raises(CapturedConfig):
+        module.LLM.__init__(object(), model_path="/tmp/target",
+                            speculative_num_draft_tokens=2, mtp_k=5)
+    assert captured["speculative_num_draft_tokens"] == 2 and captured["mtp_k"] == 5
+
+
+@pytest.mark.parametrize("count", [0, -1, True, False, 1.5, "3"])
+def test_runtime_width_config_rejects_invalid_common_counts(count):
+    with pytest.raises(ValueError, match="speculative_num_draft_tokens"):
+        EngineConfig(model_path="/tmp/target", speculative_num_draft_tokens=count)
+
+
+@pytest.mark.parametrize("count", [1, 3, 7])
+@pytest.mark.parametrize("legacy", [0, 2, 5])
+def test_runtime_width_common_count_overrides_legacy_mtp_without_mutating_it(count, legacy):
+    config = EngineConfig(model_path="/tmp/target", speculative_backend="mtp",
+                          speculative_num_draft_tokens=count, mtp_k=legacy)
+    assert config.resolve_num_draft_tokens("mtp") == count and config.mtp_k == legacy
+    assert config.resolve_mtp_enabled("Qwen3_5ForConditionalGeneration", 1)
+
+
+@pytest.mark.parametrize("backend,enabled", [("none", None), (None, False)])
+def test_runtime_width_explicit_count_cannot_be_silently_disabled(backend, enabled):
+    with pytest.raises(ValueError, match="requires an enabled speculative backend"):
+        EngineConfig(model_path="/tmp/target", speculative_backend=backend,
+                     mtp_enabled=enabled, speculative_num_draft_tokens=3)
+
+
+@pytest.mark.parametrize("backend,architecture,layers", [
+    (None, "Qwen3_5ForConditionalGeneration", 0),
+    ("mtp", "Qwen3_5ForConditionalGeneration", 0),
+    (None, "DeepseekV4ForCausalLM", 3),
+    ("mtp", "DeepseekV4ForCausalLM", 3),
+])
+def test_runtime_width_explicit_mtp_count_requires_compatible_checkpoint(backend, architecture, layers):
+    config = EngineConfig(model_path="/tmp/target", speculative_backend=backend,
+                          speculative_num_draft_tokens=3)
+    with pytest.raises(ValueError):
+        config.resolve_mtp_enabled(architecture, layers)
+
+
+@pytest.mark.parametrize("count", [1, 3, 7])
+@pytest.mark.parametrize("batch", [1, 4])
+def test_runtime_width_config_validates_raw_and_effective_dspark_budget(count, batch):
+    required = (count + 1) * batch
+    values = _dspark_engine_options()
+    values.update(speculative_num_draft_tokens=count, maxd=batch, maxp=2 * required)
+    config = EngineConfig(**values)
+    config.validate_speculative_token_budget(required, batch)
+    with pytest.raises(ValueError, match="effective token budget"):
+        config.validate_speculative_token_budget(required - 1, batch)
+    values["maxp"] = required - 1
+    with pytest.raises(ValueError, match="maxp >="):
+        EngineConfig(**values)
+
+
+def test_runtime_width_explicit_mtp_budget_rejects_only_new_common_setting():
+    legacy = EngineConfig(model_path="/tmp/target", mtp_k=7)
+    legacy.validate_speculative_token_budget(1, 4)
+    explicit = EngineConfig(model_path="/tmp/target", speculative_num_draft_tokens=7)
+    with pytest.raises(ValueError, match="MTP verify window"):
+        explicit.validate_speculative_token_budget(7, 4)
+    explicit.validate_speculative_token_budget(8, 4)
+
+
+def test_runtime_width_default_and_checkpoint_maximum_remain_compatible():
+    config = EngineConfig(**_dspark_engine_options())
+    assert config.resolve_num_draft_tokens("dspark") == 7 and config.mtp_k == 3
+    values = _dspark_engine_options()
+    values["speculative_num_draft_tokens"] = 8
+    with pytest.raises(ValueError, match="checkpoint range"):
+        EngineConfig(**values)
+    assert EngineConfig(model_path="/tmp/target").resolve_num_draft_tokens("none") == 0
+
+
+
+@pytest.mark.parametrize("last_rank", [False, True])
+def test_runtime_width_loaded_mtp_head_check_respects_pipeline_owner(monkeypatch, last_rank):
+    from types import SimpleNamespace
+    from gllm.runtime import model_runner as module
+
+    class SelectionReached(Exception):
+        pass
+
+    def stop_selection(**kwargs):
+        raise SelectionReached
+
+    runner = module.ModelRunner.__new__(module.ModelRunner)
+    runner.config = EngineConfig(model_path="/tmp/target", speculative_num_draft_tokens=2)
+    runner.dspark_enabled = False
+    runner._mtp_k_cfg = 2
+    runner.verify_config = lambda: None
+    runner.model_loader = SimpleNamespace(load_model=lambda *_: SimpleNamespace(mtp=None))
+    monkeypatch.setattr(module, "is_last_pp_rank", lambda: last_rank)
+    monkeypatch.setattr(module, "select_speculative_backend", stop_selection)
+    expected = ValueError if last_rank else SelectionReached
+    with pytest.raises(expected):
+        runner.init()

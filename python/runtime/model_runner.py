@@ -269,7 +269,7 @@ class ModelRunner(
         resolved_mtp_enabled = config.resolve_mtp_enabled(
             self.model_loader.architecture, _num_nextn
         )
-        self._mtp_k_cfg = config.mtp_k
+        self._mtp_k_cfg = config.resolve_num_draft_tokens("mtp")
         self._mtp_max_batch_cfg = config.mtp_max_batch
         self.model_loader.config.mtp_enabled = resolved_mtp_enabled
         # Nested text config (Qwen3.5-VL wrapper) reads ``mtp_enabled`` off its
@@ -398,8 +398,9 @@ class ModelRunner(
                     self.max_num_batched_tokens
                 )
 
-        if getattr(self, "dspark_enabled", False) and self.max_num_batched_tokens < 8 * self.max_running_seqs:
-            raise ValueError("DSpark effective token budget must cover 8 * maxd verify rows")
+        self.config.validate_speculative_token_budget(
+            self.max_num_batched_tokens, self.max_running_seqs
+        )
 
     def resolve_model_max_length(self, model_max_length):
         if model_max_length is None:
@@ -590,7 +591,8 @@ class ModelRunner(
         self.model = self.model_loader.load_model(mp_load_progress)
         if self.dspark_enabled:
             self.dspark = load_dspark_draft(
-                self.config.dspark_model_path, self.model, self.model_max_length
+                self.config.dspark_model_path, self.model, self.model_max_length,
+                num_draft_tokens=self.config.resolve_num_draft_tokens("dspark"),
             )
         # MTP speculative decoding: number of draft tokens per step (k). Active
         # only when the model built an MTP head (mtp_enabled + nextn layers).
@@ -605,8 +607,19 @@ class ModelRunner(
         )
         if self.config.speculative_backend == "mtp" and not self.mtp_enabled:
             raise ValueError("mtp requires a loaded compatible MTP head")
+        if (
+            getattr(self.config, "speculative_num_draft_tokens", None) is not None
+            and not self.dspark_enabled and not self.mtp_enabled and is_last_pp_rank()
+        ):
+            raise ValueError("speculative_num_draft_tokens requires a loaded compatible MTP head")
         self.speculative_backend = select_speculative_backend(
             dspark_enabled=self.dspark_enabled, mtp_enabled=self.mtp_enabled,
+        )
+        count = self.dspark.block_size if self.dspark_enabled else self._mtp_k
+        logger.info(
+            "Speculative backend=%s, requested_proposals=%s, proposals=%d, verify_width=%d",
+            self.speculative_backend.name,
+            getattr(self.config, "speculative_num_draft_tokens", None), count, count + 1,
         )
         # Models may opt out of monolithic decode graphs while individual
         # components are still being made graph-safe.  Keep this capability on

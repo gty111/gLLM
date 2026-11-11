@@ -75,6 +75,8 @@ class EngineConfig:
     # Explicit selection is opt-in; None preserves the legacy MTP policy.
     speculative_backend: Optional[str] = None
     dspark_model_path: Optional[str] = None
+    # Explicit common count overrides mtp_k; omission preserves legacy defaults.
+    speculative_num_draft_tokens: Optional[int] = None
 
     def __post_init__(self):
         # Internal consistency lives here, next to the fields, so entrypoints
@@ -92,6 +94,14 @@ class EngineConfig:
         backend = self.speculative_backend
         if backend not in (None, "none", "mtp", "dspark"):
             raise ValueError(f"Invalid speculative_backend: {backend!r}")
+        count = self.speculative_num_draft_tokens
+        if count is not None:
+            if type(count) is not int or count < 1:
+                raise ValueError("speculative_num_draft_tokens must be a positive integer")
+            if backend == "none" or (backend is None and self.mtp_enabled is False):
+                raise ValueError("speculative_num_draft_tokens requires an enabled speculative backend")
+            if backend == "dspark" and count > 7:
+                raise ValueError("DSpark speculative_num_draft_tokens must be within checkpoint range [1, 7]")
         if backend == "dspark":
             if not self.dspark_model_path:
                 raise ValueError("DSpark requires a local dspark_model_path")
@@ -114,10 +124,42 @@ class EngineConfig:
                     raise ValueError(f"DSpark requires {name}={value!r}")
             if type(self.maxd) is not int or self.maxd < 1:
                 raise ValueError("DSpark requires maxd >= 1")
-            if self.maxp < 8 * self.maxd:
-                raise ValueError("DSpark requires maxp >= 8 * maxd")
+            self.validate_speculative_token_budget(self.maxp, self.maxd)
             if self.disagg_config is not None or self.assigned_layers is not None:
                 raise ValueError("DSpark does not support disaggregation or assigned_layers")
+
+    def resolve_num_draft_tokens(self, backend: str) -> int:
+        """Resolve once during startup; runtime consumers use the loaded model.
+
+        Only the current seven-position Qwen DSpark checkpoint is supported.
+        Its loader checks the actual checkpoint before constructing the draft.
+        The common explicit count takes precedence without mutating mtp_k.
+        """
+        if backend not in ("none", "mtp", "dspark"):
+            raise ValueError(f"Unknown speculative backend: {backend!r}")
+        if backend == "none":
+            if self.speculative_num_draft_tokens is not None:
+                raise ValueError("speculative_num_draft_tokens requires an enabled speculative backend")
+            return 0
+        if self.speculative_num_draft_tokens is not None:
+            return self.speculative_num_draft_tokens
+        return 7 if backend == "dspark" else self.mtp_k
+
+    def validate_speculative_token_budget(self, token_budget: int, max_running_seqs: int) -> None:
+        """Validate the effective buffer budget, including after runner clamping.
+
+        Legacy MTP keeps its existing per-step fallback policy. An explicit
+        common count must fit at least one MTP window; DSpark's startup probe
+        must fit the whole configured maximum batch.
+        """
+        if self.speculative_backend == "dspark":
+            width = self.resolve_num_draft_tokens("dspark") + 1
+            if token_budget < width * max_running_seqs:
+                raise ValueError(f"DSpark requires maxp >= {width} * maxd and an effective token budget covering that verify batch")
+        elif self.speculative_num_draft_tokens is not None:
+            width = self.resolve_num_draft_tokens("mtp") + 1
+            if token_budget < width:
+                raise ValueError(f"Speculative token budget must cover one {width}-row MTP verify window")
 
     def resolve_mtp_enabled(self, architecture: str, nextn_layers: int) -> bool:
         """Resolve head construction without confusing GDN capacity with MTP."""
@@ -125,9 +167,15 @@ class EngineConfig:
             return False
         if self.speculative_backend == "mtp":
             # V4's joint DSpark stages are not a sequential NextN head.
-            if architecture == "DeepseekV4ForCausalLM" or nextn_layers < 1 or self.mtp_k < 1:
+            if architecture == "DeepseekV4ForCausalLM" or nextn_layers < 1 or self.resolve_num_draft_tokens("mtp") < 1:
                 raise ValueError("mtp requires a compatible MTP head and positive mtp_k")
             return True
-        if self.mtp_enabled is None and architecture == "DeepseekV4ForCausalLM":
-            return False
-        return nextn_layers >= 1 if self.mtp_enabled is None else bool(self.mtp_enabled)
+        enabled = (
+            False if self.mtp_enabled is None and architecture == "DeepseekV4ForCausalLM"
+            else nextn_layers >= 1 if self.mtp_enabled is None else bool(self.mtp_enabled)
+        )
+        if self.speculative_num_draft_tokens is not None and (
+            not enabled or nextn_layers < 1 or architecture == "DeepseekV4ForCausalLM"
+        ):
+            raise ValueError("speculative_num_draft_tokens requires a compatible enabled MTP head")
+        return enabled

@@ -185,7 +185,9 @@ def _safetensors_index(path: str) -> Dict[str, Tuple[str, str]]:
 
 
 @torch.no_grad()
-def load_dspark_draft(path: str, target, model_max_length: int):
+def load_dspark_draft(
+    path: str, target, model_max_length: int, *, num_draft_tokens: int | None = None,
+):
     """Load a local standalone drafter, borrowing the target's vocabulary.
 
     Target FP8 weights are independent of activation/cache precision. Only the
@@ -213,7 +215,12 @@ def load_dspark_draft(path: str, target, model_max_length: int):
         or any(not backbone.start_layer <= i < backbone.end_layer for i in layer_ids)
     ):
         raise ValueError("DSpark checkpoint has incompatible width, vocabulary or target taps")
-    if not 9 <= model_max_length <= min(text.max_model_len, config.max_position_embeddings):
+    count = config.block_size if num_draft_tokens is None else num_draft_tokens
+    if type(count) is not int or not 1 <= count <= config.block_size:
+        raise ValueError("num_draft_tokens must fit the checkpoint proposal range")
+    # A nonempty context plus one complete anchor/candidate verify window is
+    # required by startup profiling. This does not set request prompt lengths.
+    if not count + 2 <= model_max_length <= min(text.max_model_len, config.max_position_embeddings):
         raise ValueError("DSpark serving length must fit the target and draft context windows")
     embed, head = backbone.embed_tokens, text.lm_head
     if (
@@ -233,7 +240,9 @@ def load_dspark_draft(path: str, target, model_max_length: int):
     previous_dtype = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.bfloat16)
-        draft = Qwen38DSpark(config, embed=embed, lm_head=head).eval()
+        draft = Qwen38DSpark(
+            config, embed=embed, lm_head=head, num_draft_tokens=count
+        ).eval()
         if model_max_length > draft.rotary_emb.cos_sin_cache.shape[0]:
             raise ValueError("DSpark serving length exceeds the draft RoPE cache")
         draft.load_weights(weights)

@@ -171,6 +171,7 @@ def _dspark_scheduler_spy(prefix_manager, make_scheduler):
     base = make_scheduler(manager).model_runner
     base.dspark_enabled, base.maxd, base.maxp = True, 1, 8
     base.max_num_batched_tokens = 8
+    base.dspark = SimpleNamespace(block_size=7)
     base._dspark_requests = {}
     base._validate_dspark_request = lambda seq: None
     base._get_dspark_request = lambda seq: SimpleNamespace(
@@ -436,7 +437,7 @@ def test_dspark_scheduler_batch_groups_phases_and_defers_other_ready_owners(
 
 
 
-def _dspark_capacity_scheduler(batch=2):
+def _dspark_capacity_scheduler(batch=2, *, draft_tokens=7):
     """Real scheduler/request cleanup with CPU joint-reservation failure control."""
     from types import MethodType, SimpleNamespace
     from gllm.runtime.input_data import InputData
@@ -444,13 +445,15 @@ def _dspark_capacity_scheduler(batch=2):
     from gllm.speculative.dspark import DSparkRequestState
     from gllm.speculative.dspark_execution import DSparkExecutionMixin
 
+    width = draft_tokens + 1
     calls, freed = [], []
     manager = SimpleNamespace()
     runner = SimpleNamespace(
         dspark_enabled=True, mtp_enabled=False, memory_manager=manager,
+        dspark=SimpleNamespace(block_size=draft_tokens),
         input_data=InputData.__new__(InputData),
-        maxd=batch, max_running_seqs=batch, maxp=8 * batch,
-        max_num_batched_tokens=8 * batch, minp=1, iterp=1, page_size=16,
+        maxd=batch, max_running_seqs=batch, maxp=width * batch,
+        max_num_batched_tokens=width * batch, minp=1, iterp=1, page_size=16,
         init_new_token_ratio=0.1, min_new_token_ratio=0.1,
         _dspark_requests={}, can_reserve=lambda seq: True,
     )
@@ -468,7 +471,7 @@ def _dspark_capacity_scheduler(batch=2):
             while len(table) * 16 < length:
                 table.append(seq.seq_id * 16 + len(table))
         if seq.ssm_block_table is None:
-            seq.ssm_block_table = list(range(seq.seq_id * 8, seq.seq_id * 8 + 8))
+            seq.ssm_block_table = list(range(seq.seq_id * width, seq.seq_id * width + width))
             seq.recurrent_state_slot = seq.ssm_block_table[0]
         return True
 
@@ -512,10 +515,11 @@ def _dspark_capacity_scheduler(batch=2):
     return SimpleNamespace(scheduler=scheduler, runner=runner, own=own, calls=calls, freed=freed)
 
 
-def test_dspark_capacity_defers_new_admission_until_peer_retires():
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_dspark_capacity_defers_new_admission_until_peer_retires(draft_tokens):
     from gllm.distributed.comm import IPCPackage
 
-    fixture = _dspark_capacity_scheduler()
+    fixture = _dspark_capacity_scheduler(draft_tokens=draft_tokens)
     scheduler, runner = fixture.scheduler, fixture.runner
     peer = GenerationSequence(201, list(range(13)), [], output_len=32, temperature=0)
     peer.computed_token_num = peer.prompt_len
@@ -534,10 +538,11 @@ def test_dspark_capacity_defers_new_admission_until_peer_retires():
 
 
 @pytest.mark.parametrize("phase", ["prefill", "verify"])
-def test_dspark_capacity_retracts_blocked_owners_and_keeps_readmissions_out(phase):
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_dspark_capacity_retracts_blocked_owners_and_keeps_readmissions_out(phase, draft_tokens):
     from gllm.distributed.comm import IPCPackage
 
-    fixture = _dspark_capacity_scheduler()
+    fixture = _dspark_capacity_scheduler(draft_tokens=draft_tokens)
     scheduler, runner = fixture.scheduler, fixture.runner
     seqs = [
         GenerationSequence(sid, list(range(32 if phase == "prefill" else 13)), [],
@@ -587,8 +592,9 @@ def test_dspark_capacity_preserves_a_selected_batch_and_its_waiting_peer():
     assert scheduler.num_preempt_seqs == 0
 
 
-def test_dspark_capacity_retries_joint_demand_after_more_than_one_retraction():
-    fixture = _dspark_capacity_scheduler(batch=3)
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_dspark_capacity_retries_joint_demand_after_more_than_one_retraction(draft_tokens):
+    fixture = _dspark_capacity_scheduler(batch=3, draft_tokens=draft_tokens)
     scheduler, runner = fixture.scheduler, fixture.runner
     seqs = [GenerationSequence(sid, list(range(13)), [], output_len=32, temperature=0)
             for sid in (231, 232, 233)]
@@ -606,8 +612,9 @@ def test_dspark_capacity_retries_joint_demand_after_more_than_one_retraction():
     assert not scheduler._pending_follower_frees
 
 
-def test_dspark_capacity_reports_exclusive_failure_once_and_runs_next_request():
-    fixture = _dspark_capacity_scheduler()
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_dspark_capacity_reports_exclusive_failure_once_and_runs_next_request(draft_tokens):
+    fixture = _dspark_capacity_scheduler(draft_tokens=draft_tokens)
     scheduler, runner = fixture.scheduler, fixture.runner
     owner = GenerationSequence(241, list(range(13)), [], output_len=32, temperature=0)
     owner.computed_token_num = owner.prompt_len
@@ -755,3 +762,28 @@ def test_speculative_budget_shrinks_mtp_cohort_before_forward(
     scheduler.seqs_to_decode.extend([first, second])
     assert scheduler.schedule_decode_batch(2, token_budget=7) == [first]
     assert list(scheduler.seqs_to_decode) == [second]
+
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+@pytest.mark.parametrize("shortfall,expected", [(0, 2), (1, 1)])
+def test_runtime_width_scheduler_respects_full_window_budget(draft_tokens, shortfall, expected):
+    fixture = _dspark_capacity_scheduler(batch=4, draft_tokens=draft_tokens)
+    runner, scheduler = fixture.runner, fixture.scheduler
+    width = draft_tokens + 1
+    runner.max_num_batched_tokens = 2 * width - shortfall
+    requests = [
+        GenerationSequence(401 + row, list(range(13)), [], output_len=32, temperature=0)
+        for row in range(4)
+    ]
+    for seq in requests:
+        seq.computed_token_num = seq.prompt_len
+        fixture.own(seq)
+        scheduler.seqs_to_decode.append(seq)
+    fixture.calls.clear()
+    selected = scheduler.schedule_once()
+    assert selected == requests[:expected]
+    assert sum(seq.to_compute_token_num for seq in selected) == width * expected
+    assert all(seq.to_compute_token_num == width for seq in selected)
+    assert all(call[1:3] == (13 + width, 13 + width) for call in fixture.calls)
+    assert not scheduler._pending_request_errors

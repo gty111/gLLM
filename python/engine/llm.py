@@ -81,6 +81,7 @@ class LLM:
         ssm_snapshot_stride_tokens=256,
         speculative_backend=None,
         dspark_model_path=None,
+        speculative_num_draft_tokens=None,
     ):
         init_logger()
         # Single configuration object handed to the model runner and the
@@ -122,6 +123,7 @@ class LLM:
             mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
             speculative_backend=speculative_backend,
             dspark_model_path=dspark_model_path,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
             mtp_enabled=mtp_enabled,
             mtp_k=mtp_k,
             mtp_max_batch=mtp_max_batch,

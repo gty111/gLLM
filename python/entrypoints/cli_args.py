@@ -262,6 +262,13 @@ def add_mtp_args(p: argparse.ArgumentParser) -> None:
         help="Explicit speculative backend; omission preserves --mtp-enabled policy.",
     )
     p.add_argument(
+        "--speculative-num-draft-tokens",
+        type=int,
+        default=None,
+        help="Fixed proposal count selected at startup. Overrides --mtp-k for MTP; "
+        "DSpark supports 1..7. Omission preserves each backend's default.",
+    )
+    p.add_argument(
         "--dspark-model-path",
         type=str,
         default=None,
