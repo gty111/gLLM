@@ -132,7 +132,7 @@ def tiny_model(tmp_path, request):
             layer.ple_lookup.close()
 
 
-def make_inputs(model, mtp_k=0):
+def make_inputs(model, speculative_num_draft_tokens=0):
     manager = MemoryManager.__new__(MemoryManager)
     manager.num_layers = model.num_kv_layers
     manager.dtype = torch.bfloat16
@@ -143,7 +143,7 @@ def make_inputs(model, mtp_k=0):
     manager.use_mla = False
     manager.dsv4_kv_cache_config = manager.dsv4_state_cache_config = None
     manager.ssm_cache_config = model.ssm_cache_config
-    manager.mtp_k = mtp_k
+    manager.speculative_num_draft_tokens = speculative_num_draft_tokens
     manager.requires_mrope_buffer = model.requires_mrope_buffer
     kv_layout = manager._kv_cache_layout()
     arena = CacheArena(
@@ -533,7 +533,7 @@ def mtp_model(tmp_path):
 
 @torch.inference_mode()
 def test_mtp_carries_all_hidden_streams(mtp_model):
-    manager, data = make_inputs(mtp_model, mtp_k=2)
+    manager, data = make_inputs(mtp_model, speculative_num_draft_tokens=2)
     seq = make_request(manager, 0, list(range(1, 17)))
     run_chunk(mtp_model, data, seq, 8)
     seq.to_compute_token_num = 1
@@ -552,14 +552,14 @@ def test_mtp_carries_all_hidden_streams(mtp_model):
 def test_verify_ple_state_matches_accepted_prefix(mtp_model, accepted):
     model = mtp_model
     tokens = list(range(1, 25))
-    baseline_manager, baseline_data = make_inputs(model, mtp_k=2)
+    baseline_manager, baseline_data = make_inputs(model, speculative_num_draft_tokens=2)
     baseline_seq = make_request(baseline_manager, 0, tokens)
     run_chunk(model, baseline_data, baseline_seq, 8)
     for end in range(9, 10 + accepted):
         expected_logits = run_chunk(model, baseline_data, baseline_seq, end)
     baseline_slot = baseline_seq.recurrent_state_slot
 
-    manager, data = make_inputs(model, mtp_k=2)
+    manager, data = make_inputs(model, speculative_num_draft_tokens=2)
     seq = make_request(manager, 0, tokens)
     manager.ssm_segment.free_block_table(seq.ssm_block_table)
     seq.ssm_block_table = manager.ssm_segment.allocate_block_table(3)
@@ -601,7 +601,7 @@ def test_verify_ple_state_matches_accepted_prefix(mtp_model, accepted):
 @torch.inference_mode()
 def test_verify_graph_replays_candidates_and_resume_columns(mtp_model):
     model = mtp_model
-    manager, data = make_inputs(model, mtp_k=2)
+    manager, data = make_inputs(model, speculative_num_draft_tokens=2)
     seq = make_request(manager, 0, list(range(1, 33)))
     manager.ssm_segment.free_block_table(seq.ssm_block_table)
     seq.ssm_block_table = manager.ssm_segment.allocate_block_table(3)
@@ -661,7 +661,7 @@ def test_piecewise_mixed_verify_and_prefill_updates_live_metadata(mtp_model):
     from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 
     model = mtp_model
-    manager, data = make_inputs(model, mtp_k=2)
+    manager, data = make_inputs(model, speculative_num_draft_tokens=2)
     seq = make_request(manager, 0, list(range(1, 33)))
     manager.ssm_segment.free_block_table(seq.ssm_block_table)
     seq.ssm_block_table = manager.ssm_segment.allocate_block_table(3)

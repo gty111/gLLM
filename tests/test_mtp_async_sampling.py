@@ -35,7 +35,7 @@ def _runner(monkeypatch, *, asynchronous, sparse, tp_override=False):
         install_ctx_host=host.clone().pin_memory(),
     )
     runner._mtp_staging.install_ctx_host_np = runner._mtp_staging.install_ctx_host.numpy()
-    runner._mtp_k = k
+    runner.speculative_num_draft_tokens = k
     runner.max_running_seqs = n
     runner._mtp_can_sample = True
     runner._mtp_sampling_seen = False

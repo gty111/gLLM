@@ -76,7 +76,6 @@ class LLM:
         mla_cache_dtype="bf16",
         mamba_ssm_cache_dtype="auto",
         mtp_enabled=None,
-        mtp_k=3,
         mtp_max_batch=0,
         ssm_snapshot_stride_tokens=256,
         speculative_backend=None,
@@ -125,7 +124,6 @@ class LLM:
             dspark_model_path=dspark_model_path,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             mtp_enabled=mtp_enabled,
-            mtp_k=mtp_k,
             mtp_max_batch=mtp_max_batch,
             ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
         )

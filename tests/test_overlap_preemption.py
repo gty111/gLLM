@@ -101,7 +101,7 @@ def test_mtp_compaction_recalculates_demand_and_avoids_preemption(setup_pending,
         mtp=True, length=length, result=(40, 41)
     )
     if lookahead:
-        s.model_runner.mtp_k = 3
+        s.model_runner.speculative_num_draft_tokens = 3
         s.model_runner.model = SimpleNamespace(mtp=object())
         # The fixture installs its simulated MTP head after construction.
         from gllm.speculative.backend import select_speculative_backend

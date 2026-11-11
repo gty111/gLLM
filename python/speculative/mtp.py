@@ -91,7 +91,7 @@ class MtpMixin:
         return self._mtp_decide(num_decodes)
 
     def _mtp_decide(self, num_decodes: int) -> bool:
-        qlen = 1 + self._mtp_k
+        qlen = 1 + self.speculative_num_draft_tokens
         fits_token_budget = (
             qlen > 1 and num_decodes * qlen <= self.max_num_batched_tokens
         )
@@ -111,7 +111,7 @@ class MtpMixin:
         this check needs no device read. Declining speculation lets the worker
         drain that completion before preparing ordinary one-token decode.
         """
-        width = 1 + self._mtp_k
+        width = 1 + self.speculative_num_draft_tokens
         return all(
             len(seq) + width
             <= min(self.model_max_length, seq.raw_prompt_len + seq.output_len)
@@ -906,7 +906,7 @@ class MtpMixin:
         # the chain outputs and position helpers persistent so the hot path does
         # not allocate k clones, a stack output, a base-position clone, or a new
         # arange tensor on every speculative step.
-        self._d_drafts = torch.empty((B, self._mtp_k), dtype=torch.int64, device=dev)
+        self._d_drafts = torch.empty((B, self.speculative_num_draft_tokens), dtype=torch.int64, device=dev)
         self._d_base_pos = torch.empty(B, dtype=torch.long, device=dev)
         self._d_row_idx = torch.arange(B, dtype=torch.int64, device=dev)
         self._d_penalty_history = torch.ones(
@@ -1135,7 +1135,7 @@ class MtpMixin:
         # Dummy SSM block table (all point at the dummy block 0) so the verify
         # metadata (2D block table) is built during graph capture with the same
         # shape as a real verify batch. num_accepted stays 1 (resume col 0).
-        k1 = 1 + self._mtp_k
+        k1 = 1 + self.speculative_num_draft_tokens
         # Dummy seq ids are offset high to avoid the common case of colliding
         # with a live request id, but correctness does NOT rely on that: we only
         # seed an embedding-cache stub when the id is currently ABSENT, remember
@@ -1160,7 +1160,7 @@ class MtpMixin:
             s.computed_token_num = ctx
             s.to_compute_token_num = qlen
             s._mtp_verify = True
-            if self.memory_manager.ssm_segment is not None and self._mtp_k > 0:
+            if self.memory_manager.ssm_segment is not None and self.speculative_num_draft_tokens > 0:
                 s.ssm_block_table = [0] * k1
                 s.ssm_num_accepted = 1
             if self.memory_manager.recurrent_segment is not None:
@@ -1201,7 +1201,7 @@ class MtpMixin:
         both graph-safe (the selector reads only static-buffer views; the kernel
         + ``get_mla_metadata`` already run inside the captured decode graph).
         """
-        qlen = 1 + self._verify_k
+        qlen = 1 + self.speculative_num_draft_tokens
         # ``capture_sizes`` is expressed in decode requests, while the verify
         # forward consumes ``bucket * (1+k)`` token rows. Keep verify graphs
         # within the same hard token capacity used by the scheduler and the
@@ -1276,7 +1276,7 @@ class MtpMixin:
         bucket fits (caller falls back to eager).
         """
         qlen = 1 + kk
-        if qlen != 1 + self._verify_k:
+        if qlen != 1 + self.speculative_num_draft_tokens:
             return None  # only the captured qlen is supported
         bucket = None
         for b in sorted(self._verify_size_to_graph.keys()):
@@ -1362,7 +1362,7 @@ class MtpMixin:
         shape needed by a future DP-wide fixed-mode implementation.
         """
         nd = len(decode_seqs)
-        qlen = 1 + self._mtp_k
+        qlen = 1 + self.speculative_num_draft_tokens
         missing_pos = [
             i for i, s in enumerate(decode_seqs) if s.seq_id not in self._mtp_relay
         ]
@@ -1916,7 +1916,7 @@ class MtpMixin:
         """
         extra_prefill_seqs = list(extra_prefill_seqs or ())
         nd = self.input_data.num_decodes
-        k = self._mtp_k
+        k = self.speculative_num_draft_tokens
         mtp = self.model.mtp
         decode_seqs = self.input_data.seqs[:nd]
         dev = hidden.device
@@ -2577,7 +2577,7 @@ class MtpMixin:
             # Invalidate it so a later async run starts from the CPU column-0
             # view installed above instead of mixing the two conventions.
             state.reset()
-        self._record_mtp_metrics(len(seqs), self._mtp_k, [v - 1 for v in valid])
+        self._record_mtp_metrics(len(seqs), self.speculative_num_draft_tokens, [v - 1 for v in valid])
         return committed
 
 

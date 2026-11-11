@@ -39,7 +39,7 @@ class MtpBackend(TargetBackend):
         """
         if not eligible or num_decodes <= 0 or dp_attention:
             return 1
-        k = int(getattr(runner, "mtp_k", 0) or 0)
+        k = int(getattr(runner, "speculative_num_draft_tokens", 0) or 0)
         if k <= 0 or getattr(runner.model, "mtp", None) is None:
             return 1
         max_batch = int(getattr(runner, "mtp_max_batch", 0) or 0)

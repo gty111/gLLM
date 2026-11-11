@@ -16,7 +16,7 @@ def test_verify_dummy_embedding_cache_preserves_live_entries(monkeypatch):
         memory_manager=SimpleNamespace(
             dummy_page=0, ssm_segment=None, recurrent_segment=None,
         ),
-        _mtp_k=3, page_size=16, use_mm=True, uses_mrope=True,
+        speculative_num_draft_tokens=3, page_size=16, use_mm=True, uses_mrope=True,
         embedding_cache={1_000_000: live},
     )
 

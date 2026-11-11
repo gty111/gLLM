@@ -16,7 +16,7 @@ from gllm.runtime.sequence import GenerationSequence
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_production_context_boundary_stages_only_fitting_mtp_window():
     runner = MtpMixin()
-    runner._mtp_k = 3
+    runner.speculative_num_draft_tokens = 3
     runner.model_max_length = 240000
     seq = GenerationSequence(1, [10] * 239996, [], output_len=64)
     seq.raw_prompt_len = 239990
@@ -25,7 +25,7 @@ def test_production_context_boundary_stages_only_fitting_mtp_window():
         uses_mrope=False, device=torch.device("cuda"),
     )
     assert runner.mtp_context_compatible([seq])
-    reserved_length = len(seq) + 1 + runner._mtp_k
+    reserved_length = len(seq) + 1 + runner.speculative_num_draft_tokens
     seq.page_table = list(range((reserved_length + 15) // 16))
     prep.push_meta(
         [seq], 1, epoch=1, ctx_lens=[len(seq)], x1=[10], dummy_page=0,

@@ -112,7 +112,7 @@ def test_explicit_backend_resolves_head_construction(backend, enabled, layers, e
     values.update(speculative_backend=backend, mtp_enabled=enabled)
     config = EngineConfig(**values)
     assert config.resolve_mtp_enabled("Qwen3_5ForConditionalGeneration", layers) is expected
-    assert config.mtp_k == 3  # DSpark's seven checkpoints are a separate capacity choice.
+    assert config.resolve_num_draft_tokens(backend) == {"none": 0, "mtp": 3, "dspark": 7}[backend]
 
 
 @pytest.mark.parametrize("options,match", [
@@ -151,10 +151,9 @@ def test_draft_path_does_not_silently_enable_dspark():
 @pytest.mark.parametrize("architecture,layers,k", [
     ("Qwen3_5ForConditionalGeneration", 0, 3),
     ("DeepseekV4ForCausalLM", 3, 3),
-    ("Qwen3_5ForConditionalGeneration", 1, 0),
 ])
 def test_explicit_mtp_requires_compatible_head(architecture, layers, k):
-    config = EngineConfig(model_path="/tmp/x", speculative_backend="mtp", mtp_k=k)
+    config = EngineConfig(model_path="/tmp/x", speculative_backend="mtp", speculative_num_draft_tokens=k)
     with pytest.raises(ValueError, match="compatible MTP"):
         config.resolve_mtp_enabled(architecture, layers)
 
@@ -354,10 +353,10 @@ def test_effective_speculative_backend_selection(dspark, mtp, name, overlap, gra
 def test_runtime_width_cli_forwards_common_proposal_count(builder):
     args = _parse(builder, [
         "server", "--model-path", "/tmp/target", "--speculative-backend", "mtp",
-        "--speculative-num-draft-tokens", "2", "--mtp-k", "5",
+        "--speculative-num-draft-tokens", "2",
     ])
     values = cli_args.engine_kwargs(args)
-    assert values["speculative_num_draft_tokens"] == 2 and values["mtp_k"] == 5
+    assert values["speculative_num_draft_tokens"] == 2 and "mtp_k" not in values
     config = EngineConfig(model_path="/tmp/target", **{
         key: value for key, value in values.items() if key != "model_path"
     })
@@ -380,8 +379,8 @@ def test_runtime_width_llm_forwards_common_count_before_worker_construction(monk
     monkeypatch.setattr(module, "EngineConfig", capture)
     with pytest.raises(CapturedConfig):
         module.LLM.__init__(object(), model_path="/tmp/target",
-                            speculative_num_draft_tokens=2, mtp_k=5)
-    assert captured["speculative_num_draft_tokens"] == 2 and captured["mtp_k"] == 5
+                            speculative_num_draft_tokens=2)
+    assert captured["speculative_num_draft_tokens"] == 2 and "mtp_k" not in captured
 
 
 @pytest.mark.parametrize("count", [0, -1, True, False, 1.5, "3"])
@@ -391,11 +390,10 @@ def test_runtime_width_config_rejects_invalid_common_counts(count):
 
 
 @pytest.mark.parametrize("count", [1, 3, 7])
-@pytest.mark.parametrize("legacy", [0, 2, 5])
-def test_runtime_width_common_count_overrides_legacy_mtp_without_mutating_it(count, legacy):
+def test_runtime_width_config_resolves_explicit_count(count):
     config = EngineConfig(model_path="/tmp/target", speculative_backend="mtp",
-                          speculative_num_draft_tokens=count, mtp_k=legacy)
-    assert config.resolve_num_draft_tokens("mtp") == count and config.mtp_k == legacy
+                          speculative_num_draft_tokens=count)
+    assert config.resolve_num_draft_tokens("mtp") == count
     assert config.resolve_mtp_enabled("Qwen3_5ForConditionalGeneration", 1)
 
 
@@ -434,18 +432,26 @@ def test_runtime_width_config_validates_raw_and_effective_dspark_budget(count, b
         EngineConfig(**values)
 
 
-def test_runtime_width_explicit_mtp_budget_rejects_only_new_common_setting():
-    legacy = EngineConfig(model_path="/tmp/target", mtp_k=7)
-    legacy.validate_speculative_token_budget(1, 4)
-    explicit = EngineConfig(model_path="/tmp/target", speculative_num_draft_tokens=7)
+@pytest.mark.parametrize("count", [None, 1, 3, 7])
+def test_runtime_width_mtp_budget_uses_resolved_count(count):
+    config = EngineConfig(model_path="/tmp/target", speculative_backend="mtp",
+                          speculative_num_draft_tokens=count)
+    width = config.resolve_num_draft_tokens("mtp") + 1
     with pytest.raises(ValueError, match="MTP verify window"):
-        explicit.validate_speculative_token_budget(7, 4)
-    explicit.validate_speculative_token_budget(8, 4)
+        config.validate_speculative_token_budget(width - 1, 4)
+    config.validate_speculative_token_budget(width, 4)
+
+
+def test_runtime_width_auto_budget_requires_backend_resolution():
+    config = EngineConfig(model_path="/tmp/target")
+    config.validate_speculative_token_budget(1, 4, backend="none")
+    with pytest.raises(ValueError, match="MTP verify window"):
+        config.validate_speculative_token_budget(3, 4, backend="mtp")
 
 
 def test_runtime_width_default_and_checkpoint_maximum_remain_compatible():
     config = EngineConfig(**_dspark_engine_options())
-    assert config.resolve_num_draft_tokens("dspark") == 7 and config.mtp_k == 3
+    assert config.resolve_num_draft_tokens("dspark") == 7
     values = _dspark_engine_options()
     values["speculative_num_draft_tokens"] = 8
     with pytest.raises(ValueError, match="checkpoint range"):
@@ -468,7 +474,7 @@ def test_runtime_width_loaded_mtp_head_check_respects_pipeline_owner(monkeypatch
     runner = module.ModelRunner.__new__(module.ModelRunner)
     runner.config = EngineConfig(model_path="/tmp/target", speculative_num_draft_tokens=2)
     runner.dspark_enabled = False
-    runner._mtp_k_cfg = 2
+    runner.speculative_num_draft_tokens = 2
     runner.verify_config = lambda: None
     runner.model_loader = SimpleNamespace(load_model=lambda *_: SimpleNamespace(mtp=None))
     monkeypatch.setattr(module, "is_last_pp_rank", lambda: last_rank)
@@ -476,3 +482,17 @@ def test_runtime_width_loaded_mtp_head_check_respects_pipeline_owner(monkeypatch
     expected = ValueError if last_rank else SelectionReached
     with pytest.raises(expected):
         runner.init()
+
+@pytest.mark.parametrize("builder", [api_server.build_arg_parser, lm_server.build_arg_parser])
+def test_runtime_width_cli_rejects_removed_mtp_k(builder):
+    with pytest.raises(SystemExit):
+        _parse(builder, ["server", "--model-path", "/tmp/target", "--mtp-k", "3"])
+
+
+def test_runtime_width_python_rejects_removed_mtp_k():
+    from gllm.engine.llm import LLM
+
+    with pytest.raises(TypeError, match="mtp_k"):
+        EngineConfig(model_path="/tmp/target", mtp_k=3)
+    with pytest.raises(TypeError, match="mtp_k"):
+        LLM(model_path="/tmp/target", mtp_k=3)

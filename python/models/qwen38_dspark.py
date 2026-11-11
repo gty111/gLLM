@@ -467,21 +467,21 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         *,
         embed: nn.Module,
         lm_head: nn.Module | None = None,
-        num_draft_tokens: int | None = None,
+        speculative_num_draft_tokens: int | None = None,
     ) -> None:
         # Validate before constructing CUDA modules. The checkpoint config is
         # immutable; only this model instance's fixed execution width changes.
         if type(config.block_size) is not int or config.block_size < 1:
             raise ValueError("checkpoint block_size must be a positive integer")
-        width = config.block_size if num_draft_tokens is None else num_draft_tokens
+        width = config.block_size if speculative_num_draft_tokens is None else speculative_num_draft_tokens
         if type(width) is not int or not 1 <= width <= config.block_size:
-            raise ValueError("num_draft_tokens must be an integer in [1, checkpoint block_size]")
+            raise ValueError("speculative_num_draft_tokens must be an integer in [1, checkpoint block_size]")
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         # Every noisy row predicts one proposal, including the anchor row.
         # The verifier also consumes the anchor id, so its width is one larger.
-        self._num_draft_tokens = width
+        self._speculative_num_draft_tokens = width
         self.mask_token_id = config.mask_token_id
 
         # The drafter ships no vocabulary: both of these belong to the target
@@ -509,12 +509,12 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
     @property
     def block_size(self) -> int:
         """Fixed runtime proposal count; config.block_size retains the checkpoint value."""
-        return self._num_draft_tokens
+        return self._speculative_num_draft_tokens
 
     @property
     def noise_width(self) -> int:
         """Each noisy row predicts one proposal, including the anchor input row."""
-        return self._num_draft_tokens
+        return self._speculative_num_draft_tokens
 
     # -- internals ---------------------------------------------------------
 
@@ -910,7 +910,7 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
                 anchor.shape[0], self.block_size, self._lm_head[0].weight.shape[1]
             )
         ):
-            raise ValueError("draft hidden must have shape [B, num_draft_tokens, hidden_size]")
+            raise ValueError("draft hidden must have shape [B, speculative_num_draft_tokens, hidden_size]")
         # The anchor input row predicts the first proposal; retain every row.
         # The anchor id itself is prepended separately in output_ids below.
         proposal_hidden = hidden_states

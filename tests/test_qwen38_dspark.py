@@ -379,7 +379,7 @@ def _tensor_config():
     )
 
 
-def _build_model(config, *, num_draft_tokens=None):
+def _build_model(config, *, speculative_num_draft_tokens=None):
     """Construct on CUDA under the loader's default dtype.
 
     ``model_loader`` calls ``torch.set_default_dtype(self.dtype)`` before
@@ -404,7 +404,7 @@ def _build_model(config, *, num_draft_tokens=None):
             embed.weight.normal_(0, 0.02)
             lm_head.weight.normal_(0, 0.02)
         return Qwen38DSpark(
-            config, embed=embed, lm_head=lm_head, num_draft_tokens=num_draft_tokens
+            config, embed=embed, lm_head=lm_head, speculative_num_draft_tokens=speculative_num_draft_tokens
         )
     finally:
         torch.set_default_dtype(previous_dtype)
@@ -939,9 +939,9 @@ def test_paged_dual_source_attention_matches_dense_oracle(context_length, kv_hea
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("poison_vocab_storage", [False, True])
-@pytest.mark.parametrize("num_draft_tokens", [None, 1, 3, 7])
+@pytest.mark.parametrize("speculative_num_draft_tokens", [None, 1, 3, 7])
 def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise(
-    monkeypatch, poison_vocab_storage, num_draft_tokens
+    monkeypatch, poison_vocab_storage, speculative_num_draft_tokens
 ):
     from dataclasses import replace
 
@@ -961,7 +961,7 @@ def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise(
 
     torch.manual_seed(53)
     config = replace(_tensor_config(), block_size=7)
-    model = _build_model(config, num_draft_tokens=num_draft_tokens)
+    model = _build_model(config, speculative_num_draft_tokens=speculative_num_draft_tokens)
     assert torch.isfinite(model._embed[0].weight).all()
     assert torch.isfinite(model._lm_head[0].weight).all()
     # Centered, bounded synthetic weights give a meaningful numerical comparison
@@ -1206,7 +1206,7 @@ def test_target_taps_reject_invalid_input_before_forward(invalid):
     assert all(layer.calls == 0 for layer in model.layers)
 
 
-def _hybrid_target_fixture(*, mtp_k=0, arena_capacity=16):
+def _hybrid_target_fixture(*, speculative_num_draft_tokens=0, arena_capacity=16):
     """Real tiny hybrid target and independent request-owned arena states."""
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -1269,7 +1269,7 @@ def _hybrid_target_fixture(*, mtp_k=0, arena_capacity=16):
         manager = MemoryManager(
             1.0, model.num_kv_layers, torch.bfloat16, 16,
             model.num_kv_heads, model.head_dim, config.vocab_size,
-            ssm_cache_config=model.ssm_cache_config, mtp_k=mtp_k,
+            ssm_cache_config=model.ssm_cache_config, speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         # Match init_arena's unquantized KV writer metadata.
         manager.kv_cache_dtype = "auto"
@@ -1470,7 +1470,7 @@ def test_eight_row_target_verify_matches_stepwise_decode_with_fp32_state(monkeyp
         find_qkv_attention_layers,
     )
 
-    model, _, make_input = _hybrid_target_fixture(mtp_k=7)
+    model, _, make_input = _hybrid_target_fixture(speculative_num_draft_tokens=7)
     assert model.mtp is None
     backend = create_qkv_attention_backend("fa3", 64, 1)
     assert bind_qkv_attention_backend(find_qkv_attention_layers(model), backend) == 1
@@ -2059,7 +2059,7 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds(dra
     from gllm.speculative.dspark import commit_dspark_verify_state, verify_dspark_target
 
     width = draft_tokens + 1
-    model, _, make_input = _hybrid_target_fixture(mtp_k=draft_tokens)
+    model, _, make_input = _hybrid_target_fixture(speculative_num_draft_tokens=draft_tokens)
     backend = create_qkv_attention_backend("fa3", 64, 1)
     bind_qkv_attention_backend(find_qkv_attention_layers(model), backend)
     prompt = tuple(range(1, 14))
@@ -2096,7 +2096,7 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds(dra
         torch.set_default_dtype(torch.bfloat16)
         draft = Qwen38DSpark(
             config, embed=model.model.embed_tokens, lm_head=model.lm_head,
-            num_draft_tokens=draft_tokens,
+            speculative_num_draft_tokens=draft_tokens,
         ).eval()
         for parameter in draft.parameters():
             if parameter.ndim >= 2:
@@ -2354,7 +2354,7 @@ def test_dspark_loader_reads_indexed_checkpoint_and_borrows_target_weights(tmp_p
     previous_dtype = torch.get_default_dtype()
     loaded = load_dspark_draft(
         str(tmp_path), target, model_max_length=32 if count is None else count + 2,
-        num_draft_tokens=count,
+        speculative_num_draft_tokens=count,
     )
     assert loaded.config.block_size == 7
     assert loaded.block_size == loaded.noise_width == (7 if count is None else count)
@@ -2397,7 +2397,7 @@ def _dspark_runtime_fixture(*, batch=1, max_tokens=32, draft_tokens=7):
     from gllm.runtime.memory_manager import DSparkKVCacheConfig, MemoryManager
     from gllm.runtime.model_runner import ModelRunner
 
-    text, _, make_input = _hybrid_target_fixture(mtp_k=draft_tokens)
+    text, _, make_input = _hybrid_target_fixture(speculative_num_draft_tokens=draft_tokens)
     # The tiny text fixture defaults to ordinary RoPE. A conditional wrapper
     # carrying three-axis positions needs the real MRoPE path, with sections
     # sized to this fixture's rotary dimension rather than the 27B geometry.
@@ -2425,7 +2425,7 @@ def _dspark_runtime_fixture(*, batch=1, max_tokens=32, draft_tokens=7):
         torch.set_default_dtype(torch.bfloat16)
         draft = Qwen38DSpark(
             config, embed=text.model.embed_tokens, lm_head=text.lm_head,
-            num_draft_tokens=draft_tokens,
+            speculative_num_draft_tokens=draft_tokens,
         ).eval()
         for param in draft.parameters():
             if param.ndim >= 2:
@@ -2435,7 +2435,7 @@ def _dspark_runtime_fixture(*, batch=1, max_tokens=32, draft_tokens=7):
     manager = MemoryManager(
         1.0, text.num_kv_layers, torch.bfloat16, 16, text.num_kv_heads, text.head_dim,
         text.config.vocab_size, max_running_seqs=batch, ssm_cache_config=text.ssm_cache_config,
-        mtp_k=draft_tokens, dspark_kv_cache_config=DSparkKVCacheConfig(
+        speculative_num_draft_tokens=draft_tokens, dspark_kv_cache_config=DSparkKVCacheConfig(
             len(draft.layers), config.num_key_value_heads, config.head_dim,
         ),
     )
@@ -5120,7 +5120,7 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
     from gllm.speculative.dspark import commit_dspark_verify_state, verify_dspark_target_batched
 
     verify_width = draft_tokens + 1
-    model, _, make_input = _hybrid_target_fixture(mtp_k=draft_tokens, arena_capacity=64)
+    model, _, make_input = _hybrid_target_fixture(speculative_num_draft_tokens=draft_tokens, arena_capacity=64)
     backend = create_qkv_attention_backend("fa3", 64, batch)
     bind_qkv_attention_backend(find_qkv_attention_layers(model), backend)
     calls, forward = [], backend.forward
@@ -6751,10 +6751,10 @@ def test_runtime_width_rejected_before_module_allocation(monkeypatch, width):
         pytest.fail("invalid width reached a CUDA module constructor")
 
     monkeypatch.setattr(module, "ReplicatedLinear", forbidden)
-    with pytest.raises(ValueError, match="num_draft_tokens"):
+    with pytest.raises(ValueError, match="speculative_num_draft_tokens"):
         module.Qwen38DSpark(
             replace(_tensor_config(), block_size=7),
-            embed=torch.nn.Identity(), num_draft_tokens=width,
+            embed=torch.nn.Identity(), speculative_num_draft_tokens=width,
         )
 
 
@@ -6781,7 +6781,7 @@ def test_runtime_width_loads_identical_checkpoint_without_changing_config(width)
     reference = _build_model(config)
     weights = _build_synthetic_checkpoint(reference, config)
     reference.load_weights(weights)
-    model = _build_model(config, num_draft_tokens=width)
+    model = _build_model(config, speculative_num_draft_tokens=width)
     model.load_weights(weights)
     assert model.config is config and config.block_size == 7
     assert model.block_size == model.noise_width == width
@@ -6824,7 +6824,7 @@ def test_runtime_width_rejects_invalid_checkpoint_before_allocation(monkeypatch,
     with pytest.raises(ValueError, match="checkpoint block_size"):
         module.Qwen38DSpark(
             replace(_tensor_config(), block_size=checkpoint_width),
-            embed=torch.nn.Identity(), num_draft_tokens=1,
+            embed=torch.nn.Identity(), speculative_num_draft_tokens=1,
         )
 
 
@@ -7020,7 +7020,7 @@ def test_runtime_width_loader_rejects_invalid_count_before_allocation(tmp_path, 
     config = replace(_tensor_config(), block_size=7)
     (tmp_path / "config.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
     with pytest.raises(ValueError, match="checkpoint proposal range"):
-        load_dspark_draft(str(tmp_path), _dspark_loader_target(config), 32, num_draft_tokens=count)
+        load_dspark_draft(str(tmp_path), _dspark_loader_target(config), 32, speculative_num_draft_tokens=count)
 
 
 @pytest.mark.parametrize("count", [1, 3, 7])
@@ -7033,7 +7033,7 @@ def test_runtime_width_loader_requires_nonempty_context_before_verify(tmp_path, 
     (tmp_path / "config.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
     with pytest.raises(ValueError, match="context windows"):
         load_dspark_draft(str(tmp_path), _dspark_loader_target(config),
-                          count + 1, num_draft_tokens=count)
+                          count + 1, speculative_num_draft_tokens=count)
 
 
 @pytest.mark.parametrize("count", [1, 3, 7])

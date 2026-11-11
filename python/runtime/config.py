@@ -65,7 +65,6 @@ class EngineConfig:
     schedule_method: str = "chunked_prefill"
     # MTP speculative decoding
     mtp_enabled: Optional[bool] = None
-    mtp_k: int = 3
     mtp_max_batch: int = 0
     # Multimodal processor
     mm_processor_min_pixels: Optional[int] = None
@@ -75,7 +74,7 @@ class EngineConfig:
     # Explicit selection is opt-in; None preserves the legacy MTP policy.
     speculative_backend: Optional[str] = None
     dspark_model_path: Optional[str] = None
-    # Explicit common count overrides mtp_k; omission preserves legacy defaults.
+    # None selects the backend default centrally at startup.
     speculative_num_draft_tokens: Optional[int] = None
 
     def __post_init__(self):
@@ -133,7 +132,7 @@ class EngineConfig:
 
         Only the current seven-position Qwen DSpark checkpoint is supported.
         Its loader checks the actual checkpoint before constructing the draft.
-        The common explicit count takes precedence without mutating mtp_k.
+        Defaults are selected here: MTP=3, DSpark=7, ordinary decoding=0.
         """
         if backend not in ("none", "mtp", "dspark"):
             raise ValueError(f"Unknown speculative backend: {backend!r}")
@@ -143,20 +142,23 @@ class EngineConfig:
             return 0
         if self.speculative_num_draft_tokens is not None:
             return self.speculative_num_draft_tokens
-        return 7 if backend == "dspark" else self.mtp_k
+        return {"mtp": 3, "dspark": 7}[backend]
 
-    def validate_speculative_token_budget(self, token_budget: int, max_running_seqs: int) -> None:
+    def validate_speculative_token_budget(self, token_budget: int, max_running_seqs: int, *, backend: Optional[str] = None) -> None:
         """Validate the effective buffer budget, including after runner clamping.
 
-        Legacy MTP keeps its existing per-step fallback policy. An explicit
-        common count must fit at least one MTP window; DSpark's startup probe
-        must fit the whole configured maximum batch.
+        MTP must fit one window; DSpark's startup probe must fit the full
+        configured batch. Auto selection supplies the resolved backend after
+        checkpoint inspection; an unresolved default must not enable MTP.
         """
-        if self.speculative_backend == "dspark":
+        selected = self.speculative_backend if backend is None else backend
+        if selected not in (None, "none", "mtp", "dspark"):
+            raise ValueError(f"Unknown speculative backend: {selected!r}")
+        if selected == "dspark":
             width = self.resolve_num_draft_tokens("dspark") + 1
             if token_budget < width * max_running_seqs:
                 raise ValueError(f"DSpark requires maxp >= {width} * maxd and an effective token budget covering that verify batch")
-        elif self.speculative_num_draft_tokens is not None:
+        elif selected == "mtp" or (selected is None and self.speculative_num_draft_tokens is not None):
             width = self.resolve_num_draft_tokens("mtp") + 1
             if token_budget < width:
                 raise ValueError(f"Speculative token budget must cover one {width}-row MTP verify window")
@@ -168,7 +170,7 @@ class EngineConfig:
         if self.speculative_backend == "mtp":
             # V4's joint DSpark stages are not a sequential NextN head.
             if architecture == "DeepseekV4ForCausalLM" or nextn_layers < 1 or self.resolve_num_draft_tokens("mtp") < 1:
-                raise ValueError("mtp requires a compatible MTP head and positive mtp_k")
+                raise ValueError("mtp requires a compatible MTP head and positive speculative_num_draft_tokens")
             return True
         enabled = (
             False if self.mtp_enabled is None and architecture == "DeepseekV4ForCausalLM"

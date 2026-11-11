@@ -186,7 +186,7 @@ def _safetensors_index(path: str) -> Dict[str, Tuple[str, str]]:
 
 @torch.no_grad()
 def load_dspark_draft(
-    path: str, target, model_max_length: int, *, num_draft_tokens: int | None = None,
+    path: str, target, model_max_length: int, *, speculative_num_draft_tokens: int | None = None,
 ):
     """Load a local standalone drafter, borrowing the target's vocabulary.
 
@@ -215,9 +215,9 @@ def load_dspark_draft(
         or any(not backbone.start_layer <= i < backbone.end_layer for i in layer_ids)
     ):
         raise ValueError("DSpark checkpoint has incompatible width, vocabulary or target taps")
-    count = config.block_size if num_draft_tokens is None else num_draft_tokens
+    count = config.block_size if speculative_num_draft_tokens is None else speculative_num_draft_tokens
     if type(count) is not int or not 1 <= count <= config.block_size:
-        raise ValueError("num_draft_tokens must fit the checkpoint proposal range")
+        raise ValueError("speculative_num_draft_tokens must fit the checkpoint proposal range")
     # A nonempty context plus one complete anchor/candidate verify window is
     # required by startup profiling. This does not set request prompt lengths.
     if not count + 2 <= model_max_length <= min(text.max_model_len, config.max_position_embeddings):
@@ -241,7 +241,7 @@ def load_dspark_draft(
     try:
         torch.set_default_dtype(torch.bfloat16)
         draft = Qwen38DSpark(
-            config, embed=embed, lm_head=head, num_draft_tokens=count
+            config, embed=embed, lm_head=head, speculative_num_draft_tokens=count
         ).eval()
         if model_max_length > draft.rotary_emb.cos_sin_cache.shape[0]:
             raise ValueError("DSpark serving length exceeds the draft RoPE cache")

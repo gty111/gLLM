@@ -265,8 +265,8 @@ def add_mtp_args(p: argparse.ArgumentParser) -> None:
         "--speculative-num-draft-tokens",
         type=int,
         default=None,
-        help="Fixed proposal count selected at startup. Overrides --mtp-k for MTP; "
-        "DSpark supports 1..7. Omission preserves each backend's default.",
+        help="Fixed proposal count selected at startup. Defaults: MTP=3, DSpark=7; "
+        "DSpark supports 1..7.",
     )
     p.add_argument(
         "--dspark-model-path",
@@ -282,12 +282,6 @@ def add_mtp_args(p: argparse.ArgumentParser) -> None:
         help="MTP speculative decoding: 'auto' (default) enables it iff the "
         "checkpoint ships an MTP head; 'on'/'off' force it. Use 'off' for a "
         "non-speculative baseline.",
-    )
-    p.add_argument(
-        "--mtp-k",
-        type=int,
-        default=3,
-        help="MTP draft-chain length (tokens drafted per target forward).",
     )
     p.add_argument(
         "--mtp-max-batch",

@@ -697,7 +697,7 @@ def test_speculative_scheduler_reservation_width(
     from gllm.speculative.backend import select_speculative_backend
 
     runner = SimpleNamespace(
-        mtp_k=k, mtp_max_batch=gate, max_num_batched_tokens=budget,
+        speculative_num_draft_tokens=k, mtp_max_batch=gate, max_num_batched_tokens=budget,
         model=SimpleNamespace(mtp=object() if head else None),
     )
     scheduler = Scheduler.__new__(Scheduler)
@@ -733,7 +733,7 @@ def test_speculative_reservation_can_exceed_actual_mtp_execution(monkeypatch):
     from gllm.speculative.mtp import MtpMixin
 
     runner = SimpleNamespace(
-        mtp_k=3, _mtp_k=3, mtp_max_batch=0, _mtp_max_batch=0,
+        speculative_num_draft_tokens=3, mtp_max_batch=0, _mtp_max_batch=0,
         max_num_batched_tokens=7, model=SimpleNamespace(mtp=object()),
     )
     backend = select_speculative_backend(dspark_enabled=False, mtp_enabled=True)
@@ -752,7 +752,7 @@ def test_speculative_budget_shrinks_mtp_cohort_before_forward(
     manager, _, _ = prefix_manager(pages=4)
     scheduler = make_scheduler(manager)
     runner = scheduler.model_runner
-    runner.mtp_enabled, runner.mtp_k, runner.mtp_max_batch = True, 3, 0
+    runner.mtp_enabled, runner.speculative_num_draft_tokens, runner.mtp_max_batch = True, 3, 0
     runner.model = SimpleNamespace(mtp=object())
     runner.max_num_batched_tokens = 7
     scheduler.speculative_backend = select_speculative_backend(

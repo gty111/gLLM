@@ -864,7 +864,7 @@ class OverlapWorker(Worker):
 
         current.deferred = self.scheduler.process_mtp_output_deferred(
             decode_rows=len(batch.decode),
-            width=1 + self.model_runner.mtp_k,
+            width=1 + self.model_runner.speculative_num_draft_tokens,
         )
         self._mtp_pending.append(current)
 
