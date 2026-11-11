@@ -56,7 +56,18 @@ def parse_text_config(raw):
     geometry = SimpleNamespace(**text)
     geometry.ngram_heads = (geometry.ngram_size - 1) * geometry.heads_per_ngram
     _validate_text_config(geometry)
-    config = Qwen4ExpTextConfig.from_dict(text)
+    # Keep the engine's indexed-attention spelling out of native validation.
+    # Published checkpoints use full_attention; Transformers resolves that
+    # alias to its own canonical spelling before running architecture checks.
+    native_text = dict(text)
+    native_text["layer_types"] = [
+        "full_attention" if kind == "indexed_attention" else kind
+        for kind in text["layer_types"]
+    ]
+    config = Qwen4ExpTextConfig.from_dict(native_text)
+    # Decoder/cache dispatch below uses the engine spelling, independently of
+    # the native config's canonical name. Neither list aliases the checkpoint.
+    config.layer_types = list(text["layer_types"])
     config.hyper_hidden_size = config.hidden_size * config.hc_count
     config.qsa_layer_ids = tuple(
         i for i, kind in enumerate(config.layer_types) if kind == "indexed_attention"

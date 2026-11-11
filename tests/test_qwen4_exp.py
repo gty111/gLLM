@@ -82,9 +82,22 @@ def config(raw_config):
 @pytest.mark.parametrize(
     "alias", ["full_attention", "qwen_sparse_attention", "indexed_attention"]
 )
-def test_config_understands_published_and_new_attention_names(raw_config, alias):
+def test_config_understands_published_and_new_attention_names(raw_config, alias, monkeypatch):
+    from transformers import Qwen4ExpTextConfig
+
+    original = Qwen4ExpTextConfig.from_dict
+    seen = []
+
+    def construct_native(text):
+        seen.append(list(text["layer_types"]))
+        assert text["layer_types"] == ["linear_attention"] * 3 + ["full_attention"]
+        return original(text)
+
+    monkeypatch.setattr(Qwen4ExpTextConfig, "from_dict", staticmethod(construct_native))
     raw_config["text_config"]["layer_types"][-1] = alias
     config = parse_text_config(raw_config)
+    assert seen == [["linear_attention"] * 3 + ["full_attention"]]
+    assert config.layer_types == ["linear_attention"] * 3 + ["indexed_attention"]
     assert config.qsa_layer_ids == (3,)
     assert config.gdn_layer_ids == (0, 1, 2)
     assert config.ple_layer_indices == (1,)
