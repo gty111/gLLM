@@ -293,11 +293,12 @@ def test_forward_head_preserves_every_noise_row(block_size):
     assert ids.tolist() == [[4] + [1] * block_size]
 
 
-def test_forward_head_aligns_markov_and_confidence_with_previous_tokens():
+@pytest.mark.parametrize("width", [1, 3, 7])
+def test_forward_head_aligns_markov_and_confidence_with_previous_tokens(width):
     """A hand-computed alternating chain pins each proposal's conditioning."""
     from gllm.models.qwen38_dspark import Qwen38DSpark
 
-    model = _head_stub(7)
+    model = _head_stub(width)
     with torch.no_grad():
         # Token 0 contributes [-2, 2]; token 1 contributes [3, -3].
         # With zero base logits, greedy proposals alternate 1, 0, 1, ...
@@ -307,7 +308,7 @@ def test_forward_head_aligns_markov_and_confidence_with_previous_tokens():
         model.confidence_head.proj.weight[0] = torch.tensor([2., 0., 1.])
         model.confidence_head.proj.bias.fill_(5)
 
-    rows = torch.arange(1, 8, dtype=torch.float32)
+    rows = torch.arange(1, width + 1, dtype=torch.float32)
     hidden = torch.stack((rows, rows * 10), dim=-1).unsqueeze(0)
     ids, logits, confidence = Qwen38DSpark.forward_head(
         model, hidden, torch.tensor([0])
@@ -318,10 +319,10 @@ def test_forward_head_aligns_markov_and_confidence_with_previous_tokens():
         [-2., 2.], [3., -3.], [-2., 2.], [3., -3.],
         [-2., 2.], [3., -3.], [-2., 2.],
     ])
-    assert ids.tolist() == [[0, 1, 0, 1, 0, 1, 0, 1]]
-    torch.testing.assert_close(logits, expected_logits, rtol=0, atol=0)
+    assert ids.tolist() == [[0] + [1, 0, 1, 0, 1, 0, 1][:width]]
+    torch.testing.assert_close(logits, expected_logits[:, :width], rtol=0, atol=0)
     torch.testing.assert_close(
-        confidence, torch.tensor([[5., 12., 9., 16., 13., 20., 17.]]),
+        confidence, torch.tensor([[5., 12., 9., 16., 13., 20., 17.]])[:, :width],
         rtol=0, atol=0,
     )
 
@@ -378,7 +379,7 @@ def _tensor_config():
     )
 
 
-def _build_model(config):
+def _build_model(config, *, speculative_num_draft_tokens=None):
     """Construct on CUDA under the loader's default dtype.
 
     ``model_loader`` calls ``torch.set_default_dtype(self.dtype)`` before
@@ -402,7 +403,9 @@ def _build_model(config):
         with torch.no_grad():
             embed.weight.normal_(0, 0.02)
             lm_head.weight.normal_(0, 0.02)
-        return Qwen38DSpark(config, embed=embed, lm_head=lm_head)
+        return Qwen38DSpark(
+            config, embed=embed, lm_head=lm_head, speculative_num_draft_tokens=speculative_num_draft_tokens
+        )
     finally:
         torch.set_default_dtype(previous_dtype)
 
@@ -936,8 +939,9 @@ def test_paged_dual_source_attention_matches_dense_oracle(context_length, kv_hea
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("poison_vocab_storage", [False, True])
+@pytest.mark.parametrize("speculative_num_draft_tokens", [None, 1, 3, 7])
 def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise(
-    monkeypatch, poison_vocab_storage
+    monkeypatch, poison_vocab_storage, speculative_num_draft_tokens
 ):
     from dataclasses import replace
 
@@ -957,7 +961,7 @@ def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise(
 
     torch.manual_seed(53)
     config = replace(_tensor_config(), block_size=7)
-    model = _build_model(config)
+    model = _build_model(config, speculative_num_draft_tokens=speculative_num_draft_tokens)
     assert torch.isfinite(model._embed[0].weight).all()
     assert torch.isfinite(model._lm_head[0].weight).all()
     # Centered, bounded synthetic weights give a meaningful numerical comparison
@@ -988,8 +992,17 @@ def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise(
 
     def check_shared_table(*args, **kwargs):
         block_table = args[5]
-        assert block_table.data_ptr() == state._device_page_table.data_ptr()
-        assert block_table.stride(0) == 0
+        source = state._device_page_table
+        # The cache owns flat storage; only the attention consumer sees rows.
+        assert source.ndim == 1 and block_table.ndim == 2
+        assert block_table.data_ptr() == source.data_ptr()
+        pages = (state.context_length + segment.page_size - 1) // segment.page_size
+        assert block_table.shape == (model.noise_width, pages)
+        assert block_table.stride(1) == source.stride(0)
+        # expand(1, -1) need not change the row stride: no dimension grows.
+        # Multiple noisy queries must still share one zero-stride table view.
+        if model.noise_width > 1:
+            assert block_table.stride(0) == 0
         return decode(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", reject_pageable_upload)
@@ -1010,7 +1023,16 @@ def test_paged_draft_matches_dense_over_multiple_rounds_without_caching_noise(
         assert torch.isfinite(got).all(), "paged draft produced nonfinite hidden"
         torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
         assert torch.equal(paged_ids, dense_ids)
-        assert got.shape == (1, 7, config.hidden_size)
+        assert got.shape == (1, model.noise_width, config.hidden_size)
+        assert paged_ids.shape == (1, model.noise_width)
+        assert paged_ids[0, 0].item() == anchor.item()
+        assert torch.all(paged_ids[0, 1:] == config.mask_token_id)
+        _, actual_logits, actual_confidence = model.forward_head(got, anchor)
+        _, expected_logits, expected_confidence = model.forward_head(expected, anchor)
+        assert actual_logits.shape == (1, model.noise_width, config.vocab_size)
+        assert actual_confidence.shape == (1, model.noise_width)
+        torch.testing.assert_close(actual_logits, expected_logits, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(actual_confidence, expected_confidence, rtol=2e-2, atol=2e-2)
         assert paged.context_length() == dense.context_length() == position
         keys, values = _read_paged_context(segment, state, position)
         for actual, reference in zip(keys + values, dense.keys + dense.values):
@@ -1184,7 +1206,7 @@ def test_target_taps_reject_invalid_input_before_forward(invalid):
     assert all(layer.calls == 0 for layer in model.layers)
 
 
-def _hybrid_target_fixture(*, mtp_k=0, arena_capacity=16):
+def _hybrid_target_fixture(*, speculative_num_draft_tokens=0, arena_capacity=16):
     """Real tiny hybrid target and independent request-owned arena states."""
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
@@ -1247,7 +1269,7 @@ def _hybrid_target_fixture(*, mtp_k=0, arena_capacity=16):
         manager = MemoryManager(
             1.0, model.num_kv_layers, torch.bfloat16, 16,
             model.num_kv_heads, model.head_dim, config.vocab_size,
-            ssm_cache_config=model.ssm_cache_config, mtp_k=mtp_k,
+            ssm_cache_config=model.ssm_cache_config, speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         # Match init_arena's unquantized KV writer metadata.
         manager.kv_cache_dtype = "auto"
@@ -1448,7 +1470,7 @@ def test_eight_row_target_verify_matches_stepwise_decode_with_fp32_state(monkeyp
         find_qkv_attention_layers,
     )
 
-    model, _, make_input = _hybrid_target_fixture(mtp_k=7)
+    model, _, make_input = _hybrid_target_fixture(speculative_num_draft_tokens=7)
     assert model.mtp is None
     backend = create_qkv_attention_backend("fa3", 64, 1)
     assert bind_qkv_attention_backend(find_qkv_attention_layers(model), backend) == 1
@@ -2026,7 +2048,8 @@ def test_dspark_commit_rejects_without_mutation_or_consuming(invalid):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.no_grad()
-def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds(draft_tokens):
     from dataclasses import replace
 
     from gllm.layers.attention.qkv_backends import (
@@ -2035,7 +2058,8 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
     from gllm.models.qwen38_dspark import Qwen38DSpark
     from gllm.speculative.dspark import commit_dspark_verify_state, verify_dspark_target
 
-    model, _, make_input = _hybrid_target_fixture(mtp_k=7)
+    width = draft_tokens + 1
+    model, _, make_input = _hybrid_target_fixture(speculative_num_draft_tokens=draft_tokens)
     backend = create_qkv_attention_backend("fa3", 64, 1)
     bind_qkv_attention_backend(find_qkv_attention_layers(model), backend)
     prompt = tuple(range(1, 14))
@@ -2045,12 +2069,12 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
     for current, owner, request in (
         (data, manager, seq), (oracle, oracle_manager, oracle_seq)
     ):
-        # Reserve 48 tokens: the greedy oracle temporarily explores all eight
+        # Reserve 48 tokens: the greedy oracle temporarily explores the full
         # inputs even when only a short prefix will be committed.
         extra = [owner.segment.allocate(), owner.segment.allocate()]
         request.page_table = [extra[1], request.page_table[0], extra[0]]
         table = request.ssm_block_table
-        request.ssm_block_table = [table[i] for i in (3, 0, 6, 2, 7, 1, 5, 4)]
+        request.ssm_block_table = [table[i] for i in (3, 0, 6, 2, 7, 1, 5, 4) if i < width]
         request.recurrent_state_slot = request.ssm_block_table[0]
         request.output_len = 48
         current.cal_and_set_input([request])
@@ -2071,7 +2095,8 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
     try:
         torch.set_default_dtype(torch.bfloat16)
         draft = Qwen38DSpark(
-            config, embed=model.model.embed_tokens, lm_head=model.lm_head
+            config, embed=model.model.embed_tokens, lm_head=model.lm_head,
+            speculative_num_draft_tokens=draft_tokens,
         ).eval()
         for parameter in draft.parameters():
             if parameter.ndim >= 2:
@@ -2081,7 +2106,7 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
     segment, cache, _ = _paged_context_storage(config, 16)
     paged = draft.prefill_paged(prompt_taps, segment=segment, cache=cache)
     chunks, old_results = [prompt_taps], []
-    rounds = (0, 0, 2, 7, None, 7)
+    rounds = (0, 0, min(2, draft_tokens), draft_tokens, None, draft_tokens)
     for round_index, desired in enumerate(rounds):
         start = seq.computed_token_num
         assert oracle_seq.computed_token_num == paged.context_length() == start
@@ -2098,7 +2123,7 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
         # the baseline prefix for the next round; production commit never copies.
         greedy_inputs, next_tokens, oracle_taps, states = [], [], [], []
         token = int(anchor.item())
-        for _ in range(8):
+        for _ in range(width):
             greedy_inputs.append(token)
             oracle_seq.to_compute_tokens = [token]
             oracle_seq.to_compute_token_num = 1
@@ -2118,7 +2143,7 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
             oracle_seq.computed_token_num += 1
         if proposed is None:
             proposed = list(greedy_inputs)
-            if desired < 7:
+            if desired < draft_tokens:
                 proposed[desired + 1] = (proposed[desired + 1] + 1) % config.vocab_size
             accepted = desired
         else:
@@ -2128,16 +2153,16 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
                     break
                 accepted += 1
 
-        seq.to_compute_tokens, seq.to_compute_token_num = proposed, 8
+        seq.to_compute_tokens, seq.to_compute_token_num = proposed, width
         seq._mtp_verify = True
         data.cal_and_set_input([seq])
         data.forward_metadata_plan.prepare_attention(backend, data)
         result = verify_dspark_target(
-            model, data, block_size=config.block_size, target_layer_ids=config.target_layer_ids
+            model, data, block_size=draft.block_size, target_layer_ids=config.target_layer_ids
         )
         assert result.accepted_drafts == accepted
         assert int(result.next_anchor.item()) == next_tokens[accepted]
-        count = 3 if round_index == len(rounds) - 1 else accepted + 1
+        count = min(3, draft_tokens) if round_index == len(rounds) - 1 else accepted + 1
         assert result.committed_ids[0, :count].tolist() == greedy_inputs[:count]
         torch.testing.assert_close(
             result.accepted_hidden[:, :count], torch.cat(oracle_taps[:count], dim=1),
@@ -2175,7 +2200,7 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
         # where the CPU/GPU slot IDs themselves did not change.
         with pytest.raises(ValueError, match="metadata"):
             verify_dspark_target(
-                model, data, block_size=7, target_layer_ids=config.target_layer_ids
+                model, data, block_size=draft.block_size, target_layer_ids=config.target_layer_ids
             )
         assert torch.equal(manager.cache_arena.backing, physical_before)
         length = seq.computed_token_num
@@ -2199,7 +2224,7 @@ def test_dspark_commits_and_paged_context_follow_greedy_over_multiple_rounds():
         if count < accepted + 1:
             # The original bonus belongs to a later position. Stop here rather
             # than reusing it after the explicitly truncated commit.
-            assert desired == 7
+            assert desired == draft_tokens
             anchor = None
         else:
             anchor = result.next_anchor
@@ -2303,7 +2328,8 @@ def test_dspark_loader_rejects_context_before_allocating_draft(tmp_path, length)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_dspark_loader_reads_indexed_checkpoint_and_borrows_target_weights(tmp_path):
+@pytest.mark.parametrize("count", [None, 1, 3, 7])
+def test_dspark_loader_reads_indexed_checkpoint_and_borrows_target_weights(tmp_path, count):
     from dataclasses import asdict, replace
     import json
     from safetensors.torch import save_file
@@ -2326,7 +2352,12 @@ def test_dspark_loader_reads_indexed_checkpoint_and_borrows_target_weights(tmp_p
     embed_before = target.model.embed_tokens.weight.clone()
     head_before = target.lm_head.weight.clone()
     previous_dtype = torch.get_default_dtype()
-    loaded = load_dspark_draft(str(tmp_path), target, model_max_length=32)
+    loaded = load_dspark_draft(
+        str(tmp_path), target, model_max_length=32 if count is None else count + 2,
+        speculative_num_draft_tokens=count,
+    )
+    assert loaded.config.block_size == 7
+    assert loaded.block_size == loaded.noise_width == (7 if count is None else count)
 
     _assert_loaded_checkpoint(loaded, weights)
     assert torch.get_default_dtype() == previous_dtype
@@ -2353,7 +2384,7 @@ def test_dspark_loader_rejects_bf16_temporal_state_before_loading(tmp_path):
         load_dspark_draft(str(tmp_path), target, model_max_length=32)
 
 
-def _dspark_runtime_fixture(*, batch=1, max_tokens=32):
+def _dspark_runtime_fixture(*, batch=1, max_tokens=32, draft_tokens=7):
     """Real MRoPE target/draft pair, before allocating their shared arena."""
     from dataclasses import replace
 
@@ -2366,7 +2397,7 @@ def _dspark_runtime_fixture(*, batch=1, max_tokens=32):
     from gllm.runtime.memory_manager import DSparkKVCacheConfig, MemoryManager
     from gllm.runtime.model_runner import ModelRunner
 
-    text, _, make_input = _hybrid_target_fixture(mtp_k=7)
+    text, _, make_input = _hybrid_target_fixture(speculative_num_draft_tokens=draft_tokens)
     # The tiny text fixture defaults to ordinary RoPE. A conditional wrapper
     # carrying three-axis positions needs the real MRoPE path, with sections
     # sized to this fixture's rotary dimension rather than the 27B geometry.
@@ -2393,7 +2424,8 @@ def _dspark_runtime_fixture(*, batch=1, max_tokens=32):
     try:
         torch.set_default_dtype(torch.bfloat16)
         draft = Qwen38DSpark(
-            config, embed=text.model.embed_tokens, lm_head=text.lm_head
+            config, embed=text.model.embed_tokens, lm_head=text.lm_head,
+            speculative_num_draft_tokens=draft_tokens,
         ).eval()
         for param in draft.parameters():
             if param.ndim >= 2:
@@ -2403,7 +2435,7 @@ def _dspark_runtime_fixture(*, batch=1, max_tokens=32):
     manager = MemoryManager(
         1.0, text.num_kv_layers, torch.bfloat16, 16, text.num_kv_heads, text.head_dim,
         text.config.vocab_size, max_running_seqs=batch, ssm_cache_config=text.ssm_cache_config,
-        mtp_k=7, dspark_kv_cache_config=DSparkKVCacheConfig(
+        speculative_num_draft_tokens=draft_tokens, dspark_kv_cache_config=DSparkKVCacheConfig(
             len(draft.layers), config.num_key_value_heads, config.head_dim,
         ),
     )
@@ -2411,7 +2443,7 @@ def _dspark_runtime_fixture(*, batch=1, max_tokens=32):
     runner = ModelRunner.__new__(ModelRunner)
     runner._dspark_requests = {}
     runner._mtp_relay, runner.use_mm = {}, False
-    runner.maxd, runner.maxp, runner.minp, runner.iterp = batch, min(max_tokens, 8 * batch), 1, 1
+    runner.maxd, runner.maxp, runner.minp, runner.iterp = batch, min(max_tokens, (draft_tokens + 1) * batch), 1, 1
     runner.max_running_seqs = batch
     runner.init_new_token_ratio = runner.min_new_token_ratio = 0.1
     runner.model, runner.dspark, runner.dspark_enabled = target, draft, True
@@ -2463,25 +2495,31 @@ def _init_dspark_runtime_test_arena(runner, *, arena_capacity=24):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("chunk_size,context_limit", [(8, 9), (8, 32), (16, 32), (32, 32)])
 @torch.no_grad()
+@pytest.mark.parametrize("count", [1, 3, 7])
 def test_dspark_startup_profiles_max_chunk_and_eight_row_verify_in_shared_arena(
-    chunk_size, context_limit
+    chunk_size, context_limit, count
 ):
     from gllm.speculative.dspark_profile import profile_dspark_paged_verify
 
-    runner, _ = _dspark_runtime_fixture()
+    width = count + 1
+    if chunk_size == 8:
+        chunk_size = width
+    if context_limit == 9:
+        context_limit = width + 1
+    runner, _ = _dspark_runtime_fixture(draft_tokens=count)
     runner.max_num_batched_tokens = chunk_size
     runner.model_max_length = context_limit
     runner.model.language_model.config.model_max_length = context_limit
-    if context_limit == 9:
+    if context_limit == width + 1:
         # The minimum valid context leaves one row for dense history in the
         # pre-arena probe and one cached row before the eight-row verify.
-        runner.dspark.rotary_emb.cos_sin_cache = runner.dspark.rotary_emb.cos_sin_cache[:9]
+        runner.dspark.rotary_emb.cos_sin_cache = runner.dspark.rotary_emb.cos_sin_cache[:context_limit]
     # Pre-arena: actual maximum prompt/tap/projection shapes and both heads.
     runner.profile_run()
     assert runner.dspark_profile["prefill_tokens"] == chunk_size
     assert runner.dspark_profile["projected_tokens"] == chunk_size
-    assert runner.dspark_profile["noise_rows"] == 7
-    assert runner.dspark_profile["target_logits_rows"] == 8
+    assert runner.dspark_profile["noise_rows"] == count
+    assert runner.dspark_profile["target_logits_rows"] == width
     assert runner.dspark_profile["paged_workspace_allowance_bytes"] > 0
 
     arena = _init_dspark_runtime_test_arena(runner)
@@ -2491,14 +2529,14 @@ def test_dspark_startup_profiles_max_chunk_and_eight_row_verify_in_shared_arena(
         max_prompt_tokens=chunk_size, model_max_length=runner.model_max_length,
         uses_mrope=runner.uses_mrope, prepare_attention=runner._prepare_attention_metadata,
     ))
-    assert runner.dspark_profile["verify_tokens"] == 8
+    assert runner.dspark_profile["verify_tokens"] == width
     assert runner.dspark_profile["paged_prefill_tokens"] == chunk_size
     # One case fits the verify after the maximum chunk; the other must
     # release that probe and create a shorter context without leaking slots.
-    context_size = min(chunk_size, context_limit - 8)
+    context_size = min(chunk_size, context_limit - width)
     assert runner.dspark_profile["verify_context_tokens"] == context_size
-    assert runner.input_data.forward_metadata_plan.query_lens == (8,)
-    assert runner.input_data.get_position().shape == (3, 8)
+    assert runner.input_data.forward_metadata_plan.query_lens == (width,)
+    assert runner.input_data.get_position().shape == (3, width)
     assert not runner.input_data.get_position().is_contiguous()
     assert arena.allocator.num_used_physical_pages == owned_before
     assert runner.input_data.seqs[0].ssm_block_table is None
@@ -2554,6 +2592,7 @@ def test_dspark_startup_rejects_short_chunks_before_cuda(monkeypatch, chunk_size
     )
     target = SimpleNamespace(forward_with_hidden_taps=unexpected_work)
     draft = SimpleNamespace(
+        block_size=7, noise_width=7,
         _project_context=unexpected_work, prefill=unexpected_work,
         prefill_paged=unexpected_work, forward_draft=unexpected_work,
         forward_head=unexpected_work,
@@ -2569,7 +2608,8 @@ def test_dspark_startup_rejects_short_chunks_before_cuda(monkeypatch, chunk_size
             )
 
 
-def test_dspark_startup_releases_outputs_before_shorter_prefill(monkeypatch):
+@pytest.mark.parametrize("count", [1, 3, 7])
+def test_dspark_startup_releases_outputs_before_shorter_prefill(monkeypatch, count):
     """CPU lifetime oracle; this does not measure CUDA memory peaks."""
     from types import SimpleNamespace
     import weakref
@@ -2588,7 +2628,7 @@ def test_dspark_startup_releases_outputs_before_shorter_prefill(monkeypatch):
             self.calls += 1
             length = data.seqs[0].to_compute_token_num
             if self.calls == 2:
-                assert length == 24 and freed == [32]
+                assert length == 32 - (count + 1) and freed == [32]
                 assert all(reference() is None for reference in previous_outputs)
                 raise ShorterProbeReached
             assert length == 32
@@ -2609,6 +2649,7 @@ def test_dspark_startup_releases_outputs_before_shorter_prefill(monkeypatch):
     data = SimpleNamespace(memory_manager=manager)
     data.cal_and_set_input = lambda seqs: setattr(data, "seqs", seqs)
     draft = SimpleNamespace(
+        block_size=count, noise_width=count,
         config=SimpleNamespace(target_layer_ids=(0,)),
         prefill_paged=lambda *args, **kwargs: object(),
     )
@@ -2624,7 +2665,7 @@ def test_dspark_startup_releases_outputs_before_shorter_prefill(monkeypatch):
         )
 
 
-def _dspark_prompt_spy(monkeypatch, *, mrope=True):
+def _dspark_prompt_spy(monkeypatch, *, mrope=True, draft_tokens=7):
     """CPU controller oracle; no real attention, allocation or CUDA execution."""
     from types import SimpleNamespace
 
@@ -2695,7 +2736,7 @@ def _dspark_prompt_spy(monkeypatch, *, mrope=True):
             return logits
 
     class Draft:
-        block_size = noise_width = 7
+        block_size = noise_width = draft_tokens
         config = SimpleNamespace(vocab_size=32, target_layer_ids=(1, 0))
         rotary_emb = SimpleNamespace(cos_sin_cache=torch.empty(64, 2))
 
@@ -2733,7 +2774,7 @@ def _dspark_prompt_spy(monkeypatch, *, mrope=True):
                 while len(table) * 16 < length:
                     table.append(len(table) + 1)
             if seq.ssm_block_table is None:
-                seq.ssm_block_table = list(range(1, 9))
+                seq.ssm_block_table = list(range(1, draft_tokens + 2))
                 seq.recurrent_state_slot = 1
             return True
 
@@ -3061,29 +3102,30 @@ def test_dspark_prompt_bootstrap_rejects_invalid_window_before_forward(monkeypat
     assert state.pending_hidden is None and state.inflight is None
 
 
-def _dspark_execution_spy(monkeypatch, *, accepted=2):
+def _dspark_execution_spy(monkeypatch, *, accepted=2, draft_tokens=7):
     """Direct runner oracle; no Worker/Scheduler or real CUDA execution."""
     from gllm.speculative import dspark_execution as module
     from gllm.speculative.dspark import DSparkVerifyResult, commit_dspark_prompt_step
 
-    runner, seq = _dspark_prompt_spy(monkeypatch)
+    runner, seq = _dspark_prompt_spy(monkeypatch, draft_tokens=draft_tokens)
     seq.output_len = 32
     tables = []
+    width = draft_tokens + 1
 
     def draft_forward(pending, anchor, *, start_pos, caches):
         assert caches.state.context_length + pending.shape[1] == start_pos
         caches.state.context_length = start_pos
-        return torch.zeros(1, 7, 4), None
+        return torch.zeros(1, draft_tokens, 4), None
 
     def draft_head(hidden, anchor):
         first = int(anchor.item())
-        return torch.tensor([[first] + [(first + i) % 32 for i in range(1, 8)]]), None, None
+        return torch.tensor([[first] + [(first + i) % 32 for i in range(1, width)]]), None, None
 
     def verify(target, data, *, block_size, target_layer_ids):
         request = data.seqs[0]
-        assert request._mtp_verify and request.to_compute_token_num == 8
+        assert request._mtp_verify and request.to_compute_token_num == width
         assert len(request) == request.computed_token_num
-        assert block_size == 7 and target_layer_ids == (1, 0)
+        assert block_size == draft_tokens and target_layer_ids == (1, 0)
         tables.append(list(request.ssm_block_table))
         length = accepted + 1
         return DSparkVerifyResult(
@@ -3091,6 +3133,7 @@ def _dspark_execution_spy(monkeypatch, *, accepted=2):
             data.tokens[:length].unsqueeze(0).clone(),
             torch.tensor([(int(data.tokens[length - 1]) + 1) % 32]),
             torch.ones(1, length, 8),
+            query_len=width,
         )
 
     runner.dspark.forward_draft, runner.dspark.forward_head = draft_forward, draft_head
@@ -3368,7 +3411,8 @@ def test_dspark_execution_ordinary_free_preserves_default_path(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.no_grad()
-def test_dspark_execution_matches_greedy_with_controlled_and_real_draft():
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_dspark_execution_matches_greedy_with_controlled_and_real_draft(draft_tokens):
     from gllm.runtime.input_data import InputData
     from gllm.runtime.sequence import GenerationSequence
 
@@ -3376,7 +3420,8 @@ def test_dspark_execution_matches_greedy_with_controlled_and_real_draft():
         commit_dspark_prompt_step, commit_dspark_tail_step, commit_dspark_verify_step,
     )
 
-    runner, make_input = _dspark_runtime_fixture()
+    width = draft_tokens + 1
+    runner, make_input = _dspark_runtime_fixture(draft_tokens=draft_tokens)
     runner.model_max_length = 64
     runner.input_data = InputData(True, runner.memory_manager, max_seq_length=64, max_running_seqs=1)
     arena = _init_dspark_runtime_test_arena(runner)
@@ -3409,7 +3454,7 @@ def test_dspark_execution_matches_greedy_with_controlled_and_real_draft():
         oracle_seq.computed_token_num += len(token_ids)
         return int(text.logits_from_hidden(hidden[-1:]).argmax(-1).item())
 
-    for chunk in (prompt[:8], prompt[8:]):
+    for chunk in (prompt[:width], prompt[width:]):
         prediction = ordinary_step(chunk)
         seq.to_compute_token_num = len(chunk)
         record = runner._step_dspark_prompt(seq)
@@ -3426,11 +3471,11 @@ def test_dspark_execution_matches_greedy_with_controlled_and_real_draft():
     assert seq.token_ids == oracle_seq.token_ids
 
     real_head = runner.dspark.forward_head
-    for desired in (0, 0, 2, 7, None):
+    for desired in (0, 0, min(2, draft_tokens), draft_tokens, None):
         start = seq.computed_token_num
         anchor = int(state.anchor.item())
         expected_inputs, predictions, snapshots = [], [], []
-        for _ in range(8):
+        for _ in range(width):
             expected_inputs.append(anchor)
             anchor = ordinary_step([anchor])
             predictions.append(anchor)
@@ -3448,7 +3493,7 @@ def test_dspark_execution_matches_greedy_with_controlled_and_real_draft():
             # final round consumes its genuine proposals without substitution.
             if desired is not None:
                 chosen = expected_inputs.copy()
-                if desired < 7:
+                if desired < draft_tokens:
                     chosen[desired + 1] = (chosen[desired + 1] + 1) % runner.dspark.config.vocab_size
                 ids[0].copy_(torch.tensor(chosen, device=ids.device))
             proposals[:] = ids[0].cpu().tolist()
@@ -3457,12 +3502,12 @@ def test_dspark_execution_matches_greedy_with_controlled_and_real_draft():
         runner.dspark.forward_head = head
         features.append(state.pending_hidden.clone())
         history, table = list(seq.token_ids), list(seq.ssm_block_table)
-        seq.to_compute_token_num = 8
+        seq.to_compute_token_num = width
         record = runner._step_dspark_verify(seq)
         assert seq.token_ids == history and seq.computed_token_num == start
-        assert record.query_len == 8 and record.ready
+        assert record.query_len == width and record.ready
         assert seq.to_compute_tokens is None and not seq._mtp_verify
-        assert runner.input_data.forward_metadata_plan.query_lens == (8,)
+        assert runner.input_data.forward_metadata_plan.query_lens == (width,)
         accepted = 0
         for got, want in zip(proposals[1:], expected_inputs[1:]):
             if got != want:
@@ -3569,6 +3614,7 @@ def _dspark_worker_spy(monkeypatch, *, accepted=2):
             data.tokens[:length].unsqueeze(0).clone(),
             torch.tensor([(int(data.tokens[length - 1]) + 1) % 32]),
             torch.ones(1, length, 8),
+            query_len=8,
         )
 
     runner.dspark.forward_draft, runner.dspark.forward_head = draft_forward, draft_head
@@ -4789,34 +4835,36 @@ def test_paged_batch_noise_failure_keeps_published_context_without_duplicate_app
     assert torch.isfinite(hidden).all() and torch.equal(arena.backing, before)
 
 
-def _verify_batch_contract_fixture(accepted=(0, 7)):
+def _verify_batch_contract_fixture(accepted=(0, 7), *, block_size=7):
     """CPU controller oracle with disjoint, shuffled request storage."""
     from gllm.layers.attention.qkv_backends import PagedAttentionMetadata
     from gllm.runtime.forward_metadata import ForwardMetadataPlan, MetadataMaterialization
     from gllm.runtime.sequence import GenerationSequence
 
+    width = block_size + 1
+    assert all(0 <= count <= block_size for count in accepted)
     target, data, buffers = _verify_contract_fixture()
     batch, starts = len(accepted), (13, 21, 7, 31)
     seqs, windows = [], []
     for row in range(batch):
         start = starts[row]
         seq = GenerationSequence(41 + row, list(range(start)), [], output_len=64, temperature=0)
-        seq.computed_token_num, seq.to_compute_token_num = start, 8
-        seq.to_compute_tokens = [(2 + row * 3 + col) % 32 for col in range(8)]
+        seq.computed_token_num, seq.to_compute_token_num = start, width
+        seq.to_compute_tokens = [(2 + row * 3 + col) % 32 for col in range(width)]
         seq._mtp_verify, seq._cache_epoch = True, 3 + row
         seq.page_table = [row * 4 + offset for offset in (2, 0, 3, 1)]
-        seq.ssm_block_table = [row * 8 + slot for slot in (4, 1, 7, 3, 8, 2, 6, 5)]
+        seq.ssm_block_table = [row * width + slot for slot in (4, 1, 7, 3, 8, 2, 6, 5) if slot <= width]
         seq.recurrent_state_slot = seq.ssm_block_table[0]
         seqs.append(seq)
         windows.extend(seq.to_compute_tokens)
     buffers.update(
         tokens=torch.tensor(windows),
-        position=torch.cat([torch.arange(start, start + 8) for start in starts[:batch]]),
-        seq_lens=torch.tensor([start + 8 for start in starts[:batch]], dtype=torch.int32),
-        query_start_loc=torch.arange(0, batch * 8 + 1, 8, dtype=torch.int32),
+        position=torch.cat([torch.arange(start, start + width) for start in starts[:batch]]),
+        seq_lens=torch.tensor([start + width for start in starts[:batch]], dtype=torch.int32),
+        query_start_loc=torch.arange(0, batch * width + 1, width, dtype=torch.int32),
         slot_mapping=torch.tensor([
             seq.page_table[pos // 16] * 16 + pos % 16
-            for seq in seqs for pos in range(seq.computed_token_num, seq.computed_token_num + 8)
+            for seq in seqs for pos in range(seq.computed_token_num, seq.computed_token_num + width)
         ]),
         block_table=torch.tensor([seq.page_table for seq in seqs], dtype=torch.int32),
         ssm_block_table_2d=torch.tensor([seq.ssm_block_table for seq in seqs], dtype=torch.int32),
@@ -4828,25 +4876,25 @@ def _verify_batch_contract_fixture(accepted=(0, 7)):
     kv.num_pages = batch * 4
     kv.k_cache = [torch.full((kv.num_pages, 16, 2, 4), .25, dtype=torch.bfloat16)]
     kv.v_cache = [torch.full((kv.num_pages, 16, 2, 4), -.5, dtype=torch.bfloat16)]
-    state.num_blocks = batch * 8 + 1
+    state.num_blocks = batch * width + 1
     state.conv_state = torch.ones(2, state.num_blocks, 4, 3, dtype=torch.bfloat16)
     state.temporal_state = torch.zeros(2, state.num_blocks, 2, 4, 4, dtype=torch.float32)
     data.seqs, data.tokens_cpu = seqs, buffers["tokens"].clone()
     data.num_mtp_verify_rows = batch
     data.forward_metadata_plan = ForwardMetadataPlan(
-        MetadataMaterialization.CPU, (8,) * batch, 0, num_mtp_verify_rows=batch,
+        MetadataMaterialization.CPU, (width,) * batch, 0, num_mtp_verify_rows=batch,
         attention_metadata=PagedAttentionMetadata(
-            buffers["block_table"], buffers["seq_lens"], buffers["query_start_loc"], 8, batch
+            buffers["block_table"], buffers["seq_lens"], buffers["query_start_loc"], width, batch
         ),
     )
-    target.hidden = torch.arange(batch * 8, dtype=torch.bfloat16)[:, None].expand(-1, 4).clone()
-    target.taps = torch.arange(batch * 64, dtype=torch.bfloat16).reshape(1, batch * 8, 8)
-    target.logits = torch.zeros(batch * 8, 32)
+    target.hidden = torch.arange(batch * width, dtype=torch.bfloat16)[:, None].expand(-1, 4).clone()
+    target.taps = torch.arange(batch * width * 8, dtype=torch.bfloat16).reshape(1, batch * width, 8)
+    target.logits = torch.zeros(batch * width, 32)
     for row, count in enumerate(accepted):
         predictions = seqs[row].to_compute_tokens[1:] + [27 - row]
-        if count < 7:
+        if count < block_size:
             predictions[count] = (predictions[count] + 1) % 32
-        target.logits[torch.arange(row * 8, row * 8 + 8), predictions] = 10
+        target.logits[torch.arange(row * width, row * width + width), predictions] = 10
     return target, data, buffers
 
 
@@ -5056,7 +5104,8 @@ def test_dspark_verify_batch_rejects_exchanged_and_stale_results_without_consumi
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("batch", [1, 2, 4])
 @torch.no_grad()
-def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, monkeypatch):
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, monkeypatch, draft_tokens):
     from copy import copy
     from types import SimpleNamespace
 
@@ -5070,7 +5119,8 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
     from gllm.runtime.sequence import GenerationSequence
     from gllm.speculative.dspark import commit_dspark_verify_state, verify_dspark_target_batched
 
-    model, _, make_input = _hybrid_target_fixture(mtp_k=7, arena_capacity=64)
+    verify_width = draft_tokens + 1
+    model, _, make_input = _hybrid_target_fixture(speculative_num_draft_tokens=draft_tokens, arena_capacity=64)
     backend = create_qkv_attention_backend("fa3", 64, batch)
     bind_qkv_attention_backend(find_qkv_attention_layers(model), backend)
     calls, forward = [], backend.forward
@@ -5092,9 +5142,9 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
                         "module": _module,
                         "conv_initial": conv_state.index_select(0, rolling).clone(),
                         "temporal_initial": temporal_state.index_select(0, rolling).clone(),
-                        "raw": mixed_qkv.reshape(batch, 8, -1).transpose(1, 2).clone(),
-                        "a": a.reshape(batch, 8, -1).clone(),
-                        "b": b.reshape(batch, 8, -1).clone(),
+                        "raw": mixed_qkv.reshape(batch, verify_width, -1).transpose(1, 2).clone(),
+                        "a": a.reshape(batch, verify_width, -1).clone(),
+                        "b": b.reshape(batch, verify_width, -1).clone(),
                     }
                 return _original(
                     input_data, mixed_qkv, a, b, conv_state, temporal_state, *args
@@ -5140,7 +5190,7 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
         seq.page_table.reverse()
         assert manager.allocate_recurrent_slot(seq)
         table = seq.ssm_block_table
-        seq.ssm_block_table = [table[index] for index in (3, 0, 6, 2, 7, 1, 5, 4)]
+        seq.ssm_block_table = [table[index] for index in (3, 0, 6, 2, 7, 1, 5, 4) if index < verify_width]
         seq.recurrent_state_slot = seq.ssm_block_table[0]
         oracle, owner, reference = make_input(prompt)
         reference.output_len = 64
@@ -5185,7 +5235,7 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
         for row, (oracle, owner, reference) in enumerate(oracles):
             inputs, predictions, features, checkpoints = [], [], [], []
             token = anchors[row]
-            for _ in range(8):
+            for _ in range(verify_width):
                 inputs.append(token)
                 reference.to_compute_tokens, reference.to_compute_token_num = [token], 1
                 oracle.cal_and_set_input([reference])
@@ -5199,11 +5249,11 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
                     for name in ("conv_state", "temporal_state")
                 ))
                 reference.computed_token_num += 1
-            wanted = (0, 2, 5, 7)[(row + round_index) % 4]
+            wanted = min(draft_tokens, (0, 2, 5, 7)[(row + round_index) % 4])
             proposed = list(inputs)
-            if wanted < 7:
+            if wanted < draft_tokens:
                 proposed[wanted + 1] = (proposed[wanted + 1] + 1) % model.config.vocab_size
-            seqs[row].to_compute_tokens, seqs[row].to_compute_token_num = proposed, 8
+            seqs[row].to_compute_tokens, seqs[row].to_compute_token_num = proposed, verify_width
             seqs[row]._mtp_verify = True
             references.append((inputs, predictions, features, checkpoints, wanted))
 
@@ -5249,8 +5299,8 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
         projected_gdn.clear()
         projected_kv.clear()
         calls.clear()
-        results = verify_dspark_target_batched(model, data, block_size=7, target_layer_ids=(1, 0))
-        assert calls == [(batch * 8, batch, 8)]
+        results = verify_dspark_target_batched(model, data, block_size=draft_tokens, target_layer_ids=(1, 0))
+        assert calls == [(batch * verify_width, batch, verify_width)]
         assert data.get_ssm_block_table_2d().cpu().tolist() == [seqs[row].ssm_block_table for row in order]
         # Same target body and physical storage layout must give the same
         # cache bytes with or without taps, including their shared aliases.
@@ -5270,7 +5320,7 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
             output = captured["conv_output"].new_empty(
                 batch, 1, module.tp_num_v_heads, module.head_v_dim
             )
-            for column in range(8):
+            for column in range(verify_width):
                 # Conv checkpoints are raw shifted input windows. Check every
                 # column exactly against the bytes that entered this forward.
                 actual_conv = torch.stack([
@@ -5301,11 +5351,11 @@ def test_dspark_verify_batch_hybrid_gdn_columns_match_independent_greedy(batch, 
                     msg=f"temporal layer {layer}, checkpoint {column}",
                 )
         for packed_row, seq in enumerate(data.seqs):
-            start, end = seq.computed_token_num, seq.computed_token_num + 8
+            start, end = seq.computed_token_num, seq.computed_token_num + verify_width
             stored = _read_paged_context(manager.segment, seq, end)
             for layer, (key, value) in projected_kv.items():
                 for actual, projected in ((stored[0][layer], key), (stored[1][layer], value)):
-                    expected = projected[packed_row * 8:packed_row * 8 + 8]
+                    expected = projected[packed_row * verify_width:packed_row * verify_width + verify_width]
                     expected = expected.transpose(0, 1).unsqueeze(0)
                     torch.testing.assert_close(actual[:, :, start:end], expected, atol=0, rtol=0)
             for actual, expected in zip(sum(
@@ -5376,7 +5426,7 @@ def test_dspark_verify_batch_rejects_unrefreshed_device_tables_after_independent
     assert all(result.consumed for result in results)
 
 
-def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True):
+def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True, draft_tokens=7):
     """CPU control oracle for real batching glue, without CUDA/model numerics."""
     from types import SimpleNamespace
 
@@ -5386,9 +5436,10 @@ def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True):
     from gllm.speculative.dspark import DSparkVerifyResult
     from gllm.workers.worker import Worker
 
-    runner, _ = _dspark_prompt_spy(monkeypatch, mrope=mrope)
+    runner, _ = _dspark_prompt_spy(monkeypatch, mrope=mrope, draft_tokens=draft_tokens)
     runner.maxd = runner.max_running_seqs = batch
     runner.maxp = runner.max_num_batched_tokens = batch * 8
+    width = draft_tokens + 1
     runner.dspark.batch_calls = []
     data, manager = runner.input_data, runner.memory_manager
     manager.dspark_segment = SimpleNamespace(page_size=16, k_cache=[torch.empty(1)])
@@ -5417,9 +5468,9 @@ def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True):
                 table.append(next_page)
                 next_page += 1
         if seq.ssm_block_table is None:
-            seq.ssm_block_table = list(range(next_state, next_state + 8))
+            seq.ssm_block_table = list(range(next_state, next_state + width))
             seq.recurrent_state_slot = next_state
-            next_state += 8
+            next_state += width
         # Controller-only source tables; production uses request-owned CUDA tables.
         cache.get_device_page_table = lambda device: torch.tensor(
             cache.page_table, dtype=torch.int32, device=device
@@ -5443,26 +5494,27 @@ def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True):
         for chunk, start, cache in zip(chunks, start_positions, caches):
             assert cache.state.context_length + chunk.shape[1] == start
             cache.state.context_length = start
-        return torch.zeros(len(chunks), 7, 4), None
+        return torch.zeros(len(chunks), draft_tokens, 4), None
     def draft_one(chunk, anchor, *, start_pos, caches):
         return draft_batch([chunk], anchor, start_positions=[start_pos], caches=[caches])
     def head(hidden, anchors):
         anchors = anchors.reshape(-1)
-        return (anchors[:, None] + torch.arange(8)[None, :]) % 32, None, None
+        return (anchors[:, None] + torch.arange(width)[None, :]) % 32, None, None
     verify_tables = []
     def verify_batch(target, current, **kwargs):
         _, taps = target.forward_with_hidden_taps(current, target_layer_ids=(1, 0))
         results = []
         for row, seq in enumerate(current.seqs):
-            assert seq._mtp_verify and seq.to_compute_token_num == 8
+            assert seq._mtp_verify and seq.to_compute_token_num == width
             verify_tables.append((seq.seq_id, list(seq.ssm_block_table)))
-            accepted = (0, 2, 5, 7)[(seq.seq_id - 61) % 4]
-            length, begin = accepted + 1, row * 8
+            accepted = min(draft_tokens, (0, 2, 5, 7)[(seq.seq_id - 61) % 4])
+            length, begin = accepted + 1, row * width
             ids = current.tokens[begin:begin + length][None].clone()
             results.append(DSparkVerifyResult(
                 seq.seq_id, seq._cache_epoch, seq.computed_token_num, accepted,
                 ids, (ids[:, -1] + 1) % 32,
                 taps[:, begin:begin + length].clone(),
+                query_len=width,
             ))
         return results
     runner.dspark.prefill_paged_batched = prefill_batch
@@ -5485,8 +5537,10 @@ def _dspark_batch_worker_spy(monkeypatch, *, batch=2, mrope=True):
 
 
 @pytest.mark.parametrize("batch,mrope", [(2, False), (2, True), (4, True)])
-def test_dspark_runtime_batch_executes_prompt_bootstrap_and_verify(monkeypatch, batch, mrope):
-    worker, seqs, tables = _dspark_batch_worker_spy(monkeypatch, batch=batch, mrope=mrope)
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_dspark_runtime_batch_executes_prompt_bootstrap_and_verify(monkeypatch, batch, mrope, draft_tokens):
+    worker, seqs, tables = _dspark_batch_worker_spy(monkeypatch, batch=batch, mrope=mrope, draft_tokens=draft_tokens)
+    width = draft_tokens + 1
     runner, scheduler = worker.model_runner, worker.scheduler
     original = [list(seq.token_ids) for seq in seqs]
     worker.schedule_forward()
@@ -5510,9 +5564,9 @@ def test_dspark_runtime_batch_executes_prompt_bootstrap_and_verify(monkeypatch, 
     worker.schedule_forward()
     records = scheduler.next_tokens_queue[-1][0]
     assert runner.dspark.batch_calls[-1] == ("verify", batch)
-    assert all(record.ready and record.query_len == 8 for record in records)
+    assert all(record.ready and record.query_len == width for record in records)
     assert all(seq.to_compute_tokens is None and not seq._mtp_verify for seq in seqs)
-    expected_positions = torch.cat([torch.arange(start, start + 8) for start in starts])
+    expected_positions = torch.cat([torch.arange(start, start + width) for start in starts])
     if mrope:
         expected_positions = expected_positions.repeat(3, 1)
     assert torch.equal(runner.input_data.positions, expected_positions)
@@ -5520,7 +5574,7 @@ def test_dspark_runtime_batch_executes_prompt_bootstrap_and_verify(monkeypatch, 
     package = scheduler.process_output()
     for row, (seq, result) in enumerate(zip(seqs, records)):
         state = runner._dspark_requests[seq.seq_id]
-        count = (0, 2, 5, 7)[row] + 1
+        count = min(draft_tokens, (0, 2, 5, 7)[row]) + 1
         assert package.next_tokens[row] == result.verification.committed_ids[0].tolist()
         assert seq.computed_token_num == starts[row] + count
         assert seq.recurrent_state_slot == before[row][count - 1]
@@ -5661,12 +5715,14 @@ def test_dspark_runtime_batch_rejects_mixed_phases_before_model_or_reservation(m
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
-def test_dspark_prefill_profile_includes_packed_head_and_argmax(monkeypatch, batch):
+@pytest.mark.parametrize("count", [1, 3, 7])
+def test_dspark_prefill_profile_includes_packed_head_and_argmax(monkeypatch, batch, count):
     """CPU allocation-shape oracle, not a measurement of GPU memory usage."""
     from types import SimpleNamespace
 
     from gllm.speculative.dspark_profile import profile_dspark_prefill
 
+    width = count + 1
     head_rows, argmax_rows, measured_rows = [], [], []
     data = SimpleNamespace(tokens_cpu=torch.zeros(32, dtype=torch.long), page_size=16)
 
@@ -5702,12 +5758,13 @@ def test_dspark_prefill_profile_includes_packed_head_and_argmax(monkeypatch, bat
 
     target = SimpleNamespace(forward_with_hidden_taps=forward, logits_from_hidden=head)
     draft = SimpleNamespace(
+        block_size=count, noise_width=count,
         config=SimpleNamespace(target_layer_ids=(0,), num_attention_heads=1, head_dim=4),
         rotary_emb=SimpleNamespace(cos_sin_cache=torch.empty(64, 2)),
         _project_context=lambda taps: taps,
         prefill=lambda *args: None,
         forward_draft=lambda *args, **kwargs: (None, None),
-        forward_head=lambda _, anchors: (torch.zeros(anchors.numel(), 8), None, None),
+        forward_head=lambda _, anchors: (torch.zeros(anchors.numel(), width), None, None),
     )
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", measure)
@@ -5715,17 +5772,22 @@ def test_dspark_prefill_profile_includes_packed_head_and_argmax(monkeypatch, bat
         target, draft, data, max_running_seqs=batch,
         prepare_attention=lambda _: None,
     )
-    expected = [8] if batch == 1 else [8, batch * 8]
+    expected = [width] if batch == 1 else [width, batch * width]
     assert head_rows == argmax_rows == measured_rows == expected
-    assert profile["target_logits_rows"] == batch * 8
-    assert profile["prefill_peak_bytes"] == 100 * batch * 8
+    assert profile["target_logits_rows"] == batch * width
+    assert profile["prefill_peak_bytes"] == 100 * batch * width
+
+    allowance = batch * count * (4 * (4 + 1) + 8 * 4 + 4 * count + 4) * 4
+    assert profile["paged_workspace_allowance_bytes"] == allowance
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("batch", [2, 4])
 @torch.no_grad()
-def test_dspark_runtime_batch_profiles_maximum_prompt_and_full_verify_shape(batch, monkeypatch):
-    runner, _ = _dspark_runtime_fixture(batch=batch)
+@pytest.mark.parametrize("count", [1, 3, 7])
+def test_dspark_runtime_batch_profiles_maximum_prompt_and_full_verify_shape(batch, monkeypatch, count):
+    width = count + 1
+    runner, _ = _dspark_runtime_fixture(batch=batch, draft_tokens=count)
     head_rows, original_head = [], runner.model.logits_from_hidden
     def head(hidden):
         head_rows.append(hidden.shape[0])
@@ -5734,23 +5796,23 @@ def test_dspark_runtime_batch_profiles_maximum_prompt_and_full_verify_shape(batc
     runner.profile_run()
     # Arena sizing must include the full packed logits tensor, not B * 8
     # independent one-row allocations that only report the same row total.
-    assert head_rows == [8, batch * 8]
+    assert head_rows == [width, batch * width]
     profile = runner.dspark_profile
     assert profile["prefill_tokens"] == profile["projected_tokens"] == 32
     assert profile["profile_batch_size"] == batch
-    assert profile["noise_rows"] == 7 * batch
-    assert profile["target_logits_rows"] == 8 * batch
+    assert profile["noise_rows"] == count * batch
+    assert profile["target_logits_rows"] == width * batch
     arena = _init_dspark_runtime_test_arena(runner, arena_capacity=64)
     before = arena.allocator.num_used_physical_pages
     head_rows.clear()
     runner._profile_dspark_paged_verify()
-    assert head_rows[-1] == batch * 8
+    assert head_rows[-1] == batch * width
     assert profile["batch_prefill_tokens"] == 32
-    assert profile["verify_batch_size"] == batch and profile["verify_tokens"] == 8 * batch
-    assert profile["gdn_working_slots"] == 8 * batch
+    assert profile["verify_batch_size"] == batch and profile["verify_tokens"] == width * batch
+    assert profile["gdn_working_slots"] == width * batch
     assert profile["batch_prefill_peak_extra_bytes"] >= 0
     assert profile["batch_verify_peak_extra_bytes"] >= 0
-    assert runner.input_data.forward_metadata_plan.query_lens == (8,) * batch
+    assert runner.input_data.forward_metadata_plan.query_lens == (width,) * batch
     assert all(not seq.page_table and seq.ssm_block_table is None for seq in runner.input_data.seqs)
     assert arena.allocator.num_used_physical_pages == before
     assert not runner._dspark_requests
@@ -5835,13 +5897,14 @@ def test_dspark_runtime_batch_profile_rejects_an_incomplete_token_budget_before_
         pytest.fail("Invalid maximum batch geometry must fail before CUDA or model work")
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", unexpected)
     data = SimpleNamespace(tokens_cpu=torch.empty(15, dtype=torch.long))
+    draft = SimpleNamespace(block_size=7, noise_width=7)
     if phase == "prefill":
         with pytest.raises(ValueError, match=r"8 \* maxd"):
-            profile_dspark_prefill(None, None, data, max_running_seqs=2)
+            profile_dspark_prefill(None, draft, data, max_running_seqs=2)
     else:
         with pytest.raises(ValueError, match=r"8 \* maxd"):
             profile_dspark_paged_verify(
-                None, None, data, max_prompt_tokens=15, model_max_length=32,
+                None, draft, data, max_prompt_tokens=15, model_max_length=32,
                 uses_mrope=False, prepare_attention=unexpected, max_running_seqs=2,
             )
 
@@ -6651,8 +6714,11 @@ def test_dspark_runtime_metadata_model_rejects_old_or_exchanged_views(monkeypatc
 def test_dspark_backend_reserves_phase_rows_without_mtp(phase, rows):
     from gllm.speculative.backend import select_speculative_backend
 
+    from types import SimpleNamespace
+
+    runner = SimpleNamespace(dspark=SimpleNamespace(block_size=7))
     backend = select_speculative_backend(dspark_enabled=True, mtp_enabled=False)
-    assert backend.reservation_width(None, 4, phase=phase) == rows
+    assert backend.reservation_width(runner, 4, phase=phase) == rows
 
 
 @pytest.mark.parametrize("phase", ["prefill", "unknown", None])
@@ -6671,3 +6737,352 @@ def test_dspark_backend_keeps_phase_scheduler():
     phase_schedule = object()
     backend = select_speculative_backend(dspark_enabled=True, mtp_enabled=False)
     assert backend.schedule_method(SimpleNamespace(_schedule_dspark=phase_schedule)) is phase_schedule
+
+
+# --- fixed runtime proposal count (checkpoint tensors stay unchanged) -------
+
+
+@pytest.mark.parametrize("width", [0, -1, 8, True, False, 1.5, "3"])
+def test_runtime_width_rejected_before_module_allocation(monkeypatch, width):
+    from dataclasses import replace
+    from gllm.models import qwen38_dspark as module
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid width reached a CUDA module constructor")
+
+    monkeypatch.setattr(module, "ReplicatedLinear", forbidden)
+    with pytest.raises(ValueError, match="speculative_num_draft_tokens"):
+        module.Qwen38DSpark(
+            replace(_tensor_config(), block_size=7),
+            embed=torch.nn.Identity(), speculative_num_draft_tokens=width,
+        )
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 2), (2, 3, 2), (1, 3, 4), (3, 2)])
+def test_runtime_width_head_rejects_bad_shape_before_projection(monkeypatch, shape):
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+
+    model = _head_stub(3)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid shape reached the vocabulary projection")
+
+    monkeypatch.setattr(model._lm_head[0], "forward", forbidden)
+    with pytest.raises(ValueError, match="draft hidden"):
+        Qwen38DSpark.forward_head(model, torch.zeros(shape), torch.tensor([0]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [1, 3, 7])
+def test_runtime_width_loads_identical_checkpoint_without_changing_config(width):
+    from dataclasses import replace
+
+    config = replace(_tensor_config(), block_size=7)
+    reference = _build_model(config)
+    weights = _build_synthetic_checkpoint(reference, config)
+    reference.load_weights(weights)
+    model = _build_model(config, speculative_num_draft_tokens=width)
+    model.load_weights(weights)
+    assert model.config is config and config.block_size == 7
+    assert model.block_size == model.noise_width == width
+    assert set(model.state_dict()) == set(reference.state_dict())
+    _assert_loaded_checkpoint(model, weights)
+    for name, value in reference.state_dict().items():
+        torch.testing.assert_close(model.state_dict()[name], value, rtol=0, atol=0)
+    # Width is fixed for this instance, never a per-request mutable field.
+    for name in ("block_size", "noise_width"):
+        with pytest.raises(AttributeError):
+            setattr(model, name, 2)
+
+    if width == 7:
+        # Explicit default and omitted default must produce identical outputs,
+        # not merely matching shapes or an unchanged state_dict.
+        with torch.no_grad():
+            model._embed[0].weight.copy_(reference._embed[0].weight)
+            model._lm_head[0].weight.copy_(reference._lm_head[0].weight)
+        prompt = _rows(config, 4)
+        suffix = _rows(config, 1)
+        anchor = torch.tensor([5], device="cuda")
+        results = []
+        for draft in (reference, model):
+            cache = draft.prefill(prompt, anchor)
+            hidden, noise = draft.forward_draft(suffix, anchor, start_pos=5, caches=cache)
+            results.append((hidden, noise, *draft.forward_head(hidden, anchor)))
+        for before, after in zip(*results):
+            torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("checkpoint_width", [0, -1, True, 2.5])
+def test_runtime_width_rejects_invalid_checkpoint_before_allocation(monkeypatch, checkpoint_width):
+    from dataclasses import replace
+    from gllm.models import qwen38_dspark as module
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid checkpoint width reached a CUDA module constructor")
+
+    monkeypatch.setattr(module, "ReplicatedLinear", forbidden)
+    with pytest.raises(ValueError, match="checkpoint block_size"):
+        module.Qwen38DSpark(
+            replace(_tensor_config(), block_size=checkpoint_width),
+            embed=torch.nn.Identity(), speculative_num_draft_tokens=1,
+        )
+
+
+
+@pytest.mark.parametrize("width", [1, 3, 7])
+def test_runtime_width_request_page_table_view_reuses_flat_storage(width):
+    """Preloaded storage isolates view geometry from CUDA upload scheduling."""
+    from gllm.runtime.memory_manager import DSparkRequestCache
+
+    cache = DSparkRequestCache(page_table=[3, 1, 9], context_length=6)
+    storage = torch.tensor([3, 1, 9, -1, -1, -1], dtype=torch.int32, device="cpu")
+    cache._device_page_table = storage
+    cache._num_uploaded_pages = len(cache.page_table)
+    request_table = cache.get_device_page_table(torch.device("cpu"))
+    # Reserving three pages does not make all three valid history pages.
+    table = request_table[:, :2].expand(width, -1)
+    assert storage.ndim == 1 and table.ndim == 2
+    assert table.shape == (width, 2)
+    assert table.data_ptr() == storage.data_ptr()
+    assert table.stride(1) == storage.stride(0)
+    if width > 1:
+        assert table.stride(0) == 0
+    assert table.tolist() == [[3, 1]] * width
+    storage[0] = 17
+    assert table[:, 0].tolist() == [17] * width
+    assert request_table.shape == (1, 3) and storage.shape == (6,)
+
+
+
+@pytest.mark.parametrize("draft_tokens,accepted", [
+    (k, accepted) for k in range(1, 8) for accepted in range(k + 1)
+])
+@torch.no_grad()
+def test_runtime_width_verifier_owns_and_commits_each_prefix(draft_tokens, accepted):
+    from gllm.speculative.dspark import commit_dspark_verify_state, verify_dspark_target
+
+    target, data, buffers = _verify_batch_contract_fixture((accepted,), block_size=draft_tokens)
+    seq = data.seqs[0]
+    table, start = list(seq.ssm_block_table), seq.computed_token_num
+    expected_ids = buffers["tokens"][:accepted + 1].clone()
+    expected_taps = target.taps[:, :accepted + 1].clone()
+    result = verify_dspark_target(
+        target, data, block_size=draft_tokens, target_layer_ids=(1, 0)
+    )
+    assert result.query_len == draft_tokens + 1
+    assert target.calls == target.head_calls == 1
+    assert result.accepted_drafts == accepted
+    buffers["tokens"].zero_()
+    target.taps.fill_(-1)
+    assert torch.equal(result.committed_ids[0], expected_ids)
+    assert torch.equal(result.accepted_hidden, expected_taps)
+    physical = [data.memory_manager.ssm_segment.conv_state.clone(),
+                data.memory_manager.ssm_segment.temporal_state.clone()]
+    commit_dspark_verify_state(seq, result, committed_count=accepted + 1)
+    assert seq.recurrent_state_slot == table[accepted] and result.consumed
+    assert seq.computed_token_num == start
+    assert len(seq.ssm_block_table) == draft_tokens + 1
+    for name, before in zip(("conv_state", "temporal_state"), physical):
+        assert torch.equal(getattr(data.memory_manager.ssm_segment, name), before)
+    selected = list(seq.ssm_block_table)
+    with pytest.raises(ValueError, match="consumed"):
+        commit_dspark_verify_state(seq, result, committed_count=1)
+    assert seq.ssm_block_table == selected
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+@torch.no_grad()
+def test_runtime_width_batch_eos_budget_and_ignore_eos_select_actual_columns(draft_tokens):
+    from gllm.speculative.dspark import (
+        DSparkRequestState, DSparkStepResult, commit_dspark_verify_step,
+        verify_dspark_target_batched,
+    )
+
+    width = draft_tokens + 1
+    target, data, _ = _verify_batch_contract_fixture(
+        (draft_tokens,) * 4, block_size=draft_tokens
+    )
+    results = verify_dspark_target_batched(
+        target, data, block_size=draft_tokens, target_layer_ids=(1, 0)
+    )
+    expected_counts = (1, max(1, width // 2), width - 1, width)
+    for row, (seq, verified, count) in enumerate(zip(data.seqs, results, expected_counts)):
+        tokens = verified.committed_ids[0].tolist()
+        seq.output_len = count if row == 2 else width + 2
+        seq.finish_tokens = [tokens[count - 1]] if row < 2 else [tokens[0]]
+        seq.ignore_eos = row >= 2
+        start, table = seq.computed_token_num, list(seq.ssm_block_table)
+        step = DSparkStepResult(seq.seq_id, seq._cache_epoch, start, width, "verify",
+                               ready=True, verification=verified)
+        state = DSparkRequestState(seq.seq_id, seq._cache_epoch, phase="verify", inflight=step)
+        state.cache.context_length = start
+        assert commit_dspark_verify_step(seq, state, step) == tokens[:count]
+        assert seq.computed_token_num == start + count
+        assert seq.recurrent_state_slot == table[count - 1]
+        assert verified.consumed and step.consumed and state.inflight is None
+        assert seq.is_finish == (row != 3)
+        if row == 3:
+            assert state.pending_hidden.shape[1] == width
+            assert state.anchor_pos == start + count
+        else:
+            assert state.pending_hidden is None and state.anchor is None
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+@pytest.mark.parametrize("corruption", ["result_width", "step_width", "table_width", "accepted", "epoch"])
+def test_runtime_width_commit_rejects_inconsistent_result_before_mutation(draft_tokens, corruption):
+    from gllm.speculative.dspark import (
+        DSparkRequestState, DSparkStepResult, commit_dspark_verify_step, verify_dspark_target,
+    )
+
+    width = draft_tokens + 1
+    target, data, _ = _verify_batch_contract_fixture((draft_tokens,), block_size=draft_tokens)
+    seq = data.seqs[0]
+    verified = verify_dspark_target(target, data, block_size=draft_tokens, target_layer_ids=(1, 0))
+    step = DSparkStepResult(seq.seq_id, seq._cache_epoch, seq.computed_token_num, width,
+                           "verify", ready=True, verification=verified)
+    state = DSparkRequestState(seq.seq_id, seq._cache_epoch, phase="verify", inflight=step)
+    state.cache.context_length = seq.computed_token_num
+    if corruption == "result_width":
+        verified.query_len += 1
+    elif corruption == "step_width":
+        step.query_len += 1
+    elif corruption == "table_width":
+        seq.ssm_block_table.pop()
+    elif corruption == "accepted":
+        verified.accepted_drafts += 1
+    else:
+        verified.cache_epoch += 1
+    table, rolling, tokens, position = (list(seq.ssm_block_table), seq.recurrent_state_slot,
+                                        list(seq.token_ids), seq.computed_token_num)
+    with pytest.raises(ValueError):
+        commit_dspark_verify_step(seq, state, step)
+    assert seq.ssm_block_table == table and seq.recurrent_state_slot == rolling
+    assert seq.token_ids == tokens and seq.computed_token_num == position
+    assert not step.consumed and not verified.consumed and state.inflight is step
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_runtime_width_verify_rejects_wrong_metadata_before_forward(draft_tokens):
+    from gllm.speculative.dspark import verify_dspark_target
+
+    target, data, _ = _verify_batch_contract_fixture((0,), block_size=draft_tokens)
+    wrong = 2 if draft_tokens == 1 else draft_tokens - 1
+    before = list(data.seqs[0].ssm_block_table)
+    with pytest.raises(ValueError, match="metadata"):
+        verify_dspark_target(target, data, block_size=wrong, target_layer_ids=(1, 0))
+    assert target.calls == target.head_calls == 0
+    assert data.seqs[0].ssm_block_table == before
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+def test_runtime_width_execution_commits_multiple_windows(monkeypatch, draft_tokens):
+    from gllm.speculative.dspark import commit_dspark_verify_step
+
+    runner, seq, _ = _dspark_execution_spy(
+        monkeypatch, accepted=draft_tokens, draft_tokens=draft_tokens
+    )
+    width = draft_tokens + 1
+    for _ in range(2):
+        state = runner._dspark_requests[seq.seq_id]
+        start, table = seq.computed_token_num, list(seq.ssm_block_table)
+        seq.to_compute_token_num = width
+        record = runner._step_dspark_verify(seq)
+        assert record.query_len == record.verification.query_len == width
+        assert len(seq.ssm_block_table) == width
+        assert commit_dspark_verify_step(seq, state, record) == record.verification.committed_ids[0].tolist()
+        assert seq.computed_token_num == start + width
+        assert state.cache.context_length == start and state.pending_hidden.shape[1] == width
+        assert seq.recurrent_state_slot == table[-1]
+
+
+@pytest.mark.parametrize("draft_tokens", [1, 3, 7])
+@pytest.mark.parametrize("budget_delta,context_delta", [(-1, 0), (0, -1), (0, 0), (1, 1)])
+def test_runtime_width_execution_fits_serving_and_output_boundaries(
+    monkeypatch, draft_tokens, budget_delta, context_delta
+):
+    runner, seq, _ = _dspark_execution_spy(
+        monkeypatch, accepted=0, draft_tokens=draft_tokens
+    )
+    width = draft_tokens + 1
+    seq.output_len = len(seq) - seq.raw_prompt_len + width + budget_delta
+    runner.model_max_length = seq.computed_token_num + width + context_delta
+    assert runner._dspark_verify_fits(seq) == (budget_delta >= 0 and context_delta >= 0)
+
+
+
+@pytest.mark.parametrize("count", [0, -1, 8, True, False, 2.5])
+def test_runtime_width_loader_rejects_invalid_count_before_allocation(tmp_path, count):
+    from dataclasses import asdict, replace
+    import json
+    from gllm.runtime.model_loader import load_dspark_draft
+
+    config = replace(_tensor_config(), block_size=7)
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
+    with pytest.raises(ValueError, match="checkpoint proposal range"):
+        load_dspark_draft(str(tmp_path), _dspark_loader_target(config), 32, speculative_num_draft_tokens=count)
+
+
+@pytest.mark.parametrize("count", [1, 3, 7])
+def test_runtime_width_loader_requires_nonempty_context_before_verify(tmp_path, count):
+    from dataclasses import asdict, replace
+    import json
+    from gllm.runtime.model_loader import load_dspark_draft
+
+    config = replace(_tensor_config(), block_size=7)
+    (tmp_path / "config.json").write_text(json.dumps(asdict(config)), encoding="utf-8")
+    with pytest.raises(ValueError, match="context windows"):
+        load_dspark_draft(str(tmp_path), _dspark_loader_target(config),
+                          count + 1, speculative_num_draft_tokens=count)
+
+
+@pytest.mark.parametrize("count", [1, 3, 7])
+@pytest.mark.parametrize("phase", ["prefill", "paged_verify"])
+@pytest.mark.parametrize("batch", [1, 4])
+def test_runtime_width_profile_rejects_incomplete_window_before_cuda(monkeypatch, count, phase, batch):
+    from types import SimpleNamespace
+    from gllm.speculative.dspark_profile import profile_dspark_prefill, profile_dspark_paged_verify
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("incomplete profile window reached CUDA or target work")
+
+    width = count + 1
+    capacity = batch * width - 1
+    data = SimpleNamespace(tokens_cpu=torch.empty(capacity, dtype=torch.long))
+    draft = SimpleNamespace(block_size=count, noise_width=count)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", forbidden)
+    with pytest.raises(ValueError, match="prefill chunk|token capacity|rows"):
+        if phase == "prefill":
+            profile_dspark_prefill(None, draft, data, max_running_seqs=batch,
+                                   prepare_attention=forbidden)
+        else:
+            profile_dspark_paged_verify(None, draft, data, max_prompt_tokens=capacity,
+                                       model_max_length=64, uses_mrope=False,
+                                       prepare_attention=forbidden, max_running_seqs=batch)
+
+
+
+@pytest.mark.parametrize("count", [1, 3, 7])
+@pytest.mark.parametrize("phase", ["prefill", "paged_verify"])
+def test_runtime_width_profile_requires_nonempty_context_before_cuda(monkeypatch, count, phase):
+    from types import SimpleNamespace
+    from gllm.speculative.dspark_profile import profile_dspark_prefill, profile_dspark_paged_verify
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid context reached CUDA profiling work")
+
+    width = count + 1
+    data = SimpleNamespace(tokens_cpu=torch.empty(width, dtype=torch.long))
+    draft = SimpleNamespace(
+        block_size=count, noise_width=count,
+        rotary_emb=SimpleNamespace(cos_sin_cache=torch.empty(count + 1, 2)),
+    )
+    for name in ("reset_peak_memory_stats", "memory_allocated", "synchronize"):
+        monkeypatch.setattr(torch.cuda, name, forbidden)
+    with pytest.raises(ValueError, match="nonempty"):
+        if phase == "prefill":
+            profile_dspark_prefill(None, draft, data)
+        else:
+            profile_dspark_paged_verify(None, draft, data, max_prompt_tokens=width,
+                                       model_max_length=width, uses_mrope=False,
+                                       prepare_attention=forbidden)

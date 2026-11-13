@@ -1051,7 +1051,7 @@ class MemoryManager:
         index_head_dim: int = 0,
         qk_rope_head_dim: int = 0,
         mla_cache_fp8: bool = False,
-        mtp_k: int = 0,
+        speculative_num_draft_tokens: int = 0,
         ssm_snapshot_stride_tokens: int = 256,
         dspark_kv_cache_config: Optional[DSparkKVCacheConfig] = None,
     ):
@@ -1098,9 +1098,9 @@ class MemoryManager:
         self.dsv4_state_cache_config = dsv4_state_cache_config
         self.dsv4_kv_cache_config = dsv4_kv_cache_config
         self.dspark_kv_cache_config = dspark_kv_cache_config
-        # Draft-chain length (mtp_k); a running seq borrows up to this many
+        # Draft-chain length (speculative_num_draft_tokens); a running seq borrows up to this many
         # transient checkpoint blocks during an MTP verify step (0 = MTP off).
-        self.mtp_k = mtp_k
+        self.speculative_num_draft_tokens = speculative_num_draft_tokens
         # Recurrent-state prefix-cache granularity, in TOKENS. Converted to
         # whole pages and installed on the segment by
         # ``PrefixMemoryManager.init``; ignored without prefix caching.
@@ -1221,7 +1221,7 @@ class MemoryManager:
             cfg = self.ssm_cache_config
             state_cache = caches["ssm_state"]
             snapshot_cache = caches["ssm_snapshot"]
-            per_seq_blocks = 1 + self.mtp_k
+            per_seq_blocks = 1 + self.speculative_num_draft_tokens
             # Slot 0 is the graph-padding state and is never allocatable. This
             # checks viability only; it does not reserve a separate SSM pool.
             usable_ssm_slots = max(0, state_cache.num_slots - 1)
@@ -1229,7 +1229,7 @@ class MemoryManager:
                 need = (per_seq_blocks + 1) * state_cache.slot_bytes
                 raise RuntimeError(
                     f"cache arena needs >= {need / (1 << 30):.1f} GB to run "
-                    f"one request with MTP k={self.mtp_k}, but its total budget "
+                    f"one request with MTP k={self.speculative_num_draft_tokens}, but its total budget "
                     f"is {backing.numel() / (1 << 30):.1f} GB. Raise "
                     "--gpu-memory-util or --tp."
                 )
@@ -1276,7 +1276,7 @@ class MemoryManager:
             logger.info(
                 "Shared SSM capacity: %d slots, MTP state demand=%d slots/request",
                 usable_ssm_slots,
-                1 + self.mtp_k,
+                1 + self.speculative_num_draft_tokens,
             )
         if usable_dsv4_slots is not None:
             logger.info(
@@ -1310,7 +1310,7 @@ class MemoryManager:
         blocks = []
         state_count = 0
         if segment is not None:
-            state_count = 1 + self.mtp_k if self.ssm_segment is not None else 1
+            state_count = 1 + self.speculative_num_draft_tokens if self.ssm_segment is not None else 1
             blocks = allocator.allocate(segment.arena_type, state_count)
             if blocks is None:
                 raise RuntimeError(
@@ -1892,12 +1892,12 @@ class MemoryManager:
         segment = self.recurrent_segment
         if segment is None:
             return True
-        if self.ssm_segment is not None and self.mtp_k > 0:
+        if self.ssm_segment is not None and self.speculative_num_draft_tokens > 0:
             # MTP on: give the sequence a fixed 1+k block table (column 0 is
             # rolling state; the remaining columns are verify checkpoints).
             if seq.ssm_block_table is not None:
                 return True
-            bt = self.ssm_segment.allocate_block_table(1 + self.mtp_k)
+            bt = self.ssm_segment.allocate_block_table(1 + self.speculative_num_draft_tokens)
             if bt is None:
                 return False  # arena exhausted; scheduler gates admission
             seq.ssm_block_table = bt

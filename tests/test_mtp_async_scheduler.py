@@ -519,7 +519,7 @@ def test_plain_decode_transition_publishes_mtp_relay_before_input_refresh():
 def _boundary_runner(limit=32):
     runner = MtpMixin()
     runner.mtp_enabled = True
-    runner._mtp_k = 3
+    runner.speculative_num_draft_tokens = 3
     runner._mtp_max_batch = 0
     runner._mtp_spec_decision = None
     runner.max_num_batched_tokens = 8192

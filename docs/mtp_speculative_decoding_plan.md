@@ -496,18 +496,18 @@ MTP is a constructor concern, not an env var. `LLM(...)` (→ `ModelRunner`) tak
 | param | default | meaning |
 | --- | --- | --- |
 | `mtp_enabled` | `None` | `None` = **auto-detect**: enable iff the checkpoint has `num_nextn_predict_layers >= 1`. `True`/`False` force on/off. |
-| `mtp_k` | `3` | draft chain length (tokens drafted per target forward). |
+| `speculative_num_draft_tokens` | `None` | Startup proposal count; omitted values resolve centrally to MTP=3 or DSpark=7. |
 
 `mtp_enabled` is stamped onto `config.mtp_enabled` and read by `deepseek_v32.py`
 (`want_mtp = config.mtp_enabled and num_nextn >= 1`) to decide whether to build
 `self.mtp = DeepseekMTP(...)`. `ModelRunner.init()` sets
-`_mtp_k = mtp_k if model.mtp is not None else 0`.
+`speculative_num_draft_tokens = 0 when no speculative backend is active`.
 
 Usage:
 ```python
 LLM(model, tp_size=8)                 # V3.2 → MTP auto-on, k=3, fused, graphs
 LLM(model, tp_size=8, mtp_enabled=False)  # force off
-LLM(model, tp_size=8, mtp_k=2)            # shorter draft chain
+LLM(model, tp_size=8, speculative_num_draft_tokens=2)            # shorter draft chain
 ```
 
 ### 10.2 Environment variables

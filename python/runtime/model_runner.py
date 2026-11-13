@@ -252,7 +252,7 @@ class ModelRunner(
         # enable iff the checkpoint declares nextn-predict layers. Stamped onto
         # the model config so the model builder (e.g. DeepseekV32ForCausalLM,
         # Qwen3_5ForCausalLM) constructs the MTP head from config instead of an
-        # env var. ``mtp_k`` is the draft-chain length.
+        # env var. ``speculative_num_draft_tokens`` is the draft-chain length.
         #
         # Two config conventions are supported:
         #   * DeepSeek V3/V3.2, GLM-MoE-DSA: top-level ``num_nextn_predict_layers``.
@@ -269,7 +269,9 @@ class ModelRunner(
         resolved_mtp_enabled = config.resolve_mtp_enabled(
             self.model_loader.architecture, _num_nextn
         )
-        self._mtp_k_cfg = config.mtp_k
+        self.speculative_num_draft_tokens = config.resolve_num_draft_tokens(
+            "dspark" if self.dspark_enabled else "mtp" if resolved_mtp_enabled else "none"
+        )
         self._mtp_max_batch_cfg = config.mtp_max_batch
         self.model_loader.config.mtp_enabled = resolved_mtp_enabled
         # Nested text config (Qwen3.5-VL wrapper) reads ``mtp_enabled`` off its
@@ -398,8 +400,10 @@ class ModelRunner(
                     self.max_num_batched_tokens
                 )
 
-        if getattr(self, "dspark_enabled", False) and self.max_num_batched_tokens < 8 * self.max_running_seqs:
-            raise ValueError("DSpark effective token budget must cover 8 * maxd verify rows")
+        self.config.validate_speculative_token_budget(
+            self.max_num_batched_tokens, self.max_running_seqs,
+            backend="dspark" if self.dspark_enabled else "mtp" if resolved_mtp_enabled else "none",
+        )
 
     def resolve_model_max_length(self, model_max_length):
         if model_max_length is None:
@@ -569,11 +573,6 @@ class ModelRunner(
         return self._last_prompt_logprobs
 
     @property
-    def mtp_k(self) -> int:
-        """Draft-chain length of the MTP head (0 when MTP is unavailable)."""
-        return self._mtp_k
-
-    @property
     def mtp_max_batch(self) -> int:
         """Batch-size performance gate for MTP; 0 disables the gate."""
         return self._mtp_max_batch
@@ -590,23 +589,34 @@ class ModelRunner(
         self.model = self.model_loader.load_model(mp_load_progress)
         if self.dspark_enabled:
             self.dspark = load_dspark_draft(
-                self.config.dspark_model_path, self.model, self.model_max_length
+                self.config.dspark_model_path, self.model, self.model_max_length,
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             )
         # MTP speculative decoding: number of draft tokens per step (k). Active
         # only when the model built an MTP head (mtp_enabled + nextn layers).
-        self._mtp_k = (
-            self._mtp_k_cfg if getattr(self.model, "mtp", None) is not None else 0
-        )
+        if not self.dspark_enabled and getattr(self.model, "mtp", None) is None:
+            self.speculative_num_draft_tokens = 0
         # The one authoritative runtime capability flag. The earlier resolved
         # preference only controls whether the loader constructs the MTP head;
         # after loading, availability additionally requires a positive k.
         self.mtp_enabled = bool(
-            self._mtp_k > 0 and getattr(self.model, "mtp", None) is not None
+            self.speculative_num_draft_tokens > 0 and getattr(self.model, "mtp", None) is not None
         )
         if self.config.speculative_backend == "mtp" and not self.mtp_enabled:
             raise ValueError("mtp requires a loaded compatible MTP head")
+        if (
+            getattr(self.config, "speculative_num_draft_tokens", None) is not None
+            and not self.dspark_enabled and not self.mtp_enabled and is_last_pp_rank()
+        ):
+            raise ValueError("speculative_num_draft_tokens requires a loaded compatible MTP head")
         self.speculative_backend = select_speculative_backend(
             dspark_enabled=self.dspark_enabled, mtp_enabled=self.mtp_enabled,
+        )
+        count = self.speculative_num_draft_tokens
+        logger.info(
+            "Speculative backend=%s, requested_proposals=%s, proposals=%d, verify_width=%d",
+            self.speculative_backend.name,
+            getattr(self.config, "speculative_num_draft_tokens", None), count, count + 1,
         )
         # Models may opt out of monolithic decode graphs while individual
         # components are still being made graph-safe.  Keep this capability on
@@ -670,10 +680,9 @@ class ModelRunner(
             # whole pages by ``PrefixMemoryManager.init``.
             ssm_snapshot_stride_tokens=self.ssm_snapshot_stride_tokens,
             # Extra GDN checkpoint entries beyond rolling state. DSpark uses
-            # the legacy capacity parameter without enabling an MTP head.
-            mtp_k=(
-                self.dspark.block_size if self.dspark_enabled
-                else self._mtp_k if (ssm_cache_config is not None and self.mtp_enabled)
+            # the shared proposal count without enabling an MTP head.
+            speculative_num_draft_tokens=(
+                self.speculative_num_draft_tokens if (self.dspark_enabled or (ssm_cache_config is not None and self.mtp_enabled))
                 else 0
             ),
             dspark_kv_cache_config=(
@@ -775,7 +784,6 @@ class ModelRunner(
             # by copy_to_input_buffer), so it is graph-capturable for both.
         )
         self._verify_size_to_graph: Dict[int, torch.cuda.CUDAGraph] = {}
-        self._verify_k = getattr(self, "_mtp_k", 0)
         # Fused MTP is the only MTP execution mode: eliminate the separate
         # x1-decode forward by relaying each step's verify bonus token + its
         # hidden as the NEXT step's draft seed. One target forward (verify) per
@@ -899,7 +907,7 @@ class ModelRunner(
             self._mtp_gpu_prep = MtpGpuPrep(
                 max_bs=max(self.max_running_seqs, 1),
                 max_blocks=self.input_data.max_num_block,
-                bt_width=(1 + self._mtp_k if self.memory_manager.use_ssm_cache else 0),
+                bt_width=(1 + self.speculative_num_draft_tokens if self.memory_manager.use_ssm_cache else 0),
                 page_size=self.page_size,
                 uses_mrope=self.uses_mrope,
                 device=torch.device("cuda", torch.cuda.current_device()),
@@ -950,7 +958,7 @@ class ModelRunner(
         self.memory_manager.init(reserve_dummy_page=self._full_cuda_graph_on)
         self.memory_manager.validate_model_max_length(
             self.model_max_length,
-            mtp_lookahead=self._mtp_k if self.mtp_enabled else 0,
+            mtp_lookahead=self.speculative_num_draft_tokens if self.mtp_enabled else 0,
             dspark_lookahead=self.dspark.block_size if self.dspark_enabled else 0,
         )
 

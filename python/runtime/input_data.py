@@ -261,10 +261,10 @@ class InputData:
                 # forward run inside a CUDA graph (the values are
                 # refilled via ``copy_to_input_buffer`` before each replay; the
                 # buffer address stays fixed across capture/replay). Width is
-                # ``1 + mtp_k`` (rolling col + k checkpoint cols); 0 when MTP off.
-                _mtp_k = getattr(memory_manager, "mtp_k", 0) or 0
-                self._mtp_bt_width = 1 + _mtp_k
-                if _mtp_k > 0:
+                # ``1 + speculative_num_draft_tokens`` (rolling col + k checkpoint cols); 0 when MTP off.
+                speculative_num_draft_tokens = getattr(memory_manager, "speculative_num_draft_tokens", 0) or 0
+                self._mtp_bt_width = 1 + speculative_num_draft_tokens
+                if speculative_num_draft_tokens > 0:
                     self.ssm_block_table_2d = torch.zeros(
                         (max_running_seqs, self._mtp_bt_width),
                         dtype=torch.int32,

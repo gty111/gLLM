@@ -50,7 +50,8 @@ class DSparkForwardProtocol(ABC):
     free of any assumption about window caches, paged KV or ``DynamicCache``.
     """
 
-    #: Number of drafted positions per step (``block_size`` in the checkpoint).
+    #: Fixed runtime proposal count. Defaults to the checkpoint's block_size;
+    #: an adapter may select a smaller supported count when it is constructed.
     block_size: int
 
     @abstractmethod

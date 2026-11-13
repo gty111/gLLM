@@ -171,7 +171,7 @@ NVFP4/INT4 and quantized dense attention projections are not implemented here.
 from gllm import LLM
 
 llm = LLM("/path/to/Qwen3.8-Flash-Next-FP8", tp_size=4, use_ep=True,
-          model_max_length=8192, mtp_enabled=True, mtp_k=2,
+          model_max_length=8192, mtp_enabled=True, speculative_num_draft_tokens=2,
           disable_cuda_graph=False)
 outputs = llm.generate(prompts=["你好"], output_lens=[32], temperature=0)
 ```
