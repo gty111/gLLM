@@ -494,6 +494,15 @@ class OverlapWorker(Worker):
         while len(self._gpu_pending) > self._collect_lag:
             self._collect_batch(self._take_oldest())
 
+    def _ready_for_memory_cmd(self) -> bool:
+        """Idle scheduler *and* no batch still in flight on the GPU."""
+        if not super()._ready_for_memory_cmd():
+            return False
+        if self._mtp_pending:
+            self._drain_mtp_pending()
+        self._drain_pending()
+        return self._prefetched_input is None and not self._gpu_pending
+
     def _drain_pending(self) -> None:
         while self._gpu_pending:
             self._collect_batch(self._take_oldest())

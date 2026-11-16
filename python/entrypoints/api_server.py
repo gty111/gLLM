@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from jinja2 import TemplateError
 from logger import logger
 
-from gllm.engine.async_llm import AsyncLLM
+from gllm.engine.async_llm import AsyncLLM, SleepModeError
 from gllm.runtime.sequence import RequestCapacityError
 from gllm.entrypoints import cli_args
 from gllm.entrypoints.protocol import (
@@ -85,7 +85,7 @@ class RequestStreamingResponse(StreamingResponse):
                     yield chunk
             except RequestCapacityError as exc:
                 error = {"type": "error", "error": {
-                    "type": "server_error", "code": "cache_capacity_exceeded",
+                    "type": "server_error", "code": exc.code,
                     "message": str(exc),
                 }}
                 yield "event: error\ndata: " + json.dumps(error) + "\n\n"
@@ -714,6 +714,66 @@ async def stop_profile():
     return JSONResponse(content={"message": "Profiler stopped", "success": True})
 
 
+# ---------------------------------------------------------------------------
+# Sleep mode (on unless --no-sleep-mode). Tags: "weights" (backed up to
+# host memory) and "kv_cache" (discarded); none given means both. A request
+# that arrives while asleep wakes the server automatically.
+# ---------------------------------------------------------------------------
+
+
+def _sleep_error(exc: Exception) -> JSONResponse:
+    disabled = not llm.sleep_mode_enabled
+    bad_input = isinstance(exc, SleepModeError) and exc.client_error
+    if not bad_input:
+        logger.error("Sleep mode request failed: %s", exc)
+    status = HTTPStatus.BAD_REQUEST if bad_input else HTTPStatus.INTERNAL_SERVER_ERROR
+    return _openai_error(
+        str(exc),
+        status.value,
+        error_type="invalid_request_error" if bad_input else "server_error",
+        code="sleep_mode_disabled" if disabled else "sleep_mode_error",
+    )
+
+
+@router.post("/sleep")
+async def sleep(raw_request: Request, level: int = 1, mode: str = "wait"):
+    """Release GPU memory. ``level=1`` (the only level) covers weights (host
+    backup) and KV cache; ``tags=weights|kv_cache`` (repeatable) narrows it.
+    ``mode=wait`` lets in-flight requests finish, ``mode=abort`` cancels them.
+    """
+    try:
+        if level != 1:
+            raise SleepModeError(
+                f"invalid level {level}: only level=1 is supported (weights are "
+                "kept in host memory, the KV cache is discarded)",
+                client_error=True,
+            )
+        tags = raw_request.query_params.getlist("tags") or None
+        result = await llm.sleep(tags, mode=mode)
+    except Exception as e:
+        return _sleep_error(e)
+    return JSONResponse(content={"status": "sleeping", "level": level, **result})
+
+
+@router.post("/wake_up")
+async def wake_up(raw_request: Request):
+    """Restore GPU memory; ``tags`` (repeatable) wakes only part, default all."""
+    try:
+        tags = raw_request.query_params.getlist("tags") or None
+        result = await llm.wake_up(tags)
+    except Exception as e:
+        return _sleep_error(e)
+    status = "sleeping" if result["sleeping_tags"] else "awake"
+    return JSONResponse(content={"status": status, **result})
+
+
+@router.get("/is_sleeping")
+async def is_sleeping():
+    return JSONResponse(
+        content={"is_sleeping": llm.is_sleeping(), "sleeping_tags": llm.sleeping_tags}
+    )
+
+
 def _build_app(dp_index=None):
     """One FastAPI app. ``dp_index`` (via ``app.state``) pins every request that
     arrives on this app to a specific DP replica; ``None`` = round-robin."""
@@ -721,7 +781,9 @@ def _build_app(dp_index=None):
 
     @app.exception_handler(RequestCapacityError)
     async def cache_capacity_error_handler(_, exc):
-        return _openai_error(str(exc), status_code=503, code="cache_capacity_exceeded")
+        return _openai_error(
+            str(exc), status_code=503, error_type="server_error", code=exc.code
+        )
 
     @app.exception_handler(RequestValidationError)
     async def openai_validation_error_handler(_, exc: RequestValidationError):
@@ -766,6 +828,8 @@ def _endpoint_ports(args):
 
 async def run_server(args):
     loop = asyncio.get_running_loop()
+    # No-op unless --sleep-idle-timeout > 0.
+    llm.start_idle_sleep_watcher()
 
     # Per-DP-replica endpoints: one HTTP listener per replica, each pinning its
     # requests to that replica (the single engine still runs the shared schedule

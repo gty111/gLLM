@@ -71,6 +71,12 @@ class EngineConfig:
     mm_processor_max_pixels: Optional[int] = None
     # Encoder disaggregation
     disagg_config: Optional[DisaggConfig] = None
+    # Sleep mode: weights and the cache arena are allocated through VMM pools
+    # whose physical memory can be released while idle (see
+    # ``gllm.runtime.sleep_mode``). ``sleep_idle_timeout`` > 0 additionally
+    # puts the server to sleep after that many idle seconds; 0 disables it.
+    sleep_mode: bool = True
+    sleep_idle_timeout: float = 0.0
     # Explicit selection is opt-in; None preserves the legacy MTP policy.
     speculative_backend: Optional[str] = None
     dspark_model_path: Optional[str] = None
@@ -89,6 +95,10 @@ class EngineConfig:
         for name in ("pp_size", "tp_size", "dp_size"):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
+        if self.sleep_idle_timeout < 0:
+            raise ValueError("sleep_idle_timeout must be >= 0 (0 disables idle sleep)")
+        if self.sleep_idle_timeout > 0 and not self.sleep_mode:
+            raise ValueError("sleep_idle_timeout requires sleep_mode")
 
         backend = self.speculative_backend
         if backend not in (None, "none", "mtp", "dspark"):

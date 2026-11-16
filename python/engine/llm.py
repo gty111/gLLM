@@ -33,6 +33,11 @@ def _resolve_sampling_param(value, config_value, default):
 
 
 class LLM:
+    # Sleep mode: while set, newly arrived requests stay in ``wait_lists``
+    # (aborts still flow) because the workers' memory is being released or is
+    # released.
+    _hold_new_requests = False
+
     def __init__(
         self,
         model_path,
@@ -81,6 +86,8 @@ class LLM:
         speculative_backend=None,
         dspark_model_path=None,
         speculative_num_draft_tokens=None,
+        sleep_mode=True,
+        sleep_idle_timeout=0.0,
     ):
         init_logger()
         # Single configuration object handed to the model runner and the
@@ -126,6 +133,8 @@ class LLM:
             mtp_enabled=mtp_enabled,
             mtp_max_batch=mtp_max_batch,
             ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
+            sleep_mode=sleep_mode,
+            sleep_idle_timeout=sleep_idle_timeout,
         )
         self.config = config
         self.model_path = config.model_path
@@ -211,6 +220,8 @@ class LLM:
         # finished, and the client hung forever (a rare tail-of-run stall under
         # high concurrency). Snapshot-and-clear under the lock makes it atomic.
         self._pending_lock = threading.Lock()
+        # Sleep/wake results from the workers, appended on the engine-io thread.
+        self._control_acks: List[dict] = []
 
         self.init_workers()
 
@@ -457,6 +468,10 @@ class LLM:
         return out
 
     def _apply_ipc_package(self, ipc_package):
+        ack = getattr(ipc_package, "control_ack", None)
+        if ack is not None:
+            with self._pending_lock:
+                self._control_acks.append(ack)
         if ipc_package is not None:
             had_async_streams = bool(self.async_streams)
             for idx, id in enumerate(ipc_package.act_schedule_ids):
@@ -518,11 +533,15 @@ class LLM:
         # the gap between reading ``wait_lists`` and clearing it. Anything that
         # arrives after this swap simply goes to the next tick's fresh list.
         with self._pending_lock:
-            if len(self.wait_lists) == 0 and len(self.abort_ids) == 0:
+            hold = self._hold_new_requests
+            if (hold or len(self.wait_lists) == 0) and len(self.abort_ids) == 0:
                 return
-            wait_lists = self.wait_lists
+            if hold:
+                wait_lists = []
+            else:
+                wait_lists = self.wait_lists
+                self.wait_lists = []
             abort_ids = self.abort_ids
-            self.wait_lists = []
             self.abort_ids = []
 
         for seq in wait_lists:
@@ -578,6 +597,22 @@ class LLM:
             self.comm.broadcast_ipc_package_to_dp(ipc_package)
         else:
             self.comm.send_ipc_package(ipc_package)
+
+    def send_memory_command(self, name: str, tags) -> None:
+        """Ask every replica's workers to ``sleep`` / ``wake_up`` ``tags``.
+
+        Each DP replica's column driver answers with one ``control_ack``
+        (see :meth:`take_control_acks`) once its column is idle and done.
+        """
+        with self._pending_lock:
+            self._control_acks = []
+        self.send_control_command((name, tuple(tags)))
+
+    def take_control_acks(self) -> List[dict]:
+        with self._pending_lock:
+            acks = self._control_acks
+            self._control_acks = []
+        return acks
 
     def start_profile(self):
         self.send_control_command("start_profile")

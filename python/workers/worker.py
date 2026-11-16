@@ -51,8 +51,10 @@ from gllm.distributed.parallel_state import (
     dp_all_gather_meta,
     get_last_pp_rank,
     get_next_pp_rank,
+    get_pp_group,
     get_pp_size,
     get_rank,
+    get_tp_group,
     get_tp_rank,
     get_tp_size,
     get_world_size,
@@ -69,6 +71,7 @@ from gllm.runtime.config import EngineConfig
 from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
 from gllm.runtime.profiler import TorchProfilerMixin
+from gllm.runtime import sleep_mode
 from gllm.scheduling.distributed import (
     DriverPayloadBuilder,
     FollowerSeqStore,
@@ -79,7 +82,17 @@ from gllm.speculative.dspark_runtime import schedule_forward_dspark
 
 
 # Used with AsyncLLM
+# Control codes for sleep mode, next to the profiler's 1 (start) / 2 (stop).
+MEMORY_SLEEP_CMD = 3
+MEMORY_WAKE_CMD = 4
+_MEMORY_CMDS = (MEMORY_SLEEP_CMD, MEMORY_WAKE_CMD)
+_MEMORY_CMD_NAMES = {"sleep": MEMORY_SLEEP_CMD, "wake_up": MEMORY_WAKE_CMD}
+
+
 class Worker(TorchProfilerMixin):
+    # Sleep/wake command received from the frontend, executed by
+    # ``_maybe_run_memory_cmd`` once this column has no work in flight.
+    _pending_memory_cmd = None
 
     def __init__(
         self,
@@ -251,6 +264,20 @@ class Worker(TorchProfilerMixin):
 
         self._is_disagg_lm = True
         lm_id = cfg.lm_id if cfg.lm_id is not None else "lm0"
+
+        if sleep_mode.sleep_mode_enabled():
+            # UCX's registration cache keeps GPU-direct RDMA registrations --
+            # and the GPU pages they pin -- alive after NIXL deregisters the
+            # arena, so sleeping could not return the arena to the device.
+            # The LM registers the arena once, explicitly, and is only ever a
+            # write target, so the cache buys nothing here. Read at UCX init.
+            os.environ.setdefault("UCX_RCACHE_ENABLE", "n")
+            if os.environ["UCX_RCACHE_ENABLE"].lower() not in ("n", "no", "0", "off"):
+                logger.warning(
+                    "UCX_RCACHE_ENABLE=%s: sleeping kv_cache may not free the "
+                    "arena's GPU memory under encoder disaggregation",
+                    os.environ["UCX_RCACHE_ENABLE"],
+                )
 
         recv = DisaggReceiver(
             self.model_runner,
@@ -567,6 +594,7 @@ class Worker(TorchProfilerMixin):
         bandwidth that would otherwise contend with the model's
         per-layer all-reduce.
         """
+        self._maybe_run_memory_cmd()
         if self._disagg_recv is not None:
             # Return embedding pages freed by earlier iterations before this
             # iteration's events, identically on every rank.
@@ -636,7 +664,11 @@ class Worker(TorchProfilerMixin):
                 self._disagg_coord.abort(cum.abort_ids)
         if cum.log is not None:
             self.scheduler.set_log(cum.log)
-        if cum.control_cmd_code != 0:
+        if cum.control_cmd_code in _MEMORY_CMDS:
+            # Sleep/wake must not race in-flight batches: defer until idle.
+            # PP followers receive it when it actually runs.
+            self._pending_memory_cmd = (cum.control_cmd_code, cum.control_data)
+        elif cum.control_cmd_code != 0:
             # Apply locally on this column driver, then forward to
             # PP-other followers via the SchedulePayload mechanism so
             # they enable / disable the profiler in the same iter.
@@ -646,8 +678,12 @@ class Worker(TorchProfilerMixin):
                     cum.control_cmd_code, cum.control_data
                 )
 
-    def _translate_control_cmd(self, control_cmd: str):
+    def _translate_control_cmd(self, control_cmd):
         """rank-0-only string -> (code, data) translation for broadcast."""
+        if isinstance(control_cmd, tuple):
+            # Sleep mode: ("sleep" | "wake_up", tags).
+            name, tags = control_cmd
+            return _MEMORY_CMD_NAMES.get(name, 0), tuple(tags)
         if control_cmd == "start_profile":
             import os
             import time
@@ -661,6 +697,163 @@ class Worker(TorchProfilerMixin):
         if control_cmd == "stop_profile":
             return 2, None
         return 0, None
+
+    def _apply_control_cmd(self, cmd_code: int, data=None):
+        if cmd_code in _MEMORY_CMDS:
+            # PP followers: the column driver forwards the command only once
+            # it is idle, and a follower runs batches in order, so it is idle
+            # here too.
+            ack = self._run_memory_cmd(cmd_code, data)
+            self._sync_memory_cmd(ack)
+            return
+        super()._apply_control_cmd(cmd_code, data)
+
+    def _disagg_restore_arena(self) -> None:
+        """Re-register the woken arena with NIXL and republish (PP0 ranks).
+
+        Collective over the TP group, like the setup handshake: every rank
+        joins the gather, also when its own wake or registration failed.
+        """
+        handshake = None
+        if not sleep_mode.SleepAllocator.get().is_sleeping(sleep_mode.KV_CACHE_TAG):
+            try:
+                handshake = self._disagg_recv.restore_arena()
+            except Exception:
+                logger.exception("Re-registering the cache arena with NIXL failed")
+        if self.tp_size > 1:
+            gathered: List[Optional[dict]] = [None] * self.tp_size
+            dist.all_gather_object(gathered, handshake, group=get_tp_group())
+        else:
+            gathered = [handshake]
+        if any(h is None for h in gathered):
+            raise RuntimeError(
+                "cache arena not restored on every TP rank; see worker logs"
+            )
+        if self._disagg_coord is not None:
+            self._disagg_coord.republish(gathered)
+
+    def _sleep_memory(self, allocator, tags) -> dict:
+        """Release this rank's memory for ``tags``; returns bytes per tag."""
+        # Fail on host memory before anything below changes state.
+        allocator.prepare_sleep(tags)
+        if sleep_mode.KV_CACHE_TAG in tags and not allocator.is_sleeping(sleep_mode.KV_CACHE_TAG):
+            # The arena contents are discarded: no prefix may hit them.
+            dropped = self.model_runner.memory_manager.drop_cached_contents()
+            if dropped:
+                logger.info("Sleep mode: dropped %d cached prefix pages", dropped)
+            if self._disagg_recv is not None:
+                self._disagg_recv.release_arena()
+        # The default pool's cached blocks (activations) stay reserved, so a
+        # forward after wake cannot fail on memory taken while asleep.
+        return allocator.sleep(tags)
+
+    def _sync_memory_cmd(self, ack: dict) -> None:
+        """Wait until every rank of this replica finished; fold into ``ack``.
+
+        Each rank releases its own memory, but only the column driver acks,
+        so the ack must not go out before PP followers and TP peers are done.
+        PP ranks reduce over their PP column first, then the PP=0 ranks over
+        their TP group; the driver then holds the replica-wide failure count
+        and byte totals. No cross-replica collective: DP replicas ack
+        independently.
+        """
+        nbytes = ack.get("bytes", {})
+        stats = torch.tensor(
+            [0 if ack["ok"] else 1] + [nbytes.get(t, 0) for t in sleep_mode.ALL_TAGS],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        if get_pp_size() > 1:
+            dist.all_reduce(stats, group=get_pp_group())
+        if self.pp_rank == 0 and get_tp_size() > 1:
+            dist.all_reduce(stats, group=get_tp_group())
+        failures, *totals = stats.tolist()
+        if failures and ack["ok"]:
+            ack.update(ok=False, error=f"{failures} worker rank(s) failed; see worker logs")
+        if ack["ok"]:
+            ack["bytes"] = {
+                t: b for t, b in zip(sleep_mode.ALL_TAGS, totals) if t in nbytes
+            }
+
+    def _ready_for_memory_cmd(self) -> bool:
+        """True when no request state remains on this column driver."""
+        s = self.scheduler
+        return not (
+            s.seqs_to_prefill
+            or s.seqs_to_decode
+            or s.batch_running
+            or s.next_tokens_queue
+            or s._blocked_prefills
+        )
+
+    def _maybe_run_memory_cmd(self) -> None:
+        pending = self._pending_memory_cmd
+        if pending is None or not self._ready_for_memory_cmd():
+            return
+        self._pending_memory_cmd = None
+        code, tags = pending
+        if get_pp_size() > 1:
+            self.comm.broadcast_control_cmd(code, tags)
+        ack = self._run_memory_cmd(code, tags)
+        self._sync_memory_cmd(ack)
+        if self._polls_frontend():
+            pkg = IPCPackage([])
+            pkg.control_ack = ack
+            self.comm.send_output(pkg)
+
+    def _run_memory_cmd(self, code: int, tags) -> dict:
+        """Release (sleep) or restore (wake) this rank's tagged GPU memory."""
+        import time
+
+        name = "sleep" if code == MEMORY_SLEEP_CMD else "wake_up"
+        ack = {"cmd": name, "ok": True}
+        if not sleep_mode.sleep_mode_enabled():
+            return {"cmd": name, "ok": False, "error": "sleep mode is disabled (--no-sleep-mode)"}
+        allocator = sleep_mode.SleepAllocator.get()
+        start = time.perf_counter()
+        free_before = torch.cuda.mem_get_info()[0]
+        nbytes = {}
+        try:
+            if code == MEMORY_SLEEP_CMD:
+                nbytes = self._sleep_memory(allocator, tags)
+            else:
+                nbytes = allocator.wake_up(tags)
+        except Exception as e:  # reported to the HTTP caller
+            logger.exception("Sleep mode %s failed", name)
+            ack.update(ok=False, error=f"{type(e).__name__}: {e}")
+        # Outside the try: a collective every PP0 rank must join, whether or
+        # not its own wake succeeded. Keyed on the requested tags (the same on
+        # every rank) and idempotent, so a retried wake also repairs a
+        # registration that failed last time.
+        if code == MEMORY_WAKE_CMD and sleep_mode.KV_CACHE_TAG in tags and self._disagg_recv is not None:
+            try:
+                self._disagg_restore_arena()
+            except Exception as e:
+                logger.exception("Sleep mode wake_up: NIXL re-registration failed")
+                if ack["ok"]:
+                    ack.update(ok=False, error=f"{type(e).__name__}: {e}")
+        if ack["ok"]:
+            elapsed = time.perf_counter() - start
+            free, total = torch.cuda.mem_get_info()
+            released = sum(nbytes.values())
+            if code == MEMORY_SLEEP_CMD and free - free_before < 0.9 * released:
+                logger.warning(
+                    "Sleep mode released %.2f GiB but device free memory rose by "
+                    "only %.2f GiB: something else still references it",
+                    released / (1 << 30),
+                    (free - free_before) / (1 << 30),
+                )
+            logger.info(
+                "Sleep mode %s %s: %.2f GiB in %.2fs (device free %.2f / %.2f GiB)",
+                name,
+                ",".join(sorted(nbytes)) or "-",
+                sum(nbytes.values()) / (1 << 30),
+                elapsed,
+                free / (1 << 30),
+                total / (1 << 30),
+            )
+            ack.update(bytes=nbytes, seconds=elapsed)
+        return ack
 
     def recv_next_tokens(self):
         """Pull tokens off the output_rank => rank 0 socket and broadcast.

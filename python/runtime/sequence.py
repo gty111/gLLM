@@ -26,7 +26,14 @@ def resolve_output_len(prompt_len: int, output_len: Optional[int], model_max_len
 
 
 class RequestCapacityError(RuntimeError):
-    """A request cannot make progress with the available cache capacity."""
+    """A request cannot make progress with the available cache capacity.
+
+    ``code`` is the OpenAI-style error code reported to the client (HTTP 503).
+    """
+
+    def __init__(self, message: str = "", code: str = "cache_capacity_exceeded"):
+        super().__init__(message)
+        self.code = code
 
 
 class GenerationSequence:

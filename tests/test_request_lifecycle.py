@@ -170,3 +170,4 @@ def test_nonstream_capacity_error_returns_503():
     response = TestClient(app).get('/capacity-test')
     assert response.status_code == 503
     assert response.json()['error']['code'] == 'cache_capacity_exceeded'
+    assert response.json()['error']['type'] == 'server_error'
