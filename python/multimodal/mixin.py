@@ -189,7 +189,7 @@ class MmMixin:
     def extract_modify_mm(self, messages: Dict):
         mm_contents = {"image": [], "video": []}
         for message in messages:
-            contents = message["content"]
+            contents = message.get("content")
             if type(contents) != list:
                 continue
             for content in contents:
@@ -229,7 +229,7 @@ class MmMixin:
         """
         items = []
         for message in messages:
-            contents = message["content"]
+            contents = message.get("content")
             if type(contents) != list:
                 continue
             for content in contents:
