@@ -5,7 +5,10 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import openai.types.chat
 import torch
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+from pydantic import (
+    BaseModel, ConfigDict, Field, StrictInt, ValidationError, field_validator,
+    model_validator,
+)
 
 # pydantic needs the TypedDict from typing_extensions
 from typing_extensions import Required, TypedDict
@@ -201,6 +204,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
+
     model: str
     audio: Optional[Dict[str, Any]] = None
     frequency_penalty: Optional[float] = 0.0
@@ -289,6 +293,32 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "that are not JSON-encodable can be identified."
         ),
     )
+
+    @field_validator("messages", mode="before")
+    @classmethod
+    def validate_message_content(cls, messages):
+        # The custom-role TypedDict fallback makes content optional even for
+        # standard roles. Validate the wire messages before union parsing can
+        # discard role-specific fields. Assistant tool calls may omit content;
+        # assistant/function messages also permit an explicit null value.
+        if not isinstance(messages, list):
+            return messages
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue  # Leave structural errors to the field schema.
+            if message.get("content") is not None:
+                continue
+            role = message.get("role")
+            if "content" in message and role in ("assistant", "function"):
+                continue
+            if role == "assistant" and (message.get("tool_calls") or message.get("function_call")):
+                continue
+            error = ValueError("content is required for this message")
+            raise ValidationError.from_exception_data(cls.__name__, [{
+                "type": "value_error", "loc": (index, "content"),
+                "input": message.get("content"), "ctx": {"error": error},
+            }])
+        return messages
 
     @model_validator(mode="before")
     @classmethod
