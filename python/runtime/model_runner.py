@@ -57,6 +57,8 @@ from gllm.multimodal.mixin import (  # noqa: F401
 # Re-exported from its historical location for callers and tests.
 from gllm.disagg.runner_mixin import DisaggSeqState as DisaggSeqState  # noqa: F401
 from gllm.runtime.async_runtime import FutureIndices, FutureMap, OverlapRuntime
+from gllm.runtime.sleep_mode import WEIGHTS_TAG, SleepAllocator
+from gllm.runtime.sleep_mode import memory_pool as sleep_memory_pool
 from gllm.runtime.config import EngineConfig
 from gllm.runtime.cuda_graph import CudaGraphMixin
 from gllm.runtime.forward_metadata import ForwardMetadataPlan
@@ -586,11 +588,29 @@ class ModelRunner(
             # verify_config may fall back even for an explicit FA3 request.
             # Other backends have not passed DSpark's GPU integration checks.
             raise RuntimeError("DSpark requires the resolved and bound FA3 backend")
-        self.model = self.model_loader.load_model(mp_load_progress)
-        if self.dspark_enabled:
-            self.dspark = load_dspark_draft(
-                self.config.dspark_model_path, self.model, self.model_max_length,
-                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+        sleep_mode = getattr(self.config, "sleep_mode", False)
+        if sleep_mode:
+            SleepAllocator.get()  # turns the releasable pools on
+        # Everything allocated while loading (parameters, buffers, derived
+        # weight layouts) lands in the releasable ``weights`` pool when sleep
+        # mode is on; a no-op context otherwise.
+        with sleep_memory_pool(WEIGHTS_TAG):
+            self.model = self.model_loader.load_model(mp_load_progress)
+            if self.dspark_enabled:
+                self.dspark = load_dspark_draft(
+                    self.config.dspark_model_path, self.model, self.model_max_length,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                )
+        if sleep_mode:
+            # Release load-time temporaries so they are neither kept resident
+            # nor copied to host memory on every sleep.
+            allocator = SleepAllocator.get()
+            trimmed = allocator.close_and_trim(WEIGHTS_TAG)
+            logger.info(
+                "Sleep mode: %.2f GiB of weights in the releasable pool "
+                "(%.2f GiB of load-time temporaries released)",
+                allocator.tag_bytes(WEIGHTS_TAG) / (1 << 30),
+                trimmed / (1 << 30),
             )
         # MTP speculative decoding: number of draft tokens per step (k). Active
         # only when the model built an MTP head (mtp_enabled + nextn layers).

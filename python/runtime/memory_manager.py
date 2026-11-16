@@ -16,6 +16,8 @@ from gllm.runtime.cache_arena import (
     select_physical_page_bytes,
 )
 from gllm.runtime.sequence import GenerationSequence
+from gllm.runtime.sleep_mode import KV_CACHE_TAG
+from gllm.runtime.sleep_mode import memory_pool as sleep_memory_pool
 from gllm.utils import async_tensor_h2d, get_dtype_bytes
 
 # DeepSeek Sparse Attention FP8 MLA cache: the nope latent is quantized in
@@ -1154,6 +1156,15 @@ class MemoryManager:
         """No SSM prefix caching without prefix metadata (base manager)."""
         return {}
 
+    def drop_cached_contents(self) -> int:
+        """Forget every cache entry whose contents outlive a request.
+
+        Called before the arena's physical memory is discarded (sleep mode),
+        with no request running. The base manager retains nothing once all
+        requests are freed. Returns the number of dropped KV pages.
+        """
+        return 0
+
     def init(self, segment_cls=Segment, reserve_dummy_page: bool = False):
         """Allocate one arena and register every persistent model cache."""
         if self.dspark_kv_cache_config is not None and issubclass(segment_cls, PrefixSegment):
@@ -1179,11 +1190,14 @@ class MemoryManager:
             raise RuntimeError("not enough GPU memory for one cache arena page")
 
         device = torch.device("cuda", torch.cuda.current_device())
-        backing = torch.empty(
-            num_kv_slots * kv_slot_bytes,
-            dtype=torch.uint8,
-            device=device,
-        )
+        # Only the backing goes into the releasable pool: its contents may be
+        # discarded while asleep. Other small tensors made here must persist.
+        with sleep_memory_pool(KV_CACHE_TAG):
+            backing = torch.empty(
+                num_kv_slots * kv_slot_bytes,
+                dtype=torch.uint8,
+                device=device,
+            )
         arena = CacheArena(backing, physical_page_bytes=physical_page_bytes)
         # The same immutable layouts drive grain selection and registration.
         # New persistent groups must be declared in _cache_layouts as well.
@@ -2268,6 +2282,26 @@ class PrefixMemoryManager(MemoryManager):
         *written* (filled), else ``None``. A reserved-but-unfilled slot holds
         zeros and must never be restored onto a non-empty prefix."""
         return self.segment._prefix.valid_snapshot(page_num)
+
+    def drop_cached_contents(self) -> int:
+        """Evict every retained prefix page and its recurrent-state snapshot.
+
+        Requires an idle engine: a referenced or pinned page would raise in
+        ``evict_arena_slot``. Afterwards the arena holds no retained slot and
+        the prefix index is empty, so no later request can hit a page whose
+        memory was discarded.
+        """
+        allocator = self.cache_arena.allocator
+        name = self.segment.id_allocator.cache_type
+        retained = sorted(allocator.cache_type(name).retained_slots)
+        for page in retained:
+            self.segment.evict_arena_slot(page)
+        allocator.discard_cached(name, retained)
+        # Snapshots attached to pages that were not retained (defensive).
+        for page, snap in enumerate(self.segment._prefix.snapshots()):
+            if snap is not None:
+                self.segment._release_snapshot_for(page)
+        return len(retained)
 
     def get_cache_hit_rate(self):
         if self.num_allocated_pages == 0:

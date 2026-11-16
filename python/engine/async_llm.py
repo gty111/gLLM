@@ -1,12 +1,27 @@
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-from typing import Dict, List
+from typing import Dict, Iterable, List, Optional
 
 from fastapi import Request
 from logger import logger
 
 from gllm.engine.llm import LLM
+from gllm.runtime.sequence import RequestCapacityError
+from gllm.runtime.sleep_mode import normalize_tags
+
+
+class SleepModeError(RuntimeError):
+    """A sleep/wake request that cannot be served.
+
+    ``client_error`` marks a bad request (sleep mode disabled, invalid tags or
+    mode) as opposed to a worker-side failure or timeout.
+    """
+
+    def __init__(self, message: str, client_error: bool = False):
+        super().__init__(message)
+        self.client_error = client_error
 
 
 class AsyncStream:
@@ -97,6 +112,19 @@ class AsyncLLM(LLM):
         self.async_streams: Dict[int, AsyncStream] = {}
         self.schedule_engine = None
 
+        # Sleep mode state. Every transition runs under ``_memory_lock`` (made
+        # lazily: it must belong to the server's event loop).
+        self.sleep_mode_enabled = bool(self.config.sleep_mode)
+        self.sleep_idle_timeout = float(self.config.sleep_idle_timeout)
+        self._sleeping_tags: set = set()
+        self._memory_lock: Optional[asyncio.Lock] = None
+        self._wake_task: Optional[asyncio.Task] = None
+        self._idle_task: Optional[asyncio.Task] = None
+        self._last_activity = time.monotonic()
+        # Upper bound for one sleep/wake round trip (draining requests in
+        # ``wait`` mode is not included).
+        self.memory_cmd_timeout = 600.0
+
     def _init_frontend_comm(self):
         # LLM's synchronous constructor waits for this short task. The same
         # persistent executor later owns every frontend-side send and receive.
@@ -164,9 +192,229 @@ class AsyncLLM(LLM):
         # Enqueue before exposing a cancellable await. This is just a locked
         # list append; executor submission could race cancellation and intake.
         self.add_requests(requests=[seq])
+        self._last_activity = time.monotonic()
+        if self._hold_new_requests:
+            # Asleep (or falling asleep): the request waits in ``wait_lists``
+            # until the memory is back.
+            self._ensure_wake_task()
         if self.schedule_engine is None:
             self.start_schedule_engine()
         return stream
+
+    # ------------------------------------------------------------------
+    # Sleep mode
+    # ------------------------------------------------------------------
+    @property
+    def sleeping_tags(self) -> List[str]:
+        return sorted(self._sleeping_tags)
+
+    def is_sleeping(self) -> bool:
+        return bool(self._sleeping_tags)
+
+    def _lock(self) -> asyncio.Lock:
+        if self._memory_lock is None:
+            self._memory_lock = asyncio.Lock()
+        return self._memory_lock
+
+    def _require_sleep_mode(self):
+        if not self.sleep_mode_enabled:
+            raise SleepModeError(
+                "sleep mode is disabled (server started with --no-sleep-mode)",
+                client_error=True,
+            )
+
+    async def _wait_until_idle(self, mode: str) -> None:
+        """Wait until no request is in flight on any worker.
+
+        New requests are already held back. ``abort`` cancels the in-flight
+        ones; ``wait`` lets them finish.
+        """
+        if mode == "abort":
+            for stream in list(self.async_streams.values()):
+                if not stream.finished:
+                    stream.abort()
+        while self.running_maps:
+            self.check_worker_alive()
+            await asyncio.sleep(0.01)
+
+    async def _memory_command(self, name: str, tags) -> List[dict]:
+        """Send sleep/wake to every replica and wait for all their acks."""
+        if self.schedule_engine is None:
+            # Acks arrive through the schedule loop's output polling.
+            self.start_schedule_engine()
+        await self._run_engine_io(self.send_memory_command, name, tags)
+        acks: List[dict] = []
+        deadline = time.monotonic() + self.memory_cmd_timeout
+        while len(acks) < self.dp_size:
+            self.check_worker_alive()
+            if time.monotonic() > deadline:
+                raise SleepModeError(f"timed out waiting for workers to {name}")
+            await asyncio.sleep(0.005)
+            acks.extend(a for a in self.take_control_acks() if a.get("cmd") == name)
+        errors = [a["error"] for a in acks if not a.get("ok")]
+        if errors:
+            raise SleepModeError(f"{name} failed: {'; '.join(sorted(set(errors)))}")
+        return acks
+
+    @staticmethod
+    def _summarize(acks: List[dict], tags) -> dict:
+        nbytes = {t: sum(a.get("bytes", {}).get(t, 0) for a in acks) for t in tags}
+        return {
+            "tags": list(tags),
+            "gib": {t: round(b / (1 << 30), 3) for t, b in nbytes.items()},
+            "seconds": round(max((a.get("seconds", 0.0) for a in acks), default=0.0), 3),
+        }
+
+    async def sleep(self, tags: Optional[Iterable[str]] = None, mode: str = "wait") -> dict:
+        """Release the GPU memory of ``tags`` (default: weights and KV cache).
+
+        New requests are held from the moment this is called; with
+        ``mode="wait"`` in-flight requests finish first, ``"abort"`` cancels
+        them. A request that arrives meanwhile wakes the engine afterwards.
+        """
+        self._require_sleep_mode()
+        if mode not in ("wait", "abort"):
+            raise SleepModeError(
+                f"invalid mode {mode!r}; expected 'wait' or 'abort'", client_error=True
+            )
+        try:
+            tags = normalize_tags(tags)
+        except ValueError as e:
+            raise SleepModeError(str(e), client_error=True) from e
+        # Shielded: a caller that goes away must not abandon a transition
+        # halfway and leave the workers and this frontend disagreeing.
+        return await asyncio.shield(self._sleep(tags, mode))
+
+    async def _sleep(self, tags, mode: str) -> dict:
+        async with self._lock():
+            todo = [t for t in tags if t not in self._sleeping_tags]
+            result = {"tags": [], "gib": {}, "seconds": 0.0}
+            if todo:
+                self._hold_new_requests = True
+                try:
+                    await self._wait_until_idle(mode)
+                except BaseException:
+                    self._hold_new_requests = bool(self._sleeping_tags)
+                    raise
+                try:
+                    acks = await self._memory_command("sleep", todo)
+                except Exception:
+                    await self._rollback_sleep(todo)
+                    raise
+                self._sleeping_tags.update(todo)
+                result = self._summarize(acks, todo)
+                logger.info(
+                    "Engine asleep (%s): released %s in %.2fs",
+                    ",".join(self.sleeping_tags),
+                    ", ".join(f"{t}={g:.2f} GiB" for t, g in result["gib"].items()),
+                    result["seconds"],
+                )
+            if self.wait_lists:
+                # Requests that arrived while falling asleep.
+                self._ensure_wake_task()
+        result["sleeping_tags"] = self.sleeping_tags
+        return result
+
+    async def wake_up(self, tags: Optional[Iterable[str]] = None) -> dict:
+        """Restore ``tags`` (default: everything asleep).
+
+        Requests resume once no tag is asleep any more.
+        """
+        self._require_sleep_mode()
+        try:
+            tags = normalize_tags(tags)
+        except ValueError as e:
+            raise SleepModeError(str(e), client_error=True) from e
+        return await asyncio.shield(self._wake_up(tags))
+
+    async def _rollback_sleep(self, todo) -> None:
+        """After a failed sleep, wake ``todo`` on every rank (idempotent).
+
+        Some ranks may have released their memory. If even that fails the
+        tags are treated as asleep, so requests stay held and the next one
+        retries the wake instead of running on released memory.
+        """
+        try:
+            await self._memory_command("wake_up", todo)
+        except Exception:
+            logger.exception("Rolling back a failed sleep failed; treating %s as asleep", todo)
+            self._sleeping_tags.update(todo)
+        self._hold_new_requests = bool(self._sleeping_tags)
+        if self._hold_new_requests and self.wait_lists:
+            self._ensure_wake_task()
+
+    async def _wake_up(self, tags) -> dict:
+        async with self._lock():
+            todo = [t for t in tags if t in self._sleeping_tags]
+            result = {"tags": [], "gib": {}, "seconds": 0.0}
+            if todo:
+                acks = await self._memory_command("wake_up", todo)
+                self._sleeping_tags.difference_update(todo)
+                result = self._summarize(acks, todo)
+                logger.info(
+                    "Engine woke %s in %.2fs",
+                    ",".join(todo),
+                    result["seconds"],
+                )
+            if not self._sleeping_tags:
+                self._hold_new_requests = False
+                self._last_activity = time.monotonic()
+        result["sleeping_tags"] = self.sleeping_tags
+        return result
+
+    def _ensure_wake_task(self) -> None:
+        if self._wake_task is not None and not self._wake_task.done():
+            return
+
+        async def wake_all():
+            try:
+                # Lets an in-progress sleep finish first (same lock).
+                await self.wake_up(None)
+            except Exception as e:
+                logger.exception("Automatic wake-up failed")
+                self._fail_held_requests(f"server is asleep and failed to wake up: {e}")
+
+        self._wake_task = asyncio.get_running_loop().create_task(wake_all())
+
+    def _fail_held_requests(self, message: str) -> None:
+        """Answer every held request with HTTP 503; the next one retries."""
+        with self._pending_lock:
+            held, self.wait_lists = self.wait_lists, []
+        for seq in held:
+            stream = self.async_streams.pop(seq.seq_id, None)
+            if stream is not None:
+                stream.put(RequestCapacityError(message, code="wake_up_failed"))
+                stream.finish()
+        self.free_finish_ids([seq.seq_id for seq in held])
+
+    def start_idle_sleep_watcher(self) -> None:
+        """Sleep after ``sleep_idle_timeout`` seconds with nothing in flight."""
+        if self.sleep_idle_timeout <= 0 or self._idle_task is not None:
+            return
+        self._idle_task = asyncio.get_running_loop().create_task(self._idle_sleep_loop())
+        self._idle_task.add_done_callback(_log_task_completion)
+        logger.info("Idle sleep enabled: sleep after %.1fs without requests", self.sleep_idle_timeout)
+
+    async def _idle_sleep_loop(self) -> None:
+        timeout = self.sleep_idle_timeout
+        poll = min(1.0, max(timeout / 4, 0.05))
+        while True:
+            await asyncio.sleep(poll)
+            now = time.monotonic()
+            if self._sleeping_tags or self._lock().locked():
+                self._last_activity = now
+                continue
+            if self.running_maps or self.wait_lists:
+                self._last_activity = now
+                continue
+            if now - self._last_activity < timeout:
+                continue
+            logger.info("No requests for %.1fs; going to sleep", now - self._last_activity)
+            try:
+                await self.sleep(None, mode="wait")
+            except Exception:
+                logger.exception("Idle sleep failed")
+            self._last_activity = time.monotonic()
 
     async def check_abort_seqs(self):
         # Snapshot: the engine step (``send_ipc_package`` / ``_apply_ipc_package``

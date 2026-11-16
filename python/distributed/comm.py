@@ -63,6 +63,9 @@ class IPCPackage:
         # prefill. Each value is the seq's ``prompt_logprobs_data`` list
         # (per prompt position: ``None`` or ``(token_id, logprob, ids, vals)``).
         self.prompt_logprobs = {}
+        # Sleep-mode command result (dict) from a column driver; ``None`` on
+        # every ordinary output package.
+        self.control_ack = None
 
     def is_input_empty(self) -> bool:
         """True iff this package carries no front-end => worker work.

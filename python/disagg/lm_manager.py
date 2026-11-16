@@ -253,6 +253,31 @@ class DisaggReceiver:
             f"{self.dtype} per page, {self.num_pages} pages) agent={self.nixl.name}"
         )
 
+    def release_arena(self) -> None:
+        """Deregister the arena before sleep mode unmaps its physical memory.
+
+        A late encoder write then fails on the encoder side (which reconnects
+        and retries) instead of landing in released memory.
+        """
+        if self.arena_reg is not None:
+            self.nixl.deregister(self.arena_reg)
+            self.arena_reg = None
+
+    def restore_arena(self) -> dict:
+        """Re-register the remapped arena; returns the new handshake.
+
+        Sleep mode keeps the arena's virtual address, so the region is
+        unchanged; only the NIXL registration (and with it this agent's
+        metadata) is new and must be republished.
+        """
+        if self.arena_reg is None:
+            backing = self.mr.memory_manager.cache_arena.backing
+            self.arena_reg = self.nixl.register(backing)
+            self.arena_region = self.nixl.region(
+                self.arena_reg, feat_dim=self.feat_dim, dtype=str(self.dtype)
+            )
+        return self.handshake()
+
     def handshake(self) -> dict:
         """Per-rank NIXL handshake info gathered to TP0 during setup."""
         return {
@@ -392,6 +417,17 @@ class DisaggCoordinator:
         # embeddings; their pages are freed on the next poll.
         self.mr._disagg_on_release = self._released.add
         self.disc = make_discovery(self.discovery_endpoint)
+        self._publish()
+        logger.info(
+            f"[lm-disagg {self.lm_id}] coordinator up: meta intake at "
+            f"{self.meta_addr}; {self.num_ranks} TP rank arena(s), <= "
+            f"{self.max_mm_pages} embedding pages "
+            f"(agents={self.rank_agent_names}); watching encoders via "
+            f"{self.discovery_endpoint}"
+        )
+        self._drain_discovery(force=True)
+
+    def _publish(self) -> None:
         self.disc.publish(
             "lm",
             self.lm_id,
@@ -404,14 +440,17 @@ class DisaggCoordinator:
                 processor_config_hash=self.processor_config_hash,
             ),
         )
-        logger.info(
-            f"[lm-disagg {self.lm_id}] coordinator up: meta intake at "
-            f"{self.meta_addr}; {self.num_ranks} TP rank arena(s), <= "
-            f"{self.max_mm_pages} embedding pages "
-            f"(agents={self.rank_agent_names}); watching encoders via "
-            f"{self.discovery_endpoint}"
-        )
-        self._drain_discovery(force=True)
+
+    def republish(self, rank_handshakes: List[dict]) -> None:
+        """Advertise new per-rank NIXL metadata (arena re-registered on wake).
+
+        Encoders see an UPDATE and reconnect; one that writes before that
+        fails, reconnects from discovery and retries.
+        """
+        self.rank_regions = [h["region"] for h in rank_handshakes]
+        self.rank_agent_names = [h["agent_name"] for h in rank_handshakes]
+        self.rank_metas = [h["nixl_meta"] for h in rank_handshakes]
+        self._publish()
 
     # ------------------------------------------------------------------
     # Discovery: dynamic encoder connect/disconnect
