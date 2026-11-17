@@ -451,8 +451,9 @@ def completion(grid, seq_ids=(0,)):
 
 
 def test_acceptance_read_does_not_release_completion_ring():
-    pending, calls = completion([[2, 11, 12, -1]])
+    pending, calls = completion([[2, 10, 11, 12, -1]])
     assert pending.read() == ([2], [[11, 12]])
+    assert pending.consumed_inputs() == [10]
     assert calls == ["wait"]
     assert pending.collect() == ([2], [[11, 12]])
     assert calls == ["wait", "release"]
@@ -461,7 +462,8 @@ def test_acceptance_read_does_not_release_completion_ring():
 def test_async_mask_uses_acceptance_not_scheduler_placeholders(backend):
     a = seq(so.StructuredOutput('{"enum":["abc","adc"]}'))
     active = backend.mask_speculative(torch.zeros(3, 131), [a], [[1]], [list(map(ord, '"ad'))])
-    pending, calls = completion([[2, ord('"'), ord('a'), -1]])
+    # x1 '"' consumed, draft 'a' accepted, bonus 'b' emitted.
+    pending, calls = completion([[2, ord('"'), ord('a'), ord('b'), -1]])
     backend.record_speculative(active, pending)
     a.token_ids.extend([-1, -1, -1])  # optimistic, not authoritative
     logits = torch.zeros(2, 131)
@@ -469,7 +471,7 @@ def test_async_mask_uses_acceptance_not_scheduler_placeholders(backend):
     assert backend.states[a].history == list(map(ord, '"a'))
     assert logits[0, ord('c')] == 0 and torch.isneginf(logits[0, ord('d')])
     assert calls == ["wait"]  # grammar didn't retire the scheduler's batch
-    successor, _ = completion([[2, ord('b'), ord('c'), -1]])
+    successor, _ = completion([[2, ord('b'), ord('c'), ord('"'), -1]])
     backend.record_speculative(next_active, successor)
     backend.finish_speculative([a], pending)  # collecting N must not commit N+1
     assert backend.states[a].history == list(map(ord, '"a'))
@@ -477,21 +479,20 @@ def test_async_mask_uses_acceptance_not_scheduler_placeholders(backend):
     backend.finish_speculative([a], successor)
     backend.finish_speculative([a], successor)  # idempotent across drain/barrier
     assert backend.states[a].history == list(map(ord, '"abc'))
-    backend.stage_relay(a, ord('"'))
-    a.computed_token_num = 5  # next ordinary sample consumes the relay quote
+    a.computed_token_num = 5  # next ordinary sample consumes the emitted bonus
     logits = torch.zeros(1, 131)
     backend.mask(logits, [a])
     assert logits[0, 128] == 0
     assert backend.states[a].history == list(map(ord, '"abc"'))
 
 
-def test_async_completed_prefill_does_not_consume_relay_x1_twice(backend):
+def test_async_completed_prefill_does_not_consume_x1_twice(backend):
     a = seq(so.StructuredOutput('{"const":12}'))
     emit(backend, [a], [ord('1')])
     logits = torch.zeros(2, 131)
     active = backend.mask_speculative(logits, [a], None, [[ord('1'), ord('2')]], positions=[1])
     assert backend.states[a].history == []
-    pending, _ = completion([[2, ord('1'), ord('2'), -1]])
+    pending, _ = completion([[2, ord('1'), ord('2'), 128, -1]])
     backend.record_speculative(active, pending)
     backend.finish_speculative([a], pending)
     assert backend.states[a].history == [ord('1'), ord('2')]
@@ -501,7 +502,10 @@ def test_async_completion_remap_keeps_per_request_row_identity(backend):
     a, b = seq(so.StructuredOutput('{"const":12}')), seq(so.StructuredOutput('{"const":34}'), 1)
     active = backend.mask_speculative(torch.zeros(4, 131), [a, b], [[1], [1]],
                                       [[ord('1'), ord('2')], [ord('3'), ord('4')]])
-    pending, calls = completion([[1, ord('1'), -1], [1, ord('3'), -1]], seq_ids=(0, 1))
+    # Both rows reject their draft and emit the target bonus instead.
+    pending, calls = completion(
+        [[1, ord('1'), ord('2'), -1], [1, ord('3'), ord('4'), -1]], seq_ids=(0, 1)
+    )
     backend.record_speculative(active, pending)
     logits = torch.zeros(2, 131)
     backend.mask_speculative(logits, [b, a], None, [[ord('4')], [ord('2')]], positions=[2, 2])

@@ -71,11 +71,6 @@ class MtpStagingBuffers:
         self.kv_gidx_gpu = torch.empty_like(self.kv_idx_gpu)
         self.kv_gsrc_gpu = torch.empty_like(self.kv_idx_gpu)
 
-        self.bootstrap_rows_host = _pinned_i64(capacity)
-        self.bootstrap_rows_host_np = self.bootstrap_rows_host.numpy()
-        self.bootstrap_rows_gpu = torch.empty(
-            capacity, dtype=torch.int64, device=device
-        )
         self.install_ctx_host = _pinned_i64(capacity)
         self.install_ctx_host_np = self.install_ctx_host.numpy()
 

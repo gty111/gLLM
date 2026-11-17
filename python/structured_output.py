@@ -337,17 +337,14 @@ class StructuredSampler:
             if completion is not None and pending is not completion:
                 continue  # the successor already registered a newer completion
             _, committed = pending.read()
-            for token in committed[row]:
+            emitted = committed[row]
+            consumed = [pending.consumed_inputs()[row]] + emitted[:-1]
+            for token in consumed:
                 state.accept(token)
                 state.history.append(token)
-            state.pending = None  # bonus stays in GPU relay until consumed
+            # The bonus was emitted but not consumed yet, like a plain sample.
+            state.pending = torch.tensor(emitted[-1], dtype=torch.int64)
             state.spec_pending = None
-
-    def stage_relay(self, seq, token):
-        """At a drain, expose the GPU-only bonus to ordinary sampling."""
-        state = self.states.get(seq)
-        if state is not None:
-            state.pending = torch.tensor(token, dtype=torch.int64)
 
     def mask_speculative(self, logits, seqs, contexts, candidates, *, positions=None):
         """Mask target distributions after each verify input [x1, d1, ...].
@@ -373,9 +370,8 @@ class StructuredSampler:
                 state.synchronize(contexts[i][seq.raw_prompt_len:])
             else:
                 # GPU context lengths are authoritative while CPU sequences
-                # still contain optimistic scheduler placeholders. Completed
-                # mixed prefills may have a pending x1 that is relay-only: do
-                # not consume it until the trial matcher below sees x1.
+                # still contain optimistic scheduler placeholders. The pending
+                # token is this verify's x1: leave it to the trial matcher.
                 position = positions[i] - seq.raw_prompt_len
                 previous = None
                 if position > len(state.history) and state.pending is not None:
@@ -403,13 +399,13 @@ class StructuredSampler:
         xgr.apply_token_bitmask_inplace(logits, mask.to(logits.device, non_blocking=logits.is_cuda))
         return active
 
-    def commit_speculative(self, active, committed, bonuses):
+    def commit_speculative(self, active, consumed, bonuses):
         for row, state in active:
-            for token in committed[row]:
+            for token in consumed[row]:
                 state.accept(token)
                 state.history.append(token)
-            # The bonus is sampled but not emitted yet. Keep the same pending
-            # convention as plain sampling so a relay-to-plain transition works.
+            # The bonus is emitted but not consumed yet: the same pending
+            # convention as plain sampling, so either kind of step follows.
             state.pending = torch.tensor(bonuses[row], dtype=torch.int64)
 
     def mask(self, logits, seqs):

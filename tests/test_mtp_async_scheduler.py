@@ -2,6 +2,7 @@ from collections import deque
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.workers.overlap import OverlapWorker
@@ -15,16 +16,12 @@ class _Runner:
     def __init__(self):
         self.freed = []
         self.hash_positions = []
-        self.mtp_relay = {}
 
     def register_decode_page_hash(self, seq, position):
         self.hash_positions.append((seq.seq_id, position))
 
     def free(self, seq):
         self.freed.append(seq.seq_id)
-
-    def take_mtp_relay_token(self, seq_id):
-        return self.mtp_relay.pop(seq_id)
 
 
 def _scheduler():
@@ -285,7 +282,7 @@ def test_mtp_finalize_then_reserve_next_keeps_placeholder_positions_stable():
     assert seq.token_ids == [10, 11, 12, 20, 21, 22]
 
 
-def test_mtp_mixed_deferred_finishes_prefill_with_relay_placeholder():
+def test_mtp_mixed_deferred_emits_completed_prefill_sample():
     scheduler = _scheduler()
     decode = _decode_seq(seq_id=11)
     prefill = GenerationSequence(
@@ -303,35 +300,50 @@ def test_mtp_mixed_deferred_finishes_prefill_with_relay_placeholder():
     deferred = scheduler.process_mtp_output_deferred(decode_rows=1, width=4)
     assert decode.token_ids[-4:] == [-1, -1, -1, -1]
     assert prefill.token_ids == [50, 51, 52, -1]
-    assert decode.computed_token_num == 6
+    assert decode.computed_token_num == len(decode.token_ids) - 1
     assert prefill.computed_token_num == 3
 
     package = scheduler.process_mtp_output_finalize(
         deferred, [[60, 61], [70]]
     )
     assert decode.token_ids[-2:] == [60, 61]
-    # The prefill sample is the successor's GPU relay x1 and is intentionally
-    # not committed twice at this boundary.
-    assert prefill.token_ids == [50, 51, 52]
-    assert package.act_schedule_ids == [11]
-    assert package.next_tokens == [[60, 61]]
+    # The prefill sample is emitted like any plain sample; it stays the one
+    # uncached token that the successor verify consumes as x1.
+    assert prefill.token_ids == [50, 51, 52, 70]
+    assert prefill.computed_token_num == 3
+    assert decode.computed_token_num == len(decode.token_ids) - 1
+    assert package.act_schedule_ids == [11, 12]
+    assert package.next_tokens == [[60, 61], [70]]
     assert [seq.seq_id for seq in scheduler.seqs_to_decode] == [11, 12]
 
-    # First successor verify consumes the GPU-only relay x1. Its reservation
-    # skips the ordinary base-compute increment exactly once, preserving the
-    # decode invariant computed_token_num == len(token_ids) - 1.
+    # The successor verify emits its accepted drafts plus bonus, never x1.
     scheduler.seqs_to_decode.clear()
     prefill.to_compute_token_num = 1
     scheduler.batch_running.append([prefill])
     successor = scheduler.process_mtp_output_deferred(decode_rows=1, width=4)
-    assert len(prefill.token_ids) == 7
-    assert prefill.computed_token_num == 6
+    assert len(prefill.token_ids) == 8
+    assert prefill.computed_token_num == 7
     successor_package = scheduler.process_mtp_output_finalize(
-        successor, [[70]]
+        successor, [[71]]
     )
+    assert prefill.token_ids == [50, 51, 52, 70, 71]
+    assert prefill.computed_token_num == 4
+    assert successor_package.next_tokens == [[71]]
+
+
+def test_mtp_mixed_deferred_does_not_requeue_prefill_that_spent_its_budget():
+    scheduler = _scheduler()
+    prefill = GenerationSequence(23, [50, 51, 52], [], output_len=1)
+    prefill.computed_token_num = 0
+    prefill.to_compute_token_num = 3
+    scheduler.batch_running.append([prefill])
+
+    deferred = scheduler.process_mtp_output_deferred(decode_rows=0, width=4)
+    assert not scheduler.seqs_to_decode
+    package = scheduler.process_mtp_output_finalize(deferred, [[70]])
     assert prefill.token_ids == [50, 51, 52, 70]
-    assert prefill.computed_token_num == 3
-    assert successor_package.next_tokens == [[70]]
+    assert package.next_tokens == [[70]]
+    assert prefill.is_finish
 
 
 def test_mtp_mixed_deferred_does_not_emit_partial_prefill_sample():
@@ -357,39 +369,6 @@ def test_mtp_mixed_deferred_does_not_emit_partial_prefill_sample():
     assert prefill.token_ids == [80, 81, 82, 83]
     assert prefill.computed_token_num == 2
     assert package.act_schedule_ids == [21]
-
-
-def test_mtp_relay_only_materializes_before_plain_decode():
-    scheduler = _scheduler()
-    prefill = GenerationSequence(
-        23,
-        [50, 51, 52],
-        [],
-        output_len=8,
-        temperature=0,
-        top_k=1,
-    )
-    prefill.computed_token_num = 0
-    prefill.to_compute_token_num = 3
-    scheduler.batch_running.append([prefill])
-
-    deferred = scheduler.process_mtp_output_deferred(decode_rows=0, width=4)
-    scheduler.process_mtp_output_finalize(deferred, [[70]])
-    assert prefill._mtp_relay_only_next
-    assert prefill.token_ids == [50, 51, 52]
-    assert prefill.computed_token_num == 3
-
-    scheduler.model_runner.mtp_relay[23] = 70
-    package = scheduler.materialize_mtp_relay_only()
-
-    assert not prefill._mtp_relay_only_next
-    assert prefill.token_ids == [50, 51, 52, 70]
-    # x1 is committed but still uncached, ready for an ordinary decode input.
-    assert prefill.computed_token_num == 3
-    assert package.act_schedule_ids == [23]
-    assert package.next_tokens == [[70]]
-    assert scheduler.model_runner.mtp_relay == {}
-    assert scheduler.model_runner.hash_positions == [(23, 3)]
 
 
 def test_mtp_verify_rows_form_a_contiguous_mixed_batch_prefix():
@@ -489,7 +468,7 @@ def test_filter_prefetched_freed_keeps_surviving_inflight_rows():
     assert list(worker.scheduler.batch_running) == [[live]]
 
 
-def test_plain_decode_transition_publishes_mtp_relay_before_input_refresh():
+def test_plain_decode_transition_drains_mtp_before_input_refresh():
     worker = OverlapWorker.__new__(OverlapWorker)
     worker._dp = False
     worker._mtp_pending = deque([object()])
@@ -502,7 +481,6 @@ def test_plain_decode_transition_publishes_mtp_relay_before_input_refresh():
     worker._drain_mtp_pending = lambda: (
         calls.append("drain"), worker._mtp_pending.clear()
     )
-    worker._publish_mtp_relay_only = lambda: calls.append("publish") or True
 
     def refresh():
         calls.append("refresh")
@@ -513,7 +491,7 @@ def test_plain_decode_transition_publishes_mtp_relay_before_input_refresh():
 
     worker.run_pp0()
 
-    assert calls == ["drain", "publish", "refresh", "build"]
+    assert calls == ["drain", "refresh", "build"]
 
 
 def _boundary_runner(limit=32):
@@ -525,6 +503,7 @@ def _boundary_runner(limit=32):
     runner.max_num_batched_tokens = 8192
     runner.model_max_length = limit
     runner._mtp_relay = {}
+    runner._mtp_async_state = None
     return runner
 
 
@@ -542,6 +521,7 @@ def test_mtp_window_respects_context_and_output_budget(limit, length, output_len
     runner = _boundary_runner(limit)
     seq = _decode_seq(output_len=output_len)
     seq.token_ids = [10] * length
+    runner._mtp_relay[seq.seq_id] = (length - 1, None)
     assert runner.mtp_begin_iter(1, seqs=[seq]) is expected
     # Input prep and execution must agree with the iteration decision.
     assert runner.mtp_speculate_batch(1) is expected
@@ -586,7 +566,6 @@ def test_context_boundary_drains_optimistic_mtp_before_replanning(accepted):
     worker.check_abort_seqs = lambda: None
     worker.recv_ipc_package = lambda: None
     worker._polls_frontend = lambda: False
-    worker._publish_mtp_relay_only = lambda: False
     worker._refresh_prefetched_input = lambda: calls.append("refresh")
 
     def drain():
@@ -594,6 +573,8 @@ def test_context_boundary_drains_optimistic_mtp_before_replanning(accepted):
         scheduler.process_mtp_output_finalize(
             worker._mtp_pending.popleft(), [[20] * accepted],
         )
+        # Materializing the drained cohort leaves the bonus's draft seed.
+        worker.model_runner._mtp_relay[seq.seq_id] = (len(seq) - 1, None)
 
     class PlainDecodeReached(Exception):
         pass
@@ -616,23 +597,6 @@ def test_context_boundary_drains_optimistic_mtp_before_replanning(accepted):
             worker.run_pp0()
 
 
-def test_plain_overlap_launch_invalidates_only_its_rows_relay():
-    worker = OverlapWorker.__new__(OverlapWorker)
-    worker.model_runner = _boundary_runner()
-    worker.model_runner._mtp_relay = {71: object(), 72: object()}
-
-    class PreparationReached(Exception):
-        pass
-
-    def prepare(data):
-        assert set(worker.model_runner._mtp_relay) == {72}
-        raise PreparationReached
-
-    worker.model_runner.prepare_input_cpu = prepare
-    with pytest.raises(PreparationReached):
-        worker._launch_batch(SimpleNamespace(seqs=[_decode_seq(71)]))
-
-
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_last_plain_overlap_token_is_finalized_without_scheduling_successor(pp_size):
     scheduler = _scheduler()
@@ -646,3 +610,74 @@ def test_last_plain_overlap_token_is_finalized_without_scheduling_successor(pp_s
     assert package.next_tokens == [20]
     assert package.free_ids == [81]
     assert seq.token_ids == [10, 11, 12, 20]
+
+
+def test_verify_leaves_its_bonus_as_the_single_uncached_token():
+    """A plain step after a verify must consume the bonus, not a verified token.
+
+    The verify consumed x1 and the accepted drafts; feeding any of them again
+    would advance hybrid GDN state twice.
+    """
+    scheduler = _scheduler()
+    scheduler.model_runner.memory_manager = SimpleNamespace(
+        pre_allocate_page=lambda seqs: None
+    )
+    scheduler.next_tokens_queue = deque()
+    seq = _decode_seq(91, output_len=32)
+    x1 = seq.token_ids[-1]
+    assert seq.computed_token_num == len(seq.token_ids) - 1
+    scheduler.batch_running.append([seq])
+    scheduler.next_tokens_queue.append(([[20, 21, 30]], None, None))
+    package = scheduler.process_output()
+    assert package.next_tokens == [[20, 21, 30]]
+    assert seq.token_ids == [10, 11, 12, 20, 21, 30]
+    assert x1 == 12
+    # x1, 20 and 21 were verify inputs; only the bonus 30 is uncached.
+    assert seq.computed_token_num == len(seq.token_ids) - 1
+    assert seq.token_ids[seq.computed_token_num] == 30
+
+
+def _relay_runner():
+    runner = _boundary_runner(limit=4096)
+    runner.mtp_enabled = True
+    return runner
+
+
+def test_plain_step_records_draft_seed_only_for_sampling_rows(monkeypatch):
+    import gllm.speculative.mtp as mtp_module
+
+    monkeypatch.setattr(mtp_module, "is_last_pp_rank", lambda: True)
+    monkeypatch.setattr(
+        mtp_module, "async_tensor_h2d",
+        lambda data, dtype, device, pin: torch.tensor(data, dtype=dtype),
+    )
+    runner = _relay_runner()
+    decode = _decode_seq(1)
+    chunk = GenerationSequence(2, [50] * 8, [], output_len=8)
+    chunk.computed_token_num, chunk.to_compute_token_num = 0, 4
+    final = GenerationSequence(3, [60] * 6, [], output_len=8)
+    final.computed_token_num, final.to_compute_token_num = 2, 4
+    hidden = torch.arange(9, dtype=torch.float32).unsqueeze(1)
+    input_data = SimpleNamespace(
+        seqs=[decode, chunk, final],
+        query_start_loc_cpu=torch.tensor([0, 1, 5, 9]),
+    )
+    runner._mtp_record_relay(input_data, hidden)
+    assert set(runner._mtp_relay) == {1, 3}
+    assert runner._mtp_relay[1][0] == 3 and runner._mtp_relay[1][1].item() == 0
+    assert runner._mtp_relay[3][0] == 6 and runner._mtp_relay[3][1].item() == 8
+
+
+def test_stale_draft_seed_is_never_a_relay_hit():
+    runner = _relay_runner()
+    seq = _decode_seq(1)
+    assert not runner.mtp_relay_ready([seq])
+    runner._mtp_relay[1] = (len(seq.token_ids) - 1, torch.zeros(1))
+    assert runner.mtp_relay_ready([seq])
+    # A later step (plain or speculative) appended tokens without refreshing
+    # this entry: it now describes an already-consumed position.
+    seq.token_ids.append(20)
+    assert not runner.mtp_relay_ready([seq])
+    assert not runner.mtp_begin_iter(1, seqs=[seq])
+    with pytest.raises(RuntimeError, match="draft seeds"):
+        runner._mtp_relay_inputs([seq])

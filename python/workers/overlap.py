@@ -208,10 +208,7 @@ class OverlapWorker(Worker):
         changed = bool(self._gpu_pending or self._mtp_pending or self._pending_frees)
         self._drain_pending()
         self._drain_mtp_pending()
-        # A completed mixed prefill may own x1 only in the GPU relay. Commit
-        # it before preemption clears that state, preserving output exactly
-        # once and the correct re-prefill boundary.
-        return self._publish_mtp_relay_only() or changed
+        return changed
 
     def check_abort_seqs(self):
         """Settle cancelled owners before freeing or rebuilding a prefetched batch."""
@@ -305,10 +302,6 @@ class OverlapWorker(Worker):
             self._prefetched_input = self._make_scheduled_input(schedule_seqs)
 
     def _launch_batch(self, input_data: InputData, dp_padded_size=None):
-        # Ordinary decode invalidates the bonus/hidden from the last verify.
-        # Other rows may re-enter MTP after a context-limited row retires.
-        if self.model_runner.mtp_enabled:
-            self.model_runner._mtp_drop_relay(input_data.seqs)
         # Pipelined input prep:
         #   * ``prepare_input_cpu`` is pure CPU work and overlaps with the
         #     previous batch's GPU forward.
@@ -606,15 +599,6 @@ class OverlapWorker(Worker):
             self._prefetched_payload = payload if seqs else None
             if not seqs and not payload.is_empty():
                 self.comm.send_schedule_payload(payload)
-
-    def _publish_mtp_relay_only(self) -> bool:
-        """Publish relay-only x1 tokens required by ordinary decode."""
-        relay_package = self.scheduler.materialize_mtp_relay_only()
-        if relay_package is None:
-            return False
-        if self._polls_frontend():
-            self.comm.send_output(relay_package)
-        return True
 
     def _mtp_decode_prefix(self, input_data) -> list:
         """Return the legal leading decode partition, or an empty list.
@@ -923,12 +907,9 @@ class OverlapWorker(Worker):
         if self._mtp_pending and not mtp_plan.speculate:
             # Mixed/prefill/plain-decode metadata is CPU-derived, so leaving a
             # stable MTP cohort first materializes its newest GPU checkpoint and
-            # compacts the optimistic token placeholders. A completed mixed
-            # prefill may then own x1 only in the GPU relay; publish it before
-            # rebuilding ordinary input, otherwise token and position shapes
-            # disagree during an MTP batch-size crossover.
+            # compacts the optimistic token placeholders before rebuilding
+            # ordinary input.
             self._drain_mtp_pending()
-            self._publish_mtp_relay_only()
             self._refresh_prefetched_input()
             if self._prefetched_input is None:
                 self._build_prefetched_input()
@@ -937,16 +918,6 @@ class OverlapWorker(Worker):
         if mtp_plan.speculate:
             self._run_mtp(mtp_plan)
             return
-
-        # A completed mixed prefill may still own an x1 token solely in the
-        # materialized MTP relay. Ordinary decode cannot consume that protocol:
-        # publish x1 to token_ids/frontend as its one uncached input, then
-        # rebuild any batch that was prepared against the relay-only shape.
-        if self._publish_mtp_relay_only():
-            self._refresh_prefetched_input()
-            if self._prefetched_input is None:
-                self._build_prefetched_input()
-                return
 
         input_data = self._prefetched_input
         is_dummy = False

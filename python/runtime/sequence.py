@@ -139,12 +139,6 @@ class GenerationSequence:
         # and its variable-width accept finalize.  Prefix-cache allocation must
         # not hash the temporary ``-1`` token placeholders in that interval.
         self._mtp_async_pending: bool = False
-        # Mixed async prefill handoff: the sampled x1 lives in GPU relay state
-        # and has no committed token_ids entry yet. The first MTP reservation
-        # must therefore not apply the ordinary decode ``base_compute == 1`` a
-        # second time. This is consumed exactly once by that reservation, or
-        # materialized into token_ids before falling back to ordinary decode.
-        self._mtp_relay_only_next: bool = False
         # Persistent per-seq slot in the repetition-penalty mask pool
         # (``MemoryManager._rep_pool``). ``None`` means no slot yet / the seq
         # has ``repetition_penalty == 1.0`` and needs none. ``rep_filled`` is
@@ -229,7 +223,6 @@ class GenerationSequence:
         self.ssm_block_table = None
         self.ssm_num_accepted = 1
         self._mtp_async_pending = False
-        self._mtp_relay_only_next = False
 
     @property
     def computed_prompt(self):

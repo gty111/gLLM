@@ -116,9 +116,14 @@ def test_sampled_acceptance_matches_sync_without_reading_gpu_on_host(monkeypatch
     assert committed == expected
     state = runner._mtp_async_state
     counts = torch.tensor(valid, device="cuda")
-    torch.testing.assert_close(state.context_lens, counts+2)
+    # One of the two tokens is the uncached x1; each row then caches x1 plus
+    # its accepted drafts, i.e. ``valid`` tokens.
+    torch.testing.assert_close(state.context_lens, counts+1)
     torch.testing.assert_close(state.resume_num_accepted, counts)
-    expected_bonus = torch.tensor([sync._mtp_relay[s.seq_id][0] for s in seqs], device="cuda")
+    assert completion.consumed_inputs() == x1
+    # Each emitted row ends with the bonus, which is also the successor's x1.
+    expected_bonus = torch.tensor([row[-1] for row in expected], device="cuda")
+    assert [sync._mtp_relay[s.seq_id][0] for s in seqs] == (counts + 1).tolist()
     torch.testing.assert_close(state.relay_tokens, expected_bonus)
     torch.testing.assert_close(state.relay_hidden, vhidden[torch.arange(3, device="cuda")*4+counts-1])
     torch.testing.assert_close(runner.penalty_commits[0][1], counts-1)
@@ -139,9 +144,11 @@ def test_sampled_successor_uses_gpu_relay_before_predecessor_collection(monkeypa
     first_valid, first_tokens = first.collect()
     second_valid, second_tokens = second.collect()
     assert first_valid == second_valid == [1, 2, 4]
-    assert [row[0] for row in first_tokens] == [5, 5, 5]
-    assert [row[0] for row in second_tokens] == [2, 2, 2]
-    assert state.context_lens.tolist() == [4, 6, 10]
+    assert first.consumed_inputs() == [5, 5, 5]
+    # The first step's bonus is emitted there and consumed by the successor.
+    assert [row[-1] for row in first_tokens] == [2, 2, 2]
+    assert second.consumed_inputs() == [2, 2, 2]
+    assert state.context_lens.tolist() == [3, 5, 9]
 
 
 def test_sampled_chain_requires_the_matching_graph_family():

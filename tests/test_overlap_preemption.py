@@ -159,7 +159,7 @@ def test_stalled_prefill_retires_readers_before_recovery(stalled_requests):
     assert s.num_preempt_seqs == 1
 
 
-def test_barrier_materializes_mixed_prefill_relay_before_retraction(setup_pending):
+def test_barrier_settles_mixed_prefill_sample_before_retraction(setup_pending):
     s, seq, w, events, emitted = setup_pending(mtp=True)
     # Replace the decode reservation with a completed mixed prefill handoff.
     seq.token_ids = [10] * 32
@@ -169,12 +169,11 @@ def test_barrier_materializes_mixed_prefill_relay_before_retraction(setup_pendin
     s.seqs_to_decode.clear()
     s.batch_running.append([seq])
     w._mtp_pending[0].deferred = s.process_mtp_output_deferred(0, 4)
-    s.model_runner.take_mtp_relay_token = lambda sid: 40
     assert s.schedule_decode_batch(1) == []
     assert events == ["settled", "free"]
     assert seq.token_ids == [10] * 32 + [40]
     assert seq.prompt_len == 33 and seq.computed_token_num == 0
-    assert not seq._mtp_async_pending and not seq._mtp_relay_only_next
+    assert not seq._mtp_async_pending
     assert len(emitted) == 1 and emitted[0].next_tokens == [[40]]
 
 
@@ -351,7 +350,7 @@ def test_received_abort_is_handled_before_next_launch(setup_pending):
     with pytest.raises(RuntimeError, match="cancelled before launch"):
         w.run_pp0()
 
-def test_abort_does_not_materialize_cancelled_mtp_relay(setup_pending):
+def test_abort_settles_completed_mixed_prefill_like_decode(setup_pending):
     s, seq, w, events, emitted = setup_pending(mtp=True)
     seq.token_ids = [10] * 32
     seq.raw_prompt_len = seq.prompt_len = 32
@@ -360,17 +359,16 @@ def test_abort_does_not_materialize_cancelled_mtp_relay(setup_pending):
     s.seqs_to_decode.clear()
     s.batch_running.append([seq])
     w._mtp_pending[0].deferred = s.process_mtp_output_deferred(0, 4)
-    s.model_runner.take_mtp_relay_token = lambda sid: pytest.fail(
-        "cancelled relay was published"
-    )
     _prefetch_cancel_owner(s, w)
     s.add_abort_ids([seq.seq_id])
     w.check_abort_seqs()
+    # The completed step's sample settles exactly once before the free,
+    # the same as an in-flight decode row.
     assert events == ["settled", "free"]
-    assert seq.token_ids == [10] * 32
+    assert seq.token_ids == [10] * 32 + [40]
     assert not s.abort_ids and s.freed == [seq.seq_id]
-    assert len(emitted) == 1 and emitted[0].free_ids == [seq.seq_id]
-    assert not emitted[0].act_schedule_ids
+    assert [sid for package in emitted for sid in package.free_ids] == [seq.seq_id]
+    assert emitted[-1].act_schedule_ids == []
 
 
 def test_abort_prefetched_owner_without_inflight_work(prefix_manager, make_scheduler):
