@@ -40,7 +40,11 @@ class MtpBackend(TargetBackend):
         if not eligible or num_decodes <= 0 or dp_attention:
             return 1
         k = int(getattr(runner, "speculative_num_draft_tokens", 0) or 0)
-        if k <= 0 or getattr(runner.model, "mtp", None) is None:
+        has_drafter = (
+            getattr(runner.model, "mtp", None) is not None
+            or getattr(runner, "_dspark_drafter", None) is not None
+        )
+        if k <= 0 or not has_drafter:
             return 1
         max_batch = int(getattr(runner, "mtp_max_batch", 0) or 0)
         if max_batch > 0 and num_decodes > max_batch:
@@ -49,23 +53,11 @@ class MtpBackend(TargetBackend):
         return width if width <= runner.max_num_batched_tokens else 1
 
 
-class DSparkBackend(TargetBackend):
+class DSparkBackend(MtpBackend):
+    """The MTP pipeline with a DSpark drafter (``speculative/dspark_drafter.py``)."""
+
     name = "dspark"
-    capabilities = SpeculativeCapabilities(overlap=False, cuda_graph=False)
-
-    def schedule_method(self, scheduler):
-        return scheduler._schedule_dspark
-
-    def reservation_width(self, runner, num_decodes, *, phase=None, eligible=True, dp_attention=False):
-        """Prefill uses its ragged chunk length; these are fixed decode phases."""
-        if phase == "verify":
-            k = runner.dspark.block_size
-            if type(k) is not int or k < 1:
-                raise ValueError("DSpark verify requires a positive runtime proposal count")
-            return k + 1
-        if phase in ("bootstrap", "tail"):
-            return 1
-        raise ValueError("DSpark decode reservation requires a known decode phase")
+    capabilities = SpeculativeCapabilities(overlap=True, cuda_graph=True)
 
 
 _TARGET = TargetBackend()

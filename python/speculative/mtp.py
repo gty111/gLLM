@@ -28,7 +28,7 @@ from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.runtime.input_data import InputData
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.async_state import MtpAsyncBatchState, MtpAsyncCompletion
-from gllm.speculative.gpu_prep import MTP_DRAFT_POS_OFFSET
+from gllm.speculative.gpu_prep import META_CTX, META_X1, MTP_DRAFT_POS_OFFSET
 from gllm.speculative.repetition_penalty import (
     SpeculativeRepetitionPenalty,
     apply_speculative_penalties,
@@ -258,18 +258,28 @@ class MtpMixin:
             (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5)
             or s.top_k != 1 for s in seqs
         )
-        if sampled:
+        if getattr(self, "_dspark_drafter", None) is not None:
+            if not sampled:
+                graphs = getattr(self, "_dspark_draft_graphs", None) or {}
+            elif self._mtp_sparse_eligible(seqs):
+                graphs = getattr(self, "_dspark_sampled_graphs", None) or {}
+            else:
+                graphs = {}  # dense q drafts eagerly
+            draft_graphs = bool(graphs)
+        elif sampled:
             graphs = (self._draft_size_to_graph_sampled_sparse
                       if self._mtp_sparse_eligible(seqs)
                       else self._draft_size_to_graph_sampled)
+            draft_graphs = self._mtp_draft_graph
         else:
             graphs = self._draft_size_to_graph
+            draft_graphs = self._mtp_draft_graph
         return bool(
             n
             and state is not None
             and state.can_remap([s.seq_id for s in seqs])
             and self._mtp_gpu_prep_on
-            and self._mtp_draft_graph
+            and draft_graphs
             and self._mtp_verify_graph
             and any(b >= n for b in graphs)
             and any(b >= n for b in self._verify_size_to_graph)
@@ -1263,6 +1273,83 @@ class MtpMixin:
             self._verify_size_to_graph[bucket] = g
             self._drop_dummy_verify_cache()
 
+    def _capture_dspark_draft_graphs(self, memory_pool, stream):
+        """Capture DSpark ``propose`` per verify bucket over GPU-prep buffers.
+
+        Inputs are the staged anchor (``x1``), context length and page table
+        of :class:`MtpGpuPrep`, which a chained overlap step overwrites from
+        the predecessor's device state, so drafting never touches the host.
+        Padding rows (context 1, dummy page) produce discarded proposals.
+        """
+        gp = self._mtp_gpu_prep
+        drafter = self._dspark_drafter
+        buckets = sorted(self._verify_size_to_graph)
+        if gp is None or drafter is None or not buckets:
+            return
+        self._dspark_drafts = torch.zeros(
+            (buckets[-1], drafter.num_draft_tokens), dtype=torch.int64, device=gp._d_meta.device
+        )
+        self._dspark_draft_graphs = {}
+        gp._d_meta.zero_()
+        gp._d_meta[:, META_CTX] = 1
+        gp._d_meta[:, META_X1] = 1
+        gp._d_pt.fill_(self.memory_manager.dummy_page or 0)
+        for bucket in buckets:
+            args = (gp._d_meta[:bucket, META_X1], gp._d_meta[:bucket, META_CTX], gp._d_pt[:bucket])
+            self._dspark_drafts[:bucket].copy_(drafter.propose(*args))  # warm up
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph=graph, pool=memory_pool, stream=stream):
+                self._dspark_drafts[:bucket].copy_(drafter.propose(*args))
+            self._dspark_draft_graphs[bucket] = graph
+        if self._mtp_can_sample:
+            self._capture_dspark_sampled_graphs(memory_pool, stream, buckets)
+
+    def _capture_dspark_sampled_graphs(self, memory_pool, stream, buckets):
+        """Sampled (top-k-sparse) DSpark drafts per bucket, recording ``q``.
+
+        Sampling parameters come from static buffers filled per step; draws
+        use Gumbel-max on the default CUDA generator, which graphs replay with
+        fresh randomness. Unrestricted ``top_k`` (dense ``q``) runs eagerly.
+        """
+        gp = self._mtp_gpu_prep
+        drafter = self._dspark_drafter
+        dev = gp._d_meta.device
+        rows, k = buckets[-1], drafter.num_draft_tokens
+        k_pad = min(self._sparse_kpad_capture, self.memory_manager.vocab_size)
+        self._dspark_temp = torch.ones((rows, 1), dtype=torch.float32, device=dev)
+        self._dspark_topk = torch.ones(rows, dtype=torch.int32, device=dev)
+        self._dspark_topp = torch.ones(rows, dtype=torch.float32, device=dev)
+        self._dspark_sampled_drafts = torch.zeros((rows, k), dtype=torch.int64, device=dev)
+        self._dspark_qv = torch.zeros((rows, k, k_pad), dtype=torch.float32, device=dev)
+        self._dspark_qi = torch.zeros((rows, k, k_pad), dtype=torch.int64, device=dev)
+        self._dspark_qd = torch.zeros((rows, k), dtype=torch.float32, device=dev)
+        self._dspark_sampled_graphs = {}
+
+        def run(bucket):
+            record = []
+            pick = self._dspark_sparse_pick(
+                self._dspark_temp[:bucket], self._dspark_topk[:bucket],
+                self._dspark_topp[:bucket], k_pad, record,
+            )
+            drafts = drafter.propose_with(
+                gp._d_meta[:bucket, META_X1], gp._d_meta[:bucket, META_CTX],
+                gp._d_pt[:bucket], pick,
+            )
+            self._dspark_sampled_drafts[:bucket].copy_(drafts)
+            vals, idx, drawn = (torch.stack(part, dim=1) for part in zip(*record))
+            self._dspark_qv[:bucket].copy_(vals)
+            self._dspark_qi[:bucket].copy_(idx)
+            self._dspark_qd[:bucket].copy_(drawn)
+
+        for bucket in buckets:
+            run(bucket)  # warm up
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cuda_graph=graph, pool=memory_pool, stream=stream):
+                run(bucket)
+            self._dspark_sampled_graphs[bucket] = graph
+
     def _capture_verify_head_kv(self, bucket: int, qlen: int) -> None:
         """Fold the post-verify MTP head KV pass into the verify graph.
 
@@ -1280,6 +1367,10 @@ class MtpMixin:
         if qlen < 2:
             return
         ntok = bucket * qlen
+        drafter = getattr(self, "_dspark_drafter", None)
+        if drafter is not None:
+            drafter.kv_sync(self.input_data, ntok)
+            return
         if ntok > self._mtp_staging.refresh_tokens.numel():
             return
         src = self.input_data.tokens[:ntok].view(bucket, qlen)
@@ -1387,6 +1478,89 @@ class MtpMixin:
             out.append(int(delta) if delta is not None else 0)
         return out
 
+    def _dspark_sparse_pick(self, temps, top_ks, top_ps, k_pad, record):
+        """Sampler over the top-k-sparse proposal distribution; records ``q``."""
+        def pick(logits):
+            vals, idx = self._mtp_sparse_probs(logits, temps, top_ks, top_ps, k_pad)
+            column = self._gumbel_argmax(vals).unsqueeze(1)
+            record.append((vals, idx, vals.gather(1, column).squeeze(1)))
+            return idx.gather(1, column).squeeze(1)
+        return pick
+
+    def _dspark_dense_pick(self, temps, top_ks, top_ps, record):
+        """Sampler over the full-vocabulary proposal distribution; records ``q``."""
+        def pick(logits):
+            q = self._mtp_probs_static(logits, temps, top_ks, top_ps)
+            record.append(q)
+            return self._gumbel_argmax(q)
+        return pick
+
+    def _dspark_propose(
+        self, decode_seqs, ctx_lens, x1_tokens, x1_gpu, x1_is_gpu,
+        *, sampled=False, sparse=False,
+    ):
+        """DSpark drafts ``[nd, k]`` on the device for this verify step.
+
+        Sampled batches draw each proposal from the request's transformed
+        distribution (the same transform as the target's ``p``) and also
+        return that distribution ``q`` for lossless rejection sampling.
+        """
+        nd = len(decode_seqs)
+        dev = x1_gpu.device
+        if sampled:
+            temps, top_ks, top_ps = self._mtp_sample_params(decode_seqs, dev)
+            graphs = getattr(self, "_dspark_sampled_graphs", None) if sparse else None
+        else:
+            graphs = getattr(self, "_dspark_draft_graphs", None)
+        bucket = min((b for b in graphs or () if b >= nd), default=None)
+        if bucket is not None:
+            # Stages anchor/context/page tables once; the verify graph of the
+            # same bucket reuses this staging (memoized per step and bucket).
+            gp = self._mtp_gpu_prep_batch(decode_seqs, ctx_lens, x1_tokens, bucket)
+            if gp is not None:
+                if not sampled:
+                    graphs[bucket].replay()
+                    return self._dspark_drafts[:nd]
+                self._dspark_temp[:nd, 0].copy_(temps.squeeze(1))
+                self._dspark_topk[:nd].copy_(top_ks)
+                self._dspark_topp[:nd].copy_(top_ps)
+                if bucket > nd:  # padded rows: neutral, discarded parameters
+                    self._dspark_temp[nd:bucket].fill_(1.0)
+                    self._dspark_topk[nd:bucket].fill_(1)
+                    self._dspark_topp[nd:bucket].fill_(1.0)
+                graphs[bucket].replay()
+                return self._dspark_sampled_drafts[:nd], self._q_sparse(
+                    self._dspark_qv[:nd].clone(), self._dspark_qi[:nd].clone(),
+                    self._dspark_qd[:nd].clone(),
+                )
+        async_state = self._mtp_async_state
+        if (
+            x1_is_gpu and async_state is not None
+            and async_state.matches([s.seq_id for s in decode_seqs])
+        ):
+            context_lens = async_state.context_lens[:nd]
+        else:
+            context_lens = torch.tensor(
+                ctx_lens, dtype=torch.int32
+            ).to(dev, non_blocking=True)
+        pages = max(len(s.page_table) for s in decode_seqs)
+        table = torch.zeros((nd, pages), dtype=torch.int32)
+        for row, seq in enumerate(decode_seqs):
+            table[row, : len(seq.page_table)] = torch.tensor(seq.page_table, dtype=torch.int32)
+        block_table = table.pin_memory().to(dev, non_blocking=True)
+        drafter = self._dspark_drafter
+        if not sampled:
+            return drafter.propose(x1_gpu[:nd], context_lens, block_table)
+        record = []
+        if sparse:
+            pick = self._dspark_sparse_pick(temps, top_ks, top_ps, self._mtp_kpad(decode_seqs), record)
+        else:
+            pick = self._dspark_dense_pick(temps, top_ks, top_ps, record)
+        drafts = drafter.propose_with(x1_gpu[:nd], context_lens, block_table, pick)
+        if sparse:
+            return drafts, self._q_sparse(*(torch.stack(part, dim=1) for part in zip(*record)))
+        return drafts, self._q_dense(torch.stack(record, dim=1))
+
     def _mtp_gpu_prep_batch(self, decode_seqs, ctx_lens, x1, bucket):
         """Stage this MTP step's per-seq facts, returning the prep helper.
 
@@ -1450,6 +1624,8 @@ class MtpMixin:
             # reads the head's KV -- and the idle-group dummy rows here are not
             # real requests.
             return False
+        if getattr(self, "_dspark_drafter", None) is not None:
+            return True  # draft K/V comes from target taps, not shifted tokens
         if getattr(self.model, "mtp", None) is None:
             return False
         mm_seqs = [s for s in input_data.seqs
@@ -1506,6 +1682,11 @@ class MtpMixin:
         if plan is None:
             return
         ntok = int(plan.num_tokens)
+        drafter = getattr(self, "_dspark_drafter", None)
+        if drafter is not None:
+            if ntok > 0:
+                drafter.kv_sync(input_data, ntok)
+            return
         if ntok <= 0 or ntok > self._mtp_staging.refresh_tokens.numel():
             return
         if target_hidden.shape[0] < ntok:
@@ -1945,7 +2126,17 @@ class MtpMixin:
         # Both graph chains fill the GPU stash; eager fallbacks return lists.
         self._drafts_gpu = None
         with torch.profiler.record_function("gllm::mtp_draft_chain"):
-            if _use_rej:
+            if getattr(self, "_dspark_drafter", None) is not None:
+                drafts = None
+                proposed = self._dspark_propose(
+                    decode_seqs, ctx_lens, x1_tokens, x1_gpu, x1_is_gpu,
+                    sampled=_use_rej, sparse=_sparse,
+                )
+                if _use_rej:
+                    self._drafts_gpu, q_dists = proposed
+                else:
+                    self._drafts_gpu = proposed
+            elif _use_rej:
                 # Sampling draft chain: prefer the captured Gumbel-max graph
                 # (draft forward + sampling in-graph, token broadcast between
                 # replays); fall back to eager when graphs are off or the batch

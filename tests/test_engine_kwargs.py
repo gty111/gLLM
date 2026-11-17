@@ -115,17 +115,22 @@ def test_explicit_backend_resolves_head_construction(backend, enabled, layers, e
     assert config.resolve_num_draft_tokens(backend) == {"none": 0, "mtp": 3, "dspark": 7}[backend]
 
 
+def test_dspark_accepts_the_default_serving_features():
+    """DSpark runs on the shared MTP pipeline: graphs, overlap, prefix cache."""
+    config = EngineConfig(
+        model_path="/tmp/target", speculative_backend="dspark",
+        dspark_model_path="/tmp/draft", attention_backend="flashinfer",
+    )
+    assert config.overlap_scheduling and config.enable_prefix_caching
+    assert not config.disable_cuda_graph and config.piecewise_cuda_graph
+
+
 @pytest.mark.parametrize("options,match", [
     ({"speculative_backend": "unknown"}, "speculative_backend"),
     ({"dspark_model_path": None}, "dspark_model_path"),
     ({"mtp_enabled": True}, "mtp_enabled"),
     ({"tp_size": 2}, "tp_size"), ({"pp_size": 2}, "pp_size"),
     ({"dp_size": 2}, "dp_size"), ({"maxd": 0}, "maxd"),
-    ({"overlap_scheduling": True}, "overlap_scheduling"),
-    ({"enable_prefix_caching": True}, "enable_prefix_caching"),
-    ({"disable_cuda_graph": False}, "disable_cuda_graph"),
-    ({"piecewise_cuda_graph": True}, "piecewise_cuda_graph"),
-    ({"piecewise_cuda_graph": None}, "piecewise_cuda_graph"),
     ({"attention_backend": "auto"}, "attention_backend"),
     ({"schedule_method": "split_pd"}, "schedule_method"),
     ({"maxp": 7}, "maxp"), ({"load_format": "dummy"}, "load_format"),
@@ -196,7 +201,7 @@ def test_dspark_rejects_actual_fa3_fallback_before_loading(monkeypatch, backend)
     runner.model_loader = SimpleNamespace(config=SimpleNamespace(), load_model=load_model)
 
     expected = RuntimeError if backend == "dspark" else LookupError
-    with pytest.raises(expected, match="resolved and bound FA3|weight loading boundary"):
+    with pytest.raises(expected, match="requested the fa3 attention backend|weight loading boundary"):
         runner.init()
     assert runner.attention_backend == "fa4"
     assert runner._validated_qkv_attention_backend.name == "fa4"
@@ -213,128 +218,30 @@ def test_dspark_rejects_backend_object_disagreeing_with_fa3_setting():
     runner.verify_config = lambda: None
     runner.attention_backend = "fa3"
     runner._validated_qkv_attention_backend = SimpleNamespace(name="fa4")
-    with pytest.raises(RuntimeError, match="resolved and bound FA3"):
+    with pytest.raises(RuntimeError, match="requested the fa3 attention backend but fa4"):
         runner.init()
 
 
-def test_dspark_startup_cuda_failure_reaches_worker_exit_path_without_cleanup(monkeypatch):
-    from types import SimpleNamespace
-
-    import torch
-    from gllm.runtime.model_runner import ModelRunner
-    from gllm.workers.worker import run_worker
-
-    failure = RuntimeError("CUDA error: an illegal memory access was encountered")
-    handled = []
-
-    def fail_forward(*args, **kwargs):
-        raise failure
-
-    def unsafe_cleanup(*args, **kwargs):
-        pytest.fail("A failed CUDA context must not be synchronized or reclaimed")
-
-    runner = SimpleNamespace(
-        max_num_batched_tokens=16, model_max_length=32, uses_mrope=False,
-        dspark=SimpleNamespace(block_size=7, noise_width=7, config=SimpleNamespace(target_layer_ids=(0, 1))),
-        input_data=SimpleNamespace(cal_and_set_input=lambda seqs: None),
-        memory_manager=SimpleNamespace(
-            reserve_dspark_pages=lambda *args, **kwargs: True,
-            free_dspark_cache=unsafe_cleanup,
-        ),
-        _prepare_attention_metadata=lambda data: None,
-        model=SimpleNamespace(forward_with_hidden_taps=fail_forward),
-    )
-    runner.input_data.memory_manager = runner.memory_manager
-    monkeypatch.setattr(torch.cuda, "synchronize", unsafe_cleanup)
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: None)
-    worker = SimpleNamespace(
-        init=lambda: ModelRunner._profile_dspark_paged_verify(runner),
-        handle_exception=handled.append,
-    )
-    run_worker(worker)
-    assert handled == [failure]
-
-
-def test_dspark_request_dispatch_rejects_an_unprepared_batch():
-    from types import SimpleNamespace
-    from gllm.runtime.model_runner import ModelRunner
-
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.dspark_enabled = True
-    runner.input_data = SimpleNamespace(seqs=[])
-    with pytest.raises(ValueError, match="unpadded batch"):
-        runner.step_once()
-
-
-@pytest.mark.parametrize("invalid", ["missing", "empty", "multiple", "prebuilt"])
-def test_dspark_input_preparation_rejects_invalid_batches_before_materialization(invalid):
-    from types import SimpleNamespace
-    from gllm.runtime.model_runner import ModelRunner
-
-    def materialize(*args, **kwargs):
-        pytest.fail("Invalid DSpark batches must be rejected before materializing input")
-
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.dspark_enabled = True
-    previous = [object()]
-    runner.input_data = SimpleNamespace(
-        seqs=previous,
-        cal_and_set_input=materialize,
-        set_input_from_prebuilt=materialize,
-    )
-    seqs, prebuilt = [object()], None
-    if invalid == "missing":
-        seqs = None
-    elif invalid == "empty":
-        seqs = []
-    elif invalid == "multiple":
-        seqs.append(object())
-    else:
-        prebuilt = object()
-    with pytest.raises(ValueError, match="live batch"):
-        runner.prepare_input(seqs, input_data=prebuilt)
-    assert runner.input_data.seqs is previous
-
-@pytest.mark.parametrize("batch", [1, 2, 4])
-def test_dspark_config_accepts_a_full_verify_batch_token_budget(batch):
+@pytest.mark.parametrize("batch", [1, 2, 64])
+def test_dspark_config_needs_only_one_verify_window(batch):
     values = _dspark_engine_options()
-    values.update(maxd=batch, maxp=8 * batch)
+    values.update(maxd=batch, maxp=8)
     config = EngineConfig(**values)
-    assert config.maxd == batch and config.maxp == 8 * batch
+    assert config.maxd == batch and config.maxp == 8
     assert not config.resolve_mtp_enabled("Qwen3_5ForConditionalGeneration", 1)
 
 
-@pytest.mark.parametrize("batch,tokens", [(2, 15), (4, 31)])
-def test_dspark_config_rejects_a_partial_maximum_verify_window(batch, tokens):
+def test_dspark_config_rejects_a_budget_below_one_verify_window():
     values = _dspark_engine_options()
-    values.update(maxd=batch, maxp=tokens)
-    with pytest.raises(ValueError, match="maxp >= 8"):
+    values.update(maxp=7)
+    with pytest.raises(ValueError, match="8-row verify window"):
         EngineConfig(**values)
-
-
-def test_dspark_prepare_and_dispatch_delegates_a_supported_batch(monkeypatch):
-    from types import SimpleNamespace
-    from gllm.runtime.model_runner import ModelRunner
-
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.dspark_enabled, runner.max_running_seqs = True, 2
-    runner.input_data = SimpleNamespace(seqs=[])
-    seqs, delegated = [object(), object()], []
-    expected = object()
-    def execute(batch):
-        delegated.append(batch)
-        return expected
-    runner._execute_dspark_batch = execute
-    runner.prepare_input(seqs)
-    assert runner.step_once() is expected
-    assert delegated == [seqs]
 
 
 @pytest.mark.parametrize("dspark,mtp,name,overlap,graph", [
     (False, False, "none", True, True),
     (False, True, "mtp", True, True),
-    (True, False, "dspark", False, False),
+    (True, True, "dspark", True, True),
 ])
 def test_effective_speculative_backend_selection(dspark, mtp, name, overlap, graph):
     from gllm.speculative.backend import select_speculative_backend
@@ -346,7 +253,6 @@ def test_effective_speculative_backend_selection(dspark, mtp, name, overlap, gra
     # Selection carries no model, request registry or execution-context state.
     assert not vars(backend)
     assert backend is select_speculative_backend(dspark_enabled=dspark, mtp_enabled=mtp)
-
 
 
 @pytest.mark.parametrize("builder", [api_server.build_arg_parser, lm_server.build_arg_parser])
@@ -420,15 +326,16 @@ def test_runtime_width_explicit_mtp_count_requires_compatible_checkpoint(backend
 @pytest.mark.parametrize("count", [1, 3, 7])
 @pytest.mark.parametrize("batch", [1, 4])
 def test_runtime_width_config_validates_raw_and_effective_dspark_budget(count, batch):
-    required = (count + 1) * batch
+    """One verify window is the minimum; larger batches speculate only when they fit."""
+    required = count + 1
     values = _dspark_engine_options()
-    values.update(speculative_num_draft_tokens=count, maxd=batch, maxp=2 * required)
+    values.update(speculative_num_draft_tokens=count, maxd=batch, maxp=required)
     config = EngineConfig(**values)
     config.validate_speculative_token_budget(required, batch)
     with pytest.raises(ValueError, match="effective token budget"):
         config.validate_speculative_token_budget(required - 1, batch)
     values["maxp"] = required - 1
-    with pytest.raises(ValueError, match="maxp >="):
+    with pytest.raises(ValueError, match="maxp"):
         EngineConfig(**values)
 
 
@@ -457,7 +364,6 @@ def test_runtime_width_default_and_checkpoint_maximum_remain_compatible():
     with pytest.raises(ValueError, match="checkpoint range"):
         EngineConfig(**values)
     assert EngineConfig(model_path="/tmp/target").resolve_num_draft_tokens("none") == 0
-
 
 
 @pytest.mark.parametrize("last_rank", [False, True])

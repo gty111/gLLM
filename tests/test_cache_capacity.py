@@ -79,48 +79,4 @@ def test_failed_working_state_claim_leaves_no_partial_reservation():
         mm.validate_model_max_length(16, mtp_lookahead=3)
     assert allocator._owners == owners
 
-@pytest.mark.parametrize("state,speculative_num_draft_tokens,draft_bytes,lookahead,expected", [
-    (None, 0, 17, 0, 13 * 16),
-    (None, 0, 33, 0, 9 * 16),
-    ("ssm", 0, 17, 7, 11 * 16 - 7),
-    ("ssm", 3, 17, 7, 8 * 16 - 7),
-    ("dsv4", 0, 17, 7, 11 * 16 - 7),
-])
-def test_dspark_capacity_claims_both_histories_with_aligned_states(
-    state, speculative_num_draft_tokens, draft_bytes, lookahead, expected
-):
-    mm, allocator = manager(state=state, speculative_num_draft_tokens=speculative_num_draft_tokens, draft_bytes=draft_bytes)
-    owners = list(allocator._owners)
-    assert mm.validate_model_max_length(
-        expected, dspark_lookahead=lookahead
-    ) == expected
-    assert allocator._owners == owners
-    with pytest.raises(RuntimeError, match="exceeds single-request cache capacity"):
-        mm.validate_model_max_length(expected + 1, dspark_lookahead=lookahead)
-    assert allocator._owners == owners
 
-
-def test_dspark_independent_free_counts_do_not_prove_joint_capacity():
-    mm, allocator = manager(draft_bytes=17)
-    assert mm.get_num_free_pages() >= 16
-    assert mm.dspark_segment.get_num_free_pages() >= 16
-    with pytest.raises(RuntimeError, match="exceeds single-request cache capacity"):
-        mm.validate_model_max_length(16 * 16)
-    assert allocator.num_used_physical_pages == 1
-
-
-@pytest.mark.parametrize("lookahead,mtp_lookahead", [(-1, 0), (7, 1)])
-def test_dspark_invalid_lookahead_does_not_claim_pages(lookahead, mtp_lookahead):
-    mm, allocator = manager(draft_bytes=17)
-    owners = list(allocator._owners)
-    with pytest.raises(ValueError):
-        mm.validate_model_max_length(
-            16, dspark_lookahead=lookahead, mtp_lookahead=mtp_lookahead
-        )
-    assert allocator._owners == owners
-
-
-def test_dspark_lookahead_requires_registered_draft_cache():
-    mm, _ = manager()
-    with pytest.raises(ValueError, match="requires a draft cache"):
-        mm.validate_model_max_length(16, dspark_lookahead=7)

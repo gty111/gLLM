@@ -20,6 +20,11 @@ from typing import Optional
 from gllm.disagg.config import DisaggConfig
 
 
+# Attention backends DSpark's target verify has been validated with. It must be
+# chosen explicitly: a silent fallback would change verify numerics.
+DSPARK_ATTENTION_BACKENDS = ("fa3", "flashinfer", "fa4")
+
+
 @dataclass
 class EngineConfig:
     """All engine knobs shared by the model runner, workers, and scheduler."""
@@ -121,16 +126,19 @@ class EngineConfig:
         if backend == "mtp" and self.mtp_enabled is False:
             raise ValueError("mtp conflicts with mtp_enabled=False")
         if backend == "dspark":
+            # Target hidden taps (the draft's input) are single-GPU for now.
             required = {
                 "tp_size": 1, "pp_size": 1, "dp_size": 1,
-                "overlap_scheduling": False, "enable_prefix_caching": False,
-                "disable_cuda_graph": True, "piecewise_cuda_graph": False,
-                "schedule_method": "chunked_prefill", "attention_backend": "fa3",
-                "load_format": "auto",
+                "schedule_method": "chunked_prefill", "load_format": "auto",
             }
             for name, value in required.items():
                 if getattr(self, name) != value:
                     raise ValueError(f"DSpark requires {name}={value!r}")
+            if self.attention_backend not in DSPARK_ATTENTION_BACKENDS:
+                raise ValueError(
+                    "DSpark requires an explicit attention_backend in "
+                    f"{DSPARK_ATTENTION_BACKENDS}"
+                )
             if type(self.maxd) is not int or self.maxd < 1:
                 raise ValueError("DSpark requires maxd >= 1")
             self.validate_speculative_token_budget(self.maxp, self.maxd)
@@ -157,20 +165,20 @@ class EngineConfig:
     def validate_speculative_token_budget(self, token_budget: int, max_running_seqs: int, *, backend: Optional[str] = None) -> None:
         """Validate the effective buffer budget, including after runner clamping.
 
-        MTP must fit one window; DSpark's startup probe must fit the full
-        configured batch. Auto selection supplies the resolved backend after
-        checkpoint inspection; an unresolved default must not enable MTP.
+        MTP and DSpark must fit one verify window. Auto selection supplies the
+        resolved backend after checkpoint inspection; an unresolved default
+        must not enable MTP.
         """
         selected = self.speculative_backend if backend is None else backend
         if selected not in (None, "none", "mtp", "dspark"):
             raise ValueError(f"Unknown speculative backend: {selected!r}")
-        if selected == "dspark":
-            width = self.resolve_num_draft_tokens("dspark") + 1
-            if token_budget < width * max_running_seqs:
-                raise ValueError(f"DSpark requires maxp >= {width} * maxd and an effective token budget covering that verify batch")
-        elif selected == "mtp" or (selected is None and self.speculative_num_draft_tokens is not None):
-            width = self.resolve_num_draft_tokens("mtp") + 1
+        if selected in ("mtp", "dspark") or (selected is None and self.speculative_num_draft_tokens is not None):
+            # Both run the MTP pipeline, which speculates only when the decode
+            # batch's windows fit the step budget; one window is the minimum.
+            width = self.resolve_num_draft_tokens(selected or "mtp") + 1
             if token_budget < width:
+                if selected == "dspark":
+                    raise ValueError(f"DSpark requires maxp (effective token budget) >= one {width}-row verify window")
                 raise ValueError(f"Speculative token budget must cover one {width}-row MTP verify window")
 
     def resolve_mtp_enabled(self, architecture: str, nextn_layers: int) -> bool:
