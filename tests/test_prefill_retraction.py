@@ -64,7 +64,6 @@ def test_full_retraction_releases_state_and_preserves_generated_history(stalled_
     victim.recurrent_state_slot = 7
     victim.ssm_block_table = [7, 8, 9, 10]
     victim.ssm_num_accepted = 3
-    victim._mtp_relay_only_next = True
     victim.to_compute_tokens = [123]
     s.memory_manager._pending_ssm_restores[victim.seq_id] = 17
     released = []
@@ -77,7 +76,6 @@ def test_full_retraction_releases_state_and_preserves_generated_history(stalled_
     assert released == [7, 8, 9, 10]
     assert victim.recurrent_state_slot is None and victim.ssm_block_table is None
     assert victim.ssm_num_accepted == 1
-    assert not victim._mtp_relay_only_next
     assert victim.to_compute_tokens is None and victim.to_compute_token_num == 0
     assert victim.token_ids == tokens
     assert victim.raw_prompt_len == 64 and victim.output_len == 80

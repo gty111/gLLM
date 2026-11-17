@@ -33,6 +33,7 @@ from gllm.speculative.repetition_penalty import (
     SpeculativeRepetitionPenalty,
     apply_speculative_penalties,
 )
+from gllm.utils import async_tensor_h2d
 
 
 @dataclass
@@ -76,8 +77,8 @@ class MtpMixin:
 
         A pure function of ``num_decodes``, which every rank sees identically, so
         TP/PP ranks always agree without a collective (MTP's sync design requires
-        TP-identical tokens). Callers that decline must also drop the fused
-        relay -- see ``_mtp_drop_relay``.
+        TP-identical tokens). Declining is always safe: the uncached token stays
+        in ``token_ids`` and the plain step records a fresh relay.
         """
         if not self.mtp_enabled:
             return False
@@ -97,8 +98,8 @@ class MtpMixin:
         )
         fits_perf_gate = self._mtp_max_batch <= 0 or num_decodes <= self._mtp_max_batch
         # DP-attention replicas must agree on the whole multi-forward MTP
-        # cadence and publish different row counts for bootstrap, each draft
-        # step, and verify. That protocol is not wired yet; entering MTP with
+        # cadence and publish different row counts for each draft step and
+        # verify. That protocol is not wired yet; entering MTP with
         # the ordinary decode counts can mismatch MoE collectives and deadlock.
         dec = not is_dp_attn() and fits_token_budget and fits_perf_gate
         self._mtp_spec_decision = (num_decodes, dec)
@@ -129,44 +130,69 @@ class MtpMixin:
         if not num_decodes or not self.mtp_enabled:
             self._mtp_spec_decision = None
             return False
-        if seqs is not None and not self.mtp_context_compatible(seqs):
+        if seqs is not None and not (
+            self.mtp_context_compatible(seqs) and self.mtp_relay_ready(seqs)
+        ):
             self._mtp_spec_decision = (num_decodes, False)
             return False
         return self._mtp_decide(num_decodes)
 
-    def _mtp_drop_relay(self, seqs: Optional[List[GenerationSequence]] = None) -> None:
-        """Invalidate fused relay state after a plain decode advance.
+    def mtp_relay_ready(self, seqs) -> bool:
+        """Whether every seq has a draft seed for its uncached last token.
 
-        A plain decode step advances every seq by one token without refreshing
-        the relay, so the stashed ``(bonus_tok, bonus_hidden)`` no longer
-        describes the seq's last position. Reusing it would seed the next draft
-        from a stale hidden. ``seqs=None`` drops the whole batch (used when a
-        pure-decode step declines speculation); mixed prefill+decode steps pass
-        only the decode rows they actually advanced so unrelated relay entries
-        remain reusable. Every dropped seq takes one padded-bootstrap step when
-        it next enters MTP.
+        A relay entry ``(ctx, hidden)`` holds the target hidden state that
+        predicted the token at position ``ctx``. It seeds the draft for that
+        token only while it is still the seq's single uncached input. Rows of
+        the live overlap cohort keep the same seed on the device.
         """
-        if not self._mtp_relay:
-            return
-        if seqs is None:
-            self._mtp_relay = {}
-            return
-        for seq in seqs:
-            self._mtp_relay.pop(seq.seq_id, None)
+        state = self._mtp_async_state
+        live = set(state.seq_ids) if state is not None else ()
+        return all(
+            seq.seq_id in live or self._mtp_host_relay_ready(seq) for seq in seqs
+        )
 
-    def take_mtp_relay_token(self, seq_id: int) -> int:
-        """Consume the GPU-relayed x1 when leaving the MTP pipeline.
+    def _mtp_host_relay_ready(self, seq) -> bool:
+        entry = self._mtp_relay.get(seq.seq_id)
+        return entry is not None and entry[0] == len(seq.token_ids) - 1
 
-        A completed mixed prefill normally hands x1 directly to its first MTP
-        verify. If scheduling instead falls back to ordinary decode, x1 must
-        become the request's one committed-but-uncached CPU token. The paired
-        hidden state is no longer reusable after that transition, so removing
-        the whole relay entry is intentional.
+    def _mtp_relay_inputs(self, seqs):
+        """Host x1 tokens and stacked draft seeds for a relay-ready batch."""
+        missing = [s.seq_id for s in seqs if not self._mtp_host_relay_ready(s)]
+        if missing:
+            raise RuntimeError(f"MTP step scheduled without draft seeds for {missing}")
+        x1 = [seq.token_ids[-1] for seq in seqs]
+        hidden = torch.stack([self._mtp_relay[seq.seq_id][1] for seq in seqs], dim=0)
+        return x1, hidden
+
+    def _mtp_record_relay(self, input_data, hidden) -> None:
+        """Remember each sampled row's final hidden state as its draft seed.
+
+        Every target forward that samples a token for a seq (prefill completion,
+        plain decode, a mixed batch) leaves that token uncached at position
+        ``computed + to_compute``. The hidden state of the row that sampled it
+        is exactly the seed the next MTP step needs, so speculation can resume
+        without another target forward.
         """
-        relay = self._mtp_relay.pop(seq_id, None)
-        if relay is None:
-            raise RuntimeError(f"missing materialized MTP relay for sequence {seq_id}")
-        return int(relay[0])
+        if not self.mtp_enabled or not is_last_pp_rank():
+            return
+        qsl = input_data.query_start_loc_cpu
+        seqs = input_data.seqs
+        if qsl is None or qsl.shape[0] < len(seqs) + 1:
+            return
+        rows, ids, ctxs = [], [], []
+        for i, seq in enumerate(seqs):
+            end = seq.computed_token_num + seq.to_compute_token_num
+            if end < seq.prompt_len:
+                continue  # an intermediate prompt chunk samples nothing
+            rows.append(int(qsl[i + 1]) - 1)
+            ids.append(seq.seq_id)
+            ctxs.append(end)
+        if not rows:
+            return
+        index = async_tensor_h2d(rows, torch.int64, hidden.device, True)
+        seeds = hidden.index_select(0, index)
+        for j, seq_id in enumerate(ids):
+            self._mtp_relay[seq_id] = (ctxs[j], seeds[j])
 
     @staticmethod
     def mtp_sampling_compatible(seqs) -> bool:
@@ -180,12 +206,11 @@ class MtpMixin:
     def mtp_prep_eligible(self, seqs: List[GenerationSequence]) -> bool:
         """True when :meth:`step_once` owns all input prep for an MTP step.
 
-        A full-relay batch goes straight to draft/verify. A batch with fresh or
-        relay-miss seqs first runs :meth:`_mtp_bootstrap_padded_verify`, which
-        builds its own uniform ``1+k`` input. In both cases the ordinary
-        scheduler-side one-token decode prep would be thrown away, so callers
-        can install only the batch bookkeeping via
-        :meth:`prepare_input_mtp`.
+        A speculative step builds its own draft/verify inputs on the GPU, so
+        the ordinary scheduler-side one-token decode prep would be thrown away
+        and callers can install only the batch bookkeeping via
+        :meth:`prepare_input_mtp`. A batch with any seq lacking a draft seed
+        runs as plain decode instead, which records the seed.
         """
         if not self.mtp_sampling_compatible(seqs):
             return False
@@ -197,6 +222,8 @@ class MtpMixin:
             return False  # batch too large to profit from speculation
         if not self.mtp_context_compatible(seqs):
             return False  # fixed-width verify would overrun a request limit
+        if not self.mtp_relay_ready(seqs):
+            return False  # plain decode first records the missing draft seed
         return True
 
     def prepare_input_mtp(self, seqs: List[GenerationSequence]) -> None:
@@ -222,7 +249,7 @@ class MtpMixin:
         """Whether ``seqs`` can consume the predecessor wholly on the GPU.
 
         Chaining is a graph/GPU-prep optimization, never a correctness
-        requirement.  A bucket miss drains and resumes from the CPU relay so
+        requirement.  A bucket miss drains and resumes from the host relay so
         eager fallbacks never see placeholder x1 token ids.
         """
         state = self._mtp_async_state
@@ -264,7 +291,7 @@ class MtpMixin:
         * **draft acceptance rate** = accepted_draft_tokens / drafted_tokens.
           ``drafted_tokens = num_drafts * k`` (k proposals per draft/step).
         * **mean acceptance length** = 1 + accepted/num_drafts (the ``1`` is the
-          always-committed target token x1, i.e. the "bonus"; so a value of
+          target's bonus token, always emitted; so a value of
           ``k+1`` means every draft accepted).
         * **per-position acceptance rate**[i] = fraction of drafts whose accepted
           length reached position ``i`` (i in ``0..k-1``), i.e.
@@ -579,7 +606,7 @@ class MtpMixin:
 
     @torch.inference_mode()
     def _draft_chain_eager(
-        self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen=None, sparse=False
+        self, decode_seqs, ctx_lens, x1, hidden, k, nd, gen=None, sparse=False
     ):
         """Eager k-step MTP draft chain (fallback / graph-disabled path).
 
@@ -644,7 +671,7 @@ class MtpMixin:
         for j in range(k):
             for i, s in enumerate(decode_seqs):
                 s.computed_token_num = (
-                    len(orig_tokens[i]) + j + MTP_DRAFT_POS_OFFSET
+                    ctx_lens[i] + j + MTP_DRAFT_POS_OFFSET
                 )
                 s.to_compute_token_num = 1
                 s.to_compute_tokens = [x1[i] if j == 0 else drafts_cols[i][-1]]
@@ -680,19 +707,19 @@ class MtpMixin:
         return drafts_cols, self._q_dense(torch.stack(q_steps, dim=1))
 
     def _draft_chain_eager_sampled(
-        self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen, sparse=False
+        self, decode_seqs, ctx_lens, x1, hidden, k, nd, gen, sparse=False
     ):
         """Sampled-mode shorthand for :meth:`_draft_chain_eager` (kept for
         callers/tests)."""
         # Dispatch through the mixin class (not ``self._draft_chain_eager``):
         # tests drive this with a duck-typed ``SimpleNamespace`` runner.
         return MtpMixin._draft_chain_eager(
-            self, decode_seqs, orig_tokens, x1, hidden, k, nd, gen=gen, sparse=sparse
+            self, decode_seqs, ctx_lens, x1, hidden, k, nd, gen=gen, sparse=sparse
         )
 
     @torch.inference_mode()
     def _draft_chain_graph(
-        self, decode_seqs, orig_tokens, x1, hidden, k, nd, sampled=False, sparse=False
+        self, decode_seqs, ctx_lens, x1, hidden, k, nd, sampled=False, sparse=False
     ):
         """CUDA-graph k-step MTP draft chain.
 
@@ -755,11 +782,11 @@ class MtpMixin:
             # Fall back to eager if this batch size wasn't captured at init.
             if not sampled:
                 return self._draft_chain_eager(
-                    decode_seqs, orig_tokens, x1, hidden, k, nd
+                    decode_seqs, ctx_lens, x1, hidden, k, nd
                 )
             gen = self._mtp_rng_step(dev)
             return self._draft_chain_eager(
-                decode_seqs, orig_tokens, x1, hidden, k, nd, gen=gen, sparse=sparse
+                decode_seqs, ctx_lens, x1, hidden, k, nd, gen=gen, sparse=sparse
             )
         g = graphs[bucket]
         if penalties is not None:
@@ -769,7 +796,7 @@ class MtpMixin:
         # graph reads these exact buffers). Padded rows [nd:bucket] are written
         # as dummy rows by the GPU prep (no throwaway ``GenerationSequence`` objects); the
         # CPU fallback still builds dummy decode seqs.
-        gp = self._mtp_gpu_prep_batch(decode_seqs, orig_tokens, x1, bucket)
+        gp = self._mtp_gpu_prep_batch(decode_seqs, ctx_lens, x1, bucket)
         if gp is not None:
             ForwardMetadataPlan.uniform_gpu(
                 num_rows=bucket,
@@ -785,7 +812,7 @@ class MtpMixin:
             # the seqs in the *verify* shape (1+k speculative tokens) for the
             # one-shot page allocation.
             for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i]) + MTP_DRAFT_POS_OFFSET
+                s.computed_token_num = ctx_lens[i] + MTP_DRAFT_POS_OFFSET
                 s.to_compute_token_num = 1
                 s.to_compute_tokens = [x1[i]]
             pad_seqs = (
@@ -1266,7 +1293,7 @@ class MtpMixin:
         )
 
     @torch.inference_mode()
-    def _verify_forward_graph(self, decode_seqs, orig_tokens, x1, drafts, nd, kk):
+    def _verify_forward_graph(self, decode_seqs, ctx_lens, x1, drafts, nd, kk):
         """Run the verify forward via a captured graph if the batch fits a bucket.
 
         Sets up ``decode_seqs`` as the uniform ``1+kk`` verify batch, selects the
@@ -1291,7 +1318,7 @@ class MtpMixin:
         # the GPU draft tensor -- no Python array rebuild, no dummy pad seqs, no
         # H2D of the token ids. ``drafts_gpu`` is threaded from the draft chain;
         # the eager draft path leaves it unset, so fall back to a one-shot H2D.
-        gp = self._mtp_gpu_prep_batch(decode_seqs, orig_tokens, x1, bucket)
+        gp = self._mtp_gpu_prep_batch(decode_seqs, ctx_lens, x1, bucket)
         if gp is not None:
             dg = getattr(self, "_drafts_gpu", None)
             if dg is None or tuple(dg.shape) != (nd, kk):
@@ -1317,7 +1344,7 @@ class MtpMixin:
         else:
             drafts = self._drafts_host(drafts, nd, kk)
             for i, s in enumerate(decode_seqs):
-                s.computed_token_num = len(orig_tokens[i])
+                s.computed_token_num = ctx_lens[i]
                 s.to_compute_token_num = qlen
                 s.to_compute_tokens = [x1[i]] + drafts[i]
                 s._mtp_verify = True
@@ -1343,134 +1370,6 @@ class MtpMixin:
         qsl = [i * qlen for i in range(nd + 1)]
         return v_logits, qsl, v_hidden
 
-    @torch.inference_mode()
-    def _mtp_bootstrap_padded_verify(self, decode_seqs):
-        """Seed relay-miss seqs with a uniform verify-shaped target forward.
-
-        A missing relay needs the ordinary target decode result: the token
-        predicted after the seq's one uncached input and that input's hidden
-        state. Instead of introducing a batch-x-1 forward shape, represent the
-        bootstrap as the same fixed ``1+k`` query used by verify:
-
-        * relay miss: ``[real uncached token, pad, ..., pad]``;
-        * relay hit: a full dummy ``1+k`` query (its existing relay is kept).
-
-        Causal execution makes row zero identical to a one-token decode; later
-        rows cannot affect it. Their speculative KV/state writes are either to
-        dummy storage or are overwritten immediately by the real MTP verify.
-        This keeps every real MTP target forward on one uniform qlen and is the
-        shape needed by a future DP-wide fixed-mode implementation.
-        """
-        nd = len(decode_seqs)
-        qlen = 1 + self.speculative_num_draft_tokens
-        missing_pos = [
-            i for i, s in enumerate(decode_seqs) if s.seq_id not in self._mtp_relay
-        ]
-        if not missing_pos:
-            relay = [self._mtp_relay[s.seq_id] for s in decode_seqs]
-            return torch.stack([r[1] for r in relay], dim=0), [r[0] for r in relay]
-
-        # Reuse a captured verify graph when possible. Padding is expressed in
-        # sequence buckets; every row still carries the fixed qlen above.
-        graph_bucket = None
-        if self._mtp_verify_graph and self._verify_size_to_graph:
-            for candidate in sorted(self._verify_size_to_graph):
-                if candidate >= nd:
-                    graph_bucket = candidate
-                    break
-        bucket = graph_bucket or nd
-
-        # Build all dummy rows in one call so their ids/cache stubs are unique.
-        # Relay-hit positions select their corresponding dummy; relay misses
-        # replace that row with the real seq mutated to a padded verify query.
-        dummy_seqs = self._create_dummy_verify_seqs(bucket, qlen)
-        graph_seqs = list(dummy_seqs)
-        saved = {}
-        missing_seqs = []
-        for pos in missing_pos:
-            seq = decode_seqs[pos]
-            saved[pos] = (
-                seq.token_ids,
-                seq.computed_token_num,
-                seq.to_compute_token_num,
-                getattr(seq, "_mtp_verify", False),
-            )
-            # A decode bootstrap must have exactly one committed-but-uncached
-            # input. The scheduler's decode contract provides it; accepting a
-            # different shape here would make row zero no longer equivalent to
-            # the ordinary decode path.
-            uncached = len(seq.token_ids) - seq.computed_token_num
-            if uncached != 1:
-                raise RuntimeError(
-                    f"MTP relay miss for seq {seq.seq_id} has {uncached} "
-                    "uncached tokens; expected exactly one decode token"
-                )
-            seq.token_ids = seq.token_ids + [0] * (qlen - 1)
-            seq.to_compute_token_num = qlen
-            seq._mtp_verify = True
-            self.memory_manager.pre_allocate_page([seq], cacheable=False)
-            graph_seqs[pos] = seq
-            missing_seqs.append(seq)
-
-        try:
-            self.prepare_input(graph_seqs)
-            # VL prepare installs placeholder embeddings for computed-prompt
-            # rows. A verify-shaped bootstrap has bucket*qlen such rows, not
-            # merely ``bucket`` one-token decode rows.
-            if self.use_mm and is_first_pp_rank():
-                self._fixup_vl_decode_embeddings(bucket * qlen)
-            if graph_bucket is not None:
-                self._verify_size_to_graph[graph_bucket].replay()
-            else:
-                self.forward()
-
-            num_missing = len(missing_pos)
-            self._mtp_staging.bootstrap_rows_host_np[:num_missing] = [
-                pos * qlen for pos in missing_pos
-            ]
-            first_rows = self._mtp_staging.bootstrap_rows_gpu[:num_missing]
-            first_rows.copy_(
-                self._mtp_staging.bootstrap_rows_host[:num_missing], non_blocking=True
-            )
-            # Clone before the following real verify overwrites the persistent
-            # output buffer.
-            bootstrap_hidden = self.output_hidden_states[: bucket * qlen]
-            missing_hidden = bootstrap_hidden.index_select(0, first_rows).clone()
-            missing_logits = self.model.logits_from_hidden(missing_hidden)
-        finally:
-            for pos, (tokens, computed, to_compute, was_verify) in saved.items():
-                seq = decode_seqs[pos]
-                seq.token_ids = tokens
-                seq.computed_token_num = computed
-                seq.to_compute_token_num = to_compute
-                seq._mtp_verify = was_verify
-            self._drop_dummy_verify_cache()
-
-        # Sample only the relay misses, using their real histories and sampling
-        # parameters. Then restore the full batch bookkeeping for _mtp_decode.
-        self.input_data.seqs = missing_seqs
-        self.input_data.prepare_sample()
-        missing_x1_gpu = self.sampler.forward_gpu(missing_logits, self.input_data)
-        if get_tp_size() > 1:
-            self._mtp_bcast_tp(missing_x1_gpu)
-        self.sampler.stage_structured_feedback(missing_x1_gpu, missing_seqs)
-        missing_x1 = missing_x1_gpu.tolist()
-        self.prepare_input_mtp(decode_seqs)
-
-        hidden_rows = []
-        x1 = []
-        miss_idx = 0
-        for seq in decode_seqs:
-            relay = self._mtp_relay.get(seq.seq_id)
-            if relay is not None:
-                x1.append(relay[0])
-                hidden_rows.append(relay[1])
-            else:
-                x1.append(missing_x1[miss_idx])
-                hidden_rows.append(missing_hidden[miss_idx])
-                miss_idx += 1
-        return torch.stack(hidden_rows, dim=0), x1
-
     def _mtp_mrope_deltas(self, seqs) -> Optional[List[int]]:
         """Per-seq mrope position delta (Qwen-VL family), or ``None``.
 
@@ -1488,7 +1387,7 @@ class MtpMixin:
             out.append(int(delta) if delta is not None else 0)
         return out
 
-    def _mtp_gpu_prep_batch(self, decode_seqs, orig_tokens, x1, bucket):
+    def _mtp_gpu_prep_batch(self, decode_seqs, ctx_lens, x1, bucket):
         """Stage this MTP step's per-seq facts, returning the prep helper.
 
         Returns ``None`` when GPU-native prep is disabled (``GLLM_MTP_GPUPREP=0``)
@@ -1510,7 +1409,7 @@ class MtpMixin:
             decode_seqs,
             bucket,
             epoch=self._mtp_prep_epoch,
-            ctx_lens=[len(t) for t in orig_tokens],
+            ctx_lens=list(ctx_lens),
             # Host values are only staging fallbacks for a chained step; the
             # authoritative context/x1/resume column is overwritten D2D below.
             x1=([0] * len(decode_seqs) if torch.is_tensor(x1) else x1),
@@ -1708,7 +1607,7 @@ class MtpMixin:
     def _mtp_verify_target(
         self,
         decode_seqs,
-        orig_tokens,
+        ctx_lens,
         x1_tokens,
         x1,
         drafts,
@@ -1726,7 +1625,7 @@ class MtpMixin:
         ):
             with torch.profiler.record_function("gllm::mtp_target_verify_graph"):
                 graph_result = self._verify_forward_graph(
-                    decode_seqs, orig_tokens, x1_tokens, drafts, nd, kk
+                    decode_seqs, ctx_lens, x1_tokens, drafts, nd, kk
                 )
             if graph_result is not None:
                 logits, _, hidden = graph_result
@@ -1751,7 +1650,7 @@ class MtpMixin:
             drafts = self._drafts_host(drafts, nd, kk)
 
         for i, seq in enumerate(decode_seqs):
-            seq.computed_token_num = len(orig_tokens[i])
+            seq.computed_token_num = ctx_lens[i]
             seq.to_compute_token_num = 1 + kk
             seq.to_compute_tokens = [x1[i]] + drafts[i]
             seq._mtp_verify = True
@@ -1840,13 +1739,13 @@ class MtpMixin:
                 stream=self.copy_stream if async_accept else None,
             )
 
+            completed = [
+                i
+                for i, seq in enumerate(extra_prefill_seqs)
+                if seq.computed_token_num + seq.to_compute_token_num
+                >= seq.prompt_len
+            ]
             if async_accept:
-                completed = [
-                    i
-                    for i, seq in enumerate(extra_prefill_seqs)
-                    if seq.computed_token_num + seq.to_compute_token_num
-                    >= seq.prompt_len
-                ]
                 if completed:
                     new_state_seq_ids = tuple(
                         extra_prefill_seqs[i].seq_id for i in completed
@@ -1867,6 +1766,14 @@ class MtpMixin:
                     new_state_hidden = prefill_hidden.index_select(0, completed_gpu)
             else:
                 prefill_tokens = prefill_tokens_gpu.cpu().tolist()
+                # A completed prompt's final hidden predicts its sampled token;
+                # keep it as that request's draft seed.
+                for i in completed:
+                    seq = extra_prefill_seqs[i]
+                    self._mtp_relay[seq.seq_id] = (
+                        seq.computed_token_num + seq.to_compute_token_num,
+                        prefill_hidden[i],
+                    )
         else:
             verify_logits = self.model.logits_from_hidden(verify_hidden)
 
@@ -1903,9 +1810,13 @@ class MtpMixin:
     ):
         """MTP speculative decode, optionally sharing verify with prefill.
 
-        Returns one committed-token list per seq: ``x1`` plus the accepted draft
-        prefix (1..k+1 tokens). The target bonus is relay-only and becomes the
-        next step's ``x1``; it is never committed in the producing step.
+        ``x1`` is each request's single uncached token, ``token_ids[-1]``,
+        exactly as in ordinary decode. Returns one emitted-token list per seq:
+        the accepted draft prefix plus the target's bonus token (1..k+1
+        tokens). The bonus is committed immediately and becomes the next
+        step's uncached ``token_ids[-1]``; the relay keeps only the hidden
+        state that predicted it, so any later step -- speculative or not --
+        consumes it exactly once.
 
         Correctness model (greedy): with a greedy target and greedy draft, the
         accepted tokens are exactly the tokens the target would have produced
@@ -1959,6 +1870,10 @@ class MtpMixin:
         # untouched: copying every request's full context each step made host
         # preparation slower as generation progressed.
         orig_tokens = [s.token_ids for s in decode_seqs]
+        # Cached context per seq: everything before the uncached x1. Under
+        # overlap these lengths include optimistic placeholders and therefore
+        # bound the device-side context from above.
+        ctx_lens = [len(tokens) - 1 for tokens in orig_tokens]
         orig_ctn = [s.computed_token_num for s in decode_seqs]
         orig_tctn = [s.to_compute_token_num for s in decode_seqs]
         orig_compute_tokens = [s.to_compute_tokens for s in decode_seqs]
@@ -1971,7 +1886,7 @@ class MtpMixin:
         # table for the rest of the step, which is what lets the GPU-native prep
         # stage the page tables a single time (see ``_mtp_gpu_prep_batch``).
         self.memory_manager.pre_allocate_page_for_lengths(
-            decode_seqs, [len(tokens) + 1 + k for tokens in orig_tokens]
+            decode_seqs, [ctx + 1 + k for ctx in ctx_lens]
         )
 
         # --- Hybrid GDN recurrent-state: block-table column commit ---
@@ -1987,14 +1902,12 @@ class MtpMixin:
         _has_gdn = _ssm_seg is not None and all(
             s.ssm_block_table is not None for s in decode_seqs
         )
-        # A target bonus is not a verify INPUT, so it has no KV/GDN state yet.
-        # Its draft seed, however, is the target hidden at the accepted verify
-        # row, and the recurrent state *before* the bonus is the checkpoint in
-        # column ``na``.  The accept path below promotes that checkpoint to
-        # column zero.  Relaying (bonus, hidden) then lets the next qlen=1+k
-        # verify consume the bonus exactly once. Together with the accepted
-        # state-column promotion, this removes the steady-state qlen=1
-        # full-model bootstrap.
+        # A target bonus is not a verify INPUT, so it has no KV/GDN state yet:
+        # it is emitted as the seq's new uncached last token. Its draft seed is
+        # the target hidden at the accepted verify row, and the recurrent state
+        # *before* the bonus is the checkpoint in column ``na``, which the
+        # accept path below promotes to column zero. Whatever step runs next
+        # (verify or plain decode) consumes the bonus exactly once.
 
         def restore():
             # NOTE: deliberately do NOT restore page_table. The verify forward
@@ -2046,7 +1959,7 @@ class MtpMixin:
                 if self._mtp_draft_graph and _sg and nd <= max(_sg.keys()):
                     drafts, q_dists = self._draft_chain_graph(
                         decode_seqs,
-                        orig_tokens,
+                        ctx_lens,
                         x1_tokens,
                         hidden,
                         k,
@@ -2057,7 +1970,7 @@ class MtpMixin:
                 else:
                     drafts, q_dists = self._draft_chain_eager(
                         decode_seqs,
-                        orig_tokens,
+                        ctx_lens,
                         x1,
                         hidden,
                         k,
@@ -2071,11 +1984,11 @@ class MtpMixin:
                 and nd <= max(self.capture_sizes)
             ):
                 drafts = self._draft_chain_graph(
-                    decode_seqs, orig_tokens, x1_tokens, hidden, k, nd
+                    decode_seqs, ctx_lens, x1_tokens, hidden, k, nd
                 )
             else:
                 drafts = self._draft_chain_eager(
-                    decode_seqs, orig_tokens, x1, hidden, k, nd
+                    decode_seqs, ctx_lens, x1, hidden, k, nd
                 )
         restore()
 
@@ -2087,13 +2000,13 @@ class MtpMixin:
             if dg is None:
                 dg = torch.tensor(drafts, dtype=torch.int64, device=dev)
             contexts = (self._mtp_async_state.context_lens[:nd] if x1_is_gpu else
-                        torch.tensor([len(t) for t in orig_tokens], dtype=torch.int64, device=dev))
+                        torch.tensor(ctx_lens, dtype=torch.int64, device=dev))
             structured_inputs = self.sampler._structured.stage_speculative_inputs(
                 contexts, x1_gpu, dg, stream=getattr(self, "copy_stream", None)
             )
         verify = self._mtp_verify_target(
             decode_seqs=decode_seqs,
-            orig_tokens=orig_tokens,
+            ctx_lens=ctx_lens,
             x1_tokens=x1_tokens,
             x1=x1,
             drafts=drafts,
@@ -2130,7 +2043,8 @@ class MtpMixin:
                     ready.synchronize()
                 rows = host.tolist()
                 structured_active = self.sampler._structured.mask_speculative(
-                    v_logits, decode_seqs, None if x1_is_gpu else orig_tokens,
+                    v_logits, decode_seqs,
+                    None if x1_is_gpu else [t[:-1] for t in orig_tokens],
                     [row[1:] for row in rows], positions=[row[0] for row in rows],
                 )
 
@@ -2172,10 +2086,10 @@ class MtpMixin:
         # equals v_pred[start+p]. Commit x1 always; append accepted drafts; the
         # bonus token is the target prediction at the first rejection (or after
         # the last accepted draft).
-        # Commit x1 + the longest prefix of drafts the target agrees with. We do
-        # NOT commit a trailing "bonus"/corrected token: relay it as the next
-        # MTP step's x1, where it becomes a verify input and receives valid KV.
-        # Every committed token here was a verify INPUT, so its KV is valid.
+        # Emit the longest prefix of drafts the target agrees with, followed by
+        # the target's bonus/corrected token. x1 was emitted by the step that
+        # sampled it. Every accepted draft was a verify INPUT, so its KV and GDN
+        # state are valid; the bonus is the new uncached ``token_ids[-1]``.
         # Size to ``nd`` (the real decode seqs captured at entry). The graph path
         # leaves ``self.input_data.seqs`` holding bucket-padded seqs, so it is no
         # longer a reliable count here -- use ``nd`` directly. This batch is pure
@@ -2186,14 +2100,13 @@ class MtpMixin:
 
         if _use_rej:
             # --- 3b. Rejection-sampling accept (distribution-lossless). ---
-            # x1 is already a proper target sample (step_once's sampler), always
-            # committed. For each draft d_p ~ q, accept with prob min(1, p/q);
+            # x1 is an already-emitted target sample. For each draft d_p ~ q,
+            # accept with prob min(1, p/q);
             # on reject, resample the position from the residual (p-q)+ and stop;
             # if all accepted, sample a bonus from p at the last position.
             #
-            # DON'T commit the bonus this step; relay (bonus_tok, bonus_hidden)
-            # as the NEXT step's x1. Committing it both here and as next-step x1
-            # would double-emit it. ``bonus_hidden`` is the verify hidden at the
+            # The bonus is emitted with the accepted drafts and becomes the next
+            # step's uncached x1. ``bonus_hidden`` is the verify hidden at the
             # last-accepted position (start+na), exactly the state the bonus was
             # sampled from, so it correctly seeds the next draft.
             # Fully vectorized on the GPU. The previous per-seq python loop read
@@ -2354,7 +2267,7 @@ class MtpMixin:
                         "MTP async cohort changed before pending completion was collected"
                     )
                 self._mtp_staging.install_ctx_host_np[:nd] = [
-                    len(t) for t in orig_tokens
+                    ctx for ctx in ctx_lens
                 ]
                 state.install(
                     seq_ids,
@@ -2393,7 +2306,7 @@ class MtpMixin:
         # host still needs.  This must stay after the async early return;
         # doing it before that branch silently serialized overlap MTP.
         #   row 0        : n_accepted
-        #   row 1        : the relayed bonus token
+        #   row 1        : the bonus token
         #   rows 2..2+kk : the draft token grid (transposed)
         rows = [na_gpu.to(torch.int64)]
         rows.append(next_bonus.to(torch.int64))
@@ -2406,33 +2319,31 @@ class MtpMixin:
         for i, s in enumerate(decode_seqs):
             na = na_cpu[i]
             n_accepted[i] = na
-            # committed = x1 + the accepted draft prefix.
-            results[i] = [x1[i]] + (drafts_cpu[i][:na] if na else [])
-            # Bonus token from the on-device gather; bonus hidden is row i of
-            # the batched gather and only seeds the next draft.
-            new_relay[s.seq_id] = (bonus_cpu2[i], bonus_hidden_all[i])
+            accepted = drafts_cpu[i][:na] if na else []
+            results[i] = accepted + [bonus_cpu2[i]]
+            # The bonus sits at position ctx + 1 + na. Its predecessor's hidden
+            # (row i of the batched gather) seeds the next draft.
+            new_relay[s.seq_id] = (ctx_lens[i] + 1 + na, bonus_hidden_all[i])
 
         if self._mtp_penalties is not None:
             self._mtp_penalties.commit(penalty_candidates, na_gpu)
         self._record_mtp_metrics(nd, kk, n_accepted)
         if structured_active:
+            # Grammar history holds consumed tokens; the bonus stays pending
+            # like any freshly sampled, not yet consumed token.
             self.sampler._structured.commit_speculative(
-                structured_active, results,
-                [new_relay[s.seq_id][0] for s in decode_seqs],
+                structured_active,
+                [[x1[i]] + results[i][:-1] for i in range(nd)],
+                [results[i][-1] for i in range(nd)],
             )
 
-        # Update only rows that actually ran. A seq absent from this MTP batch
-        # has not advanced, so its relay remains position-correct and must be
-        # retained. Relay invalidation belongs to the paths that really advance
-        # a seq without MTP (``_mtp_drop_relay``) and to request cleanup. The
-        # old wholesale replacement turned harmless scheduling gaps into relay
-        # misses; the bootstrap then consumed an already-verified token again
-        # and double-advanced hybrid GDN state.
+        # Rows absent from this batch keep their entries: each entry names the
+        # context it belongs to, so a stale one can never be mistaken for a hit.
         self._mtp_relay.update(new_relay)
 
         # --- Hybrid GDN recurrent-state: commit the accepted column to col 0 ---
         # The verify forward wrote token t's post-state into block-table column
-        # t. Each seq committed ``1+na`` tokens, so the post-acceptance state is
+        # t. Each seq consumed ``1+na`` tokens, so the post-acceptance state is
         # already sitting in the block at column ``na``. Rather than COPY that
         # block's 18.6MB (all 18 layers) into column 0 -- pure memory-bandwidth
         # cost, ~2.2ms at nd=64 -- we just SWAP the two block-table entries: the
@@ -2502,14 +2413,9 @@ class MtpMixin:
             x1 = async_state.relay_tokens[: len(decode_seqs)]
             hidden = async_state.relay_hidden[: len(decode_seqs)]
             self.prepare_input_mtp(decode_seqs)
-        elif all(s.seq_id in self._mtp_relay for s in decode_seqs):
-            relay = [self._mtp_relay[s.seq_id] for s in decode_seqs]
-            x1 = [r[0] for r in relay]
-            hidden = torch.stack([r[1] for r in relay], dim=0)
-            self.prepare_input_mtp(decode_seqs)
         else:
-            # Bootstrap finishes by restoring the fused decode bookkeeping.
-            hidden, x1 = self._mtp_bootstrap_padded_verify(decode_seqs)
+            x1, hidden = self._mtp_relay_inputs(decode_seqs)
+            self.prepare_input_mtp(decode_seqs)
         self._last_logprobs = None
         old_publish = self._mtp_async_publish
         self._mtp_async_publish = async_publish
@@ -2550,7 +2456,7 @@ class MtpMixin:
             # per speculative iteration.
             state_n = state.batch_size
             relay_hidden = state.relay_hidden[:state_n].clone()
-            relay_tokens = state.relay_tokens[:state_n].cpu().tolist()
+            contexts = state.context_lens[:state_n].cpu().tolist()
             resume = state.resume_num_accepted[:state_n].cpu().tolist()
             candidates = list(materialize_seqs or seqs)
             by_id = {s.seq_id: s for s in candidates}
@@ -2563,9 +2469,7 @@ class MtpMixin:
                 seq = by_id[seq_id]
                 if getattr(seq, "_overlap_freed", False):
                     continue
-                self._mtp_relay[seq.seq_id] = (int(relay_tokens[i]), relay_hidden[i])
-                if self.sampler._structured is not None:
-                    self.sampler._structured.stage_relay(seq, int(relay_tokens[i]))
+                self._mtp_relay[seq.seq_id] = (int(contexts[i]), relay_hidden[i])
                 na = int(resume[i]) - 1
                 if seq.ssm_block_table is not None:
                     if na > 0:

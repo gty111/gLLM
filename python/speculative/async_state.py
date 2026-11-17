@@ -33,11 +33,14 @@ class MtpAsyncCompletion:
     output_seq_ids: Tuple[int, ...] = ()
     extra_batch_size: int = 0
     _result: object = field(default=None, init=False, repr=False)
+    _inputs: object = field(default=None, init=False, repr=False)
 
     def read(self) -> Tuple[List[int], List[List[int]]]:
         """Read acceptance without retiring the scheduler's completion slot.
 
-        Grammar can consume this at the successor's mask boundary while that
+        Each decode row emits its accepted drafts followed by the target bonus;
+        the consumed input x1 was emitted by the step that sampled it. Grammar
+        can consume this at the successor's mask boundary while that
         successor's forward runs. CPU scheduling/slot retirement happens later.
         """
         if self._result is not None:
@@ -45,7 +48,8 @@ class MtpAsyncCompletion:
         self.event.synchronize()
         host = self.owner._host[self.slot][: self.batch_size]
         valid = host[:, 0].tolist()
-        grid = host[:, 1:].tolist()
+        self._inputs = host[:, 1].tolist()
+        grid = host[:, 2:].tolist()
         committed = [row[:n] for row, n in zip(grid, valid)]
         if self.extra_batch_size:
             extra = self.owner._extra_host[self.slot][: self.extra_batch_size]
@@ -53,8 +57,13 @@ class MtpAsyncCompletion:
         self._result = valid, committed
         return self._result
 
+    def consumed_inputs(self) -> List[int]:
+        """The x1 token each decode row consumed (already emitted earlier)."""
+        self.read()
+        return self._inputs
+
     def collect(self) -> Tuple[List[int], List[List[int]]]:
-        """Return the accepted prefix (including x1), then release the slot."""
+        """Return the emitted tokens (drafts + bonus), then release the slot."""
         result = self.read()
         self.owner._release(self.slot)
         return result
@@ -96,7 +105,7 @@ class MtpAsyncBatchState:
         self.relay_hidden = torch.empty(
             (max_batch_size, hidden_size), dtype=hidden_dtype, device=device
         )
-        # Number of tokens committed by the latest verify step (x1 plus the
+        # Number of tokens consumed by the latest verify step (x1 plus the
         # accepted draft prefix).  During a stable async cohort the CPU block
         # table deliberately stays unchanged; the next GDN verify reads this
         # tensor and resumes directly from column ``valid_count - 1``.
@@ -134,10 +143,10 @@ class MtpAsyncBatchState:
         )
 
         # Completion layout per row:
-        #   [valid_count, current_x1, accepted_drafts..., -1 padding]
-        # The relay bonus remains in the authoritative GPU state and is copied
-        # only at a real drain, so it does not belong in every host completion.
-        shape = (max_batch_size, 1 + self.width)
+        #   [valid_count, consumed_x1, accepted_drafts..., bonus, -1 padding]
+        # ``valid_count`` counts the emitted tokens (drafts + bonus). The bonus
+        # also stays in the GPU state as the successor's x1.
+        shape = (max_batch_size, 2 + self.width)
         self._device = [
             torch.empty(shape, dtype=torch.int64, device=device) for _ in range(2)
         ]
@@ -312,12 +321,12 @@ class MtpAsyncBatchState:
         valid = na + 1
         out = self._device[slot][:n]
         out[:, 0].copy_(valid)
-        grid = out[:, 1:]
+        out[:, 1].copy_(current_x1[:n].to(torch.int64))
+        grid = out[:, 2:]
         grid.fill_(-1)
-        grid[:, 0].copy_(current_x1[:n].to(torch.int64))
         if self.k:
             accepted = self._draft_cols < na.unsqueeze(1)
-            grid[:, 1:].copy_(
+            grid[:, : self.k].copy_(
                 torch.where(
                     accepted,
                     drafts[:n, : self.k].to(torch.int64),
@@ -326,6 +335,7 @@ class MtpAsyncBatchState:
                     ),
                 )
             )
+        grid.scatter_(1, na.unsqueeze(1), next_bonus[:n].to(torch.int64).unsqueeze(1))
 
         # These tensors are the authoritative inputs for the next iteration;
         # no CPU acceptance result is needed to advance the model pipeline.

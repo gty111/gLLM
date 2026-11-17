@@ -42,18 +42,20 @@ def _runner_stub():
 
 def _inputs():
     seqs = [SimpleNamespace(), SimpleNamespace()]
-    orig_tokens = [[1, 2], [4, 5, 6]]
+    # Token histories [1, 2] and [4, 5, 6]: everything before the uncached
+    # last token (the draft chain's first input) is cached.
+    ctx_lens = [1, 2]
     first_tokens = [2, 6]
     hidden = torch.zeros((2, 4), dtype=torch.float32)
-    return seqs, orig_tokens, first_tokens, hidden
+    return seqs, ctx_lens, first_tokens, hidden
 
 
 def test_eager_mtp_draft_prepares_attention_metadata_each_step():
     runner, mtp = _runner_stub()
-    seqs, orig_tokens, first_tokens, hidden = _inputs()
+    seqs, ctx_lens, first_tokens, hidden = _inputs()
 
     drafts = ModelRunner._draft_chain_eager(
-        runner, seqs, orig_tokens, first_tokens, hidden, k=3, nd=2
+        runner, seqs, ctx_lens, first_tokens, hidden, k=3, nd=2
     )
 
     assert mtp.forward_calls == 3
@@ -62,12 +64,12 @@ def test_eager_mtp_draft_prepares_attention_metadata_each_step():
 
 def test_sampled_eager_mtp_draft_prepares_attention_metadata_each_step():
     runner, mtp = _runner_stub()
-    seqs, orig_tokens, first_tokens, hidden = _inputs()
+    seqs, ctx_lens, first_tokens, hidden = _inputs()
 
     drafts, q_dist = ModelRunner._draft_chain_eager_sampled(
         runner,
         seqs,
-        orig_tokens,
+        ctx_lens,
         first_tokens,
         hidden,
         k=3,

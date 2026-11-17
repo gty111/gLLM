@@ -804,13 +804,11 @@ class ModelRunner(
             # by copy_to_input_buffer), so it is graph-capturable for both.
         )
         self._verify_size_to_graph: Dict[int, torch.cuda.CUDAGraph] = {}
-        # Fused MTP is the only MTP execution mode: eliminate the separate
-        # x1-decode forward by relaying each step's verify bonus token + its
-        # hidden as the NEXT step's draft seed. One target forward (verify) per
-        # steady-state step instead of two. ``_mtp_relay`` maps seq_id ->
-        # (seed_tok:int, seed_hidden:tensor[H]) across consecutive steps; a seq
-        # missing from it (fresh admission / batch reshuffle) is seeded by one
-        # padded verify-shaped bootstrap before joining the fused steady state.
+        # Fused MTP is the only MTP execution mode: one target forward (verify)
+        # per step. Every target forward that samples a seq's next token also
+        # keeps the hidden state that predicted it; that hidden seeds the next
+        # draft. ``_mtp_relay`` maps seq_id -> (ctx:int, seed_hidden:tensor[H]),
+        # valid while position ``ctx`` holds the seq's single uncached token.
         # Piecewise graphs split a dynamic forward at model-declared
         # Attention/SSM boundaries. ``auto`` (None) preserves the historical
         # behavior by enabling them only for MTP mixed forwards; explicit True
@@ -891,7 +889,7 @@ class ModelRunner(
         # work by ``1+k``; it wins only
         # while the decode batch leaves the GPU under-utilized. Past the crossover
         # a plain 1-token step is strictly faster, so skip MTP for that step.
-        # Returning to MTP invalidates the relay and takes one padded bootstrap.
+        # The plain step records fresh draft seeds, so MTP resumes directly.
         # ``0`` disables the performance gate (always speculate when capacity and
         # execution mode permit it).
         self._mtp_max_batch = int(getattr(self, "_mtp_max_batch_cfg", 0) or 0)
@@ -899,7 +897,7 @@ class ModelRunner(
         if self.mtp_enabled and is_dp_attn() and get_local_rank() == 0:
             logger.warning(
                 "MTP speculative decoding is disabled under DP-attention: "
-                "bootstrap/draft/verify collective shapes are not yet "
+                "draft/verify collective shapes are not yet "
                 "coordinated across DP replicas; using plain decode."
             )
         if self.mtp_enabled and self._mtp_max_batch > 0:
@@ -1338,19 +1336,10 @@ class ModelRunner(
                 return self._step_dspark_tail(seq)
             return self._step_dspark_verify(seq)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
-        # A mixed prefill+decode batch deliberately uses the ordinary forward
-        # path below: speculative draft/verify is only legal for pure decode.
-        # Any decode row in this mixed batch nevertheless advances by one token,
-        # invalidating the bonus token + hidden relayed by its previous MTP
-        # verify. Drop exactly those rows before the plain forward; otherwise a
-        # following pure-decode iteration can mistake the stale entry for a full
-        # relay hit and seed its draft from the wrong sequence position.
-        if self.input_data.num_prefills > 0 and self.input_data.num_decodes > 0:
-            self._mtp_drop_relay(self.input_data.seqs[: self.input_data.num_decodes])
-        # Fused MTP path. Full-relay batches go straight to draft/verify. Fresh
-        # or relay-miss seqs are seeded by a verify-shaped padded bootstrap so
-        # every MTP target forward keeps the same fixed qlen=1+k; the ordinary
-        # batch-x-1 decode path is never used for an enabled MTP step.
+        # Fused MTP path: every seq's uncached token already has a draft seed
+        # (recorded by whichever target forward sampled it), so the step goes
+        # straight to draft/verify. Anything else runs the ordinary forward
+        # below, which records the seeds for the next step.
         if (
             self.mtp_enabled
             and dp_padded_size is None
@@ -1362,6 +1351,7 @@ class ModelRunner(
             and self.check_decode_batch()
             and self.mtp_sampling_compatible(self.input_data.seqs)
             and self.mtp_context_compatible(self.input_data.seqs)
+            and self.mtp_relay_ready(self.input_data.seqs)
         ):
             seqs = self.input_data.seqs[: self.input_data.num_decodes]
             if seqs:
@@ -1375,15 +1365,11 @@ class ModelRunner(
                     # hidden state and real context length stay on the GPU.
                     x1 = async_state.relay_tokens[: len(seqs)]
                     hidden = async_state.relay_hidden[: len(seqs)]
-                elif all(s.seq_id in self._mtp_relay for s in seqs):
-                    relay = [self._mtp_relay[s.seq_id] for s in seqs]
-                    x1 = [r[0] for r in relay]
-                    hidden = torch.stack([r[1] for r in relay], dim=0)
                 else:
-                    hidden, x1 = self._mtp_bootstrap_padded_verify(seqs)
-                # Fused bypasses the sampler/logprobs block below; the relayed
-                # or bootstrapped x1 is committed by ``_mtp_decode``. The next
-                # bonus is relayed, not committed, so it cannot be double-emitted.
+                    x1, hidden = self._mtp_relay_inputs(seqs)
+                # Fused bypasses the sampler/logprobs block below. x1 is the
+                # already-emitted uncached token; ``_mtp_decode`` emits the
+                # accepted drafts plus the new bonus.
                 self._last_logprobs = None
                 return self._mtp_decode(hidden, x1)
         if dp_padded_size is not None:
@@ -1472,54 +1458,8 @@ class ModelRunner(
                 tail_seqs=self.input_data.seqs,
                 tail_next_tokens=next_tokens,
             )
-            # MTP speculative decoding: on a pure-decode batch, draft k tokens
-            # per seq with the MTP head and verify them with one base forward,
-            # committing the accepted prefix. Returns per-seq token LISTS.
-            if (
-                self.mtp_enabled
-                and self.input_data.num_prefills == 0
-                and self.input_data.num_decodes > 0
-                and (not self.mtp_speculate_batch(self.input_data.num_decodes)
-                     or not self.mtp_sampling_compatible(seqs)
-                     or not self.mtp_context_compatible(seqs))
-            ):
-                # Constraints require plain sampling, the verify window does
-                # not fit, or the batch is too large to profit from speculation.
-                # Its one sampled token is final.
-                # The relay it leaves behind is stale (see ``_mtp_drop_relay``).
-                self._mtp_drop_relay()
-            elif (
-                self.mtp_enabled
-                and self.input_data.num_prefills == 0
-                and self.input_data.num_decodes > 0
-            ):
-                # x1 (this decode batch's first target token) was just sampled by
-                # the per-rank sampler above. Under GREEDY (top_k==1 -> argmax) it
-                # is TP-deterministic, but under SAMPLING each TP rank draws
-                # independently -> x1 diverges -> the draft/verify forwards in
-                # ``_mtp_decode`` get different inputs -> the seq token_ids diverge
-                # -> next-iter scheduling / overlap ``_gpu_pending`` depth diverges
-                # across ranks -> NCCL deadlock. MTP's whole sync design assumes
-                # TP-identical tokens. So when any seq samples, make TP-rank-0's x1
-                # authoritative before ``_mtp_decode`` touches the model. (This is
-                # independent of rejection sampling -- plain sampling + MTP needs
-                # it too.) Greedy skips the broadcast (argmax already matches).
-                nd_dec = self.input_data.num_decodes
-                dec_seqs = self.input_data.seqs[:nd_dec]
-                _sampling = any(
-                    (s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5)
-                    or s.top_k != 1
-                    for s in dec_seqs
-                )
-                if _sampling and get_tp_size() > 1:
-                    x1_t = torch.tensor(
-                        next_tokens[:nd_dec], dtype=torch.int64, device=hidden.device
-                    )
-                    self._mtp_bcast_tp(x1_t)
-                    x1_list = x1_t.tolist()
-                    for _i in range(nd_dec):
-                        next_tokens[_i] = x1_list[_i]
-                return self._mtp_decode(hidden, next_tokens)
+            # Seed the next MTP step from the rows that sampled a token.
+            self._mtp_record_relay(self.input_data, hidden)
             return next_tokens
         return (
             self.output_hidden_states[:num_cal_tokens],
@@ -2015,6 +1955,7 @@ class OverlapModelRunner(ModelRunner):
                         tail_seqs=self.input_data.seqs,
                         tail_next_tokens=next_tokens_gpu,
                     )
+            self._mtp_record_relay(self.input_data, hidden)
             self.future_map.store_to_map(future_indices, next_tokens_gpu)
             if get_pp_size() > 1:
                 # Issue the feedback broadcast on ``feedback_stream``, not on

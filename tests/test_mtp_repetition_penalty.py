@@ -169,7 +169,8 @@ def test_eager_draft_uses_penalized_causal_distribution(sampled):
         _mtp_probs_from_logits=lambda logits, seqs: logits.softmax(-1),
         _q_dense=ModelRunner._q_dense,
     )
-    args = ([SimpleNamespace()], [[0]], [1], torch.zeros(1, 2, device='cuda'))
+    # History [0, 1]: one cached token before the uncached x1 = 1.
+    args = ([SimpleNamespace()], [1], [1], torch.zeros(1, 2, device='cuda'))
     if sampled:
         drafts, q = ModelRunner._draft_chain_eager_sampled(
             runner, *args, k=3, nd=1, gen=torch.Generator(device='cuda').manual_seed(7),

@@ -33,7 +33,6 @@ class _MtpDeferredRow:
     seq: GenerationSequence
     start: int
     placeholder_width: int
-    relay_only: bool = False
 
 
 def _runner_config_field(name):
@@ -378,10 +377,10 @@ class Scheduler:
                 row_logprobs = (
                     logprobs[idx] if logprobs is not None and seq.logprobs_enabled else None
                 )
-                # MTP relay: ``tok`` is ``[x1] + accepted_drafts``. Every element
-                # was a verify input, so its KV/GDN state is already valid; the
-                # target bonus stays in the runner relay and becomes the next
-                # verify's x1. For the ordinary path ``tok`` is one uncached token.
+                # MTP: ``tok`` is ``accepted_drafts + [bonus]``; the consumed
+                # x1 was emitted by an earlier step. The accepted drafts were
+                # verify inputs, so they are cached; the bonus is the new
+                # uncached last token, exactly like an ordinary sample.
                 committed = tok if isinstance(tok, list) else [tok]
                 # Preserve the old append-then-stop rule for a completed step,
                 # including its first token when the budget is already spent.
@@ -393,9 +392,8 @@ class Scheduler:
                 for t in committed[:kept]:
                     seq.append(t)
                     self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
-                # Cached beyond the base decode's +1: the accepted drafts. In
-                # MTP, the +1 accounts for x1 even though it arrived from the
-                # runner relay rather than the scheduler token list.
+                # Cached beyond the base decode's +1 (which covers x1): the
+                # accepted drafts.
                 extra = kept - 1
                 if extra > 0:
                     seq.computed_token_num += extra
@@ -1017,12 +1015,11 @@ class OverlapScheduler(Scheduler):
         """Optimistically expose an in-flight variable-width MTP result.
 
         The batch layout is always ``[decode prefix | prefill suffix]``. Decode
-        rows reserve ``width == 1+k``; prefill rows use a relay-only shape
-        placeholder. A completed mixed prefill transitions to decode without
-        committing its sampled token:
-        that token becomes the GPU-resident MTP x1 and is verified/committed by
-        the successor. This avoids both a bootstrap and double-emitting x1.
-        Unfinished chunks only advance their computed count.
+        rows reserve ``width == 1+k`` placeholders for their accepted drafts
+        plus bonus; a completed prefill reserves one for its sampled token.
+        That token is emitted at finalize like any plain sample, and the GPU
+        state also hands it to the successor verify as x1. Unfinished chunks
+        only advance their computed count.
         """
         if not self.batch_running:
             return None
@@ -1044,24 +1041,13 @@ class OverlapScheduler(Scheduler):
             seq.computed_token_num += base_compute
             if not seq.computed_prompt:
                 continue
-            row_width = width if batch_idx < decode_rows else 0
-            relay_only = row_width == 0
-            relay_seed = bool(getattr(seq, "_mtp_relay_only_next", False))
-            if relay_seed:
-                # This row's x1 came directly from the predecessor prefill and
-                # is not present in token_ids yet. The verify caches it, but
-                # the ordinary decode base increment would count it once before
-                # it is actually committed by this completion.
-                seq.computed_token_num -= base_compute
-                seq._mtp_relay_only_next = False
-            placeholder_width = 1 if relay_only else row_width
+            # A verify row emits up to ``width`` tokens (accepted drafts plus
+            # the bonus); a completed prefill row emits its one sampled token.
+            # Either way the last emitted token stays uncached.
+            placeholder_width = width if batch_idx < decode_rows else 1
             start = len(seq.token_ids)
-            # A relay-only prefill transition still needs one host placeholder
-            # so an optimistically scheduled *mixed* successor has matching
-            # token/position shapes. GPU correction overwrites its value; the
-            # predecessor finalize removes it without committing/emitting it.
             seq.token_ids.extend([-1] * placeholder_width)
-            seq.computed_token_num += max(row_width - 1, 0)
+            seq.computed_token_num += placeholder_width - 1
             # Prefix-cache page allocation can run while these placeholders are
             # visible.  Suppress boundary registration until finalize installs
             # real accepted tokens; hashing ``-1`` would poison the cache.
@@ -1072,9 +1058,17 @@ class OverlapScheduler(Scheduler):
                     seq=seq,
                     start=start,
                     placeholder_width=placeholder_width,
-                    relay_only=relay_only,
                 )
             )
+            # A prompt whose one sampled token already exhausts the output
+            # budget must not feed an optimistic successor. (Verify rows are
+            # bounded by ``mtp_context_compatible`` instead; their placeholder
+            # width is only an upper bound on what they emit.)
+            if (
+                batch_idx >= decode_rows
+                and len(seq) - seq.raw_prompt_len >= seq.output_len
+            ):
+                continue
             to_requeue.append(seq)
         # ``appendleft`` one-by-one would reverse the cohort every iteration,
         # turning stable async MTP into a drain/reinstall loop. Preserve the
@@ -1104,16 +1098,8 @@ class OverlapScheduler(Scheduler):
             if seq.token_ids[start : start + width] != [-1] * width:
                 raise RuntimeError("MTP async placeholders were modified before finalize")
             del seq.token_ids[start : start + width]
-            seq.computed_token_num -= max(width - 1, 0)
+            seq.computed_token_num -= width - 1
             seq._mtp_async_pending = False
-
-            # Width zero is the prefill->MTP handoff. The mixed target's
-            # sampled token lives in MtpAsyncBatchState as the successor x1;
-            # it has not been consumed by the model yet, so it must not be
-            # appended or emitted until the next verify completion.
-            if item.relay_only:
-                seq._mtp_relay_only_next = True
-                continue
 
             if not row:
                 raise RuntimeError("MTP async completion committed an empty row")
@@ -1154,46 +1140,6 @@ class OverlapScheduler(Scheduler):
 
             if seq.is_finish:
                 self._retire_seq(seq, ipc_package, defer_frees)
-        return ipc_package if (
-            ipc_package.act_schedule_ids or ipc_package.free_ids
-        ) else None
-
-    def materialize_mtp_relay_only(self):
-        """Commit relay-only prefill x1 tokens before ordinary decode.
-
-        Mixed async MTP normally keeps a completed prefill's sampled x1 solely
-        in GPU relay state so the successor verify can consume it without a
-        bootstrap. If the scheduler leaves MTP before that successor, ordinary
-        decode instead requires x1 in ``token_ids`` as its single uncached
-        input. Materialize and emit it exactly once, without advancing
-        ``computed_token_num``: the model has not consumed x1 yet.
-        """
-        candidates = {}
-        for seq in self.seqs_to_decode:
-            candidates[seq.seq_id] = seq
-        for batch in self.batch_running:
-            for seq in batch:
-                candidates[seq.seq_id] = seq
-
-        ipc_package = IPCPackage([])
-        for seq in candidates.values():
-            if not getattr(seq, "_mtp_relay_only_next", False):
-                continue
-            if getattr(seq, "_mtp_async_pending", False):
-                raise RuntimeError(
-                    f"cannot materialize in-flight MTP relay for seq {seq.seq_id}"
-                )
-
-            token = self.model_runner.take_mtp_relay_token(seq.seq_id)
-            seq._mtp_relay_only_next = False
-            seq.append(token)
-            self.model_runner.register_decode_page_hash(seq, len(seq) - 1)
-
-            append_output_row(ipc_package, seq, [token])
-
-            if seq.is_finish:
-                self._retire_seq(seq, ipc_package)
-
         return ipc_package if (
             ipc_package.act_schedule_ids or ipc_package.free_ids
         ) else None
