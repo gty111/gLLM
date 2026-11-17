@@ -787,3 +787,42 @@ def test_runtime_width_scheduler_respects_full_window_budget(draft_tokens, short
     assert all(seq.to_compute_token_num == width for seq in selected)
     assert all(call[1:3] == (13 + width, 13 + width) for call in fixture.calls)
     assert not scheduler._pending_request_errors
+
+
+def test_mtp_window_survives_readmission_of_its_preemption_victim(prefix_manager, populate, make_seq, make_scheduler):
+    """A preempted request's cached prefix must not take the decode window.
+
+    Preempting the long decoder returns its cached pages to the free pool;
+    the same tick re-admits it at the head of the prefill queue, and its
+    prefix hit re-pins those pages. The surviving decoder's speculative
+    window (len + 1 + k) was checked against that pool, so it must already
+    own its pages by then.
+    """
+    from types import SimpleNamespace
+
+    from gllm.runtime.sequence import GenerationSequence
+    from gllm.speculative.backend import select_speculative_backend
+
+    k = 3
+    mm, _, _ = prefix_manager(pages=5)
+    s = make_scheduler(mm)
+    s.model_runner.speculative_num_draft_tokens = k
+    s.model_runner.model = SimpleNamespace(mtp=object())
+    s.speculative_backend = select_speculative_backend(dspark_enabled=False, mtp_enabled=True)
+
+    short = GenerationSequence(1, [7] * 16, [], output_len=16)
+    short.page_table = [mm.segment.allocate()]
+    short.computed_token_num = short.prompt_len = 15
+    long = make_seq(2, 64)
+    populate(mm.segment, long)  # four cached prefix pages
+    long.computed_token_num = long.prompt_len = 63
+    s.seqs_to_decode.extend([short, long])
+    assert mm.get_num_free_pages() == 0
+
+    batch = s.schedule_once()
+
+    assert s.num_preempt_seqs == 1 and long not in s.seqs_to_decode
+    assert short in batch
+    # The runner allocates the verify window at launch; it must already be owned.
+    mm.pre_allocate_page_for_lengths([short], [len(short) + k])
+    assert len(short.page_table) * 16 >= len(short) + 1 + k
