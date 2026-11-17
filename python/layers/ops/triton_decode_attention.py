@@ -103,7 +103,7 @@ def _fwd_kernel_stage1(
                 + offs_n // PAGE_SIZE,
                 mask=offs_n < split_kv_end,
                 other=0,
-            )
+            ).to(tl.int64)  # page * page stride overflows int32 in large caches
             kv_token = offs_n % PAGE_SIZE
             offs_buf_k = (
                 kv_page_number[:, None] * stride_buf_kblock
@@ -319,7 +319,7 @@ def _fwd_grouped_kernel_stage1(
                 + offs_n // PAGE_SIZE,
                 mask=offs_n < split_kv_end,
                 other=0,
-            )
+            ).to(tl.int64)  # page * page stride overflows int32 in large caches
             kv_token = offs_n % PAGE_SIZE
             offs_buf_k = (
                 kv_page_number[None, :] * stride_buf_kblock
