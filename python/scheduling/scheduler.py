@@ -805,12 +805,15 @@ class Scheduler:
             candidates = list(self.seqs_to_decode)[:decode_token_budget]
             width = self._decode_tokens_per_seq(len(candidates), mtp_eligible=mtp_eligible)
             # Ordinary decode computes the final token already in token_ids.
-            # MTP additionally preallocates len(seq) + 1 + k in the runner.
+            # MTP additionally writes its whole window, len(seq) + 1 + k.
             lookahead = width if width > 1 else 0
             pages_needed = sum(max(0, (len(seq) + lookahead + self.page_size - 1) // self.page_size
                                    - len(seq.page_table)) for seq in candidates)
-            if not self.check_preempt(pages_needed):
+            if self.get_num_free_pages() >= pages_needed or not self.seqs_to_decode:
                 break
+            # Preemption changes the candidates (a later request moves up), so
+            # check the new set again.
+            self.check_preempt(pages_needed)
         num_to_schedule = min(decode_token_budget, len(self.seqs_to_decode))
         if token_budget is not None and num_to_schedule > 0:
             tokens_per_seq = self._decode_tokens_per_seq(
@@ -825,6 +828,14 @@ class Scheduler:
             decode_batch.append(seq)
 
         self.memory_manager.pre_allocate_page(decode_batch)
+        if lookahead:
+            # Claim the speculative window now, while the check above holds.
+            # Left to the runner, prefill admitted later in this tick could
+            # take them: re-pinning a just-preempted request's cached prefix
+            # consumes pages that its preemption made free.
+            self.memory_manager.pre_allocate_page_for_lengths(
+                decode_batch, [len(seq) + lookahead for seq in decode_batch]
+            )
         return decode_batch
 
     def _decode_batch_token_cost(self, decode_batch, mtp_eligible=True):
