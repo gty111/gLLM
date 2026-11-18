@@ -164,7 +164,7 @@ def test_eager_draft_uses_penalized_causal_distribution(sampled):
     )
     runner = SimpleNamespace(
         model=SimpleNamespace(mtp=mtp), input_data=None, _mtp_penalties=state,
-        prepare_input=lambda seqs: None, _prepare_attention_metadata=lambda inputs: None,
+        prepare_input=lambda seqs, **kwargs: None, _prepare_attention_metadata=lambda inputs: None,
         _mtp_bcast_tp=lambda token: token,
         _mtp_probs_from_logits=lambda logits, seqs: logits.softmax(-1),
         _q_dense=ModelRunner._q_dense,

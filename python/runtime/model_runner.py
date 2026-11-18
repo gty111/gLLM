@@ -1001,17 +1001,30 @@ class ModelRunner(
             self.input_data.embedding_size = hidden_states.shape[0]
 
     def prepare_input(
-        self, seqs: List[GenerationSequence] = None, input_data: InputData = None
+        self, seqs: List[GenerationSequence] = None, input_data: InputData = None,
+        *, num_decodes: Optional[int] = None,
     ):
+        # An explicit partition is only for caller-owned sequence metadata.
+        # Prebuilt inputs already carry their own immutable partition.
+        if input_data is not None and num_decodes is not None:
+            raise ValueError("prebuilt input already owns its decode partition")
         if input_data is not None:
             self.input_data.set_input_from_prebuilt(input_data)
         else:
             assert seqs is not None
-            self.input_data.cal_and_set_input(seqs)
+            if num_decodes is None:
+                self.input_data.cal_and_set_input(seqs)
+            else:
+                self.input_data.cal_and_set_input(seqs, num_decodes=num_decodes)
         if self.use_mm and is_first_pp_rank():
-            input_embeddings, mrope_positions = self.mm_prepare_inputs(
-                self.input_data.seqs
-            )
+            if num_decodes is None:
+                input_embeddings, mrope_positions = self.mm_prepare_inputs(
+                    self.input_data.seqs
+                )
+            else:
+                input_embeddings, mrope_positions = self.mm_prepare_inputs(
+                    self.input_data.seqs, num_decodes=num_decodes
+                )
             # Kimi keeps the plain 1-D positions set by ``cal_and_set_input``
             # above; only the Qwen-VL family overrides with 3-D mrope.
             if self.uses_mrope:

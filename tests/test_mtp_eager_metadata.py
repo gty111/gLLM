@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import gllm.runtime.model_runner as runner_module
+from gllm.runtime.input_data import InputData
 from gllm.runtime.model_runner import ModelRunner
+from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.staging import MtpStagingBuffers
 
 
@@ -26,7 +29,8 @@ def _runner_stub():
     mtp = _MtpStub()
     runner = SimpleNamespace(model=SimpleNamespace(mtp=mtp), input_data=None)
 
-    def prepare_input(_seqs):
+    def prepare_input(_seqs, *, num_decodes):
+        assert num_decodes == len(_seqs)
         runner.input_data = SimpleNamespace(attention_prepared=False)
 
     def prepare_attention(input_data):
@@ -103,3 +107,85 @@ def test_mtp_staging_patches_host_and_device_boundary_tokens():
     )
 
     assert shifted.tolist() == [0, 13, 0, 0, 0, 47, 0, 0]
+
+@pytest.mark.parametrize("new_first", [False, True])
+@pytest.mark.parametrize("k", [1, 3, 7])
+@pytest.mark.parametrize("uses_mrope", [
+    False,
+    pytest.param(True, marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="pinned MRoPE metadata requires CUDA")),
+])
+def test_eager_draft_keeps_new_request_in_decode_partition(
+    make_mm_runner, monkeypatch, new_first, k, uses_mrope
+):
+    """Shifted positions must not reclassify a completed prompt as prefill."""
+    monkeypatch.setattr(runner_module, "is_first_pp_rank", lambda: True)
+    runner, _, _ = make_mm_runner(uses_mrope, False)
+    runner.use_mm = True
+    runner.model.mtp = _MtpStub()
+    data = InputData.__new__(InputData)
+    seen = []
+    positions = []
+
+    def materialize(seqs, plan):
+        assert plan.num_decodes == len(seqs) == 2
+        assert plan.query_lens == (1, 1)
+        data.seqs = seqs
+        data.num_decodes = plan.num_decodes
+        data.num_prefills = 0
+        data.attention_prepared = False
+        seen.append(tuple(s.computed_token_num for s in seqs))
+
+    data._materialize_cpu_metadata = materialize
+    data.copy_to_input_buffer = lambda: None
+    data.set_mrope_position = lambda value: positions.append(value.clone())
+    runner.input_data = data
+
+    def attention(current):
+        assert current.forward_metadata_plan.num_decodes == 2
+        current.attention_prepared = True
+
+    runner._prepare_attention_metadata = attention
+    fresh = GenerationSequence(1, [1, 2, 3], [], output_len=32)
+    fresh.append(4)
+    old = GenerationSequence(2, [1, 2, 3, 4], [], output_len=32)
+    old.token_ids.extend([5, 6, 7])
+    seqs = [fresh, old] if new_first else [old, fresh]
+    ctx = [len(s) - 1 for s in seqs]
+    prompts = [s.prompt_len for s in seqs]
+    histories = [s.token_ids[:] for s in seqs]
+    drafts = runner._draft_chain_eager(
+        seqs, ctx, [s[-1] for s in seqs], torch.zeros((2, 4)), k=k, nd=2
+    )
+    assert drafts == [[3] * k, [3] * k]
+    assert seen == [tuple(c + j - 1 for c in ctx) for j in range(k)]
+    assert [s.prompt_len for s in seqs] == prompts
+    assert [s.token_ids for s in seqs] == histories
+    if uses_mrope:
+        assert len(positions) == k
+        for j, pos in enumerate(positions):
+            assert pos.tolist() == [[c + j - 1 for c in ctx]] * 3
+
+
+@pytest.mark.parametrize("count", [-1, 2])
+def test_eager_draft_rejects_invalid_mm_decode_partition(make_mm_runner, count):
+    runner, _, _ = make_mm_runner(False, False)
+    seq = GenerationSequence(1, [1, 2, 3], [], output_len=8)
+    with pytest.raises(ValueError, match="decode partition"):
+        runner._mm_prepare_cpu([seq], num_decodes=count)
+
+
+def test_eager_draft_does_not_override_prebuilt_partition():
+    runner = ModelRunner.__new__(ModelRunner)
+    with pytest.raises(ValueError, match="prebuilt input"):
+        runner.prepare_input(input_data=SimpleNamespace(), num_decodes=1)
+
+
+def test_eager_draft_default_mm_still_rejects_prefill_before_decode(make_mm_runner):
+    runner, _, _ = make_mm_runner(False, False)
+    fresh = GenerationSequence(1, [1, 2, 3], [], output_len=8)
+    fresh.computed_token_num, fresh.to_compute_token_num = 2, 1
+    old = GenerationSequence(2, [1, 2, 3], [], output_len=8)
+    old.computed_token_num, old.to_compute_token_num = 4, 1
+    with pytest.raises(AssertionError, match="decode seqs must precede"):
+        runner._mm_prepare_cpu([fresh, old])
