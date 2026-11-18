@@ -240,7 +240,9 @@ class MmMixin:
         return items
 
     @torch.inference_mode()
-    def _mm_prepare_cpu(self, seqs: List[GenerationSequence]) -> Dict:
+    def _mm_prepare_cpu(
+        self, seqs: List[GenerationSequence], *, num_decodes: Optional[int] = None
+    ) -> Dict:
         """CPU phase of :meth:`mm_prepare_inputs`.
 
         Computes mrope positions and collects per-seq prefill work to run in
@@ -255,13 +257,18 @@ class MmMixin:
         the overlap scheduler run this phase concurrently with the previous
         batch's GPU forward.
         """
+        if num_decodes is not None and not 0 <= num_decodes <= len(seqs):
+            raise ValueError("decode partition is outside the current batch")
         batch_positions: List[torch.Tensor] = []
         prefill_works: List[Dict] = []
         num_decode_tokens = 0
         in_decode = True
 
-        for seq in seqs:
-            if seq.computed_prompt:
+        for index, seq in enumerate(seqs):
+            # Eager MTP shifts positions inside the completed prompt at its
+            # first draft step. Its explicit plan still owns a decode row.
+            is_decode = seq.computed_prompt if num_decodes is None else index < num_decodes
+            if is_decode:
                 # Decode token: positions only; embed is deferred to fixup.
                 # The scheduler places decode seqs before prefill seqs, so
                 # the contiguous decode block always sits at the front.
@@ -900,9 +907,14 @@ class MmMixin:
         return start, end, indices, values
 
     @torch.inference_mode()
-    def mm_prepare_inputs(self, seqs: List[GenerationSequence]):
-        """Single-shot wrapper kept for the non-overlap worker path."""
-        ctx = self._mm_prepare_cpu(seqs)
+    def mm_prepare_inputs(
+        self, seqs: List[GenerationSequence], *, num_decodes: Optional[int] = None
+    ):
+        """Prepare embeddings and positions using the caller-owned partition."""
+        if num_decodes is None:
+            ctx = self._mm_prepare_cpu(seqs)
+        else:
+            ctx = self._mm_prepare_cpu(seqs, num_decodes=num_decodes)
         input_embeddings = self._mm_prepare_gpu(ctx)
         return input_embeddings, ctx["mrope_positions"]
 

@@ -64,3 +64,25 @@ def test_overlap_snapshot_is_reserved_and_published_at_launch(monkeypatch, pp_si
     data.mark_ssm_snapshot_writes_enqueued()
     assert segment.page2ssm_snapshot_valid[15]
     assert data._ssm_snapshot_writes_pending == ()
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned metadata requires CUDA")
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_eager_draft_decode_partition_skips_prefill_snapshot(monkeypatch, pp_size):
+    """A shifted last-prompt position is draft decode, not a snapshot boundary."""
+    monkeypatch.setattr(input_data_module, "get_pp_size", lambda: pp_size)
+    segment = _SnapshotSegment()
+    manager = SimpleNamespace(page_size=16, use_mla=False, use_recurrent_state=True,
+                              use_ssm_cache=True, segment=segment)
+    data = InputData(False, manager, max_seq_length=512)
+    seq = GenerationSequence(1, [1] * 16, [], output_len=8)
+    seq.append(2)
+    seq.computed_token_num, seq.to_compute_token_num = 15, 1
+    seq.recurrent_state_slot = 3
+    seq.page_table = [0]
+    assert not seq.computed_prompt
+    data._cal_recurrent_state_metadata([seq])
+    data._cal_ssm_metadata([seq], num_decodes=1)
+    data._materialize_ssm_snapshot_targets()
+    assert segment.calls == []
+    assert data.ssm_snapshot_write_slot_per_seq_cpu.tolist() == [-1]
+    assert data._ssm_snapshot_candidates == ()

@@ -196,9 +196,11 @@ class InputData:
         )
         self.needs_repetition_penalty = self.repetition_penalty is not None
 
-    def cal_input(self, seqs: List[GenerationSequence]):
+    def cal_input(
+        self, seqs: List[GenerationSequence], *, num_decodes: Optional[int] = None
+    ):
         """Plan and materialize the ordinary pinned-CPU metadata phase."""
-        plan = ForwardMetadataPlan.from_sequences(seqs)
+        plan = ForwardMetadataPlan.from_sequences(seqs, num_decodes=num_decodes)
         plan.materialize(self, CpuInputMetadataMaterializer(seqs))
 
     def _materialize_cpu_metadata(
@@ -252,7 +254,7 @@ class InputData:
             self._cal_recurrent_state_metadata(seqs)
 
         if self.use_ssm_cache:
-            self._cal_ssm_metadata(seqs)
+            self._cal_ssm_metadata(seqs, num_decodes=plan.num_decodes)
 
         if self.use_mla:
             self._cal_mla_metadata(seqs)
@@ -272,7 +274,9 @@ class InputData:
             slots, device="cpu"
         ).pin_memory()
 
-    def _cal_ssm_metadata(self, seqs: List[GenerationSequence]):
+    def _cal_ssm_metadata(
+        self, seqs: List[GenerationSequence], *, num_decodes: Optional[int] = None
+    ):
         """Build the GDN-only initial-state flag + snapshot target.
 
         * ``has_initial_state_per_seq[i]`` = True when ``computed_token_num >
@@ -311,7 +315,10 @@ class InputData:
             # skip this branch since ``computed_prompt`` flips True before any
             # decode token is emitted (see GenerationSequence), and ``reserve`` is None for
             # non-prefix-cache runs.
-            if reserve is None or seq.computed_prompt:
+            # Honor the same partition as attention/MM when eager MTP
+            # temporarily shifts a completed request inside its prompt.
+            is_decode = seq.computed_prompt if num_decodes is None else i < num_decodes
+            if reserve is None or is_decode:
                 continue
             end_tokens = seq.computed_token_num + seq.to_compute_token_num
             if end_tokens == 0 or end_tokens % page_size != 0:
@@ -457,8 +464,13 @@ class InputData:
         if self.use_mla:
             self._set_mla_metadata()
 
-    def cal_and_set_input(self, seqs: List[GenerationSequence]):
-        self.cal_input(seqs)
+    def cal_and_set_input(
+        self, seqs: List[GenerationSequence], *, num_decodes: Optional[int] = None
+    ):
+        if num_decodes is None:
+            self.cal_input(seqs)
+        else:
+            self.cal_input(seqs, num_decodes=num_decodes)
         self.copy_to_input_buffer()
 
     def _materialize_ssm_snapshot_targets(self) -> None:

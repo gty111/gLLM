@@ -803,7 +803,11 @@ class MtpMixin:
                 )
                 s.to_compute_token_num = 1
                 s.to_compute_tokens = [x1[i] if j == 0 else drafts_cols[i][-1]]
-            self.prepare_input(decode_seqs)
+            # Draft positions are shifted left, so a request on its first
+            # decode can temporarily lie inside its prompt. Preserve the
+            # caller's decode partition instead of re-inferring it from that
+            # temporary position in attention and multimodal metadata.
+            self.prepare_input(decode_seqs, num_decodes=nd)
             # ``mtp.forward`` reaches the same attention backend as an ordinary
             # model forward.  The graph path prepares its static draft plan in
             # ``_draft_step_forward*``; eager fallback must prepare the dynamic
