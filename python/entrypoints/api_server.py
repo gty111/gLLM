@@ -202,6 +202,23 @@ class _UnsupportedMMInput(Exception):
     """A request carried media the loaded model cannot consume."""
 
 
+class _InvalidChatTemplateInput(Exception):
+    """A chat template explicitly rejected the supplied input or options."""
+
+
+async def _encode_chat_input(encode, *args, **kwargs):
+    try:
+        return await _async(encode)(*args, **kwargs)
+    except TemplateError as exc:
+        # Transformers' raise_exception helper uses the base TemplateError
+        # for model-specific input checks (effort levels, roles, etc.). Jinja
+        # subclasses such as TemplateSyntaxError and UndefinedError indicate
+        # template defects and must retain the server-error path.
+        if type(exc) is not TemplateError:
+            raise
+        raise _InvalidChatTemplateInput(str(exc)) from exc
+
+
 async def _tokenize_messages(messages, effective_tools, chat_template_kwargs,
                              *, check_mm_support=False):
     """Tokenize chat messages into ``(token_ids, mm_contents, mm_items)``.
@@ -220,12 +237,12 @@ async def _tokenize_messages(messages, effective_tools, chat_template_kwargs,
     mm_items = None
     if disagg and mm_contents is not None:
         mm_items = await _async(llm.model_runner.extract_mm_items_ordered)(messages)
-        token_ids = await _async(llm.model_runner.encode_skeleton)(
+        token_ids = await _encode_chat_input(llm.model_runner.encode_skeleton,
             messages, chat_template_kwargs=chat_template_kwargs or None
         )
         mm_contents = None  # LM holds no pixels; embeddings arrive over NIXL
     else:
-        token_ids = await _async(llm.model_runner.encode)(
+        token_ids = await _encode_chat_input(llm.model_runner.encode,
             messages,
             chat=True,
             has_mm=mm_contents is not None,
@@ -553,7 +570,7 @@ async def create_response(request: ResponseRequest, raw_request: Request):
         )
     except _UnsupportedMMInput as exc:
         return _unsupported("input", str(exc))
-    except (TypeError, ValueError, TemplateError) as exc:
+    except (TypeError, ValueError) as exc:
         return _openai_error(str(exc), param="input", code="invalid_input")
 
     if not llm.check_seq_length(token_ids, request.max_output_tokens):
@@ -778,6 +795,12 @@ def _build_app(dp_index=None):
     """One FastAPI app. ``dp_index`` (via ``app.state``) pins every request that
     arrives on this app to a specific DP replica; ``None`` = round-robin."""
     app = fastapi.FastAPI()
+
+    @app.exception_handler(_InvalidChatTemplateInput)
+    async def chat_template_input_error_handler(_, exc):
+        # The template supplies the reason, but not a reliable field path.
+        # Do not blame messages when it actually rejected a template option.
+        return _openai_error(str(exc), code="invalid_chat_template_input")
 
     @app.exception_handler(RequestCapacityError)
     async def cache_capacity_error_handler(_, exc):
