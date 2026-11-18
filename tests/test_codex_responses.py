@@ -145,6 +145,7 @@ def test_compacted_history_moves_instructions_before_conversation(instructions, 
 
 
 def test_model_template_errors_return_invalid_input(monkeypatch):
+    from fastapi.testclient import TestClient
     from gllm.entrypoints import api_server
     from jinja2 import TemplateError
 
@@ -153,10 +154,12 @@ def test_model_template_errors_return_invalid_input(monkeypatch):
 
     runner = SimpleNamespace(extract_modify_mm=lambda messages: None, encode=fail_encode)
     monkeypatch.setattr(api_server, "llm", SimpleNamespace(model_path="test", model_runner=runner))
-    response = asyncio.run(api_server.create_response(request([]), SimpleNamespace()))
+    response = TestClient(api_server._build_app()).post(
+        "/v1/responses", json=request([]).model_dump(mode="json", exclude_none=True)
+    )
     assert response.status_code == 400
-    error = json.loads(response.body)["error"]
-    assert error["code"] == "invalid_input"
+    error = response.json()["error"]
+    assert error["code"] == "invalid_chat_template_input"
     assert "model template" in error["message"]
 
 
