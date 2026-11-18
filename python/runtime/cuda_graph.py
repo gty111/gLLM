@@ -171,6 +171,8 @@ class CudaGraphMixin:
                 # ``_mtp_decode`` collapses the ~250ms eager forward to a graph.
                 if self._mtp_verify_graph:
                     self._capture_verify_graphs(memory_pool, stream)
+                    if getattr(self, "_dspark_drafter", None) is not None:
+                        self._capture_dspark_draft_graphs(memory_pool, stream)
                 if self._piecewise_runner is not None:
                     self._capture_piecewise_graphs(stream)
         finally:

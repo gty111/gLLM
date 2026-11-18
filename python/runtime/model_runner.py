@@ -61,22 +61,16 @@ from gllm.runtime.sleep_mode import WEIGHTS_TAG, SleepAllocator
 from gllm.runtime.sleep_mode import memory_pool as sleep_memory_pool
 from gllm.runtime.config import EngineConfig
 from gllm.runtime.cuda_graph import CudaGraphMixin
-from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.runtime.input_data import InputData
-from gllm.runtime.memory_manager import (
-    DSparkKVCacheConfig, MemoryManager, PrefixMemoryManager,
-)
+from gllm.runtime.forward_metadata import ForwardMetadataPlan
+from gllm.runtime.memory_manager import MemoryManager, PrefixMemoryManager
 from gllm.runtime.model_loader import (
     ModelLoader, load_dspark_draft, propagate_serving_config,
 )
 from gllm.runtime.piecewise_cuda_graph import PiecewiseGraphRunner
 from gllm.runtime.sequence import GenerationSequence
 from gllm.speculative.async_state import MtpAsyncBatchState
-from gllm.speculative.dspark import DSparkRequestState, DSparkStepResult
-from gllm.speculative.dspark_execution import DSparkExecutionMixin
-from gllm.speculative.dspark_profile import (
-    profile_dspark_paged_verify, profile_dspark_prefill,
-)
+from gllm.speculative.dspark_drafter import DSparkDrafter
 from gllm.speculative.gpu_prep import MtpGpuPrep
 from gllm.speculative.backend import select_speculative_backend
 from gllm.speculative.mtp import MtpMixin, MtpQDist, MtpVerifyResult
@@ -114,13 +108,12 @@ def apply_mm_processor_pixels(
 
 
 class ModelRunner(
-    DSparkExecutionMixin, MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin,
+    MtpMixin, MmMixin, DisaggMixin, TokenizerMixin, CudaGraphMixin,
 ):
     def __init__(self, config: EngineConfig):
         self.config = config
         self.dspark_enabled = config.speculative_backend == "dspark"
         self.dspark = None
-        self._dspark_requests: Dict[int, DSparkRequestState] = {}
 
         self.max_num_batched_tokens = (
             config.maxp
@@ -580,14 +573,18 @@ class ModelRunner(
         return self._mtp_max_batch
 
     def init(self, mp_load_progress=None):
+        # verify_config rewrites attention_backend when it falls back.
+        requested_backend = getattr(self, "attention_backend", None)
         self.verify_config()
         if self.dspark_enabled and (
-            self.attention_backend != "fa3"
-            or self._validated_qkv_attention_backend.name != "fa3"
+            self._validated_qkv_attention_backend.name != requested_backend
         ):
-            # verify_config may fall back even for an explicit FA3 request.
-            # Other backends have not passed DSpark's GPU integration checks.
-            raise RuntimeError("DSpark requires the resolved and bound FA3 backend")
+            # DSpark runs only on the backend it was configured (and
+            # validated) for; a silent fallback would change verify numerics.
+            raise RuntimeError(
+                f"DSpark requested the {requested_backend} attention backend "
+                f"but {self._validated_qkv_attention_backend.name} was bound"
+            )
         sleep_mode = getattr(self.config, "sleep_mode", False)
         if sleep_mode:
             SleepAllocator.get()  # turns the releasable pools on
@@ -622,6 +619,24 @@ class ModelRunner(
         self.mtp_enabled = bool(
             self.speculative_num_draft_tokens > 0 and getattr(self.model, "mtp", None) is not None
         )
+        self._dspark_drafter = None
+        if self.dspark_enabled:
+            # DSpark drives the shared MTP pipeline through a drafter: its K/V
+            # are extra layers of the target segment, fed from hidden taps that
+            # every target forward writes to a persistent sink.
+            self.mtp_enabled = True
+            text = getattr(self.model, "language_model", self.model)
+            layer_ids = tuple(self.dspark.config.target_layer_ids)
+            taps = torch.empty(
+                (self.max_num_batched_tokens, len(layer_ids) * text.config.hidden_size),
+                dtype=self.model_loader.dtype, device="cuda",
+            )
+            text.model.set_hidden_tap_sink(layer_ids, taps)
+            self._dspark_drafter = DSparkDrafter(
+                self.dspark,
+                kv_base_layer=getattr(self.model, "num_kv_layers", self.model.num_layers),
+                taps=taps,
+            )
         if self.config.speculative_backend == "mtp" and not self.mtp_enabled:
             raise ValueError("mtp requires a loaded compatible MTP head")
         if (
@@ -669,6 +684,8 @@ class ModelRunner(
             PrefixMemoryManager if self.enable_prefix_caching else MemoryManager
         )
         kv_num_layers = getattr(self.model, "num_kv_layers", self.model.num_layers)
+        if self._dspark_drafter is not None:
+            kv_num_layers += self._dspark_drafter.num_kv_layers
         self.memory_manager = memory_manager_cls(
             gpu_memory_util=self.gpu_memory_util,
             num_layers=kv_num_layers,
@@ -704,14 +721,6 @@ class ModelRunner(
             speculative_num_draft_tokens=(
                 self.speculative_num_draft_tokens if (self.dspark_enabled or (ssm_cache_config is not None and self.mtp_enabled))
                 else 0
-            ),
-            dspark_kv_cache_config=(
-                DSparkKVCacheConfig(
-                    num_layers=len(self.dspark.layers),
-                    kv_head_num=self.dspark.config.num_key_value_heads,
-                    kv_head_dim=self.dspark.config.head_dim,
-                )
-                if self.dspark_enabled else None
             ),
         )
         self.memory_manager.requires_mrope_buffer = getattr(self.model, "requires_mrope_buffer", False)
@@ -769,6 +778,7 @@ class ModelRunner(
         self._mtp_draft_graph = (
             self.speculative_backend.capabilities.cuda_graph
             and self.mtp_enabled
+            and self._dspark_drafter is None  # MTP-head draft graphs
             and not is_dp_attn()
             and not self.disable_cuda_graph
             # Works for both MLA (DeepSeek) and non-MLA (Qwen3.5 GDN): the draft
@@ -977,11 +987,9 @@ class ModelRunner(
         self.memory_manager.validate_model_max_length(
             self.model_max_length,
             mtp_lookahead=self.speculative_num_draft_tokens if self.mtp_enabled else 0,
-            dspark_lookahead=self.dspark.block_size if self.dspark_enabled else 0,
         )
-
-        if self.dspark_enabled:
-            self._profile_dspark_paged_verify()
+        if self._dspark_drafter is not None:
+            self._dspark_drafter.bind_kv(self.memory_manager.segment)
 
         if self._full_cuda_graph_on or self._piecewise_runner is not None:
             self.capture_graph()
@@ -995,15 +1003,6 @@ class ModelRunner(
     def prepare_input(
         self, seqs: List[GenerationSequence] = None, input_data: InputData = None
     ):
-        if getattr(self, "dspark_enabled", False):
-            if (
-                input_data is not None or not seqs
-                or len(seqs) > getattr(self, "max_running_seqs", getattr(self, "maxd", 1))
-            ):
-                raise ValueError("DSpark input preparation requires a nonempty live batch within capacity")
-            # Per-phase dispatch reserves storage before building GPU metadata.
-            self.input_data.seqs = seqs
-            return
         if input_data is not None:
             self.input_data.set_input_from_prebuilt(input_data)
         else:
@@ -1108,16 +1107,11 @@ class ModelRunner(
                 torch.zeros((3, num_cal_tokens), device="cpu")
             )
         stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullcontext()
-        with stream_ctx:
+        # The startup profile also covers a speculative step's own tensors.
+        step_ctx = self.mtp_profile_step() if stream is None else _nullcontext()
+        with stream_ctx, step_ctx:
             self._prepare_attention_metadata(self.input_data)
-            if getattr(self, "dspark_enabled", False):
-                self.dspark_profile = profile_dspark_prefill(
-                    self.model, self.dspark, self.input_data,
-                    max_running_seqs=getattr(self, "max_running_seqs", getattr(self, "maxd", 1)),
-                    uses_mrope=self.uses_mrope,
-                    prepare_attention=self._prepare_attention_metadata,
-                )
-            elif is_first_pp_rank():
+            if is_first_pp_rank():
                 self.model(self.input_data)
             else:
                 self.model(
@@ -1132,17 +1126,6 @@ class ModelRunner(
             stream.synchronize()
         else:
             torch.cuda.synchronize()
-
-    def _profile_dspark_paged_verify(self):
-        """Run the DSpark post-arena probe after shared cache initialization."""
-        profile = profile_dspark_paged_verify(
-            self.model, self.dspark, self.input_data,
-            max_prompt_tokens=self.max_num_batched_tokens,
-            model_max_length=self.model_max_length, uses_mrope=self.uses_mrope,
-            prepare_attention=self._prepare_attention_metadata,
-            max_running_seqs=getattr(self, "max_running_seqs", getattr(self, "maxd", 1)),
-        )
-        self.dspark_profile.update(profile)
 
     @torch.inference_mode()
     def forward(self):
@@ -1309,32 +1292,8 @@ class ModelRunner(
             if c0 + n >= prompt_len:
                 self._last_prompt_logprobs[seq.seq_id] = seq.prompt_logprobs_data
 
-    def _step_dspark_prompt(self, seq: GenerationSequence) -> DSparkStepResult:
-        return self._execute_dspark_prompt(seq)
-
-    def _step_dspark_verify(self, seq: GenerationSequence) -> DSparkStepResult:
-        return self._execute_dspark_verify(seq)
-
-    def _step_dspark_tail(self, seq: GenerationSequence) -> DSparkStepResult:
-        return self._execute_dspark_tail(seq)
-
-    def complete_dspark_failed_step(self, seq: GenerationSequence) -> None:
-        self._complete_dspark_failed_step(seq)
-
     @torch.inference_mode()
     def step_once(self, dp_padded_size: Optional[int] = None):
-        if getattr(self, "dspark_enabled", False):
-            if dp_padded_size is not None or not self.input_data.seqs:
-                raise ValueError("DSpark runtime requires a nonempty unpadded batch")
-            if len(self.input_data.seqs) > 1:
-                return self._execute_dspark_batch(self.input_data.seqs)
-            seq = self.input_data.seqs[0]
-            state = self._dspark_requests.get(seq.seq_id)
-            if state is None or state.phase in ("prefill", "bootstrap"):
-                return self._step_dspark_prompt(seq)
-            if state.phase == "tail":
-                return self._step_dspark_tail(seq)
-            return self._step_dspark_verify(seq)
         num_cal_tokens = self.input_data.tokens_cpu.shape[0]
         # Fused MTP path: every seq's uncached token already has a draft seed
         # (recorded by whichever target forward sampled it), so the step goes
@@ -1485,8 +1444,7 @@ class ModelRunner(
         # when the request finishes instead of waiting for another MTP iteration
         # to replace the relay map (which may never happen when the batch ends).
         self._mtp_relay.pop(seq.seq_id, None)
-        if not self._free_dspark_request(seq):
-            self.memory_manager.free(seq)
+        self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():
             self.embedding_cache.pop(seq.seq_id, None)
             self._disagg_free(seq.seq_id)

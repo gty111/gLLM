@@ -61,8 +61,7 @@ from gllm.models.weight_utils import get_tensor_from_dict
 
 
 if TYPE_CHECKING:
-    from gllm.runtime.memory_manager import DSparkRequestCache, Segment
-    from gllm.runtime.forward_metadata import DSparkDraftMetadata
+    from gllm.runtime.memory_manager import Segment
 
 
 @dataclass(frozen=True)
@@ -192,17 +191,6 @@ class Qwen38DSparkCache:
         return self.keys[0].shape[-2]
 
 
-@dataclass
-class Qwen38DSparkPagedCache:
-    """A view of one request's arena storage; allocation stays with the runtime."""
-
-    segment: Segment
-    state: DSparkRequestCache
-
-    def context_length(self) -> int:
-        return self.state.context_length
-
-
 class Qwen38DSparkMarkovHead(nn.Module):
     """Low-rank previous-token logit bias (SpecForge ``VanillaMarkovHead``).
 
@@ -305,11 +293,8 @@ class Qwen38DSparkAttention(nn.Module):
         cached_v: torch.Tensor,
         noise_positions: torch.Tensor,
         rotary_cache: torch.Tensor,
-        *,
-        page_table: torch.Tensor | None = None,
-        context_length: int | tuple[int, ...] = 0,
     ) -> torch.Tensor:
-        """Attend the noisy block against the history plus itself.
+        """Attend the noisy block against the history plus itself (dense).
 
         ``cached_k`` / ``cached_v`` already carry this step's accepted context
         rows -- :meth:`Qwen38DSpark.forward_draft` appends them before calling
@@ -328,96 +313,65 @@ class Qwen38DSparkAttention(nn.Module):
         k_noise, v_noise = self._project_kv(hidden_states)
         k_noise = _rotate(k_noise, rotary_cache, noise_positions)
 
-        if page_table is not None:
-            out = self._paged_attention(
-                q, k_noise, v_noise, cached_k, cached_v, page_table, context_length
-            )
-        else:
-            k = torch.cat([cached_k, k_noise], dim=2)
-            v = torch.cat([cached_v, v_noise], dim=2)
-            k = _repeat_kv(k, self.num_key_value_groups)
-            v = _repeat_kv(v, self.num_key_value_groups)
-            # The dense validation path also sees all history and noise.
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, scale=self.scaling
-            )
+        k = torch.cat([cached_k, k_noise], dim=2)
+        v = torch.cat([cached_v, v_noise], dim=2)
+        k = _repeat_kv(k, self.num_key_value_groups)
+        v = _repeat_kv(v, self.num_key_value_groups)
+        # The dense reference path sees all history and noise.
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=self.scaling)
         out = out.transpose(1, 2).reshape(batch, query_len, -1)
         return self.o_proj(out)
 
-    def _paged_attention(
+    def forward_paged(
         self,
-        q: torch.Tensor,
-        k_noise: torch.Tensor,
-        v_noise: torch.Tensor,
+        hidden_states: torch.Tensor,
         cached_k: torch.Tensor,
         cached_v: torch.Tensor,
-        page_table: torch.Tensor,
-        context_length: int | tuple[int, ...],
+        noise_positions: torch.Tensor,
+        rotary_cache: torch.Tensor,
+        block_rows: torch.Tensor,
+        seq_lens_rows: torch.Tensor,
     ) -> torch.Tensor:
-        """Merge paged history and noncausal noise without sharing histories.
+        """Noise block over a nonempty paged history, with device-only metadata.
 
-        The single-request table keeps its zero row stride. A batched table
-        already has noise_width rows per nonempty request, in query order.
-        Empty histories use noise only and never enter the paged reducer.
+        ``block_rows`` / ``seq_lens_rows`` hold one page-table row and history
+        length per noise row (``B * noise_width``). Shapes depend only on the
+        batch, so the call is CUDA-graph capturable.
         """
-        batch, _, query_len, _ = q.shape
-        lengths = (context_length,) if isinstance(context_length, int) else context_length
-        if len(lengths) != batch or any(length < 0 for length in lengths):
-            raise ValueError("paged attention needs one valid length per request")
-        active = [index for index, length in enumerate(lengths) if length]
-        noise_k = _repeat_kv(k_noise, self.num_key_value_groups)
-        noise_v = _repeat_kv(v_noise, self.num_key_value_groups)
-        scores = torch.matmul(q.float(), noise_k.float().transpose(-1, -2))
-        scores = scores * self.scaling
-        noise_output = torch.matmul(scores.softmax(-1), noise_v.float()).to(q.dtype)
-        if not active:
-            return noise_output
-
         from gllm.layers.ops.merge_attn_states import merge_attn_states
         from gllm.layers.ops.triton_decode_attention import decode_attention_fwd
 
-        def pack_active(tensor):
-            if len(active) == batch:
-                return tensor.reshape(batch * query_len, *tensor.shape[2:]).contiguous()
-            return torch.cat([tensor[index] for index in active], dim=0).contiguous()
+        batch, query_len = hidden_states.shape[:-1]
+        q = self.q_proj(hidden_states).view(batch, query_len, self.num_heads, self.head_dim)
+        q = _rotate(self.q_norm(q).transpose(1, 2), rotary_cache, noise_positions)
+        k_noise, v_noise = self._project_kv(hidden_states)
+        k_noise = _rotate(k_noise, rotary_cache, noise_positions)
 
-        query = pack_active(q.transpose(1, 2))
+        noise_k = _repeat_kv(k_noise, self.num_key_value_groups)
+        noise_v = _repeat_kv(v_noise, self.num_key_value_groups)
+        scores = torch.matmul(q.float(), noise_k.float().transpose(-1, -2)) * self.scaling
+        noise_output = torch.matmul(scores.softmax(-1), noise_v.float()).to(q.dtype)
+        rows = batch * query_len
+        query = q.transpose(1, 2).reshape(rows, self.num_heads, self.head_dim).contiguous()
         history_output = torch.empty_like(query)
-        history_lse = torch.empty(
-            query.shape[0], self.num_heads, device=q.device, dtype=torch.float32
-        )
-        block_table = (
-            page_table.expand(query_len, -1) if isinstance(context_length, int) else page_table
-        )
-        seq_lens = torch.cat([
-            torch.full((query_len,), lengths[index], device=q.device, dtype=torch.int32)
-            for index in active
-        ])
+        history_lse = torch.empty(rows, self.num_heads, device=q.device, dtype=torch.float32)
         num_splits = 4
         scratch = torch.empty(
-            query.shape[0], self.num_heads, num_splits, self.head_dim + 1,
+            rows, self.num_heads, num_splits, self.head_dim + 1,
             device=q.device, dtype=torch.float32,
         )
         decode_attention_fwd(
             query, cached_k, cached_v, history_output, history_lse,
-            block_table, seq_lens, scratch, num_splits, self.scaling,
+            block_rows, seq_lens_rows, scratch, num_splits, self.scaling,
             cached_k.shape[1],
         )
-        noise_lse = pack_active(scores.logsumexp(-1).transpose(1, 2))
-        suffix_output = pack_active(noise_output.transpose(1, 2))
         merged = torch.empty_like(history_output)
         merge_attn_states(
-            merged, history_output, history_lse, suffix_output, noise_lse
+            merged, history_output, history_lse,
+            noise_output.transpose(1, 2).reshape(rows, self.num_heads, self.head_dim).contiguous(),
+            scores.logsumexp(-1).transpose(1, 2).reshape(rows, self.num_heads).contiguous(),
         )
-        merged = merged.view(
-            len(active), query_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)
-        if len(active) == batch:
-            return merged
-        outputs = list(noise_output.unbind(0))
-        for index, request in enumerate(active):
-            outputs[request] = merged[index]
-        return torch.stack(outputs)
+        return self.o_proj(merged.view(batch, query_len, -1))
 
 
 class Qwen38DSparkDecoderLayer(nn.Module):
@@ -439,9 +393,6 @@ class Qwen38DSparkDecoderLayer(nn.Module):
         cached_v: torch.Tensor,
         noise_positions: torch.Tensor,
         rotary_cache: torch.Tensor,
-        *,
-        page_table: torch.Tensor | None = None,
-        context_length: int | tuple[int, ...] = 0,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.self_attn(
@@ -450,12 +401,20 @@ class Qwen38DSparkDecoderLayer(nn.Module):
             cached_v,
             noise_positions,
             rotary_cache,
-            page_table=page_table,
-            context_length=context_length,
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
         return residual + self.mlp(self.post_attention_layernorm(hidden_states))
+
+    def forward_paged(self, hidden_states, cached_k, cached_v, noise_positions,
+                      rotary_cache, block_rows, seq_lens_rows):
+        residual = hidden_states
+        hidden_states = self.self_attn.forward_paged(
+            self.input_layernorm(hidden_states), cached_k, cached_v,
+            noise_positions, rotary_cache, block_rows, seq_lens_rows,
+        )
+        hidden_states = residual + hidden_states
+        return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
 
 class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
@@ -551,263 +510,19 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
             values.append(v)
         return Qwen38DSparkCache(keys=keys, values=values)
 
-    @torch.no_grad()
-    def prefill_paged(
-        self,
-        main_hidden: torch.Tensor,
-        *,
-        segment: Segment,
-        cache: DSparkRequestCache,
-    ) -> Qwen38DSparkPagedCache:
-        """Seed or append a prompt chunk in storage reserved by the caller."""
-        self.append_paged_context(
-            main_hidden, start_pos=cache.context_length + main_hidden.shape[1],
-            segment=segment, cache=cache,
-        )
-        return Qwen38DSparkPagedCache(segment=segment, state=cache)
-
-    @torch.no_grad()
-    def append_paged_context(
-        self,
-        main_hidden: torch.Tensor,
-        *,
-        start_pos: int,
-        segment: Segment,
-        cache: DSparkRequestCache,
-    ) -> None:
-        """Append accepted context to an already-reserved draft segment.
-
-        This single-request BF16/TP=1 path uses the same position convention as
-        forward_draft: start_pos is the exclusive context end (the anchor
-        position), and the suffix starts at cache.context_length. Logical slot
-        IDs address the segment's strided views; they are not physical page IDs.
-
-        Only new rows are projected. Publish the valid length after all layer
-        writes are enqueued, preserving commit_dspark_context's invariant.
-        A layer failure leaves the old valid prefix unchanged; an unpublished
-        suffix may be overwritten on retry. The caller serializes access on
-        one CUDA stream (or supplies synchronization), and must not retry a
-        fatal asynchronous device error as though it were a Python exception.
-        """
-        self._validate_paged_context(main_hidden, start_pos, segment, cache)
-        length = main_hidden.shape[1]
-        if length == 0:
-            return
-
-        from gllm.layers.ops.cache_kernels import reshape_and_cache_flash
-
-        context = self._project_context(main_hidden)
-        positions = torch.arange(
-            cache.context_length, start_pos, device=main_hidden.device
-        )
-        page_table = cache.get_device_page_table(main_hidden.device)[0]
-        slot_mapping = (
-            page_table[positions // segment.page_size].long() * segment.page_size
-            + positions % segment.page_size
-        )
-        for index, layer in enumerate(self.layers):
-            key, value = layer.self_attn.prefill_context(
-                context, positions, self.rotary_emb.cos_sin_cache
-            )
-            # The writer requires packed head/dim axes. Copy only the new
-            # suffix, never the existing history. "auto" ignores scale tensors.
-            key = key[0].transpose(0, 1).contiguous()
-            value = value[0].transpose(0, 1).contiguous()
-            reshape_and_cache_flash(
-                key, value, segment.k_cache[index], segment.v_cache[index],
-                slot_mapping, "auto", key, value,
-            )
-        cache.context_length = start_pos
-
-    def _validate_paged_context(self, main_hidden, start_pos, segment, cache):
-        if (
-            main_hidden.ndim != 3
-            or main_hidden.shape[0] != 1
-            or main_hidden.shape[2] != self.config.target_hidden_size
-        ):
-            raise ValueError("paged context requires [1, S, target_hidden_size]")
-        if _tp_size() != 1:
-            raise ValueError("paged DSpark context currently requires TP=1")
-        geometry = (segment.num_layers, segment.kv_head_num, segment.kv_head_dim)
-        expected = (
-            len(self.layers), self.config.num_key_value_heads, self.config.head_dim
-        )
-        if geometry != expected:
-            raise ValueError((geometry, expected))
-        key_cache = segment.k_cache[0]
-        if (
-            main_hidden.dtype != torch.bfloat16
-            or key_cache.dtype != main_hidden.dtype
-            or key_cache.device != main_hidden.device
-        ):
-            raise ValueError("paged context and cache must share a BF16 device")
-        length = main_hidden.shape[1]
-        if type(start_pos) is not int or start_pos < 0:
-            raise ValueError("paged context position must be a nonnegative integer")
-        if start_pos - length != cache.context_length:
-            raise ValueError((start_pos, length, cache.context_length))
-        if start_pos > len(cache.page_table) * segment.page_size:
-            raise ValueError("draft context exceeds reserved page capacity")
-        if start_pos > self.rotary_emb.cos_sin_cache.shape[0]:
-            raise ValueError("draft context exceeds the rotary position range")
-
-    def _validate_paged_batch(self, main_hiddens, start_positions, caches):
-        if not caches or not len(main_hiddens) == len(start_positions) == len(caches):
-            raise ValueError("paged batch needs one context, position and cache per request")
-        if any(not isinstance(cache, Qwen38DSparkPagedCache) for cache in caches):
-            raise ValueError("paged batch requires request-owned paged cache views")
-        if len({id(cache.state) for cache in caches}) != len(caches):
-            raise ValueError("paged batch cannot repeat a request cache")
-        segment = caches[0].segment
-        if any(cache.segment is not segment for cache in caches):
-            raise ValueError("paged batch must use one shared draft segment")
-        for hidden, end, cache in zip(main_hiddens, start_positions, caches):
-            self._validate_paged_context(hidden, end, segment, cache.state)
-
-    def _append_paged_context_batched(self, main_hiddens, start_positions, caches):
-        """Write only the ragged new suffixes; publish all lengths last.
-
-        Validation is complete before any write. Only the newly accepted
-        context is packed, never the historical KV. A layer failure leaves all
-        old valid lengths intact; callers must not retry fatal CUDA errors.
-        """
-        nonempty = [
-            (hidden, end, cache) for hidden, end, cache in zip(
-                main_hiddens, start_positions, caches
-            ) if hidden.shape[1]
-        ]
-        if not nonempty:
-            return
-        from gllm.layers.ops.cache_kernels import reshape_and_cache_flash
-
-        segment = caches[0].segment
-        context = self._project_context(torch.cat([row[0] for row in nonempty], dim=1))
-        positions, slots = [], []
-        for hidden, end, cache in nonempty:
-            position = torch.arange(cache.state.context_length, end, device=hidden.device)
-            page_table = cache.state.get_device_page_table(hidden.device)[0]
-            positions.append(position)
-            slots.append(
-                page_table[position // segment.page_size].long() * segment.page_size
-                + position % segment.page_size
-            )
-        positions, slots = torch.cat(positions), torch.cat(slots)
-        for index, layer in enumerate(self.layers):
-            key, value = layer.self_attn.prefill_context(
-                context, positions, self.rotary_emb.cos_sin_cache
-            )
-            key = key[0].transpose(0, 1).contiguous()
-            value = value[0].transpose(0, 1).contiguous()
-            reshape_and_cache_flash(
-                key, value, segment.k_cache[index], segment.v_cache[index],
-                slots, "auto", key, value,
-            )
-        for end, cache in zip(start_positions, caches):
-            cache.state.context_length = end
-
-    @torch.no_grad()
-    def prefill_paged_batched(
-        self,
-        main_hiddens: list[torch.Tensor],
-        *,
-        segment: Segment,
-        caches: list[DSparkRequestCache],
-    ) -> list[Qwen38DSparkPagedCache]:
-        """Append independent prompt chunks with one packed context projection."""
-        if any(hidden.ndim != 3 for hidden in main_hiddens):
-            raise ValueError("paged context requires [1, S, target_hidden_size]")
-        views = [Qwen38DSparkPagedCache(segment, cache) for cache in caches]
-        ends = [
-            cache.context_length + hidden.shape[1] for hidden, cache in zip(main_hiddens, caches)
-        ]
-        self._validate_paged_batch(main_hiddens, ends, views)
-        self._append_paged_context_batched(main_hiddens, ends, views)
-        return views
-
-    def validate_draft_batch(self, main_hiddens, input_ids, *, start_positions, caches):
-        """Validate every member before the execution context appends any K/V."""
-        self._validate_paged_batch(main_hiddens, start_positions, caches)
-        anchor = _anchor_ids(input_ids)
-        device = caches[0].segment.k_cache[0].device
-        if anchor.shape != (len(caches),) or anchor.device != device or anchor.dtype != torch.int64:
-            raise ValueError("paged batch needs one CUDA int64 anchor per request")
-        if any(
-            end + self.noise_width > self.rotary_emb.cos_sin_cache.shape[0]
-            for end in start_positions
-        ):
-            raise ValueError("draft noise exceeds the rotary position range")
-
-    @torch.no_grad()
-    def forward_draft_batched(
-        self,
-        main_hiddens: list[torch.Tensor],
-        input_ids: torch.Tensor,
-        *,
-        start_positions: list[int],
-        caches: list[Qwen38DSparkPagedCache],
-        metadata: DSparkDraftMetadata | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run a real batch with ragged committed suffixes and private anchors.
-
-        For B>1 context is already appended; each input is [1, 0, taps*H].
-        The runtime supplies the history page table for this execution.
-        Returns [B, noise_width, H] and the noisy input IDs [B, noise_width].
-        The shared forward protocol's B=1/dense entry is unchanged. All
-        reservations and stream/completion ownership remain with the caller.
-        Context is published before noise; a later failure does not roll it
-        back. Callers must not replay an already appended suffix on failure.
-        """
-        self.validate_draft_batch(
-            main_hiddens, input_ids, start_positions=start_positions, caches=caches
-        )
-        anchor = _anchor_ids(input_ids)
-        device = caches[0].segment.k_cache[0].device
-        if len(caches) == 1:
-            return self.forward_draft(
-                main_hiddens[0], input_ids, start_pos=start_positions[0], caches=caches[0]
-            )
-        lengths = tuple(start_positions)
-        if (
-            any(hidden.shape[1] for hidden in main_hiddens)
-            or metadata is None or not metadata.valid or metadata.plan.context_lens != lengths
-            or metadata.plan.noise_width != self.noise_width
-            or len(metadata.request_caches) != len(caches)
-            or any(owner is not cache.state for owner, cache in zip(metadata.request_caches, caches))
-        ):
-            raise ValueError("batched draft needs runtime metadata for already appended context")
-        page_table = metadata.page_table
-        expected_rows = sum(length > 0 for length in lengths) * self.noise_width
-        page_size = caches[0].segment.page_size
-        expected_pages = max((length + page_size - 1) // page_size for length in lengths)
-        if (
-            page_table.device != device or page_table.dtype != torch.int32
-            or page_table.shape != (expected_rows, expected_pages)
-        ):
-            raise ValueError("batched draft metadata has invalid page-table geometry")
-        noise_positions = torch.stack([
-            torch.arange(end, end + self.noise_width, device=device) for end in lengths
-        ])
-        hidden = self._embed_noise(input_ids)
-        draft_ids = anchor.new_full((len(caches), self.noise_width), self.mask_token_id)
-        draft_ids[:, 0] = anchor
-        segment = caches[0].segment
-        for index, layer in enumerate(self.layers):
-            hidden = layer(
-                hidden, segment.k_cache[index], segment.v_cache[index],
-                noise_positions, self.rotary_emb.cos_sin_cache,
-                page_table=page_table, context_length=lengths,
-            )
-        return self.norm(hidden), draft_ids
-
     def forward_draft(
         self,
         main_hidden: torch.Tensor,
         input_ids: torch.Tensor,
         *,
         start_pos: int,
-        caches: Qwen38DSparkCache | Qwen38DSparkPagedCache,
+        caches: Qwen38DSparkCache,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the noisy block and return ``(hidden, draft_ids)``.
+        """Dense reference: run the noisy block and return ``(hidden, draft_ids)``.
+
+        Serving drafts through :meth:`write_context_kv` / :meth:`propose` over
+        the target's paged K/V; this path keeps the protocol's dense contract
+        and is the reference those are tested against.
 
         ``main_hidden`` carries only the *newly accepted* context rows, and this
         call **advances ``caches`` in place**: each layer's rotated K/V for
@@ -819,9 +534,6 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         ``[start_pos - len(main_hidden), start_pos)``.  The caller therefore
         has to satisfy ``start_pos - len(main_hidden) == caches.context_length()``
         -- passing anything else silently overlaps or skips positions.
-        The paged path checks this convention and the noise position range
-        before appending. Once appended, context remains valid even if later
-        noise computation fails. The dense path retains its existing API.
 
         Only context is appended.  The noisy block is attended against the
         history and then dropped, which is the net effect of SpecForge's
@@ -840,24 +552,7 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
         block becomes a caller-supplied input instead.
         """
         anchor = _anchor_ids(input_ids)
-        page_table = None
-        if isinstance(caches, Qwen38DSparkPagedCache):
-            if anchor.numel() != 1:
-                raise ValueError("paged draft requires a single anchor")
-            if start_pos + self.noise_width > self.rotary_emb.cos_sin_cache.shape[0]:
-                raise ValueError("draft noise exceeds the rotary position range")
-            self.append_paged_context(
-                main_hidden, start_pos=start_pos,
-                segment=caches.segment, cache=caches.state,
-            )
-            num_pages = (
-                start_pos + caches.segment.page_size - 1
-            ) // caches.segment.page_size
-            page_table = caches.state.get_device_page_table(
-                main_hidden.device
-            )[:, :num_pages]
-        else:
-            context = self._project_context(main_hidden)
+        context = self._project_context(main_hidden)
         noise = self._embed_noise(input_ids)
         draft_ids = anchor.new_full(
             (anchor.shape[0], self.noise_width), self.mask_token_id
@@ -876,21 +571,14 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
 
         hidden = noise
         for index, layer in enumerate(self.layers):
-            if page_table is not None:
-                cached_k = caches.segment.k_cache[index]
-                cached_v = caches.segment.v_cache[index]
-            else:
-                new_k, new_v = layer.self_attn.prefill_context(
-                    context, context_positions, rotary_cache
-                )
-                cached_k = torch.cat([caches.keys[index], new_k], dim=2)
-                cached_v = torch.cat([caches.values[index], new_v], dim=2)
-                caches.keys[index] = cached_k
-                caches.values[index] = cached_v
-            hidden = layer(
-                hidden, cached_k, cached_v, noise_positions, rotary_cache,
-                page_table=page_table, context_length=start_pos,
+            new_k, new_v = layer.self_attn.prefill_context(
+                context, context_positions, rotary_cache
             )
+            cached_k = torch.cat([caches.keys[index], new_k], dim=2)
+            cached_v = torch.cat([caches.values[index], new_v], dim=2)
+            caches.keys[index] = cached_k
+            caches.values[index] = cached_v
+            hidden = layer(hidden, cached_k, cached_v, noise_positions, rotary_cache)
         return self.norm(hidden), draft_ids
 
     def forward_head(
@@ -936,6 +624,103 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
             torch.cat([proposal_hidden, markov_hidden], dim=-1)
         ).squeeze(-1)
         return output_ids, logits, confidence
+
+    # -- drafter API over the target's KV segment ------------------------
+
+    def kv_layer_views(self, segment: Segment, base_layer: int):
+        """Per-layer ``(k, v)`` views of the target segment's extra layers.
+
+        The draft owns layers ``base_layer .. base_layer + num_layers`` of the
+        target KV segment and shares its page tables and slot mapping. Its
+        K/V geometry must have the target's bytes per token per layer.
+        """
+        heads, dim = self.config.num_key_value_heads, self.config.head_dim
+        views = []
+        for index in range(len(self.layers)):
+            k_cache = segment.k_cache[base_layer + index]
+            v_cache = segment.v_cache[base_layer + index]
+            if k_cache.shape[-2] * k_cache.shape[-1] != heads * dim:
+                raise ValueError("draft K/V geometry does not match the target KV layer")
+            views.append((
+                k_cache.view(*k_cache.shape[:-2], heads, dim),
+                v_cache.view(*v_cache.shape[:-2], heads, dim),
+            ))
+        return views
+
+    @torch.no_grad()
+    def write_context_kv(self, taps, positions, slot_mapping, kv_views) -> None:
+        """Write draft K/V for target rows from their hidden taps.
+
+        ``taps`` is ``[rows, taps * target_hidden]`` in target query order;
+        ``positions`` / ``slot_mapping`` are the target forward's. Slots < 0
+        (padding) are skipped. Device-only, so CUDA-graph capturable.
+        """
+        from gllm.layers.ops.cache_kernels import reshape_and_cache_flash
+
+        context = self._project_context(taps.unsqueeze(0))
+        for layer, (k_cache, v_cache) in zip(self.layers, kv_views):
+            key, value = layer.self_attn.prefill_context(
+                context, positions, self.rotary_emb.cos_sin_cache
+            )
+            key = key[0].transpose(0, 1).contiguous()
+            value = value[0].transpose(0, 1).contiguous()
+            reshape_and_cache_flash(
+                key, value, k_cache, v_cache, slot_mapping, "auto", key, value,
+            )
+
+    @torch.no_grad()
+    def propose(self, anchors, context_lens, block_table, kv_views) -> torch.Tensor:
+        """Greedy proposals ``[B, k]`` after each anchor, all on the device.
+
+        ``anchors[b]`` sits at position ``context_lens[b]`` (> 0); the history
+        ``[0, context_lens[b])`` is in the draft K/V, addressed by
+        ``block_table[b]``. Shapes depend only on ``B``: CUDA-graph capturable.
+        """
+        hidden = self.noise_hidden(anchors, context_lens, block_table, kv_views)
+        return self.greedy_proposals(hidden, anchors)
+
+    @torch.no_grad()
+    def greedy_proposals(self, hidden, anchors) -> torch.Tensor:
+        """Greedy LM-head + Markov chain over normed noise hidden ``[B, k, H]``."""
+        return self.chain_proposals(
+            self._lm_head[0](hidden), anchors, lambda logits: logits.argmax(dim=-1)
+        )
+
+    def markov_bias(self, prev_token_ids: torch.Tensor) -> torch.Tensor:
+        """``[B]`` previous tokens -> ``[B, vocab]`` additive logit bias."""
+        return self.markov_head.markov_w2(self.markov_head.markov_w1(prev_token_ids))
+
+    @torch.no_grad()
+    def chain_proposals(self, logits, anchors, pick) -> torch.Tensor:
+        """Draw ``k`` proposals left to right from per-position ``logits``.
+
+        Position ``j``'s logits get the Markov bias of the token actually
+        drawn at ``j - 1`` (the anchor for ``j = 0``); ``pick`` maps the biased
+        ``[B, vocab]`` logits to ``[B]`` tokens (argmax, or a sampler that
+        also records its proposal distribution).
+        """
+        proposals = anchors.new_empty((anchors.shape[0], self.block_size))
+        prev = anchors
+        for position in range(self.block_size):
+            prev = pick(logits[:, position] + self.markov_bias(prev)).to(anchors.dtype)
+            proposals[:, position] = prev
+        return proposals
+
+    @torch.no_grad()
+    def noise_hidden(self, anchors, context_lens, block_table, kv_views) -> torch.Tensor:
+        """Normed noise-block hidden ``[B, k, H]`` over the paged history."""
+        width = self.noise_width
+        offsets = torch.arange(width, device=anchors.device, dtype=torch.int64)
+        noise_positions = context_lens.to(torch.int64)[:, None] + offsets
+        block_rows = block_table.repeat_interleave(width, dim=0)
+        seq_lens_rows = context_lens.to(torch.int32).repeat_interleave(width)
+        hidden = self._embed_noise(anchors)
+        rotary = self.rotary_emb.cos_sin_cache
+        for layer, (k_cache, v_cache) in zip(self.layers, kv_views):
+            hidden = layer.forward_paged(
+                hidden, k_cache, v_cache, noise_positions, rotary, block_rows, seq_lens_rows,
+            )
+        return self.norm(hidden)
 
     @torch.no_grad()
     def load_weights(self, weights, mp_load_progress=None) -> None:
@@ -1151,7 +936,6 @@ def _h_markov_vocab_shard(ctx: LoadContext, key: str, param: Any) -> None:
 __all__ = [
     "Qwen38DSpark",
     "Qwen38DSparkCache",
-    "Qwen38DSparkPagedCache",
     "Qwen38DSparkConfig",
     "Qwen38DSparkMapping",
 ]

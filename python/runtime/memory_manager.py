@@ -113,109 +113,6 @@ class DeepseekV4KVCacheConfig:
 
 
 @dataclass
-class DSparkKVCacheConfig:
-    """Draft geometry, independent of the target's attention cache.
-
-    A logical slot holds K/V for all draft layers and uses the manager's
-    tokens-per-page. Noise K/V is step-local scratch and is not stored here.
-    """
-
-    num_layers: int
-    kv_head_num: int
-    kv_head_dim: int
-    dtype: torch.dtype = torch.bfloat16
-
-
-@dataclass
-class DSparkRequestCache:
-    """Request-owned draft slots and the all-layers-valid history length.
-
-    Reservation only grows the page table. Publish context_length through
-    commit_dspark_context after every draft layer has written the suffix.
-    Noise and rejected target features must never advance this length.
-    """
-
-    page_table: List[int] = field(default_factory=list)
-    context_length: int = 0
-    _device_page_table: Optional[torch.Tensor] = field(
-        default=None, init=False, repr=False, compare=False
-    )
-    _page_table_staging: Optional[torch.Tensor] = field(
-        default=None, init=False, repr=False, compare=False
-    )
-    _num_uploaded_pages: int = field(default=0, init=False, repr=False, compare=False)
-    _page_table_copy_done: Optional[torch.cuda.Event] = field(
-        default=None, init=False, repr=False, compare=False
-    )
-    _pending_page_table_staging: List[Tuple[torch.cuda.Event, torch.Tensor]] = field(
-        default_factory=list, init=False, repr=False, compare=False
-    )
-
-    def get_device_page_table(self, device: torch.device) -> torch.Tensor:
-        """Return a request-owned CUDA int32 table with shape [1, pages].
-
-        The host table is append-only until reset. Updates and consumers must
-        use the same CUDA stream, or the caller must supply synchronization.
-        The uploaded count means enqueued, not device-complete: stream order
-        makes those entries visible before the consuming kernels execute.
-        """
-        count = len(self.page_table)
-        if count < self._num_uploaded_pages:
-            raise ValueError("reset the draft cache before replacing its pages")
-        table = self._device_page_table
-        if table is None or count > table.numel():
-            capacity = max(count, 1 if table is None else 2 * table.numel())
-            grown = torch.empty(capacity, device=device, dtype=torch.int32)
-            staging = torch.empty(
-                capacity, device="cpu", dtype=torch.int32, pin_memory=True
-            )
-            if self._num_uploaded_pages:
-                grown[:self._num_uploaded_pages].copy_(
-                    table[:self._num_uploaded_pages], non_blocking=True
-                )
-            # Only capacity growth retires a staging allocation. Its last
-            # event covers every earlier copy from it on the consuming stream.
-            self._pending_page_table_staging = [
-                (event, buffer)
-                for event, buffer in self._pending_page_table_staging
-                if not event.query()
-            ]
-            if (
-                self._page_table_copy_done is not None
-                and not self._page_table_copy_done.query()
-            ):
-                self._pending_page_table_staging.append(
-                    (self._page_table_copy_done, self._page_table_staging)
-                )
-            self._device_page_table = table = grown
-            self._page_table_staging = staging
-            self._page_table_copy_done = torch.cuda.Event()
-
-        if count > self._num_uploaded_pages:
-            begin = self._num_uploaded_pages
-            # Never overwrite an earlier staging range: a previous H2D copy
-            # may still be reading it. Only newly allocated IDs cross to CUDA.
-            staging = self._page_table_staging[begin:count]
-            staging.copy_(torch.tensor(
-                self.page_table[begin:count], device="cpu", dtype=torch.int32
-            ))
-            table[begin:count].copy_(staging, non_blocking=True)
-            self._page_table_copy_done.record(torch.cuda.current_stream(device))
-            self._num_uploaded_pages = count
-        return table[:count].unsqueeze(0)
-
-    def reset(self) -> None:
-        """Clear metadata after freeing slots and finishing GPU users/copies."""
-        self.page_table.clear()
-        self.context_length = 0
-        self._device_page_table = None
-        self._page_table_staging = None
-        self._num_uploaded_pages = 0
-        self._page_table_copy_done = None
-        self._pending_page_table_staging.clear()
-
-
-@dataclass
 class SSMCacheConfig:
     """Layout description for the recurrent-state cache used by linear-attention
     (Mamba / Gated DeltaNet) layers.
@@ -1055,7 +952,6 @@ class MemoryManager:
         mla_cache_fp8: bool = False,
         speculative_num_draft_tokens: int = 0,
         ssm_snapshot_stride_tokens: int = 256,
-        dspark_kv_cache_config: Optional[DSparkKVCacheConfig] = None,
     ):
         """
         Args:
@@ -1070,9 +966,6 @@ class MemoryManager:
             dsv4_state_cache_config: packed request-owned state layout for
                 DeepSeek-V4 learned KV compressors.
             dsv4_kv_cache_config: V4 raw/compressed/index paged-cache banks.
-            dspark_kv_cache_config: optional draft K/V geometry. Registers an
-                independent cache type in the same arena; no draft slots are
-                claimed until explicitly allocated by the caller.
             ssm_snapshot_stride_tokens: token granularity of recurrent-state
                 prefix caching, rounded down to whole KV pages (see
                 ``PrefixSegment.ssm_snapshot_stride``). Smaller = finer restore
@@ -1099,7 +992,6 @@ class MemoryManager:
         self.ssm_cache_config = ssm_cache_config
         self.dsv4_state_cache_config = dsv4_state_cache_config
         self.dsv4_kv_cache_config = dsv4_kv_cache_config
-        self.dspark_kv_cache_config = dspark_kv_cache_config
         # Draft-chain length (speculative_num_draft_tokens); a running seq borrows up to this many
         # transient checkpoint blocks during an MTP verify step (0 = MTP off).
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
@@ -1110,7 +1002,6 @@ class MemoryManager:
         # Populated by :meth:`init`; ``None`` when the model is not hybrid.
         self.ssm_segment: Optional[SSMSegment] = None
         self.dsv4_state_segment: Optional[DeepseekV4StateSegment] = None
-        self.dspark_segment: Optional[Segment] = None
         self.cache_arena: Optional[CacheArena] = None
         self.segment: Union[Segment, PrefixSegment] = None
 
@@ -1167,8 +1058,6 @@ class MemoryManager:
 
     def init(self, segment_cls=Segment, reserve_dummy_page: bool = False):
         """Allocate one arena and register every persistent model cache."""
-        if self.dspark_kv_cache_config is not None and issubclass(segment_cls, PrefixSegment):
-            raise ValueError("DSpark cache does not support prefix caching")
         layouts = self._cache_layouts()
         physical_page_bytes = select_physical_page_bytes(layouts.values())
         kv_layout = layouts["kv_cache"]
@@ -1217,19 +1106,6 @@ class MemoryManager:
             mla_cache_fp8=self.mla_cache_fp8,
             dsv4_kv_cache_config=self.dsv4_kv_cache_config,
         )
-
-        if self.dspark_kv_cache_config is not None:
-            cfg = self.dspark_kv_cache_config
-            draft_cache = caches["dspark_kv_cache"]
-            # Separate logical slot IDs and geometry, shared physical ownership.
-            self.dspark_segment = Segment(
-                cfg.num_layers,
-                self.page_size,
-                cfg.kv_head_num,
-                cfg.kv_head_dim,
-                False,
-                draft_cache,
-            )
 
         if self.ssm_cache_config is not None:
             cfg = self.ssm_cache_config
@@ -1304,7 +1180,6 @@ class MemoryManager:
 
     def validate_model_max_length(
         self, model_max_length: int, *, mtp_lookahead: int = 0,
-        dspark_lookahead: int = 0,
     ) -> int:
         """Check single-request capacity at startup, before graph capture.
 
@@ -1314,11 +1189,7 @@ class MemoryManager:
         This touches CPU ownership metadata only, not the cache tensors.
         Prefix snapshots are evictable and need no permanent reservation.
         """
-        if dspark_lookahead < 0 or (dspark_lookahead and mtp_lookahead):
-            raise ValueError("DSpark lookahead must be nonnegative and cannot mix with MTP")
-        if dspark_lookahead and self.dspark_segment is None:
-            raise ValueError("DSpark lookahead requires a draft cache")
-        lookahead = dspark_lookahead or mtp_lookahead
+        lookahead = mtp_lookahead
         segment = self.recurrent_segment
         allocator = self.cache_arena.allocator
         blocks = []
@@ -1333,30 +1204,6 @@ class MemoryManager:
                 )
         try:
             kv_pages = self.get_num_free_pages()
-            if self.dspark_segment is not None:
-                # Both types borrow the same physical pages. Claim draft first,
-                # then target, matching request reservation. Probe without
-                # leaving any temporary ownership behind.
-                target_type = self.segment.id_allocator.cache_type
-                draft_type = self.dspark_segment.id_allocator.cache_type
-                low, high = 0, min(kv_pages, self.dspark_segment.get_num_free_pages())
-                while low < high:
-                    count = (low + high + 1) // 2
-                    draft = allocator.allocate(draft_type, count)
-                    target = None
-                    try:
-                        if draft is not None:
-                            target = allocator.allocate(target_type, count)
-                        if target is not None:
-                            low = count
-                        else:
-                            high = count - 1
-                    finally:
-                        if target:
-                            allocator.free(target_type, target)
-                        if draft:
-                            allocator.free(draft_type, draft)
-                kv_pages = low
             # Reserve the worst speculative suffix for both paged histories.
             max_length = max(0, kv_pages * self.page_size - lookahead)
         finally:
@@ -1377,11 +1224,21 @@ class MemoryManager:
             )
         return max_length
 
+    def max_recurrent_requests(self, budget_bytes: int) -> Optional[int]:
+        """Most running requests whose recurrent state fits in ``budget_bytes``.
+
+        Each running request holds ``1 + k`` state slots of the shared arena,
+        so this bounds concurrency before the arena is sized. ``None`` when the
+        model keeps no recurrent state.
+        """
+        if self.ssm_cache_config is None:
+            return None
+        slot = self._ssm_cache_layout("ssm_state").entry_bytes
+        return budget_bytes // ((1 + self.speculative_num_draft_tokens) * slot)
+
     def _cache_layouts(self) -> Dict[str, CacheLayout]:
         """Declare all arena groups before choosing a physical page size."""
         layouts = [self._kv_cache_layout()]
-        if self.dspark_kv_cache_config is not None:
-            layouts.append(self._dspark_kv_cache_layout())
         if self.ssm_cache_config is not None:
             layouts.extend((
                 self._ssm_cache_layout("ssm_state"),
@@ -1499,25 +1356,6 @@ class MemoryManager:
                 )
             )
         return CacheLayout("kv_cache", tuple(tensors))
-
-    def _dspark_kv_cache_layout(self) -> CacheLayout:
-        """Describe draft history as [slot, layer, token, kv_head, head_dim].
-
-        Per-layer views are NHD with the arena's physical slot stride, which
-        need not equal the packed layer size. Registration creates views only;
-        reserved capacity does not establish any valid context length.
-        """
-        cfg = self.dspark_kv_cache_config
-        if cfg is None:
-            raise RuntimeError("cannot register DSpark cache without its config")
-        shape = (cfg.num_layers, self.page_size, cfg.kv_head_num, cfg.kv_head_dim)
-        return CacheLayout(
-            "dspark_kv_cache",
-            (
-                CacheTensorLayout("key", cfg.dtype, shape),
-                CacheTensorLayout("value", cfg.dtype, shape),
-            ),
-        )
 
     def _ssm_cache_layout(self, name: str) -> CacheLayout:
         cfg = self.ssm_cache_config
@@ -1666,73 +1504,6 @@ class MemoryManager:
             )
             for _ in range(num_page):
                 seq.page_table.append(self.segment.allocate())
-
-    def reserve_dspark_pages(
-        self,
-        seq: GenerationSequence,
-        cache: DSparkRequestCache,
-        *,
-        target_length: int,
-        draft_length: int,
-    ) -> bool:
-        """Reserve one request's state, draft and target demand together.
-
-        Lengths are exclusive maximum write positions, not committed lengths.
-        State demand follows the manager's recurrent configuration; provisioning
-        DSpark verify checkpoints is a separate runtime integration concern.
-        On exhaustion only new claims are released; existing pages and valid
-        context remain intact. No token list or computation progress is changed.
-        """
-        if self.dspark_segment is None:
-            raise RuntimeError("DSpark page reservation requires a draft cache")
-        if target_length < 0 or draft_length < cache.context_length:
-            raise ValueError((target_length, draft_length, cache.context_length))
-        had_state = seq.recurrent_state_slot is not None or seq.ssm_block_table is not None
-        if not self.allocate_recurrent_slot(seq):
-            return False
-        allocator = self.cache_arena.allocator
-        draft_type = self.dspark_segment.id_allocator.cache_type
-        target_type = self.segment.id_allocator.cache_type
-        draft = target = None
-        committed = False
-        try:
-            count = max(0, (draft_length + self.page_size - 1) // self.page_size - len(cache.page_table))
-            draft = allocator.allocate(draft_type, count)
-            if draft is None:
-                return False
-            count = max(0, (target_length + self.page_size - 1) // self.page_size - len(seq.page_table))
-            target = allocator.allocate(target_type, count)
-            if target is None:
-                return False
-            cache.page_table.extend(draft)
-            seq.page_table.extend(target)
-            committed = True
-            return True
-        finally:
-            if not committed:
-                if target:
-                    allocator.free(target_type, target)
-                if draft:
-                    allocator.free(draft_type, draft)
-                if not had_state:
-                    self.free_recurrent_slot(seq)
-
-    def commit_dspark_context(self, cache: DSparkRequestCache, length: int) -> None:
-        """Publish a contiguous history suffix only after all layer writes."""
-        if not cache.context_length <= length <= len(cache.page_table) * self.page_size:
-            raise ValueError((cache.context_length, length, len(cache.page_table)))
-        cache.context_length = length
-
-    def free_dspark_cache(self, seq: GenerationSequence, cache: DSparkRequestCache) -> None:
-        """Release the request after its GPU users have finished.
-
-        Runtime must call this for DSpark teardown/preemption rather than the
-        target-only free. Clearing both tables makes repeated cleanup safe.
-        """
-        self.dspark_segment.free_many(cache.page_table)
-        cache.reset()
-        self.free(seq)
-        seq.page_table.clear()
 
     def register_decode_boundary(self, seq: GenerationSequence, pos: int) -> None:
         """No-op without a prefix cache; overridden by ``PrefixMemoryManager``."""

@@ -1137,6 +1137,11 @@ class Qwen3_5Model(nn.Module):
     page and recurrent-state arena layouts match the model's real shape.
     """
 
+    # Optional (layer_ids, buffer): every forward writes these layers'
+    # post-block residual streams into buffer[:tokens] (see
+    # ``set_hidden_tap_sink``). Used by a DSpark drafter.
+    _tap_sink = None
+
     def __init__(self, config, decoder_layer_type=None):
         super().__init__()
         self.config = config
@@ -1175,7 +1180,6 @@ class Qwen3_5Model(nn.Module):
         self._layer_types: List[str] = []
         self._kv_layer_ids: List[Optional[int]] = []
         self._ssm_layer_ids: List[Optional[int]] = []
-
         kv_counter = 0
         ssm_counter = 0
         layers: List[Qwen3_5DecoderLayer] = []
@@ -1296,6 +1300,25 @@ class Qwen3_5Model(nn.Module):
             input_data, hidden_states, residual, hidden_tap_layers=layer_ids
         )
 
+    def set_hidden_tap_sink(self, layer_ids: Tuple[int, ...], buffer: torch.Tensor) -> None:
+        """Make every forward also write hidden taps into ``buffer[:tokens]``.
+
+        ``buffer`` is persistent ``[max_tokens, len(layer_ids) * hidden]`` so
+        captured CUDA graphs write it at a fixed address. Columns follow
+        ``layer_ids`` order, as in :meth:`forward_with_hidden_taps`.
+        """
+        layer_ids = tuple(layer_ids)
+        if (get_tp_size(), get_pp_size(), get_dp_size()) != (1, 1, 1):
+            raise ValueError("Qwen3.5 hidden taps require TP=PP=DP=1")
+        if (
+            not layer_ids or len(set(layer_ids)) != len(layer_ids)
+            or any(not self.start_layer <= i < self.end_layer for i in layer_ids)
+        ):
+            raise ValueError("tap layer ids must be unique block indices")
+        if buffer.ndim != 2 or buffer.shape[1] != len(layer_ids) * self.config.hidden_size:
+            raise ValueError("tap sink must be [max_tokens, taps * hidden]")
+        self._tap_sink = (layer_ids, buffer)
+
     def _forward(
         self,
         input_data: InputData,
@@ -1310,6 +1333,17 @@ class Qwen3_5Model(nn.Module):
 
         taps = None
         tap_columns = None
+        sink_taps = None
+        if hidden_tap_layers is None and self._tap_sink is not None:
+            sink_layers, sink = self._tap_sink
+            if hidden_states.shape[0] > sink.shape[0]:
+                raise ValueError("forward exceeds the hidden tap sink capacity")
+            sink_taps = sink[: hidden_states.shape[0]]
+            width = self.config.hidden_size
+            tap_columns = {
+                layer_id: slice(index * width, (index + 1) * width)
+                for index, layer_id in enumerate(sink_layers)
+            }
         if hidden_tap_layers is not None:
             width = self.config.hidden_size
             taps = hidden_states.new_empty(
@@ -1328,7 +1362,8 @@ class Qwen3_5Model(nn.Module):
                 # complete stream now: the next fused norm mutates both inputs.
                 # Writing into owned storage leaves the model's pair unchanged.
                 torch.add(
-                    hidden_states, residual, out=taps[:, tap_columns[global_idx]]
+                    hidden_states, residual,
+                    out=(taps if sink_taps is None else sink_taps)[:, tap_columns[global_idx]],
                 )
             if (
                 deepstack_input_embeds is not None
