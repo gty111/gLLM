@@ -175,3 +175,117 @@ def test_sampled_pick_records_the_distribution_it_draws_from(sparse):
     assert (q[tokens] > 0).all()
     empirical = torch.bincount(tokens, minlength=vocab).float() / rows
     assert (empirical - q).abs().max() < 0.03
+
+
+def _tap_target(hidden_size, num_layers=3):
+    """Tiny target backbone (real ``Qwen3_5Model._forward``) with dense layers."""
+    from gllm.models.qwen3_5 import Qwen3_5Model
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+
+        def forward(self, data, hidden, residual):
+            residual = hidden.clone() if residual is None else residual + hidden
+            return torch.tanh(self.proj(residual)), residual
+
+    class Norm(torch.nn.Module):
+        def forward(self, hidden, residual):
+            return hidden + residual, residual
+
+    model = Qwen3_5Model.__new__(Qwen3_5Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=hidden_size)
+    model.start_layer, model.end_layer = 0, num_layers
+    model.embed_tokens = torch.nn.Embedding(128, hidden_size)
+    model.layers = torch.nn.ModuleList(Layer() for _ in range(num_layers))
+    model.norm = Norm()
+    model._fuse_tail = False
+    return model.cuda().bfloat16()
+
+
+@torch.no_grad()
+def test_graph_replays_refresh_tap_sink_and_draft_kv():
+    """A captured target forward + ``kv_sync`` must follow each replay's inputs.
+
+    The sink and the draft K/V are written at fixed addresses inside the
+    graph; every replay with new tokens, positions and slots must leave
+    exactly what an eager run on those inputs leaves.
+    """
+    from gllm.speculative.dspark_drafter import DSparkDrafter
+
+    rows, page_size = 6, 16
+    config, draft, segment, tables = _setup([3 * page_size], page_size)
+    target = _tap_target(config.hidden_size)
+    taps = torch.zeros(16, config.target_hidden_size, device="cuda", dtype=torch.bfloat16)
+    target.set_hidden_tap_sink(config.target_layer_ids, taps)
+    drafter = DSparkDrafter(draft, kv_base_layer=3, taps=taps)
+    drafter.bind_kv(segment)
+
+    tokens = torch.zeros(rows, dtype=torch.long, device="cuda")
+    positions = torch.zeros(rows, dtype=torch.long, device="cuda")
+    slots = torch.zeros(rows, dtype=torch.long, device="cuda")
+    data = SimpleNamespace(
+        seqs=[SimpleNamespace(mm_contents=None)], get_tokens=lambda: tokens,
+        get_position=lambda: positions, get_slot_mapping=lambda: slots,
+    )
+
+    def step():
+        target(data)
+        drafter.kv_sync(data, rows)
+
+    table = torch.tensor(tables[0])
+    gen = torch.Generator().manual_seed(1)
+
+    def load(start):
+        """New tokens for rows at positions ``start..start+rows``."""
+        tokens.copy_(torch.randint(0, 128, (rows,), generator=gen))
+        pos = torch.arange(start, start + rows)
+        positions.copy_(pos)
+        slots.copy_(table[pos // page_size] * page_size + pos % page_size)
+
+    def snapshot():
+        return taps[:rows].clone(), [(k.clone(), v.clone()) for k, v in drafter.kv_views]
+
+    load(0)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        step()  # warm up outside capture
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+
+    previous = None
+    for start in (0, 10, 20):  # the second window crosses a page boundary
+        load(start)
+        state = (tokens.clone(), positions.clone(), slots.clone())
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = snapshot()
+
+        # Eager rerun of the same inputs from a clean slate.
+        taps.zero_()
+        for k, v in drafter.kv_views:
+            k.zero_()
+            v.zero_()
+        if previous is not None:  # restore earlier windows the eager run does not rewrite
+            for (k, v), (pk, pv) in zip(drafter.kv_views, previous[1]):
+                k.copy_(pk)
+                v.copy_(pv)
+        for dst, src in zip((tokens, positions, slots), state):
+            dst.copy_(src)
+        step()
+        eager = snapshot()
+
+        torch.testing.assert_close(replayed[0], eager[0], rtol=0, atol=0)
+        for (rk, rv), (ek, ev) in zip(replayed[1], eager[1]):
+            torch.testing.assert_close(rk, ek, rtol=0, atol=0)
+            torch.testing.assert_close(rv, ev, rtol=0, atol=0)
+        if previous is not None:
+            assert not torch.equal(replayed[0], previous[0])  # the sink did move
+        written = slots // page_size, slots % page_size
+        assert all(k[written].abs().sum() > 0 for k, _ in drafter.kv_views)
+        previous = replayed
