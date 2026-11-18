@@ -344,3 +344,21 @@ def test_triton_mla_decode_honors_arena_block_stride():
     torch.cuda.synchronize()
     assert torch.equal(contiguous[0], strided[0])
     assert torch.equal(contiguous[1], strided[1])
+
+
+def test_recurrent_request_bound_covers_what_the_arena_can_run():
+    cfg = SSMCacheConfig(
+        num_layers=2, conv_dim=12, conv_kernel=4, num_v_heads=2, head_v_dim=4,
+        head_k_dim=4, dtype=torch.float32, conv_state_dtype=torch.bfloat16,
+    )
+    kwargs = dict(num_layers=2, dtype=torch.bfloat16, page_size=4, kv_head_num=2,
+                  kv_head_dim=8, vocab_size=32, speculative_num_draft_tokens=3)
+    assert MemoryManager(0.9, **kwargs).max_recurrent_requests(1 << 30) is None
+    manager = MemoryManager(0.9, ssm_cache_config=cfg, **kwargs)
+    state = manager._ssm_cache_layout("ssm_state")
+    budget = 40 * state.entry_bytes
+    assert manager.max_recurrent_requests(budget) == 10
+    # An arena of that size never holds more working states than the bound.
+    arena = CacheArena(torch.empty(budget, dtype=torch.uint8),
+                       physical_page_bytes=state.entry_bytes)
+    assert arena.register_cache(state).num_slots // 4 <= 10

@@ -132,6 +132,21 @@ def test_sampled_acceptance_matches_sync_without_reading_gpu_on_host(monkeypatch
 
 
 @cuda
+@pytest.mark.parametrize("chunk_seqs", [1, 2])
+def test_dense_acceptance_is_unchanged_when_p_is_chunked(monkeypatch, chunk_seqs):
+    x1, hidden = [5, 5, 5], torch.zeros(3, 2, device="cuda")
+    whole, _, _ = _runner(monkeypatch, asynchronous=False, sparse=False)
+    expected = whole._mtp_decode(hidden, x1)
+    runner, _, _ = _runner(monkeypatch, asynchronous=False, sparse=False)
+    runner._DENSE_P_CHUNK_BYTES = 4 * 8 * 4 * chunk_seqs  # fp32, vocab 8, 1 + k rows
+    transform, rows = runner._mtp_probs_static, []
+    runner._mtp_probs_static = lambda logits, *args: rows.append(len(logits)) or transform(logits, *args)
+    assert runner._mtp_decode(hidden, x1) == expected
+    # All 12 verify rows are transformed once, a whole sequence at a time.
+    assert sum(rows) == 12 and max(rows) <= 4 * chunk_seqs and all(n % 4 == 0 for n in rows)
+
+
+@cuda
 def test_sampled_successor_uses_gpu_relay_before_predecessor_collection(monkeypatch):
     runner, seqs, _ = _runner(monkeypatch, asynchronous=True, sparse=True)
     first = runner._mtp_decode(torch.zeros(3, 2, device="cuda"), [5, 5, 5])

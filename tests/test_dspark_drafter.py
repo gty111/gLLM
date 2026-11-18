@@ -161,7 +161,8 @@ def test_sampled_pick_records_the_distribution_it_draws_from(sparse):
     if sparse:
         pick = runner._dspark_sparse_pick(temps, top_ks, top_ps, 72, record)
     else:
-        pick = runner._dspark_dense_pick(temps, top_ks, top_ps, record)
+        dense = torch.empty((rows, 1, vocab), device="cuda")
+        pick = runner._dspark_dense_pick(temps, top_ks, top_ps, dense)
     tokens = pick(logits)
     if sparse:
         vals, idx, drawn = record[0]
@@ -170,7 +171,7 @@ def test_sampled_pick_records_the_distribution_it_draws_from(sparse):
         torch.testing.assert_close(drawn, vals.gather(1, column[:, None]).squeeze(1))
         q = torch.zeros(vocab, device="cuda").scatter_(0, idx[0], vals[0])
     else:
-        q = record[0][0]
+        q = dense[0, 0]
     assert (q[tokens] > 0).all()
     empirical = torch.bincount(tokens, minlength=vocab).float() / rows
     assert (empirical - q).abs().max() < 0.03

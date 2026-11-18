@@ -1224,6 +1224,18 @@ class MemoryManager:
             )
         return max_length
 
+    def max_recurrent_requests(self, budget_bytes: int) -> Optional[int]:
+        """Most running requests whose recurrent state fits in ``budget_bytes``.
+
+        Each running request holds ``1 + k`` state slots of the shared arena,
+        so this bounds concurrency before the arena is sized. ``None`` when the
+        model keeps no recurrent state.
+        """
+        if self.ssm_cache_config is None:
+            return None
+        slot = self._ssm_cache_layout("ssm_state").entry_bytes
+        return budget_bytes // ((1 + self.speculative_num_draft_tokens) * slot)
+
     def _cache_layouts(self) -> Dict[str, CacheLayout]:
         """Declare all arena groups before choosing a physical page size."""
         layouts = [self._kv_cache_layout()]

@@ -1107,7 +1107,9 @@ class ModelRunner(
                 torch.zeros((3, num_cal_tokens), device="cpu")
             )
         stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullcontext()
-        with stream_ctx:
+        # The startup profile also covers a speculative step's own tensors.
+        step_ctx = self.mtp_profile_step() if stream is None else _nullcontext()
+        with stream_ctx, step_ctx:
             self._prepare_attention_metadata(self.input_data)
             if is_first_pp_rank():
                 self.model(self.input_data)

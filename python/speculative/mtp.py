@@ -6,6 +6,7 @@ Method bodies here were moved verbatim out of ``gllm.runtime.model_runner``;
 original meaning.
 """
 
+import contextlib
 from typing import List, Optional
 
 import torch
@@ -500,6 +501,116 @@ class MtpMixin:
         probs = top_p_renorm_prob(probs, top_ps)
         return probs
 
+    @contextlib.contextmanager
+    def mtp_profile_step(self):
+        """Hold a speculative step's largest tensors around the profiled forward.
+
+        The cache arena is sized from what the profiled target forward leaves
+        free, but at the largest MTP batch a step also needs the verify logits
+        over ``nd * (1 + k)`` rows and, when sampling without a top-k limit,
+        the dense draft distributions ``q`` ``[nd, k, vocab]``, which stay
+        alive through the verify forward and the accept. Running the same ops
+        at that shape keeps their blocks in the caching allocator, so the
+        arena is sized from what remains.
+        """
+        if not (self.mtp_enabled and is_last_pp_rank()):
+            yield
+            return
+        k = self.speculative_num_draft_tokens
+        nd = min(self.max_running_seqs, self.max_num_batched_tokens // (1 + k))
+        if self._mtp_max_batch > 0:
+            nd = min(nd, self._mtp_max_batch)
+        # Hybrid models run out of recurrent state slots long before the token
+        # budget; the arena will be at most this large.
+        budget = int(torch.cuda.mem_get_info()[0] * self.memory_manager.gpu_memory_util)
+        by_state = self.memory_manager.max_recurrent_requests(budget)
+        if by_state is not None:
+            nd = min(nd, by_state)
+        if k < 1 or nd < 1:
+            yield
+            return
+        vocab = self.memory_manager.vocab_size
+        dev = torch.device("cuda", torch.cuda.current_device())
+        dtype = self.model_loader.dtype
+        rows = nd * (1 + k)
+
+        def params(n):
+            # Unrestricted top-k with a top-p cut: the dense path, both renorms.
+            return (
+                torch.ones((n, 1), dtype=torch.float32, device=dev),
+                torch.full((n,), vocab, dtype=torch.int32, device=dev),
+                torch.full((n,), 0.95, dtype=torch.float32, device=dev),
+            )
+
+        q = None
+        if self._mtp_can_sample:
+            # Draft: the logits it samples from (DSpark's block forward yields
+            # all k positions at once) and one position's transform into q.
+            width = k if getattr(self, "dspark_enabled", False) else 1
+            q = torch.empty((nd, k, vocab), dtype=torch.float32, device=dev)
+            logits = torch.zeros((nd, width, vocab), dtype=dtype, device=dev)
+            q[:, 0].copy_(self._mtp_probs_static(logits[:, 0], *params(nd)))
+            del logits
+        yield
+        v_logits = torch.zeros((rows, vocab), dtype=dtype, device=dev)
+        if q is not None:
+            # Verify accept, then the residual against q.
+            drafts = torch.zeros((nd, k), dtype=torch.int64, device=dev)
+            u = torch.zeros((nd, k), device=dev)
+            na, p_row = self._mtp_dense_accept(v_logits, *params(rows), drafts, u + 1, u)
+            ar = torch.arange(nd, device=dev)
+            resid = (p_row - q[ar, na.clamp(max=k - 1)]).clamp_min(0)
+            del na, p_row, resid
+        torch.cuda.synchronize()
+        del q, v_logits
+
+    # Largest dense fp32 ``p`` block the verify accept materializes at once.
+    # The transform holds about three copies, so at 4096 verify rows over a
+    # 248k vocab the unchunked form needs ~12 GB on top of the logits.
+    _DENSE_P_CHUNK_BYTES = 512 << 20
+
+    @staticmethod
+    def _mtp_accepted_prefix(p_d, q_d, u):
+        """Accepted draft count per row: accept ``d_p`` with prob ``min(1, p/q)``.
+
+        ``q <= 0`` can only happen for a token q never proposes, so it counts
+        as certain acceptance (matches the old scalar branch).
+        """
+        ratio = torch.where(
+            q_d > 0,
+            (p_d / q_d.clamp_min(1e-30)).clamp_max(1.0),
+            torch.ones_like(p_d),
+        )
+        accept = u < ratio  # [nd,kk] bool
+        # Leading all-accept prefix length (same cumprod trick as greedy).
+        return torch.cumprod(accept.to(torch.int32), dim=1).sum(dim=1)
+
+    def _mtp_dense_accept(self, logits, temps, top_ks, top_ps, drafts, q_d, u):
+        """Rejection accept against a dense target distribution ``p``.
+
+        ``logits`` holds ``1 + kk`` verify rows per sequence and ``drafts`` is
+        ``[nd, kk]``. Each sequence only needs p at its drafts and the full p
+        row where it stops (the residual or bonus row), so p is built for a
+        chunk of sequences at a time and only those survive. Returns the
+        accepted count ``[nd]`` and that row ``[nd, vocab]``.
+        """
+        nd, kk = drafts.shape
+        qlen, vocab = kk + 1, logits.shape[-1]
+        per = max(self._DENSE_P_CHUNK_BYTES // (4 * vocab * qlen), 1)
+        na = torch.empty(nd, dtype=torch.int64, device=logits.device)
+        p_row = torch.empty((nd, vocab), dtype=torch.float32, device=logits.device)
+        for a in range(0, nd, per):
+            b = min(a + per, nd)
+            rows = slice(a * qlen, b * qlen)
+            p = self._mtp_probs_static(
+                logits[rows], temps[rows], top_ks[rows], top_ps[rows]
+            ).view(b - a, qlen, vocab)
+            p_d = p[:, :kk].gather(2, drafts[a:b].unsqueeze(-1)).squeeze(-1)
+            na[a:b] = self._mtp_accepted_prefix(p_d, q_d[a:b], u[a:b])
+            p_row[a:b] = p[torch.arange(b - a, device=p.device), na[a:b]]
+            del p
+        return na, p_row
+
     # Headroom over the largest per-request ``top_k`` when building the sparse
     # (top-k) distribution: the reference kernel is TIE-INCLUSIVE (it keeps every
     # token whose prob equals the k-th largest), and bf16 logits over a 248k
@@ -644,6 +755,7 @@ class MtpMixin:
         cur_hidden = hidden
         sampled = gen is not None
         q_steps, qv_steps, qi_steps, qd_steps = [], [], [], []
+        q_all = None
         penalties = getattr(self, "_mtp_penalties", None)
         penalty_history = penalties.history.clone() if penalties is not None else None
 
@@ -675,7 +787,13 @@ class MtpMixin:
                     .to(torch.int64)
                 )
                 tok = self._mtp_bcast_tp(tok)
-                q_steps.append(q)
+                # Written step by step: stacking k per-step copies would hold
+                # q twice.
+                nonlocal q_all
+                if q_all is None:
+                    q_all = q.new_empty((nd, k, q.shape[-1]))
+                q_all[:, len(q_steps)].copy_(q)
+                q_steps.append(tok)
                 return tok
 
         for j in range(k):
@@ -714,7 +832,7 @@ class MtpMixin:
                 torch.stack(qi_steps, dim=1),
                 torch.stack(qd_steps, dim=1),
             )
-        return drafts_cols, self._q_dense(torch.stack(q_steps, dim=1))
+        return drafts_cols, self._q_dense(q_all)
 
     def _draft_chain_eager_sampled(
         self, decode_seqs, ctx_lens, x1, hidden, k, nd, gen, sparse=False
@@ -870,7 +988,12 @@ class MtpMixin:
             blk = block_table[row_idx, (pos // page_sz)]
             return blk.to(torch.int64) * page_sz + (pos % page_sz)
 
-        step_q, step_qv, step_qi, step_qd = [], [], [], []
+        step_qv, step_qi, step_qd = [], [], []
+        if sampled and not sparse:
+            # Written step by step: stacking k per-step copies would hold q twice.
+            q_all = torch.empty(
+                (nd, k, self.memory_manager.vocab_size), dtype=torch.float32, device=dev
+            )
         for j in range(k):
             if j > 0:
                 self._d_tok[:bucket].copy_(self._d_next_tok[:bucket])
@@ -906,7 +1029,7 @@ class MtpMixin:
                         ).sum(dim=1)
                     )
                 else:
-                    step_q.append(self._d_q[:nd].clone())
+                    q_all[:, j].copy_(self._d_q[:nd])
 
         # Stash the GPU draft tensor so the verify prep / accept step can take
         # the tokens straight from the device.
@@ -920,7 +1043,7 @@ class MtpMixin:
                 torch.stack(step_qd, dim=1),  # [nd, k]
             )
         else:
-            q = self._q_dense(torch.stack(step_q, dim=1))  # [nd, k, vocab]
+            q = self._q_dense(q_all)  # [nd, k, vocab]
         # Both sampling modes pass drafts directly to verify/accept on device.
         # Reading them here would wait for the entire draft chain and break
         # launch-current/collect-previous overlap before target verification.
@@ -1487,12 +1610,19 @@ class MtpMixin:
             return idx.gather(1, column).squeeze(1)
         return pick
 
-    def _dspark_dense_pick(self, temps, top_ks, top_ps, record):
-        """Sampler over the full-vocabulary proposal distribution; records ``q``."""
+    def _dspark_dense_pick(self, temps, top_ks, top_ps, q):
+        """Sampler over the full-vocabulary proposal distribution.
+
+        Writes position ``j``'s distribution into ``q[:, j]`` (``[nd, k,
+        vocab]``, allocated once: stacking per-position copies would hold q
+        twice).
+        """
+        positions = iter(range(q.shape[1]))
+
         def pick(logits):
-            q = self._mtp_probs_static(logits, temps, top_ks, top_ps)
-            record.append(q)
-            return self._gumbel_argmax(q)
+            dist = q[:, next(positions)]
+            dist.copy_(self._mtp_probs_static(logits, temps, top_ks, top_ps))
+            return self._gumbel_argmax(dist)
         return pick
 
     def _dspark_propose(
@@ -1551,15 +1681,18 @@ class MtpMixin:
         drafter = self._dspark_drafter
         if not sampled:
             return drafter.propose(x1_gpu[:nd], context_lens, block_table)
-        record = []
         if sparse:
+            record = []
             pick = self._dspark_sparse_pick(temps, top_ks, top_ps, self._mtp_kpad(decode_seqs), record)
-        else:
-            pick = self._dspark_dense_pick(temps, top_ks, top_ps, record)
-        drafts = drafter.propose_with(x1_gpu[:nd], context_lens, block_table, pick)
-        if sparse:
+            drafts = drafter.propose_with(x1_gpu[:nd], context_lens, block_table, pick)
             return drafts, self._q_sparse(*(torch.stack(part, dim=1) for part in zip(*record)))
-        return drafts, self._q_dense(torch.stack(record, dim=1))
+        q = torch.empty(
+            (nd, drafter.draft.block_size, self.memory_manager.vocab_size),
+            dtype=torch.float32, device=dev,
+        )
+        pick = self._dspark_dense_pick(temps, top_ks, top_ps, q)
+        drafts = drafter.propose_with(x1_gpu[:nd], context_lens, block_table, pick)
+        return drafts, self._q_dense(q)
 
     def _mtp_gpu_prep_batch(self, decode_seqs, ctx_lens, x1, bucket):
         """Stage this MTP step's per-seq facts, returning the prep helper.
@@ -2248,7 +2381,7 @@ class MtpMixin:
         # [seq0: x1,d1..dk | seq1: ...]; the per-seq sampling params are expanded
         # on-device with ``repeat_interleave`` instead of building a 256-entry
         # python seq list per step.
-        p_dists = None  # dense [num_v, vocab] (unrestricted-top_k batches)
+        p_dense = None  # (logits, temps, top_ks, top_ps) per verify row
         p_sparse = None  # (vals, idx) [nd, 1+kk, k_pad] (top_k-restricted)
         if _use_rej:
             num_v = nd * (1 + kk)
@@ -2266,9 +2399,8 @@ class MtpMixin:
                 pv, pi = self._mtp_sparse_probs(v_logits[:num_v], t_r, k_r, p_r, k_pad)
                 p_sparse = (pv.view(nd, rep, -1), pi.view(nd, rep, -1))
             else:
-                p_dists = self._mtp_probs_static(
-                    v_logits[:num_v], t_r, k_r, p_r
-                )  # [num_v, vocab]
+                # Transformed in the accept: see ``_mtp_dense_accept``.
+                p_dense = (v_logits[:num_v], t_r, k_r, p_r)
 
         # --- 3. Greedy accept per seq. ---
         # Verify inputs per seq are [x1, d1..dk] at positions start..start+k.
@@ -2312,8 +2444,6 @@ class MtpMixin:
             sparse = p_sparse is not None
             if sparse:
                 p3_vals, p3_idx = p_sparse  # [nd, qlen, k_pad] each
-            else:
-                p3 = p_dists.view(nd, qlen, p_dists.shape[-1])
             if kk > 0:
                 dg = getattr(self, "_drafts_gpu", None)
                 if dg is not None and tuple(dg.shape) == (nd, kk):
@@ -2329,24 +2459,22 @@ class MtpMixin:
                     p_d = (p3_vals[:, :kk] * hit).sum(dim=-1)  # [nd,kk] p(d_p)
                     # q(d_p) was recorded by the draft step that drew it.
                     q_d = q_dists.drawn
+                    u = torch.rand((nd, kk), generator=gen, device=dev)
+                    na_gpu = self._mtp_accepted_prefix(p_d, q_d, u)
                 else:
-                    p_d = p3[:, :kk].gather(2, idx).squeeze(-1)  # [nd,kk] p(d_p)
                     q_d = q_dists.dense.gather(2, idx).squeeze(-1)  # [nd,kk] q(d_p)
-                # accept d_p with prob min(1, p/q); q<=0 can only happen for a
-                # token q never proposes, so treat it as certain acceptance
-                # (matches the old scalar branch).
-                ratio = torch.where(
-                    q_d > 0,
-                    (p_d / q_d.clamp_min(1e-30)).clamp_max(1.0),
-                    torch.ones_like(p_d),
-                )
-                u = torch.rand((nd, kk), generator=gen, device=dev)
-                accept = u < ratio  # [nd,kk] bool
-                # Leading all-accept prefix length (same cumprod trick as greedy).
-                na_gpu = torch.cumprod(accept.to(torch.int32), dim=1).sum(dim=1)
+                    # Building p draws no random numbers, so drawing u first
+                    # keeps the generator sequence unchanged.
+                    u = torch.rand((nd, kk), generator=gen, device=dev)
+                    na_gpu, p_row = self._mtp_dense_accept(*p_dense, d_gpu, q_d, u)
             else:
                 d_gpu = None
                 na_gpu = torch.zeros(nd, dtype=torch.int64, device=dev)
+                if not sparse:
+                    empty = torch.empty((nd, 0), device=dev)
+                    _, p_row = self._mtp_dense_accept(
+                        *p_dense, empty.long(), empty, empty
+                    )
             na_l = na_gpu.to(torch.long)
             # Bonus draw. Rejected at position ``na`` (``na < kk``): draw from the
             # residual ``(p-q)+`` there. All accepted (``na == kk``): draw from p
@@ -2358,8 +2486,7 @@ class MtpMixin:
                 # p's ``k_pad`` columns plus q's values at those same token ids.
                 p_row = p3_vals[seq_ar, na_l]  # [nd, k_pad]
                 p_row_idx = p3_idx[seq_ar, na_l]  # [nd, k_pad]
-            else:
-                p_row = p3[seq_ar, na_l]  # [nd, V]
+            # Dense: ``_mtp_dense_accept`` already took p's row ``na``.
             if kk > 0:
                 sel = na_l.clamp(max=kk - 1)
                 if sparse:
