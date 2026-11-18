@@ -17,13 +17,13 @@ gLLM is an efficient and versatile inference engine for distributed LLM serving.
 
 <p align="left">
   <a href="https://yatcc-ai.com/en/">
-    <img src="docs/pic/yatcc.webp" alt="YatCC AI logo" width="60" height="60">
+    <img src="docs/pic/yatcc.webp" alt="YatCC logo" width="60" height="60">
   </a><br>
-  <a href="https://yatcc-ai.com/en/"><strong>YatCC AI Hub</strong></a>
+  <a href="https://yatcc-ai.com/en/"><strong>YatCC</strong></a>
 </p>
 
 *Latest News* :fire:
-- [2026/09/18]: gLLM is used by [YatCC AI Hub](https://yatcc-ai.com/en/) to power its LLM inference services :rocket:
+- [2026/09/18]: gLLM is used by [YatCC](https://yatcc-ai.com/en/) to power its LLM inference services :rocket:
 - [2026/08/31]: DeepSeek V4 is supported — native mHC hyper-connections, learned C4/C128 KV compression, lightning indexer, and MXFP4 experts, with fused Triton kernels throughout the decode path :tada:
 - [2026/08/25]: Qwen3.8 is supported :tada:
 - [2026/07/19]: DeepSeek V3.2 is supported — with DeepSeek Sparse Attention (DSA) in both prefill and decode, and an FP8 sparse indexer :tada:
