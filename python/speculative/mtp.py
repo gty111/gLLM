@@ -109,16 +109,16 @@ class MtpMixin:
     def mtp_context_compatible(self, seqs) -> bool:
         """Fit the whole verify window, including optimistic overlap tokens.
 
+        Only the context limit bounds the window: page tables and GPU metadata
+        are sized for ``model_max_length``. A row near its output budget still
+        verifies; commit keeps only the tokens the budget allows and retires
+        it, so one short row does not push the whole cohort to plain decode.
         CPU placeholders bound the in-flight accepted length from above, so
         this check needs no device read. Declining speculation lets the worker
         drain that completion before preparing ordinary one-token decode.
         """
         width = 1 + self.speculative_num_draft_tokens
-        return all(
-            len(seq) + width
-            <= min(self.model_max_length, seq.raw_prompt_len + seq.output_len)
-            for seq in seqs
-        )
+        return all(len(seq) + width <= self.model_max_length for seq in seqs)
 
     def mtp_begin_iter(self, num_decodes: Optional[int], *, seqs=None) -> bool:
         """Open an iteration: decide once whether it speculates, and cache it.
