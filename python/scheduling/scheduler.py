@@ -1057,14 +1057,12 @@ class OverlapScheduler(Scheduler):
                     placeholder_width=placeholder_width,
                 )
             )
-            # A prompt whose one sampled token already exhausts the output
-            # budget must not feed an optimistic successor. (Verify rows are
-            # bounded by ``mtp_context_compatible`` instead; their placeholder
-            # width is only an upper bound on what they emit.)
-            if (
-                batch_idx >= decode_rows
-                and len(seq) - seq.raw_prompt_len >= seq.output_len
-            ):
+            # Every row commits at least one token. A row whose first token
+            # already exhausts the output budget retires at finalize, so it
+            # must not feed an optimistic successor past its limit. A verify
+            # row with more budget left may still finish early (EOS or a
+            # budget cut at finalize); the successor then drops its stale row.
+            if start + 1 - seq.raw_prompt_len >= seq.output_len:
                 continue
             to_requeue.append(seq)
         # ``appendleft`` one-by-one would reverse the cohort every iteration,

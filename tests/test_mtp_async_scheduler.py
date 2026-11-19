@@ -265,6 +265,32 @@ def test_mtp_deferred_keeps_batch_row_mapping_after_stale_row_finishes():
     assert live.token_ids[-2:] == [40, 41]
 
 
+@pytest.mark.parametrize("output_len,requeued", [(2, False), (3, True), (32, True)])
+def test_mtp_deferred_requeues_a_verify_row_only_if_it_can_continue(output_len, requeued):
+    # One token generated so far; every verify commits at least one more.
+    scheduler = _scheduler()
+    seq = _decode_seq(seq_id=8, output_len=output_len)
+    scheduler.batch_running.append([seq])
+    scheduler.process_mtp_output_deferred(decode_rows=1, width=4)
+    assert (list(scheduler.seqs_to_decode) == [seq]) is requeued
+
+
+def test_near_budget_verify_row_commits_only_its_budget_and_retires():
+    scheduler = _scheduler()
+    near, live = _decode_seq(seq_id=5, output_len=3), _decode_seq(seq_id=6)
+    scheduler.batch_running.append([near, live])
+    deferred = scheduler.process_mtp_output_deferred(decode_rows=2, width=4)
+    assert list(scheduler.seqs_to_decode) == [near, live]
+    protected = []
+    package = scheduler.process_mtp_output_finalize(
+        deferred, [[20, 21, 22, 23], [30, 31, 32, 33]], defer_frees=protected,
+    )
+    # ``near`` had one output token and a budget of three: two more are kept.
+    assert near.token_ids == [10, 11, 12, 20, 21]
+    assert package.next_tokens == [[20, 21], [30, 31, 32, 33]]
+    assert package.free_ids == [5] and protected == [near]
+
+
 def test_mtp_finalize_then_reserve_next_keeps_placeholder_positions_stable():
     scheduler = _scheduler()
     seq = _decode_seq()
@@ -514,10 +540,13 @@ def _boundary_runner(limit=32):
     (33, 30, 64, False),
     (240000, 239996, 240000, True),
     (240000, 239997, 240000, False),
-    (64, 28, 30, True),  # Two prompt tokens plus thirty output tokens.
-    (64, 29, 30, False),
+    # Two prompt tokens plus thirty output tokens: a row near its output
+    # budget still verifies (finalize cuts the commit), only context declines.
+    (64, 28, 30, True),
+    (64, 29, 30, True),
+    (64, 31, 30, True),
 ])
-def test_mtp_window_respects_context_and_output_budget(limit, length, output_len, expected):
+def test_mtp_window_respects_context_but_not_output_budget(limit, length, output_len, expected):
     runner = _boundary_runner(limit)
     seq = _decode_seq(output_len=output_len)
     seq.token_ids = [10] * length
