@@ -96,7 +96,8 @@ def _hash_tensor_bytes(*tensors: torch.Tensor) -> bytes:
         # different reinterpretations can't collide.
         h.update(str(t.dtype).encode())
         h.update(repr(tuple(t.shape)).encode())
-        h.update(memoryview(t.numpy().tobytes()))
+        # Raw bytes via a uint8 view: numpy has no bfloat16.
+        h.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
     return h.digest()
 
 
