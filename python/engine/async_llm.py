@@ -9,7 +9,7 @@ from logger import logger
 
 from gllm.engine.llm import LLM
 from gllm.runtime.sequence import RequestCapacityError
-from gllm.runtime.sleep_mode import normalize_tags
+from gllm.runtime.sleep_mode import ALL_TAGS, normalize_tags
 
 
 class SleepModeError(RuntimeError):
@@ -116,7 +116,9 @@ class AsyncLLM(LLM):
         # lazily: it must belong to the server's event loop).
         self.sleep_mode_enabled = bool(self.config.sleep_mode)
         self.sleep_idle_timeout = float(self.config.sleep_idle_timeout)
+        self.sleep_idle_level = self.config.sleep_idle_level
         self._sleeping_tags: set = set()
+        self._workers_suspended = False
         self._memory_lock: Optional[asyncio.Lock] = None
         self._wake_task: Optional[asyncio.Task] = None
         self._idle_task: Optional[asyncio.Task] = None
@@ -211,6 +213,12 @@ class AsyncLLM(LLM):
     def is_sleeping(self) -> bool:
         return bool(self._sleeping_tags)
 
+    @property
+    def sleep_level(self) -> int:
+        if self._workers_suspended:
+            return 2
+        return 1 if self._sleeping_tags else 0
+
     def _lock(self) -> asyncio.Lock:
         if self._memory_lock is None:
             self._memory_lock = asyncio.Lock()
@@ -265,7 +273,9 @@ class AsyncLLM(LLM):
             "seconds": round(max((a.get("seconds", 0.0) for a in acks), default=0.0), 3),
         }
 
-    async def sleep(self, tags: Optional[Iterable[str]] = None, mode: str = "wait") -> dict:
+    async def sleep(
+        self, tags: Optional[Iterable[str]] = None, mode: str = "wait", *, level: int = 1
+    ) -> dict:
         """Release the GPU memory of ``tags`` (default: weights and KV cache).
 
         New requests are held from the moment this is called; with
@@ -281,12 +291,33 @@ class AsyncLLM(LLM):
             tags = normalize_tags(tags)
         except ValueError as e:
             raise SleepModeError(str(e), client_error=True) from e
+        if level not in (1, 2):
+            raise SleepModeError(
+                f"invalid sleep level {level}; expected 1 or 2", client_error=True
+            )
+        if level == 2:
+            if not self.config.supports_full_sleep:
+                raise SleepModeError(
+                    "sleep level 2 requires a local, non-disaggregated server",
+                    client_error=True,
+                )
+            if set(tags) != set(ALL_TAGS):
+                raise SleepModeError("sleep level 2 requires all tags", client_error=True)
         # Shielded: a caller that goes away must not abandon a transition
         # halfway and leave the workers and this frontend disagreeing.
-        return await asyncio.shield(self._sleep(tags, mode))
+        return await asyncio.shield(self._sleep(tags, mode, level))
 
-    async def _sleep(self, tags, mode: str) -> dict:
+    async def _sleep(self, tags, mode: str, level: int) -> dict:
         async with self._lock():
+            if self._workers_suspended:
+                if self.process_list or self.comm is not None:
+                    return await self._sleep_all_workers(mode)
+                return {
+                    "tags": [], "gib": {}, "seconds": 0.0,
+                    "sleeping_tags": self.sleeping_tags, "level": 2,
+                }
+            if level == 2:
+                return await self._sleep_all_workers(mode)
             todo = [t for t in tags if t not in self._sleeping_tags]
             result = {"tags": [], "gib": {}, "seconds": 0.0}
             if todo:
@@ -313,7 +344,94 @@ class AsyncLLM(LLM):
                 # Requests that arrived while falling asleep.
                 self._ensure_wake_task()
         result["sleeping_tags"] = self.sleeping_tags
+        result["level"] = self.sleep_level
         return result
+
+    def _stop_local_workers(self) -> None:
+        # Run on the engine-I/O thread, which owns the frontend ZMQ sockets.
+        # The worker processes own the CUDA contexts. Exiting the whole group
+        # releases graph pools, NCCL, and any pinned level-1 weight backups.
+        started = [p for p in self.process_list if p.pid is not None]
+        for process in started:
+            if process.is_alive():
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 30
+        for process in started:
+            process.join(timeout=max(0, deadline - time.monotonic()))
+        if any(process.is_alive() for process in started):
+            raise RuntimeError("timed out waiting for local workers to exit")
+        for process in self.process_list:
+            process.close()
+        self.process_list.clear()
+        if self.comm is not None:
+            self.comm.ctx.destroy(linger=0)
+            self.comm = None
+
+    def _restart_local_workers(self) -> None:
+        # A failed transition may have left workers alive. Never start a new
+        # group while an old one still owns CUDA memory or a rendezvous port.
+        self._stop_local_workers()
+        self._reset_worker_state()
+        super()._init_frontend_comm()
+        self._launch_workers(show_progress=False)
+
+    async def _sleep_all_workers(self, mode: str) -> dict:
+        if not self._workers_suspended:
+            self._hold_new_requests = True
+            try:
+                # Wait out a schedule tick that may have already removed a batch
+                # from wait_lists but hasn't yet registered it in running_maps.
+                await self._run_engine_io(lambda: None)
+                await self._wait_until_idle(mode)
+            except BaseException:
+                self._hold_new_requests = bool(self._sleeping_tags)
+                raise
+        start = time.monotonic()
+        self._workers_suspended = True
+        self._sleeping_tags.update(ALL_TAGS)
+        try:
+            await self._run_engine_io(self._stop_local_workers)
+        except Exception as exc:
+            raise SleepModeError(f"sleep level 2 failed: {exc}") from exc
+        finally:
+            if self.wait_lists:
+                self._ensure_wake_task()
+        elapsed = round(time.monotonic() - start, 3)
+        logger.info("Engine asleep (level 2): local workers exited in %.2fs", elapsed)
+        return {
+            "tags": self.sleeping_tags, "gib": {}, "seconds": elapsed,
+            "sleeping_tags": self.sleeping_tags, "level": 2,
+        }
+
+    async def _wake_all_workers(self) -> dict:
+        start = time.monotonic()
+        try:
+            await self._run_engine_io(self._restart_local_workers)
+            while True:
+                states = list(self.mp_alive)
+                if -1 in states or any(p.exitcode is not None for p in self.process_list):
+                    raise RuntimeError("a worker exited during initialization")
+                if all(state == 1 for state in states):
+                    break
+                if time.monotonic() - start > self.memory_cmd_timeout:
+                    raise RuntimeError("timed out waiting for local workers to initialize")
+                await asyncio.sleep(0.05)
+        except Exception as exc:
+            try:
+                await self._run_engine_io(self._stop_local_workers)
+            except Exception:
+                logger.exception("Failed to clean up workers after wake-up failure")
+            raise SleepModeError(f"wake-up from level 2 failed: {exc}") from exc
+
+        tags = self.sleeping_tags
+        self._sleeping_tags.clear()
+        self._workers_suspended = False
+        elapsed = round(time.monotonic() - start, 3)
+        logger.info("Engine woke from level 2: local workers initialized in %.2fs", elapsed)
+        return {"tags": tags, "gib": {}, "seconds": elapsed}
 
     async def wake_up(self, tags: Optional[Iterable[str]] = None) -> dict:
         """Restore ``tags`` (default: everything asleep).
@@ -347,7 +465,13 @@ class AsyncLLM(LLM):
         async with self._lock():
             todo = [t for t in tags if t in self._sleeping_tags]
             result = {"tags": [], "gib": {}, "seconds": 0.0}
-            if todo:
+            if self._workers_suspended:
+                if set(tags) != set(ALL_TAGS):
+                    raise SleepModeError(
+                        "waking from sleep level 2 requires all tags", client_error=True
+                    )
+                result = await self._wake_all_workers()
+            elif todo:
                 acks = await self._memory_command("wake_up", todo)
                 self._sleeping_tags.difference_update(todo)
                 result = self._summarize(acks, todo)
@@ -360,6 +484,7 @@ class AsyncLLM(LLM):
                 self._hold_new_requests = False
                 self._last_activity = time.monotonic()
         result["sleeping_tags"] = self.sleeping_tags
+        result["level"] = self.sleep_level
         return result
 
     def _ensure_wake_task(self) -> None:
@@ -380,6 +505,8 @@ class AsyncLLM(LLM):
         """Answer every held request with HTTP 503; the next one retries."""
         with self._pending_lock:
             held, self.wait_lists = self.wait_lists, []
+            held_ids = {seq.seq_id for seq in held}
+            self.abort_ids = [seq_id for seq_id in self.abort_ids if seq_id not in held_ids]
         for seq in held:
             stream = self.async_streams.pop(seq.seq_id, None)
             if stream is not None:
@@ -411,7 +538,7 @@ class AsyncLLM(LLM):
                 continue
             logger.info("No requests for %.1fs; going to sleep", now - self._last_activity)
             try:
-                await self.sleep(None, mode="wait")
+                await self.sleep(None, mode="wait", level=self.sleep_idle_level)
             except Exception:
                 logger.exception("Idle sleep failed")
             self._last_activity = time.monotonic()
@@ -431,7 +558,12 @@ class AsyncLLM(LLM):
 
     async def schedule(self):
         while True:
+            if self._workers_suspended:
+                await asyncio.sleep(0.01)
+                continue
             await self.check_abort_seqs()
+            if self._workers_suspended:
+                continue
             await self._run_engine_io(super().schedule)
             await asyncio.sleep(0)
 

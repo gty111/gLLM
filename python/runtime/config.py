@@ -82,6 +82,7 @@ class EngineConfig:
     # puts the server to sleep after that many idle seconds; 0 disables it.
     sleep_mode: bool = True
     sleep_idle_timeout: float = 0.0
+    sleep_idle_level: int = 1
     # Explicit selection is opt-in; None preserves the legacy MTP policy.
     speculative_backend: Optional[str] = None
     dspark_model_path: Optional[str] = None
@@ -104,6 +105,10 @@ class EngineConfig:
             raise ValueError("sleep_idle_timeout must be >= 0 (0 disables idle sleep)")
         if self.sleep_idle_timeout > 0 and not self.sleep_mode:
             raise ValueError("sleep_idle_timeout requires sleep_mode")
+        if self.sleep_idle_level not in (1, 2):
+            raise ValueError("sleep_idle_level must be 1 or 2")
+        if self.sleep_idle_level == 2 and not self.supports_full_sleep:
+            raise ValueError("sleep_idle_level=2 requires a local, non-disaggregated server")
 
         backend = self.speculative_backend
         if backend not in (None, "none", "mtp", "dspark"):
@@ -144,6 +149,10 @@ class EngineConfig:
             self.validate_speculative_token_budget(self.maxp, self.maxd)
             if self.disagg_config is not None or self.assigned_layers is not None:
                 raise ValueError("DSpark does not support disaggregation or assigned_layers")
+
+    @property
+    def supports_full_sleep(self) -> bool:
+        return self.launch_mode == "normal" and self.disagg_config is None
 
     def resolve_num_draft_tokens(self, backend: str) -> int:
         """Resolve once during startup; runtime consumers use the loaded model.

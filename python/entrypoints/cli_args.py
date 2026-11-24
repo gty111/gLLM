@@ -91,8 +91,9 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
         help=(
             "Allocate model weights and the KV cache arena from releasable "
             "memory pools so an idle server can free most of its GPU memory "
-            "(POST /sleep, /wake_up; requests wake it automatically). Weights "
-            "are backed up to pinned host memory while asleep. Default: on."
+            "(POST /sleep, /wake_up; requests wake it automatically). Level 1 "
+            "backs up weights to host memory. Level 2 shuts down local workers. "
+            "Default: on."
         ),
     )
     p.add_argument(
@@ -104,6 +105,13 @@ def add_runtime_args(p: argparse.ArgumentParser) -> None:
             "seconds without any request in flight; 0 (default) disables idle "
             "sleep so only the explicit endpoints trigger it."
         ),
+    )
+    p.add_argument(
+        "--sleep-idle-level",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Sleep level used by --sleep-idle-timeout (default: 1).",
     )
     p.add_argument(
         "--enable-prefix-caching",

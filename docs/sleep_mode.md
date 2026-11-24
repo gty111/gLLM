@@ -1,8 +1,8 @@
 # Sleep mode
 
-Sleep mode lets an idle server give back most of its GPU memory and get it
-back when requests return. The process, NCCL groups and captured CUDA graphs
-stay alive, so waking up does not reload or recompile anything.
+Sleep mode lets an idle server release GPU memory and reclaim it when requests
+return. Level 1 keeps the workers alive for a fast wake-up. Level 2 stops the
+workers to release all GPU memory they own while the HTTP frontend stays online.
 
 ## Enabling
 
@@ -18,6 +18,7 @@ python -m gllm.entrypoints.api_server --model-path <model> \
   allocator and the sleep endpoints answer 400.
 * `--sleep-idle-timeout S` puts the server to sleep after `S` seconds with no
   request in flight. Leave it at `0` to sleep only through the endpoint.
+* `--sleep-idle-level 2` uses level 2 for idle sleep. The default is level 1.
 
 A request that arrives while the server is asleep (or falling asleep) is
 queued and wakes the server automatically; it runs as soon as the memory is
@@ -27,23 +28,24 @@ back. Its first-token latency therefore includes the wake-up time.
 
 | Endpoint | Description |
 | --- | --- |
-| `POST /sleep` | Release memory. Query: `tags` (repeatable, default all), `mode=wait` (default: let in-flight requests finish) or `mode=abort` (cancel them), `level=1` (the only supported level). |
-| `POST /wake_up` | Restore memory. Query: `tags` (repeatable, default all). |
-| `GET /is_sleeping` | `{"is_sleeping": bool, "sleeping_tags": [...]}` |
+| `POST /sleep` | Release memory. Query: `level=1` (default) or `level=2`, `mode=wait` (default: let in-flight requests finish) or `mode=abort` (cancel them), and `tags` (repeatable, default all). Level 2 requires all tags. |
+| `POST /wake_up` | Restore memory. Query: `tags` (repeatable, default all). Waking from level 2 requires all tags. |
+| `GET /is_sleeping` | `{"is_sleeping": bool, "sleeping_tags": [...], "level": 0|1|2}` (level 0 is awake). |
 
 ```sh
 curl -X POST localhost:8000/sleep
 curl -X POST 'localhost:8000/sleep?tags=kv_cache'      # KV cache only
+curl -X POST 'localhost:8000/sleep?level=2'
 curl -X POST localhost:8000/wake_up
 curl localhost:8000/is_sleeping
 ```
 
-`/sleep` and `/wake_up` return once every worker has finished, with the
-released/restored GiB per tag (summed over all ranks) and the duration on the
-slowest DP replica's driver. New requests are held from the moment `/sleep` is called; requests
-resume only when no tag is asleep any more.
+`/sleep` and `/wake_up` return once every worker has finished. For level 1
+they report GiB per tag (summed over all ranks) and the duration on the slowest
+DP replica. For a level 2 transition they report wall-clock duration with an
+empty `gib` map. New requests are held while workers are asleep.
 
-## What is released
+## Level 1
 
 | Tag | Memory | While asleep | On wake |
 | --- | --- | --- | --- |
@@ -55,15 +57,29 @@ the CUDA context and the allocator's cached activation blocks stay resident,
 so once both tags are back a forward pass cannot run out of memory because of
 what another process took while the server was asleep.
 
+## Level 2
+
+Workers exit after in-flight requests have drained or been canceled. Their
+CUDA contexts, graph pools, communication buffers, weights, KV cache, and
+any pinned level-1 weight backups are released. The frontend retains its
+tokenizer and HTTP routes. Wake-up starts new workers, reloads weights from
+the checkpoint, builds a fresh KV cache and captures graphs again. Allow
+startup time when planning the first request after a level 2 sleep.
+
+Level 2 supports workers launched locally by the frontend (`launch_mode=normal`)
+without encoder disaggregation. It releases memory owned by those workers.
+
 ## Failures
 
 * If waking fails (typically: another process now holds the GPU memory),
   `/wake_up` answers 500 and the server stays asleep. Requests that triggered
   an automatic wake-up get HTTP 503 with code `wake_up_failed`; the next
   request tries again.
-* If sleeping fails on some rank, the frontend wakes every rank again (a
+* If level 1 sleep fails on some rank, the frontend wakes every rank again (a
   no-op where nothing was released) before answering 500. If even that fails
   the server is treated as asleep, so no request runs on released memory.
+* After a failed level 2 worker restart, the frontend stays asleep and
+  cleans up the failed worker group so a later request can retry.
 * A sleep or wake-up runs to completion even if the HTTP caller disconnects.
 
 The pinned host buffer for weights is allocated on the first sleep and kept
@@ -97,6 +113,4 @@ with the old metadata first fails, reconnects from discovery and retries.
 
 ## Limitations
 
-* `level=2` (discarding weights entirely) is not supported; weights always
-  stay in host memory.
 * Idle sleep runs only in `gllm.entrypoints.api_server`.
