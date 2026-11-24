@@ -754,22 +754,16 @@ def _sleep_error(exc: Exception) -> JSONResponse:
 
 @router.post("/sleep")
 async def sleep(raw_request: Request, level: int = 1, mode: str = "wait"):
-    """Release GPU memory. ``level=1`` (the only level) covers weights (host
-    backup) and KV cache; ``tags=weights|kv_cache`` (repeatable) narrows it.
+    """Release GPU memory. Level 1 supports individual tags. Level 2 exits
+    all local workers and releases their GPU memory.
     ``mode=wait`` lets in-flight requests finish, ``mode=abort`` cancels them.
     """
     try:
-        if level != 1:
-            raise SleepModeError(
-                f"invalid level {level}: only level=1 is supported (weights are "
-                "kept in host memory, the KV cache is discarded)",
-                client_error=True,
-            )
         tags = raw_request.query_params.getlist("tags") or None
-        result = await llm.sleep(tags, mode=mode)
+        result = await llm.sleep(tags, mode=mode, level=level)
     except Exception as e:
         return _sleep_error(e)
-    return JSONResponse(content={"status": "sleeping", "level": level, **result})
+    return JSONResponse(content={"status": "sleeping", **result})
 
 
 @router.post("/wake_up")
@@ -787,7 +781,11 @@ async def wake_up(raw_request: Request):
 @router.get("/is_sleeping")
 async def is_sleeping():
     return JSONResponse(
-        content={"is_sleeping": llm.is_sleeping(), "sleeping_tags": llm.sleeping_tags}
+        content={
+            "is_sleeping": llm.is_sleeping(),
+            "sleeping_tags": llm.sleeping_tags,
+            "level": llm.sleep_level,
+        }
     )
 
 

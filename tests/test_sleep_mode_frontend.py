@@ -19,7 +19,12 @@ def make_llm(script=None):
     llm = AsyncLLM.__new__(AsyncLLM)
     llm.sleep_mode_enabled = True
     llm.sleep_idle_timeout = 0.0
+    llm.sleep_idle_level = 1
+    llm.config = SimpleNamespace(supports_full_sleep=True)
     llm._sleeping_tags = set()
+    llm._workers_suspended = False
+    llm.process_list = []
+    llm.comm = None
     llm._memory_lock = None
     llm._wake_task = None
     llm._idle_task = None
@@ -135,8 +140,16 @@ def test_failed_auto_wake_answers_held_requests_with_503():
     assert llm.is_sleeping() and llm._hold_new_requests
 
 
-def test_idle_watcher_sleeps_only_when_enabled():
+@pytest.mark.parametrize("level", [1, 2])
+def test_idle_watcher_sleeps_only_when_enabled(level):
     llm = make_llm()
+    llm.sleep_idle_level = level
+
+    async def engine_io(func):
+        return func()
+
+    llm._run_engine_io = engine_io
+    llm._stop_local_workers = lambda: None
 
     async def run(timeout):
         llm.sleep_idle_timeout = timeout
@@ -148,20 +161,94 @@ def test_idle_watcher_sleeps_only_when_enabled():
     asyncio.run(run(0.0))
     assert llm._idle_task is None and not llm.is_sleeping()
     asyncio.run(run(0.1))
-    assert llm.is_sleeping()
+    assert llm.sleep_level == level
 
 
 def test_invalid_input_is_a_client_error():
     llm = make_llm()
 
     async def run():
-        for kwargs in ({"tags": ["bogus"]}, {"mode": "later"}):
+        for kwargs in ({"tags": ["bogus"]}, {"mode": "later"}, {"level": 3}):
             with pytest.raises(SleepModeError) as err:
                 await llm.sleep(**kwargs)
             assert err.value.client_error
+        llm.config.supports_full_sleep = False
+        with pytest.raises(SleepModeError, match="local, non-disaggregated") as err:
+            await llm.sleep(level=2)
+        assert err.value.client_error
         llm.sleep_mode_enabled = False
         with pytest.raises(SleepModeError) as err:
             await llm.wake_up()
         assert err.value.client_error
+
+    asyncio.run(run())
+
+
+def test_level_two_stops_workers_after_drain_and_can_resume():
+    llm = make_llm()
+    events = []
+
+    async def engine_io(func):
+        return func()
+
+    async def drain(mode):
+        assert llm._hold_new_requests
+        assert not llm._workers_suspended
+        events.append(mode)
+
+    def restart():
+        assert llm._hold_new_requests and llm._workers_suspended
+        events.append("restart")
+        llm.mp_alive = [1]
+        llm.process_list = [SimpleNamespace(exitcode=None)]
+
+    llm._run_engine_io = engine_io
+    llm._wait_until_idle = drain
+    llm._stop_local_workers = lambda: events.append("stop")
+    llm._restart_local_workers = restart
+
+    async def run():
+        await llm.sleep(["weights"])
+        assert (await llm.sleep(mode="abort", level=2))["level"] == 2
+        assert llm.sleeping_tags == ["kv_cache", "weights"]
+        assert (await llm.sleep())["level"] == 2
+        with pytest.raises(SleepModeError, match="all tags"):
+            await llm.wake_up(["weights"])
+        assert llm.is_sleeping()
+
+        llm._ensure_wake_task()
+        await llm._wake_task
+        assert llm.sleep_level == 0 and not llm._hold_new_requests
+
+    asyncio.run(run())
+    assert events == ["wait", "abort", "stop", "restart"]
+    assert llm.sent == [("sleep", ("weights",))]
+
+
+def test_level_two_failed_start_cleans_up_and_allows_retry():
+    llm = make_llm()
+    killed = []
+
+    async def engine_io(func):
+        return func()
+
+    def failed_start():
+        llm.mp_alive = [-1]
+        llm.process_list = [SimpleNamespace(exitcode=1)]
+
+    llm._run_engine_io = engine_io
+    llm._stop_local_workers = lambda: killed.append(True)
+    llm._restart_local_workers = failed_start
+
+    async def run():
+        await llm.sleep(level=2)
+        with pytest.raises(SleepModeError, match="exited during initialization"):
+            await llm.wake_up()
+        assert llm.sleep_level == 2 and llm._hold_new_requests
+        assert killed == [True, True]
+        llm._restart_local_workers = lambda: setattr(llm, "mp_alive", [1])
+        llm.process_list = [SimpleNamespace(exitcode=None)]
+        assert (await llm.wake_up())["level"] == 0
+        assert not llm._hold_new_requests
 
     asyncio.run(run())

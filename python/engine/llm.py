@@ -88,6 +88,7 @@ class LLM:
         speculative_num_draft_tokens=None,
         sleep_mode=True,
         sleep_idle_timeout=0.0,
+        sleep_idle_level=1,
     ):
         init_logger()
         # Single configuration object handed to the model runner and the
@@ -135,6 +136,7 @@ class LLM:
             ssm_snapshot_stride_tokens=ssm_snapshot_stride_tokens,
             sleep_mode=sleep_mode,
             sleep_idle_timeout=sleep_idle_timeout,
+            sleep_idle_level=sleep_idle_level,
         )
         self.config = config
         self.model_path = config.model_path
@@ -254,10 +256,7 @@ class LLM:
         self.num_workers = len(self.act_worker_ranks)
 
         self.ctx = mp.get_context("spawn")
-        self.mp_alive = self.ctx.Array("i", [0 for i in range(self.num_workers)])
-        self.mp_load_progress = self.ctx.Array(
-            "i", [0 for _ in range(self.num_workers * 2)]
-        )
+        self._reset_worker_state()
 
         ipc_path_prefix = random_uuid()
         self.schedule_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_schedule"
@@ -270,6 +269,10 @@ class LLM:
             f"Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size}"
         )
         self._launch_workers()
+
+    def _reset_worker_state(self):
+        self.mp_alive = self.ctx.Array("i", self.num_workers)
+        self.mp_load_progress = self.ctx.Array("i", self.num_workers * 2)
 
     def _init_frontend_comm(self):
         """Create the frontend ZeroMQ sockets on their owning thread."""
@@ -285,7 +288,7 @@ class LLM:
         )
         self.comm.init()
 
-    def _launch_workers(self):
+    def _launch_workers(self, *, show_progress=True):
         # Build every worker process object first (cheap), then fire all the
         # ``process.start()`` calls concurrently. For the spawn start method
         # ``start()`` blocks the parent while it pickles the worker and writes
@@ -323,7 +326,7 @@ class LLM:
                     # silently leaving a half-launched fleet.
                     f.result()
 
-        if self.load_format == "auto":
+        if show_progress and self.load_format == "auto":
             self.load_progress()
 
     def build_worker(self, local_rank, pp_rank, tp_rank, dp_rank=0):
@@ -590,6 +593,8 @@ class LLM:
             self.comm.broadcast_ipc_package_to_dp(abort_pkg)
 
     def send_control_command(self, control_cmd: str):
+        if self.comm is None:
+            raise RuntimeError("Workers are asleep")
         ipc_package = IPCPackage([])
         ipc_package.control_cmd = control_cmd
         if self.dp_size > 1:
