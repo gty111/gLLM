@@ -3,12 +3,33 @@ name: rust-frontend
 on:
   push:
     branches: [master]
-    paths: ["rust/frontend/**", ".github/workflows/rust-frontend.yml"]
   pull_request:
-    paths: ["rust/frontend/**", ".github/workflows/rust-frontend.yml"]
 
+# `build` is a required check, so the workflow runs on every change and skips
+# the build (which counts as passing) when nothing under rust/frontend changed.
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if ! git cat-file -e "$BASE^{commit}" 2>/dev/null \
+            || git diff --name-only "$BASE" HEAD | grep -qE '^(rust/frontend/|\.github/workflows/rust-frontend\.yml$)'; then
+            echo rust=true >> "$GITHUB_OUTPUT"
+          else
+            echo rust=false >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
