@@ -4,13 +4,43 @@ import sys
 from typing import List
 
 from setuptools import find_packages, setup
-from setuptools_rust import Binding, RustExtension
+from setuptools_rust import Binding, RustBin, RustExtension
 
 ROOT_DIR = os.path.dirname(__file__)
 
 assert sys.platform.startswith(
     "linux"
 ), "gLLM only supports Linux platform (including WSL)."
+
+
+# rust/frontend (and the vLLM crates it uses) needs this toolchain; an older
+# cargo fails deep inside a dependency, so refuse early with the fix.
+MIN_RUST = (1, 95)
+
+
+def check_rust_toolchain() -> None:
+    import re
+    import shutil
+    import subprocess
+
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        return  # setuptools-rust reports a missing cargo itself
+    try:
+        out = subprocess.run([cargo, "--version"], capture_output=True, text=True).stdout
+    except OSError:
+        return
+    m = re.search(r"(\d+)\.(\d+)", out)
+    if m and (int(m[1]), int(m[2])) < MIN_RUST:
+        raise SystemExit(
+            f"gLLM needs Rust >= {MIN_RUST[0]}.{MIN_RUST[1]} to build gllm-frontend, "
+            f"found `{out.strip()}` at {cargo}. Install it with "
+            f"`rustup toolchain install {MIN_RUST[0]}.{MIN_RUST[1]}` and put that "
+            "toolchain first on PATH."
+        )
+
+
+check_rust_toolchain()
 
 
 def get_path(*filepath) -> str:
@@ -66,6 +96,13 @@ setup(
             binding=Binding.PyO3,
             features=["pyo3/extension-module"],
             py_limited_api=True,
+            debug=False,
+        ),
+        # The OpenAI-compatible HTTP front end (rust/frontend), installed as the
+        # `gllm-frontend` executable next to the Python interpreter.
+        RustBin(
+            "gllm-frontend",
+            path="rust/frontend/Cargo.toml",
             debug=False,
         ),
     ],

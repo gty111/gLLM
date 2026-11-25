@@ -8,7 +8,7 @@ original meaning.
 
 from typing import Dict, Optional
 
-from gllm.tokenizers.tool_parsers import normalize_chat_template_messages
+from gllm.tokenizers.chat_messages import normalize_chat_template_messages
 from gllm.utils import unify_decode
 
 
@@ -38,7 +38,19 @@ class TokenizerMixin:
         if tools:
             template_kwargs["tools"] = tools
         if chat:
-            normalize_chat_template_messages(messages)
+            deepseek_encoder = None
+            if self._deepseek_encoder_variant is not None:
+                from gllm.tokenizers.deepseek_official import load_deepseek_encoder
+
+                deepseek_encoder = load_deepseek_encoder(
+                    self.model_path, self._deepseek_encoder_variant
+                )
+            use_deepseek = deepseek_encoder is not None and (
+                not self.use_mm or not has_mm
+            )
+            # DeepSeek's encoders take tool arguments as the JSON wire string;
+            # a decoded mapping is rendered differently.
+            normalize_chat_template_messages(messages, tool_arguments=not use_deepseek)
             # OpenAI-style requests may send ``content: null`` (e.g. an assistant
             # turn that only carries ``tool_calls``). Many chat templates assume
             # ``content`` is a str or list and iterate it in the non-string
@@ -47,14 +59,7 @@ class TokenizerMixin:
             for message in messages:
                 if isinstance(message, dict) and message.get("content") is None:
                     message["content"] = ""
-            deepseek_encoder = None
-            if self._deepseek_encoder_variant is not None:
-                from gllm.tokenizers.deepseek_official import load_deepseek_encoder
-
-                deepseek_encoder = load_deepseek_encoder(
-                    self.model_path, self._deepseek_encoder_variant
-                )
-            if deepseek_encoder is not None and (not self.use_mm or not has_mm):
+            if use_deepseek:
                 # DeepSeek-V3.2/V4: render with the checkpoint's official encoder
                 # (reference DSML format) instead of a Jinja chat template.
                 from gllm.tokenizers.deepseek_official import (
@@ -124,26 +129,3 @@ class TokenizerMixin:
 
     def decode(self, token_ids):
         return unify_decode(self.tokenizer, token_ids)
-
-    def encode_skeleton(self, messages, chat_template_kwargs: Optional[Dict] = None):
-        """Text-only tokenization with one sentinel per mm item.
-
-        Used by the disaggregated LM frontend instead of the multimodal
-        ``processor.apply_chat_template``: no pixels are opened or processed
-        here, and each image/video collapses to a single placeholder id that
-        the LM PP0 later expands to ``N_vis_i`` tokens. Returns the skeleton
-        token-id list. ``chat_template_kwargs`` carries per-request chat-template
-        variables (e.g. ``{"thinking": False}``) straight from the request.
-        """
-        from gllm.multimodal.common import tokenize_text_only
-
-        cfg = self.model_loader.config
-        skel = tokenize_text_only(
-            self.tokenizer,
-            messages,
-            image_token_id=int(cfg.image_token_id),
-            video_token_id=int(cfg.video_token_id),
-            add_generation_prompt=True,
-            chat_template_kwargs=chat_template_kwargs,
-        )
-        return skel.token_ids

@@ -1,21 +1,9 @@
-"""CLI arguments shared by the serving entrypoints.
+"""Engine CLI arguments of ``engine_server`` (the engine the ``gllm-frontend``
+binary starts, or a multi-node slave).
 
-``api_server`` and ``lm_server`` configure the *same* engine
-(:class:`gllm.engine.async_llm.AsyncLLM`); they differ only in what sits in
-front of it (an OpenAI-compatible HTTP app vs an encoder-disaggregated LM node).
-Every engine knob therefore has to exist in both, and duplicating the
-definitions means every new one is added twice, drifts in its default or help
-text, or -- as happened with the MTP flags -- lands in one entrypoint only.
-
-The groups below own the shared surface. Each entrypoint adds the groups it
-needs plus its own front-end-specific flags, and builds the engine's common
-kwargs with :func:`engine_kwargs`, so the argument *and* its plumbing to the
-engine are declared once.
-
-Deliberately NOT shared: ``--host`` / ``--port``. Their defaults are part of each
-entrypoint's contract (api_server auto-allocates a free port and logs it;
-lm_server pins 8000), so folding them in would hide a real behavioural
-difference behind a shared helper.
+Each group owns one part of the surface; :func:`engine_kwargs` builds the
+engine's kwargs from the parsed namespace, so an argument and its plumbing to
+the engine are declared once.
 """
 
 import argparse
@@ -341,16 +329,48 @@ def add_mm_processor_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def add_frontend_args(p: argparse.ArgumentParser) -> None:
-    """OpenAI-frontend flags. ``lm_server`` serves the same app, so it needs these too."""
+def add_topology_args(p: argparse.ArgumentParser) -> None:
+    """Parallel layout and multi-node launch."""
+    p.add_argument("--pp", dest="pp_size", type=int, help="Number of pipeline stages", default=1)
     p.add_argument(
-        "--tool-call-parser",
+        "--dp",
+        dest="dp_size",
+        type=int,
+        help=(
+            "Number of data-parallel (DP-attention) replicas. World size is "
+            "pp*dp*tp; with EP enabled the MoE experts are sharded across "
+            "EP = dp*tp ranks per pipeline stage."
+        ),
+        default=1,
+    )
+    p.add_argument(
+        "--enable-ep",
+        dest="use_ep",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable expert parallelism. EP is OFF by default because for many "
+            "MoE configs (e.g. Qwen3-30B-A3B with num_experts=128, top_k=8 on "
+            "TP=4 / a single node) the EP path leaves each rank with only a "
+            "small slice of experts, so the per-expert GEMM is too thin to "
+            "saturate the SMs. Pass --enable-ep to opt into expert parallelism."
+        ),
+    )
+    p.add_argument(
+        "--assigned-layers",
         type=str,
+        help="If the model have 64 layers, we can set it to 16,16,16,16 or 16,16,17,15",
         default=None,
-        choices=["kimi", "qwen"],
-        help="Parser for model-native tool-call output -> structured "
-        "tool_calls. Default: auto-detect from model architecture; pass a "
-        "name to override.",
+    )
+    # Multi-Node deployment
+    p.add_argument(
+        "--launch-mode",
+        type=str,
+        choices=["normal", "master", "slave"],
+        default="normal",
+    )
+    p.add_argument(
+        "--ranks", dest="worker_ranks", type=str, help="Specify the ranks of worker like 0,1", default=None
     )
 
 
@@ -366,8 +386,7 @@ def add_engine_args(p: argparse.ArgumentParser, *, tp_help: str = None) -> None:
 
 # Args whose dest matches an EngineConfig field are forwarded to the engine
 # verbatim by ``engine_kwargs`` below; entrypoints never pass engine fields
-# explicitly (they mutate the args namespace instead, e.g. lm_server's
-# fixed-role constants), so kwargs can never collide.
+# explicitly (they mutate the args namespace instead), so kwargs can never collide.
 
 
 def engine_kwargs(args: argparse.Namespace) -> dict:

@@ -1,25 +1,15 @@
-"""Output limits use actual prompt lengths and are shared by all entrypoints."""
+"""Output limits use actual prompt lengths."""
 
-import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
 import torch
-from pydantic import ValidationError
 
 from gllm.engine.llm import LLM
-from gllm.entrypoints import api_server
-from gllm.entrypoints.protocol import (
-    ChatCompletionRequest,
-    CompletionRequest,
-    ResponseRequest,
-)
 from gllm.layers import sampler as sampler_module
 from gllm.runtime.id_allocator import IDAllocator
 from gllm.runtime.input_data import InputData
 from gllm.runtime.sequence import GenerationSequence
-from gllm.utils import StreamOutput, get_finish_reason
 
 
 def make_engine(context=262144):
@@ -65,25 +55,6 @@ def test_engine_zero_temperature_overrides_model_sampling_defaults():
     assert Sampler._get_sampling_flags(SimpleNamespace(seqs=[seq]))["is_all_greedy"]
 
 
-@pytest.mark.parametrize("overrides,expected", [
-    ({}, (1.0, 0.95)),
-    ({"temperature": 0.7, "top_p": 0.8}, (0.7, 0.8)),
-])
-def test_responses_inherits_model_sampling_defaults(overrides, expected):
-    from gllm.entrypoints.serving_responses import make_chat_request
-
-    engine = make_engine()
-    engine.generation_config.temperature = 1.0
-    engine.generation_config.top_p = 0.95
-    engine.generation_config.top_k = 20
-    chat = make_chat_request(ResponseRequest(model="test", input="Hello", **overrides))
-    seq = engine.allocate_seq(
-        [1, 2], temperature=chat.temperature, top_p=chat.top_p, top_k=chat.top_k,
-    )
-    assert (seq.temperature, seq.top_p) == expected
-    assert seq.top_k == 20
-
-
 @pytest.mark.parametrize("prompt_len,requested,expected", [
     (180000, None, 82144),
     (262143, None, 1),
@@ -127,7 +98,9 @@ def test_default_budget_survives_cache_progress_and_preemption():
     assert not seq.is_finish
     seq.append(13)
     assert seq.is_finish
-    assert get_finish_reason(seq) == "length"
+    # The budget, not a finish token, ended it.
+    assert seq.token_ids[-1] not in seq.finish_tokens
+    assert len(seq.token_ids) - seq.raw_prompt_len == seq.output_len
 
 
 def test_default_budget_still_stops_at_eos():
@@ -135,7 +108,7 @@ def test_default_budget_still_stops_at_eos():
     seq.computed_token_num = 2
     seq.append(99)
     assert seq.is_finish
-    assert get_finish_reason(seq) == "stop"
+    assert seq.token_ids[-1] in seq.finish_tokens
 
 
 @pytest.mark.parametrize("requested,expected", [(None, 2), (1, 1), (2, 2)])
@@ -180,121 +153,6 @@ def test_disagg_rejects_budget_that_no_longer_fits(requested, image_tokens):
         coordinator._admit_meta_complete(pending, events)
     assert not events.admits
     assert not pending.admitted
-
-
-class FakeStream:
-    def __init__(self, seq):
-        self.seq = seq
-
-    async def __aiter__(self):
-        self.seq.append(99)
-        yield StreamOutput("hello")
-
-
-REQUESTS = {
-    "chat": (ChatCompletionRequest, api_server.create_chat_completion,
-             {"messages": [{"role": "user", "content": "hi"}]}, "max_completion_tokens"),
-    "responses": (ResponseRequest, api_server.create_response,
-                  {"input": "hi"}, "max_output_tokens"),
-    "completions": (CompletionRequest, api_server.create_completion,
-                    {"prompt": "hi"}, "max_tokens"),
-}
-
-
-@pytest.mark.parametrize("endpoint", REQUESTS)
-@pytest.mark.parametrize("streaming", [False, True])
-@pytest.mark.parametrize("limit", ["omitted", None, 7])
-def test_api_budget_reaches_engine(monkeypatch, endpoint, streaming, limit):
-    engine = make_engine(context=8192)
-    engine.model_runner = SimpleNamespace(
-        encode=lambda *args, **kwargs: [1] * 100,
-        extract_modify_mm=lambda messages: None,
-    )
-    allocated = []
-
-    async def add_requests(raw, *args, **kwargs):
-        kwargs.pop("dp_index", None)
-        seq = engine.allocate_seq(*args, **kwargs)
-        allocated.append(seq)
-        return FakeStream(seq)
-
-    engine.add_requests_async = add_requests
-    monkeypatch.setattr(api_server, "llm", engine)
-    monkeypatch.setattr(api_server, "tool_parser", None)
-    cls, handler, fields, limit_field = REQUESTS[endpoint]
-    fields = dict(fields)
-    if limit != "omitted":
-        fields[limit_field] = limit
-    request = cls(model="test", stream=streaming, **fields)
-    raw = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
-
-    async def run():
-        result = await handler(request, raw)
-        assert result.status_code == 200
-        if streaming:
-            chunks = [chunk async for chunk in result.body_iterator]
-            assert chunks
-        else:
-            assert json.loads(result.body)
-
-    asyncio.run(run())
-    expected = 7 if limit == 7 else 8092
-    if endpoint == "completions" and limit == "omitted":
-        expected = 16  # Preserve the legacy Completions API default.
-    assert len(allocated) == 1
-    assert allocated[0].output_len == expected
-
-
-@pytest.mark.parametrize("endpoint", REQUESTS)
-@pytest.mark.parametrize("prompt_len,limit", [(8, None), (9, None), (7, 2)])
-def test_api_returns_context_error_without_enqueuing(monkeypatch, endpoint, prompt_len, limit):
-    engine = make_engine(context=8)
-    engine.model_runner = SimpleNamespace(
-        encode=lambda *args, **kwargs: [1] * prompt_len,
-        extract_modify_mm=lambda messages: None,
-    )
-    # No add_requests_async: a regression that enqueues must fail the test.
-    monkeypatch.setattr(api_server, "llm", engine)
-    cls, handler, fields, limit_field = REQUESTS[endpoint]
-    request = cls(model="test", **fields, **{limit_field: limit})
-    response = asyncio.run(handler(request, SimpleNamespace()))
-    assert response.status_code == 400
-    assert json.loads(response.body)["error"]["code"] == "context_length_exceeded"
-
-
-@pytest.mark.parametrize("endpoint", REQUESTS)
-@pytest.mark.parametrize("limit", [0, -1])
-def test_nonpositive_api_limits_are_invalid(endpoint, limit):
-    cls, _, fields, limit_field = REQUESTS[endpoint]
-    with pytest.raises(ValidationError):
-        cls(model="test", **fields, **{limit_field: limit})
-
-
-@pytest.mark.parametrize("fields,expected", [
-    ({"max_tokens": 9}, 9),
-    ({"max_tokens": 9, "max_completion_tokens": 7}, 7),
-])
-def test_legacy_chat_limit_and_modern_precedence(monkeypatch, fields, expected):
-    captured = []
-    engine = make_engine(context=8192)
-    engine.model_runner = SimpleNamespace(
-        encode=lambda *args, **kwargs: [1, 2],
-        extract_modify_mm=lambda messages: None,
-    )
-
-    async def add_requests(raw, *args, **kwargs):
-        kwargs.pop("dp_index", None)
-        seq = engine.allocate_seq(*args, **kwargs)
-        captured.append(seq.output_len)
-        return FakeStream(seq)
-
-    engine.add_requests_async = add_requests
-    monkeypatch.setattr(api_server, "llm", engine)
-    monkeypatch.setattr(api_server, "tool_parser", None)
-    request = ChatCompletionRequest(model="test", messages=[], **fields)
-    raw = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
-    assert asyncio.run(api_server.create_chat_completion(request, raw)).status_code == 200
-    assert captured == [expected]
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

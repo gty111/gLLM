@@ -103,7 +103,7 @@ measurably changes output.
 
 ### 3.3 CUDA-graph gibberish (DSA-specific, pre-existing)
 
-With CUDA graph enabled (the api_server default), V3.2 produced pure gibberish
+With CUDA graph enabled (the server default), V3.2 produced pure gibberish
 (`1. (1# # -*- coding ...`). Bisecting proved it was **not** the MoE/UE8M0 fixes
 (neutralizing both still gibberished under graph). Root cause: the decode
 selector used `max_L = int(decode_seq_lens_cpu.max().item())` — a **data-dependent
@@ -288,9 +288,9 @@ RULER eval client: `benchmarks/evaluate_ruler.py` (buckets 4096/8192/16384).
 
 ```
 # bf16 MLA cache (default), CUDA graph on:
-python -m gllm.entrypoints.api_server --model-path <V3.2> \
+gllm-frontend --model-path <V3.2> --port 8100 -- \
   --tp 8 --enable-ep --page-size 64 --mla-decode-backend flashmla \
-  --gpu-memory-util 0.6 --maxd 512 --model-max-length 8192 --port 8100
+  --gpu-memory-util 0.6 --maxd 512 --model-max-length 8192
 
 # FP8 MLA cache (smaller KV, ~1pt MMLU trade-off):
 #   add  --mla-cache-dtype fp8

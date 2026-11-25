@@ -10,8 +10,7 @@ handling as MTP.
 ## Usage
 
 ```sh
-python -m gllm.entrypoints.api_server \
-    --model-path Qwen/Qwen3.8-27B \
+gllm-frontend --model-path Qwen/Qwen3.8-27B -- \
     --speculative-backend dspark \
     --dspark-model-path /path/to/Qwen3.8-27B-DSpark \
     [--speculative-num-draft-tokens K]   # 1..7, default 7

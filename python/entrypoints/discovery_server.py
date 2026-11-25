@@ -2,7 +2,8 @@
 
 A tiny, dependency-free ZMQ rendezvous service that the LM and Encoder servers
 publish to and watch -- the network (etcd-style) registry. Start one of these
-per service group; point every ``lm_server`` and ``encoder_server`` at it with
+per service group; point every LM node (``gllm-frontend ... -- --skip-visual``)
+and ``encoder_server`` at it with
 ``--discovery-endpoint HOST:PORT``.
 
     python -m gllm.entrypoints.discovery_server --listen 0.0.0.0:9500

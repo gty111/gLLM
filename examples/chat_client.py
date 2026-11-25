@@ -32,7 +32,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-# Modify OpenAI's API key and API base to use vLLM's API server.
+# Modify OpenAI's API key and API base to use gLLM's API server.
 openai_api_key = "EMPTY"
 openai_api_base = f"http://0.0.0.0:{args.port}/v1"
 

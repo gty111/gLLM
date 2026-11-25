@@ -24,6 +24,7 @@ class _SnapshotSegment:
             self.page2ssm_snapshot_valid[page_num] = True
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned metadata requires CUDA")
 @pytest.mark.parametrize("pp_size", [1, 2])
 def test_overlap_snapshot_is_reserved_and_published_at_launch(monkeypatch, pp_size):
     monkeypatch.setattr(input_data_module, "get_pp_size", lambda: pp_size)

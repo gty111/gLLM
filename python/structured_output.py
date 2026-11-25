@@ -140,36 +140,69 @@ class StructuredOutput:
     tag: str | None = None
 
 
-def prepare_output(fmt, tokenizer, vocab_size, stop_tokens, prompt_ids, *,
-                   tools=None, parser_name=None, custom_formats=None,
-                   parallel_tool_calls=True):
-    schema = normalize_format(fmt)
-    from gllm.tool_constraints import build_tool_tag
+def normalize_structural_tag(text):
+    """Return an XGrammar structural-tag JSON string.
 
-    tag = build_tool_tag(tools, parser_name, custom_formats=custom_formats,
-                         schema=schema, parallel_tool_calls=parallel_tool_calls)
-    # Compile before admission: bad schemas must not kill a worker. Cache hits
-    # amortize compilation; the API runs this function off its event loop.
-    if tag is not None:
-        compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_structural_tag(tag)
-    elif schema is not None:
-        compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_json_schema(schema, strict_mode=False)
-    from gllm.tokenizers.reasoning import create_reasoning_parser
+    Takes the current ``{"type": "structural_tag", "format": ...}`` form (the
+    ``type`` key may be absent) or the older
+    ``{"structures": [{"begin", "schema", "end"}], "triggers": [...]}`` form,
+    which is rewritten into a ``triggered_tags`` format.
+    """
+    try:
+        tag = json.loads(text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("structural_tag must be a JSON object.") from exc
+    if not isinstance(tag, dict):
+        raise ValueError("structural_tag must be a JSON object.")
+    if "structures" in tag:
+        structures, triggers = tag.get("structures"), tag.get("triggers")
+        if not isinstance(structures, list) or not isinstance(triggers, list):
+            raise ValueError("structural_tag structures and triggers must be lists.")
+        tags = []
+        for item in structures:
+            if not isinstance(item, dict) or not isinstance(item.get("schema"), dict):
+                raise ValueError("Each structural_tag structure needs an object schema.")
+            tags.append({
+                "type": "tag", "begin": item.get("begin", ""), "end": item.get("end", ""),
+                "content": {"type": "json_schema", "json_schema": item["schema"]},
+            })
+        tag = {"format": {"type": "triggered_tags", "triggers": triggers, "tags": tags}}
+    if not isinstance(tag.get("format"), dict):
+        raise ValueError("structural_tag requires a format object.")
+    tag["type"] = "structural_tag"
+    return json.dumps(tag, ensure_ascii=False)
 
-    parser = create_reasoning_parser(tokenizer, prompt_ids)
-    if parser is None:
-        return StructuredOutput(schema, tag=tag) if schema is not None or tag is not None else None
-    start = tokenizer.convert_tokens_to_ids(parser.START)
-    end = tokenizer.convert_tokens_to_ids(parser.END)
-    suffix = tokenizer.decode(prompt_ids[-16:], skip_special_tokens=False).rstrip()
-    if schema is None and tag is None and suffix.endswith(parser.END):
-        return None  # template explicitly disabled thinking
-    return StructuredOutput(
-        schema, start, end, parser.prefilled,
-        not parser.prefilled and not suffix.endswith(parser.END),
-        tuple(prompt_ids[-1:]),
-        tag,
-    )
+
+def validate_structured_output(spec, tokenizer, vocab_size, stop_tokens):
+    """Normalize and compile a request's constraint before it is admitted.
+
+    A front end that cannot compile grammars itself sends the spec as is; a bad
+    schema must be refused here rather than fail inside the sampler. Returns
+    the spec to use; raises ``ValueError`` with a client-facing message.
+    """
+    import dataclasses
+
+    tag = spec.tag
+    schema = spec.schema
+    try:
+        if schema is not None:
+            # Same checks and rewrites the server applied to response formats:
+            # refuse constraints the grammar cannot enforce.
+            schema = normalize_format(
+                {"type": "json_schema", "json_schema": {"name": "output", "schema": json.loads(schema)}}
+            )
+        if tag is not None:
+            tag = normalize_structural_tag(tag)
+            compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_structural_tag(tag)
+        elif schema is not None:
+            compiler(tokenizer, vocab_size, tuple(stop_tokens)).compile_json_schema(schema, strict_mode=False)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Invalid structured output constraint: {exc}") from exc
+    if tag == spec.tag and schema == spec.schema:
+        return spec
+    return dataclasses.replace(spec, tag=tag, schema=schema)
 
 
 class _State:

@@ -76,8 +76,8 @@ no encrypted reasoning items.
 
 When `max_output_tokens` is omitted or null, the output budget is the configured
 context length minus the tokenized input length, including the chat template
-and image tokens. An explicit limit is preserved; requests that leave no output
-space or whose input plus output budget exceeds the context window are rejected.
+and image tokens. A limit larger than the context length is rejected; a smaller limit that
+does not fit next to the input is reduced to the space that is left.
 The budget includes reasoning, answer text, and tool-call tokens. EOS can end a
 response before the budget is exhausted. Limits explicitly supplied by a proxy
 still apply. Chat Completions uses the same remaining-context default; legacy
@@ -93,14 +93,13 @@ These checks report unsuccessful generation; they do not retry requests or
 prevent repetitive reasoning during generation.
 
 Grammar checks validate generated input **after generation**, rather than
-constraining token sampling. Lark formats use Python Lark; the empty-line regex
-forms used by Codex patches (`/(.*)/` and `/.*/`) are adapted to optional nonempty
-terminals. Other grammar dialect differences are not translated.
+constraining token sampling. Regex formats are checked; Lark formats are
+accepted but their output is not checked yet.
 
 Invalid or undeclared generated tool calls are not published. Non-streaming
 requests return HTTP 500 with `invalid_tool_output`; streams terminate with a
 `response.failed` event using the Responses error code `server_error` and a
-diagnostic message. Invalid grammar definitions are rejected before inference.
+diagnostic message. Invalid regex definitions are rejected before inference.
 
 Hosted tools, forced tool choices, and background requests are not supported. Unsupported
 capabilities return an error. This endpoint does not implement the complete
@@ -110,13 +109,9 @@ OpenAI Responses API.
 
 Run in a Linux gLLM environment with its dependencies installed:
 
-```sh
-python -m pytest -q tests/test_codex_responses.py tests/test_openai_protocol_compat.py tests/test_tool_parsers.py tests/test_reasoning_output.py tests/test_responses_history.py
-```
-
-These tests validate response objects and streaming events with the OpenAI Python
-SDK, including failed custom calls, namespace collisions, Qwen3.8 XML markup,
-text and regex tools, and Codex patch grammars.
+`rust/frontend/parity/compare_servers.py` covers the Responses cases (text,
+thinking, function and custom tools, stored turns, `previous_response_id`,
+streamed events) between two server builds; see its README.
 
 History tests also cover generated Responses items replayed as assistant/tool
 messages. To check the rendered boundaries against an actual local Qwen3.8

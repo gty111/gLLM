@@ -9,7 +9,7 @@ workers to release all GPU memory they own while the HTTP frontend stays online.
 Sleep mode is on by default:
 
 ```sh
-python -m gllm.entrypoints.api_server --model-path <model> \
+gllm-frontend --model-path <model> -- \
     --sleep-idle-timeout 300   # optional; 0 (default) disables idle sleep
 ```
 
@@ -59,14 +59,17 @@ what another process took while the server was asleep.
 
 ## Level 2
 
-Workers exit after in-flight requests have drained or been canceled. Their
-CUDA contexts, graph pools, communication buffers, weights, KV cache, and
-any pinned level-1 weight backups are released. The frontend retains its
-tokenizer and HTTP routes. Wake-up starts new workers, reloads weights from
-the checkpoint, builds a fresh KV cache and captures graphs again. Allow
-startup time when planning the first request after a level 2 sleep.
+After in-flight requests have drained or been canceled, `gllm-frontend`
+stops its engine process and the workers with it. Their CUDA contexts, graph
+pools, communication buffers, weights, KV cache, and any pinned level-1 weight
+backups are released. The frontend keeps its tokenizer, HTTP routes and
+media arena. Wake-up starts the engine again with the same arguments: new
+workers reload weights from the checkpoint, build a fresh KV cache and capture
+graphs again. Allow startup time when planning the first request after a
+level 2 sleep. `/start_profile` and `/stop_profile` answer 500 while the
+workers are stopped.
 
-Level 2 supports workers launched locally by the frontend (`launch_mode=normal`)
+Level 2 supports workers launched locally by the frontend (`--launch-mode normal`)
 without encoder disaggregation. It releases memory owned by those workers.
 
 ## Failures
@@ -79,7 +82,9 @@ without encoder disaggregation. It releases memory owned by those workers.
   no-op where nothing was released) before answering 500. If even that fails
   the server is treated as asleep, so no request runs on released memory.
 * After a failed level 2 worker restart, the frontend stays asleep and
-  cleans up the failed worker group so a later request can retry.
+  cleans up the failed worker group so a later request can retry. A restart
+  that is not ready within `--wake-timeout-s` seconds (default 1800) counts as
+  failed.
 * A sleep or wake-up runs to completion even if the HTTP caller disconnects.
 
 The pinned host buffer for weights is allocated on the first sleep and kept
@@ -113,4 +118,4 @@ with the old metadata first fails, reconnects from discovery and retries.
 
 ## Limitations
 
-* Idle sleep runs only in `gllm.entrypoints.api_server`.
+* Idle sleep runs in the `gllm-frontend` server.

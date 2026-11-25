@@ -5,11 +5,11 @@ and run online serving with the OpenAI client.
 Launch the gLLM server with the following command:
 
 (single image inference with Llava)
-python -m gllm.entrypoints.api_server --model-path llava-hf/llava-1.5-7b-hf
+gllm-frontend --model-path llava-hf/llava-1.5-7b-hf
 
 (multi-image inference with Phi-3.5-vision-instruct)
-python -m gllm.entrypoints.api_server --model-path microsoft/Phi-3.5-vision-instruct \
-    --max-model-len 4096
+gllm-frontend --model-path microsoft/Phi-3.5-vision-instruct -- \
+    --model-max-length 4096
 
 run the script with
 python mm_chat.py --chat-type single-image

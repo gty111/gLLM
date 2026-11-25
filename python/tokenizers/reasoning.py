@@ -166,30 +166,3 @@ def decode_stream_delta(seq, tokenizer, tokens, controls):
             size += len(piece)
     pieces.append(seq.detokenize_inc(tokenizer))
     return "".join(pieces), tuple(positions)
-
-
-def create_reasoning_parser(tokenizer, token_ids):
-    """Enable parsing only for tokenizers with native think delimiters.
-
-    Inspect the actual generation prefix, not reasoning_effort: templates can
-    enable thinking by default or override it through chat_template_kwargs.
-    """
-    if tokenizer is None:
-        return None
-    for marker in (ThinkParser.START, ThinkParser.END):
-        token_id = tokenizer.convert_tokens_to_ids(marker)
-        if token_id is None or tokenizer.decode([token_id], skip_special_tokens=False) != marker:
-            return None
-    suffix = tokenizer.decode(token_ids[-16:], skip_special_tokens=False)
-    return ThinkParser(prefilled=suffix.rstrip().endswith(ThinkParser.START))
-
-
-async def split_reasoning_stream(stream, parser):
-    """Preserve engine metadata while splitting text, including EOF fragments."""
-    from gllm.utils import StreamOutput
-
-    async for item in stream:
-        reasoning, content = parser.feed(item.text, control_tokens=item.control_tokens) if parser else ("", item.text)
-        yield item, reasoning, content, False
-    reasoning, content = parser.finish() if parser else ("", "")
-    yield StreamOutput(""), reasoning, content, True

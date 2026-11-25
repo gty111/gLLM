@@ -1,7 +1,7 @@
 """Explicit configuration for encoder disaggregation.
 
 Replaces the ``GLLM_DISAGG_*`` / ``GLLM_SKIP_*`` environment variables that
-``lm_server`` / ``encoder_server`` used to set from parsed CLI args and that the
+the LM and encoder entrypoints used to set from parsed CLI args and that the
 worker + model loader read back across the ``spawn`` process boundary. The
 object is built once in the entrypoint and threaded explicitly:
 

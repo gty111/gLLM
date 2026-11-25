@@ -33,37 +33,6 @@ K = TypeVar("K")
 T = TypeVar("T")
 
 
-class StreamOutput:
-    """A single streamed generation delta.
-
-    ``text`` is the incremental detokenized text (may be empty while a
-    multi-byte token is still being assembled). ``logprob`` is the OpenAI-ready
-    per-token logprob dict for the token that produced this delta, or ``None``
-    when the request did not ask for logprobs. Kept as a plain object (not a
-    bare str) so the async stream can carry both without a second channel.
-    """
-
-    __slots__ = ("text", "logprob", "prompt_logprobs", "control_tokens")
-
-    def __init__(
-        self,
-        text: str,
-        logprob: Optional[dict] = None,
-        prompt_logprobs: Optional[list] = None,
-        *,
-        control_tokens=None,
-    ):
-        self.text = text
-        self.logprob = logprob
-        # Set only on the first delta of a request that asked for
-        # ``prompt_logprobs``: the full per-prompt-token list (index 0 is
-        # ``None``). ``None`` on every other delta.
-        self.prompt_logprobs = prompt_logprobs
-        # None: legacy text-only source; (): known to contain no native controls.
-        # Otherwise (character offset, marker) pairs in this delta.
-        self.control_tokens = control_tokens
-
-
 def init_logger():
     formatter = logging.Formatter(
         f"[%(asctime)s %(filename)s:%(lineno)d] %(levelname)s - %(message)s",
@@ -128,27 +97,6 @@ def find_free_port(host="0.0.0.0"):
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((bind_host, 0))
         return s.getsockname()[1]
-
-
-def find_free_ports(count, host="0.0.0.0"):
-    """Return ``count`` distinct free TCP ports (not necessarily contiguous).
-
-    Binds all sockets to ``:0`` simultaneously before reading their assigned
-    ports, so the OS hands back distinct numbers instead of reusing the same
-    just-released ephemeral port across a loop.
-    """
-    bind_host = "" if host in ("0.0.0.0", "", None) else host
-    socks = []
-    try:
-        for _ in range(count):
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((bind_host, 0))
-            socks.append(s)
-        return [s.getsockname()[1] for s in socks]
-    finally:
-        for s in socks:
-            s.close()
 
 
 def make_pull_random(ctx, host):
@@ -305,15 +253,3 @@ def unify_decode(tokenizer, token_ids, skip_special_tokens: bool = True):
     chat-tuned models, without needing per-model stop-string lists.
     """
     return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
-
-
-def __getattr__(name: str):
-    # Backwards-compatible lazy re-exports: the OpenAI response constructors
-    # live in ``gllm.entrypoints.common`` (which owns ``protocol``). Importing
-    # them here at module top would be circular, because
-    # ``gllm.entrypoints.protocol`` itself imports ``random_uuid`` from here.
-    if name in ("get_finish_reason", "build_usage"):
-        from gllm.entrypoints import common
-
-        return getattr(common, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

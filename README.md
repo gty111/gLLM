@@ -90,10 +90,20 @@ token-level JSON Schema constraints and streaming.
 Unsupported hosted features return an OpenAI-style
 `unsupported_parameter` error instead of being silently ignored.
 
+The server is the `gllm-frontend` binary (Rust, built and installed by
+`pip install`). It starts the engine workers and talks to them directly;
+engine arguments go after `--`:
+
 ```bash
-# To see the description of args, run 'python -m gllm.entrypoints.api_server -h'
-python -m gllm.entrypoints.api_server --model-path $MODEL_PATH
+# Front-end flags: 'gllm-frontend -h'; engine flags: 'python -m gllm.entrypoints.engine_server -h'
+gllm-frontend --model-path $MODEL_PATH --port 8000 -- --tp 2
 ```
+
+Media are given as data URLs or http(s) URLs (request bodies up to
+`--max-request-mb`, default 1024). JPEG decoding matches PIL when
+`libturbojpeg.so.0` is on the loader path (`apt install libturbojpeg0` or
+`conda install libjpeg-turbo`), and video inputs need an `ffmpeg` executable on
+`PATH`; the server warns at startup when a multimodal model is missing either.
 
 ### Interactive Offline Chat
 ```bash
@@ -111,16 +121,16 @@ python examples/batch_inference.py --model $MODEL \
 
 gLLM supports three launch modes: (1) `normal` for single-node multiple GPUs, (2) `master` for multi-node deployment, and (3) `slave` for multi-node deployment.
 
-To launch the master instance:
+To launch the master instance (front end plus its workers):
 ```bash
-python -m gllm.entrypoints.api_server --port $PORT --master-port $MASTER_PORT \
-    --model-path $MODEL_PATH --pp $PP --launch-mode master --worker-ranks $RANKS
+gllm-frontend --model-path $MODEL_PATH --port $PORT -- \
+    --master-port $MASTER_PORT --pp $PP --launch-mode master --ranks $RANKS
 ```
-To launch the slave instance:
+To launch the slave instance (workers only):
 ```bash
-python -m gllm.entrypoints.api_server --host $HOST \
+python -m gllm.entrypoints.engine_server --host $HOST \
     --master-addr $MASTER_ADDR --master-port $MASTER_PORT \
-    --model-path $MODEL_PATH --pp $PP --launch-mode slave --worker-ranks $RANKS
+    --model-path $MODEL_PATH --pp $PP --launch-mode slave --ranks $RANKS
 ```
 
 > **Notes:**

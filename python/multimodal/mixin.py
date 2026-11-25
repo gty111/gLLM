@@ -187,59 +187,6 @@ class MultiModalEmbeddingCache:
 
 
 class MmMixin:
-    def extract_modify_mm(self, messages: Dict):
-        mm_contents = {"image": [], "video": []}
-        for message in messages:
-            contents = message.get("content")
-            if type(contents) != list:
-                continue
-            for content in contents:
-                if content["type"] == "image":
-                    mm_contents["image"].append(content["image"])
-                elif content["type"] == "video":
-                    mm_contents["video"].append(content["video"])
-                elif content["type"] == "image_url":
-                    content["type"] = "image"
-                    data = content["image_url"]
-                    del content["image_url"]
-                    if type(data) == dict:
-                        data = data["url"]
-                    content["image"] = data
-                    mm_contents["image"].append(data)
-                elif content["type"] == "video_url":
-                    content["type"] = "video"
-                    data = content["video_url"]
-                    del content["video_url"]
-                    if type(data) == dict:
-                        data = data["url"]
-                    content["video"] = data
-                    mm_contents["video"].append(data)
-        return (
-            mm_contents
-            if len(mm_contents["image"]) + len(mm_contents["video"]) != 0
-            else None
-        )
-
-    def extract_mm_items_ordered(self, messages: List[Dict]):
-        """Return the mm items as an ordered ``[(modality, content), ...]`` list.
-
-        Encoder disaggregation needs the items in *prompt order* (matching the
-        skeleton's sentinel order) so the LM can pair the i-th sentinel with the
-        i-th encoder job. Call *after* :meth:`extract_modify_mm`, which has
-        already normalized ``image_url``/``video_url`` -> ``image``/``video``.
-        """
-        items = []
-        for message in messages:
-            contents = message.get("content")
-            if type(contents) != list:
-                continue
-            for content in contents:
-                if content["type"] == "image":
-                    items.append(("image", content["image"]))
-                elif content["type"] == "video":
-                    items.append(("video", content["video"]))
-        return items
-
     @torch.inference_mode()
     def _mm_prepare_cpu(
         self, seqs: List[GenerationSequence], *, num_decodes: Optional[int] = None
@@ -487,6 +434,14 @@ class MmMixin:
         mm_input: Dict = {}
         image_grid_thw: Optional[torch.Tensor] = None
         video_grid_thw: Optional[torch.Tensor] = None
+        preprocessed = (seq.mm_contents or {}).get("preprocessed")
+        if preprocessed is not None:
+            # A gateway already ran the image/video processors (and expanded
+            # the prompt's placeholders); its tensors stand in for theirs.
+            mm_input = dict(preprocessed)
+            image_grid_thw = mm_input.get("image_grid_thw")
+            video_grid_thw = mm_input.get("video_grid_thw")
+            return mm_input, image_grid_thw, video_grid_thw
         if seq.mm_contents is not None and self.is_kimi_mm:
             return self._mm_run_processor_kimi(seq)
         if seq.mm_contents is not None:
