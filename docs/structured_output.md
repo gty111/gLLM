@@ -184,11 +184,6 @@ or copy a second speculative-execution framework.
 
 CPU tests: `pytest -q tests/test_structured_output.py tests/test_structured_string_lengths.py`.
 
-`tests/run_structured_output.py` is a Slurm-only online integration harness for
-Qwen3.8-27B: greedy and random sampling, mixed schemas and ordinary requests,
-streaming, reasoning, chunked prefill, truncation, Chat/Responses, TP2, PP2,
-overlap, and an ordinary-request baseline. The `before` mode runs the same
-structured suite against `--baseline`; fixed JSON B1/B32 trials compare latency,
-throughput and output parity before and after grammar-aware MTP. It writes server logs and JSON
-results to its `--output` directory. GPU jobs use partition `normal`, job name
-`dev`, and CUDA devices 2 and 3.
+Online behaviour (JSON Schema with and without thinking, `json_object`, tool
+calls) is compared between two server builds by
+`rust/frontend/parity/compare_servers.py`; see its README.

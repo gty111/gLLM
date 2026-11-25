@@ -46,7 +46,7 @@ vision-light workloads.
 | Component | Entry point | Role |
 |-----------|-------------|------|
 | **Discovery registry** | `gllm.entrypoints.discovery_server` | A tiny ZMQ rendezvous service. The LM and encoders register with it and discover each other (TTL leases, heartbeats, ADD/REMOVE events). |
-| **LM node** | `gllm.entrypoints.lm_server` | Frontend + scheduler + PP0 worker + KV/SSM cache, **without the vision tower**. Serves the OpenAI-compatible API. |
+| **LM node** | `gllm-frontend ... -- --skip-visual` | Front end + scheduler + PP0 worker + KV/SSM cache, **without the vision tower**. Serves the OpenAI-compatible API. |
 | **Encoder node** | `gllm.entrypoints.encoder_server` | **Vision tower only**. Runs the ViT per item and writes embeddings back to the LM over NIXL. One process per GPU; run several replicas. |
 
 Two planes:
@@ -91,7 +91,8 @@ see section 6.1). Verified:
 
 - NIXL (UCX backend) available for GPU→GPU transfer.
 - **One GPU per process:** each encoder/LM binds a single card via
-  `--encoder-gpu` / `--lm-gpu` (it sets `CUDA_VISIBLE_DEVICES` internally).
+  `--encoder-gpu` on the encoder (it sets `CUDA_VISIBLE_DEVICES` internally);
+  pin the LM node with `CUDA_VISIBLE_DEVICES` (one ordinal per TP rank).
   Make sure the target card is free.
 - Keep the LM↔encoder NIXL traffic within the same NUMA domain (cross-NUMA UCX
   wireup can fail — see section 9).
@@ -121,10 +122,9 @@ DISC=127.0.0.1:9500   # registry address; reused for bind and connect
 # 1) Discovery registry
 python -m gllm.entrypoints.discovery_server --listen $DISC &
 
-# 2) LM node (port 8100). Vision tower is skipped by default on this entry point.
-python -m gllm.entrypoints.lm_server \
-    --model-path $MODEL --lm-gpu 2 --port 8100 \
-    --discovery-endpoint $DISC &
+# 2) LM node (port 8100) on GPU 2, without the vision tower.
+CUDA_VISIBLE_DEVICES=2 gllm-frontend --model-path $MODEL --port 8100 -- \
+    --skip-visual --discovery-endpoint $DISC &
 
 # 3) Encoder node (vision only)
 python -m gllm.entrypoints.encoder_server \
@@ -138,7 +138,7 @@ control-plane ports = ephemeral, prefix caching on, `--gpu-memory-util 0.9`,
 
 Readiness:
 
-- LM log shows `Uvicorn running on http://0.0.0.0:8100` and
+- LM log shows `serving on http://0.0.0.0:8100` and
   `encoder ... connected; live encoders=N`.
 - Encoder log shows `READY; entering job loop` / `serving jobs`.
 
@@ -172,7 +172,7 @@ You normally only need `--model-path`, the GPU index, the LM `--port`, and
 | Flag | Applies to | Purpose |
 |------|-----------|---------|
 | `--model-path` | LM, encoder | Same model directory on both sides. |
-| `--lm-gpu` / `--encoder-gpu` | LM / encoder | Physical GPU to bind. |
+| `CUDA_VISIBLE_DEVICES` / `--encoder-gpu` | LM / encoder | Physical GPU(s) to bind. |
 | `--port` | LM | OpenAI API port (default 8000). |
 | `--discovery-endpoint` | LM, encoder | Registry `HOST:PORT`. **If omitted on the LM, it falls back to a plain text-only server.** |
 | `--listen` | discovery | Registry bind address (default `0.0.0.0:9500`). |
@@ -287,9 +287,8 @@ DISC=127.0.0.1:9500   # registry address; reused for bind and connect
 
 python -m gllm.entrypoints.discovery_server --listen $DISC &
 
-python -m gllm.entrypoints.lm_server \
-    --model-path $MODEL --lm-gpu 4 --port 8100 \
-    --discovery-endpoint $DISC --encoder-dp 3 --maxd 64 &
+CUDA_VISIBLE_DEVICES=4 gllm-frontend --model-path $MODEL --port 8100 -- \
+    --skip-visual --discovery-endpoint $DISC --encoder-dp 3 --maxd 64 &
 
 for g in 5 6 7; do
   python -m gllm.entrypoints.encoder_server \
@@ -390,13 +389,13 @@ bottleneck.
 
 ## 11. Validating correctness (byte-identical to monolith)
 
-Run a **monolith** (`api_server`) and a **disaggregated stack** side by side,
+Run a **monolith** (`gllm-frontend` without `--skip-visual`) and a **disaggregated stack** side by side,
 ask the same question about the same image, and the outputs should be identical
 byte-for-byte (greedy decoding + prefix cache, cold == warm).
 
 ```bash
-# Monolith (api_server) on port 8200
-python -m gllm.entrypoints.api_server --model-path $MODEL --port 8200 \
+# Monolith on port 8200
+gllm-frontend --model-path $MODEL --port 8200 -- \
     --pp 1 --tp 1 --disable-cuda-graph &
 
 # Then send the same image request to both stacks (e.g. with
@@ -430,7 +429,7 @@ not byte-identical (different decoder, see section 6.1).
 
 ```bash
 # Kill the stack (LM / encoder / discovery / monolith) and clean up stray workers
-ps -eo pid,cmd | grep -E "lm_server|encoder_server|api_server|discovery_server" \
+ps -eo pid,cmd | grep -E "gllm-frontend|engine_server|encoder_server|discovery_server" \
   | grep -v grep | awk '{print $1}' | xargs -r kill -9
 for w in $(ps -eo pid,ppid,cmd | grep multiprocessing | grep -v grep | awk '$2==1{print $1}'); do
   kill -9 $w

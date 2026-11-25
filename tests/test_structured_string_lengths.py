@@ -102,13 +102,8 @@ def test_multi_character_token_boundary(backend):
     {"minLength": True}, {"minLength": 4, "maxLength": 3},
 ])
 def test_invalid_bounds_rejected(bounds):
-    from gllm.entrypoints.api_server import _validate_output_format
-
     with pytest.raises(ValueError):
         so.normalize_format(fmt(title_schema(bounds)))
-    error = _validate_output_format(fmt(title_schema(bounds)), "response_format")
-    assert error.status_code == 400
-    assert json.loads(error.body)["error"]["code"] == "invalid_output_format"
 
 
 def test_untyped_length_rejected():
@@ -134,25 +129,6 @@ def test_nested_nullable_reference(backend):
     assert accepts(backend, schema, '{"titles":[null,"\u4e2d","ab"]}')
     assert not accepts(backend, schema, '{"titles":[""]}')
     assert not accepts(backend, schema, '{"titles":["abc"]}')
-
-
-def test_codex_title_format_compiles_for_both_endpoints(monkeypatch, byte_compiler):
-    from gllm.entrypoints import api_server
-    from gllm.entrypoints.protocol import ChatCompletionRequest, ResponseRequest
-
-    monkeypatch.setattr(api_server, "llm", SimpleNamespace(model_path="test"))
-    monkeypatch.setattr(so, "compiler", lambda *args: byte_compiler)
-    schema = title_schema({"minLength": 1, "maxLength": 36})
-    chat = fmt(schema)
-    response = {"type": "json_schema", **chat["json_schema"]}
-    chat_request = ChatCompletionRequest(model="test", messages=[{"role": "user", "content": "JSON"}],
-                                         response_format=chat)
-    response_request = ResponseRequest(model="test", input="JSON", text={"format": response})
-    assert api_server._validate_chat_capabilities(chat_request) is None
-    assert api_server._validate_response_capabilities(response_request) is None
-    for value in (chat, response):
-        spec = so.prepare_output(value, None, 260, [256], [1])
-        assert json.loads(spec.schema) == schema
 
 
 def test_speculative_length_boundary_rejects_draft_without_committing(backend):

@@ -82,8 +82,8 @@ prompt token at that position). It is delivered once, on the streaming chunk
 where the prompt finishes prefill.
 
 Both requests clamp the alternative count to **20** (the OpenAI ceiling) to bound
-the per-step top-k work — see `api_server.create_chat_completion` /
-`create_completion`.
+the per-step top-k work — see `rust/frontend/src/http/chat.rs` /
+`completions.rs`.
 
 ---
 
@@ -165,10 +165,10 @@ support prompt logprobs (silent no-op).
               ▼
      LLM._apply_ipc_package (frontend)
         · _make_logprob_entry / _make_prompt_logprobs  (decode ids → pieces)
-        · StreamOutput(text, logprob, prompt_logprobs)  ─► AsyncStream
+        · worker rows ─► per-position logprobs (rust/frontend/src/backend.rs)
               │
               ▼
-     serving_chat / serving_completions  ─► OpenAI JSON
+     rust/frontend/src/http/{chat,completions}.rs  ─► OpenAI JSON
 ```
 
 Key carriers:
@@ -321,9 +321,8 @@ curl -s localhost:8200/v1/chat/completions -H 'Content-Type: application/json' -
 
 | File | Role |
 |------|------|
-| `python/entrypoints/protocol.py` | request/response schema fields |
-| `python/entrypoints/api_server.py` | parse + clamp request params |
-| `python/entrypoints/serving_chat.py`, `serving_completions.py` | build OpenAI logprob objects |
+| `rust/frontend/src/http/{chat,completions}.rs` | parse + clamp request params, build OpenAI logprob objects |
+| `rust/frontend/src/backend.rs` | worker rows -> per-position logprobs |
 | `python/layers/sampler.py` | `compute_logprobs` on GPU |
 | `python/runtime/model_runner.py` | `_build_logprob_rows`, `_compute_prompt_logprobs`, overlap staging |
 | `python/models/*.py` | `logits_from_hidden` (LM-head projection) |
@@ -332,5 +331,4 @@ curl -s localhost:8200/v1/chat/completions -H 'Content-Type: application/json' -
 | `python/workers/worker.py`, `workers/overlap.py` | carry logprobs alongside tokens (incl. PP>1) |
 | `python/scheduling/distributed.py` | `SeqRegister` / `FollowerSeq` logprob flags (PP>1) |
 | `python/runtime/sequence.py` | per-seq logprob flags + `prompt_logprobs_data` |
-| `python/engine/llm.py`, `engine/async_llm.py` | decode ids → entries, plumb params |
-| `python/utils/__init__.py` | `StreamOutput` |
+| `python/distributed/wire.py` | logprob rows on the front end <-> worker wire |

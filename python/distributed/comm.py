@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 import zmq
 
+from gllm.distributed import wire
 from gllm.distributed.parallel_state import (
     get_ipc_tp_group,
     get_output_rank,
@@ -52,6 +53,8 @@ class IPCPackage:
         # worker => front-end
         self.free_ids = []  # seq_ids to free
         self.request_errors = {}  # terminal per-request capacity errors
+        # Error code per ``request_errors`` entry; absent means capacity.
+        self.request_error_codes = {}
         self.act_schedule_ids = []
         self.next_tokens = []
         # Per-token logprobs aligned with ``next_tokens`` (one entry per acted
@@ -325,12 +328,11 @@ class zmqComm:
             return None
 
     def send_output(self, output):
-        self.output_socket.send_pyobj(output)
+        self.output_socket.send(wire.encode_output(output), copy=False)
 
     def recv_output(self):
         if self.output_socket.poll(timeout=0) != 0:
-            output = self.output_socket.recv_pyobj()
-            return output
+            return wire.decode_output(self.output_socket.recv(copy=False).buffer)
         else:
             return None
 
@@ -570,20 +572,20 @@ class zmqComm:
         return None
 
     def send_ipc_package(self, ipc_package):
-        self.request_socket.send_pyobj(ipc_package)
+        self.request_socket.send(wire.encode_input(ipc_package), copy=False)
 
     def send_ipc_package_to_dp(self, ipc_package, dp_index):
         """Send a package to one DP replica (frontend, dp_size > 1 only)."""
-        self.request_sockets[dp_index].send_pyobj(ipc_package)
+        self.request_sockets[dp_index].send(wire.encode_input(ipc_package), copy=False)
 
     def broadcast_ipc_package_to_dp(self, ipc_package):
         """Send a copy of the package to every DP replica (aborts/control)."""
+        data = wire.encode_input(ipc_package)
         for sock in self.request_sockets:
-            sock.send_pyobj(ipc_package)
+            sock.send(data)
 
     def recv_ipc_package(self):
         if self.request_socket.poll(timeout=0) != 0:
-            ipc_package = self.request_socket.recv_pyobj()
-            return ipc_package
+            return wire.decode_input(self.request_socket.recv(copy=False).buffer)
         else:
             return None

@@ -46,6 +46,7 @@ import torch
 import torch.distributed as dist
 from logger import logger
 
+from gllm.distributed import wire
 from gllm.distributed.comm import IPCPackage, zmqComm
 from gllm.distributed.parallel_state import (
     dp_all_gather_meta,
@@ -80,7 +81,7 @@ from gllm.scheduling.distributed import (
 from gllm.scheduling.scheduler import Scheduler
 
 
-# Used with AsyncLLM
+# Sleep mode, requested by the front end.
 # Control codes for sleep mode, next to the profiler's 1 (start) / 2 (stop).
 MEMORY_SLEEP_CMD = 3
 MEMORY_WAKE_CMD = 4
@@ -92,6 +93,8 @@ class Worker(TorchProfilerMixin):
     # Sleep/wake command received from the frontend, executed by
     # ``_maybe_run_memory_cmd`` once this column has no work in flight.
     _pending_memory_cmd = None
+    # Path of the front end's media arena (set by ``LLM.build_worker``).
+    media_arena = None
 
     def __init__(
         self,
@@ -237,6 +240,9 @@ class Worker(TorchProfilerMixin):
         self._init_role_state()
 
         self._maybe_init_disagg()
+
+        if self.media_arena:
+            wire.map_media_arena(self.media_arena)
 
         self.mp_alive[self.local_rank] = 1
 
@@ -620,6 +626,8 @@ class Worker(TorchProfilerMixin):
                         cum.control_data = data
             if not saw_log_override:
                 cum.log = None
+            if cum.schedule_lists:
+                cum.schedule_lists = self._refuse_invalid_requests(cum.schedule_lists)
 
         # TP0 control plane: drive the disagg coordinator (discovery / meta /
         # notif / dispatch / watchdog) once per iter and attach the resulting
@@ -676,6 +684,35 @@ class Worker(TorchProfilerMixin):
                 self.comm.broadcast_control_cmd(
                     cum.control_cmd_code, cum.control_data
                 )
+
+    def _refuse_invalid_requests(self, seqs):
+        """Compile output constraints before admission (driver only).
+
+        A rejected request is answered at once with an error and never reaches
+        the scheduler, so a bad schema cannot fail inside the sampler.
+        """
+        from gllm.structured_output import validate_structured_output
+
+        admitted, errors = [], {}
+        for seq in seqs:
+            spec = getattr(seq, "structured_output", None)
+            if spec is not None:
+                runner = self.model_runner
+                try:
+                    seq.structured_output = validate_structured_output(
+                        spec, runner.tokenizer, runner.model_loader.vocab_size, seq.finish_tokens
+                    )
+                except ValueError as exc:
+                    errors[seq.seq_id] = str(exc)
+                    continue
+            admitted.append(seq)
+        if errors:
+            pkg = IPCPackage([])
+            pkg.free_ids = list(errors)
+            pkg.request_errors = errors
+            pkg.request_error_codes = {seq_id: "invalid_request" for seq_id in errors}
+            self.comm.send_output(pkg)
+        return admitted
 
     def _translate_control_cmd(self, control_cmd):
         """rank-0-only string -> (code, data) translation for broadcast."""

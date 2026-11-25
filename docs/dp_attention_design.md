@@ -115,7 +115,7 @@ Key accessors in `parallel_state.py`: `is_dp_attn()` (`_DP_SIZE > 1`), `get_dp_s
   `next_tokens`/`free_ids`) and keyed by `seq_id`, so ordering across replicas is
   irrelevant; the engine drains *all* queued packages each tick.
 
-Server flag: `--dp N` (see `python/entrypoints/api_server.py`). World size is
+Engine flag: `--dp N` (see `python/entrypoints/cli_args.py`). World size is
 `pp·dp·tp`; with `--enable-ep` the experts shard across `EP = dp·tp` per stage.
 
 ---
@@ -317,8 +317,7 @@ with **0 empty responses and no tail stall**; GPUs stayed 47–80 % utilized. Be
 
 ```bash
 # DP attention: TP2 × DP2, experts sharded EP = DP·TP = 4 (4 GPUs)
-python -m gllm.entrypoints.api_server \
-    --model-path <MLA-model> \
+gllm-frontend --model-path <MLA-model> -- \
     --tp 2 --dp 2 --enable-ep \
     --model-max-length 8192
 ```

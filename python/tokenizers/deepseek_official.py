@@ -98,10 +98,29 @@ def apply_deepseek_chat_template(
     tokenize: bool = True,
     **kwargs: Any,
 ):
-    """Render OpenAI messages through a bundled DeepSeek encoder."""
-    thinking = bool(
-        kwargs.get("thinking", False) or kwargs.get("enable_thinking", False)
+    """Render OpenAI messages through a bundled DeepSeek encoder.
+
+    Thinking follows DeepSeek's own defaults: an explicit ``thinking`` /
+    ``enable_thinking`` wins, effort ``none`` switches it off, any other effort
+    switches it on, and otherwise V4 (whose encoder takes an effort) thinks
+    while V3.2 does not.
+    """
+    # V4 accepts this extension, while older V3.2 encoders do not. Inspect the
+    # bundled function rather than branching on a model name.
+    takes_effort = "reasoning_effort" in inspect.signature(
+        encoder.encode_messages
+    ).parameters
+    toggle = next(
+        (kwargs[k] for k in ("thinking", "enable_thinking") if kwargs.get(k) is not None),
+        None,
     )
+    effort = kwargs.get("reasoning_effort")
+    if toggle is not None:
+        thinking = bool(toggle)
+    elif effort is not None:
+        thinking = effort != "none"
+    else:
+        thinking = takes_effort
     thinking_mode = "thinking" if thinking else "chat"
     normalized = []
     for message in messages:
@@ -122,12 +141,12 @@ def apply_deepseek_chat_template(
         "thinking_mode": thinking_mode,
         "drop_thinking": drop_thinking,
     }
-    # V4 accepts this extension, while older V3.2 encoders do not. Inspect the
-    # bundled function rather than branching on a model name.
-    if "reasoning_effort" in inspect.signature(
-        encoder.encode_messages
-    ).parameters:
-        encode_kwargs["reasoning_effort"] = kwargs.get("reasoning_effort")
+    if takes_effort:
+        # The encoder knows "high" and "max"; other names render the plain
+        # prompt, as an unset effort does.
+        encode_kwargs["reasoning_effort"] = (
+            effort if thinking and effort in ("high", "max") else None
+        )
     prompt = encoder.encode_messages(normalized, **encode_kwargs)
     if not tokenize:
         return prompt

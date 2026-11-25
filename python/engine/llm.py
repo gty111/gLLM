@@ -9,13 +9,11 @@ import tqdm
 from logger import logger
 
 from gllm.distributed.comm import IPCPackage, zmqComm
-from gllm.tokenizers.reasoning import decode_stream_delta, reasoning_control_tokens
 from gllm.runtime.config import EngineConfig
 from gllm.runtime.id_allocator import IDAllocator
 from gllm.runtime.model_runner import ModelRunner, OverlapModelRunner
 from gllm.runtime.sequence import GenerationSequence, resolve_output_len
 from gllm.utils import (
-    StreamOutput,
     find_free_port,
     get_model_load_pbar,
     init_logger,
@@ -37,6 +35,8 @@ class LLM:
     # (aborts still flow) because the workers' memory is being released or is
     # released.
     _hold_new_requests = False
+    # Path of the front end's shared-memory media arena; local workers map it.
+    media_arena = None
 
     def __init__(
         self,
@@ -158,7 +158,6 @@ class LLM:
             OverlapModelRunner if config.overlap_scheduling else ModelRunner
         )
         self.model_runner = model_runner_cls(config)
-        self._reasoning_controls = reasoning_control_tokens(self.model_runner.tokenizer)
         self.pp_size = pp_size
         self.tp_size = tp_size
         # Data-parallel (DP) attention + Expert-Parallel MoE. Run ``dp_size``
@@ -211,7 +210,6 @@ class LLM:
         self.wait_lists: List[GenerationSequence] = []
         self.abort_ids: List[int] = []
         self.running_maps: Dict[int, GenerationSequence] = dict()  # seq_id => GenerationSequence
-        self.async_streams = None
         # Guards the newly-arrived ``wait_lists`` / ``abort_ids`` hand-off queues.
         # The async server runs both request intake (``add_requests``) and the
         # engine step (``send_ipc_package``) on the event loop's default
@@ -222,8 +220,6 @@ class LLM:
         # finished, and the client hung forever (a rare tail-of-run stall under
         # high concurrency). Snapshot-and-clear under the lock makes it atomic.
         self._pending_lock = threading.Lock()
-        # Sleep/wake results from the workers, appended on the engine-io thread.
-        self._control_acks: List[dict] = []
 
         self.init_workers()
 
@@ -256,9 +252,11 @@ class LLM:
         self.num_workers = len(self.act_worker_ranks)
 
         self.ctx = mp.get_context("spawn")
-        self._reset_worker_state()
+        self.mp_alive = self.ctx.Array("i", self.num_workers)
+        self.mp_load_progress = self.ctx.Array("i", self.num_workers * 2)
 
-        ipc_path_prefix = random_uuid()
+        # An external front end picks the prefix and owns the frontend sockets.
+        ipc_path_prefix = getattr(self, "ipc_prefix", None) or random_uuid()
         self.schedule_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_schedule"
         self.output_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_output"
         self.token_path = f"ipc:///tmp/{ipc_path_prefix}_gllm_token"
@@ -269,10 +267,6 @@ class LLM:
             f"Launching worker {self.act_worker_ranks}, PP size {self.pp_size}, TP size {self.tp_size}"
         )
         self._launch_workers()
-
-    def _reset_worker_state(self):
-        self.mp_alive = self.ctx.Array("i", self.num_workers)
-        self.mp_load_progress = self.ctx.Array("i", self.num_workers * 2)
 
     def _init_frontend_comm(self):
         """Create the frontend ZeroMQ sockets on their owning thread."""
@@ -288,7 +282,7 @@ class LLM:
         )
         self.comm.init()
 
-    def _launch_workers(self, *, show_progress=True):
+    def _launch_workers(self):
         # Build every worker process object first (cheap), then fire all the
         # ``process.start()`` calls concurrently. For the spawn start method
         # ``start()`` blocks the parent while it pickles the worker and writes
@@ -326,7 +320,7 @@ class LLM:
                     # silently leaving a half-launched fleet.
                     f.result()
 
-        if show_progress and self.load_format == "auto":
+        if self.load_format == "auto":
             self.load_progress()
 
     def build_worker(self, local_rank, pp_rank, tp_rank, dp_rank=0):
@@ -360,6 +354,7 @@ class LLM:
         # rather than growing the Worker signature.
         worker.dp_rank = dp_rank
         worker.dp_size = self.dp_size
+        worker.media_arena = self.media_arena
         process = self.ctx.Process(
             target=run_target,
             args=(worker,),
@@ -422,61 +417,8 @@ class LLM:
             num_finish += self._apply_ipc_package(ipc_package)
         return num_finish
 
-    def _make_logprob_entry(self, token_id, lp):
-        """Turn a raw ``(sampled_logprob, top_ids, top_vals)`` tuple into the
-        OpenAI-ready per-token dict, decoding each id to its piece + bytes.
-
-        Returns ``None`` when the seq did not request logprobs (``lp is None``).
-        The token string uses the tokenizer's single-id decode; the response
-        builder applies ``return_tokens_as_token_ids`` on top if requested.
-        """
-        if lp is None:
-            return None
-        sampled, top_ids, top_vals = lp
-        tokenizer = self.model_runner.tokenizer
-
-        def build(tid, val):
-            try:
-                piece = tokenizer.decode([int(tid)])
-            except Exception:
-                piece = ""
-            return {
-                "token_id": int(tid),
-                "token": piece,
-                "logprob": float(val),
-                "bytes": list(piece.encode("utf-8")),
-            }
-
-        entry = build(token_id, sampled)
-        entry["top_logprobs"] = [
-            build(tid, val) for tid, val in zip(top_ids, top_vals)
-        ]
-        return entry
-
-    def _make_prompt_logprobs(self, raw):
-        """Decode the worker's ``prompt_logprobs_data`` into response dicts.
-
-        ``raw`` is a list (length prompt_len) where index 0 is ``None`` and
-        each other entry is ``(token_id, logprob, top_ids, top_vals)``. Returns
-        the same-length list with ``None`` preserved and every populated entry
-        turned into the OpenAI logprob dict shape.
-        """
-        out = []
-        for item in raw:
-            if item is None:
-                out.append(None)
-                continue
-            token_id, sampled, top_ids, top_vals = item
-            out.append(self._make_logprob_entry(token_id, (sampled, top_ids, top_vals)))
-        return out
-
     def _apply_ipc_package(self, ipc_package):
-        ack = getattr(ipc_package, "control_ack", None)
-        if ack is not None:
-            with self._pending_lock:
-                self._control_acks.append(ack)
         if ipc_package is not None:
-            had_async_streams = bool(self.async_streams)
             for idx, id in enumerate(ipc_package.act_schedule_ids):
                 # Under overlap scheduling a worker can emit a trailing token
                 # for a sequence it freed one step earlier (EOS detected after
@@ -490,25 +432,8 @@ class LLM:
                     token_id = ipc_package.next_tokens[idx]
                     # MTP: a per-seq entry may be a LIST of committed tokens.
                     tokens = token_id if isinstance(token_id, list) else [token_id]
-                    if self.async_streams:
-                        text, controls = decode_stream_delta(
-                            seq, self.model_runner.tokenizer, tokens, self._reasoning_controls
-                        )
-                        logprob = None
-                        if idx < len(ipc_package.logprobs):
-                            logprob = self._make_logprob_entry(
-                                tokens[-1], ipc_package.logprobs[idx]
-                            )
-                        prompt_lp = None
-                        raw_prompt_lp = ipc_package.prompt_logprobs.get(id)
-                        if raw_prompt_lp is not None:
-                            prompt_lp = self._make_prompt_logprobs(raw_prompt_lp)
-                        self.async_streams[id].put(
-                            StreamOutput(text, logprob, prompt_lp, control_tokens=controls)
-                        )
-                    else:
-                        for t in tokens:
-                            seq.append(t)
+                    for t in tokens:
+                        seq.append(t)
             # Aborts (including queued requests) carry free_ids without any
             # acted token rows. Retire them independently, exactly once.
             retired = []
@@ -516,15 +441,8 @@ class LLM:
                 if self.running_maps.pop(id, None) is None:
                     continue
                 retired.append(id)
-                stream = self.async_streams.pop(id, None) if self.async_streams else None
-                if stream is not None:
-                    error = getattr(ipc_package, "request_errors", {}).get(id)
-                    if error:
-                        from gllm.runtime.sequence import RequestCapacityError
-                        stream.put(RequestCapacityError(error))
-                    stream.finish()
             self.free_finish_ids(retired)
-            if not had_async_streams and getattr(ipc_package, "request_errors", {}):
+            if getattr(ipc_package, "request_errors", {}):
                 from gllm.runtime.sequence import RequestCapacityError
                 raise RequestCapacityError(next(iter(ipc_package.request_errors.values())))
             return len(retired)
@@ -566,9 +484,7 @@ class LLM:
 
         New sequences are sent one per package so zmq delivers each to exactly
         one replica (that replica then owns the seq's KV for its whole lifetime).
-        A seq's target replica is ``seq.target_dp`` when the request arrived on a
-        per-replica HTTP endpoint (``--endpoint-per-dp``); otherwise it is
-        round-robined across replicas. Aborts don't carry replica ownership on
+        Sequences are round-robined across replicas. Aborts don't carry replica ownership on
         the frontend, so they are broadcast to every replica; a replica that
         doesn't own the seq_id simply ignores the unknown id.
 
@@ -578,11 +494,8 @@ class LLM:
         for seq in wait_lists:
             pkg = IPCPackage([seq])
             pkg.log = log
-            target = getattr(seq, "target_dp", None)
-            if target is None:
-                target = self._dp_rr
-                self._dp_rr = (self._dp_rr + 1) % self.dp_size
-            self.comm.send_ipc_package_to_dp(pkg, target)
+            self.comm.send_ipc_package_to_dp(pkg, self._dp_rr)
+            self._dp_rr = (self._dp_rr + 1) % self.dp_size
         if len(abort_ids) != 0:
             logger.warning(
                 f"Abort {len(abort_ids)} request(s) due to loss of network connection"
@@ -593,8 +506,6 @@ class LLM:
             self.comm.broadcast_ipc_package_to_dp(abort_pkg)
 
     def send_control_command(self, control_cmd: str):
-        if self.comm is None:
-            raise RuntimeError("Workers are asleep")
         ipc_package = IPCPackage([])
         ipc_package.control_cmd = control_cmd
         if self.dp_size > 1:
@@ -602,22 +513,6 @@ class LLM:
             self.comm.broadcast_ipc_package_to_dp(ipc_package)
         else:
             self.comm.send_ipc_package(ipc_package)
-
-    def send_memory_command(self, name: str, tags) -> None:
-        """Ask every replica's workers to ``sleep`` / ``wake_up`` ``tags``.
-
-        Each DP replica's column driver answers with one ``control_ack``
-        (see :meth:`take_control_acks`) once its column is idle and done.
-        """
-        with self._pending_lock:
-            self._control_acks = []
-        self.send_control_command((name, tuple(tags)))
-
-    def take_control_acks(self) -> List[dict]:
-        with self._pending_lock:
-            acks = self._control_acks
-            self._control_acks = []
-        return acks
 
     def start_profile(self):
         self.send_control_command("start_profile")

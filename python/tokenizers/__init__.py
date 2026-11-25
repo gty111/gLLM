@@ -1,15 +1,14 @@
-"""Tokenizer-side logic: chat-template encoding and tool-call parsing.
+"""Tokenizer-side helpers for offline chat encoding (``LLM`` / ``ModelRunner``).
 
+- :mod:`gllm.tokenizers.chat_messages` -- OpenAI message normalization for
+  model-native chat templates.
 - :mod:`gllm.tokenizers.deepseek_official` -- DeepSeek official message
-  encoder (loaded from the checkpoint's ``encoding/`` dir; replaces a
-  hand-written Jinja chat template).
-- :mod:`gllm.tokenizers.tool_parsers` -- model-native tool-call markup parsers
-  (Qwen / Kimi / DeepSeek) and OpenAI tool-call message normalization.
+  encoder (loaded from the checkpoint's ``encoding/`` dir).
+- :mod:`gllm.tokenizers.reasoning` -- ``<think>`` handling used by the
+  structured-output sampler.
 """
 
-from gllm.tokenizers.tool_parsers import (
-    ToolParser,
-    get_tool_parser,
+from gllm.tokenizers.chat_messages import (
     normalize_chat_template_messages,
     normalize_chat_template_tool_arguments,
 )
@@ -17,6 +16,4 @@ from gllm.tokenizers.tool_parsers import (
 __all__ = [
     "normalize_chat_template_tool_arguments",
     "normalize_chat_template_messages",
-    "ToolParser",
-    "get_tool_parser",
 ]

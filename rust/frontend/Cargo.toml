@@ -1,0 +1,57 @@
+[package]
+name = "gllm-frontend"
+# Same as the Python package version in setup.py (tests/test_frontend_version.py).
+version = "0.0.7"
+edition = "2024"
+# The vLLM crates build with this toolchain; older ones fail mid-build.
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "OpenAI-compatible HTTP front end for gLLM workers"
+
+[[bin]]
+name = "gllm-frontend"
+path = "src/main.rs"
+
+[dependencies]
+# Protocol-agnostic layers of vLLM's Rust front end (chat templates, tokenizer,
+# detokenizer, tool/reasoning parsers, multimodal), pinned to one upstream
+# commit. All vllm-* crates must use the same rev.
+vllm-chat = { git = "https://github.com/vllm-project/vllm", rev = "418af607309d819bf091229bcc3d8ca8e5ce007f" }
+vllm-text = { git = "https://github.com/vllm-project/vllm", rev = "418af607309d819bf091229bcc3d8ca8e5ce007f" }
+vllm-llm = { git = "https://github.com/vllm-project/vllm", rev = "418af607309d819bf091229bcc3d8ca8e5ce007f" }
+vllm-tokenizer = { git = "https://github.com/vllm-project/vllm", rev = "418af607309d819bf091229bcc3d8ca8e5ce007f" }
+vllm-engine-core-client = { git = "https://github.com/vllm-project/vllm", rev = "418af607309d819bf091229bcc3d8ca8e5ce007f" }
+
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+axum = "0.8.8"
+clap = { version = "4.5.38", features = ["derive", "env"] }
+futures = "0.3.31"
+rmp-serde = "1.3.1"
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+tokio = { version = "1.47.1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "process", "signal", "io-util"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7.18", features = ["rt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+async-stream = "0.3"
+libc = "0.2.177"
+base64 = "0.22"
+regex = "1"
+reqwest = { version = "0.12.8", default-features = false, features = ["native-tls"] }
+bytes = "1.12.0"
+memmap2 = "0.9"
+serde_bytes = "0.11"
+thiserror = "2.0.16"
+uuid = { version = "1.22.0", features = ["v4"] }
+zeromq = { git = "https://github.com/zeromq/zmq.rs", rev = "67dcba97559ebe8e8206dab753710d8b9cb07591", default-features = false, features = ["tokio-runtime", "all-transport"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+
+# Mirrors the [patch] of the vLLM workspace: its parser needs unreleased pcre2
+# APIs. Keep in sync when bumping the vllm rev.
+[patch.crates-io]
+pcre2 = { git = "https://github.com/vllm-project/rust-pcre2", rev = "bb2f377c9f919c881860c210fad8375945c90d43" }

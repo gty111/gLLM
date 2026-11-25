@@ -1,13 +1,13 @@
-"""engine_kwargs is the single source of engine kwargs: entrypoints never pass
-EngineConfig fields explicitly (they mutate the args namespace or rely on
-defaults), so kwargs can never collide at the AsyncLLM/LLM call sites."""
+"""engine_kwargs is the single source of engine kwargs: the engine entrypoint
+never passes EngineConfig fields explicitly, so kwargs can never collide at
+the LLM call site."""
 
 import dataclasses
 import sys
 
 import pytest
 
-from gllm.entrypoints import api_server, cli_args, lm_server
+from gllm.entrypoints import cli_args, engine_server
 from gllm.runtime.config import EngineConfig
 
 _FIELDS = {f.name for f in dataclasses.fields(EngineConfig)}
@@ -22,16 +22,15 @@ def _parse(parser_builder, argv):
         sys.argv = old
 
 
-def test_api_server_forwards_all_parser_defined_engine_fields():
-    args = _parse(api_server.build_arg_parser, ["api_server", "--model-path", "/tmp/x"])
+def test_engine_server_forwards_all_parser_defined_engine_fields():
+    args = _parse(engine_server.build_arg_parser, ["engine_server", "--model-path", "/tmp/x"])
     kwargs = cli_args.engine_kwargs(args)
     # Every parser arg whose dest is an EngineConfig field must be forwarded.
     missing = {n for n in vars(args) if n in _FIELDS and n not in kwargs}
     assert not missing
-    # Entrypoint-owned server args never leak in.
-    assert "host" not in kwargs and "port" not in kwargs
-    # Topology args defined by api_server's own parser arrive under their
-    # EngineConfig names.
+    # Entrypoint-owned args never leak in.
+    assert "host" not in kwargs and "ipc_prefix" not in kwargs
+    # Topology args arrive under their EngineConfig names.
     assert kwargs["pp_size"] == 1 and kwargs["dp_size"] == 1
     assert kwargs["use_ep"] is False
     assert kwargs["launch_mode"] == "normal"
@@ -41,19 +40,14 @@ def test_api_server_forwards_all_parser_defined_engine_fields():
     assert kwargs["mtp_enabled"] is None
 
 
-def test_lm_server_defaults_and_ep_flag():
-    args = _parse(lm_server.build_arg_parser, ["lm_server", "--model-path", "/tmp/x"])
-    kwargs = cli_args.engine_kwargs(args)
-    # The LM node's fixed role is just the EngineConfig defaults: the parser
-    # does not define launch_mode/pp_size at all.
-    assert "launch_mode" not in kwargs and "pp_size" not in kwargs
-    # EP is off by default but user-controllable.
-    assert kwargs["use_ep"] is False
-    args = _parse(
-        lm_server.build_arg_parser,
-        ["lm_server", "--model-path", "/tmp/x", "--enable-ep"],
-    )
+def test_engine_server_ep_flag_and_disagg_lm_flags():
+    args = _parse(engine_server.build_arg_parser,
+                  ["engine_server", "--model-path", "/tmp/x", "--enable-ep", "--skip-visual",
+                   "--discovery-endpoint", "127.0.0.1:9500", "--encoder-dp", "2"])
     assert cli_args.engine_kwargs(args)["use_ep"] is True
+    # Disaggregation flags configure the DisaggConfig, not EngineConfig fields.
+    assert args.skip_visual and args.encoder_dp == 2
+    assert "skip_visual" not in cli_args.engine_kwargs(args)
 
 
 def test_engine_config_validation():
@@ -78,7 +72,7 @@ def _dspark_engine_options():
     )
 
 
-@pytest.mark.parametrize("builder", [api_server.build_arg_parser, lm_server.build_arg_parser])
+@pytest.mark.parametrize("builder", [engine_server.build_arg_parser])
 def test_dspark_cli_forwards_explicit_backend_and_local_draft(builder):
     args = _parse(builder, [
         "server", "--model-path", "/tmp/target",
@@ -255,7 +249,7 @@ def test_effective_speculative_backend_selection(dspark, mtp, name, overlap, gra
     assert backend is select_speculative_backend(dspark_enabled=dspark, mtp_enabled=mtp)
 
 
-@pytest.mark.parametrize("builder", [api_server.build_arg_parser, lm_server.build_arg_parser])
+@pytest.mark.parametrize("builder", [engine_server.build_arg_parser])
 def test_runtime_width_cli_forwards_common_proposal_count(builder):
     args = _parse(builder, [
         "server", "--model-path", "/tmp/target", "--speculative-backend", "mtp",
@@ -389,7 +383,7 @@ def test_runtime_width_loaded_mtp_head_check_respects_pipeline_owner(monkeypatch
     with pytest.raises(expected):
         runner.init()
 
-@pytest.mark.parametrize("builder", [api_server.build_arg_parser, lm_server.build_arg_parser])
+@pytest.mark.parametrize("builder", [engine_server.build_arg_parser])
 def test_runtime_width_cli_rejects_removed_mtp_k(builder):
     with pytest.raises(SystemExit):
         _parse(builder, ["server", "--model-path", "/tmp/target", "--mtp-k", "3"])

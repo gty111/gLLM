@@ -79,31 +79,6 @@ def test_non_native_marker_does_not_close_thinking():
     assert not guard.allows_eos
 
 
-def test_optional_reasoning_and_disabled_template():
-    tok = ByteTokenizer()
-    assert guard_for('Ordinary answer', prefilled=False).allows_eos
-    assert not guard_for('<think>Working', prefilled=False).allows_eos
-    assert guard_for('<think>Working</think>Done', prefilled=False).allows_eos
-    assert so.prepare_output(None, tok, 259, [256], tok.encode('<think>\n</think>\n')) is None
-    assert so.prepare_output(None, None, 259, [256], [1]) is None
-
-
-def test_guard_spec_does_not_compile_xgrammar(monkeypatch):
-    def forbidden(*args):
-        pytest.fail('A reasoning guard must not compile a grammar')
-    monkeypatch.setattr(so, 'compiler', forbidden)
-    tok = ByteTokenizer()
-    spec = so.prepare_output(None, tok, 259, [256], tok.encode('Prompt\n<think>'))
-    assert spec.schema is None and spec.thinking
-    seq = GenerationSequence(0, [1], [256], 64, structured_output=spec)
-    seq.to_compute_token_num = 1
-    backend = so.StructuredSampler(tok)
-    logits = torch.zeros(1, 259)
-    backend.mask(logits, [seq])
-    assert torch.isneginf(logits[0, 256])
-    assert logits[0, 258] == 0
-
-
 def test_speculative_guard_forks_and_rewinds():
     tok = ByteTokenizer()
     backend = so.StructuredSampler(tok)
@@ -141,16 +116,6 @@ def test_detokenizer_window_does_not_grow_with_output():
     assert not guard.allows_eos
 
 
-def test_output_budget_still_terminates_unclosed_reasoning():
-    from gllm.entrypoints.serving_responses import _response_completion_fields
-
-    parser = ThinkParser(prefilled=True)
-    parser.feed('Working')
-    result = _response_completion_fields('length', parser, False)
-    assert result['status'] == 'incomplete'
-    assert result['incomplete_details'] == {'reason': 'max_output_tokens'}
-
-
 @pytest.mark.skipif(not os.environ.get('GLLM_TEST_QWEN_TOKENIZER'), reason='Checkpoint tokenizer unavailable')
 def test_checkpoint_guard_tracks_literal_and_native_boundaries():
     from transformers import AutoTokenizer
@@ -168,14 +133,3 @@ def test_checkpoint_guard_tracks_literal_and_native_boundaries():
     assert len(branch.decoder.token_ids) <= 8
 
 
-def test_both_api_formats_enable_guard_without_user_schema(monkeypatch):
-    from gllm.entrypoints import api_server
-
-    tok = ByteTokenizer()
-    monkeypatch.setattr(api_server, 'llm', SimpleNamespace(
-        model_runner=SimpleNamespace(tokenizer=tok, model_loader=SimpleNamespace(vocab_size=259)),
-        finish_tokens=[256],
-    ))
-    for fmt in (None, {'type': 'text'}):
-        spec = asyncio.run(api_server._prepare_output_format(fmt, tok.encode('<think>')))
-        assert spec.schema is None and spec.thinking

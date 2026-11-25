@@ -26,10 +26,14 @@ for supported models, launch modes, and serving examples.
 ## Source layout
 
 Python library sources live directly in `python/`; Rust crates live in `rust/`.
-The build maps `python/` to the installed `gllm` package, so Python imports and
-`python -m gllm.entrypoints.api_server` remain unchanged. Install the checkout
-in editable mode before running examples or tests; adding the repository root
-to `PYTHONPATH` does not install the package.
+The build maps `python/` to the installed `gllm` package and installs the
+`gllm-frontend` server binary (`rust/frontend`) next to the Python interpreter;
+building it needs Rust 1.95 or newer (`setup.py` refuses an older `cargo`)
+and network access for its git dependencies. Front-end changes and vLLM crate
+upgrades are checked with the scripts in `rust/frontend/parity/` (see its
+README); CI runs clippy and the unit tests on `rust/frontend`. Install the checkout in editable mode before running
+examples or tests; adding the repository root to `PYTHONPATH` does not install
+the package.
 
 ## Development workflow
 
@@ -38,7 +42,7 @@ to `PYTHONPATH` does not install the package.
    `benchmarks/`).
 3. If you change serving behavior, verify with a small model:
    ```bash
-   python -m gllm.entrypoints.api_server --model-path $MODEL_PATH
+   gllm-frontend --model-path $MODEL_PATH --port $PORT
    python examples/client.py --port $PORT
    ```
 4. Open a PR against `master` and link related issues (`Closes #123` /
@@ -50,8 +54,8 @@ to `PYTHONPATH` does not install the package.
 - Describe **what** changed and **why**.
 - Include a short **test plan** (commands or scenarios reviewers can reproduce).
 - Update docs / examples when user-facing behavior or flags change.
-- Bump the version in `setup.py` and
-  `python/entrypoints/api_server.py` only when intentionally cutting a release.
+- Bump the version in `setup.py` and `GLLM_VERSION` in
+  `rust/frontend/src/http/mod.rs` only when intentionally cutting a release.
 - Keep diffs small and avoid drive-by refactors unrelated to the PR.
 
 ## Reporting issues

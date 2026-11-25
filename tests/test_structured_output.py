@@ -278,44 +278,6 @@ def test_no_grammar_gpu_work_for_ordinary_requests(monkeypatch):
     assert result.tolist() == [1]
 
 
-def test_api_rejects_incompatible_options():
-    from gllm.entrypoints.api_server import _validate_output_format
-
-    assert _validate_output_format(fmt(), "response_format") is None
-    assert _validate_output_format(fmt(), "response_format", tools=[{"type": "function"}]) is None
-    for kwargs in ({"ignore_eos": True}, {"tools": [{"type": "function"}], "ignore_eos": True}):
-        assert _validate_output_format(fmt(), "response_format", **kwargs).status_code == 400
-
-
-@pytest.mark.parametrize("kind", ["json_schema", "json_object"])
-def test_both_api_frontends_validate_structured_formats(monkeypatch, kind):
-    from gllm.entrypoints import api_server
-    from gllm.entrypoints.protocol import ChatCompletionRequest, ResponseRequest
-
-    monkeypatch.setattr(api_server, "llm", SimpleNamespace(model_path="test"))
-    chat_format = fmt() if kind == "json_schema" else {"type": kind}
-    response_format = ({"type": kind, **fmt()["json_schema"]}
-                       if kind == "json_schema" else {"type": kind})
-    chat = ChatCompletionRequest(model="test", messages=[{"role": "user", "content": "JSON"}],
-                                 response_format=chat_format)
-    response = ResponseRequest(model="test", input="JSON", text={"format": response_format})
-    assert api_server._validate_chat_capabilities(chat) is None
-    assert api_server._validate_response_capabilities(response) is None
-    assert so.normalize_format(chat.response_format) == so.normalize_format(response.text["format"])
-
-
-def test_responses_frontend_rejects_unsupported_schema(monkeypatch):
-    from gllm.entrypoints import api_server
-    from gllm.entrypoints.protocol import ResponseRequest
-
-    monkeypatch.setattr(api_server, "llm", SimpleNamespace(model_path="test"))
-    request = ResponseRequest(model="test", input="JSON", text={"format": {
-        "type": "json_schema", "name": "answer", "schema": {"type": "integer", "minimum": 1}}})
-    error = api_server._validate_response_capabilities(request)
-    assert error.status_code == 400
-    assert json.loads(error.body)["error"]["param"] == "text.format"
-
-
 def test_mtp_sampling_supports_constraints_but_preserves_optional_features():
     from gllm.runtime.model_runner import ModelRunner
 
@@ -592,15 +554,12 @@ def test_reprefill_recovers_committed_history_after_chunk_copy(backend, follower
      "required": ["x"], "additionalProperties": False, "enum": [{}, {"x": 1}]},
 ])
 @pytest.mark.parametrize("strict", [False, True])
-def test_unenforced_schema_intersections_return_400(schema, strict):
-    from gllm.entrypoints.api_server import _validate_output_format
-
+def test_unenforced_schema_intersections_are_rejected(schema, strict):
     chat = fmt(schema, strict=strict)
     response = {"type": "json_schema", **chat["json_schema"]}
-    for value, param in ((chat, "response_format"), (response, "text.format")):
-        error = _validate_output_format(value, param)
-        assert error.status_code == 400
-        assert json.loads(error.body)["error"]["code"] == "invalid_output_format"
+    for value in (chat, response):
+        with pytest.raises(ValueError):
+            so.normalize_format(value)
 
 
 def test_required_properties_without_schema_are_rejected():
