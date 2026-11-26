@@ -724,7 +724,11 @@ class Scheduler:
                 # output on the seq so the later ``_mm_prepare_cpu`` pass
                 # doesn't redo the work.
                 self.model_runner._mm_precompute_hash(seq)
-                self.memory_manager.pre_allocate_computed_page([seq])
+                # Prompt logprobs need a hidden state at every prompt position,
+                # which a cached prefix skips; such requests compute the whole
+                # prompt (their pages are still registered for later hits).
+                if not getattr(seq, "prompt_logprobs_enabled", False):
+                    self.memory_manager.pre_allocate_computed_page([seq])
                 # Full/partial hit post-processing (rollback + hybrid SSM
                 # snapshot restore) lives in PrefixMemoryManager.
             # Encoder-disaggregation overlap gate B: a disagg seq
