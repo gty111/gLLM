@@ -9,25 +9,45 @@ from gllm.runtime.input_data import InputData
 from gllm.layers.repetition_penalty import apply_scaling_penalties
 
 
+def _joint_top_k_top_p_probs(
+    probs: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor,
+) -> torch.Tensor:
+    """Filter original probabilities jointly, retaining entire cutoff ties.
+
+    The count and mass strictly above a probability group are tested BEFORE
+    normalization. Non-positive k/p retain the existing torch fallback's
+    unbounded behavior; this does not extend public parameter validation.
+    Inputs require positive row mass and valid finite nonnegative probabilities.
+    """
+    values, token_ids = probs.float().sort(dim=-1, descending=True)
+    ranks = torch.arange(values.shape[-1], device=values.device).expand_as(token_ids)
+    starts = torch.cat((
+        torch.ones_like(values[:, :1], dtype=torch.bool),
+        values[:, 1:] != values[:, :-1],
+    ), dim=1)
+    group_start = torch.where(starts, ranks, 0).cummax(dim=1).values
+    exclusive = torch.cat((
+        torch.zeros_like(values[:, :1]),
+        values.cumsum(dim=1)[:, :-1],
+    ), dim=1)
+    mass_above = exclusive.gather(1, group_start)
+    ks = torch.where(top_ks <= 0, values.shape[-1], top_ks).unsqueeze(1)
+    ps = top_ps.unsqueeze(1)
+    keep = (group_start < ks) & (values > 0)
+    keep &= (ps >= 1) | (ps <= 0) | (mass_above < ps)
+    weights = torch.where(keep, values, 0.)
+    weights = weights / weights.sum(dim=1, keepdim=True)
+    return torch.zeros_like(probs, dtype=torch.float32).scatter_(1, token_ids, weights)
+
+
 def _top_k_top_p_torch(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
 ) -> torch.Tensor:
     """Apply joint top-k/top-p filtering and sample without FlashInfer."""
-    values, token_ids = probs.float().sort(dim=-1, descending=True)
-    ranks = torch.arange(values.shape[-1], device=values.device).unsqueeze(0)
-    ks = torch.where(top_ks <= 0, values.shape[-1], top_ks).unsqueeze(1)
-    values = values.masked_fill(ranks >= ks, 0.0)
-
-    ps = top_ps.to(values.dtype).unsqueeze(1)
-    cumulative = values.cumsum(dim=-1)
-    # Keep the token that first brings the cumulative probability above p.
-    excluded = (cumulative - values > ps) & (ps > 0) & (ps < 1)
-    values = values.masked_fill(excluded, 0.0)
-    values = values / values.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-    sampled_ranks = torch.multinomial(values, 1)
-    return token_ids.gather(1, sampled_ranks).squeeze(1)
+    filtered = _joint_top_k_top_p_probs(probs, top_ks, top_ps)
+    return torch.multinomial(filtered, 1).squeeze(1)
 
 
 def _fused_top_k_top_p_sample(
