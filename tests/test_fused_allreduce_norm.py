@@ -47,3 +47,35 @@ def test_no_deferral_anywhere_leaves_every_norm_plain():
 
 def test_empty_stack_reports_no_tail():
     assert link_fused_reduces([]) is False
+
+
+def test_workspace_is_not_created_or_cached_during_graph_capture(monkeypatch):
+    import torch
+
+    import gllm.layers.fused_allreduce_norm as fused
+
+    created = []
+    monkeypatch.setattr(fused, "_WORKSPACES", {})
+    monkeypatch.setattr(fused, "_create_workspace", lambda *key: created.append(key) or "ws")
+    key = (2, 0, 128, 64, torch.bfloat16)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert fused._workspace(*key) is None
+    assert created == [] and fused._WORKSPACES == {}
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    assert fused._workspace(*key) == "ws"
+    # Later calls (including during capture) reuse the same workspace.
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    assert fused._workspace(*key) == "ws"
+    assert created == [key]
+
+
+def test_prepare_is_a_no_op_without_tensor_parallelism(monkeypatch):
+    import torch
+
+    import gllm.layers.fused_allreduce_norm as fused
+
+    monkeypatch.setattr(fused, "get_tp_size", lambda: 1)
+    monkeypatch.setattr(fused, "_create_workspace", lambda *key: (_ for _ in ()).throw(AssertionError))
+    assert fused.prepare_fused_allreduce_norm(64, torch.bfloat16) is False
