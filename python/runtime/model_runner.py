@@ -42,6 +42,7 @@ from gllm.layers.attention.qkv_backends import (
     find_qkv_attention_layers,
 )
 from gllm.disagg.runner_mixin import DisaggMixin
+from gllm.layers.fused_allreduce_norm import prepare_fused_allreduce_norm
 from gllm.layers.sampler import Sampler
 from gllm.multimodal.mixin import (
     EmbeddingInfo,
@@ -995,6 +996,10 @@ class ModelRunner(
         if self._dspark_drafter is not None:
             self._dspark_drafter.bind_kv(self.memory_manager.segment)
 
+        # Graph capture cannot create the fused all-reduce workspace.
+        prepare_fused_allreduce_norm(
+            self.hidden_size, self.output_hidden_states.dtype
+        )
         if self._full_cuda_graph_on or self._piecewise_runner is not None:
             self.capture_graph()
 

@@ -73,15 +73,33 @@ def _max_token_num(tp_size: int, hidden_size: int, dtype: torch.dtype) -> Option
     return int(budget * _MiB) // (hidden_size * element_size)
 
 
-@functools.lru_cache(maxsize=4)
-def _workspace(tp_size: int, rank: int, max_token_num: int, hidden_dim: int, dtype):
-    """Create (once) the Lamport workspace this rank's fused all-reduce uses.
+# Workspaces by (tp_size, rank, max_token_num, hidden_dim, dtype); ``None``
+# records a configuration the topology cannot support.
+_WORKSPACES: dict = {}
 
-    Cached because the workspace registers IPC buffers across the TP group: it
-    must be built exactly once per configuration, and its addresses have to stay
-    fixed for CUDA-graph replay.  ``None`` means the topology cannot support the
-    fused kernel (no NVSwitch, multicast unavailable), and callers fall back.
+
+def _workspace(tp_size: int, rank: int, max_token_num: int, hidden_dim: int, dtype):
+    """Return this rank's Lamport workspace, creating it once outside capture.
+
+    The workspace registers IPC buffers across the TP group, so it is built
+    exactly once per configuration and its addresses stay fixed for CUDA-graph
+    replay. Building it copies host data to the device, which CUDA-graph
+    capture forbids: during capture an absent workspace is reported as
+    unavailable *without* being recorded, so :func:`prepare_fused_allreduce_norm`
+    (or the next eager call) can still create it. ``None`` means the topology
+    cannot support the fused kernel (no NVSwitch, multicast unavailable), and
+    callers fall back.
     """
+    key = (tp_size, rank, max_token_num, hidden_dim, dtype)
+    if key in _WORKSPACES:
+        return _WORKSPACES[key]
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    _WORKSPACES[key] = workspace = _create_workspace(*key)
+    return workspace
+
+
+def _create_workspace(tp_size, rank, max_token_num, hidden_dim, dtype):
     comm, _ = _flashinfer_comm()
     if comm is None:
         return None
@@ -115,6 +133,26 @@ def _workspace(tp_size: int, rank: int, max_token_num: int, hidden_dim: int, dty
         workspace.destroy()
         return None
     return workspace
+
+
+def prepare_fused_allreduce_norm(hidden_size: int, dtype: torch.dtype) -> bool:
+    """Build the fused all-reduce workspace ahead of CUDA-graph capture.
+
+    The first in-budget call usually comes from a graph capture (the profiling
+    forward exceeds the token budget), where the workspace cannot be created.
+    Every rank of the TP group must call this together: creation exchanges IPC
+    handles over the group. Returns whether the fused path is available.
+    """
+    tp_size = get_tp_size()
+    if tp_size == 1 or dtype not in _SUPPORTED_DTYPES:
+        return False
+    comm, pattern = _flashinfer_comm()
+    if comm is None or pattern is None:
+        return False
+    budget = _max_token_num(tp_size, hidden_size, dtype)
+    if budget is None:
+        return False
+    return _workspace(tp_size, get_tp_rank(), budget, hidden_size, dtype) is not None
 
 
 def _plan(x: torch.Tensor, tp_size: int):
@@ -333,6 +371,7 @@ def fused_all_reduce_rms_norm(
 
 __all__ = [
     "defer_reduce",
+    "prepare_fused_allreduce_norm",
     "fused_all_reduce_rms_norm",
     "link_fused_reduces",
     "maybe_fused_norm",
