@@ -218,6 +218,46 @@ def test_passthrough_tensor_is_bridged_out_of_graph_owned_storage():
     torch.testing.assert_close(bridged_residual, residual)
 
 
+def test_passthrough_slot_keeps_one_buffer_per_shape():
+    # Hybrid layers carry different gates in the same passthrough slot (a GDN
+    # ``z`` vs. an attention output gate); each shape gets its own buffer and
+    # same-shape slots of one call never alias.
+    passthrough_buffers = []
+
+    class _Capture:
+        def add_eager(self, fn, *, capture_result=None):
+            return capture_result
+
+    runtime = PiecewiseRuntime(
+        bucket=8,
+        num_tokens=3,
+        workspace_tokens=8,
+        passthrough_buffers=passthrough_buffers,
+    )
+    runtime.capture = _Capture()
+    residual = torch.ones(8, 4)
+    seen = {}
+    for gate_shape in [(8, 6, 2), (8, 3, 4), (8, 6, 2), (8, 3, 4)]:
+        gate = torch.randn(gate_shape)
+        _, bridged_residual, bridged_gate = runtime.dynamic_tensor(
+            lambda value: value, torch.zeros(8, 4), residual, gate
+        )
+        torch.testing.assert_close(bridged_gate, gate)
+        assert bridged_gate.data_ptr() == seen.setdefault(
+            gate_shape, bridged_gate.data_ptr()
+        )
+        assert bridged_residual.data_ptr() != bridged_gate.data_ptr()
+    assert len(passthrough_buffers) == 3
+
+    same_shape = torch.full((8, 4), 2.0)
+    _, first, second = runtime.dynamic_tensor(
+        lambda value: value, torch.zeros(8, 4), residual, same_shape
+    )
+    assert first.data_ptr() != second.data_ptr()
+    torch.testing.assert_close(first, residual)
+    torch.testing.assert_close(second, same_shape)
+
+
 class _FakePiecewiseRunner:
     def __init__(self, max_tokens=8):
         self.max_tokens = max_tokens
