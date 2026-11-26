@@ -1,5 +1,6 @@
 import functools
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import torch
 import triton
@@ -159,6 +160,85 @@ def w8a8_block_fp8_matmul_deepgemm_packed(
     return C
 
 
+# Blackwell (SM100) block-scale FP8 GEMM from FlashInfer: takes the
+# checkpoint's FP32 (1x128 activation, 128x128 weight) scales as-is, so unlike
+# the packed-UE8M0 DeepGEMM path it is exact for ordinary FP8 checkpoints.
+# Measured 2-3x faster than the Triton fallback on Qwen3.8-27B shapes and on par
+# with bf16 cuBLAS for large M. Scales are passed in "MN"-major layout.
+_GROUPWISE_SCALE_ATTR = "_flashinfer_groupwise_scale"
+_groupwise_probe: Optional[bool] = None
+
+
+def flashinfer_groupwise_available() -> bool:
+    """Whether FlashInfer's SM100 groupwise FP8 GEMM runs and is exact here."""
+    global _groupwise_probe
+    if _groupwise_probe is not None:
+        return _groupwise_probe
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        _groupwise_probe = False
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False  # probe later, outside capture
+    try:
+        from flashinfer.gemm import gemm_fp8_nt_groupwise
+
+        a = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) * 0.05
+        ws = w.view(2, 128, 2, 128).abs().amax(dim=(1, 3)).float() / 448.0
+        wq = (w.view(2, 128, 2, 128) / ws[:, None, :, None]).to(torch.float8_e4m3fn).view(256, 256)
+        aq, as_ = per_token_group_quant_fp8(a, 128)
+        out = gemm_fp8_nt_groupwise(
+            aq, wq, as_.t().contiguous(), ws.t().contiguous(),
+            scale_major_mode="MN", out_dtype=torch.bfloat16,
+        )
+        wdq = (wq.float().view(2, 128, 2, 128) * ws[:, None, :, None]).view(256, 256)
+        ref = aq.float().view(4, 2, 128).mul(as_[:, :, None]).view(4, 256) @ wdq.t()
+        ok = bool(((out.float() - ref).abs().max() <= 1e-2 * ref.abs().max()).item())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"FlashInfer groupwise FP8 GEMM unavailable: {e}")
+        ok = False
+    _groupwise_probe = ok
+    return ok
+
+
+def _groupwise_weight_scale(weight_scale: torch.Tensor) -> Optional[torch.Tensor]:
+    """``(N/128, K/128)`` scales in the kernel's MN-major ``(K/128, N/128)`` form.
+
+    Built once per weight during the eager bucket warmup; ``None`` under graph
+    capture if it is somehow still missing (the caller then falls back).
+    """
+    cached = getattr(weight_scale, _GROUPWISE_SCALE_ATTR, None)
+    if cached is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        cached = weight_scale.t().contiguous()
+        setattr(weight_scale, _GROUPWISE_SCALE_ATTR, cached)
+    return cached
+
+
+def w8a8_block_fp8_matmul_flashinfer_groupwise(
+    A: torch.Tensor, As: torch.Tensor, B: torch.Tensor, Bs_mn: torch.Tensor
+) -> torch.Tensor:
+    """``C = A @ B^T`` for FP8 ``A`` (M, K) with row-major ``As`` (M, K/128).
+
+    The MN-major activation scales are ``(K/128, M)`` FP32, whose row stride
+    must be 16-byte aligned, so M is padded to a multiple of 4 (rows are
+    independent; the padding is sliced off).
+    """
+    from flashinfer.gemm import gemm_fp8_nt_groupwise
+
+    M = A.shape[0]
+    pad = -M % 4
+    if pad:
+        A = torch.cat((A, A.new_zeros(pad, A.shape[1])))
+        As = torch.cat((As, As.new_ones(pad, As.shape[1])))
+    out = gemm_fp8_nt_groupwise(
+        A, B, As.t().contiguous(), Bs_mn,
+        scale_major_mode="MN", out_dtype=torch.bfloat16,
+    )
+    return out[:M] if pad else out
+
+
 def fp8_backend_requires_bucket_warmup(quant_config) -> bool:
     """Whether an FP8 model needs eager per-bucket backend warmup.
 
@@ -173,10 +253,19 @@ def fp8_backend_requires_bucket_warmup(quant_config) -> bool:
         deepgemm_available()
         or deepgemm_packed_available()
         or flashinfer_swapab_available()
+        or flashinfer_groupwise_available()
     )
 
 
 _deepgemm_logged = False
+_groupwise_logged = False
+
+
+def _log_groupwise_enabled_once() -> None:
+    global _groupwise_logged
+    if not _groupwise_logged:
+        _groupwise_logged = True
+        logger.info("FlashInfer groupwise FP8 GEMM backend enabled (SM100 block-scale kernels).")
 
 
 def _log_deepgemm_enabled_once(packed: bool = False) -> None:
@@ -312,6 +401,146 @@ def validate_fp8_block_shape(
                 )
 
 
+@dataclass(frozen=True)
+class Fp8GemmCase:
+    """What the backend rules look at for one block-FP8 linear call."""
+
+    M: int
+    N: int
+    K: int
+    block_n: int
+    block_k: int
+    round_scale: bool  # UE8M0 activation scales (``scale_fmt="ue8m0"`` checkpoints)
+    input_dtype: torch.dtype
+
+    @property
+    def block_128(self) -> bool:
+        return self.block_n == 128 and self.block_k == 128
+
+    @property
+    def shape_ok(self) -> bool:
+        return _deepgemm_shape_supported(
+            self.N, self.K, self.block_n, self.block_k, self.input_dtype
+        )
+
+
+@dataclass(frozen=True)
+class Fp8GemmRule:
+    """One backend and the empirically-derived conditions it is used under.
+
+    ``applies(case, weight_scale)`` holds the rule (device, scale format,
+    shape, M range) and finally the backend's availability probe, cheapest
+    checks first. ``run(case, input_2d, weight, weight_scale)`` returns the
+    bf16 output; rules marked ``fused_quant`` take the bf16 activation, the
+    others quantize it with :func:`_quantize_activation` first.
+    """
+
+    name: str
+    applies: Callable[[Fp8GemmCase, torch.Tensor], bool]
+    run: Callable[..., torch.Tensor]
+
+
+def _quantize_activation(case: Fp8GemmCase, input_2d: torch.Tensor):
+    return per_token_group_quant_fp8(
+        input_2d, case.block_k, column_major_scales=False,
+        round_scale=case.round_scale,
+    )
+
+
+def _run_swapab(case, input_2d, weight, weight_scale):
+    return _flashinfer_blockscale_gemm()(
+        input_2d, weight, None, weight_scale, out_dtype=torch.bfloat16
+    )
+
+
+def _run_groupwise(case, input_2d, weight, weight_scale):
+    _log_groupwise_enabled_once()
+    q_input, x_scale = _quantize_activation(case, input_2d)
+    return w8a8_block_fp8_matmul_flashinfer_groupwise(
+        q_input, x_scale, weight, _groupwise_weight_scale(weight_scale)
+    )
+
+
+def _run_deepgemm_packed(case, input_2d, weight, weight_scale):
+    _log_deepgemm_enabled_once(packed=True)
+    q_input, x_scale = _quantize_activation(case, input_2d)
+    return w8a8_block_fp8_matmul_deepgemm_packed(
+        q_input, weight, x_scale,
+        packed_weight_scale(weight_scale, case.N, case.block_n), case.input_dtype,
+    )
+
+
+def _run_deepgemm(case, input_2d, weight, weight_scale):
+    _log_deepgemm_enabled_once()
+    q_input, x_scale = _quantize_activation(case, input_2d)
+    return w8a8_block_fp8_matmul_deepgemm(
+        q_input, weight, x_scale, weight_scale,
+        [case.block_n, case.block_k], case.input_dtype,
+    )
+
+
+def _run_triton(case, input_2d, weight, weight_scale):
+    q_input, x_scale = _quantize_activation(case, input_2d)
+    return w8a8_block_fp8_matmul(
+        q_input, weight, x_scale, weight_scale,
+        [case.block_n, case.block_k], case.input_dtype,
+    )
+
+
+# Block-FP8 GEMM backends in priority order; the first rule that applies is
+# used, and the Triton kernel always applies. The conditions are measured
+# rules of thumb, not autotuning; keep the reason next to each one.
+FP8_GEMM_RULES: tuple[Fp8GemmRule, ...] = (
+    # Decode on capability 9.0: takes the bf16 activation and fuses its
+    # quantization into a swapAB GEMM, ~2x faster than DeepGEMM's 1d2d kernel.
+    # M<32 is a perf *and* accuracy bound (swapAB degrades at larger M). UE8M0
+    # activation rounding needs the explicit quant path, so it is excluded.
+    Fp8GemmRule(
+        "flashinfer_swapab",
+        lambda case, ws: (
+            not case.round_scale
+            and case.M < _FLASHINFER_SWAPAB_MAX_M
+            and case.input_dtype == torch.bfloat16
+            and _flashinfer_shape_supported(case.N, case.K, case.block_n, case.block_k, ws)
+            and flashinfer_swapab_available()
+        ),
+        _run_swapab,
+    ),
+    # Capability 10.0, FP32 scales: CUTLASS groupwise GEMM consumes the
+    # checkpoint scales as-is; 2-3x faster than Triton on Qwen3.8-27B shapes
+    # at every M. Its scale cache is never built under graph capture.
+    Fp8GemmRule(
+        "flashinfer_groupwise",
+        lambda case, ws: (
+            case.shape_ok
+            and not case.round_scale
+            and case.block_128
+            and flashinfer_groupwise_available()
+            and _groupwise_weight_scale(ws) is not None
+        ),
+        _run_groupwise,
+    ),
+    # Capability 10.0/12.0, UE8M0 checkpoints: packing rounds scales to UE8M0,
+    # which is these checkpoints' native format and therefore lossless here.
+    Fp8GemmRule(
+        "deepgemm_packed",
+        lambda case, ws: case.shape_ok and case.round_scale and deepgemm_packed_available(),
+        _run_deepgemm_packed,
+    ),
+    # Capability 9.0 block-scale kernels for everything swapAB does not take.
+    Fp8GemmRule(
+        "deepgemm",
+        lambda case, ws: case.shape_ok and deepgemm_available(),
+        _run_deepgemm,
+    ),
+    Fp8GemmRule("triton", lambda case, ws: True, _run_triton),
+)
+
+
+def select_fp8_gemm_rule(case: Fp8GemmCase, weight_scale: torch.Tensor) -> Fp8GemmRule:
+    return next(rule for rule in FP8_GEMM_RULES if rule.applies(case, weight_scale))
+
+
 def fp8LinearMethod(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -324,53 +553,14 @@ def fp8LinearMethod(
     assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
-
     N, K = weight.shape
-    block_n, block_k = block_size[0], block_size[1]
-    M = input_2d.shape[0]
-
-    # Decode (small M): FlashInfer's swapAB kernel takes the BF16 activation
-    # directly and fuses quantization + GEMM, ~2x faster than DeepGEMM's 1d2d.
-    # Restricted to M<32 (perf *and* accuracy: swapAB degrades at larger M).
-    # UE8M0 activation rounding needs the explicit quant path (swapAB quantizes
-    # internally with a plain scale), so skip the fused kernel when it's on.
-    if (
-        not round_scale
-        and M < _FLASHINFER_SWAPAB_MAX_M
-        and input.dtype == torch.bfloat16
-        and _flashinfer_shape_supported(N, K, block_n, block_k, weight_scale)
-        and flashinfer_swapab_available()
-    ):
-        output = _flashinfer_blockscale_gemm()(
-            input_2d, weight, None, weight_scale, out_dtype=torch.bfloat16
-        )
-    else:
-        q_input, x_scale = per_token_group_quant_fp8(
-            input_2d, block_size[1], column_major_scales=False,
-            round_scale=round_scale,
-        )
-        shape_ok = _deepgemm_shape_supported(N, K, block_n, block_k, input.dtype)
-        # ``round_scale`` means the activation scales are already UE8M0, so the
-        # packed path costs no extra precision -- see ``deepgemm_packed_available``.
-        if shape_ok and round_scale and deepgemm_packed_available():
-            _log_deepgemm_enabled_once(packed=True)
-            output = w8a8_block_fp8_matmul_deepgemm_packed(
-                q_input,
-                weight,
-                x_scale,
-                packed_weight_scale(weight_scale, N, block_n),
-                input.dtype,
-            )
-        elif shape_ok and deepgemm_available():
-            _log_deepgemm_enabled_once()
-            output = w8a8_block_fp8_matmul_deepgemm(
-                q_input, weight, x_scale, weight_scale, block_size, input.dtype
-            )
-        else:
-            output = w8a8_block_fp8_matmul(
-                q_input, weight, x_scale, weight_scale, block_size, input.dtype
-            )
-
+    case = Fp8GemmCase(
+        M=input_2d.shape[0], N=N, K=K, block_n=block_size[0], block_k=block_size[1],
+        round_scale=round_scale, input_dtype=input.dtype,
+    )
+    output = select_fp8_gemm_rule(case, weight_scale).run(
+        case, input_2d, weight, weight_scale
+    )
     if bias is not None:
         output = output + bias
     return output.to(dtype=input.dtype).view(*output_shape)

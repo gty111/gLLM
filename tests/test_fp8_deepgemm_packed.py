@@ -81,9 +81,17 @@ def test_packed_weight_scale_covers_partial_last_block():
 
 def test_gate_requires_ue8m0_scales():
     """Without UE8M0 activation scales the packed path would silently reround."""
-    import inspect
+    import torch
 
     from gllm.layers.quantization import fp8
 
-    src = inspect.getsource(fp8.fp8LinearMethod)
-    assert "round_scale and deepgemm_packed_available()" in src
+    rule = next(r for r in fp8.FP8_GEMM_RULES if r.name == "deepgemm_packed")
+    case = dict(M=8, N=1024, K=2048, block_n=128, block_k=128, input_dtype=torch.bfloat16)
+    original = fp8.deepgemm_packed_available
+    fp8.deepgemm_packed_available = lambda: True
+    try:
+        scale = torch.ones(8, 16)
+        assert not rule.applies(fp8.Fp8GemmCase(round_scale=False, **case), scale)
+        assert rule.applies(fp8.Fp8GemmCase(round_scale=True, **case), scale)
+    finally:
+        fp8.deepgemm_packed_available = original
