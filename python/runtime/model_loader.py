@@ -571,6 +571,14 @@ class ModelLoader:
         if self.load_weights_from_local(self.model_path):
             return
 
+        if os.path.isdir(self.model_path):
+            # A local directory is never a Hub repo id; asking the Hub would
+            # only fail with an unrelated "Repo id must be in the form" error.
+            raise FileNotFoundError(
+                f"No *.safetensors or *.bin weights in {self.model_path}; "
+                "the checkpoint looks incomplete (only config/tokenizer files?)."
+            )
+
         if self.load_weights_from_huggingface(self.model_path):
             return
 
