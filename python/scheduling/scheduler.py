@@ -49,6 +49,21 @@ def _runner_config_field(name):
     )
 
 
+
+def copy_for_next_prefill_chunk(seq):
+    """Copy ``seq`` for its next prefill chunk, sharing prompt logprobs.
+
+    The copy is made when this chunk is scheduled, before it runs; the runner
+    fills this chunk's prompt logprobs afterwards. Both objects therefore hold
+    the same list, so every chunk lands in the one the last chunk sends.
+    """
+    memo = {}
+    if getattr(seq, "prompt_logprobs_enabled", False):
+        if seq.prompt_logprobs_data is None:
+            seq.prompt_logprobs_data = [None] * seq.raw_prompt_len
+        memo[id(seq.prompt_logprobs_data)] = seq.prompt_logprobs_data
+    return copy.deepcopy(seq, memo)
+
 class Scheduler:
     maxd = _runner_config_field("maxd")
     maxp = _runner_config_field("maxp")
@@ -771,7 +786,7 @@ class Scheduler:
             resident_work = True
             prefill_batch.append(seq)
             if seq.computed_token_num + seq.to_compute_token_num < seq.prompt_len:
-                seq_new = copy.deepcopy(seq)
+                seq_new = copy_for_next_prefill_chunk(seq)
                 seq_new.computed_token_num += seq_new.to_compute_token_num
                 unfinish_prefill_seqs.appendleft(seq_new)
 
