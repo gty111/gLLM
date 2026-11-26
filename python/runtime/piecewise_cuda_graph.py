@@ -209,28 +209,28 @@ class PiecewiseRuntime:
 
         bridged_passthrough = []
         for index, value in enumerate(passthrough):
+            # Layers of one model may carry different passthrough shapes in the
+            # same slot (e.g. a GDN gate vs. an attention output gate), so a
+            # slot owns one buffer per signature.
             passthrough_shape = (self.workspace_tokens, *value.shape[1:])
-            if index < len(self.passthrough_buffers):
-                passthrough_buffer = self.passthrough_buffers[index]
-                if (
-                    passthrough_buffer.shape != passthrough_shape
-                    or passthrough_buffer.dtype != value.dtype
-                    or passthrough_buffer.device != value.device
-                ):
-                    raise RuntimeError(
-                        "piecewise passthrough signature changed: "
-                        f"break={break_index}, slot={index}, "
-                        f"expected={passthrough_shape}/{value.dtype}/"
-                        f"{value.device}, actual="
-                        f"{tuple(passthrough_buffer.shape)}/"
-                        f"{passthrough_buffer.dtype}/{passthrough_buffer.device}"
-                    )
-            else:
+            passthrough_buffer = next(
+                (
+                    buffer
+                    for buffer in self.passthrough_buffers
+                    if buffer.shape == passthrough_shape
+                    and buffer.dtype == value.dtype
+                    and buffer.device == value.device
+                    and getattr(buffer, "_piecewise_passthrough_slot", 0) == index
+                ),
+                None,
+            )
+            if passthrough_buffer is None:
                 passthrough_buffer = torch.zeros(
                     passthrough_shape,
                     dtype=value.dtype,
                     device=value.device,
                 )
+                passthrough_buffer._piecewise_passthrough_slot = index
                 self.passthrough_buffers.append(passthrough_buffer)
             bridged = passthrough_buffer[: self.bucket]
             # Residual/skip tensors bypass the eager operator but remain live

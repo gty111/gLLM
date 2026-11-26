@@ -110,7 +110,10 @@ from gllm.models.weight_loader import (
 )
 from gllm.models.mixins import StandardCausalLMMixin
 from gllm.models.mtp_utils import detached_head, load_remapped_weights
-from gllm.runtime.piecewise_cuda_graph import piecewise_dynamic_tensor
+from gllm.runtime.piecewise_cuda_graph import (
+    PiecewiseRuntime,
+    piecewise_dynamic_tensor,
+)
 
 
 _GLOBAL_LAYER_TYPE_ATTRS = ("layer_types", "layers_block_type")
@@ -695,18 +698,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def forward_piecewise(self, input_data, hidden_states, *passthrough):
         mixed_qkv, a, b, z = self._project(hidden_states)
+
+        def core_into(out, qkv, gate_a, gate_b):
+            # The SSM segment is built only after the memory-profile forward.
+            if getattr(input_data.memory_manager, "ssm_segment", None) is None:
+                return out.zero_()
+            return self._forward_core(input_data, qkv, gate_a, gate_b, out=out)
+
+        def core(qkv, gate_a, gate_b):
+            if getattr(input_data.memory_manager, "ssm_segment", None) is None:
+                return qkv.new_zeros(
+                    (qkv.shape[0], self.tp_num_v_heads, self.head_v_dim)
+                )
+            return self._forward_core(input_data, qkv, gate_a, gate_b)
+
         core, *bridged = piecewise_dynamic_tensor(
-            lambda qkv, gate_a, gate_b: self._forward_core(
-                input_data, qkv, gate_a, gate_b
-            ),
+            core,
             mixed_qkv,
             *passthrough,
             z,
             inputs=(a, b),
             output_shape=(self.tp_num_v_heads, self.head_v_dim),
-            out_fn=lambda out, qkv, gate_a, gate_b: self._forward_core(
-                input_data, qkv, gate_a, gate_b, out=out
-            ),
+            out_fn=core_into,
         )
         return self._finish(core, bridged[-1]), *bridged[:-1]
 
@@ -979,6 +992,14 @@ class Qwen3_5FullAttention(nn.Module):
         )
 
     def forward(self, input_data: InputData, hidden_states: torch.Tensor):
+        q, k, v, gate = self._project(hidden_states)
+        attn_out = self._core(input_data, q, k, v)
+        if gate is not None:
+            attn_out = _apply_strided_attention_output_gate(attn_out, gate)
+        return self.o_proj(attn_out)
+
+    def _project(self, hidden_states):
+        """Graph-safe part before the attention core: qkv, q/k norm, gate."""
         qkv = self.qkv_proj(hidden_states)
         orig_shape = qkv.shape[:-1]
         if self.attn_output_gate:
@@ -990,20 +1011,32 @@ class Qwen3_5FullAttention(nn.Module):
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             gate = None
-
-        q_shape = (*orig_shape, self.q_size)
-        k_shape = (*orig_shape, self.kv_size)
         q = q.view(*orig_shape, self.num_heads, self.head_dim)
         k = k.view(*orig_shape, self.num_kv_heads, self.head_dim)
-        q = self.q_norm(q).reshape(q_shape)
-        k = self.k_norm(k).reshape(k_shape)
+        q = self.q_norm(q).reshape(*orig_shape, self.q_size)
+        k = self.k_norm(k).reshape(*orig_shape, self.kv_size)
+        return q, k, v, gate
+
+    def _core(self, input_data, q, k, v):
+        """Position- and KV-dependent part; eager under piecewise graphs."""
         q, k = self.rotary_emb(input_data.get_position(), q, k)
+        return self.attn.forward(q, k, v, input_data)
 
-        attn_out = self.attn.forward(q, k, v, input_data)
-
+    def forward_piecewise(self, input_data, hidden_states, *passthrough):
+        q, k, v, gate = self._project(hidden_states)
+        gates = () if gate is None else (gate,)
+        attn_out, *bridged = piecewise_dynamic_tensor(
+            lambda q_, k_, v_: self._core(input_data, q_, k_, v_),
+            q,
+            *passthrough,
+            *gates,
+            inputs=(k, v),
+            output_shape=(self.q_size,),
+        )
         if gate is not None:
-            attn_out = _apply_strided_attention_output_gate(attn_out, gate)
-        return self.o_proj(attn_out)
+            attn_out = _apply_strided_attention_output_gate(attn_out, bridged[-1])
+            bridged = bridged[:-1]
+        return self.o_proj(attn_out), *bridged
 
 
 def _is_moe_text_config(config) -> bool:
@@ -1099,14 +1132,19 @@ class Qwen3_5DecoderLayer(nn.Module):
                 hidden_states, residual, self.input_layernorm, self._fuse_input
             )
 
-        if self.self_attn is not None:
-            hidden_states, residual = piecewise_dynamic_tensor(
-                lambda x: self.self_attn(input_data, x), hidden_states, residual
+        if PiecewiseRuntime.current() is not None:
+            # Only the dynamic core runs between graph segments; projections,
+            # norms and gates stay inside the captured regions.
+            attention = (
+                self.self_attn if self.self_attn is not None else self.linear_attn
             )
+            hidden_states, residual = attention.forward_piecewise(
+                input_data, hidden_states, residual
+            )
+        elif self.self_attn is not None:
+            hidden_states = self.self_attn(input_data, hidden_states)
         else:
-            hidden_states, residual = piecewise_dynamic_tensor(
-                lambda x: self.linear_attn(input_data, x), hidden_states, residual
-            )
+            hidden_states = self.linear_attn(input_data, hidden_states)
         hidden_states, residual = maybe_fused_norm(
             hidden_states, residual, self.post_attention_layernorm, self._fuse_attn
         )
