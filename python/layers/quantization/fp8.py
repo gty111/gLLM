@@ -159,6 +159,85 @@ def w8a8_block_fp8_matmul_deepgemm_packed(
     return C
 
 
+# Blackwell (SM100) block-scale FP8 GEMM from FlashInfer: takes the
+# checkpoint's FP32 (1x128 activation, 128x128 weight) scales as-is, so unlike
+# the packed-UE8M0 DeepGEMM path it is exact for ordinary FP8 checkpoints.
+# Measured 2-3x faster than the Triton fallback on Qwen3.8-27B shapes and on par
+# with bf16 cuBLAS for large M. Scales are passed in "MN"-major layout.
+_GROUPWISE_SCALE_ATTR = "_flashinfer_groupwise_scale"
+_groupwise_probe: Optional[bool] = None
+
+
+def flashinfer_groupwise_available() -> bool:
+    """Whether FlashInfer's SM100 groupwise FP8 GEMM runs and is exact here."""
+    global _groupwise_probe
+    if _groupwise_probe is not None:
+        return _groupwise_probe
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        _groupwise_probe = False
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False  # probe later, outside capture
+    try:
+        from flashinfer.gemm import gemm_fp8_nt_groupwise
+
+        a = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+        w = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16) * 0.05
+        ws = w.view(2, 128, 2, 128).abs().amax(dim=(1, 3)).float() / 448.0
+        wq = (w.view(2, 128, 2, 128) / ws[:, None, :, None]).to(torch.float8_e4m3fn).view(256, 256)
+        aq, as_ = per_token_group_quant_fp8(a, 128)
+        out = gemm_fp8_nt_groupwise(
+            aq, wq, as_.t().contiguous(), ws.t().contiguous(),
+            scale_major_mode="MN", out_dtype=torch.bfloat16,
+        )
+        wdq = (wq.float().view(2, 128, 2, 128) * ws[:, None, :, None]).view(256, 256)
+        ref = aq.float().view(4, 2, 128).mul(as_[:, :, None]).view(4, 256) @ wdq.t()
+        ok = bool(((out.float() - ref).abs().max() <= 1e-2 * ref.abs().max()).item())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"FlashInfer groupwise FP8 GEMM unavailable: {e}")
+        ok = False
+    _groupwise_probe = ok
+    return ok
+
+
+def _groupwise_weight_scale(weight_scale: torch.Tensor) -> Optional[torch.Tensor]:
+    """``(N/128, K/128)`` scales in the kernel's MN-major ``(K/128, N/128)`` form.
+
+    Built once per weight during the eager bucket warmup; ``None`` under graph
+    capture if it is somehow still missing (the caller then falls back).
+    """
+    cached = getattr(weight_scale, _GROUPWISE_SCALE_ATTR, None)
+    if cached is None:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        cached = weight_scale.t().contiguous()
+        setattr(weight_scale, _GROUPWISE_SCALE_ATTR, cached)
+    return cached
+
+
+def w8a8_block_fp8_matmul_flashinfer_groupwise(
+    A: torch.Tensor, As: torch.Tensor, B: torch.Tensor, Bs_mn: torch.Tensor
+) -> torch.Tensor:
+    """``C = A @ B^T`` for FP8 ``A`` (M, K) with row-major ``As`` (M, K/128).
+
+    The MN-major activation scales are ``(K/128, M)`` FP32, whose row stride
+    must be 16-byte aligned, so M is padded to a multiple of 4 (rows are
+    independent; the padding is sliced off).
+    """
+    from flashinfer.gemm import gemm_fp8_nt_groupwise
+
+    M = A.shape[0]
+    pad = -M % 4
+    if pad:
+        A = torch.cat((A, A.new_zeros(pad, A.shape[1])))
+        As = torch.cat((As, As.new_ones(pad, As.shape[1])))
+    out = gemm_fp8_nt_groupwise(
+        A, B, As.t().contiguous(), Bs_mn,
+        scale_major_mode="MN", out_dtype=torch.bfloat16,
+    )
+    return out[:M] if pad else out
+
+
 def fp8_backend_requires_bucket_warmup(quant_config) -> bool:
     """Whether an FP8 model needs eager per-bucket backend warmup.
 
@@ -173,10 +252,19 @@ def fp8_backend_requires_bucket_warmup(quant_config) -> bool:
         deepgemm_available()
         or deepgemm_packed_available()
         or flashinfer_swapab_available()
+        or flashinfer_groupwise_available()
     )
 
 
 _deepgemm_logged = False
+_groupwise_logged = False
+
+
+def _log_groupwise_enabled_once() -> None:
+    global _groupwise_logged
+    if not _groupwise_logged:
+        _groupwise_logged = True
+        logger.info("FlashInfer groupwise FP8 GEMM backend enabled (SM100 block-scale kernels).")
 
 
 def _log_deepgemm_enabled_once(packed: bool = False) -> None:
@@ -352,7 +440,21 @@ def fp8LinearMethod(
         shape_ok = _deepgemm_shape_supported(N, K, block_n, block_k, input.dtype)
         # ``round_scale`` means the activation scales are already UE8M0, so the
         # packed path costs no extra precision -- see ``deepgemm_packed_available``.
-        if shape_ok and round_scale and deepgemm_packed_available():
+        groupwise_scale = (
+            _groupwise_weight_scale(weight_scale)
+            if shape_ok
+            and not round_scale
+            and block_n == 128
+            and block_k == 128
+            and flashinfer_groupwise_available()
+            else None
+        )
+        if groupwise_scale is not None:
+            _log_groupwise_enabled_once()
+            output = w8a8_block_fp8_matmul_flashinfer_groupwise(
+                q_input, x_scale, weight, groupwise_scale
+            )
+        elif shape_ok and round_scale and deepgemm_packed_available():
             _log_deepgemm_enabled_once(packed=True)
             output = w8a8_block_fp8_matmul_deepgemm_packed(
                 q_input,

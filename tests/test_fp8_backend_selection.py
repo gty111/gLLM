@@ -27,6 +27,7 @@ def test_non_fp8_models_do_not_probe_fp8_backends(monkeypatch):
 
     monkeypatch.setattr(fp8, "deepgemm_available", unexpected_probe)
     monkeypatch.setattr(fp8, "flashinfer_swapab_available", unexpected_probe)
+    monkeypatch.setattr(fp8, "flashinfer_groupwise_available", unexpected_probe)
 
     assert fp8.fp8_backend_requires_bucket_warmup(None) is False
     assert fp8.fp8_backend_requires_bucket_warmup({}) is False
