@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 import torch
 
 import gllm.runtime.model_runner as model_runner_module
@@ -75,3 +77,25 @@ def test_next_prefill_chunk_shares_prompt_logprobs_with_the_running_chunk():
 
     plain = GenerationSequence(8, list(range(10)), [], 4, False, 1.0, 1.0, -1, 1.0, None, False, 0, False, 0)
     assert copy_for_next_prefill_chunk(plain).prompt_logprobs_data is None
+
+
+@pytest.mark.parametrize("scored", [False, True])
+def test_prompt_logprob_requests_skip_prefix_cache_hits(
+    prefix_manager, populate, make_seq, make_scheduler, scored
+):
+    mm, _, _ = prefix_manager(pages=12)
+    cached = make_seq(0, 64)
+    populate(mm.segment, cached)
+    mm.segment.free_many(cached.page_table)
+    s = make_scheduler(mm)
+    request = make_seq(1, 64)
+    request.prompt_logprobs_enabled = scored
+    s.add_new_requests([request])
+    assert s.schedule_once() == [request]
+    if scored:
+        # Every position needs a hidden state for its prompt logprob.
+        assert request.computed_token_num == 0
+        assert request.to_compute_token_num == 64
+    else:
+        # Full hit: only the last token is recomputed.
+        assert request.to_compute_token_num == 1
