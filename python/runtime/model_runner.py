@@ -77,6 +77,10 @@ from gllm.speculative.mtp import MtpMixin, MtpQDist, MtpVerifyResult
 from gllm.speculative.staging import MtpStagingBuffers
 from gllm.tokenizers.mixin import TokenizerMixin
 
+# Upper bound on the float32 logprob matrix materialized per LM-head call when
+# computing prompt logprobs (rows x vocab x 4 bytes).
+_PROMPT_LOGPROBS_STEP_BYTES = 256 << 20
+
 
 def apply_mm_processor_pixels(
     image_processor,
@@ -1258,6 +1262,10 @@ class ModelRunner(
         if project is None:
             return
         qsl = self.input_data.query_start_loc_cpu
+        vocab_size = getattr(getattr(self, "model_loader", None), "vocab_size", None)
+        rows_per_step = max(
+            1, _PROMPT_LOGPROBS_STEP_BYTES // (4 * (vocab_size or (1 << 18)))
+        )
         for i, seq in enumerate(seqs):
             if not getattr(seq, "prompt_logprobs_enabled", False):
                 continue
@@ -1273,19 +1281,28 @@ class ModelRunner(
             jmax = min(n, prompt_len - 1 - c0)
             if jmax <= 0:
                 continue
-            logits = project(hidden_states[start : start + jmax])
-            logprobs = torch.log_softmax(logits.float(), dim=-1)
             target_ids = seq.token_ids[c0 + 1 : c0 + 1 + jmax]
             target = torch.tensor(
-                target_ids, device=logprobs.device, dtype=torch.long
+                target_ids, device=hidden_states.device, dtype=torch.long
             ).view(-1, 1)
-            sampled = logprobs.gather(1, target).squeeze(1).cpu().tolist()
-            k = min(seq.num_prompt_logprobs, logprobs.shape[-1])
-            if k > 0:
-                top_vals, top_ids = torch.topk(logprobs, k, dim=-1)
-                top_vals = top_vals.cpu().tolist()
-                top_ids = top_ids.cpu().tolist()
-            else:
+            k = seq.num_prompt_logprobs
+            sampled, top_vals, top_ids = [], [], []
+            # Full-vocab logprobs for a whole prefill chunk would need
+            # rows x vocab floats (GiBs for a long prompt); project a bounded
+            # number of rows at a time. Every TP rank uses the same split, so
+            # the LM head's collectives stay balanced.
+            for r0 in range(0, jmax, rows_per_step):
+                r1 = min(jmax, r0 + rows_per_step)
+                logits = project(hidden_states[start + r0 : start + r1])
+                logprobs = torch.log_softmax(logits.float(), dim=-1)
+                del logits
+                sampled += logprobs.gather(1, target[r0:r1]).squeeze(1).cpu().tolist()
+                if k > 0:
+                    vals, ids = torch.topk(logprobs, min(k, logprobs.shape[-1]), dim=-1)
+                    top_vals += vals.cpu().tolist()
+                    top_ids += ids.cpu().tolist()
+                del logprobs
+            if k == 0:
                 top_vals = [[] for _ in range(jmax)]
                 top_ids = [[] for _ in range(jmax)]
             if seq.prompt_logprobs_data is None:
