@@ -177,6 +177,112 @@ def test_sampled_pick_records_the_distribution_it_draws_from(sparse):
     assert (empirical - q).abs().max() < 0.03
 
 
+@pytest.mark.parametrize("batch", [1, 4])
+@torch.no_grad()
+def test_propose_confidence_matches_head_and_reuses_output(batch):
+    from gllm.speculative.dspark_drafter import DSparkDrafter
+
+    lengths = [4, 9, 17, 30][:batch]
+    config, draft, segment, tables = _setup(lengths)
+    drafter = DSparkDrafter(draft, kv_base_layer=3, taps=None)
+    drafter.bind_kv(segment)
+    anchors = torch.arange(batch, device="cuda", dtype=torch.long) + 3
+    lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros((batch, max(map(len, tables))), dtype=torch.int32)
+    for row, table in enumerate(tables):
+        block_table[row, :len(table)] = torch.tensor(table)
+    block_table = block_table.cuda()
+    output = torch.full((batch, draft.block_size), float("nan"),
+                        device="cuda", dtype=draft.confidence_head.proj.weight.dtype)
+    pointer = output.data_ptr()
+    lm_calls = []
+    hook = draft._lm_head[0].register_forward_hook(lambda *args: lm_calls.append(1))
+    rng = torch.cuda.get_rng_state()
+    plain = drafter.propose(anchors, lens, block_table)
+    observed = drafter.propose(anchors, lens, block_table, confidence_out=output)
+    hook.remove()
+    assert len(lm_calls) == 2  # observation must not rerun the LM head
+    assert torch.equal(plain, observed)
+    assert torch.equal(rng, torch.cuda.get_rng_state())
+    hidden = draft.noise_hidden(anchors, lens, block_table, drafter.kv_views)
+    ids, _, reference = draft.forward_head(hidden, anchors)
+    assert torch.equal(observed, ids[:, 1:])
+    torch.testing.assert_close(output, reference)
+
+    # A caller that keeps an older record owns its snapshot, not this scratch.
+    first = output.clone()
+    saved = first.clone()
+    anchors = anchors + 17
+    output.fill_(float("nan"))
+    next_proposals = drafter.propose(anchors, lens, block_table, confidence_out=output)
+    hidden = draft.noise_hidden(anchors, lens, block_table, drafter.kv_views)
+    ids, _, reference = draft.forward_head(hidden, anchors)
+    assert torch.equal(next_proposals, ids[:, 1:])
+    torch.testing.assert_close(output, reference)
+    assert output.data_ptr() == pointer
+    assert torch.equal(first, saved)
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("sparse", [False, True])
+@torch.no_grad()
+def test_propose_confidence_preserves_sampled_q_and_rng(batch, sparse):
+    from gllm.speculative.dspark_drafter import DSparkDrafter
+
+    lengths = [4, 9, 17, 30][:batch]
+    config, draft, segment, tables = _setup(lengths)
+    drafter = DSparkDrafter(draft, kv_base_layer=3, taps=None)
+    drafter.bind_kv(segment)
+    anchors = torch.arange(batch, device="cuda", dtype=torch.long) + 3
+    lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros((batch, max(map(len, tables))), dtype=torch.int32)
+    for row, table in enumerate(tables):
+        block_table[row, :len(table)] = torch.tensor(table)
+    block_table = block_table.cuda()
+    runner = _sampler_runner()
+    temps = torch.full((batch, 1), 0.8, device="cuda")
+    top_ks = torch.full((batch,), 8 if sparse else -1, dtype=torch.int32, device="cuda")
+    top_ps = torch.full((batch,), 0.9, device="cuda")
+    output = torch.empty((batch, draft.block_size),
+                         device="cuda", dtype=draft.confidence_head.proj.weight.dtype)
+    initial_rng = torch.cuda.get_rng_state()
+
+    def draw(confidence_out):
+        torch.cuda.set_rng_state(initial_rng)
+        record = []
+        if sparse:
+            pick = runner._dspark_sparse_pick(temps, top_ks, top_ps, 72, record)
+        else:
+            q = torch.empty((batch, draft.block_size, config.vocab_size), device="cuda")
+            pick = runner._dspark_dense_pick(temps, top_ks, top_ps, q)
+        proposals = drafter.propose_with(
+            anchors, lens, block_table, pick, confidence_out=confidence_out
+        )
+        distributions = (
+            tuple(torch.stack(part, dim=1) for part in zip(*record))
+            if sparse else (q,)
+        )
+        return proposals, distributions, torch.cuda.get_rng_state()
+
+    lm_calls = []
+    hook = draft._lm_head[0].register_forward_hook(lambda *args: lm_calls.append(1))
+    plain, plain_q, plain_rng = draw(None)
+    observed, observed_q, observed_rng = draw(output)
+    hook.remove()
+    assert len(lm_calls) == 2
+    assert torch.equal(plain, observed)
+    assert torch.equal(plain_rng, observed_rng)
+    for actual, expected in zip(observed_q, plain_q):
+        assert torch.equal(actual, expected)
+
+    # Replay the already-drawn tokens through the existing head without drawing.
+    hidden = draft.noise_hidden(anchors, lens, block_table, drafter.kv_views)
+    columns = iter(observed.unbind(1))
+    ids, _, reference = draft.forward_head(hidden, anchors, sample=lambda logits: next(columns))
+    assert torch.equal(ids[:, 1:], observed)
+    torch.testing.assert_close(output, reference)
+
+
 def _tap_target(hidden_size, num_layers=3):
     """Tiny target backbone (real ``Qwen3_5Model._forward``) with dense layers."""
     from gllm.models.qwen3_5 import Qwen3_5Model

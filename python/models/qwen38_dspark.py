@@ -668,16 +668,51 @@ class Qwen38DSpark(nn.Module, DSparkForwardProtocol):
                 key, value, k_cache, v_cache, slot_mapping, "auto", key, value,
             )
 
+    def _validate_confidence_out(self, anchors, confidence_out) -> None:
+        if (
+            confidence_out.shape != (anchors.shape[0], self.block_size)
+            or confidence_out.device != anchors.device
+            or confidence_out.dtype != self.confidence_head.proj.weight.dtype
+        ):
+            raise ValueError(
+                "confidence_out must have shape [B, k], the anchor device "
+                "and the confidence head dtype"
+            )
+
     @torch.no_grad()
-    def propose(self, anchors, context_lens, block_table, kv_views) -> torch.Tensor:
+    def _confidence_from_proposals(self, hidden, anchors, proposals) -> torch.Tensor:
+        """Raw scores for the actual proposals, without sampling again.
+
+        Row j uses the anchor (j == 0) or the token drawn at j - 1.
+        The hidden rows are already normed by noise_hidden. These logits are
+        observations, not calibrated probabilities or acceptance decisions.
+        """
+        previous = torch.cat((anchors[:, None], proposals[:, :-1]), dim=1)
+        markov_hidden = self.markov_head.markov_w1(previous)
+        return self.confidence_head.proj(
+            torch.cat((hidden, markov_hidden), dim=-1)
+        ).squeeze(-1)
+
+    @torch.no_grad()
+    def propose(
+        self, anchors, context_lens, block_table, kv_views, *,
+        confidence_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Greedy proposals ``[B, k]`` after each anchor, all on the device.
 
         ``anchors[b]`` sits at position ``context_lens[b]`` (> 0); the history
         ``[0, context_lens[b])`` is in the draft K/V, addressed by
         ``block_table[b]``. Shapes depend only on ``B``: CUDA-graph capturable.
+        Optional raw scores overwrite the caller-owned ``[B, k]`` buffer;
+        it must not alias the inputs. The proposal return value is unchanged.
         """
+        if confidence_out is not None:
+            self._validate_confidence_out(anchors, confidence_out)
         hidden = self.noise_hidden(anchors, context_lens, block_table, kv_views)
-        return self.greedy_proposals(hidden, anchors)
+        proposals = self.greedy_proposals(hidden, anchors)
+        if confidence_out is not None:
+            confidence_out.copy_(self._confidence_from_proposals(hidden, anchors, proposals))
+        return proposals
 
     @torch.no_grad()
     def greedy_proposals(self, hidden, anchors) -> torch.Tensor:
