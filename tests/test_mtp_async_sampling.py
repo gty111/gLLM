@@ -379,3 +379,128 @@ def test_decode_passes_batch_temperature_gate_to_all_target_chunks(monkeypatch, 
     monkeypatch.setattr(runner, "_mtp_target_probs_static", observe)
     runner._mtp_decode(torch.zeros(3, 2, device="cuda"), [5, 5, 5])
     assert seen == [expected] * 3
+
+
+def _confidence_runner(monkeypatch, mode):
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+    from gllm.speculative.dspark_drafter import DSparkDrafter
+
+    runner, originals, vhidden = _runner(
+        monkeypatch, asynchronous=False, sparse=mode != "dense"
+    )
+    seqs = []
+    for old, position in zip(originals, [1, 4, 8]):
+        class Sequence:
+            pass
+        seq = Sequence()
+        seq.__dict__.update(vars(old))
+        seq.__dict__.update(
+            token_ids=[4] * position + [5], computed_token_num=position,
+            raw_prompt_len=position, output_len=2, _cache_epoch=0,
+            finish_tokens=[2], ignore_eos=False, top_p=1.0, page_table=[0],
+        )
+        if mode == "greedy":
+            seq.temperature, seq.top_k = 1.0, 1
+        seqs.append(seq)
+    runner.input_data.seqs = seqs
+    runner._sp_host_f = None
+    runner._mtp_sample_params = MtpMixin._mtp_sample_params.__get__(runner)
+    runner.config = SimpleNamespace(
+        overlap_scheduling=False, disable_cuda_graph=True, piecewise_cuda_graph=False,
+    )
+    runner.dspark_enabled = True
+    runner._mtp_verify_graph = False
+    runner._piecewise_runner = None
+    runner._dspark_draft_graphs = {}
+    runner._dspark_sampled_graphs = {}
+    runner._mtp_tie_overflow = torch.zeros((), dtype=torch.int64, device="cuda")
+    w1 = torch.nn.Embedding(8, 1, device="cuda")
+    w2 = torch.nn.Linear(1, 8, bias=False, device="cuda")
+    confidence = torch.nn.Linear(3, 1, device="cuda")
+    with torch.no_grad():
+        w1.weight[:, 0].copy_(torch.arange(8, device="cuda"))
+        w2.weight.zero_()
+        confidence.weight.copy_(torch.tensor([[1., 0., 1.]], device="cuda"))
+        confidence.bias.fill_(3)
+    logits = torch.full((3, 3, 8), -float("inf"), device="cuda")
+    logits[:, :, 1] = 0
+    model = SimpleNamespace(
+        block_size=3, markov_head=SimpleNamespace(markov_w1=w1, markov_w2=w2),
+        confidence_head=SimpleNamespace(proj=confidence), _lm_head=[lambda hidden: logits.clone()],
+    )
+
+    def noise(anchors, context_lens, *args):
+        hidden = torch.zeros(3, 3, 2, device="cuda")
+        hidden[:, :, 0].copy_(context_lens[:, None].expand(3, 3))
+        return hidden
+    model.noise_hidden = noise
+    for name in ("_validate_confidence_out", "_confidence_from_proposals",
+                 "chain_proposals", "markov_bias", "greedy_proposals", "propose"):
+        setattr(model, name, getattr(Qwen38DSpark, name).__get__(model))
+    runner._dspark_drafter = DSparkDrafter(model, kv_base_layer=0, taps=None)
+    q_seen = []
+    original = runner._mtp_q_drawn
+
+    def q_drawn(dist, tokens):
+        q_seen.append(
+            (dist.dense.clone(),) if dist.dense is not None
+            else tuple(value.clone() for value in (dist.vals, dist.idx, dist.drawn))
+        )
+        return original(dist, tokens)
+    runner._mtp_q_drawn = q_drawn
+    return runner, seqs, q_seen
+
+
+@cuda
+@pytest.mark.parametrize("mode", ["greedy", "sparse", "dense"])
+def test_dspark_confidence_eager_observation_preserves_outputs_q_rng_and_state(monkeypatch, mode):
+    from gllm.speculative.dspark_confidence import DSparkConfidenceObserver
+
+    plain, _, plain_q = _confidence_runner(monkeypatch, mode)
+    observed, seqs, observed_q = _confidence_runner(monkeypatch, mode)
+    observer = DSparkConfidenceObserver("synthetic-worker")
+    observed._dspark_confidence_observer = observer
+    initial_rng = torch.cuda.get_rng_state()
+    hidden = torch.zeros(3, 2, device="cuda")
+    expected = plain._mtp_decode(hidden, [5, 5, 5])
+    plain_rng = torch.cuda.get_rng_state()
+    torch.cuda.set_rng_state(initial_rng)
+    actual = observed._mtp_decode(hidden, [5, 5, 5])
+    assert actual == expected == [[2], [1, 2], [1, 1, 1, 2]]
+    assert torch.equal(plain_rng, torch.cuda.get_rng_state())
+    if mode != "greedy":
+        assert torch.equal(plain._mtp_rng.get_state(), observed._mtp_rng.get_state())
+    assert len(plain_q) == len(observed_q)
+    for plain_parts, observed_parts in zip(plain_q, observed_q):
+        assert all(torch.equal(a, b) for a, b in zip(plain_parts, observed_parts))
+    assert [s.ssm_block_table for s in seqs] == [
+        s.ssm_block_table for s in plain.input_data.seqs
+    ]
+    rows = observer.drain()
+    assert [r.anchor_pos for r in rows] == [1, 4, 8]
+    assert [r.accepted_drafts for r in rows] == [0, 1, 3]
+    assert [r.confidence_logits for r in rows] == [(9., 5., 5.), (12., 8., 8.), (16., 12., 12.)]
+    assert rows[2].remaining_tokens == 1 and rows[2].accepted_drafts == 3
+    assert rows[0].conditional_labels == (0, None, None)
+
+
+@cuda
+@pytest.mark.parametrize("unsupported", ["async", "graph", "mixed", "gpu_anchor"])
+def test_dspark_confidence_unsupported_decode_fails_before_rng_or_forward(monkeypatch, unsupported):
+    from gllm.speculative.dspark_confidence import DSparkConfidenceObserver
+
+    runner, _, _ = _confidence_runner(monkeypatch, "sparse")
+    runner._dspark_confidence_observer = DSparkConfidenceObserver("synthetic-worker")
+    if unsupported == "async":
+        runner._mtp_async_publish = True
+    if unsupported == "graph":
+        runner.config.disable_cuda_graph = False
+    initial = torch.cuda.get_rng_state()
+    tokens = torch.tensor([5, 5, 5], device="cuda") if unsupported == "gpu_anchor" else [5, 5, 5]
+    with pytest.raises(ValueError, match="strict synchronous Eager"):
+        runner._mtp_decode(
+            torch.zeros(3, 2, device="cuda"), tokens,
+            extra_prefill_seqs=[object()] if unsupported == "mixed" else None,
+        )
+    assert runner._mtp_step == 0
+    assert torch.equal(initial, torch.cuda.get_rng_state())

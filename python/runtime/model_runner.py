@@ -118,6 +118,7 @@ class ModelRunner(
     def __init__(self, config: EngineConfig):
         self.config = config
         self.dspark_enabled = config.speculative_backend == "dspark"
+        self._dspark_confidence_observer = None  # opt-in, worker-owned observation only
         self.dspark = None
 
         self.max_num_batched_tokens = (
@@ -1478,6 +1479,9 @@ class ModelRunner(
         # A relay hidden owns a full hidden-size GPU tensor.  Drop it immediately
         # when the request finishes instead of waiting for another MTP iteration
         # to replace the relay map (which may never happen when the batch ends).
+        observer = getattr(self, "_dspark_confidence_observer", None)
+        if observer is not None:
+            observer.forget(seq)
         self._mtp_relay.pop(seq.seq_id, None)
         self.memory_manager.free(seq)
         if self.use_mm and is_first_pp_rank():

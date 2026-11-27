@@ -1692,7 +1692,7 @@ class MtpMixin:
 
     def _dspark_propose(
         self, decode_seqs, ctx_lens, x1_tokens, x1_gpu, x1_is_gpu,
-        *, sampled=False, sparse=False,
+        *, sampled=False, sparse=False, confidence_out=None,
     ):
         """DSpark drafts ``[nd, k]`` on the device for this verify step.
 
@@ -1707,6 +1707,8 @@ class MtpMixin:
         else:
             graphs = getattr(self, "_dspark_draft_graphs", None)
         bucket = min((b for b in graphs or () if b >= nd), default=None)
+        if confidence_out is not None and bucket is not None:
+            raise ValueError("Graph confidence observation is not supported")
         if bucket is not None:
             # Stages anchor/context/page tables once; the verify graph of the
             # same bucket reuses this staging (memoized per step and bucket).
@@ -1743,19 +1745,20 @@ class MtpMixin:
             table[row, : len(seq.page_table)] = torch.tensor(seq.page_table, dtype=torch.int32)
         block_table = table.pin_memory().to(dev, non_blocking=True)
         drafter = self._dspark_drafter
+        confidence_args = {} if confidence_out is None else {"confidence_out": confidence_out}
         if not sampled:
-            return drafter.propose(x1_gpu[:nd], context_lens, block_table)
+            return drafter.propose(x1_gpu[:nd], context_lens, block_table, **confidence_args)
         if sparse:
             record = []
             pick = self._dspark_sparse_pick(temps, top_ks, top_ps, self._mtp_kpad(decode_seqs), record)
-            drafts = drafter.propose_with(x1_gpu[:nd], context_lens, block_table, pick)
+            drafts = drafter.propose_with(x1_gpu[:nd], context_lens, block_table, pick, **confidence_args)
             return drafts, self._q_sparse(*(torch.stack(part, dim=1) for part in zip(*record)))
         q = torch.empty(
             (nd, drafter.draft.block_size, self.memory_manager.vocab_size),
             dtype=torch.float32, device=dev,
         )
         pick = self._dspark_dense_pick(temps, top_ks, top_ps, q)
-        drafts = drafter.propose_with(x1_gpu[:nd], context_lens, block_table, pick)
+        drafts = drafter.propose_with(x1_gpu[:nd], context_lens, block_table, pick, **confidence_args)
         return drafts, self._q_dense(q)
 
     def _mtp_gpu_prep_batch(self, decode_seqs, ctx_lens, x1, bucket):
@@ -2208,6 +2211,11 @@ class MtpMixin:
         k = self.speculative_num_draft_tokens
         mtp = self.model.mtp
         decode_seqs = self.input_data.seqs[:nd]
+        observer = getattr(self, "_dspark_confidence_observer", None)
+        if observer is not None:
+            observer.check_runner(
+                self, mixed=bool(extra_prefill_seqs), gpu_anchor=torch.is_tensor(x1_tokens)
+            )
         dev = hidden.device
         # ``hidden`` is a view into the persistent output_hidden_states buffer;
         # clone so subsequent forwards (draft/verify) can't mutate it underfoot.
@@ -2314,6 +2322,15 @@ class MtpMixin:
         # Choose the proposal q representation once. Target p is always full
         # vocabulary and is independent of this sparse/dense draft choice.
         _sparse = _rej_active and self._mtp_sparse_eligible(decode_seqs)
+        confidence_rows = confidence_out = None
+        if observer is not None:
+            confidence_rows = observer.begin(
+                decode_seqs, ctx_lens, x1, k, sampled=_use_rej, sparse=_sparse
+            )
+            confidence_out = torch.empty(
+                (nd, k), device=dev,
+                dtype=self._dspark_drafter.draft.confidence_head.proj.weight.dtype,
+            )
         # One TP-synced generator per MTP step, used by BOTH the eager sampled
         # draft chain (if taken) AND the accept-step residual/bonus draws below.
         # (The graph draft path uses the default CUDA generator internally and
@@ -2327,6 +2344,7 @@ class MtpMixin:
                 proposed = self._dspark_propose(
                     decode_seqs, ctx_lens, x1_tokens, x1_gpu, x1_is_gpu,
                     sampled=_use_rej, sparse=_sparse,
+                    **({"confidence_out": confidence_out} if observer is not None else {}),
                 )
                 if _use_rej:
                     self._drafts_gpu, q_dists = proposed
@@ -2702,6 +2720,13 @@ class MtpMixin:
                 decode_seqs[i].ssm_num_accepted = 1
 
         restore()
+        if observer is not None:
+            # Eager acceptance is already synchronized. Keep scores separate
+            # from the integer completion; never move this read into overlap.
+            observer.complete(
+                confidence_rows, confidence_out.cpu().tolist(),
+                na_cpu, drafts_cpu, bonus_cpu2,
+            )
         return results + prefill_tokens
 
     def step_once_mtp_async(self) -> MtpAsyncCompletion:

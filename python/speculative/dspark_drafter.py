@@ -49,15 +49,35 @@ class DSparkDrafter:
             self.kv_views,
         )
 
-    def propose(self, anchors, context_lens, block_table) -> torch.Tensor:
-        return self.draft.propose(anchors, context_lens, block_table, self.kv_views)
+    def propose(
+        self, anchors, context_lens, block_table, *,
+        confidence_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if confidence_out is None:
+            return self.draft.propose(anchors, context_lens, block_table, self.kv_views)
+        return self.draft.propose(
+            anchors, context_lens, block_table, self.kv_views,
+            confidence_out=confidence_out,
+        )
 
-    def propose_with(self, anchors, context_lens, block_table, pick) -> torch.Tensor:
+    def propose_with(
+        self, anchors, context_lens, block_table, pick, *,
+        confidence_out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Proposals drawn by ``pick`` (see ``Qwen38DSpark.chain_proposals``).
 
         Used for sampled requests: ``pick`` applies the request's sampling
         transform, records the proposal distribution ``q`` for rejection
-        sampling, and draws from it.
+        sampling, and draws from it. Optional raw confidence scores use the
+        tokens actually drawn; neither ``pick`` nor the LM head is rerun.
+        The output buffer belongs to the caller and must not alias inputs.
         """
+        if confidence_out is not None:
+            self.draft._validate_confidence_out(anchors, confidence_out)
         hidden = self.draft.noise_hidden(anchors, context_lens, block_table, self.kv_views)
-        return self.draft.chain_proposals(self.draft._lm_head[0](hidden), anchors, pick)
+        proposals = self.draft.chain_proposals(self.draft._lm_head[0](hidden), anchors, pick)
+        if confidence_out is not None:
+            confidence_out.copy_(
+                self.draft._confidence_from_proposals(hidden, anchors, proposals)
+            )
+        return proposals

@@ -354,6 +354,101 @@ def test_forward_head_conditions_on_sampled_token_instead_of_argmax():
     )
 
 
+@pytest.mark.parametrize("width", [1, 3, 7])
+def test_confidence_from_proposals_matches_hand_computed_previous_tokens(width):
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+
+    model = _head_stub(width)
+    with torch.no_grad():
+        model.markov_head.markov_w1.weight[:2, 0] = torch.tensor([-2., 3.])
+        model.markov_head.markov_w2.weight[:2, 0] = torch.tensor([1., -1.])
+        model.confidence_head.proj.weight[0] = torch.tensor([2., 0., 1.])
+        model.confidence_head.proj.bias.fill_(5)
+    rows = torch.arange(1, width + 1, dtype=torch.float32)
+    hidden = torch.stack((rows, rows * 10), dim=-1).unsqueeze(0)
+    anchors = torch.tensor([0])
+    ids, _, reference = Qwen38DSpark.forward_head(model, hidden, anchors)
+    proposals = ids[:, 1:]
+    before = [value.clone() for value in (hidden, anchors, proposals)]
+
+    scores = Qwen38DSpark._confidence_from_proposals(model, hidden, anchors, proposals)
+
+    expected = torch.tensor([[5., 12., 9., 16., 13., 20., 17.]])[:, :width]
+    torch.testing.assert_close(scores, expected, rtol=0, atol=0)
+    torch.testing.assert_close(scores, reference, rtol=0, atol=0)
+    for value, original in zip((hidden, anchors, proposals), before):
+        assert torch.equal(value, original)
+
+
+def test_confidence_from_proposals_uses_sampled_previous_token():
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+
+    model = _head_stub(5)
+    with torch.no_grad():
+        model.markov_head.markov_w1.weight[0, 0] = -2
+        model.markov_head.markov_w1.weight[2, 0] = 7
+        model.confidence_head.proj.weight[0, 2] = 1
+    hidden, anchors = torch.zeros(1, 5, 2), torch.tensor([0])
+    proposals = torch.full((1, 5), 2)
+    scores = Qwen38DSpark._confidence_from_proposals(model, hidden, anchors, proposals)
+    torch.testing.assert_close(
+        scores, torch.tensor([[-2., 7., 7., 7., 7.]]), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_propose_confidence_disabled_does_not_compute_scores(explicit_none):
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+    from gllm.speculative.dspark_drafter import DSparkDrafter
+
+    def forbidden(*args):
+        pytest.fail("disabled confidence must not be computed or validated")
+
+    model = _head_stub(3)
+    hidden, anchors = torch.zeros(1, 3, 2), torch.tensor([0])
+    proposals = torch.tensor([[1, 2, 3]])
+    model.noise_hidden = lambda *args: hidden
+    model.greedy_proposals = lambda *args: proposals
+    model._validate_confidence_out = forbidden
+    model._confidence_from_proposals = forbidden
+    model.propose = Qwen38DSpark.propose.__get__(model)
+    options = {"confidence_out": None} if explicit_none else {}
+    assert model.propose(anchors, None, None, None, **options) is proposals
+    drafter = DSparkDrafter(model, kv_base_layer=0, taps=None)
+    assert drafter.propose(anchors, None, None, **options) is proposals
+    model.chain_proposals = lambda *args: proposals
+    assert drafter.propose_with(anchors, None, None, forbidden, **options) is proposals
+
+
+@pytest.mark.parametrize("entry", ["model", "greedy_drafter", "sampled_drafter"])
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "device"])
+def test_propose_confidence_rejects_bad_output_before_sampling(entry, invalid):
+    from gllm.models.qwen38_dspark import Qwen38DSpark
+    from gllm.speculative.dspark_drafter import DSparkDrafter
+
+    def forbidden(*args):
+        pytest.fail("invalid output must fail before forward or sampling")
+
+    model = _head_stub(3)
+    model._validate_confidence_out = Qwen38DSpark._validate_confidence_out.__get__(model)
+    model.noise_hidden = forbidden
+    model.propose = Qwen38DSpark.propose.__get__(model)
+    out = {
+        "shape": lambda: torch.empty(1, 2),
+        "dtype": lambda: torch.empty(1, 3, dtype=torch.float64),
+        "device": lambda: torch.empty(1, 3, device="meta"),
+    }[invalid]()
+    anchors = torch.tensor([0])
+    drafter = DSparkDrafter(model, kv_base_layer=0, taps=None)
+    with pytest.raises(ValueError, match="confidence_out"):
+        if entry == "model":
+            model.propose(anchors, None, None, None, confidence_out=out)
+        elif entry == "greedy_drafter":
+            drafter.propose(anchors, None, None, confidence_out=out)
+        else:
+            drafter.propose_with(anchors, None, None, forbidden, confidence_out=out)
+
+
 # --- GPU forward path -------------------------------------------------------
 
 
