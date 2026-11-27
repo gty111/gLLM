@@ -25,6 +25,7 @@ from gllm.distributed.parallel_state import (
     is_first_pp_rank,
     is_last_pp_rank,
 )
+from gllm.layers.sampler import _joint_top_k_top_p_probs
 from gllm.runtime.forward_metadata import ForwardMetadataPlan
 from gllm.runtime.input_data import InputData
 from gllm.runtime.sequence import GenerationSequence
@@ -350,11 +351,9 @@ class MtpMixin:
             per_pos,
             rate,
         )
-        # Sparse top-k window overflow (see ``_mtp_sparse_probs``). Read at most
-        # once per log window so the hot path never syncs; a nonzero count means
-        # probability ties spilled past ``top_k + _SPARSE_TIE_MARGIN`` and a few
-        # tied tokens were dropped from p's support (tiny distribution skew, not a
-        # correctness break) -- raise the margin if it ever shows up.
+        # A proposal window-edge count is conservative: it can fire even
+        # when the whole vocabulary fits. q records the distribution actually
+        # sampled; target p is computed independently over the full vocabulary.
         if self._mtp_sampling_seen:
             n_of = int(self._mtp_tie_overflow)
             if n_of:
@@ -415,10 +414,9 @@ class MtpMixin:
 
     def _mtp_probs_from_logits(self, logits, seqs):
         """Apply the per-seq sampling transform (temp -> softmax -> top-k/top-p
-        renorm) to ``logits`` [n, vocab], returning a proper prob distribution
-        [n, vocab]. Mirrors ``Sampler.forward_gpu`` so the MTP draft dist ``q``
-        and target dist ``p`` live on the SAME transformed space, which is what
-        rejection sampling requires. ``seqs`` is aligned row-for-row with logits.
+        renorm) to ``logits`` [n, vocab], returning proposal probabilities q.
+        Target p follows the ordinary joint contract independently; q need only
+        describe the actual draft draws. ``seqs`` aligns row-for-row with logits.
         """
         from flashinfer.sampling import top_k_renorm_prob, top_p_renorm_prob
 
@@ -547,7 +545,7 @@ class MtpMixin:
             # Draft: the logits it samples from (DSpark's block forward yields
             # all k positions at once) and one position's transform into q.
             width = k if getattr(self, "dspark_enabled", False) else 1
-            q = torch.empty((nd, k, vocab), dtype=torch.float32, device=dev)
+            q = torch.full((nd, k, vocab), 1.0 / vocab, dtype=torch.float32, device=dev)
             logits = torch.zeros((nd, width, vocab), dtype=dtype, device=dev)
             q[:, 0].copy_(self._mtp_probs_static(logits[:, 0], *params(nd)))
             del logits
@@ -557,17 +555,28 @@ class MtpMixin:
             # Verify accept, then the residual against q.
             drafts = torch.zeros((nd, k), dtype=torch.int64, device=dev)
             u = torch.zeros((nd, k), device=dev)
-            na, p_row = self._mtp_dense_accept(v_logits, *params(rows), drafts, u + 1, u)
-            ar = torch.arange(nd, device=dev)
-            resid = (p_row - q[ar, na.clamp(max=k - 1)]).clamp_min(0)
-            del na, p_row, resid
+            q_drawn = q.gather(2, drafts.unsqueeze(-1)).squeeze(-1)
+            na, p_row = self._mtp_dense_accept(
+                v_logits, *params(rows), drafts, q_drawn, u
+            )
+            q_dist = MtpQDist(dense=q)
+            q_row = self._mtp_q_row(q_dist, na.clamp(max=k - 1), vocab)
+            resid = torch.where(
+                (na < k).unsqueeze(1), (p_row - q_row).clamp_min(0), p_row
+            )
+            resid = torch.where(
+                resid.sum(dim=1, keepdim=True) > 1e-12, resid, p_row
+            )
+            del na, p_row, q_row, resid, q_dist, q_drawn
         torch.cuda.synchronize()
         del q, v_logits
 
-    # Largest dense fp32 ``p`` block the verify accept materializes at once.
-    # The transform holds about three copies, so at 4096 verify rows over a
-    # 248k vocab the unchunked form needs ~12 GB on top of the logits.
+    # Planning allowance for the full-sort target transform, including float
+    # buffers and int64 indices. This is not a measured CUDA allocator bound:
+    # arena profiling must exercise the same transform and residual lifetimes.
+    # One complete request is the minimum block even if it exceeds this budget.
     _DENSE_P_CHUNK_BYTES = 512 << 20
+    _TARGET_P_WORK_BYTES_PER_ELEMENT = 128
 
     @staticmethod
     def _mtp_accepted_prefix(p_d, q_d, u):
@@ -585,7 +594,58 @@ class MtpMixin:
         # Leading all-accept prefix length (same cumprod trick as greedy).
         return torch.cumprod(accept.to(torch.int32), dim=1).sum(dim=1)
 
-    def _mtp_dense_accept(self, logits, temps, top_ks, top_ps, drafts, q_d, u):
+
+    @staticmethod
+    def _mtp_q_drawn(q_dist, drafts):
+        """Return actual proposal probabilities in candidate order [R, K]."""
+        if q_dist.dense is not None:
+            return q_dist.dense.gather(2, drafts.unsqueeze(-1)).squeeze(-1)
+        return q_dist.drawn
+
+    @staticmethod
+    def _mtp_q_row(q_dist, positions, vocab):
+        """Materialize only the selected q row [R, V] for a dense residual.
+
+        Sparse columns contain vocabulary IDs, not dense row offsets.
+        Entries outside that recorded support are exactly zero. The caller
+        selects a draft position only when K > 0; an all-accepted row uses
+        target p as its bonus distribution instead of a residual.
+        """
+        rows = torch.arange(positions.shape[0], device=positions.device)
+        if q_dist.dense is not None:
+            return q_dist.dense[rows, positions]
+        vals = q_dist.vals[rows, positions]
+        indices = q_dist.idx[rows, positions]
+        result = vals.new_zeros((positions.shape[0], vocab))
+        return result.scatter_(1, indices, vals)
+
+
+    @staticmethod
+    def _mtp_target_probs_static(
+        logits, temps, top_ks, top_ps, *, need_temperature=True,
+    ):
+        """Target p uses the ordinary joint contract, including greedy rows.
+
+        Inputs are post-penalty/mask logits and normalized positive temperatures.
+        The shared helper retains full probability groups. q remains the
+        independently recorded proposal distribution. need_temperature is
+        determined once for the logical verify batch, before probability
+        chunking; each chunk must retain that same ordinary-sampler gate.
+        """
+        # Match ordinary sampling's in-place temperature rounding and softmax
+        # dtype without modifying verify logits shared by later consumers.
+        scaled = logits.clone()
+        if need_temperature:
+            scaled.div_(temps)
+        probs = torch.softmax(scaled, dim=-1).float()
+        result = _joint_top_k_top_p_probs(probs, top_ks, top_ps)
+        greedy = torch.zeros_like(probs).scatter_(1, logits.argmax(dim=1, keepdim=True), 1.)
+        return torch.where((top_ks == 1).unsqueeze(1), greedy, result)
+
+    def _mtp_dense_accept(
+        self, logits, temps, top_ks, top_ps, drafts, q_d, u, *,
+        need_temperature=True,
+    ):
         """Rejection accept against a dense target distribution ``p``.
 
         ``logits`` holds ``1 + kk`` verify rows per sequence and ``drafts`` is
@@ -596,14 +656,15 @@ class MtpMixin:
         """
         nd, kk = drafts.shape
         qlen, vocab = kk + 1, logits.shape[-1]
-        per = max(self._DENSE_P_CHUNK_BYTES // (4 * vocab * qlen), 1)
+        per = max(self._DENSE_P_CHUNK_BYTES // (self._TARGET_P_WORK_BYTES_PER_ELEMENT * vocab * qlen), 1)
         na = torch.empty(nd, dtype=torch.int64, device=logits.device)
         p_row = torch.empty((nd, vocab), dtype=torch.float32, device=logits.device)
         for a in range(0, nd, per):
             b = min(a + per, nd)
             rows = slice(a * qlen, b * qlen)
-            p = self._mtp_probs_static(
-                logits[rows], temps[rows], top_ks[rows], top_ps[rows]
+            p = self._mtp_target_probs_static(
+                logits[rows], temps[rows], top_ks[rows], top_ps[rows],
+                need_temperature=need_temperature,
             ).view(b - a, qlen, vocab)
             p_d = p[:, :kk].gather(2, drafts[a:b].unsqueeze(-1)).squeeze(-1)
             na[a:b] = self._mtp_accepted_prefix(p_d, q_d[a:b], u[a:b])
@@ -1635,9 +1696,8 @@ class MtpMixin:
     ):
         """DSpark drafts ``[nd, k]`` on the device for this verify step.
 
-        Sampled batches draw each proposal from the request's transformed
-        distribution (the same transform as the target's ``p``) and also
-        return that distribution ``q`` for lossless rejection sampling.
+        Sampled batches return the actual proposal distribution q alongside
+        the draws. Target p follows ordinary sampling independently of q.
         """
         nd = len(decode_seqs)
         dev = x1_gpu.device
@@ -2251,9 +2311,8 @@ class MtpMixin:
         # sampling draft chain, which keeps the per-step draft dist ``q``.
         _use_rej = _rej_active
         q_dists = None
-        # Sparse (top-k) rejection path: decided ONCE per step so the draft's ``q``
-        # and the verify's ``p`` are always built by the same code (they must live
-        # on the same transformed space for the accept test to be exact).
+        # Choose the proposal q representation once. Target p is always full
+        # vocabulary and is independent of this sparse/dense draft choice.
         _sparse = _rej_active and self._mtp_sparse_eligible(decode_seqs)
         # One TP-synced generator per MTP step, used by BOTH the eager sampled
         # draft chain (if taken) AND the accept-step residual/bonus draws below.
@@ -2376,35 +2435,24 @@ class MtpMixin:
                     [row[1:] for row in rows], positions=[row[0] for row in rows],
                 )
 
-        # Target verification returns post-final-norm hidden states, matching
-        # vLLM and sglang's MTP conditioning contract.
-        # Rejection mode: the target dist ``p`` at each of the 1+kk verify
-        # positions, in the SAME transformed space as the draft dist ``q``
-        # (temperature + top-k/top-p renorm) -- that equality is what makes the
-        # accept test distribution-lossless. Rows are laid out
-        # [seq0: x1,d1..dk | seq1: ...]; the per-seq sampling params are expanded
-        # on-device with ``repeat_interleave`` instead of building a 256-entry
-        # python seq list per step.
-        p_dense = None  # (logits, temps, top_ks, top_ps) per verify row
-        p_sparse = None  # (vals, idx) [nd, 1+kk, k_pad] (top_k-restricted)
+        # Target p follows ordinary sampling; proposal q records the actual
+        # draft distribution and may have a smaller or different support.
+        # Build p in bounded blocks during acceptance, never in a sparse window.
+        p_dense = None
         if _use_rej:
             num_v = nd * (1 + kk)
+            # Match Sampler._get_sampling_flags for this logical verify batch.
+            # Resolve on host once: chunking must not change a row's transform.
+            target_need_temperature = any(
+                s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5
+                for s in decode_seqs
+            )
             temps, top_ks, top_ps = self._mtp_sample_params(decode_seqs, dev)
             rep = 1 + kk
-            t_r = temps.repeat_interleave(rep, dim=0)
-            k_r = top_ks.repeat_interleave(rep)
-            p_r = top_ps.repeat_interleave(rep)
-            if _sparse:
-                # Only the top-k support can carry probability, so keep p in the
-                # sparse form: one ``topk`` instead of a full-vocab softmax + two
-                # renorm passes over ``[nd*(1+k), vocab]`` (3.1 ms -> 0.6 ms at
-                # nd=64, and 254 MB of dense probs never materialized).
-                k_pad = self._mtp_kpad(decode_seqs)
-                pv, pi = self._mtp_sparse_probs(v_logits[:num_v], t_r, k_r, p_r, k_pad)
-                p_sparse = (pv.view(nd, rep, -1), pi.view(nd, rep, -1))
-            else:
-                # Transformed in the accept: see ``_mtp_dense_accept``.
-                p_dense = (v_logits[:num_v], t_r, k_r, p_r)
+            p_dense = (
+                v_logits[:num_v], temps.repeat_interleave(rep, dim=0),
+                top_ks.repeat_interleave(rep), top_ps.repeat_interleave(rep),
+            )
 
         # --- 3. Greedy accept per seq. ---
         # Verify inputs per seq are [x1, d1..dk] at positions start..start+k.
@@ -2445,64 +2493,32 @@ class MtpMixin:
             # the outcome through ONE packed D2H at the end.
             qlen = 1 + kk
             seq_ar = self._mtp_staging.row_idx[:nd]
-            sparse = p_sparse is not None
-            if sparse:
-                p3_vals, p3_idx = p_sparse  # [nd, qlen, k_pad] each
             if kk > 0:
                 dg = getattr(self, "_drafts_gpu", None)
                 if dg is not None and tuple(dg.shape) == (nd, kk):
                     d_gpu = dg.to(torch.int64)
                 else:
                     d_gpu = torch.tensor(drafts, device=dev, dtype=torch.int64)
-                idx = d_gpu.unsqueeze(-1)
-                if sparse:
-                    # p(d_p): the drafted token either sits in p's kept support
-                    # (pick its value) or outside it, where p is exactly 0 -- the
-                    # same value the dense gather would return.
-                    hit = (p3_idx[:, :kk] == idx).to(p3_vals.dtype)
-                    p_d = (p3_vals[:, :kk] * hit).sum(dim=-1)  # [nd,kk] p(d_p)
-                    # q(d_p) was recorded by the draft step that drew it.
-                    q_d = q_dists.drawn
-                    u = torch.rand((nd, kk), generator=gen, device=dev)
-                    na_gpu = self._mtp_accepted_prefix(p_d, q_d, u)
-                else:
-                    q_d = q_dists.dense.gather(2, idx).squeeze(-1)  # [nd,kk] q(d_p)
-                    # Building p draws no random numbers, so drawing u first
-                    # keeps the generator sequence unchanged.
-                    u = torch.rand((nd, kk), generator=gen, device=dev)
-                    na_gpu, p_row = self._mtp_dense_accept(*p_dense, d_gpu, q_d, u)
+                q_d = self._mtp_q_drawn(q_dists, d_gpu)
+                # Constructing p consumes no RNG; preserve acceptance draw order.
+                u = torch.rand((nd, kk), generator=gen, device=dev)
+                na_gpu, p_row = self._mtp_dense_accept(
+                    *p_dense, d_gpu, q_d, u,
+                    need_temperature=target_need_temperature,
+                )
             else:
                 d_gpu = None
-                na_gpu = torch.zeros(nd, dtype=torch.int64, device=dev)
-                if not sparse:
-                    empty = torch.empty((nd, 0), device=dev)
-                    _, p_row = self._mtp_dense_accept(
-                        *p_dense, empty.long(), empty, empty
-                    )
+                empty = torch.empty((nd, 0), device=dev)
+                na_gpu, p_row = self._mtp_dense_accept(
+                    *p_dense, empty.long(), empty, empty,
+                    need_temperature=target_need_temperature,
+                )
             na_l = na_gpu.to(torch.long)
-            # Bonus draw. Rejected at position ``na`` (``na < kk``): draw from the
-            # residual ``(p-q)+`` there. All accepted (``na == kk``): draw from p
-            # at the tail position. Both are row ``na``, so one gather serves both
-            # cases and a single batched multinomial does the draw.
-            if sparse:
-                # ``(p-q)+`` is supported inside p's kept set (outside it p == 0,
-                # so the clamp is 0 there), which is why the residual only needs
-                # p's ``k_pad`` columns plus q's values at those same token ids.
-                p_row = p3_vals[seq_ar, na_l]  # [nd, k_pad]
-                p_row_idx = p3_idx[seq_ar, na_l]  # [nd, k_pad]
-            # Dense: ``_mtp_dense_accept`` already took p's row ``na``.
+            # At the first rejection, expand only that actual q row. The
+            # full target residual may assign mass outside the draft window.
             if kk > 0:
                 sel = na_l.clamp(max=kk - 1)
-                if sparse:
-                    # q's values at p's kept token ids. Everything outside q's own
-                    # support is q == 0, so matching the two id lists (k_pad x
-                    # k_pad per row, ~16k comparisons) is all that's needed.
-                    q_row_v = q_dists.vals[seq_ar, sel]  # [nd, k_pad]
-                    q_row_i = q_dists.idx[seq_ar, sel]  # [nd, k_pad]
-                    match = q_row_i.unsqueeze(1) == p_row_idx.unsqueeze(2)
-                    q_at_p = (match.to(q_row_v.dtype) * q_row_v.unsqueeze(1)).sum(-1)
-                else:
-                    q_at_p = q_dists.dense[seq_ar, sel]  # [nd, V]
+                q_at_p = self._mtp_q_row(q_dists, sel, p_row.shape[-1])
                 resid = torch.where(
                     (na_gpu < kk).unsqueeze(1),
                     (p_row - q_at_p).clamp_min(0),
@@ -2516,9 +2532,6 @@ class MtpMixin:
             else:
                 resid = p_row
             bonus_gpu = torch.multinomial(resid, 1, generator=gen).squeeze(1)
-            if sparse:
-                # Map the drawn column back to a token id.
-                bonus_gpu = p_row_idx.gather(1, bonus_gpu.unsqueeze(1)).squeeze(1)
             # Rank zero's acceptance must win BEFORE gathering hidden state,
             # committing penalties or publishing the next GPU relay. Use the
             # model TP communicator so collectives retain forward-stream order.
