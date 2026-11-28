@@ -23,7 +23,7 @@ def _runner(monkeypatch, *, asynchronous, sparse, tp_override=False):
     runner.input_data = SimpleNamespace(num_decodes=n, seqs=seqs)
     runner.model = SimpleNamespace(mtp=object())
     runner.memory_manager = SimpleNamespace(
-        vocab_size=vocab, ssm_segment=object(),
+        vocab_size=vocab, dtype=torch.float32, ssm_segment=object(),
         pre_allocate_page_for_lengths=lambda *args: None,
     )
     host = torch.empty(n, dtype=torch.int64, pin_memory=True)
@@ -68,7 +68,7 @@ def _runner(monkeypatch, *, asynchronous, sparse, tp_override=False):
 
     runner._draft_chain_graph = draft
     runner._mtp_verify_target = lambda **kwargs: MtpVerifyResult(logits.clone(), vhidden, None, [])
-    runner._mtp_sample_params = lambda *args: (
+    runner._mtp_sample_params = lambda *args, **kwargs: (
         torch.ones(n, 1, device="cuda"), torch.full((n,), 2, device="cuda"),
         torch.ones(n, device="cuda"),
     )
@@ -379,3 +379,91 @@ def test_decode_passes_batch_temperature_gate_to_all_target_chunks(monkeypatch, 
     monkeypatch.setattr(runner, "_mtp_target_probs_static", observe)
     runner._mtp_decode(torch.zeros(3, 2, device="cuda"), [5, 5, 5])
     assert seen == [expected] * 3
+
+
+@cuda
+@pytest.mark.parametrize("sparse_q", [False, True])
+@pytest.mark.parametrize("boundary", ["top_p", "mixed_greedy", "temperature_zero"])
+def test_target_decode_matches_real_parameter_uploads(monkeypatch, sparse_q, boundary):
+    from gllm.layers import sampler as sampler_module
+    from gllm.runtime.input_data import InputData
+
+    runner, seqs, hidden = _runner(monkeypatch, asynchronous=False, sparse=sparse_q)
+    runner.memory_manager.dtype = torch.bfloat16
+    runner.memory_manager.build_repetition_penalty_mask = lambda seqs: None
+    for i, seq in enumerate(seqs):
+        seq.temperature = .6 if boundary != "top_p" else 1.
+        seq.top_k = 1 if boundary == "mixed_greedy" and i == 0 else 2
+        if boundary == "temperature_zero" and i == 0:
+            seq.temperature, seq.top_k = 0., 20
+        seq.top_p = .9
+        seq.repetition_penalty = 1.
+    # Use the real ordinary uploader and real speculative pinned-buffer uploader.
+    data = InputData.__new__(InputData)
+    data.seqs, data.memory_manager = seqs, runner.memory_manager
+    data.prepare_sample()
+    runner._sp_host_f = runner._sp_host_k = None
+    runner._sp_dev_f = runner._sp_dev_k = None
+    runner._mtp_sample_params = MtpMixin._mtp_sample_params.__get__(runner)
+    values = [0., -2.1875] if boundary == "top_p" else [1.21875, 1.2265625]
+    base = torch.full((3, 8), -float("inf"), dtype=torch.bfloat16, device="cuda")
+    base[:, :2] = torch.tensor(values, dtype=torch.bfloat16, device="cuda")
+    ordinary_probs = []
+    def ordinary_sample(probs, ks, ps):
+        filtered = sampler_module._joint_top_k_top_p_probs(probs, ks, ps)
+        ordinary_probs.append(filtered.clone())
+        return filtered.argmax(-1)
+    monkeypatch.setattr(sampler_module, "_fused_top_k_top_p_sample", ordinary_sample)
+    ordinary = sampler_module.Sampler()
+    tokens = ordinary.forward_gpu(base.clone(), data)
+    expected = ordinary_probs[0]
+    greedy = data.top_k == 1
+    expected[greedy] = 0.
+    expected[greedy, tokens[greedy]] = 1.
+    if boundary == "top_p":
+        assert expected[:, 1].eq(0).all()
+    else:
+        assert tokens[0].item() == (1 if boundary == "temperature_zero" else 0)
+    # Verify uses identical fixed logits in every candidate position. Force
+    # request-aligned chunks so the upload/cast is checked for every chunk.
+    runner._mtp_verify_target = lambda **kwargs: MtpVerifyResult(
+        base.repeat_interleave(4, dim=0), hidden, None, [])
+    runner._DENSE_P_CHUNK_BYTES = runner._TARGET_P_WORK_BYTES_PER_ELEMENT * 8 * 4
+    transform, seen = runner._mtp_target_probs_static, []
+    def inspect(logits, temps, ks, ps, **kwargs):
+        assert temps.dtype == ps.dtype == data.temperature.dtype == torch.bfloat16
+        result = transform(logits, temps, ks, ps, **kwargs)
+        seen.append((temps.clone(), ks.clone(), ps.clone(), result.clone()))
+        return result
+    runner._mtp_target_probs_static = inspect
+    draft_original = runner._draft_chain_graph
+    proposals = []
+    def draft(*args, **kwargs):
+        result = draft_original(*args, **kwargs)
+        q = result[1]
+        saved = {name: getattr(q, name).clone() for name in ("dense", "vals", "idx", "drawn")
+                 if getattr(q, name) is not None}
+        proposals.append((q, saved))
+        return result
+    runner._draft_chain_graph = draft
+    runner._mtp_decode(torch.zeros(3, 2, device="cuda"), [5, 5, 5])
+    assert len(seen) == 3
+    torch.testing.assert_close(torch.cat([x[0] for x in seen]), data.temperature[:, None].repeat_interleave(4, 0),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(torch.cat([x[1] for x in seen]), data.top_k.repeat_interleave(4),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(torch.cat([x[2] for x in seen]), data.top_p.repeat_interleave(4),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(torch.cat([x[3] for x in seen]), expected.repeat_interleave(4, 0),
+                               atol=0, rtol=0)
+    assert proposals
+    for q, saved in proposals:
+        for name, value in saved.items():
+            assert torch.equal(getattr(q, name), value)
+    # Target casts must not rewrite the shared FP32 staging used by Draft.
+    assert runner._sp_dev_f.dtype == torch.float32
+    torch.testing.assert_close(runner._sp_dev_f[0, :3],
+                               torch.tensor([s.temperature if s.temperature > 1e-5 else 1.
+                                             for s in seqs], device="cuda"))
+    torch.testing.assert_close(runner._sp_dev_f[1, :3],
+                               torch.tensor([s.top_p for s in seqs], device="cuda"))

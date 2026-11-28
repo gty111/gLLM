@@ -443,7 +443,7 @@ class MtpMixin:
             probs = top_p_renorm_prob(probs, top_ps)
         return probs
 
-    def _mtp_sample_params(self, seqs, dev):
+    def _mtp_sample_params(self, seqs, dev, *, target=False):
         """Per-seq ``(temps[n,1], top_ks[n], top_ps[n])`` on the device.
 
         Staged through **persistent pinned** buffers with ``non_blocking`` copies.
@@ -475,14 +475,24 @@ class MtpMixin:
         hf, hk = host_f.numpy(), host_k.numpy()
         hf[0, :n] = [s.temperature if s.temperature > 1e-5 else 1.0 for s in seqs]
         hf[1, :n] = [s.top_p for s in seqs]
-        hk[:n] = [s.top_k if s.top_k != -1 else V for s in seqs]
+        # Ordinary decoding normalizes temperature=0 to greedy top-k=1.
+        # Draft retains its original proposal parameters and recorded q.
+        hk[:n] = [
+            1 if target and s.temperature == 0 else (s.top_k if s.top_k != -1 else V)
+            for s in seqs
+        ]
         self._sp_dev_f[:, :n].copy_(host_f[:, :n], non_blocking=True)
         self._sp_dev_k[:n].copy_(host_k[:n], non_blocking=True)
-        return (
+        temps, top_ks, top_ps = (
             self._sp_dev_f[0, :n].unsqueeze(1),
             self._sp_dev_k[:n],
             self._sp_dev_f[1, :n],
         )
+        if target:
+            # Match InputData.prepare_sample without changing Draft's FP32 q.
+            return (temps.to(dtype=self.memory_manager.dtype), top_ks,
+                    top_ps.to(dtype=self.memory_manager.dtype))
+        return temps, top_ks, top_ps
 
     def _mtp_probs_static(self, logits, temps, top_ks, top_ps):
         """Graph-safe variant of ``_mtp_probs_from_logits``: all inputs are
@@ -532,12 +542,12 @@ class MtpMixin:
         dtype = self.model_loader.dtype
         rows = nd * (1 + k)
 
-        def params(n):
+        def params(n, *, param_dtype=torch.float32):
             # Unrestricted top-k with a top-p cut: the dense path, both renorms.
             return (
-                torch.ones((n, 1), dtype=torch.float32, device=dev),
+                torch.ones((n, 1), dtype=param_dtype, device=dev),
                 torch.full((n,), vocab, dtype=torch.int32, device=dev),
-                torch.full((n,), 0.95, dtype=torch.float32, device=dev),
+                torch.full((n,), 0.95, dtype=param_dtype, device=dev),
             )
 
         q = None
@@ -557,7 +567,8 @@ class MtpMixin:
             u = torch.zeros((nd, k), device=dev)
             q_drawn = q.gather(2, drafts.unsqueeze(-1)).squeeze(-1)
             na, p_row = self._mtp_dense_accept(
-                v_logits, *params(rows), drafts, q_drawn, u
+                v_logits, *params(rows, param_dtype=self.memory_manager.dtype),
+                drafts, q_drawn, u
             )
             q_dist = MtpQDist(dense=q)
             q_row = self._mtp_q_row(q_dist, na.clamp(max=k - 1), vocab)
@@ -639,7 +650,9 @@ class MtpMixin:
             scaled.div_(temps)
         probs = torch.softmax(scaled, dim=-1).float()
         result = _joint_top_k_top_p_probs(probs, top_ks, top_ps)
-        greedy = torch.zeros_like(probs).scatter_(1, logits.argmax(dim=1, keepdim=True), 1.)
+        # Ordinary mixed batches take argmax after in-place temperature
+        # rounding. A BF16 scaling tie can change the lowest winning token ID.
+        greedy = torch.zeros_like(probs).scatter_(1, scaled.argmax(dim=1, keepdim=True), 1.)
         return torch.where((top_ks == 1).unsqueeze(1), greedy, result)
 
     def _mtp_dense_accept(
@@ -2447,7 +2460,7 @@ class MtpMixin:
                 s.temperature > 1e-5 and abs(s.temperature - 1.0) > 1e-5
                 for s in decode_seqs
             )
-            temps, top_ks, top_ps = self._mtp_sample_params(decode_seqs, dev)
+            temps, top_ks, top_ps = self._mtp_sample_params(decode_seqs, dev, target=True)
             rep = 1 + kk
             p_dense = (
                 v_logits[:num_v], temps.repeat_interleave(rep, dim=0),

@@ -240,3 +240,29 @@ def test_target_chunking_preserves_batch_temperature_gate(chunk_requests, width)
     )
     torch.testing.assert_close(row, expected, atol=0, rtol=0)
     assert torch.equal(accepted, torch.zeros(3, dtype=torch.int64))
+
+
+@pytest.mark.parametrize("sampled_peer", [False, True])
+def test_target_bf16_mixed_greedy_scaling_tie_matches_ordinary(monkeypatch, sampled_peer):
+    from types import SimpleNamespace
+    from gllm.speculative.mtp import MtpMixin
+
+    seqs = [SimpleNamespace(temperature=.6, top_k=1),
+            SimpleNamespace(temperature=1., top_k=2 if sampled_peer else 1)]
+    logits = torch.tensor([[1.21875, 1.2265625], [0., -1.]], dtype=torch.bfloat16)
+    data = SimpleNamespace(seqs=seqs, needs_repetition_penalty=False,
+                           temperature=torch.tensor([.6, 1.], dtype=torch.bfloat16),
+                           top_k=torch.tensor([s.top_k for s in seqs]),
+                           top_p=torch.ones(2, dtype=torch.bfloat16))
+    monkeypatch.setattr(sampler, "top_k_top_p_sampling_from_probs", None)
+    ordinary = sampler.Sampler()
+    tokens = ordinary.forward_gpu(logits.clone(), data)
+    flags = ordinary._get_sampling_flags(data)
+    # Entirely greedy batches bypass temperature scaling in both paths.
+    actual = MtpMixin._mtp_target_probs_static(
+        logits, data.temperature[:, None], data.top_k, data.top_p,
+        need_temperature=flags["need_temperature"] and not flags["is_all_greedy"])
+    assert tokens[0].item() == (0 if sampled_peer else 1)
+    assert actual[0].tolist() == ([1., 0.] if sampled_peer else [0., 1.])
+    if not sampled_peer:
+        assert torch.equal(actual.argmax(-1), tokens)
