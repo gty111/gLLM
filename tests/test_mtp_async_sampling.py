@@ -23,7 +23,7 @@ def _runner(monkeypatch, *, asynchronous, sparse, tp_override=False):
     runner.input_data = SimpleNamespace(num_decodes=n, seqs=seqs)
     runner.model = SimpleNamespace(mtp=object())
     runner.memory_manager = SimpleNamespace(
-        vocab_size=vocab, ssm_segment=object(),
+        vocab_size=vocab, dtype=torch.float32, ssm_segment=object(),
         pre_allocate_page_for_lengths=lambda *args: None,
     )
     host = torch.empty(n, dtype=torch.int64, pin_memory=True)
@@ -68,12 +68,10 @@ def _runner(monkeypatch, *, asynchronous, sparse, tp_override=False):
 
     runner._draft_chain_graph = draft
     runner._mtp_verify_target = lambda **kwargs: MtpVerifyResult(logits.clone(), vhidden, None, [])
-    runner._mtp_sample_params = lambda *args: (
+    runner._mtp_sample_params = lambda *args, **kwargs: (
         torch.ones(n, 1, device="cuda"), torch.full((n,), 2, device="cuda"),
         torch.ones(n, device="cuda"),
     )
-    runner._mtp_probs_static = lambda logits, *args: logits.softmax(-1)
-    runner._mtp_sparse_probs = lambda logits, *args: logits.softmax(-1).topk(2, dim=-1)
     runner.penalty_commits = []
     penalty = SimpleNamespace(
         verify=lambda *args: None,
@@ -138,9 +136,9 @@ def test_dense_acceptance_is_unchanged_when_p_is_chunked(monkeypatch, chunk_seqs
     whole, _, _ = _runner(monkeypatch, asynchronous=False, sparse=False)
     expected = whole._mtp_decode(hidden, x1)
     runner, _, _ = _runner(monkeypatch, asynchronous=False, sparse=False)
-    runner._DENSE_P_CHUNK_BYTES = 4 * 8 * 4 * chunk_seqs  # fp32, vocab 8, 1 + k rows
-    transform, rows = runner._mtp_probs_static, []
-    runner._mtp_probs_static = lambda logits, *args: rows.append(len(logits)) or transform(logits, *args)
+    runner._DENSE_P_CHUNK_BYTES = runner._TARGET_P_WORK_BYTES_PER_ELEMENT * 8 * 4 * chunk_seqs
+    transform, rows = runner._mtp_target_probs_static, []
+    runner._mtp_target_probs_static = lambda logits, *args, **kwargs: rows.append(len(logits)) or transform(logits, *args, **kwargs)
     assert runner._mtp_decode(hidden, x1) == expected
     # All 12 verify rows are transformed once, a whole sequence at a time.
     assert sum(rows) == 12 and max(rows) <= 4 * chunk_seqs and all(n % 4 == 0 for n in rows)
@@ -212,3 +210,260 @@ def test_parameter_uploads_do_not_overwrite_the_inflight_predecessor():
     assert second[0].item() == pytest.approx(1.2)
     assert second[1].item() == 40
     assert second[2].item() == pytest.approx(0.7)
+
+
+@cuda
+@pytest.mark.parametrize("sparse_q", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_target_acceptance_helpers_replay_changed_inputs(sparse_q, dtype):
+    """Synthetic acceptance/probability graph; no target backbone or weights."""
+    runner = MtpMixin()
+    n, k, vocab = 4, 2, 129
+    runner._DENSE_P_CHUNK_BYTES = runner._TARGET_P_WORK_BYTES_PER_ELEMENT * vocab * (k + 1) * 2
+    probabilities = torch.zeros(n, k + 1, vocab, device="cuda")
+    probabilities[..., 0] = .2
+    probabilities[..., 1] = .3
+    probabilities[..., -1] = .5
+    logits = probabilities.log().to(dtype).reshape(-1, vocab)
+    temps = torch.ones(n * (k + 1), 1, device="cuda")
+    ks = torch.full((n * (k + 1),), vocab, device="cuda")
+    ps = torch.ones(n * (k + 1), device="cuda")
+    drafts = torch.zeros(n, k, dtype=torch.int64, device="cuda")
+    u = torch.tensor([[.9, .1], [.1, .9], [.1, .1], [.1, .9]], device="cuda")
+    dense = torch.zeros(n, k, vocab, device="cuda")
+    dense[..., 0], dense[..., 1] = .8, .2
+    vals = torch.tensor([.8, .2], device="cuda").expand(n, k, 2).clone()
+    idx = torch.tensor([0, 1], device="cuda").expand(n, k, 2).clone()
+    drawn = torch.full((n, k), .8, device="cuda")
+    q = MtpQDist(vals=vals, idx=idx, drawn=drawn) if sparse_q else MtpQDist(dense=dense)
+
+    def run():
+        q_d = runner._mtp_q_drawn(q, drafts)
+        na, p_row = runner._mtp_dense_accept(logits, temps, ks, ps, drafts, q_d, u)
+        q_row = runner._mtp_q_row(q, na.long().clamp(max=k - 1), vocab)
+        residual = torch.where((na < k).unsqueeze(1),
+                               (p_row - q_row).clamp_min(0), p_row)
+        return na, p_row, residual
+
+    for _ in range(2):
+        run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    first = None
+    last = None
+    for stage in range(3):
+        if stage == 1:
+            probabilities[..., 0], probabilities[..., 1], probabilities[..., -1] = .6, .1, .3
+            logits.copy_(probabilities.log().to(dtype).reshape(-1, vocab))
+        if stage == 2:
+            dense[..., 0], dense[..., 1] = .5, .5
+            vals.fill_(.5)
+            drawn.fill_(.5)
+        expected = run()
+        graph.replay()
+        torch.cuda.synchronize()
+        for observed, reference in zip(actual, expected):
+            torch.testing.assert_close(observed, reference, atol=0., rtol=0.)
+        assert actual[2][:, -1].gt(0).all()  # Target mass outside q survives.
+        if first is None:
+            first = tuple(x.clone() for x in actual)
+        if stage == 1:
+            assert not torch.equal(actual[1], first[1])
+            last = actual[0].clone()
+        if stage == 2:
+            assert not torch.equal(actual[0], last)
+
+
+@cuda
+@pytest.mark.parametrize("sparse_q", [False, True])
+def test_one_proposal_first_output_matches_full_target_distribution(sparse_q):
+    """Synthetic one-proposal output distribution through actual GPU helpers."""
+    import math
+
+    runner = MtpMixin()
+    n, vocab = 65536, 3
+    torch.manual_seed(20261126 + int(sparse_q))
+    p = torch.tensor([.2, .3, .5], device="cuda")
+    q_row = torch.tensor([.8, .2, 0.], device="cuda").expand(n, vocab).contiguous()
+    drafts = torch.multinomial(q_row, 1)
+    q_d = q_row.gather(1, drafts)
+    if sparse_q:
+        q = MtpQDist(
+            vals=q_row[:, :2].unsqueeze(1),
+            idx=torch.tensor([0, 1], device="cuda").expand(n, 1, 2),
+            drawn=q_d)
+    else:
+        q = MtpQDist(dense=q_row.unsqueeze(1))
+    logits = p.log().expand(n * 2, vocab).contiguous()
+    na, target = runner._mtp_dense_accept(
+        logits, torch.ones(n * 2, 1, device="cuda"),
+        torch.full((n * 2,), vocab, device="cuda"),
+        torch.ones(n * 2, device="cuda"), drafts,
+        runner._mtp_q_drawn(q, drafts), torch.rand(n, 1, device="cuda"))
+    selected_q = runner._mtp_q_row(q, torch.zeros(n, dtype=torch.long, device="cuda"), vocab)
+    residual = torch.where((na == 0).unsqueeze(1),
+                           (target - selected_q).clamp_min(0), target)
+    bonus = torch.multinomial(residual, 1).squeeze(1)
+    first = torch.where(na > 0, drafts[:, 0], bonus)
+    counts = torch.bincount(first, minlength=vocab).cpu()
+    expected = p.cpu().double()
+    error = (counts.double() / n - expected).abs()
+    # Register both q representations, all three bins: family alpha 0.001.
+    log_factor = math.log(2 * 6 / .001)
+    bound = (2 * expected * (1 - expected) * log_factor / n).sqrt() + 2 * log_factor / (3 * n)
+    assert bool((error <= bound).all()), (counts.tolist(), error.tolist(), bound.tolist())
+    assert counts[2] > 0  # This token cannot be proposed by q.
+
+
+@cuda
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("temperature", [1.-5e-6, 1.+5e-6])
+@pytest.mark.parametrize("context", ["solo", "sampled_peer", "greedy_peer"])
+def test_target_temperature_gate_matches_real_ordinary_entry(
+    monkeypatch, dtype, temperature, context,
+):
+    from gllm.layers import sampler as sampler_module
+
+    seqs = [SimpleNamespace(temperature=temperature, top_k=4)]
+    rows = [[0., -1., -2., -3.]]
+    if context != "solo":
+        seqs.append(SimpleNamespace(temperature=.6,
+                                   top_k=1 if context == "greedy_peer" else 4))
+        rows.append([-.5, .2, 1., -1.])
+    logits = torch.tensor(rows, dtype=dtype, device="cuda")
+    temps = torch.tensor([s.temperature for s in seqs], device="cuda")
+    ks = torch.tensor([s.top_k for s in seqs], dtype=torch.int32, device="cuda")
+    ps = torch.ones(len(seqs), device="cuda")
+    ps[0] = logits[0].softmax(-1)[0].float()
+    data = SimpleNamespace(seqs=seqs, temperature=temps, top_k=ks, top_p=ps,
+                           needs_repetition_penalty=False)
+    captured = []
+    def sample(weights, count):
+        assert count == 1
+        captured.append(weights.clone())
+        return weights.argmax(-1, keepdim=True)
+    monkeypatch.setattr(torch, "multinomial", sample)
+    monkeypatch.setattr(sampler_module, "top_k_top_p_sampling_from_probs", None)
+    ordinary = sampler_module.Sampler()
+    tokens = ordinary.forward_gpu(logits.clone(), data)
+    expected = captured[0].clone()
+    greedy = ks == 1
+    expected[greedy] = 0
+    expected[greedy, tokens[greedy]] = 1
+    need_temperature = ordinary._get_sampling_flags(data)["need_temperature"]
+    original = logits.clone()
+    actual = MtpMixin._mtp_target_probs_static(
+        logits, temps[:, None], ks, ps, need_temperature=need_temperature)
+    torch.testing.assert_close(actual, expected, atol=0., rtol=0.)
+    assert torch.equal(actual > 0, expected > 0)
+    torch.testing.assert_close(logits, original, atol=0., rtol=0.)
+
+
+@cuda
+@pytest.mark.parametrize("peer_temperature", [1., .6])
+def test_decode_passes_batch_temperature_gate_to_all_target_chunks(monkeypatch, peer_temperature):
+    from gllm.layers.sampler import Sampler
+
+    runner, seqs, _ = _runner(monkeypatch, asynchronous=False, sparse=True)
+    seqs[0].temperature = 1.+5e-6
+    seqs[1].temperature = peer_temperature
+    runner._DENSE_P_CHUNK_BYTES = runner._TARGET_P_WORK_BYTES_PER_ELEMENT * 8 * 4
+    expected = Sampler()._get_sampling_flags(SimpleNamespace(
+        seqs=seqs, needs_repetition_penalty=False))["need_temperature"]
+    transform, seen = runner._mtp_target_probs_static, []
+    def observe(logits, *args, **kwargs):
+        seen.append(kwargs["need_temperature"])
+        return transform(logits, *args, **kwargs)
+    monkeypatch.setattr(runner, "_mtp_target_probs_static", observe)
+    runner._mtp_decode(torch.zeros(3, 2, device="cuda"), [5, 5, 5])
+    assert seen == [expected] * 3
+
+
+@cuda
+@pytest.mark.parametrize("sparse_q", [False, True])
+@pytest.mark.parametrize("boundary", ["top_p", "mixed_greedy", "temperature_zero"])
+def test_target_decode_matches_real_parameter_uploads(monkeypatch, sparse_q, boundary):
+    from gllm.layers import sampler as sampler_module
+    from gllm.runtime.input_data import InputData
+
+    runner, seqs, hidden = _runner(monkeypatch, asynchronous=False, sparse=sparse_q)
+    runner.memory_manager.dtype = torch.bfloat16
+    runner.memory_manager.build_repetition_penalty_mask = lambda seqs: None
+    for i, seq in enumerate(seqs):
+        seq.temperature = .6 if boundary != "top_p" else 1.
+        seq.top_k = 1 if boundary == "mixed_greedy" and i == 0 else 2
+        if boundary == "temperature_zero" and i == 0:
+            seq.temperature, seq.top_k = 0., 20
+        seq.top_p = .9
+        seq.repetition_penalty = 1.
+    # Use the real ordinary uploader and real speculative pinned-buffer uploader.
+    data = InputData.__new__(InputData)
+    data.seqs, data.memory_manager = seqs, runner.memory_manager
+    data.prepare_sample()
+    runner._sp_host_f = runner._sp_host_k = None
+    runner._sp_dev_f = runner._sp_dev_k = None
+    runner._mtp_sample_params = MtpMixin._mtp_sample_params.__get__(runner)
+    values = [0., -2.1875] if boundary == "top_p" else [1.21875, 1.2265625]
+    base = torch.full((3, 8), -float("inf"), dtype=torch.bfloat16, device="cuda")
+    base[:, :2] = torch.tensor(values, dtype=torch.bfloat16, device="cuda")
+    ordinary_probs = []
+    def ordinary_sample(probs, ks, ps):
+        filtered = sampler_module._joint_top_k_top_p_probs(probs, ks, ps)
+        ordinary_probs.append(filtered.clone())
+        return filtered.argmax(-1)
+    monkeypatch.setattr(sampler_module, "_fused_top_k_top_p_sample", ordinary_sample)
+    ordinary = sampler_module.Sampler()
+    tokens = ordinary.forward_gpu(base.clone(), data)
+    expected = ordinary_probs[0]
+    greedy = data.top_k == 1
+    expected[greedy] = 0.
+    expected[greedy, tokens[greedy]] = 1.
+    if boundary == "top_p":
+        assert expected[:, 1].eq(0).all()
+    else:
+        assert tokens[0].item() == (1 if boundary == "temperature_zero" else 0)
+    # Verify uses identical fixed logits in every candidate position. Force
+    # request-aligned chunks so the upload/cast is checked for every chunk.
+    runner._mtp_verify_target = lambda **kwargs: MtpVerifyResult(
+        base.repeat_interleave(4, dim=0), hidden, None, [])
+    runner._DENSE_P_CHUNK_BYTES = runner._TARGET_P_WORK_BYTES_PER_ELEMENT * 8 * 4
+    transform, seen = runner._mtp_target_probs_static, []
+    def inspect(logits, temps, ks, ps, **kwargs):
+        assert temps.dtype == ps.dtype == data.temperature.dtype == torch.bfloat16
+        result = transform(logits, temps, ks, ps, **kwargs)
+        seen.append((temps.clone(), ks.clone(), ps.clone(), result.clone()))
+        return result
+    runner._mtp_target_probs_static = inspect
+    draft_original = runner._draft_chain_graph
+    proposals = []
+    def draft(*args, **kwargs):
+        result = draft_original(*args, **kwargs)
+        q = result[1]
+        saved = {name: getattr(q, name).clone() for name in ("dense", "vals", "idx", "drawn")
+                 if getattr(q, name) is not None}
+        proposals.append((q, saved))
+        return result
+    runner._draft_chain_graph = draft
+    runner._mtp_decode(torch.zeros(3, 2, device="cuda"), [5, 5, 5])
+    assert len(seen) == 3
+    torch.testing.assert_close(torch.cat([x[0] for x in seen]), data.temperature[:, None].repeat_interleave(4, 0),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(torch.cat([x[1] for x in seen]), data.top_k.repeat_interleave(4),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(torch.cat([x[2] for x in seen]), data.top_p.repeat_interleave(4),
+                               atol=0, rtol=0)
+    torch.testing.assert_close(torch.cat([x[3] for x in seen]), expected.repeat_interleave(4, 0),
+                               atol=0, rtol=0)
+    assert proposals
+    for q, saved in proposals:
+        for name, value in saved.items():
+            assert torch.equal(getattr(q, name), value)
+    # Target casts must not rewrite the shared FP32 staging used by Draft.
+    assert runner._sp_dev_f.dtype == torch.float32
+    torch.testing.assert_close(runner._sp_dev_f[0, :3],
+                               torch.tensor([s.temperature if s.temperature > 1e-5 else 1.
+                                             for s in seqs], device="cuda"))
+    torch.testing.assert_close(runner._sp_dev_f[1, :3],
+                               torch.tensor([s.top_p for s in seqs], device="cuda"))
